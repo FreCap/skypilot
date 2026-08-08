@@ -1,7 +1,9 @@
 """Logic tests for the controller-owned external LB lifecycle."""
 # pylint: disable=protected-access,unexpected-keyword-arg
+import contextvars
 import os
 import re
+import threading
 from types import SimpleNamespace
 from unittest import mock
 
@@ -1812,6 +1814,99 @@ def test_role_snapshot_reuses_owner_pods_and_service(monkeypatch):
         'snapshot_parse_routing',
         'snapshot_parse_pods',
     }
+
+
+def test_role_snapshot_joins_independent_kubernetes_reads(monkeypatch):
+    apps, core = _install(monkeypatch, db_service_names=('svc',))
+    desired_revision = 'a' * 64
+    owner = {
+        'hash': 'incarnation',
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        'lifecycle_epoch': 7,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lb_active_slot': lb_ha.LbSlot.A.value,
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+    }
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_controller_owner',
+                        lambda *_args, **_kwargs: owner)
+    service = SimpleNamespace(
+        metadata=SimpleNamespace(
+            resource_version='lb-service-rv',
+            annotations={
+                lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY: '3',
+                lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+            },
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            owner_references=[_owner_reference()]),
+        spec=SimpleNamespace(external_traffic_policy='Cluster',
+                             selector={
+                                 lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                                 lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+                             }))
+    pods = SimpleNamespace(items=[
+        _lb_pod('slot-a',
+                labels={lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value}),
+        _lb_pod('slot-b',
+                labels={lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.B.value}),
+    ])
+    deployment = SimpleNamespace(metadata=SimpleNamespace(
+        uid='api-deployment-uid'))
+    reads_started = threading.Barrier(3, timeout=5)
+    deployment_call_lock = threading.Lock()
+    deployment_calls = 0
+    caller_context = contextvars.ContextVar('role_snapshot_caller_context')
+    caller_context_token = caller_context.set('controller-request')
+
+    def list_pods(*_args, **_kwargs):
+        assert caller_context.get() == 'controller-request'
+        reads_started.wait()
+        return pods
+
+    def read_service(*_args, **_kwargs):
+        assert caller_context.get() == 'controller-request'
+        reads_started.wait()
+        return service
+
+    def read_deployment(*_args, **_kwargs):
+        nonlocal deployment_calls
+        with deployment_call_lock:
+            deployment_calls += 1
+            first_read = deployment_calls == 1
+        if first_read:
+            assert caller_context.get() == 'controller-request'
+            reads_started.wait()
+        return deployment
+
+    core.list_namespaced_pod.side_effect = list_pods
+    core.read_namespaced_service.side_effect = read_service
+    apps.read_namespaced_deployment.side_effect = read_deployment
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
+                                 lb_ha.LbCutoverPhase.STABLE, 7)
+
+    try:
+        snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state)
+    finally:
+        caller_context.reset(caller_context_token)
+
+    assert snapshot is not None
+    assert snapshot.routing == lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 3,
+                                                       'lb-service-rv',
+                                                       desired_revision)
+    assert snapshot.authority.slot_by_uid == {
+        'slot-a': lb_ha.LbSlot.A,
+        'slot-b': lb_ha.LbSlot.B,
+    }
+    # The post-join owner validation remains a second live Deployment read.
+    assert deployment_calls == 2
 
 
 def test_role_snapshot_fails_closed_on_malformed_shared_service(monkeypatch):
