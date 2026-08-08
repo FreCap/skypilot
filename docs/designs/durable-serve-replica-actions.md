@@ -1127,6 +1127,38 @@ and chart digest is
 The zero-incremental-capacity rollout and a fresh 60-minute production
 qualification remain open.
 
+Production Helm revision 370 deployed that exact artifact at 06:10:11 UTC,
+and all 17 API/load-balancer workloads first became Ready on its exact digest
+with zero restarts at 06:14:31 UTC.  The stricter issue-#1349 qualification
+failed immediately without a safety regression: both `boltz-l4-fleet` slots
+recorded new `client_timeout` outcomes after readiness while retaining the
+correct generation-161 ACTIVE/STANDBY roles.  By 06:18:28 UTC the exact
+post-readiness logs contained six ACTIVE-retaining and seven
+STANDBY-retaining timeout warnings.  Both slots remained synced,
+non-draining, `STABLE`, and converged; all 17 Pods remained Ready on the exact
+digest with zero restarts, the retired-state gate stayed empty, and Kubernetes
+recorded no Warning event after readiness.  The zero-timeout gate is
+monotonic, so revision 370 cannot qualify and its +60 timer was stopped rather
+than misrepresented as recoverable evidence.
+
+The new phase telemetry narrows the remaining serialized work.  On the first
+post-readiness sample, the ACTIVE/STANDBY `kubernetes_role_snapshot` recent
+p99 was 5.065/3.475 seconds.  Its Pod LIST reached 4.111/2.067 seconds, the
+first live Deployment-identity read reached 3.572/1.133 seconds, and the
+second live Deployment-ownership validation reached 1.177/1.862 seconds.
+Those independent Pod, Service, and first Deployment reads still execute
+sequentially under the per-service role lock; the opposite slot then waits for
+their sum and performs the same sequence.  The next bounded correction will
+issue only those first three independent reads concurrently, join all three
+before parsing or making a role decision, and retain the second live
+Deployment UID read after the join.  Thus the critical path becomes the
+maximum of the independent reads rather than their sum while the existing
+lock, fail-closed error mapping, exact Pod/Service/incarnation checks, and
+two-read Deployment replacement fence remain unchanged.  It adds no cache,
+TTL, stale authority, new mutation path, or provider capacity.  A fresh exact
+readiness/+10/+30/+60 production qualification on the subsequently merged
+artifact remains mandatory.
+
 ### R0 manual test plan
 
 Before the compatibility deployment, run the focused Python tests for the
