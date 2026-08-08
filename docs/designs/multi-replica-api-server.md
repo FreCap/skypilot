@@ -8,8 +8,8 @@ accepted; the private durable HA-observer canary contract is specified but its
 implementation and independent acceptance remain pending; the Rainier RWX
 storage deployment, role-split HA, and live scrape acceptance are pending;
 production fleet rollout and M5 compatibility cleanup remain fleet-gated; the
-Review-27 ownership and safety correction is independently accepted and its
-implementation remains pending
+Review-29 operator-authorization correction is accepted and its implementation
+remains pending
 
 Last updated: 2026-08-08
 
@@ -51,11 +51,16 @@ the one-way PostgreSQL request-store cutover in release 1.1.1089. That database
 cutover is historical input to this design, not work for the storage migration
 to repeat.
 
-A read-only production audit on 2026-08-08 found Helm revision 359 running
-1.1.1149 at commit `3d98a371e4d320aa1b9f3067088caa94d620c4f9` with a healthy
-single all-role pod. The pod explicitly uses PostgreSQL and the durable cutover
-gate, but still uses `Recreate` and the same 200-Gi `gp2` `ReadWriteOnce`
-claim. Its exact EBS volume is unencrypted and had no snapshot at audit time.
+A read-only production re-audit on 2026-08-08 at 06:10 UTC found Helm revision
+370 running 1.1.1166 at commit
+`606b4b29703dd2a6e69f57e49db685e85a3c6468` with a healthy single all-role
+pod. The image is pinned to
+`sha256:ad1fe699b9b940d669f6161cafcd1d719a5d8e4742572854adc9a7b5bf0c2013`
+and the chart to
+`sha256:520ffca476dfcdeb8b10a90ce3403a956e9035dc4aeeac3f261951695a7c84e4`.
+The pod explicitly uses PostgreSQL and the durable cutover gate, but still uses
+`Recreate` and the same 200-Gi `gp2` `ReadWriteOnce` claim. Its exact EBS volume
+is unencrypted and had no snapshot at audit time.
 The cluster has three on-demand `m6i.8xlarge` nodes, one in each zone, and has
 no EFS filesystem, EFS CSI add-on, or EFS Pod Identity association.
 The request-store prerequisite and guarded rollout implementation are therefore
@@ -843,17 +848,29 @@ mechanism, then freeze the live release and infrastructure state. A locked
 state inspection must find exactly these four root application addresses:
 `helm_release.skypilot`, `kubernetes_config_map_v1.seed_config`,
 `kubernetes_job_v1.seed_config`, and
-`terraform_data.reconcile_api_server`; any mismatch stops the handoff. A
-one-time, independently reviewed Rainier root revision contains a permanent
-`removed` block with `lifecycle { destroy = false }` for each address while
-switching to the infrastructure-only module. Its saved Terragrunt/OpenTofu plan
+`terraform_data.reconcile_api_server`; any mismatch stops the handoff. Because
+Terragrunt downloads the SkyPilot control-plane module as the root, one
+immutable SkyPilot module revision requires language version 1.7 or newer,
+deletes the four resource blocks, and contains a permanent `removed` block with
+`lifecycle { destroy = false }` for each address. Platform-generated sibling
+tombstones are forbidden: they conflict with the predecessor declarations and
+can disappear on a later pin. A repository guard makes the four module-root
+tombstones permanent. The Rainier unit switches to that infrastructure-only
+revision. Its saved Terragrunt/OpenTofu plan
 must forget exactly those four addresses with zero Helm, Kubernetes, or AWS
 mutation. A human using the approved non-admin deployment identity applies it
 once and proves all four state addresses are absent while the live release,
-values, manifest, revision, Deployment UID, pod UIDs, and database-config
-generation digest are unchanged; a second platform plan must be zero-change.
+values, manifest, revision, Deployment UID, pod UIDs, and database-config raw
+and canonical digests are unchanged; a second platform plan must be zero-change.
 The four tombstones remain permanently. The forgotten seed ConfigMap and Job
 remain inert until a later direct-Helm cleanup proves replacement-seed parity.
+
+The immutable SkyPilot commit is shared by the Rainier control plane,
+research-production EKS pool, research-usw2 spoke-workspace EKS pool, and
+multi-tenant AWS-VM unit. The handoff gate therefore includes a separate
+reviewed saved plan for all four units: Rainier has exactly the four forgets,
+and every other unit has zero managed-resource actions. Output-only changes are
+enumerated and cannot mask an action.
 
 After that handoff, `boltz-platform` owns only static infrastructure and
 infra-scoped migration helpers through reviewed saved Terragrunt/OpenTofu plans
@@ -864,8 +881,9 @@ SkyPilot Deployments, or mutate chart-owned objects. A SkyPilot build, upgrade,
 or rollback never requires a platform change or apply.
 
 SkyPilot application runtime is owned exclusively by direct Helm operations
-performed by a human operator. Every named release bundle contains an operation
-ID and digest, exact chart archive and SHA-256/OCI provenance, image digest,
+performed by an explicitly authorized operator. Every named release bundle
+contains an operation ID and digest, exact chart archive and SHA-256/OCI
+provenance, image digest,
 secret-free user-values capture, computed all-values audit, complete stage
 overlay and target values, rendered-manifest digest, database-head and
 placement compatibility, preflight, and fix-forward command. Ordinary changes
@@ -875,6 +893,42 @@ nor native `helm rollback`. A `--reset-values -f <complete-target-values>`
 operation is allowed only when the complete render and named retired-key diff
 are reviewed. Application and infrastructure stages may consume each other's
 accepted evidence, but neither tool may mutate resources owned by the other.
+
+H0's bundle also sets
+`configReconciliation.handoffGuard.expectedRawConfigSha256` over the exact live
+`config_yaml.api_server_config` text and `expectedConfigSha256` over its
+canonical decoded JSON. Both 64-character lowercase digests are required
+together. The `requiredPaths` string array contains `/gcp/vpc_name`,
+`/aws/ingress_source_ranges`, and `/kubernetes/allowed_contexts` plus an exact,
+exclusive enumeration of every live workspace. For workspace name `N`, form
+RFC 6901 component `E(N)` by escaping `~` as `~0` and `/` as `~1`. A disabled
+workspace contributes only
+`/workspaces/E(N)/kubernetes/disabled`, whose value must be the JSON Boolean
+`true`; an enabled workspace contributes exactly both
+`/workspaces/E(N)/kubernetes/namespace` and
+`/workspaces/E(N)/kubernetes/allowed_contexts`. Missing, extra, mixed, or
+incomplete workspace coverage fails closed. The two row hashes bind the exact
+pointed values; every pointer must also resolve. The seed Job
+must match that captured row before mutation, require its deterministic merge
+to be a complete config no-op, write only the separate seed-generation row,
+and prove the raw bytes, canonical digest, and required values unchanged after
+commit. The post-hook repeats both raw and canonical digests plus required-path
+checks in a new read-only transaction. Missing or changed security paths fail
+closed; a new generation marker alone is never handoff parity evidence.
+
+This transition supports only the built-in configuration schema. Every enabled
+operation sets literal `configReconciliation.pluginsUnsupported: true`, which
+is included in the generation, after proving Rainier has no configured API
+plugin schema. The helper rejects a nonempty stored top-level `plugins` value
+and validates the complete row with strict built-in unknown-field rejection. It
+does not import or install plugins, and a row containing plugin-provided fields
+fails closed instead of being partially preserved.
+
+The guard remains persisted through phase 0 and no-pod-change H2/H0-C
+operations. Clearing it changes the seed generation, so only a later reviewed
+application operation whose contract already permits a generation rollout may
+clear both hashes and the path list. It never causes an otherwise forbidden
+rollout merely to remove handoff evidence.
 
 Stable cluster policy may remain platform-owned only when it does not encode a
 SkyPilot release, chart, image, or template identity. The direct-Helm bundle or
@@ -893,9 +947,11 @@ backfilled into Terraform.
    KMS key, the EFS driver, an encrypted General Purpose filesystem with
    Elastic Throughput, a dedicated daily AWS Backup plan and vault with at least
    35 days of retention, and one mount target per availability zone. Create two
-   Terraform-owned static access points and statically bound RWX PV/PVC pairs:
-   the application state root and a distinct authority root. The state access
-   point is owned by UID/GID 0 so migration can preserve existing root-owned
+   Terraform-owned static access points in the cluster unit and statically
+   bound RWX PV/PVC pairs in the dedicated
+   `deployment/terragrunt/environments/gitops-hub-rainier/skypilot-kubernetes-infrastructure`
+   unit: the application state root and a distinct authority root. The state
+   access point is owned by UID/GID 0 so migration can preserve existing root-owned
    `.sky` and `.ssh` metadata. Workloads mount state read-write and authority
    read-only; they cannot reach the authority directory through the state
    access point. Only migration Jobs ever mount authority read-write, and their
@@ -1306,6 +1362,17 @@ backfilled into Terraform.
    scaled during overlap. Version, launch-template/AMI, capacity, and scaling
    inputs are frozen, every group is `prevent_destroy`, the legacy group is
    adopted without replacement, and no launch template uses `latest_version`.
+   Before plan A is saved, its configuration explicitly removes
+   `create_before_destroy` from the legacy `aws_eks_node_group.main` and pins
+   `launch_template.version` to the captured live integer rather than
+   `aws_launch_template.eks_nodes.latest_version`. Both source changes must be
+   no-ops for the legacy resource in plan A; otherwise stop. Leaving either
+   behavior live could turn an incidental launch-template edit into a full
+   three-node replacement surge, producing twelve physical instances--above
+   the approved transient-ten and dollar ceilings. Launch-template drift is
+   therefore counted alongside AZ rebalancing as a possible transient source,
+   but unlike the approved single AZ-rebalance instance it is prohibited by
+   configuration and plan.
    Exact values come from the approved non-admin identity and saved plan, never
    repository defaults. Acceptance B requires exactly two
    Ready nodes per bound subnet/AZ, Ready CNI and policy agents, and matched
@@ -1467,13 +1534,21 @@ backfilled into Terraform.
 The refreshed platform stack starts by repurposing
 `boltz-bio/boltz-platform#7823` as the one-time root
 four-address application ownership handoff and immutable reusable-module pin.
-Its old 1.1.1087 runtime payload is obsolete. Its plan must contain exactly
+Its old 1.1.1087 runtime payload is obsolete. The pinned SkyPilot module commit
+contains the resource deletions, language floor, and permanent tombstones.
+The platform PR removes the now-inert Helm/ECR provider configuration,
+application inputs, and application-value assertions, replacing them with a
+static ownership guard; direct-Helm H0 artifacts own those assertions. Its
+Rainier plan must contain exactly
 four root `forget` actions for `helm_release.skypilot`,
 `kubernetes_config_map_v1.seed_config`,
 `kubernetes_job_v1.seed_config`, and
 `terraform_data.reconcile_api_server`, with zero remote mutation. Its human
-apply must not change the live release or inert legacy seed objects. The remaining linear
-infrastructure stages map to `#7824` (inert EFS and both RWX object pairs),
+apply must not change the live release or inert legacy seed objects. The same
+shared pin must have separate zero-managed-resource-action saved plans for the
+research-production EKS pool, research-usw2 spoke-workspace EKS pool, and
+multi-tenant AWS-VM unit before the Rainier handoff is accepted. The remaining
+linear infrastructure stages map to `#7824` (inert EFS and both RWX object pairs),
 `#7829` (legacy retention and generation-scoped online preseed), `#7830`
 (quiescence infrastructure only), a new finalizer PR, a separate
 writer-retirement PR, and `#7831` (infrastructure prerequisites and gates for
@@ -1496,9 +1571,9 @@ finalizer stage; its descendant direct-Helm abort-B artifact cannot run before
 abort-A writer retirement and stable absence proof. It is used only if no
 fence committed and never merges into the successful fix-forward path. Each
 infrastructure stage requires its own complete saved plan and human apply, and
-each application stage requires its own reviewed Helm artifact and human
-operation. Merging either repository is not evidence that an earlier live gate
-passed.
+each application stage requires its own reviewed Helm artifact and explicitly
+authorized operation. Merging either repository is not evidence that an earlier
+live gate passed.
 
 The current resource candidate preserves the all-role pod's measured 128
 controller-class long-worker budget. Each controller requests 16 CPU, is
@@ -1657,13 +1732,16 @@ Rainier's storage authorization and state boundary are explicit:
   cleanup and cost are recorded and authorized separately from rehearsal
   success.
 - The Kubernetes provider in every Rainier unit that needs cluster access uses
-  exec-based `aws eks get-token` acquisition at apply time; infrastructure
-  roots declare no Helm provider. Direct Helm obtains its own short-lived
-  operator authentication outside Terraform. A 15-minute
-  `data.aws_eks_cluster_auth` token may not be embedded in a saved plan. Every
-  apply requires an approved non-admin hub deploy identity, STS account
-  `255203429798`, and a context that reaches the private EKS endpoint; the
-  read-only administrator audit identity is not apply authorization.
+  exec-based `aws eks get-token` acquisition at apply time. The cluster unit may
+  retain its Helm provider solely for platform-owned releases such as Argo CD,
+  but that provider also uses exec-based token acquisition. The SkyPilot
+  control-plane and Kubernetes-infrastructure roots declare no Helm provider;
+  direct SkyPilot Helm obtains its own short-lived operator authentication
+  outside Terraform. A 15-minute `data.aws_eks_cluster_auth` token may feed
+  neither provider nor be embedded in a saved plan. Every apply requires an
+  approved non-admin hub deploy identity, STS account `255203429798`, and a
+  context that reaches the private EKS endpoint; the read-only administrator
+  audit identity is not apply authorization.
 - The EFS CSI node service account uses its own EKS Pod Identity role. Its
   identity policy grants `ClientMount`, `ClientWrite`, and `ClientRootAccess`
   only for the managed filesystem and either exact access point through a mount target.
@@ -1682,12 +1760,13 @@ Rainier's storage authorization and state boundary are explicit:
   is not production storage precedent.
 - The cluster Terraform state exports both exact `fs-id::fsap-id` handles only
   after mount targets, backup and filesystem policies, the node Pod Identity
-  association, and the managed CSI add-on are ready. The control-plane unit
-  consumes that output through a real dependency. Mocks are allowed for plan
-  and validate, never apply, so a fake handle cannot enter Kubernetes state
-  and the two states cannot apply concurrently.
-- The control-plane unit owns both retained, `prevent_destroy` static PV/PVC
-  pairs outside Helm. Each PV is pre-bound to its exact namespaced claim and
+  association, and the managed CSI add-on are ready. The new Kubernetes-
+  infrastructure unit consumes that output through a real dependency. Mocks
+  are allowed for plan and validate, never apply, so a fake handle cannot enter
+  its Kubernetes state and the two states cannot apply concurrently.
+- The new `gitops-hub-rainier/skypilot-kubernetes-infrastructure` unit owns both
+  retained, `prevent_destroy` static PV/PVC pairs outside Helm. Each PV is
+  pre-bound to its exact namespaced claim and
   both objects in a pair use a distinct non-empty sentinel class, for which no
   StorageClass object exists. This prevents default-class admission from
   changing a PVC and prevents dynamic provisioning. Both pairs advertise
@@ -1696,6 +1775,20 @@ Rainier's storage authorization and state boundary are explicit:
   PV. This provisioning revision does not change live Helm claim selection, the
   `Recreate` strategy, PostgreSQL request-store configuration, or pod identity;
   those changes occur only at the guarded stages above.
+
+  This unit inherits the repository `root.hcl` S3 backend, so its state key is
+  `gitops-hub-rainier/skypilot-kubernetes-infrastructure/opentofu.tfstate` in
+  `boltz-platform-opentofu-state-255203429798`, with encryption and native S3
+  locking. It has real Terragrunt dependencies on `../cluster` for the EKS
+  endpoint/name/CA and ready EFS access-point handles and on
+  `../skypilot-control-plane` for the infrastructure-owned namespace identity.
+  Its generated Kubernetes provider uses apply-time `aws eks get-token` exec
+  authentication under the approved non-admin account-255203429798 identity;
+  it declares no Helm provider. Mocks are allowed only for `init`, `validate`,
+  and `plan`. Apply ordering is cluster storage/CSI first, the already-stable
+  infrastructure-only control-plane namespace second if needed, and this
+  Kubernetes-infrastructure state last; no two dependent states apply in
+  parallel.
 
 ### M2: Split API and executor roles
 
@@ -2420,9 +2513,12 @@ by HA mode.
   `kubernetes_job_v1.seed_config`, and
   `terraform_data.reconcile_api_server` through permanent `destroy = false`
   tombstones, with zero Helm, Kubernetes, or AWS action. Post-apply simulation
-  proves all four addresses remain absent on every later plan. CI rejects any
-  infrastructure-module Helm provider, release/chart/image/application-values
-  input, seed object, rollout restart, or release-specific admission digest.
+  proves all four addresses remain absent on every later plan. Separate saved
+  plans for all three other shared-pin production consumers have zero managed-
+  resource actions. SkyPilot CI rejects removal of a module-root tombstone;
+  platform CI rejects any Helm provider in the SkyPilot control-plane or
+  Kubernetes-infrastructure roots, release/chart/image/application-values input,
+  seed object, rollout restart, or release-specific admission digest.
   Direct-Helm harness tests require
   immutable chart/image/operation digests, captured `values --all`, manifest
   and history, complete render and diff, default `--reuse-values`, and reject
@@ -2430,6 +2526,11 @@ by HA mode.
   containing an application mutation. Seed parity tests cover fresh and
   existing databases, merge/list/workspace/prune semantics, all-role and
   split-role reload, migration-before-seed and seed-before-rollout ordering,
+  H0 raw-byte and canonical-row no-op parity, required-path preservation for
+  GCP VPC, AWS ingress, global Kubernetes contexts, and every workspace
+  boundary, missing/mutated-path rejection, the required literal no-plugin
+  attestation, nonempty-plugin and ordinary/plugin-field rejection, and proof
+  that no plugin loader, import, or installer executes,
   the 262,144-byte input bound, pre-seed failure, post-rollout verification,
   retry, failure TTLs, interrupted-client-after-success and uninstall residue,
   and revision-scoped cleanup of the
@@ -2476,7 +2577,9 @@ by HA mode.
   controller long workers in both original pods and the promoted replacement.
   Managed-node-group tests require fixed 2/2/2 target and three-node legacy
   sizes, target-only `MINIMAL` updates and disabled repair, captured/frozen
-  legacy update/repair behavior, frozen version/AMI inputs, and a
+  legacy update/repair behavior, no legacy `create_before_destroy`, an exact
+  integer legacy launch-template version with no `latest_version` reference,
+  a plan-A no-op for the legacy resource, frozen version/AMI inputs, and a
   normal maximum of nine plus the explicitly approved single-instance legacy
   `AZRebalance` transient. Guard tests cover stable legacy-three, partial target
   creation with tagged instances before ASG binding, exact stable-nine
@@ -3546,14 +3649,16 @@ infrastructure only. Four permanent `destroy = false` state tombstones perform
 the one-time, mutation-free release/seed/restart ownership handoff. All rollout,
 rollback, abort, activation, stack mapping, and
 test language above now preserves that split. Independent exact-byte review of
-this updated revision remains a merge gate.
+this updated revision was treated as a merge gate.
 
 ### Review 27: complete handoff and executable seed-hook lifecycle
 
 Exact-byte review of the first Review-26 revision rejected three contradictions.
 The platform-stack map now requires all four root `forget` actions rather than
-only the release, infrastructure roots no longer configure a Helm provider, and
-direct Helm uses its own short-lived operator authentication.
+only the release, the SkyPilot control-plane and Kubernetes-infrastructure roots
+no longer configure a Helm provider, and direct Helm uses its own short-lived
+operator authentication. The cluster root may retain its unrelated platform-
+release Helm provider with exec authentication.
 
 The same review found that one seed hook could not both commit before target
 Deployments were applied and verify their later rollout. It also found that a
@@ -3563,10 +3668,49 @@ the size-bounded canonical config directly in a weighted pre-upgrade seed Job,
 rolls regular generation-annotated Deployments under `--wait`, and uses a
 separate post-upgrade read-only verifier. Only Jobs remain as seed hook residue;
 their success/failure lifecycles and TTLs are bounded and tested. Independent
-exact-byte review of this correction remains a merge gate.
+exact-byte review of this correction was then rerun.
 
 A second exact pass required the verifier TTL on successful Jobs as well as
 failures: `hook-succeeded` is eager client-side cleanup, not protection against
 an interrupted Helm client. The same bounded TTL now covers every outcome.
 Independent exact review accepted commit
 `e7d484f85571e89887ad903d8d59df9b9681e437` with no remaining blocker.
+
+### Review 28: executable module-root handoff and bounded legacy capacity
+
+Cross-repository review of the platform implementation found that Terragrunt
+downloads the SkyPilot control-plane module as the root. The four tombstones
+therefore move into the same SkyPilot module revision that deletes the resource
+blocks; generating them platform-side would conflict before the pin and lose
+the permanent policy after a later pin. Because that immutable commit is shared,
+all four production consumers now require saved plans, with exactly four
+forgets only in Rainier and zero managed-resource actions elsewhere. Phase 0
+also retires inert platform Helm/ECR/application inputs and repoints ownership
+and application assertions to the direct-Helm artifact.
+
+The review also found that generation-only seed evidence could miss loss of
+security-load-bearing config. H0 now proves raw-byte and canonical whole-row
+no-op parity plus explicit GCP VPC, AWS ingress, global Kubernetes-context, and
+workspace-boundary values before and after the seed transaction and again in
+the post-verifier. The transition also requires a generation-bound no-plugin
+attestation and strict built-in-schema validation. The storage phase names its
+new Kubernetes-infrastructure
+state, backend, authentication, dependencies, and apply order. Finally, plan A
+removes legacy `create_before_destroy` and pins the captured integer launch-
+template version as plan no-ops; otherwise an incidental three-node replacement
+could create twelve physical instances and exceed the transient-ten approval.
+Independent exact cross-repository review accepted the corrected contract with
+no remaining blocker; implementation remains gated on preserving these bytes.
+
+### Review 29: authorized direct-Helm operator boundary
+
+Follow-up review found that Review 28 accidentally described every direct-Helm
+application stage as human-only. That is stricter than the organization
+operating contract: an explicitly authorized operator, including an agent
+acting under a user's deployment instruction, may execute the reviewed Helm
+artifact and its monitoring gates. The human-only boundary remains on the
+separately reviewed production Terraform/OpenTofu state handoff and other
+infrastructure applies. The two ownership domains remain disjoint, and an
+ordinary SkyPilot rollout still neither waits for nor modifies
+`boltz-platform`. Exact review accepted this operator-boundary correction with
+no remaining blocker.
