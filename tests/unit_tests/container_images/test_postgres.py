@@ -4969,11 +4969,20 @@ def test_live_service_version_demand_evidence_covers_every_incarnation(
                     publication_record,
                     regional,
                     profile,
+                    owner='svc:incarnation:legacy:colon-hash:v2',
+                    controller_epoch='service:legacy-colon-hash:v2',
+                    controller_sequence=2,
+                    request_id='legacy-colon-hash',
+                    now=51)
+    _warming_demand(active,
+                    publication_record,
+                    regional,
+                    profile,
                     owner='svc:incarnation:new-hash:v2:target:target-scope',
                     controller_epoch='service:new-hash:v2',
                     controller_sequence=2,
                     request_id='new-target',
-                    now=51)
+                    now=52)
     _warming_demand(active,
                     publication_record,
                     regional,
@@ -4982,7 +4991,7 @@ def test_live_service_version_demand_evidence_covers_every_incarnation(
                     controller_epoch='service:new-hash:v20',
                     controller_sequence=20,
                     request_id='different-version',
-                    now=52)
+                    now=53)
     _warming_demand(active,
                     publication_record,
                     regional,
@@ -4991,7 +5000,7 @@ def test_live_service_version_demand_evidence_covers_every_incarnation(
                     controller_epoch='service:new-hash:v2-shadow',
                     controller_sequence=2,
                     request_id='different-service',
-                    now=53)
+                    now=54)
 
     all_incarnations = (
         demand_state.get_live_service_version_demand_evidence_any_incarnation(
@@ -4999,7 +5008,7 @@ def test_live_service_version_demand_evidence_covers_every_incarnation(
     exact_current = demand_state.get_live_service_version_demand_evidence(
         'svc', 2, 'new-hash')
 
-    assert all_incarnations.count == 2
+    assert all_incarnations.count == 3
     assert exact_current.count == 1
     assert all_incarnations.digest != exact_current.digest
 

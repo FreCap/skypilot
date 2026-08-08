@@ -26,6 +26,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import ephemeral_storage_contract
 from sky.serve import paid_capacity
 from sky.serve import placement_contract_normalization
+from sky.serve import placement_normalization_manifest
 from sky.serve import placement_policy
 from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_managers
@@ -169,9 +170,8 @@ def _insert_placement_normalization_run(engine,
                                         schema_revision: str = '037',
                                         mode: str = 'apply_supported',
                                         normalizer_protocol: int = 1) -> None:
-    digest = 'a' * 64
-    if classification_counts is None:
-        classification_counts = {'fieldless_supported': row_count}
+    del classification_counts
+    empty_inventory_digest = hashlib.sha256(b'[]').hexdigest()
     with orm.Session(engine) as session:
         session.execute(
             serve_state.placement_normalization_runs_table.insert().values(
@@ -183,12 +183,68 @@ def _insert_placement_normalization_run(engine,
                 started_at=1.0,
                 completed_at=2.0,
                 row_bound=row_count,
-                row_count=row_count,
-                classification_counts=classification_counts,
-                pre_inventory_sha256=digest,
-                post_inventory_sha256=digest,
-                freeze_evidence_sha256=digest))
+                row_count=0,
+                classification_counts={},
+                pre_inventory_sha256=empty_inventory_digest,
+                post_inventory_sha256=empty_inventory_digest,
+                freeze_evidence_sha256='a' * 64))
         session.commit()
+
+
+def _placement_normalization_value_sha256(value) -> str:
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    elif isinstance(value, bytearray):
+        value = bytes(value)
+    if isinstance(value, bytes):
+        payload = b'bytes\0' + value
+    else:
+        payload = b'json\0' + json.dumps(
+            value,
+            sort_keys=True,
+            separators=(',', ':'),
+            ensure_ascii=True,
+            default=str,
+        ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _placement_normalization_row_sha256(column_sha256s: dict[str, str]) -> str:
+    return hashlib.sha256(
+        json.dumps(column_sha256s, sort_keys=True,
+                   separators=(',', ':')).encode()).hexdigest()
+
+
+def _refresh_placement_normalization_manifest(session: orm.Session,
+                                              run_id: uuid.UUID) -> None:
+    """Keep synthetic manifests complete and cryptographically coherent."""
+    rows = session.execute(
+        sqlalchemy.select(serve_state.placement_normalization_rows_table).where(
+            serve_state.placement_normalization_rows_table.c.run_id ==
+            run_id)).mappings().all()
+    classification_counts: dict[str, int] = {}
+    pre_inventory = []
+    post_inventory = []
+    for row in rows:
+        classification = row['classification']
+        classification_counts[classification] = (
+            classification_counts.get(classification, 0) + 1)
+        identity = (row['service_name'], row['version'])
+        pre_inventory.append((*identity, row['original_row_sha256']))
+        post_inventory.append((*identity, row['result_row_sha256']))
+
+    def _fleet_digest(inventory) -> str:
+        return hashlib.sha256(
+            json.dumps(sorted(inventory),
+                       separators=(',', ':')).encode()).hexdigest()
+
+    session.execute(
+        sqlalchemy.update(serve_state.placement_normalization_runs_table).where(
+            serve_state.placement_normalization_runs_table.c.run_id ==
+            run_id).values(row_count=len(rows),
+                           classification_counts=classification_counts,
+                           pre_inventory_sha256=_fleet_digest(pre_inventory),
+                           post_inventory_sha256=_fleet_digest(post_inventory)))
 
 
 def _insert_placement_normalization_row(
@@ -204,8 +260,23 @@ def _insert_placement_normalization_row(
         classification: str = 'fieldless_supported',
         outcome: str = 'changed') -> None:
     spec_digest = hashlib.sha256(spec_bytes).hexdigest()
-    row_digest = 'b' * 64
     with orm.Session(engine) as session:
+        version_row = session.execute(
+            sqlalchemy.select(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == service_name,
+                serve_state.version_specs_table.c.version ==
+                version)).mappings().one()
+        result_columns = {
+            column: _placement_normalization_value_sha256(value)
+            for column, value in version_row.items()
+        }
+        original_columns = dict(result_columns)
+        original_spec_sha256 = spec_digest
+        if outcome != 'unchanged':
+            original_spec_sha256 = hashlib.sha256(b'original-spec\0' +
+                                                  spec_bytes).hexdigest()
+            original_columns['spec'] = hashlib.sha256(b'original-column\0' +
+                                                      spec_bytes).hexdigest()
         session.execute(
             serve_state.placement_normalization_rows_table.insert().values(
                 run_id=run_id,
@@ -213,16 +284,280 @@ def _insert_placement_normalization_row(
                 version=version,
                 classification=classification,
                 outcome=outcome,
-                original_spec_sha256='c' * 64,
+                original_spec_sha256=original_spec_sha256,
                 result_spec_sha256=(result_spec_sha256 or spec_digest),
-                original_row_sha256=row_digest,
-                result_row_sha256=row_digest,
-                original_column_sha256s={},
-                result_column_sha256s={},
-                contract_projection={'version': 1},
+                original_row_sha256=_placement_normalization_row_sha256(
+                    original_columns),
+                result_row_sha256=_placement_normalization_row_sha256(
+                    result_columns),
+                original_column_sha256s=original_columns,
+                result_column_sha256s=result_columns,
+                contract_projection=(None
+                                     if classification == 'placeholder' else {
+                                         'version': 1
+                                     }),
                 service_hash=service_hash,
                 service_lifecycle_epoch=lifecycle_epoch,
-                dependency_facts={}))
+                dependency_facts={
+                    'service_hash': service_hash,
+                    'service_lifecycle_epoch': lifecycle_epoch,
+                }))
+        _refresh_placement_normalization_manifest(session, run_id)
+        session.commit()
+
+
+def _protocol4_historical_payload() -> bytes:
+    historical = _exact_service_spec('historical', uses_logical_replicas=True)
+    state = dict(historical.__dict__)
+    for field in placement_policy.CONTRACT_FIELDS:
+        state.pop(field, None)
+    state.pop(placement_policy.ROLLBACK_REPLICA_UNIT_FIELD, None)
+    return placement_contract_normalization._serialize_raw_state(state, 4)
+
+
+def _protocol4_cleanup_yaml(resource_scope: str,
+                            storage_generation: str) -> str:
+    scope_id = ephemeral_storage_contract.canonical_ephemeral_storage_scope_id(
+        resource_scope, storage_generation)
+    metadata_key = serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY
+    return f"""\
+_metadata:
+  {metadata_key}:
+    resource_scope: {resource_scope}
+    scope_id: {scope_id}
+    storage_generation: {storage_generation}
+    storage_mounts: []
+service: {{}}
+"""
+
+
+def _insert_protocol4_terminal_receipt_state(
+    engine,
+    service_name: str,
+    owner: tuple[int, str],
+) -> tuple[uuid.UUID, int]:
+    """Persist a real protocol-4 terminal manifest for receipt tests."""
+    service_hash = 'incarnation-a'
+    assert _add_minimal_service(service_name,
+                                service_hash=service_hash,
+                                controller_pid=owner[0],
+                                controller_ip=owner[1],
+                                resource_scope=service_hash,
+                                spec=_v2_service_spec('initial'))
+    lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(service_name)
+    assert serve_state.add_version(service_name) == 2
+    assert serve_state.add_version(service_name) == 3
+    assert serve_state.add_or_update_version(
+        service_name, 4, _v2_service_spec('successor'),
+        'service: {}') is serve_state.VersionCommitResult.COMMITTED
+
+    cleanup_yaml = _protocol4_cleanup_yaml(service_hash, 'generation-1')
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == service_name,
+                serve_state.version_specs_table.c.version == 1).values(
+                    spec=_protocol4_historical_payload(),
+                    yaml_content=cleanup_yaml,
+                    controller_applied_at=None))
+        session.commit()
+
+    rows = []
+    for version in range(1, 5):
+        persisted = _read_version_row(engine, service_name, version)
+        analysis, classification = (
+            placement_contract_normalization._classify_version_row(persisted))
+        facts = {
+            'service_present': True,
+            'service_current_version': 4,
+            'service_hash': service_hash,
+            'service_lifecycle_epoch': lifecycle_epoch,
+            'service_resource_scope': service_hash,
+            'service_status': 'READY',
+            'service_active': version == 4,
+            'service_pool': 0,
+            'service_resource_action_mode': 'legacy',
+            'service_resource_action_mode_changed_at': None,
+            'replica_count': 0,
+            'unknown_version_replica_count': 0,
+            'cleanup_intent_count': 1,
+            'quarantined': False,
+            'controller_applied': False,
+            'retired': False,
+        }
+        rows.append(
+            placement_contract_normalization._RowWork(persisted,
+                                                      dict(persisted),
+                                                      analysis,
+                                                      classification,
+                                                      dependency_facts=facts))
+
+    intent = {
+        'service_name': service_name,
+        'resource_scope': service_hash,
+        'storage_generation': 'generation-1',
+        'yaml_content': cleanup_yaml,
+        'pool': 0,
+        'lifecycle_epoch': lifecycle_epoch,
+        'provisional': 1,
+        'created_at': 0.5,
+    }
+    service_row = {
+        'name': service_name,
+        'current_version': 4,
+        'active_versions': '[4]',
+        'hash': service_hash,
+        'lifecycle_epoch': lifecycle_epoch,
+        'resource_scope': service_hash,
+        'workspace': 'workspace',
+        'status': 'READY',
+        'pool': 0,
+        'resource_action_mode': 'legacy',
+        'resource_action_mode_changed_at': None,
+    }
+    cleanup_plan = placement_contract_normalization._build_cleanup_intent_plan(
+        [intent], rows, {service_name: service_row}, row_bound=len(rows))
+
+    approved_commit_digest = (
+        placement_contract_normalization._canonical_json_sha256(['b' * 40]))
+    freeze_input_digest = 'c' * 64
+    freeze_binding_digest = (
+        placement_contract_normalization._canonical_json_sha256({
+            'approved_loaded_image_commit_sha256': approved_commit_digest,
+            'operator_freeze_evidence_input_sha256': freeze_input_digest,
+        }))
+    receipt_facts = {
+        'predecessor_receipt_schema':
+            placement_contract_normalization._PREDECESSOR_RECEIPT_SCHEMA,
+        'predecessor_receipt_inventory_count': 1,
+        'predecessor_receipt_inventory_sha256':
+            placement_contract_normalization._canonical_json_sha256(
+                [service_name]),
+        'approved_loaded_image_commit_count': 1,
+        'approved_loaded_image_commit_sha256': approved_commit_digest,
+        'operator_freeze_evidence_input_sha256': freeze_input_digest,
+        'operator_freeze_approved_commit_binding_sha256': freeze_binding_digest,
+        'predecessor_receipts_complete': True,
+    }
+    receipt_evidence = (
+        placement_contract_normalization._PredecessorReceiptEvidence(
+            frozenset({service_name}), receipt_facts))
+    image_evidence = {
+        (service_name, version):
+            placement_contract_normalization._ExternalEvidence(0, digest * 64)
+        for version, digest in zip((1, 2, 3), 'abc')
+    }
+    action_evidence = {
+        (service_name, version):
+            placement_contract_normalization._ExternalEvidence(0, digest * 64)
+        for version, digest in zip((1, 2, 3), 'def')
+    }
+    empty_evidence = placement_contract_normalization._ExternalEvidence(
+        0, '0' * 64)
+    api_pod = placement_contract_normalization._canonical_api_pod_identity(
+        'pod-a', uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
+    run_id = uuid.uuid4()
+    placement_contract_normalization._prepare_retirement_rows(
+        rows, {service_name: service_row}, run_id, 10.0, image_evidence,
+        action_evidence, empty_evidence, empty_evidence, api_pod,
+        empty_evidence, cleanup_plan, receipt_evidence)
+
+    ledger_entries = []
+    classification_counts: dict[str, int] = {}
+    for row in rows:
+        classification = row.ledger_classification
+        classification_counts[classification] = (
+            classification_counts.get(classification, 0) + 1)
+        ledger_entries.append({
+            'run_id': run_id,
+            'service_name': service_name,
+            'version': row.identity[1],
+            'classification': classification,
+            'outcome': row.outcome,
+            'original_spec_sha256': row.analysis.source_sha256,
+            'result_spec_sha256': placement_contract_normalization._sha256(
+                bytes(row.result['spec'])),
+            'original_row_sha256': placement_contract_normalization._row_sha256(
+                row.original),
+            'result_row_sha256': placement_contract_normalization._row_sha256(
+                row.result),
+            'original_column_sha256s':
+                placement_contract_normalization._column_sha256s(row.original),
+            'result_column_sha256s':
+                placement_contract_normalization._column_sha256s(row.result),
+            'contract_projection': row.analysis.contract_projection,
+            'service_hash': service_hash,
+            'service_lifecycle_epoch': lifecycle_epoch,
+            'dependency_facts': row.dependency_facts,
+        })
+    run_values = {
+        'run_id': run_id,
+        'mode': 'retire_terminal_historical',
+        'normalizer_version': f'4:{"a" * 40}',
+        'schema_revision': '037',
+        'release_version': 'test',
+        'started_at': 1.0,
+        'completed_at': 2.0,
+        'row_bound': len(rows),
+        'row_count': len(rows),
+        'classification_counts': classification_counts,
+        'pre_inventory_sha256': placement_contract_normalization._fleet_sha256(
+            rows, result=False),
+        'post_inventory_sha256': placement_contract_normalization._fleet_sha256(
+            rows, result=True),
+        'freeze_evidence_sha256': freeze_binding_digest,
+    }
+    with orm.Session(engine) as session:
+        session.execute(
+            serve_state.placement_normalization_runs_table.insert().values(
+                **run_values))
+        session.execute(serve_state.placement_normalization_rows_table.insert(),
+                        ledger_entries)
+        for row in rows:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name, serve_state.version_specs_table.c.version ==
+                    row.identity[1]).values(**row.result))
+        session.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == service_name).values(
+                    placement_normalization_requested_run_id=run_id))
+        session.commit()
+    return run_id, lifecycle_epoch
+
+
+def _validate_placement_normalization_manifest_directly(
+        engine, run_id: uuid.UUID) -> None:
+    with orm.Session(engine) as session:
+        serve_state._load_and_validate_placement_normalization_manifest(
+            session, run_id)
+
+
+def _recreate_protocol4_service_version(engine, service_name: str, *,
+                                        explicit: bool) -> None:
+    if explicit:
+        spec = pickle.dumps(_v2_service_spec('recreated'), protocol=4)
+        yaml_content = 'service: {}'
+        created_at = 3.0
+    else:
+        spec = pickle.dumps(None, protocol=4)
+        yaml_content = None
+        created_at = None
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.delete(serve_state.version_specs_table).where(
+                serve_state.version_specs_table.c.service_name == service_name))
+        session.execute(
+            sqlalchemy.update(serve_state.services_table).where(
+                serve_state.services_table.c.name == service_name).values(
+                    hash='incarnation-b', lifecycle_epoch=2, current_version=1))
+        session.execute(serve_state.version_specs_table.insert().values(
+            service_name=service_name,
+            version=1,
+            spec=spec,
+            yaml_content=yaml_content,
+            created_at=created_at))
         session.commit()
 
 
@@ -243,6 +578,16 @@ def test_placement_normalization_receipt_locks_only_service_row() -> None:
     sql = str(locked.compile(dialect=postgresql.dialect()))
 
     assert 'FOR UPDATE OF services' in sql
+
+
+def test_protocol4_current_inventory_query_projects_frozen_columns() -> None:
+    query = serve_state._placement_normalization_current_inventory_query(
+        ['svc'])
+
+    assert tuple(query.selected_columns.keys()) == (
+        placement_normalization_manifest.VERSION_SPEC_COLUMNS)
+    assert serve_state._PLACEMENT_NORMALIZATION_RECEIPT_MAX_ROWS + 1 in (
+        query.compile().params.values())
 
 
 _VERSIONED_HA_SCRIPT = (
@@ -4782,13 +5127,356 @@ class TestRecoveryVersionSelection:
                             service_hash='incarnation-b'))
             session.commit()
         with pytest.raises(RuntimeError,
-                           match='service incarnation ledger anchor'):
+                           match='service incarnation|owner_facts'):
             serve_state.get_placement_normalization_request(
                 service_name,
                 recovery_version=2,
                 current_version=2,
                 expected_service_hash='incarnation-a',
                 expected_controller_owner=owner)
+
+    def test_protocol4_receipt_read_rejects_coherent_stale_relabel(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-relabel'
+        owner = (123, '10.0.0.1')
+        run_id, _ = _insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner)
+        with orm.Session(_mock_serve_db) as session:
+            entries = session.execute(
+                sqlalchemy.select(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id)).mappings().all()
+            retired = next(
+                entry for entry in entries if entry['outcome'] == 'retired')
+            stale = sorted((entry for entry in entries
+                            if entry['classification'] == 'stale_placeholder'),
+                           key=lambda entry: entry['version'])
+            relabeled_facts = dict(stale[0]['dependency_facts'])
+            relabeled_facts.pop('stale_placeholder_evidence')
+            retired_facts = dict(retired['dependency_facts'])
+            summary = dict(
+                retired_facts['same_service_stale_placeholder_proof'])
+            remaining_evidence = [
+                entry['dependency_facts']['stale_placeholder_evidence']
+                for entry in stale[1:]
+            ]
+            summary['placeholder_count'] = len(remaining_evidence)
+            summary['inventory_sha256'] = (placement_normalization_manifest.
+                                           stale_placeholder_inventory_sha256(
+                                               service_name,
+                                               summary['current_version'],
+                                               remaining_evidence))
+            retired_facts['same_service_stale_placeholder_proof'] = summary
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == stale[0]['version']).values(
+                            classification='explicit_v2',
+                            dependency_facts=relabeled_facts))
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == retired['version']).values(
+                            dependency_facts=retired_facts))
+            _refresh_placement_normalization_manifest(session, run_id)
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='stale_placeholder|manifest'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=4,
+                current_version=4,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_protocol4_ack_rejects_coherent_stale_ledger_omission(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-omission'
+        owner = (123, '10.0.0.1')
+        run_id, _ = _insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner)
+        request = serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=4,
+            current_version=4,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner)
+        assert request is not None
+
+        with orm.Session(_mock_serve_db) as session:
+            entries = session.execute(
+                sqlalchemy.select(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id)).mappings().all()
+            retired = next(
+                entry for entry in entries if entry['outcome'] == 'retired')
+            stale = sorted((entry for entry in entries
+                            if entry['classification'] == 'stale_placeholder'),
+                           key=lambda entry: entry['version'])
+            retired_facts = dict(retired['dependency_facts'])
+            summary = dict(
+                retired_facts['same_service_stale_placeholder_proof'])
+            remaining_evidence = [
+                entry['dependency_facts']['stale_placeholder_evidence']
+                for entry in stale[1:]
+            ]
+            summary['placeholder_count'] = len(remaining_evidence)
+            summary['inventory_sha256'] = (placement_normalization_manifest.
+                                           stale_placeholder_inventory_sha256(
+                                               service_name,
+                                               summary['current_version'],
+                                               remaining_evidence))
+            retired_facts['same_service_stale_placeholder_proof'] = summary
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == retired['version']).values(
+                            dependency_facts=retired_facts))
+            session.execute(
+                sqlalchemy.delete(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name,
+                        serve_state.placement_normalization_rows_table.c.version
+                        == stale[0]['version']))
+            _refresh_placement_normalization_manifest(session, run_id)
+            session.commit()
+
+        with pytest.raises(RuntimeError,
+                           match='terminal current inventory|post_terminal'):
+            serve_state.acknowledge_placement_normalization_loaded(
+                service_name,
+                request,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner,
+                image_commit='commit-a',
+                child_controller_pid=456,
+                boot_id='a' * 32,
+                loaded_at=123.0)
+        assert _read_row(
+            _mock_serve_db,
+            service_name)['placement_normalization_loaded_run_id'] is None
+
+    def test_protocol4_receipt_live_binding_is_candidate_scoped(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-candidate'
+        unrelated_name = 'svc-normalization-p4-unrelated'
+        owner = (123, '10.0.0.1')
+        run_id, lifecycle_epoch = (_insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner))
+        assert _add_minimal_service(unrelated_name,
+                                    service_hash='unrelated-incarnation',
+                                    spec=_v2_service_spec('unrelated'))
+        unrelated_lifecycle = serve_state.claim_service_lifecycle_epoch(
+            unrelated_name)
+        unrelated_spec = _read_version_row(_mock_serve_db, unrelated_name,
+                                           1)['spec']
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_runs_table).where(
+                        serve_state.placement_normalization_runs_table.c.run_id
+                        == run_id).values(row_bound=5))
+            session.commit()
+        _insert_placement_normalization_row(_mock_serve_db,
+                                            run_id,
+                                            unrelated_name,
+                                            1,
+                                            unrelated_spec,
+                                            'unrelated-incarnation',
+                                            unrelated_lifecycle,
+                                            classification='explicit_v2',
+                                            outcome='unchanged')
+        unrelated_projection = (
+            placement_contract_normalization.analyze_spec_pickle(
+                unrelated_spec).contract_projection)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == unrelated_name).values(
+                            contract_projection=unrelated_projection))
+            session.commit()
+
+        assert serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=4,
+            current_version=4,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner) == (
+                serve_state.PlacementNormalizationRequest(
+                    run_id=run_id,
+                    recovery_version=4,
+                    current_version=4,
+                    lifecycle_epoch=lifecycle_epoch))
+
+    def test_protocol4_receipt_ack_and_later_lifecycle_are_valid(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-valid-ack'
+        owner = (123, '10.0.0.1')
+        run_id, lifecycle_epoch = (_insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner))
+        request = serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=4,
+            current_version=4,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner)
+        assert request == serve_state.PlacementNormalizationRequest(
+            run_id=run_id,
+            recovery_version=4,
+            current_version=4,
+            lifecycle_epoch=lifecycle_epoch)
+        assert serve_state.acknowledge_placement_normalization_loaded(
+            service_name,
+            request,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            image_commit='commit-a',
+            child_controller_pid=456,
+            boot_id='a' * 32,
+            loaded_at=123.0)
+
+        assert serve_state.claim_service_lifecycle_epoch(
+            service_name) == lifecycle_epoch + 1
+        assert serve_state.get_placement_normalization_request(
+            service_name,
+            recovery_version=4,
+            current_version=4,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner) is None
+
+    def test_protocol4_receipt_rejects_deleted_retired_candidate(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-candidate-deleted'
+        owner = (123, '10.0.0.1')
+        _insert_protocol4_terminal_receipt_state(_mock_serve_db, service_name,
+                                                 owner)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.delete(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name,
+                    serve_state.version_specs_table.c.version == 1))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='retired_candidate_row_missing'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=4,
+                current_version=4,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_protocol4_receipt_rejects_retirement_column_drift(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-candidate-drift'
+        owner = (123, '10.0.0.1')
+        _insert_protocol4_terminal_receipt_state(_mock_serve_db, service_name,
+                                                 owner)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name,
+                    serve_state.version_specs_table.c.version == 1).values(
+                        retired_yaml_content='tampered: true'))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='retired_terminal_row_drift'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=4,
+                current_version=4,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_protocol4_manifest_rejects_present_parent_without_hash(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-parent-without-hash'
+        owner = (123, '10.0.0.1')
+        run_id, _ = _insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        hash=None))
+            session.commit()
+
+        with pytest.raises(RuntimeError,
+                           match='invalid_current_parent_hash_observation'):
+            _validate_placement_normalization_manifest_directly(
+                _mock_serve_db, run_id)
+
+    def test_protocol4_manifest_allows_complete_parent_teardown(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-teardown'
+        owner = (123, '10.0.0.1')
+        run_id, _ = _insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.delete(serve_state.version_specs_table).where(
+                    serve_state.version_specs_table.c.service_name ==
+                    service_name))
+            session.execute(
+                sqlalchemy.delete(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name))
+            session.commit()
+
+        _validate_placement_normalization_manifest_directly(
+            _mock_serve_db, run_id)
+
+    def test_protocol4_manifest_allows_recreated_explicit_overlap(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-recreated-explicit'
+        owner = (123, '10.0.0.1')
+        run_id, _ = _insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner)
+        _recreate_protocol4_service_version(_mock_serve_db,
+                                            service_name,
+                                            explicit=True)
+
+        _validate_placement_normalization_manifest_directly(
+            _mock_serve_db, run_id)
+
+    def test_protocol4_manifest_rejects_recreated_placeholder_overlap(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-p4-recreated-placeholder'
+        owner = (123, '10.0.0.1')
+        run_id, _ = _insert_protocol4_terminal_receipt_state(
+            _mock_serve_db, service_name, owner)
+        _recreate_protocol4_service_version(_mock_serve_db,
+                                            service_name,
+                                            explicit=False)
+
+        with pytest.raises(RuntimeError,
+                           match='old_stale|invalid_new_incarnation'):
+            _validate_placement_normalization_manifest_directly(
+                _mock_serve_db, run_id)
 
     def test_placement_normalization_receipt_rejects_stale_lifecycle(
             self, _mock_serve_db):
@@ -5153,7 +5841,8 @@ class TestRecoveryVersionSelection:
                         serve_state.placement_normalization_rows_table.c.version
                         == 2).values(service_hash='incarnation-b'))
             session.commit()
-        with pytest.raises(RuntimeError, match='service incarnation'):
+        with pytest.raises(RuntimeError,
+                           match='service incarnation|owner_facts'):
             serve_state.get_placement_normalization_request(
                 service_name,
                 recovery_version=2,
@@ -5288,7 +5977,7 @@ class TestRecoveryVersionSelection:
             session.commit()
 
         with pytest.raises(RuntimeError,
-                           match='service incarnation ledger anchor'):
+                           match='incomplete_run_inventory|ledger anchor'):
             serve_state.get_placement_normalization_request(
                 service_name,
                 recovery_version=1,

@@ -297,8 +297,13 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     _assert_classification_rows_retained(engine)
 
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
-                                         migration_utils.SERVE_VERSION)
+                                         '039')
     alembic_command.stamp(config, '033')
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         '039')
+    assert migration_utils.get_current_alembic_revision(
+        engine, migration_utils.SERVE_DB_NAME) == '039'
+
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(

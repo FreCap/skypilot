@@ -12,6 +12,7 @@ from sky.serve import serve_state
     placement_normalization_identity.PROTOCOL_V1,
     placement_normalization_identity.PROTOCOL_V2,
     placement_normalization_identity.PROTOCOL_V3,
+    placement_normalization_identity.PROTOCOL_V4,
 ])
 def test_parse_normalizer_identity_accepts_exact_supported_protocols(protocol):
     commit = '0123456789abcdef' * 2 + '01234567'
@@ -32,7 +33,7 @@ def test_parse_normalizer_identity_accepts_exact_supported_protocols(protocol):
     '2',
     '2:',
     f'0:{"a" * 40}',
-    f'4:{"a" * 40}',
+    f'5:{"a" * 40}',
     f'02:{"a" * 40}',
     f'2:{"a" * 39}',
     f'2:{"a" * 41}',
@@ -53,7 +54,7 @@ def test_format_normalizer_identity_emits_only_current_protocol():
 
     value = placement_normalization_identity.format_normalizer_identity(commit)
 
-    assert value == f'3:{commit}'
+    assert value == f'4:{commit}'
     assert placement_normalization_identity.parse_normalizer_identity(
         value).protocol == placement_normalization_identity.CURRENT_PROTOCOL
 
@@ -95,14 +96,34 @@ def test_parse_manifest_mode_rejects_aliases_and_coercions(mode):
         placement_normalization_identity.parse_manifest_mode(mode)
 
 
+_FROZEN_APPLY_OUTCOMES = frozenset({
+    ('placeholder', 'unchanged'),
+    ('explicit_v1', 'changed'),
+    ('explicit_v2', 'unchanged'),
+    ('fieldless_supported', 'changed'),
+    ('historical_physical_per_gpu', 'unchanged'),
+    ('retired', 'unchanged'),
+})
+_FROZEN_RETIREMENT_OUTCOMES = frozenset({
+    ('placeholder', 'unchanged'),
+    ('explicit_v2', 'unchanged'),
+    ('historical_physical_per_gpu', 'retired'),
+    ('retired', 'unchanged'),
+})
+
+
 @pytest.mark.parametrize('protocol', [1, 2, 3])
-def test_manifest_outcome_dispatch_is_mode_bound(protocol):
+def test_v1_to_v3_manifest_outcome_matrices_remain_frozen(protocol):
     identity = placement_normalization_identity.parse_normalizer_identity(
         f'{protocol}:{"c" * 40}')
     apply_mode = placement_normalization_identity.APPLY_SUPPORTED_MODE
     retirement_mode = (
         placement_normalization_identity.RETIRE_TERMINAL_HISTORICAL_MODE)
 
+    assert placement_normalization_identity.allowed_manifest_outcomes(
+        identity, apply_mode) == _FROZEN_APPLY_OUTCOMES
+    assert placement_normalization_identity.allowed_manifest_outcomes(
+        identity, retirement_mode) == _FROZEN_RETIREMENT_OUTCOMES
     assert placement_normalization_identity.is_loadable_manifest_outcome(
         identity, apply_mode, 'fieldless_supported', 'changed')
     assert not placement_normalization_identity.is_loadable_manifest_outcome(
@@ -113,9 +134,53 @@ def test_manifest_outcome_dispatch_is_mode_bound(protocol):
         identity, apply_mode, 'placeholder', 'unchanged')
     assert placement_normalization_identity.is_fillable_manifest_outcome(
         identity, retirement_mode, 'placeholder', 'unchanged')
-    assert ('fieldless_supported', 'changed') not in (
+
+
+def test_v4_retirement_distinguishes_stale_placeholder_from_fillable():
+    identity = placement_normalization_identity.parse_normalizer_identity(
+        f'4:{"c" * 40}')
+    apply_mode = placement_normalization_identity.APPLY_SUPPORTED_MODE
+    retirement_mode = (
+        placement_normalization_identity.RETIRE_TERMINAL_HISTORICAL_MODE)
+
+    assert placement_normalization_identity.allowed_manifest_outcomes(
+        identity, apply_mode) == _FROZEN_APPLY_OUTCOMES
+    assert placement_normalization_identity.allowed_manifest_outcomes(
+        identity, retirement_mode) == _FROZEN_RETIREMENT_OUTCOMES | {
+            ('stale_placeholder', 'unchanged'),
+        }
+    assert placement_normalization_identity.is_fillable_manifest_outcome(
+        identity, apply_mode, 'placeholder', 'unchanged')
+    assert placement_normalization_identity.is_fillable_manifest_outcome(
+        identity, retirement_mode, 'placeholder', 'unchanged')
+    assert not placement_normalization_identity.is_loadable_manifest_outcome(
+        identity, retirement_mode, 'stale_placeholder', 'unchanged')
+    assert not placement_normalization_identity.is_fillable_manifest_outcome(
+        identity, retirement_mode, 'stale_placeholder', 'unchanged')
+
+
+@pytest.mark.parametrize('protocol', [1, 2, 3])
+def test_historical_protocols_reject_stale_placeholder(protocol):
+    identity = placement_normalization_identity.parse_normalizer_identity(
+        f'{protocol}:{"c" * 40}')
+
+    assert ('stale_placeholder', 'unchanged') not in (
         placement_normalization_identity.allowed_manifest_outcomes(
-            identity, retirement_mode))
+            identity,
+            placement_normalization_identity.RETIRE_TERMINAL_HISTORICAL_MODE))
+
+
+@pytest.mark.parametrize('protocol', [1, 2, 3, 4])
+@pytest.mark.parametrize('mode', [
+    placement_normalization_identity.APPLY_SUPPORTED_MODE,
+    placement_normalization_identity.RETIRE_TERMINAL_HISTORICAL_MODE,
+])
+def test_stale_placeholder_is_never_fillable(protocol, mode):
+    identity = placement_normalization_identity.parse_normalizer_identity(
+        f'{protocol}:{"c" * 40}')
+
+    assert not placement_normalization_identity.is_fillable_manifest_outcome(
+        identity, mode, 'stale_placeholder', 'unchanged')
 
 
 def _manifest_row(normalizer_version):
@@ -139,7 +204,7 @@ def _manifest_row(normalizer_version):
     }
 
 
-@pytest.mark.parametrize('protocol', [1, 2, 3])
+@pytest.mark.parametrize('protocol', [1, 2, 3, 4])
 def test_serve_state_manifest_accepts_each_supported_identity(protocol):
     row = _manifest_row(f'{protocol}:{"b" * 40}')
 
@@ -151,7 +216,7 @@ def test_serve_state_manifest_accepts_each_supported_identity(protocol):
 
 @pytest.mark.parametrize('normalizer_version', [
     '1:test',
-    f'4:{"b" * 40}',
+    f'5:{"b" * 40}',
     f'2:{"B" * 40}',
     f'2:{"b" * 40}-dirty',
 ])

@@ -5183,9 +5183,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                  if zero_cost_only else None)
         is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
         if not is_zero_cost and self._spot_placer is not None:
-            candidates = self._spot_placer.zero_cost_locations()
-            if isinstance(candidates, (list, tuple, set, frozenset)):
-                is_zero_cost = location in candidates
+            is_zero_cost = self._spot_placer.is_zero_cost_location(location)
         info.is_zero_cost = is_zero_cost
         launch_result = _ReplicaLaunchResult(
             replica_id=replica_id,

@@ -3,6 +3,7 @@
 # pylint: disable=protected-access,unused-argument
 
 import base64
+import functools
 import gzip
 import hashlib
 import io
@@ -33,6 +34,31 @@ from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import status_lib
 from sky.utils import yaml_utils
+
+
+def _with_skypilot_config(path):
+    """Load one process config and restore the prior environment on exit."""
+
+    def decorator(test):
+
+        @functools.wraps(test)
+        def wrapped(*args, **kwargs):
+            key = skypilot_config.ENV_VAR_SKYPILOT_CONFIG
+            previous = os.environ.get(key)
+            try:
+                os.environ[key] = path
+                skypilot_config.reload_config()
+                return test(*args, **kwargs)
+            finally:
+                if previous is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous
+                skypilot_config.reload_config()
+
+        return wrapped
+
+    return decorator
 
 
 def test_provider_templates_use_shared_wheel_installer():
@@ -172,12 +198,9 @@ def test_aws_template_preserves_docker_credential_helper(
 @mock.patch('sky.backends.backend_utils._deterministic_cluster_yaml_hash',
             return_value='fake-hash')
 @mock.patch('sky.utils.common_utils.fill_template')
+@_with_skypilot_config('./tests/test_yamls/test_aws_config.yaml')
 def test_write_cluster_config_w_remote_identity(mock_fill_template,
                                                 *mocks) -> None:
-    os.environ[
-        skypilot_config.
-        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_aws_config.yaml'
-    skypilot_config.reload_config()
 
     cloud = clouds.AWS()
 
@@ -284,11 +307,9 @@ def test_write_cluster_config_w_remote_identity(mock_fill_template,
 @mock.patch('sky.backends.backend_utils._get_yaml_path_from_cluster_name',
             return_value='/tmp/fake/path')
 @mock.patch('sky.utils.common_utils.fill_template')
+@_with_skypilot_config('./tests/test_yamls/test_aws_config_runcmd.yaml')
 def test_write_cluster_config_w_post_provision_runcmd_aws(
         mock_fill_template, *mocks):
-    os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = (
-        './tests/test_yamls/test_aws_config_runcmd.yaml')
-    skypilot_config.reload_config()
 
     cloud = clouds.AWS()
     region = clouds.Region(name='fake-region')
@@ -325,11 +346,9 @@ def test_write_cluster_config_w_post_provision_runcmd_aws(
             return_value=[])
 @mock.patch('sky.utils.common_utils.fill_template',
             wraps=common_utils.fill_template)
+@_with_skypilot_config('./tests/test_yamls/test_k8s_config_runcmd.yaml')
 def test_write_cluster_config_w_post_provision_runcmd_kubernetes(
         mock_fill_template, *mocks):
-    os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG] = (
-        './tests/test_yamls/test_k8s_config_runcmd.yaml')
-    skypilot_config.reload_config()
 
     cloud = clouds.Kubernetes()
     region = clouds.Region(name='fake-context')

@@ -292,9 +292,10 @@ their claim.
 
 The manager reconstructs an advisory wave-local budget from durable service
 claims and the central pool snapshot. Selection filters locations with
-remaining allowance, then delegates to `DynamicFallbackSpotPlacer`, which
-chooses the cheapest active candidate. The budget is debited after an atomic
-central claim succeeds. It paces one wave but is not the concurrency authority;
+remaining allowance, then delegates to the concrete `SpotPlacer` dynamic
+engine, which chooses the cheapest active candidate. The budget is debited
+after an atomic central claim succeeds. It paces one wave but is not the
+concurrency authority;
 the service-and-pool transaction provides safety across services and controller
 processes. Before that central transaction existed, the same manager-local
 budget was safe only within one manager lock.

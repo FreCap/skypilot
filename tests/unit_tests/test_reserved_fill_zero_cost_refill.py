@@ -10,13 +10,12 @@ cluster and then releases it -- the situation that emptied the production
 fleet on 2026-08-04, when 218 of 328 A100s sat free while the service shed
 requests onto paid spot that had no capacity.
 """
-# `reserve_retry` is defined on the SpotPlacer base; pylint cannot infer it
-# through the __new__ construction these builders use.
-# pylint: disable=protected-access,no-member
+# pylint: disable=protected-access
 import time
 from unittest import mock
 
 from spot_placer_test_utils import make_location
+from spot_placer_test_utils import make_placer
 
 from sky.serve import placement_policy
 from sky.serve import reserved_capacity
@@ -36,26 +35,12 @@ _K8S_A100 = make_location('prod_research_cluster_eks',
 
 
 def _make_zero_cost_placer(benched_at=None):
-    """A placer over the two zero-cost k8s shapes, optionally benched.
-
-    Skips __init__ (task-based discovery) and wires only the state the
-    launchability views read, mirroring spot_placer_test_utils.make_placer.
-    """
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer._placement_contract = (  # pylint: disable=protected-access
-        placement_policy.resolve_fresh_contract(
-            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
+    """A placer over the two zero-cost k8s shapes, optionally benched."""
     locations = [_K8S_A100_80GB, _K8S_A100]
-    placer.location2status = {
-        location: spot_placer.LocationStatus.ACTIVE for location in locations
-    }
-    placer.location2preempted_at = {}
-    placer.location2preempted_reason = {}
-    placer.location2retry_reserved_at = {}
-    placer.location2cost = {location: 0.0 for location in locations}
-    placer._retry_state_dirty = False
-    placer._workspace = None
+    placer = make_placer(
+        {location: 0.0 for location in locations},
+        placement_contract=placement_policy.resolve_fresh_contract(
+            placement_policy.CAPACITY_AWARE_SPOT_PLACER, pool=False))
     if benched_at is not None:
         for location in locations:
             placer.location2status[location] = (
@@ -284,20 +269,10 @@ class TestPaidTierProbeThrottleIsCorrect:
                                  accelerators={'L4': 1},
                                  use_spot=True,
                                  cloud_name='AWS')
-        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-            spot_placer.DynamicFallbackSpotPlacer)
-        placer._placement_contract = (  # pylint: disable=protected-access
-            placement_policy.resolve_fresh_contract(
-                placement_policy.SPOT_HEDGE_PLACER, pool=False))
-        placer.location2status = {
-            aws_spot: spot_placer.LocationStatus.PREEMPTED
-        }
+        placer = make_placer({aws_spot: 1.0})
+        placer.location2status[aws_spot] = (
+            spot_placer.LocationStatus.PREEMPTED)
         placer.location2preempted_at = {aws_spot: time.time() - 10_000}
-        placer.location2preempted_reason = {}
-        placer.location2retry_reserved_at = {}
-        placer.location2cost = {aws_spot: 1.0}
-        placer._retry_state_dirty = False
-        placer._workspace = None
 
         assert (placer._effective_status(aws_spot) ==
                 spot_placer.LocationStatus.ACTIVE)

@@ -32,7 +32,9 @@ from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import maintenance
 from sky.serve import paid_capacity
+from sky.serve import placement_normalization_authority
 from sky.serve import placement_normalization_identity
+from sky.serve import placement_normalization_manifest
 from sky.serve import placement_policy
 from sky.serve import resource_action_m4_state_schema
 from sky.serve import serve_state_schema
@@ -70,6 +72,8 @@ logger = sky_logging.init_logger(__name__)
 
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 _REPLICA_LAUNCH_AUTHORITY_LOCK_PREFIX = 'skyserve-replica-launch-authority'
+_PLACEMENT_NORMALIZATION_RECEIPT_MAX_ROWS = (
+    placement_normalization_manifest.MAX_INVENTORY_ROWS)
 
 Base = serve_state_schema.Base
 # Keep every public Serve table on the one canonical metadata graph.  Local
@@ -3341,17 +3345,12 @@ def get_service_placement_policy_states(
         service_name: str) -> dict[str, dict[str, Any] | None] | None:
     """Read restart-safe placer and economic-stabilization state."""
     engine = _db_manager.get_engine()
-    try:
-        with orm.Session(engine) as session:
-            row = session.execute(
-                sqlalchemy.select(
-                    services_table.c.spot_placement_state,
-                    services_table.c.cost_rebalance_state,
-                ).where(services_table.c.name == service_name)).fetchone()
-    except sqlalchemy.exc.SQLAlchemyError as e:
-        if _placement_policy_columns_missing(e):
-            return None
-        raise
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                services_table.c.spot_placement_state,
+                services_table.c.cost_rebalance_state,
+            ).where(services_table.c.name == service_name)).fetchone()
     if row is None:
         return None
     return {
@@ -3373,42 +3372,20 @@ def _set_service_placement_policy_state(
 ) -> bool:
     """Persist one controller-owned policy state under the service fence."""
     engine = _db_manager.get_engine()
-    try:
-        with orm.Session(engine) as session:
-            if not _lock_service_owner_in_session(
-                    session,
-                    service_name,
-                    service_hash,
-                    controller_owner,
-                    require_launch_allowed=require_launch_allowed):
-                session.rollback()
-                return False
-            session.execute(
-                sqlalchemy.update(services_table).where(
-                    services_table.c.name == service_name).values(
-                        {column: state}))
-            session.commit()
-    except sqlalchemy.exc.SQLAlchemyError as e:
-        if _placement_policy_columns_missing(e):
-            # Mixed rollout compatibility. Migration 029 is ordered before
-            # controller deployment; until it lands, retain process-local
-            # behavior instead of blocking every placer-backed launch.
-            return True
-        raise
+    with orm.Session(engine) as session:
+        if not _lock_service_owner_in_session(
+                session,
+                service_name,
+                service_hash,
+                controller_owner,
+                require_launch_allowed=require_launch_allowed):
+            session.rollback()
+            return False
+        session.execute(
+            sqlalchemy.update(services_table).where(
+                services_table.c.name == service_name).values({column: state}))
+        session.commit()
     return True
-
-
-def _placement_policy_columns_missing(
-        error: sqlalchemy.exc.SQLAlchemyError) -> bool:
-    """Whether an old schema lacks migration-029 policy columns."""
-    original = getattr(error, 'orig', None)
-    sqlstate = (getattr(original, 'sqlstate', None) or
-                getattr(original, 'pgcode', None))
-    message = str(error).casefold()
-    mentions_column = ('spot_placement_state' in message or
-                       'cost_rebalance_state' in message)
-    return mentions_column and (sqlstate == '42703' or 'no such column'
-                                in message or 'undefined column' in message)
 
 
 def set_service_spot_placement_state(
@@ -5774,6 +5751,27 @@ def _placement_normalization_raw_spec_bytes(row: Mapping[str, Any],
     return raw_spec
 
 
+def _bind_placement_normalization_receipt_authority(
+        session: orm.Session, engine: sqlalchemy.engine.Engine) -> None:
+    """Bind a receipt transaction to the exact revision-040 schema."""
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
+        return
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError('Placement normalization receipts require '
+                           f'PostgreSQL; found {engine.dialect.name!r}.')
+    try:
+        authority = (
+            placement_normalization_authority.assert_reader_database_authority(
+                session.connection()))
+        placement_normalization_authority.bind_session_to_authority(
+            session, authority)
+    except (placement_normalization_authority.
+            PlacementNormalizationAuthorityError) as exc:
+        raise RuntimeError(
+            'Placement normalization receipt database authority is absent '
+            'or invalid.') from exc
+
+
 def _validate_raw_explicit_placement_contract(
     row: Mapping[str, Any],
     prefix: str,
@@ -5948,6 +5946,116 @@ def _lock_placement_normalization_receipt_query(
         # lock the nullable side of the outer join.
         return query.with_for_update(of=services_table)
     return query
+
+
+def _raise_placement_normalization_manifest_error(
+    context: str,
+    error: placement_normalization_manifest.PlacementNormalizationManifestError
+) -> typing.NoReturn:
+    first_mismatch = error.mismatches[0] if error.mismatches else None
+    raise RuntimeError(
+        f'Placement normalization {context} is invalid; first mismatch is '
+        f'{first_mismatch!r}.') from None
+
+
+def _placement_normalization_current_inventory_query(
+        candidate_services: typing.Sequence[str]) -> sqlalchemy.Select:
+    """Project the frozen protocol-4 version schema under a fixed bound."""
+    version_columns = tuple(
+        version_specs_table.c[column_name] for column_name in
+        placement_normalization_manifest.VERSION_SPEC_COLUMNS)
+    return sqlalchemy.select(*version_columns).where(
+        version_specs_table.c.service_name.in_(candidate_services)).order_by(
+            version_specs_table.c.service_name,
+            version_specs_table.c.version).limit(
+                _PLACEMENT_NORMALIZATION_RECEIPT_MAX_ROWS + 1)
+
+
+def _validate_protocol_v4_current_inventory(
+    session: orm.Session,
+    run: Mapping[str, Any],
+    entries: list[dict[str, Any]],
+) -> None:
+    """Bind a terminal protocol-4 receipt to current version state."""
+    if not placement_normalization_manifest.is_terminal_protocol4_manifest(
+            run, entries):
+        return
+    candidate_services = sorted({
+        entry['service_name']
+        for entry in entries
+        if entry.get('classification') == 'historical_physical_per_gpu' and
+        entry.get('outcome') == 'retired'
+    })
+    current_rows = [
+        dict(row) for row in session.execute(
+            _placement_normalization_current_inventory_query(
+                candidate_services)).mappings().all()
+    ]
+    if len(current_rows) > _PLACEMENT_NORMALIZATION_RECEIPT_MAX_ROWS:
+        raise RuntimeError(
+            'Placement normalization terminal current inventory exceeds the '
+            'fixed receipt-reader bound.')
+
+    current_service_hashes = {
+        service_name: placement_normalization_manifest.ServiceHashObservation(
+            False, None) for service_name in candidate_services
+    }
+    service_rows = session.execute(
+        sqlalchemy.select(services_table.c.name, services_table.c.hash).where(
+            services_table.c.name.in_(candidate_services))).mappings().all()
+    for service_row in service_rows:
+        current_service_hashes[service_row['name']] = (
+            placement_normalization_manifest.ServiceHashObservation(
+                True, service_row['hash']))
+
+    current_classifications = {}
+    for current_row in current_rows:
+        identity = (current_row['service_name'], current_row['version'])
+        analysis = placement_contract_normalization.analyze_spec_pickle(
+            current_row['spec'])
+        current_classifications[identity] = analysis.classification.value
+    try:
+        placement_normalization_manifest.validate_current_inventory(
+            run, entries, current_rows, current_service_hashes,
+            current_classifications)
+    except placement_normalization_manifest.PlacementNormalizationManifestError as error:
+        _raise_placement_normalization_manifest_error(
+            'terminal current inventory', error)
+
+
+def _load_and_validate_placement_normalization_manifest(
+    session: orm.Session,
+    run_id: uuid.UUID,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Load and validate a complete manifest under fixed reader bounds."""
+    run = session.execute(
+        sqlalchemy.select(placement_normalization_runs_table).where(
+            placement_normalization_runs_table.c.run_id ==
+            run_id)).mappings().one_or_none()
+    if run is None:
+        raise RuntimeError(
+            'Placement normalization requested run manifest is missing.')
+    entries = session.execute(
+        sqlalchemy.select(placement_normalization_rows_table).where(
+            placement_normalization_rows_table.c.run_id == run_id).order_by(
+                placement_normalization_rows_table.c.service_name,
+                placement_normalization_rows_table.c.version).limit(
+                    _PLACEMENT_NORMALIZATION_RECEIPT_MAX_ROWS +
+                    1)).mappings().all()
+    if len(entries) > _PLACEMENT_NORMALIZATION_RECEIPT_MAX_ROWS:
+        raise RuntimeError(
+            'Placement normalization requested run ledger exceeds the fixed '
+            'receipt-reader bound.')
+    run_dict = dict(run)
+    entry_dicts = [dict(entry) for entry in entries]
+    try:
+        placement_normalization_manifest.validate_completed_manifest(
+            run_dict, entry_dicts)
+    except placement_normalization_manifest.PlacementNormalizationManifestError as error:
+        _raise_placement_normalization_manifest_error('requested run manifest',
+                                                      error)
+    _validate_protocol_v4_current_inventory(session, run_dict, entry_dicts)
+    return run_dict, entry_dicts
 
 
 def _placement_normalization_manifest_identity(
@@ -6176,6 +6284,51 @@ def _validate_placement_normalization_loaded_receipt(
                            'its run completion.')
 
 
+def _validated_placement_normalization_request(
+    row: Mapping[str, Any],
+    requested_run_id: uuid.UUID | None,
+    manifest_completed_at: float | None,
+    recovery_version: int,
+    current_version: int,
+    expected_service_hash: str,
+) -> PlacementNormalizationRequest | None:
+    """Finish a receipt decision while its database gate lock is held."""
+    lifecycle_epoch = row['lifecycle_epoch']
+    if (lifecycle_epoch is not None and
+        (type(lifecycle_epoch) is not int or lifecycle_epoch < 1)):
+        raise RuntimeError('Service lifecycle epoch is invalid.')
+    require_cleanup_contract = requested_run_id is not None
+    _validate_raw_explicit_placement_contract(
+        row, 'recovery', require_cleanup_contract=require_cleanup_contract)
+    _validate_raw_explicit_placement_contract(
+        row, 'current', require_cleanup_contract=require_cleanup_contract)
+    _validate_placement_normalization_loaded_receipt(row, requested_run_id,
+                                                     manifest_completed_at)
+    if requested_run_id is None:
+        return None
+    # The ledger proves the one forced post-normalization load.  A completed
+    # receipt does not make an inventoried version mutable: when the requested
+    # run still has a row for either loaded version, verify its exact bytes.
+    if row['loaded_run_id'] == requested_run_id:
+        assert manifest_completed_at is not None
+        _validate_placement_normalization_completed_service_incarnation(
+            row, expected_service_hash)
+        for prefix in ('recovery', 'current'):
+            _validate_placement_normalization_completed_ledger_result(
+                row, prefix, expected_service_hash, manifest_completed_at)
+        return None
+    _validate_placement_normalization_pending_ledger_proof(
+        row, 'recovery', expected_service_hash, lifecycle_epoch)
+    _validate_placement_normalization_pending_ledger_proof(
+        row, 'current', expected_service_hash, lifecycle_epoch)
+    return PlacementNormalizationRequest(
+        run_id=requested_run_id,
+        recovery_version=recovery_version,
+        current_version=current_version,
+        lifecycle_epoch=lifecycle_epoch,
+    )
+
+
 def get_placement_normalization_request(
     service_name: str,
     recovery_version: int,
@@ -6209,6 +6362,7 @@ def get_placement_normalization_request(
 
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _bind_placement_normalization_receipt_authority(session, engine)
         row = session.execute(
             _placement_normalization_receipt_query(
                 service_name,
@@ -6217,56 +6371,25 @@ def get_placement_normalization_request(
                 expected_service_hash,
                 expected_controller_owner,
                 require_ledger=False)).mappings().one_or_none()
-    if row is None:
-        raise RuntimeError(
-            'Placement normalization receipt read lost its exact service '
-            'owner, recovery-version, or current-version fence.')
-
-    requested_run_id = row['requested_run_id']
-    if requested_run_id is not None and not isinstance(requested_run_id,
-                                                       uuid.UUID):
-        raise RuntimeError('Placement normalization requested run ID is not '
-                           'a UUID.')
-    lifecycle_epoch = row['lifecycle_epoch']
-    if (lifecycle_epoch is not None and
-        (type(lifecycle_epoch) is not int or lifecycle_epoch < 1)):
-        raise RuntimeError('Service lifecycle epoch is invalid.')
-    require_cleanup_contract = requested_run_id is not None
-    manifest_completed_at: float | None = None
-    if requested_run_id is not None:
-        manifest_completed_at = _validate_placement_normalization_run_manifest(
-            row, requested_run_id)
-    _validate_raw_explicit_placement_contract(
-        row, 'recovery', require_cleanup_contract=require_cleanup_contract)
-    _validate_raw_explicit_placement_contract(
-        row, 'current', require_cleanup_contract=require_cleanup_contract)
-    _validate_placement_normalization_loaded_receipt(row, requested_run_id,
-                                                     manifest_completed_at)
-    if requested_run_id is None:
-        return None
-    # The ledger proves the one forced post-normalization load.  A completed
-    # receipt does not make an inventoried version mutable: when the requested
-    # run still has a row for either loaded version, verify that its exact
-    # bytes still match the result digest.  Later ordinary version commits are
-    # independent of the old run inventory and therefore have no ledger row.
-    if row['loaded_run_id'] == requested_run_id:
-        assert manifest_completed_at is not None
-        _validate_placement_normalization_completed_service_incarnation(
-            row, expected_service_hash)
-        for prefix in ('recovery', 'current'):
-            _validate_placement_normalization_completed_ledger_result(
-                row, prefix, expected_service_hash, manifest_completed_at)
-        return None
-    _validate_placement_normalization_pending_ledger_proof(
-        row, 'recovery', expected_service_hash, lifecycle_epoch)
-    _validate_placement_normalization_pending_ledger_proof(
-        row, 'current', expected_service_hash, lifecycle_epoch)
-    return PlacementNormalizationRequest(
-        run_id=requested_run_id,
-        recovery_version=recovery_version,
-        current_version=current_version,
-        lifecycle_epoch=lifecycle_epoch,
-    )
+        if row is None:
+            raise RuntimeError(
+                'Placement normalization receipt read lost its exact service '
+                'owner, recovery-version, or current-version fence.')
+        requested_run_id = row['requested_run_id']
+        if requested_run_id is not None and not isinstance(
+                requested_run_id, uuid.UUID):
+            raise RuntimeError('Placement normalization requested run ID is '
+                               'not a UUID.')
+        manifest_completed_at: float | None = None
+        if requested_run_id is not None:
+            manifest_completed_at = (
+                _validate_placement_normalization_run_manifest(
+                    row, requested_run_id))
+            _load_and_validate_placement_normalization_manifest(
+                session, requested_run_id)
+        return _validated_placement_normalization_request(
+            row, requested_run_id, manifest_completed_at, recovery_version,
+            current_version, expected_service_hash)
 
 
 def acknowledge_placement_normalization_loaded(
@@ -6325,13 +6448,14 @@ def acknowledge_placement_normalization_loaded(
     with _replica_launch_authority_write_session(service_name) as (engine,
                                                                    session):
         _begin_immediate_if_sqlite(session, engine)
+        _bind_placement_normalization_receipt_authority(session, engine)
         query = _placement_normalization_receipt_query(
             service_name,
             request.recovery_version,
             request.current_version,
             expected_service_hash,
             expected_controller_owner,
-            require_ledger=True).where(
+            require_ledger=False).where(
                 services_table.c.placement_normalization_requested_run_id ==
                 request.run_id)
         query = _lock_placement_normalization_receipt_query(query, engine)
@@ -6347,6 +6471,8 @@ def acknowledge_placement_normalization_loaded(
                                                   require_cleanup_contract=True)
         manifest_completed_at = _validate_placement_normalization_run_manifest(
             row, request.run_id)
+        _load_and_validate_placement_normalization_manifest(
+            session, request.run_id)
         _validate_placement_normalization_loaded_receipt(
             row, request.run_id, manifest_completed_at)
         if row['loaded_run_id'] is not None:
@@ -6986,8 +7112,8 @@ def _legacy_projection_matches(row: sqlalchemy.engine.Row,
     """Whether a persisted legacy row is exactly the rebuilt projection."""
     expected = dict(projection)
     expected['pool_key'] = expected.pop('legacy_pool_key')
-    return all(
-        getattr(row, column) == value for column, value in expected.items())
+    return all(row._mapping[column] == value  # pylint: disable=protected-access
+               for column, value in expected.items())
 
 
 def set_reserved_fill_protocol_version(
@@ -7278,7 +7404,7 @@ def _write_reserved_fill_legacy_projection_in_session(
     insert_stmt = insert_stmt.on_conflict_do_update(
         index_elements=['service_name'],
         set_={
-            key: getattr(insert_stmt.excluded, key)
+            key: insert_stmt.excluded[key]
             for key in values
             if key != 'service_name'
         })
@@ -7400,7 +7526,7 @@ def replace_reserved_fill_claim_set(
         set_insert = set_insert.on_conflict_do_update(
             index_elements=['service_name'],
             set_={
-                key: getattr(set_insert.excluded, key)
+                key: set_insert.excluded[key]
                 for key in set_values
                 if key != 'service_name'
             })
@@ -7416,7 +7542,7 @@ def replace_reserved_fill_claim_set(
             edge_insert = edge_insert.on_conflict_do_update(
                 index_elements=['service_name', 'pool_key'],
                 set_={
-                    key: getattr(edge_insert.excluded, key)
+                    key: edge_insert.excluded[key]
                     for key in edge_values
                     if key not in ('service_name', 'pool_key')
                 })
@@ -7810,7 +7936,7 @@ def upsert_reserved_fill_claim(
         insert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=['service_name'],
             set_={
-                key: getattr(insert_stmt.excluded, key)
+                key: insert_stmt.excluded[key]
                 for key in values
                 if key != 'service_name'
             })
@@ -7950,7 +8076,7 @@ def upsert_demand_capacity_observation(
         insert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=['context'],
             set_={
-                key: getattr(insert_stmt.excluded, key)
+                key: insert_stmt.excluded[key]
                 for key in values
                 if key != 'context'
             })
@@ -8166,7 +8292,7 @@ def publish_reserved_fill_round(
         insert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=['pool_key'],
             set_={
-                key: getattr(insert_stmt.excluded, key)
+                key: insert_stmt.excluded[key]
                 for key in values
                 if key != 'pool_key'
             })

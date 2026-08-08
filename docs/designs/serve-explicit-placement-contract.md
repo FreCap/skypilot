@@ -28,10 +28,17 @@ failed closed before mutation because six older-writer retained versions have
 controllers and 16 load balancers.  The unrelated direct-shell OOM cleanup
 PR #1183 subsequently deployed v1.1.1151 directly with Helm at revision 363,
 with the controller hold disabled and the sole Recreate API pod healthy.  The
-timestamp-proof hotfix described below is implemented, locally verified, and
-open as PR #1341 at
-`2e6ab8924c3626ec47ed65aedf48f97f718fa4f1`; merge, release, and reader-first
-rollout remain pending.  Created 2026-08-07; last updated 2026-08-08._
+timestamp-proof hotfix merged as PR #1341 at
+`5eb15b544e6fdb5bf43853b5e753d6e24cf4515e`, released as v1.1.1155, and
+deployed reader-first and then held at direct Helm revision 365.  Its first
+protocol-3 retirement attempt rolled back without a write because the target
+service also has exact pickled-`None` placeholder versions 3 and 10.  Those
+rows are not placement contracts, are neither current nor active, and have no
+YAML, staged controller configuration, replica, catalog, action identity, or
+typed resource-action root.  The protocol-4 follow-up below replaces the
+blanket same-service-placeholder rejection with a complete locked proof of
+that non-executable state; an unproved or concurrently owned reservation still
+blocks the transaction.  Created 2026-08-07; last updated 2026-08-08._
 
 ## Decision summary
 
@@ -75,6 +82,23 @@ history-only column, clears the committed-YAML marker, and replaces only the
 legacy pickle with `pickle(None)`; the version row and recovery/cleanup
 evidence remain.  Every normalization or retirement is digest-CASed and
 recorded in a durable run ledger without retaining the legacy pickle.
+
+A canonical protocol-4 `pickle.dumps(None, protocol=4)` version is an inventory reservation, not an executable
+placement contract.  Its presence beside a terminal historical version does
+not by itself block retirement.  Protocol 4 may retain such a row unchanged
+only after proving, under the same freeze and transaction, that it is not the
+service's current or active version, owns no replica, committed or submitted
+YAML, placement catalog, staged controller configuration, controller receipt,
+quarantine state, action-spec identity, image demand, or typed resource-action
+root.  It must also be lower than a surviving committed current version; the
+central version-commit CAS then permanently returns `STALE_VERSION` if any
+caller tries to fill it.  A trailing placeholder with no higher committed
+version remains fillable and blocks retirement.  The normalizer binds the
+complete placeholder row inventory and external evidence to the retirement
+ledger as the distinct durable `stale_placeholder/unchanged` classification.
+It is not the fillable `placeholder/unchanged` outcome.  Active Serve requests
+and service/controller processes must remain absent before, during, and after
+the locked write.
 
 This design is the placement-policy subdesign of
 `docs/designs/skyserve-accelerator-compatibility.md`.  Its centralized catalog
@@ -125,6 +149,9 @@ pickles must remain restartable.
   representation; a completed receipt can never bless fieldless or v1 bytes.
 - Retire the transition-only historical tuple only with an auditable,
   fail-closed proof that the exact service version is terminal.
+- Distinguish a non-executable placeholder from an owned in-flight reservation
+  through explicit persisted and external evidence instead of treating every
+  same-service placeholder as an implicit dependency.
 
 ## Non-goals
 
@@ -325,6 +352,12 @@ normalizer classifies each row exactly once:
   undecodable payload, or any other object blocks the entire apply before the
   first mutation.
 
+Raw classification is immutable.  Protocol-4 retirement adds a separate
+manifest classification: after the complete proof below, an eligible
+candidate-service raw `PLACEHOLDER` is recorded as
+`stale_placeholder/unchanged`; an unproved or unrelated raw placeholder remains
+`placeholder/unchanged`.
+
 For every non-placeholder, non-retired version with a live `services` parent,
 the raw contract workload kind must also match the parent's exact integer
 `pool` discriminator (`0` for service, `1` for pool).  Invalid parent values or
@@ -334,10 +367,11 @@ recovery rows must also agree with the parent's monotonic
 `logical_replica_semantics` fence.  This prevents a representation rewrite from
 requesting a controller reload that the durable parent fence would reject.
 
-Either apply mode is refused above an explicit dry-run row bound.  At
-`SERIALIZABLE` isolation it sets bounded PostgreSQL lock/statement timeouts,
-then acquires one transaction-scoped, process-global placement-normalizer
-advisory lock followed by
+Either apply mode is refused above an explicit dry-run row bound.  Before
+opening its `SERIALIZABLE` snapshot it attempts one nonblocking session-scoped,
+process-global placement-normalizer advisory lock and fails busy rather than
+waiting behind a migration or another writer.  It then sets bounded PostgreSQL
+lock/statement timeouts and takes
 `SHARE ROW EXCLUSIVE` table locks in this fixed order: `services`,
 `version_specs`, `replicas`, and `ephemeral_storage_cleanup_intents`.  This
 blocks all ordinary row writers while leaving status reads available.  The
@@ -388,34 +422,420 @@ writer, changed preimage, missing row-inventory entry, incomplete manifest,
 ledger collision, or timeout aborts the whole transaction.  Rerunning after
 success must report zero pending fieldless/v1 changes and verify the completed
 manifest, every surviving v2 result digest, every intentional retirement, and
-all new rows.  The latest completed full-run manifest must cover the exact
-current `(service_name, version)` identity set; a later v2 or placeholder row
-is an explicit `untracked_current_row` mismatch until a new zero-change apply
-records it.  Spec-drift comparison uses the latest result for the exact
-`(service_name, version, service_hash, lifecycle_epoch)` owner generation and
-does not compare unrelated mutable status columns.
+all new rows.  Before the terminal protocol-4 retirement, the latest completed
+full-run manifest must cover the exact current `(service_name, version)`
+identity set; a later v2 or placeholder row is an explicit
+`untracked_current_row` mismatch until a new zero-change apply records it.
+After the terminal manifest, an untracked row is accepted without a newer
+writer generation only when its version is above the terminal proved current
+version and above the maximum version inventoried by that terminal manifest for
+the same service incarnation.  It must be either an ordinary explicit-v2
+commit with finite `created_at > completed_at` or an exact fillable canonical
+placeholder with SQL-NULL `created_at`.  An older, stale-version, retired,
+historical, or blocker row remains a mismatch.  The immutable admission
+boundary is derived from manifested row identities, not today's mutable
+current pointer or a copied dependency fact.  Spec-drift comparison uses the
+terminal result for the exact
+`(service_name, version, service_hash)` incarnation and does not compare
+unrelated mutable status columns.  The ledger's lifecycle epoch is an exact
+commit-time observation and must agree across the protocol-4 candidate,
+current, and stale entries, but a later lifecycle claim on the same service
+hash does not invalidate immutable version bytes or turn manifested rows into
+untracked identities.
+
+One same-identity mutation is explicit and asymmetric: a terminal-manifest
+`placeholder/unchanged` entry is ordinary and may become a committed
+explicit-v2 row for the same service hash when the central writer records a
+finite `created_at > completed_at`.  This is the existing fillable reservation
+contract.  A `stale_placeholder/unchanged` entry is never fillable and any
+spec, YAML, side-state, row-hash, or identity change remains terminal proof
+drift.
+
+A post-terminal same-incarnation row follows the high-water rules above.  A
+genuinely recreated service hash has no terminal version-number boundary: its
+row is accepted only when it is committed explicit v2 with finite
+`created_at > completed_at`.  A new-incarnation NULL-timestamp reservation
+blocks terminal verification until the central writer either commits it with a
+finite timestamp or removes it.  Deleting old-incarnation version rows during
+normal service teardown does not erase their immutable terminal audit entries.
+
+A successful protocol-4 retirement manifest containing a validated
+`historical_physical_per_gpu/retired` outcome is the terminal writer
+generation, including when its proved stale-placeholder inventory is empty.
+Terminal identity does not depend on the continued presence of the very stale
+entries it protects.  Every later
+`--apply-supported` or `--retire-terminal-historical` invocation must fail
+before external evidence collection or DML instead of emitting a newer
+manifest that could downgrade the durable stale classification to an ordinary
+fillable placeholder.  Read-only dry-runs remain available for verification;
+the staged cleanup removes the transitional writer after its rollout gates.
+The terminal fence is checked against the latest fully validated manifest once
+before any external getter and again after acquiring the unchanged advisory and
+table locks; two concurrent first-retirement attempts cannot both pass it.
+The pre-external terminal check and every read-only dry-run first prove reader
+authority and bind that same session to the proved canonical schema before the
+first protected-table read.  Their inventory can therefore never come from an
+untrusted search path or a pooled temporary-table shadow.  The active-request,
+fresh API-instance, API resource-action, and Serve shadow-action database
+evidence readers use the same typed reader transaction; no external proof reads
+a schema-less pooled session.
+After acquiring its nonblocking session advisory lock and before opening the
+writer snapshot, every protocol-4 apply also invokes revision 040's exact
+runtime-authority assertion by its canonical schema-qualified name.  The
+application discovers that canonical schema from exactly one persistent
+`alembic_version_serve_state_db = '040'` relation colocated with the assertion,
+gate, and both ledger relations; it never trusts caller-controlled
+`current_schema()` or unqualified name resolution.  Before invoking the
+database function, the application compares its complete `prosrc` byte string
+with the exact expected definition regenerated from the compiled, frozen
+revision-040 contract; function name, owner, signature, configuration, or a
+self-reported `true` result is never a trust root.  Before its first catalog
+query, every authority interface freezes the transaction-local search path to
+`pg_catalog`; schema translation then binds all application relations to the
+proved canonical schema.  Caller-defined functions, aggregates, operators, and
+types therefore cannot participate in either proof or inventory reads.  The colocated Alembic
+version relation also has an exact application-verified envelope: one
+nonpartitioned persistent ordinary relation, owner-only ACL, no RLS,
+inheritance, rewrite rule, trigger, or default; exactly one nonnullable
+`varchar(32)` local column named `version_num` with no column ACL; and Alembic's one exact
+nondeferrable validated primary-key constraint and corresponding one-column
+unique primary index, both named `alembic_version_serve_state_db_pkc`.  That
+index is the unparameterized default btree with default opclass, source-column
+collation, ascending/nulls-last key, owner-only ACL, and no predicate,
+expression, exclusion, deferred-validity, or physical storage options.  Its
+single row contains `040`.  The schema-qualified assertion then verifies the complete
+040 catalog, its exact relation/function OIDs, and one coherent open or terminal
+singleton.
+
+There are three named application interfaces rather than one boolean flag.  A
+reader assertion accepts exact open or terminal state and retains an `ACCESS
+SHARE` lock on the canonical gate through its transaction.  A writer assertion
+additionally requires open state and proves that its own physical backend holds
+the unchanged session advisory lock.  A downgrade assertion additionally
+requires open state while relying on downgrade's already-held transaction
+advisory lock.  The writer actively proves exactly one session-level hold—not a
+transaction-only or reentrant pooled hold—before authoritative DML and again
+immediately before commit; the same physical connection retains it until commit
+or rollback returns, and only then releases exactly one hold and proves none
+remain.  Any uncertain acquisition, probe, or release invalidates the physical
+connection instead of returning it to the pool.  The operator
+rejects any same-session `pg_my_temp_schema()` relation or assertion-function
+shadow in its write/read set, binds all SQLAlchemy tables to the asserted
+canonical schema, and schema-qualifies its raw table locks; PostgreSQL's
+implicit `pg_temp` precedence therefore cannot redirect either the proof or
+authoritative DML.  A writer whose preflight overlaps a completed preterminal
+downgrade aborts before DML even if it reaches the advisory lock only after
+downgrade released it.
+
+The PostgreSQL ledger is an append-only authority, not a self-authenticating
+JSON document.  Schema revision 040 installs `ENABLE ALWAYS` database triggers
+that reject every `UPDATE`, `DELETE`, or `TRUNCATE` of a normalization run or
+row, including under PostgreSQL's replica session role.  After an
+immutable protocol-4 terminal `historical_physical_per_gpu/retired` row exists,
+the database also rejects insertion of any later normalization run, including
+one attempted by an older protocol-1/2/3 image.  The terminal transaction
+inserts its run before its rows, so its own first generation remains atomic;
+the insertion fence becomes active for subsequent transactions only after the
+terminal row commits.  Revision 040 may be downgraded cleanly before terminal
+retirement, but its downgrade must fail closed once a terminal row exists.
+Later cleanup must explicitly remove these triggers as part of its reviewed
+schema retirement, never weaken them in place or reuse the generic downgrade
+as a post-terminal escape hatch.
+
+An advisory-lock wait inside a trigger is not this fence: a repeatable-read or
+serializable transaction may keep a snapshot taken before the wait and miss the
+newly committed terminal row.  Revision 040 therefore owns one internal
+singleton write-fence row containing a monotonic generation, the latest
+admitted run UUID and transaction ID, and optional terminal run UUID and
+transaction ID.  A run `BEFORE INSERT FOR EACH ROW` trigger takes the unchanged
+cross-protocol advisory identity without waiting; failure to acquire it aborts
+instead of continuing on the statement snapshot.  An `AFTER INSERT FOR EACH
+ROW` trigger then atomically advances the singleton only while its terminal UUID
+is NULL.  Its source run must have PostgreSQL `xmin` equal to
+`pg_current_xact_id()::xid`, and the singleton records the corresponding
+`xid8`.  Ledger writes are deliberately top-level transactions: a run or row
+inserted inside a savepoint has a subtransaction `xmin` and fails closed rather
+than weakening the binding.  Admission also requires the singleton's recorded
+transaction ID to differ from the current one, so a second distinct run in the
+same top-level transaction is rejected instead of ambiguously replacing the
+first.
+Concurrent read-committed statements re-evaluate the updated row after a wait,
+while an older repeatable-read/serializable snapshot receives PostgreSQL's
+concurrent-update serialization failure.
+
+Terminal activation is an `AFTER INSERT FOR EACH ROW`, `DEFERRABLE INITIALLY
+DEFERRED` constraint trigger on the row ledger.  At transaction end it performs
+an explicit no-op for every nonterminal inventory row.  Only the exact
+protocol-4 `historical_physical_per_gpu/retired` tuple performs one conditional
+`UPDATE ... RETURNING` compare-and-set: both the run and row `xmin` values must
+equal `pg_current_xact_id()::xid`, and the singleton's latest run and admitted
+`xid8` must match them.  A run committed
+without such a row can never be activated by a delayed insert.  The compare-and-
+set accepts an already-terminal singleton only for the same run and same
+transaction, so two or more valid retired candidates in one manifest are
+idempotent while a competing activation fails.  Rollback rolls back admission
+and terminal activation together; no nontransactional marker may poison the
+fence.
+
+The singleton is migration-private state, not an application interface.  It
+has exactly one row and the exact columns `singleton boolean`, `generation
+bigint`, `latest_run_id uuid`, `admitted_xid xid8`, `terminal_run_id uuid`, and
+`terminal_xid xid8`.  `singleton` is the true primary key; generation is
+nonnegative; generation zero is equivalent to both admission fields being
+NULL; the two terminal fields are either both NULL or both present; and a
+present terminal UUID equals the latest UUID.  Both UUIDs have nondeferrable,
+restricting foreign keys to the run ledger.  Those two foreign keys and the row
+ledger's run foreign key retain their exact PostgreSQL internal RI-trigger
+quartets in canonical standard mode; revision 040 never requires superuser-only
+internal-trigger administration.  The exact internal-trigger inventory across
+the singleton and ledgers is 18: those three authority-FK quartets contribute
+12, while the three revision-037 receipt/retirement foreign keys from
+`services` and `version_specs` contribute their six referenced-side triggers
+on the run ledger.  All six foreign keys are verified against their complete
+source/reference column, action, match, validation, deferrability, parent, and
+delete-column envelope.  Runtime verification independently rejects
+any existing row-ledger orphan, including one introduced by a privileged
+replication-role session, before trusting the authority.  The initial row is exactly
+`(true, 0, NULL, NULL, NULL, NULL)`, and upgrade refuses any pre-existing
+protocol-4 terminal tuple instead of seeding an incoherent open fence.
+
+Catalog verification also binds that structural row to immutable ledger
+semantics.  A nonzero generation's latest run must exist and its `xmin` must
+equal `admitted_xid`.  Open state is valid only when no committed exact
+protocol-4 `historical_physical_per_gpu/retired` tuple exists anywhere in the
+ledger.  Terminal state is valid only when the latest run is exact protocol 4
+terminal mode, at least one exact retired row belongs to it, the run and every
+such terminal row have `xmin` equal to `terminal_xid`, and the terminal and
+admission XIDs are equal.  Thus restored trigger definitions cannot make an
+open gate coexist with old terminal evidence or make a fabricated terminal
+gate point at a missing, wrong, or different-transaction tuple.
+
+`ENABLE ALWAYS` singleton triggers reject every direct `INSERT`, `DELETE`, or
+`TRUNCATE`.  Its `UPDATE` guard accepts only one of the two exact state
+transitions above at trigger depth two.  This is not a depth-only bypass: an
+admission transition must be a one-generation advance to a newly inserted run
+whose unforgeable `xmin` is the recorded current transaction, and an activation
+transition must retain every admission field and prove a newly inserted exact
+terminal row with that same `xmin`.  Once the source trigger has made either
+transition, a top-level replay cannot make another valid state change.  The
+verified source-table trigger inventory admits no additional trigger that could
+issue a transition first.
+
+Revision 040 verifies the complete relation, constraint, index,
+trigger/function, owner, ACL, and data envelope: exact columns, PostgreSQL
+types, nullability, defaults, absence of column ACLs, primary/check/foreign-key
+behavior and internal RI triggers, one coherent
+singleton row, relation kind/persistence/RLS state, function owner and revoked
+PUBLIC execution, fixed `pg_catalog` search path, security/volatility/parallel
+attributes, exact relation/function/event and row/statement level,
+always-enabled state, and no `WHEN` predicate, arguments, transition tables,
+unexpected constraint metadata, duplicate name, overload, or extra source
+trigger.  Frozen expression catalogs are compiled with `pg_catalog` first and
+explicit `pg_temp` second, then restore the transaction's frozen `pg_catalog`
+path, so hostile caller schemas or temporary type aliases cannot change the
+expected node tree.
+The three relations must have no inheritance parent or child and no
+non-internal rewrite rule; `pg_inherits`, `relhassubclass`, `pg_rewrite`, and
+`relhasrules` are part of the verified envelope so inherited or redirected DML
+cannot bypass the parent triggers.  A partial, disabled, predicate-gated,
+shadowed, inherited, rewrite-enabled, or owner/ACL/config-drifted catalog is a
+migration failure, not an adoptable state.
+
+Downgrade is serialized with the writer rather than relying on a point-in-time
+terminal query.  It must first acquire the same advisory transaction lock
+without waiting, resolve the same unique compiled revision-040 identity while
+rejecting temporary shadows, then take fixed-order `ACCESS EXCLUSIVE` locks on
+those exact schema/OID-qualified singleton, run-ledger, and row-ledger
+relations.  It reverifies the exact catalog and open singleton after those
+locks and schema/OID-qualifies every trigger/function removal and gate drop;
+`current_schema()` never chooses a downgrade target.  If a writer owns the
+advisory authority, downgrade fails busy; if downgrade owns it first, a writer
+fails its nonblocking session-lock attempt instead of waiting to enter after the
+catalog removal commits.  If downgrade finishes before that attempt begins, the
+writer's mandatory runtime-authority assertion observes the absent 040 catalog
+and fails before opening its snapshot.  A committed terminal UUID always makes
+downgrade fail closed.
+
+This database boundary is necessary because a maliciously coherent rewrite of
+the run protocol, every row classification and dependency fact, all counts,
+and all fleet digests cannot be distinguished from an originally written older
+manifest by a pure function.  The shared validator still rejects every partial
+or internally contradictory v3/v4 relabel.  PostgreSQL immutability rejects the
+whole-manifest rewrite itself, and the post-terminal run-insert trigger keeps
+old writers from replacing the latest terminal generation.  Receipt and
+operator validation therefore rely on both layers explicitly instead of
+pretending that recomputable digests authenticate their own source.
 
 The cleanup-contract and receipt additions introduced normalizer protocol 2.
-The NULL-timestamp proof below introduces protocol 3.  Ledger verification
+The NULL-timestamp proof below introduced protocol 3.  The explicit stale
+placeholder proof introduces protocol 4.  Ledger verification
 continues to accept and exactly validate completed protocol-1 manifests from
 the supported v1.1.1143 transaction and completed protocol-2 manifests from
-PR #1339; it dispatches retirement-fact validation by the recorded protocol
+PR #1339; protocol-3 timestamp facts remain frozen exactly as released in
+v1.1.1155.  Validation dispatches retirement facts by the recorded protocol
 instead of reinterpreting old facts as a later schema.  Every new write uses
-protocol 3.  The advisory-lock identity remains unchanged so v1, v2, and v3
-operators cannot run concurrently.
+protocol 4.  The advisory-lock identity remains unchanged so v1, v2, v3, and
+v4 operators cannot run concurrently.
 `normalizer_version` has the exact grammar
-`^(1|2|3):[0-9a-f]{40}$`; apply refuses a build without an exact release
+`^(1|2|3|4):[0-9a-f]{40}$`; apply refuses a build without an exact release
 commit.  Protocol 1 keeps its frozen mode/outcome matrix and original
 retirement-fact validator byte-for-byte.  Protocol 2 keeps its frozen matrix
 and cleanup/receipt validator, requires the exact cleanup-schema-v2 fact set,
 and rejects every cleanup-schema-v3-only field.  Protocol 3 uses the same
 mode/outcome matrix but requires the v3 timestamp-bound cleanup proof and the
-same predecessor-receipt facts for every retired outcome.  This dispatcher is
+same predecessor-receipt facts for every retired outcome; it rejects the new
+stale-placeholder proof fields.  Protocol 4 has a separate retirement outcome
+matrix: proved same-service rows use `stale_placeholder/unchanged`, while
+unrelated ordinary reservations remain `placeholder/unchanged`; only the
+latter is fillable.  It requires the complete v3 proof plus the run-level
+cross-row placeholder inventory described below.  Protocol-specific v4
+validation covers the retired entry and every `stale_placeholder` entry, not
+only rows whose outcome is `retired`; every v1-v3 manifest rejects the v4
+classification and both v4-only nested fact objects.  This dispatcher is
 shared by complete-ledger verification, controller receipt-manifest
 validation, and the global predecessor-receipt scan; an unknown protocol, a
-malformed suffix, a relabeled v3 proof, or any protocol/fact mismatch is a
-blocker.  Tests include a secret-free exact manifest/row snapshot of production
+malformed suffix, a partial relabeled v3/v4 proof, or any protocol/fact mismatch
+is a blocker.  A coherent whole-manifest downgrade is rejected by the
+append-only PostgreSQL boundary above.  Tests include a secret-free exact
+manifest/row snapshot of production
 run `3bacd32f-888e-4a1f-af87-8f17dd82f168`, not only a synthetic v1 ledger.
+The dependency-light `placement_normalization_manifest` module owns this pure
+persisted-manifest contract and imports no operator or database state module.
+Both operator-side validation and the controller receipt reader call that same
+validator.  The receipt reader loads the requested run's complete bounded row
+inventory and validates it before returning a pending request, accepting a
+completed receipt, or acknowledging and CASing a load; validating only the
+selected current and recovery entries is insufficient for protocol 4.  For a
+protocol-4 retirement run it also reads the current bounded `version_specs`
+rows and parent service hash for every retired candidate service.  This live
+query and its required parent-hash observation are scoped exactly to those
+candidate names; unrelated services that merely appear in the full fleet
+manifest are not live-proof inputs.  The query projects exactly the frozen
+protocol-4 revision-038 columns listed below, so a later live-schema addition
+cannot retroactively invalidate an old receipt.  While that
+same service incarnation exists, every manifested stale identity must remain
+the exact canonical, unretired pickled-`None` full row/column postimage, and
+every additional canonical placeholder whose version is at or below the
+proved current version is an omitted stale row and blocks.  The manifested
+retired candidate must also remain present while that same-hash parent exists
+and must retain the exact terminal `spec`, `yaml_content`,
+`retired_yaml_content`, `retired_at`, `retirement_reason`, and
+`retirement_run_id` postimage; changing or deleting the tombstone blocks even
+though its `spec` is canonical pickled `None`.  If the old parent is absent,
+missing stale and retired rows are permitted because the immutable audit
+remains in the manifest.  If the name belongs to a different incarnation, an
+unchanged old stale postimage at the same name/version would be implicitly
+reassociated and blocks.  Reuse of an old version number is nevertheless
+unambiguous and allowed when that row is instead a committed explicit-v2
+postimage with a finite `created_at` strictly after manifest completion; the
+different parent hash and later commit boundary prove that the old row was
+removed and the new incarnation created a new one.  A new-incarnation
+placeholder, including one at an old version number, remains ambiguous and
+blocks.  A
+later ordinary placeholder is permitted only when its version is above both
+the proved current version and the terminal same-incarnation manifested
+high-water mark, and its `created_at` remains SQL NULL, matching the central
+reservation writer; it remains `placeholder/unchanged` and fillable.
+This
+live snapshot binding prevents a coherently rewritten ledger from omitting or
+relabeling an unchanged stale placeholder without making later reservations
+part of the terminal proof, and is repeated inside the acknowledgement
+transaction.
+
+On PostgreSQL, the receipt reader first resolves the same unique revision-040
+schema identity and invokes the same schema-qualified database-authority
+assertion on the exact ORM connection that reads the receipt.  It accepts a
+coherent open or terminal gate because predecessor receipts remain readable
+after terminal retirement, rejects temporary shadows for every receipt
+relation and the assertion function, applies the canonical schema map before
+its first table query, and acquires `ACCESS SHARE` on the exact gate.  Resolver,
+compiled-definition check, database assertion, schema binding, complete bounded
+manifest/live reads, validation, and the returned decision all occur in that
+one uninterrupted ORM transaction; the gate lock prevents downgrade's
+`ACCESS EXCLUSIVE` removal until it ends.  The acknowledgement path repeats
+that proof inside its service-owner/advisory transaction and retains the gate
+lock through receipt CAS commit or rollback.  SQLite remains only the existing
+local/controller test-store path and does not pretend to provide this central
+PostgreSQL authority.
+The protocol-1 through protocol-3 validators retain the historical
+`same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
+must neither emit nor accept that fact: its complete stale-placeholder
+inventory replaces the blanket absence contract, so persisting both would be
+contradictory rather than additional evidence.
+The persisted `schema_revision="037"` is the immutable placement-normalization
+ledger schema identifier for protocols 1-4, not the central database migration
+number.  Protocol 4 nevertheless requires the current full column-hash maps to
+contain exactly the frozen revision-038 `version_specs` columns
+`service_name`, `version`, `spec`, `yaml_content`, `submitted_yaml_content`,
+`created_at`, `created_by`, `quarantined_at`, `quarantine_reason`,
+`retired_yaml_content`, `retired_at`, `retirement_reason`,
+`retirement_run_id`, `placement_catalog`, `controller_config`,
+`controller_config_digest`, `controller_config_snapshot_id`,
+`controller_applied_at`, `resource_action_spec_identity`, and
+`resource_action_spec_identity_sha256`.  The action-identity columns must hash
+as SQL NULL for every stale placeholder.  Later live-schema additions do not
+retroactively change this protocol-4 column contract.
+
+For each historical candidate service, protocol 4 selects every exact
+`PLACEHOLDER` row from the already bounded locked version inventory.  Each
+must use bytes exactly equal to the central writer's canonical
+`pickle.dumps(None, protocol=4)`, remain byte-for-byte and column-for-column
+unchanged, and have SQL NULL in exactly `yaml_content`,
+`submitted_yaml_content`, `placement_catalog`, `controller_config`,
+`controller_config_digest`, `controller_config_snapshot_id`,
+`controller_applied_at`, `quarantined_at`, `quarantine_reason`,
+`retired_yaml_content`, `retired_at`, `retirement_reason`,
+`retirement_run_id`, `resource_action_spec_identity`, and
+`resource_action_spec_identity_sha256`.  Its version
+must be strictly lower than the one surviving committed explicit-v2 current
+row, it must be absent from `active_versions`, and its exact replica count must
+be zero.  The service-wide unknown-version-replica proof remains zero.  After
+this proof its separate manifest classification changes from raw `PLACEHOLDER`
+to durable `stale_placeholder`; its raw classification and database row do not
+change.  Its contextual dependency facts must also retain exact
+`service_present=true`, `service_pool=0`, `service_active=false`,
+`quarantined=false`, `controller_applied=false`, and `retired=false` values and
+the same nonempty service hash and positive lifecycle epoch as the retired
+candidate; contradictory fact booleans invalidate the complete manifest even
+when the side-column hashes remain clean.
+
+The preflight, locked, and postflight image-demand and typed resource-action
+scans include both historical candidates and these stale placeholders.  Every
+placeholder count must remain zero and every digest must remain stable across
+the three checkpoints.  Each `stale_placeholder` ledger entry adds exactly one
+top-level fact, `stale_placeholder_evidence`, whose value is an exact-key map:
+`schema` (the literal `skyserve-stale-placeholder-retirement-v1`),
+`service_name_sha256` (64 lowercase hex), `version` (the exact positive row
+version), `original_row_sha256` (the ledger preimage row digest),
+`strictly_newer_committed_version` (an exact integer greater than `version`),
+`image_demand_count` and `resource_action_root_count` (exact integer zero), the
+two 64-hex `image_demand_sha256` and `resource_action_root_sha256` digests, and
+exact booleans
+`state_clean=true` and `fill_stale_proved=true`.  No missing or extra nested key
+is accepted.
+
+Each retired candidate adds exactly one top-level fact,
+`same_service_stale_placeholder_proof`, whose exact-key value contains the same
+literal `schema`, the service-name digest, surviving `current_version`, exact
+nonnegative `placeholder_count`, exact-zero aggregate `image_demand_count` and
+`resource_action_root_count`, a 64-hex `inventory_sha256`, and
+`fill_stale_proved=true`; no missing or extra nested key is accepted.  The
+inventory digest is domain-separated canonical
+compact JSON of
+`{"schema":"skyserve-stale-placeholder-retirement-v1",
+"service_name_sha256":...,"current_version":...,"placeholders":[...]}`;
+`placeholders` is the version-sorted list of each complete exact-key
+`stale_placeholder_evidence` map.  Full-manifest validation reconstructs this
+envelope from all same-service `stale_placeholder` entries, proves each
+entry's original and result row/column hashes are identical, proves every
+listed side-column hash equals the canonical SQL-NULL hash, and proves the
+placeholder's `contract_projection` is exactly NULL.  The surviving current
+entry must be committed explicit v2 and its service hash/lifecycle epoch must
+equal both the retired candidate and every stale entry.  A missing, extra,
+duplicated, fillable, active, stateful, evidence-bearing, or substituted
+placeholder invalidates the entire run.  The empty list uses the same envelope
+and is valid.  Older-protocol all-row validation rejects either v4-only
+top-level fact even if an attacker also relabels the manifest.
 
 For a supported fieldless or v1 tuple, the result pickle is a real
 `SkyServiceSpec`.  Its raw top-level mapping differs only by the explicit
@@ -458,7 +878,13 @@ service-version demands in `WARMING`, `READY`, or `FAILED` across every
 incarnation hash and target-scoped derivative; that cross-database
 snapshot is taken before and after the locked Serve transaction while requests
 are frozen.  Missing, hash-mismatched, and terminal services do not bypass
-those checks.  The same bounded pre/locked/post protocol requires zero exact
+those checks.  Historical service hashes are opaque nonempty strings and may
+contain `:`.  Any-incarnation owner parsing therefore anchors the exact
+`:v<version>` suffix from the right and conservatively accepts every nonempty
+hash prefix; it must not use a `[^:]+` hash regex that can silently discard a
+valid legacy owner.  An ambiguous or malformed possibly matching owner blocks
+instead of producing zero-demand evidence.  The same bounded pre/locked/post
+protocol requires zero exact
 `ProviderLaunchContentSourceV1` roots for the candidate `(service_name,
 version)` in either `api_resource_actions.immutable_spec` or
 `serve_resource_action_shadow_samples.immutable_spec`.  Both complete bounded
@@ -625,8 +1051,9 @@ well-formed completed-run manifest.  A version absent from that run is accepted
 as a later ordinary version only when its immutable `created_at` is strictly
 after the manifest's `completed_at`; an absent inventory row for a version that
 already existed when the run completed is corruption and fails closed.  A
-manifested pickled-`None` placeholder may subsequently be filled through the
-v2-only central writer: the completed check still binds that inventory
+manifested `placeholder/unchanged` row may subsequently be filled through the
+v2-only central writer; `stale_placeholder/unchanged` never may.  For a
+fillable row, the completed check still binds that inventory
 identity to the same service incarnation, but does not compare the obsolete
 placeholder digest or lifecycle epoch.  Both cases remain subject to raw v2
 validation; any other inventoried non-loadable outcome rejects.  Pending
@@ -637,7 +1064,8 @@ requested or loaded receipt column is non-NULL.  It is ordered by exact service
 name, uses `limit + 1` against an explicit bound, and hashes the complete typed
 tuple.  It therefore catches a NULL requested UUID with a stray loaded field as
 well as ordinary pending/mismatched state.  Each requested UUID must equal its
-loaded UUID; its protocol-1, protocol-2, or protocol-3 manifest, per-version
+loaded UUID; its protocol-1, protocol-2, protocol-3, or protocol-4 manifest,
+per-version
 ledger rows,
 and raw current/recovery specs pass the shared full validator.  The loaded
 image commit must be one of an explicit operator-supplied set of approved exact
@@ -652,7 +1080,7 @@ epoch fencing applies only to the pending read/CAS path.  Unknown protocols,
 overflow, duplicate names, partial state, orphan manifests, or unapproved
 commits block.  The approved
 commit set is itself hashed into the operator freeze evidence rather than
-inferred from tags.  Protocols 2 and 3 store the caller's exact 64-hex freeze digest
+inferred from tags.  Protocols 2, 3, and 4 store the caller's exact 64-hex freeze digest
 and the canonical digest of the sorted approved-commit set in each retirement
 row, and the run manifest stores the canonical SHA-256 of
 `{"approved_loaded_image_commit_sha256": <set digest>,
@@ -771,21 +1199,20 @@ attribute, or private compatibility mirror.
 
 ### One placement engine
 
-`DynamicFallbackSpotPlacer` receives the resolved contract directly.  Catalog
-construction consults `catalog_mode`; ranking consults `cost_unit`.
+The final `SpotPlacer` class is the sole concrete dynamic-fallback engine and
+receives the resolved contract directly.  Catalog construction consults
+`catalog_mode`; ranking consults `cost_unit`.
 Zero-cost-first selection, bench/retry behavior, exact-location filtering,
 workspace policy, and paid launch fencing remain shared and unchanged.
 
-There is no class registry or default flag.  Before deleting
-`CapacityAwareDynamicFallbackSpotPlacer`, the transition audits source imports,
-plugins, retry artifacts, version pickles, controller/local databases,
-snapshots, and rollback backups for its qualified class path.  If any durable
-object references it, a deprecated deserialization-only import shim remains;
-otherwise a real preceding-release pickle fixture must prove the deletion is
-safe.  If a qualified-class reference does exist, a real fixture must prove
-the deserialization-only shim loads it and resolves the typed contract without
-restoring a second runtime engine.  Supported public names are a fixed mapping
-to contract presets.
+There is no class registry, abstract/factory placer, policy subclass, or
+test-only production allocator hook.  The placer itself is not persisted;
+durable service specs and retry artifacts persist the explicit primitive
+contract and placement catalog instead, so deleting the former
+`DynamicFallbackSpotPlacer` name does not require a deserialization shim.
+Tests that bypass provider enumeration construct a complete test double in
+test-only helpers.  Supported public names are a fixed mapping to contract
+presets.
 `spot_placer: null` constructs no placer.
 
 Reserved-capacity validation reads `reserved_fill_mode` from the engine
@@ -903,6 +1330,15 @@ fixture before production apply.  Because that release can write v1 and lacks
 the controller hold, it must never be deployed after apply; the normalization
 release is the minimum server rollback floor.
 
+The protocol-4 follow-up adds PostgreSQL-only schema revision 040 for the
+append-only run/row triggers and the post-terminal run-insert fence described
+above, including its single internal transaction-bound gate row.  It changes no
+placement pickle during startup.  Reader-first rollout
+must prove the trigger definitions are installed before the held operator
+transaction; after the terminal row commits, rollback to any image that does
+not understand protocol 4 and downgrade of revision 040 are forbidden
+independently of the application-level writer fence.
+
 Production baseline inventory found 155 valid fieldless public contracts,
 seven pickled-`None` placeholders, and one fieldless transition-only
 physical/per-GPU contract.  The historical row is eligible only if the
@@ -978,18 +1414,30 @@ evidence is attached.
    Every retirement-protocol rollout is explicitly reader-first and
    two-phase.  Protocol 2 completed that sequence with v1.1.1149, but its
    retirement transaction failed closed before mutation on the legacy NULL
-   timestamps.  For protocol 3, first deploy the exact corrected image
-   directly with Helm `--reuse-values` while
+   timestamps.  Protocol 3 completed its reader-first v1.1.1155 rollout and
+   entered the separate hold, but its transaction rolled back before DML on
+   the blanket placeholder guard.  Revision 366 then restored the same exact
+   image with `serve.controllerHold=false`; all eight controller health probes
+   and all 16 load-balancer deployments recovered.  For protocol 4, first
+   deploy the exact corrected image directly with Helm `--reuse-values` while
    `serve.controllerHold=false`.  Let the Recreate pod recover controllers and
-   require every existing protocol-1/protocol-2 receipt and manifest to pass
-   its frozen validator, all eight requested receipts to remain converged, all
+   require every existing protocol-1/protocol-2/protocol-3 receipt and manifest
+   to pass its frozen validator, all eight requested receipts to remain converged, all
    controller ports and health probes to recover, all endpoint/LB identities
    and 16 LB deployments to remain healthy, and
    committed/elected/applied versions, replica inventory, and paid-capacity
    authority to remain unchanged.  Only after attaching that reader-first
-   evidence may a separate Helm revision set the hold to true and apply the
-   protocol-3 retirement.  The hold revision must retain the exact protocol-3
-   image and chart pins.
+   evidence may a separate Helm revision set the hold to true.  Its final
+   preflight must reproduce all 164 rows and the exact preimage digest, classify
+   exactly 156 explicit-v2, one historical, and seven placeholders, prove
+   `{3, 10}` is the complete same-service placeholder set below committed/current
+   version 51, and prove every required side column, replica count, image demand,
+   and action root is zero/NULL before applying protocol-4 retirement.  The hold
+   revision must retain the exact protocol-4 image and chart pins.  Post-apply,
+   require both placeholder rows to retain identical full row/column hashes;
+   among preexisting version and cleanup rows, only historical version 2 and
+   the 49 exact `provisional: 1 -> 0` bits may change.  Recompute the complete
+   protocol-4 ledger and postimage before clearing the hold.
 6. Clear the recovery hold and start each affected live controller under the
    normalization release's transition-compatible decoder.  Verify
    committed/elected/applied convergence, active versions, endpoint and LB
@@ -997,7 +1445,9 @@ evidence is attached.
    errors.  Rerun the normalizer in dry-run mode and require zero changes plus
    complete run/inventory/postimage verification and requested/loaded
    generation receipts for every affected controller, including the new
-   retirement run separately from the predecessor receipts.  Start the zero-event
+   retirement run separately from the predecessor receipts.  The test service's
+   committed/current version must remain 51 and its requested/loaded protocol-4
+   receipt must converge after unhold.  Start the zero-event
    clock only after this final reload and query.
 7. Migrate eligible physical GPU services only through an explicit rolling
    update.  Require every old replica to drain and the logical bridge to
@@ -1011,12 +1461,12 @@ evidence is attached.
    still available.  After apply, roll back chart/config changes while pinning
    the normalization-or-newer image, or restore the pre-apply database backup
    before deploying v1.1.1135.  Normalized rows are mirror-free v2.
-   Once any protocol-3 run manifest or requested receipt exists, the exact
-   protocol-3-capable release becomes the stricter live-database rollback
-   floor: v1.1.1149 and every older image reject the `3:<commit>` identity and
+   Once any protocol-4 run manifest or requested receipt exists, the exact
+   protocol-4-capable release becomes the stricter live-database rollback
+   floor: v1.1.1155 and every older image reject the `4:<commit>` identity and
    must not be started against that database.  Rolling back chart or config
-   after that point must retain the protocol-3-capable image.  Deploying an
-   older image requires first restoring a verified pre-protocol-3 database
+   after that point must retain the protocol-4-capable image.  Deploying an
+   older image requires first restoring a verified pre-protocol-4 database
    backup under the controller hold.  Historical retirement is intentionally
    irreversible in the live database:
    the retained history row and strictly newer committed row preserve the
@@ -1046,9 +1496,17 @@ The blocked cleanup may merge only when all are true:
   qualified class reference.  A retained snapshot/backup containing such state
   is classified as non-directly-recoverable and must be covered by the tested
   hold-and-normalize-before-resume restore runbook below.
-- The PostgreSQL run manifest and row inventory cover the exact current row
-  identity set and the point-in-time canonical fleet digest; every current spec
-  matches the latest result-spec digest for its exact owner generation.  Every
+- The terminal PostgreSQL run manifest and row inventory cover its exact
+  point-in-time row identity set and canonical fleet digest; every manifested
+  current spec matches the terminal result-spec digest for its exact owner
+  generation.  Every later unmanifested row satisfies the strict
+  higher-version and explicit-v2-with-post-completion-timestamp or
+  fillable-placeholder-with-NULL-timestamp contract above; it cannot replace
+  or mutate a manifested row.
+  A later lifecycle epoch on the same service hash is accepted without
+  rewriting immutable manifest rows; a recreated hash follows the stricter
+  post-completion committed-v2 rule above.
+  Every
   terminal retirement includes the locked dependency proof and retired-row
   digests; requested/loaded controller receipts converge; and a post-reload
   dry-run reports zero pending changes, zero blockers, and zero ledger
@@ -1056,19 +1514,20 @@ The blocked cleanup may merge only when all are true:
   immutable spec proof.
 - No bridge, retryable version, placement catalog, replica row,
   resource-action root, or shadow root depends on that version.  A retained
-  cleanup intent is permitted only when its frozen protocol-2 all-finite proof
-  or protocol-3 timestamp-bound proof records its exact committed match, zero
+  cleanup intent is permitted only when its frozen protocol-2 all-finite proof,
+  protocol-3 timestamp-bound proof, or protocol-4 timestamp-plus-placeholder
+  proof records its exact committed match, zero
   deletion targets, byte-exact retained YAML, and omission-lossless old-reader
   coverage; every other cleanup dependency blocks.  A NULL version timestamp
-  requires protocol 3.
+  requires protocol 3 or 4.
 - All eligible GPU services have committed/applied logical versions, no
   quarantined version, and zero remaining physical replicas from migration.
 - Pools and intentionally physical services are either still supported by the
   physical preset or have completed a separately designed migration.
 - The release/CI-managed minimum compatible API version and the minimum
   supported server, controller, and rollback image all write placement-contract
-  v2 and include the clean-generation guard.  After a protocol-3 manifest or
-  request exists, every live-database rollback image also parses protocol 3.
+  v2 and include the clean-generation guard.  After a protocol-4 manifest or
+  request exists, every live-database rollback image also parses protocol 4.
   v1-writer images are explicitly forbidden once supported normalization apply
   commits.
 - At least two consecutive production releases and 30 continuous days after
@@ -1196,11 +1655,74 @@ Automated coverage must prove:
   matched finite row or legacy boundary fails closed; exact protocol-v2 ledger
   fixtures remain readable, while protocol-v3 field deletion, valid-looking
   digest/count/mode/boundary substitution, and relabeling as v2 all fail;
+- the production-shaped same-service placeholders at versions 3 and 10 are
+  accepted in real PostgreSQL only with historical version 2,
+  committed/current explicit-v2 version 51, canonical protocol-4 `None` bytes,
+  clean NULL side columns, zero replicas, and stable zero image/action evidence;
+  protocol-5 or other merely decodable-`None` bytes, a trailing fillable
+  placeholder, current/active placeholder, side-state
+  field, replica, demand/action root, or placeholder add/fill/side-state/replica
+  race between preflight and locked scan fails and rolls back the complete
+  transaction;
+- independently inject locked and postflight image/action nonzero counts,
+  zero-count digest drift, and evidence-target-map drift for candidates and
+  stale placeholders; delete, substitute, or swap each protocol-4 count,
+  successor, per-row evidence digest, row/column hash, candidate inventory
+  digest, nested key, and `stale_placeholder` classification; partially
+  relabel v3 as v4 and v4 as v3 and require full-manifest rejection; attempt a
+  coherent whole-manifest v4-to-v3 rewrite in real PostgreSQL and require the
+  first ledger mutation to fail at the append-only trigger; prove the trigger
+  also fires for `TRUNCATE` and with `session_replication_role=replica`; after a
+  successful terminal transaction, attempt a protocol-3 run insert and a
+  revision-040 downgrade and require both post-terminal database fences to
+  reject them; prove a pre-terminal downgrade removes exactly the revision-040
+  catalog; race terminal insertion against read-committed, repeatable-read, and
+  serializable old-writer transactions whose snapshots precede or overlap the
+  terminal commit and require every physically later run either to fail at the
+  busy advisory gate, observe the terminal singleton, or abort with a
+  serialization failure; commit a terminal-mode run without a retired row and
+  require a later row insertion to fail its transaction binding; accept two
+  terminal candidates plus ordinary nonterminal inventory rows inserted by the
+  same admitted run and reject a competing activation; insert a run or terminal
+  row under a SAVEPOINT and require the subtransaction `xmin` to fail closed;
+  attempt two distinct runs in one top-level transaction and reject the second;
+  race downgrade and terminal admission in both lock orders, including a writer
+  whose external preflight predates a downgrade but whose session-lock attempt
+  follows its commit, and require exactly one authority to proceed; require the
+  named writer assertion to reject an absent, terminal, lock-lost, or
+  catalog-drifted 040 installation before writer DML; require the named reader
+  assertion to accept the exact terminal installation but reject a
+  missing/wrong/duplicate revision identity, any version-table envelope or
+  assertion-body substitution, catalog drift, an open gate with any committed
+  terminal row, or a terminal gate with a missing/wrong-row or xid-mismatched
+  immutable run; hold a reader gate lock while a concurrent downgrade attempts
+  removal and prove downgrade cannot pass until the complete read/return or
+  acknowledgement commit ends; create same-session temporary shadows for the assertion name and each
+  operator or receipt relation and prove the schema-qualified assertion plus
+  canonical-schema SQL binding rejects them before any preliminary dry-run,
+  external-evidence getter, or DML; require transaction-only and reentrant
+  pooled advisory ownership to fail the active writer probe, and fault an
+  acquisition or release response after its possible side effect to prove the
+  physical connection is invalidated rather than pooled; tamper
+  with every singleton
+  column/default/type/nullability/key/check/FK, singleton row value/count,
+  relation or column ACL, owner/kind/persistence/RLS/inheritance/rule state,
+  index access method/opclass/collation/order/options,
+  function/trigger owner, ACL, search-path, body, event, enablement, predicate,
+  argument, transition, constraint, overload, or duplicate/extra-source-trigger
+  field and require fail-closed rejection; replace, disable, or replica-bypass
+  any internal authority-FK trigger and inject an orphan ledger row, requiring
+  both trigger enforcement and the independent data invariant to fail closed;
+  compile the frozen expected catalog under a hostile caller search path with a
+  temporary `uuid` alias and shadow `length(text)` function, and require the exact catalog
+  plus a transaction-local `pg_catalog` path; attempt every top-level singleton
+  DML operation and a depth-two update without the exact current-transaction
+  source tuples and require rejection;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
   malformed false-ish cleanup fields, noncanonical scope metadata, inventory
   overflow/drift, or ledger-fact tampering blocks retirement;
-- protocol-3 verification accepts the exact completed protocol-1 and
-  protocol-2 manifests through their frozen validators without weakening
+- protocol-4 verification accepts the exact completed protocol-1,
+  protocol-2, and protocol-3 manifests through their frozen validators without weakening
   their predicates, and a clean pending, partial,
   mismatched, or orphan-manifest predecessor receipt blocks retirement; a
   real-PostgreSQL pending acknowledgement emits `FOR UPDATE OF services`, not
@@ -1229,8 +1751,16 @@ and static checks, then a cold service smoke test for each eligible provider
 class.  A paid-capacity smoke requires separate explicit cost authorization;
 zero-cost reserved-capacity tests remain fail closed.
 
-### Verification evidence as of 2026-08-07
+### Verification evidence as of 2026-08-08
 
+- The protocol-4 implementation passed the complete native-PostgreSQL-14
+  schema-040, authority-lock, receipt, and retirement suites; the focused
+  placement-contract, cheapest-first, hybrid, reserved-capacity, measured-
+  availability, and zero-cost-refill suites; repository formatting, mypy,
+  pylint, and dashboard lint/format checks; and an adversarial authority audit
+  with an unconditional GO.  A fresh integration audit found no path,
+  semantic, or merge-tree overlap with the two newer `origin/improvements`
+  commits, which touch only the Managed Jobs dashboard banner.
 - Adversarial review of this exact design and code-level implementation review
   both returned GO for the transition.  A separate final cleanup audit returned
   GO for committing and submitting the blocked cleanup, and NO-GO for merging
@@ -1467,7 +1997,23 @@ zero-cost reserved-capacity tests remain fail closed.
   mismatch, and valid-looking proof-fact substitution fail closed.  The exact
   updated design passed adversarial review before implementation.  Final code
   review, merge CI, immutable artifact publication, and production execution
-  remain open.
+  completed as PR #1341 and v1.1.1155.  Direct Helm revision 364 completed the
+  reader-first rollout and revision 365 enabled the hold on the same immutable
+  chart and image.  The exact held preimage remained 164 rows at
+  `9867b1f55c74b49dd0b1f52e0eb8384a7dda8336bbe0d94865283ccce19b7dee`.
+- The first protocol-3 operator invocation exited with
+  `Historical service still has a non-retired version placeholder or
+  reservation` before its first DML.  A post-failure dry-run reproduced the
+  same pre/post digest, 156 explicit-v2 rows, one historical row, seven
+  placeholders, zero changes, and zero ledger mismatches.  The target service
+  has exact clean placeholders at versions 3 and 10 below committed/current
+  version 51; neither is current, active, applied, quarantined, configured,
+  cataloged, replica-owning, demanded, or action-rooted.  Revision 366 disabled
+  the hold without changing the v1.1.1155 pins; the replacement pod and both
+  init containers have zero restarts, all eight controller health probes
+  return 200, and all 16 load-balancer deployments are Ready and Available.
+  Protocol 4 implementation, review, immutable release, reader-first rollout,
+  and a fresh held apply remain open.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
 remain open gates.  This is only the first transition production release, and
@@ -1509,23 +2055,27 @@ removal gate are not yet attached.
 
 - Draft cleanup PR #1319 is authored in stack #1320.  Its first production
   rollout check passed, but the remaining removal gates are unmet, so it is not
-  approved to merge or deploy.
+  approved to merge or deploy.  After protocol 4 merges, rebase and refresh it
+  to retain or extract the shared protocol-1/2/3/4 identity and receipt reader,
+  a read-only full-ledger/bootstrap guard, the production-shaped protocol-4
+  fixture, the stale-placeholder zero-materialization gate, and the new rollback
+  floor.  The transition decoder/writer may be deleted only after those final
+  readers and the documented 30-day gate pass.
 - Transition and cleanup GitHub CI, including the mandatory real-PostgreSQL
   lane, completed successfully.  Credentialed AWS catalog coverage remains
   open because it has not been rerun after the operator refreshed SSO for this
   deployment.
-- Production control-plane v1.1.1151 is deployed directly through Helm at
-  revision 363 with the controller hold disabled; closed Platform PR #8090 is
-  not part of the release path.  Its source is the unrelated OOM cleanup merge
-  `f60829c367dc425895a7a30a06922fc81869ae51`; the sole Recreate API pod is
-  healthy on the matching immutable image with both containers Ready and zero
-  restarts.  Protocol-2 retirement made no mutation.  Protocol-3 hotfix PR
-  #1341 must merge, release, and complete its reader-first Helm rollout before
-  a separate hold revision and retirement attempt.  Normalization apply has
-  committed, so the current rollback floor is v1.1.1143; after any protocol-3
-  manifest or request exists, the protocol-3-capable hotfix becomes the floor
-  and older rollback requires a pre-protocol-3 database restore.  That restore
-  path still needs a drill.
+- Production control-plane v1.1.1155 is deployed directly through Helm at
+  revision 366 with the controller hold disabled; closed Platform PR #8090 is
+  not part of the release path.  The sole Recreate API pod is healthy on the
+  exact PR #1341 image with both init containers and both app containers Ready
+  and zero restarts.  Protocol-2 and protocol-3 retirement attempts made no
+  mutation.  Protocol 4 must pass design/code review, merge, release, and
+  complete a reader-first Helm rollout before a separate hold revision and
+  retirement attempt.  Normalization apply has committed, so the current
+  rollback floor is v1.1.1143; after any protocol-4 manifest or request exists,
+  the protocol-4-capable release becomes the floor and older rollback requires
+  a pre-protocol-4 database restore.  That restore path still needs a drill.
 - A second consecutive production release, the retained 45-day log sink, exact
   zero-event query, and 30 continuous qualifying days remain required.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
@@ -1533,7 +2083,7 @@ removal gate are not yet attached.
   and drained before any service update can claim scale-to-zero compliance.
 - Service version 58 is authoritative mirror-free placement-contract v2.  Its
   requested load receipt and the seven other requested receipts converged
-  under v1.1.1146 and remained healthy through v1.1.1151.  The one historical
-  test-service tuple requires the protocol-3 NULL-timestamp hotfix to pass
+  under v1.1.1146 and remain healthy through v1.1.1155.  The one historical
+  test-service tuple requires the protocol-4 stale-placeholder proof to pass
   review, merge, deploy reader-first, and run its locked terminal-retirement
   proof before the zero-event window can start.

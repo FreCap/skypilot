@@ -1,4 +1,4 @@
-"""DynamicFallbackSpotPlacer fills the cheapest usable location first."""
+"""SpotPlacer fills the cheapest usable location first."""
 # pylint: disable=redefined-outer-name,unused-variable
 import pytest
 from spot_placer_test_utils import make_location

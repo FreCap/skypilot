@@ -4325,7 +4325,8 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
 
     def test_kubernetes_zero_cost_seed_avoids_live_reclassification(self):
         location = spot_placer.Location.from_pickleable(_K8S_KEY)
-        task = types.SimpleNamespace(resources=[mock.Mock()], num_nodes=1)
+        task = types.SimpleNamespace(
+            resources=[mock.Mock(cluster_config_overrides=None)], num_nodes=1)
         with mock.patch.object(spot_placer,
                                '_get_possible_location_from_task',
                                return_value=[location]):
@@ -4341,18 +4342,12 @@ class TestCostFeasibilityDegradation(unittest.TestCase):
         placer.resources.copy.assert_not_called()
 
     def test_missing_spot_price_does_not_block_zero_cost_enumeration(self):
-        placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-            spot_placer.DynamicFallbackSpotPlacer)
-        placer._placement_contract = (  # pylint: disable=protected-access
-            placement_policy.resolve_fresh_contract(
-                placement_policy.SPOT_HEDGE_PLACER, pool=False))
         free = _make_location('research-ctx', 'free')
         missing_price = _make_location('paid-region', 'missing-price')
-        placer.location2status = {
-            free: spot_placer.LocationStatus.ACTIVE,
-            missing_price: spot_placer.LocationStatus.ACTIVE,
-        }
-        placer.location2cost = {free: 0.0, missing_price: float('inf')}
+        placer = _make_placer({
+            free: 0.0,
+            missing_price: float('inf'),
+        })
 
         self.assertEqual(placer.zero_cost_locations(), [free])
         self.assertEqual(placer.location2cost[missing_price], float('inf'))
@@ -4877,10 +4872,9 @@ class TestBrokerPollerCycle(unittest.TestCase):
         for uses_logical_replicas in (True, False):
             with self.subTest(uses_logical_replicas=uses_logical_replicas):
                 autoscaler = _make_autoscaler(min_replicas=1)
-                per_gpu_placer = (spot_placer.DynamicFallbackSpotPlacer.__new__(
-                    spot_placer.DynamicFallbackSpotPlacer))
-                per_gpu_placer._placement_contract = (  # pylint: disable=protected-access
-                    placement_policy.resolve_legacy_contract(
+                per_gpu_placer = _make_placer(
+                    {},
+                    placement_contract=placement_policy.resolve_legacy_contract(
                         placement_policy.CAPACITY_AWARE_SPOT_PLACER,
                         pool=False,
                         uses_logical_replicas=uses_logical_replicas))
@@ -4911,10 +4905,9 @@ class TestBrokerPollerCycle(unittest.TestCase):
         for uses_logical_replicas in (True, False):
             with self.subTest(uses_logical_replicas=uses_logical_replicas):
                 autoscaler = _make_autoscaler(min_replicas=1)
-                per_gpu_placer = (spot_placer.DynamicFallbackSpotPlacer.__new__(
-                    spot_placer.DynamicFallbackSpotPlacer))
-                per_gpu_placer._placement_contract = (  # pylint: disable=protected-access
-                    placement_policy.resolve_legacy_contract(
+                per_gpu_placer = _make_placer(
+                    {},
+                    placement_contract=placement_policy.resolve_legacy_contract(
                         placement_policy.CAPACITY_AWARE_SPOT_PLACER,
                         pool=False,
                         uses_logical_replicas=uses_logical_replicas))
