@@ -1862,6 +1862,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
     historical_payload = zlib.decompress(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
     successor_payload = _explicit_v2_payload()
+    historical_yaml = _zero_target_cleanup_yaml('service-hash', 'generation-1')
     with engine.begin() as connection:
         connection.execute(serve_state.services_table.insert().values(
             name='svc',
@@ -1876,7 +1877,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
             'service_name': 'svc',
             'version': 1,
             'spec': historical_payload,
-            'yaml_content': 'service: {}',
+            'yaml_content': historical_yaml,
             'created_at': 1.0,
             'created_by': 'test',
         }, {
@@ -1887,9 +1888,47 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
             'created_at': 2.0,
             'created_by': 'test',
         }])
+        connection.execute(
+            serve_state.ephemeral_storage_cleanup_intents_table.insert().values(
+                service_name='svc',
+                resource_scope='service-hash',
+                storage_generation='generation-1',
+                yaml_content=historical_yaml,
+                pool=0,
+                lifecycle_epoch=7,
+                provisional=1,
+                created_at=0.5))
 
     no_evidence = placement_contract_normalization._ExternalEvidence(
         count=0, digest='0' * 64)
+    with orm.Session(engine) as session:
+        predecessor_rows, _ = (placement_contract_normalization._scan_inventory(
+            session, row_bound=10))
+    predecessor_run_id = uuid.uuid4()
+    predecessor_digest = placement_contract_normalization._fleet_sha256(
+        predecessor_rows, result=False)
+    with orm.Session(engine) as session, session.begin():
+        placement_contract_normalization._insert_ledger(
+            session,
+            predecessor_rows,
+            run_id=predecessor_run_id,
+            mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+            row_bound=10,
+            started_at=2.5,
+            completed_at=3.0,
+            freeze_evidence_sha256='e' * 64,
+            pre_digest=predecessor_digest,
+            post_digest=predecessor_digest)
+    with engine.begin() as connection:
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == 'svc').values(
+                placement_normalization_requested_run_id=predecessor_run_id,
+                placement_normalization_loaded_run_id=predecessor_run_id,
+                placement_normalization_loaded_image_commit='b' * 40,
+                placement_normalization_loaded_controller_pid=456,
+                placement_normalization_loaded_controller_ip=None,
+                placement_normalization_loaded_boot_id='c' * 32,
+                placement_normalization_loaded_at=4.0))
 
     for replica_id, replica_version in ((1, None), (2, 999)):
         with engine.begin() as connection:
@@ -1922,6 +1961,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
                   RETIRE_TERMINAL_HISTORICAL),
             row_bound=10,
             freeze_evidence_sha256='f' * 64,
+            approved_loaded_image_commits=('b' * 40,),
             consolidation_mode_checker=lambda: False)
 
     common_retirement_kwargs = {
@@ -1930,6 +1970,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
                  RETIRE_TERMINAL_HISTORICAL),
         'row_bound': 10,
         'freeze_evidence_sha256': 'f' * 64,
+        'approved_loaded_image_commits': ('b' * 40,),
         'image_evidence_getter': lambda _name, _version: no_evidence,
         'request_evidence_getter': lambda _engine: no_evidence,
         'process_evidence_getter': lambda _targets, _pod_uid: no_evidence,
@@ -1991,7 +2032,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
     retired, successor = versions
     assert bytes(retired['spec']) == pickle.dumps(None, protocol=4)
     assert retired['yaml_content'] is None
-    assert retired['retired_yaml_content'] == 'service: {}'
+    assert retired['retired_yaml_content'] == historical_yaml
     assert retired['retired_at'] == 11.0
     assert retired['retirement_run_id'] == run_id
     assert bytes(successor['spec']) == successor_payload
