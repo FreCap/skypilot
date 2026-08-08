@@ -574,7 +574,7 @@ seconds, controller p99 7.51/7.71 seconds, and end-to-end role p99 entered the
 invariants stayed intact, so this is a fix-forward latency failure rather than
 a rollback trigger.
 
-The bounded follow-up removes those duplicated reads without changing the
+PR #1368 adds the complementary bounded read collapse without changing the
 eight-second client budget or six-second independent report-freshness gate:
 
 - One PostgreSQL query returns the exact controller owner/incarnation tuple and
@@ -608,6 +608,43 @@ other proxy route. The 143-backend overlap, owner-replacement, transition, and
 full external-load-balancer suites remain mandatory. The immutable follow-up
 must repeat the same direct-Helm staging and production qualification; revision
 372 does not satisfy completion.
+PR #1367 subsequently addressed the cross-slot provider amplification exposed
+by the same production evidence. It merged as
+`34822adbbd56d946cd21c70eebf4aa11cb8dc8ac` and release `1.1.1173`, but was not
+deployed independently before the complete read-collapse change was ready.
+
+Revision 372's remaining amplification is between the two slot heartbeats.
+After #1362 they independently execute the same fail-closed Pod, Service, and
+final live Deployment-owner reads for the same immutable PostgreSQL fence and
+cutover state. Under provider pressure that doubles identical Kubernetes API
+traffic. Moving the final live Deployment UID read earlier is not acceptable:
+it would widen the replacement race by making the owner check cease to be the
+last Kubernetes snapshot observation.
+
+PR #1367 coalesces only an identical snapshot while it is actively running:
+
+- key the in-flight task by the complete immutable controller owner/fence row
+  and frozen cutover state, and share it only for validated STABLE requests
+  with the exact same key;
+- remove the task immediately when it completes, with an identity-checked
+  callback so an older task cannot clear a newer different-key task. There is
+  no TTL, completed-result reuse, cache, or stale authority window;
+- shield the shared task from individual request cancellation so one timed-out
+  slot cannot cancel work already awaited by its peer. Snapshot success,
+  bounded failure, and subphase timings are deterministic for every waiter;
+- keep the Service-then-live-Deployment ordering and final owner
+  linearization inside `get_lb_role_snapshot` unchanged; and
+- independently re-read and compare the exact complete owner/fence/cutover row
+  under the role lock for every request before its own session-ledger update or
+  role decision. Different keys start independent tasks, and non-STABLE states
+  keep the existing locked path.
+
+Focused tests must prove that two concurrent exact-key STABLE heartbeats make
+one provider snapshot call but retain two independent fenced decisions, that a
+different fence or state is never shared, that cancelling one waiter does not
+poison its peer, that shared errors retain their deterministic fail-closed
+outcome, and that non-STABLE behavior is unchanged. The same immutable staging
+and fresh production readiness/+10/+30/+60 gates remain mandatory.
 
 ### Final-removal artifact evidence (2026-08-08)
 
