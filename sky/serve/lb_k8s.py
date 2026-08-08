@@ -701,12 +701,18 @@ def _owner_reference_identity(owner_reference) -> tuple[Any, Any, Any, Any]:
     )
 
 
-def _live_deployment_owner_uid(context: str, namespace: str,
-                               deployment_name: str) -> str | None:
+def _live_deployment_owner_uid(
+        context: str,
+        namespace: str,
+        deployment_name: str,
+        request_timeout_seconds: float | None = None) -> str | None:
     """Return a referenced Deployment's live UID, or None after deletion."""
+    request_kwargs = ({
+        '_request_timeout': request_timeout_seconds
+    } if request_timeout_seconds is not None else {})
     try:
         deployment = kubernetes.apps_api(context).read_namespaced_deployment(
-            deployment_name, namespace)
+            deployment_name, namespace, **request_kwargs)
     except kubernetes.api_exception() as e:
         if getattr(e, 'status', None) == 404:
             return None
@@ -771,9 +777,13 @@ def _require_existing_lb_object_ownership(context: str, namespace: str,
     return str(resource_version)
 
 
-def _require_existing_lb_object_live_ownership(context: str, namespace: str,
-                                               object_name: str, existing,
-                                               service_hash: str) -> str:
+def _require_existing_lb_object_live_ownership(
+        context: str,
+        namespace: str,
+        object_name: str,
+        existing,
+        service_hash: str,
+        request_timeout_seconds: float | None = None) -> str:
     """Validate a read-only LB snapshot at one live owner linearization point.
 
     Unlike mutation callers, a role snapshot does not need to construct a new
@@ -819,7 +829,8 @@ def _require_existing_lb_object_live_ownership(context: str, namespace: str,
                            'resourceVersion for the existing object.')
 
     live_owner_uid = _live_deployment_owner_uid(context, namespace,
-                                                expected_owner_name)
+                                                expected_owner_name,
+                                                request_timeout_seconds)
     if live_owner_uid != owner_identity[3]:
         raise RuntimeError(
             f'Refusing to read external load balancer object '
@@ -2900,9 +2911,35 @@ def get_lb_role_snapshot(
         context = kubernetes.in_cluster_context_name()
         namespace = get_lb_namespace()
         core_api = kubernetes.core_api(context)
+        request_timeout = (constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS
+                           if expected_state.phase
+                           is lb_ha.LbCutoverPhase.STABLE else None)
         label_selector = (f'{SERVE_LB_LABEL_KEY}={service_name},'
                           f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
         name = lb_service_name(service_name, resource_scope)
+
+        def list_pods():
+            if request_timeout is None:
+                return timed('snapshot_pod_list',
+                             core_api.list_namespaced_pod,
+                             namespace,
+                             label_selector=label_selector)
+            return timed('snapshot_pod_list',
+                         core_api.list_namespaced_pod,
+                         namespace,
+                         label_selector=label_selector,
+                         _request_timeout=request_timeout)
+
+        def read_service():
+            if request_timeout is None:
+                return timed('snapshot_service_read',
+                             core_api.read_namespaced_service, name, namespace)
+            return timed('snapshot_service_read',
+                         core_api.read_namespaced_service,
+                         name,
+                         namespace,
+                         _request_timeout=request_timeout)
+
         # These reads are independent but all are required for one authority
         # snapshot.  Joining them removes their sum from the serialized role
         # path without adding a cache or extending the snapshot's freshness
@@ -2910,16 +2947,9 @@ def get_lb_role_snapshot(
         # concurrent multi-failure retains deterministic outcome mapping.
         parent_context = contextvars.copy_context()
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            pods_future = executor.submit(parent_context.copy().run,
-                                          timed,
-                                          'snapshot_pod_list',
-                                          core_api.list_namespaced_pod,
-                                          namespace,
-                                          label_selector=label_selector)
-            service_future = executor.submit(parent_context.copy().run, timed,
-                                             'snapshot_service_read',
-                                             core_api.read_namespaced_service,
-                                             name, namespace)
+            pods_future = executor.submit(parent_context.copy().run, list_pods)
+            service_future = executor.submit(parent_context.copy().run,
+                                             read_service)
             pods = pods_future.result()
             try:
                 service = service_future.result()
@@ -2929,7 +2959,7 @@ def get_lb_role_snapshot(
             resource_version = timed(
                 'snapshot_ownership_validation',
                 _require_existing_lb_object_live_ownership, context, namespace,
-                name, service, service_hash)
+                name, service, service_hash, request_timeout)
             if expected_state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
                                         lb_ha.LbCutoverPhase.ROLLING_BACK):
                 routing: (LbServiceRouting |

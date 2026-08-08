@@ -2096,9 +2096,24 @@ class SkyServeController:
                                                        timings)
 
                 try:
-                    snapshot = await loop.run_in_executor(
-                        getattr(self, '_lb_role_executor', None), get_snapshot)
+                    snapshot = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            getattr(self, '_lb_role_executor', None),
+                            get_snapshot),
+                        timeout=serve_constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS
+                    )
                     return _StableLbRoleSnapshotRead(snapshot, timings, None)
+                except asyncio.TimeoutError:
+                    # wait_for() cannot stop a sync function that is already
+                    # running in an executor.  Return an immutable timing copy
+                    # and let this task complete so the identity-checked
+                    # callback makes the next heartbeat start a fresh read.
+                    # The late read is side-effect-free and its eventual result
+                    # is intentionally ignored.
+                    error = lb_k8s.LbRoleSnapshotRoutingError(
+                        'HA role Kubernetes snapshot exceeded its bounded '
+                        'provider deadline.')
+                    return _StableLbRoleSnapshotRead(None, dict(timings), error)
                 except Exception as e:  # pylint: disable=broad-except
                     # Return failures as task data so an individually cancelled
                     # waiter cannot leave an unobserved task exception behind.

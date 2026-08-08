@@ -28,21 +28,28 @@ queue selection.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
-final-removal artifact preserved every safety and retired-state invariant while
-failing its exact +60 heartbeat-latency comparator. PRs #1355 and #1360 merged
-two bounded snapshot-latency corrections, but production revisions 370 and 371
-both failed the stricter zero-new-timeout qualification without a safety or
-state regression. Parent PR #1362 owns the narrower remaining per-service
-role-lock serialization fix. Its immutable artifact must pass the fresh test and
-production qualification below before this cleanup record can merge.
+first final-removal artifact preserved every safety and retired-state invariant
+while failing its exact +60 heartbeat-latency comparator. PRs #1355, #1360,
+and #1362 merged bounded latency corrections; production revisions 370, 371,
+and 372 each preserved safety but failed the stricter zero-new-timeout
+qualification. PRs #1367, #1368, #1369, and #1370 complete the coalesced
+snapshot, read-collapse, and full-owner-attestation fix-forward. Their combined
+exact artifact passed the fresh `boltz-test` readiness/+10/+30 gate, but
+production revision 374 failed +30 when an unbounded shared Kubernetes owner
+read amplified one stall across both slots. The bounded task/transport deadline
+below is now stacked on PR #1373's merged dedicated-executor isolation. The
+combined exact artifact is the implementation gate. This canonical follow-up
+remains the sole R0 closeout gate after that fix passes production
+qualification.
 
 The combined HA latency fix through PRs #1367, #1369, and #1370 shipped as
 release `1.1.1176` and passed the exact `boltz-test` readiness/+10/+30 window.
-Its production +10 gate failed with one client timeout on each
+One later-clock production +10 sample failed with one client timeout on each
 `boltz-l4-fleet` slot while the service controller was under provisioning
-pressure. Safety held, but completion is now blocked on the executor-isolation
-correction and a fresh exact-artifact production readiness/+10/+30/+60 window
-defined below.
+pressure, and the binding +30 trace identified an unbounded provider read.
+Safety held, but completion is now blocked on the combined executor-isolation
+and snapshot-deadline artifact plus a fresh production
+readiness/+10/+30/+60 window defined below.
 
 The review found one smaller, independent correctness gap in the existing
 Serve controller: an ordinary replica launch records its exact API request ID
@@ -820,95 +827,174 @@ HA authority path and fail-closed behavior when the Deployment is replaced.
 The immutable rollout artifact must include #1369 together with #1367, #1368,
 and the full controller-owner attestation correction above.
 
-### HA role executor-isolation correction (2026-08-08)
+### HA role executor-isolation and snapshot-deadline correction (2026-08-08)
 
-Release `1.1.1176` points exactly to merge
-`54184f7c7046d1113077f61232045d5e8fe4d6d7`. Its source image digest is
-`sha256:68b9869f4fcc7ae8fa752443b98ed779d827c5a6d1e734bc849b58bd49617cbc`;
-its chart digest is
+PR #1369 merged as
+`b8ba790278459a5f228e0108e54f8fcfa98a8d7b`. PR #1370 then corrected the
+first #1368 implementation by deriving the complete live service hash, PID,
+normalized IP, and port on both database reads and comparing all four values to
+the controller's immutable bootstrap fingerprint before any Kubernetes snapshot
+or attestation. Its focused mismatch matrix proves that each independently
+changed component fails closed before invoking the snapshot handler. The exact
+integrated external-load-balancer, Kubernetes, proxy, and state suite passed,
+its exact head passed 30/30 CI checks, and it merged as
+`54184f7c7046d1113077f61232045d5e8fe4d6d7`.
+
+Release `1.1.1176` points exactly to that final merge. Its source image is
+`255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz@sha256:68b9869f4fcc7ae8fa752443b98ed779d827c5a6d1e734bc849b58bd49617cbc`;
+the chart OCI digest is
 `sha256:04288f5d76edaf4658a6d0204667f27cba6f6ba61c3b6a0ef9f526d62600259b`.
-Direct-Helm `boltz-test` revision 104 passed readiness, +10, and +30 with the
-same six Pod UIDs, zero restarts, no new Warning or high-signal log event,
-healthy exact-version endpoints, empty retired state, and Spot-only placement.
+The test-account mirror resolves to the same image digest. `boltz-test` Helm
+revision 104 deployed that immutable artifact with `--reuse-values`; the
+canonical non-image values before and after were byte-equivalent and migration
+104 succeeded exactly once. A temporary two-Spot-claim rollout surge returned
+to exactly 10 Spot claims, zero On-Demand claims, and zero deleting claims
+before clean T0 at 11:21:46 UTC. Readiness, +10 at 11:32:21, and +30 at
+11:52:27 passed with six exact-digest workloads Ready, zero restarts, exact
+health/version/commit, schema heads API008/Serve039/state028/capacity001, two
+fresh healthy heartbeats per role, empty private/gated state, no authority
+objects, and no post-T0 application severity or Kubernetes Warning event.
 
-Production direct-Helm revision 373 deployed the same exact chart and image on
-the unchanged three fixed `m6i.8xlarge` nodes. A concurrent operator then
-created revision 374 with the same chart, image, values, and capacity; no API
-or LB Pod UID changed and no Pod restarted. The qualification clock was
-therefore restarted from a clean revision-374 T0 at 11:57:52 UTC.
+Production preflight rendered digest
+`236a230e92356fbf43d312f3e0156430b3279883fcb648380e269968acbdf1ef`.
+The fixed node group remained min/max/desired/actual 3/3/3/3 on the same three
+`m6i.8xlarge` instances: `i-003a087558f131dc8`,
+`i-01d341c152ac226b3`, and `i-084d983ca017ad5d8`. A concurrent operator
+deployed the same exact `1.1.1176` artifact as Helm revision 373 at 11:47:18
+UTC, five minutes before the staging +30 gate unlocked promotion. This is an
+explicit sequencing-contract departure; it does not waive the staging or
+production evidence gates. After staging +30 passed, the authorized
+`--reuse-values` deployment of the identical chart and image completed as
+revision 374 at 11:53:31 UTC without `--atomic` or a capacity change. Canonical
+non-image values are unchanged from revision 372, and both forward-only
+migration jobs 373 and 374 succeeded once with zero failures.
 
-The production +10 checkpoint at 12:08:06 UTC failed the exact behavior gate.
-Each `boltz-l4-fleet` slot added one `client_timeout` outcome. The clients
-timed out at 12:06:15/12:06:16 UTC and recovered in 4.974/4.738 seconds. The
-controller returned those requests with HTTP 200 only at
-12:06:20.746/12:06:20.818 UTC, after the previous pair had completed at
-12:06:05.350/12:06:05.411 UTC. Other services' role requests continued to
-complete throughout that interval. All 17 exact-digest API/LB Pods remained
-Ready with zero restarts, all eight pairs retained the correct ACTIVE/STANDBY
-roles and complete owner/cutover state, the schema and retired-state gates
-remained clean, no Warning event was added, and fixed capacity was unchanged.
-This is another fix-forward latency failure, not a rollback trigger.
+Production reached a clean exact-artifact T0 at 11:55:42 UTC. All 17 API and
+load-balancer workloads were Ready on the exact digest with zero restarts; all
+eight service pairs were `STABLE`, converged, synced, non-draining, correctly
+routed, and split one ACTIVE/one STANDBY; all 16 capacity endpoints succeeded;
+health reported version `1.1.1176` and the exact merge; the four schema heads,
+fresh heartbeat, empty retired/private/gated state, and absent authority-object
+checks passed. The +10 sample at 12:05:55 also passed with no pod or node
+identity change, no non-success outcome delta, no active or recovered failure,
+no eight-second role/controller/phase bucket, no Kubernetes Warning-event
+delta, and no application severity since T0. The large-fleet pair added 243/242
+successful observations; its role p99 was 3.20/2.94 seconds and controller p99
+was 2.39/2.30 seconds. The three exact ASG members remained `InService` and
+healthy at 3/3/3/3.
 
-The failing Kubernetes selector names one service incarnation and returned
-exactly its two LB Pods, so neither an unbounded Pod payload nor cross-service
-API-server failure explains this service-local stall. The live controller log
-shows fleet-wide sync and readiness-probe rounds over roughly 89 backends in
-the same process around the failure. Unrelated service controllers remained
-responsive. The role path currently submits both PostgreSQL authority reads
-and the shared Kubernetes snapshot to the controller event loop's default
-executor; fleet sync uses that same executor, while readiness probes use a
-separate high-fan-out pool in the same process. The cancelled requests did not
-publish their phase traces, so this evidence does not distinguish default-pool
-queue wait from PostgreSQL, Kubernetes, or process-wide scheduling delay. It
-does prove that the safety-critical role path retains an avoidable shared
-executor dependency and needs queue-delay telemetry. It does not justify
-weakening an owner fence, increasing the eight-second deadline, or reusing a
-completed authority snapshot.
+The binding +30 sample at 12:25:55 failed the intended-behavior gate without a
+safety regression. Between T0 and that sample, each large-fleet slot added five
+`client_timeout` outcomes and entered the eight-second role bucket. Both slots
+recovered to `last_outcome=success` and the correct ACTIVE/STANDBY split, but
+their maximum failure-recovery durations were 29.42/29.93 seconds. The shared
+snapshot's final live Deployment-UID validation reached 32.90 seconds. Because
+#1367 deliberately shields and shares an identical in-flight snapshot, every
+heartbeat arriving during that provider stall joined the same unbounded task;
+one slow owner read was therefore amplified into a roughly 30-second role
+failure streak. A route-lease 503 and later sync 503 corroborate the interval.
+All 17 workloads remained Ready with zero restarts, all eight pairs stayed safe,
+the four schema/empty-state gates and Kubernetes Warning-event gate remained
+clean, and the fixed ASG remained 3/3/3/3 on the same healthy members. Revision
+374 remains deployed because revision 372 has the same latency defect and there
+is no safety rollback trigger. The failed monotonic window stops before +60 and
+cannot qualify R0.
 
-The bounded correction is:
+The next bounded fix-forward gives a shared STABLE snapshot one three-second
+task-creation deadline. That remains above the observed 1.61-second snapshot
+p99 while leaving headroom inside both the six-second report-freshness limit
+and the eight-second client timeout. Every waiter observes the same deadline;
+a late joiner cannot extend it. On expiry, the controller returns the existing
+fail-closed routing-unavailable outcome, removes that exact task from the
+shareable slot, ignores any eventual executor result, and permits the next
+heartbeat to start a fresh fenced snapshot. The underlying Pod, Service, and
+final Deployment Kubernetes calls also receive the same three-second transport
+deadline so abandoned executor work cannot accumulate without bound. No partial
+or expired snapshot is cached or consumed; every successful retry still
+performs the final live Deployment-UID validation and under-lock exact database
+revalidation, and all transition/mutation paths remain unchanged. Focused tests
+must prove a hung provider read is shared only until the fixed deadline, both
+waiters fail closed below the client budget, a later fresh read can succeed
+without a stale completion clearing or replacing it, transport deadlines cover
+all three role snapshot reads, cancellation remains isolated, and non-STABLE
+behavior is unchanged. Completion again requires an exact immutable artifact
+and fresh staging readiness/+10/+30 followed by production
+readiness/+10/+30/+60 on the unchanged capacity, with zero `client_timeout`
+delta, failure recovery at most 15 seconds, and every safety/state/log/event
+gate passing.
 
-- Every HA controller owns one two-worker role executor. All blocking work
-  entered by `_handle_load_balancer_role`, including the pre-lock and
-  under-lock PostgreSQL reads, the shared STABLE Kubernetes snapshot, and
-  serialized transition operations, runs on this executor. Ordinary
-  provisioning, autoscaling, sync, and unrelated controller work remain on the
-  default executor and cannot occupy or queue ahead on the role executor. This
-  does not claim to isolate PostgreSQL capacity, Kubernetes latency, the GIL,
-  or the readiness-probe pool; the exact rollout gate remains authoritative.
-- The executor changes only scheduling isolation. The complete owner/fence and
-  cutover record is still read before the Kubernetes snapshot and compared
-  byte-for-byte with a second read under the role lock. The exact Service then
-  live-Deployment owner ordering, in-flight-only snapshot sharing, session
-  ledger, state machine, demand lock, and every mutation fence remain
-  unchanged. There is no TTL, completed-result cache, fallback authority, or
-  added capacity.
-- Two workers are sufficient for the two independently arriving slot
-  pre-reads while the identical STABLE provider snapshot remains coalesced.
-  The pool is fixed-size, created only for HA controllers, and shut down by the
-  controller lifespan. Executor queue delay is exposed separately from the
-  blocking operation's total latency so a future scheduling regression is
-  attributable.
+A concurrent monitor reset its revision-374 clock at 11:57:52 UTC. Its +10
+sample at 12:08:06 caught the first timeout from the same failed window: each
+large-fleet slot added one `client_timeout` at 12:06:15/12:06:16 and recovered
+in 4.974/4.738 seconds, while unrelated service controllers remained
+responsive. The Kubernetes selector returned exactly the two Pods for one
+service incarnation, and fleet sync/readiness work was active in the same
+controller process. Because cancelled clients did not publish their controller
+phase trace, that earlier sample could not distinguish default-executor queue
+delay from a PostgreSQL, Kubernetes, GIL, or process-scheduling stall.
 
-Focused tests must saturate a one-worker default executor, prove it is still
-blocked, and require a real HA role request to return the exact intended role
-through the dedicated executor. Existing exact-key sharing, cancellation,
-owner replacement, complete-row mismatch, non-STABLE transition, and all
-external-load-balancer suites remain mandatory. Completion requires a new
-immutable exact-merge artifact, direct-Helm staging readiness/+10/+30, and a
-fresh direct-Helm production readiness/+10/+30/+60 window with zero incremental
+PR #1373 therefore made the independently justified scheduling correction. It
+gives every HA controller a fixed two-worker role executor for all blocking
+work in `_handle_load_balancer_role`, including both PostgreSQL reads, the
+shared STABLE snapshot, and serialized transition work. Ordinary provisioning,
+autoscaling, sync, and unrelated controller work remain on the default
+executor. The pool is created only for HA controllers, is shut down by the
+controller lifespan, and exposes queue delay separately from blocking-operation
+latency. A focused test saturates the default executor and still requires a
+real role request to return the intended role. PR #1373's exact head passed all
+CI checks and 494 selected tests, and merged as
+`5c399d5dfa65b711d5c24010111eeef9054d3a3e`.
+
+Executor isolation is complementary to, not a replacement for, the provider
+deadline. The binding +30 trace measured 32.90 seconds inside
+`snapshot_ownership_validation`, after the dedicated executor job would have
+started. A dedicated worker prevents unrelated default-executor work from
+queuing ahead of authority reads, but it cannot bound an already-running
+Kubernetes Deployment GET. Deploying #1373 alone therefore cannot satisfy the
+observed failure contract and is not a qualification candidate.
+
+The stacked bounded correction retains #1373 and adds these invariants:
+
+- The shared STABLE snapshot has one three-second deadline measured from task
+  creation. That is above the observed healthy 1.61-second snapshot p99 and
+  leaves retry and proxy/database headroom inside the six-second report-age
+  limit and eight-second client timeout. Every exact-key waiter observes the
+  same deadline; a late join cannot extend it.
+- On expiry, every waiter receives the existing fail-closed
+  `routing_unavailable` outcome, the exact task is removed from the shareable
+  slot, and its eventual side-effect-free executor result is ignored. A later
+  heartbeat starts a fresh fenced read, and an old identity-checked completion
+  cannot clear a newer task.
+- The STABLE Pod LIST, Service GET, and final live Deployment UID GET each use
+  the same three-second Kubernetes transport timeout. This bounds abandoned
+  workers as well as asyncio waiters. Non-STABLE transition and mutation paths
+  retain their existing transport behavior because timing them out could leave
+  an ambiguous write or transition.
+- The complete owner/fence/cutover record is still read before the Kubernetes
+  snapshot and compared byte-for-byte under the role lock. Every successful
+  retry still performs Service-then-live-Deployment validation. Session-ledger,
+  state-machine, demand-lock, transition, and mutation fences are unchanged.
+  There is no TTL, completed-result cache, fallback authority, stale result, or
+  capacity change.
+
+Focused tests must jointly prove default-executor isolation, fixed shared-task
+expiry for both slots, a late waiter's inability to extend the deadline, fresh
+retry while the expired synchronous read is still blocked, late-result
+isolation, all three STABLE transport timeouts, cancellation isolation, and no
+timeout keyword on non-STABLE reads. The complete external-load-balancer,
+owner-replacement, exact-key, complete-row mismatch, and transition suites
+remain mandatory. Completion requires one immutable merge containing both
+corrections, direct-Helm staging readiness/+10/+30, and a fresh direct-Helm
+production readiness/+10/+30/+60 window with zero incremental
 `client_timeout`, no role/controller/phase observation in the eight-second
 bucket, recovery at most 15 seconds, unchanged fixed capacity, and every
-safety, state, schema, event, log, health, and restart gate passing.
-
-Local pre-PR verification passed on 2026-08-08. The selected 21-file HA,
-external-load-balancer, controller-proxy, controller-event-loop, and controller
-hard-exit suite passed with exit code zero (493 tests before the final
-lifecycle test was added). A focused rerun then passed both the default-pool
-saturation behavior test and the executor-lifespan shutdown test, bringing the
-distinct selected coverage to 494 tests. The repository's configured mypy set
-passed for 884 source files, Pylint rated all three changed Python files
-10.00/10, and `git diff --check` passed. CI and both exact-artifact deployment
-windows remain open gates.
+safety, state, schema, event, log, health, and restart gate passing. The
+combined local verification passed: eight focused executor/deadline/transport
+cases and the complete 21-file controller/external-load-balancer selection
+passed with 912 tests, the configured mypy run passed 884 source files, Pylint
+rated the changed Python files 10.00/10, dashboard lint/format passed, and
+`git diff --check` passed. Exact-head CI and both deployment windows remain open
+gates.
 
 ### Final-removal artifact evidence (2026-08-08)
 
@@ -1320,11 +1406,19 @@ approved canary:
   revision 98 passed its fresh readiness/+10/+30 window; production revision
   371 preserved every safety and state invariant but failed the monotonic
   zero-new-timeout gate by its first post-T0 sample.
-- [ ] Pass PR #1362 exact-head CI, merge it, and qualify its exact immutable
-  artifact on `boltz-test` through fresh readiness/+10/+30 without On-Demand
-  capacity. Then deploy the same artifact to production with `--reuse-values`
-  on the fixed three-node capacity and pass fresh readiness/+10/+30/+60 gates,
-  including zero `client_timeout` delta and the exact issue-#1349 comparator.
+- [x] Merge PR #1362 and qualify its exact immutable artifact on `boltz-test`.
+  Production revision 372 preserved every safety and state invariant but failed
+  its +10 intended-behavior gate with 21 new timeouts per large-fleet slot.
+- [x] Merge PRs #1367, #1368, #1369, and #1370; qualify their combined exact
+  `1.1.1176` artifact on `boltz-test`; and deploy it to production on unchanged
+  capacity. Revision 374 passed readiness/+10 but failed +30 with five new
+  timeouts per slot and a 32.90-second shared owner-validation read.
+- [ ] Pass exact-head CI and merge the bounded shared-snapshot deadline fix.
+  Qualify its immutable artifact on `boltz-test` through fresh
+  readiness/+10/+30 without On-Demand capacity, then deploy the same artifact
+  to production with `--reuse-values` on the fixed three-node capacity and pass
+  fresh readiness/+10/+30/+60 gates, including zero `client_timeout` delta,
+  recovery at most 15 seconds, and the exact issue-#1349 comparator.
 - [x] Complete PR #1346's production monitoring. Revision 369 deployed the
   exact artifact and passed its readiness, +10, +30 safety/state, sync-rate,
   and 60-second recovery-safety gates. Its exact +60 comparison failed at 64
@@ -1338,7 +1432,8 @@ approved canary:
 - [ ] R2 only: obtain named capacity approval before any positive launch/down
   crash canary or any rollout that invalidates the zero-capacity bound.
 
-Until PR #1362's production monitor and this stacked canonical follow-up merge,
-the dedicated authority-stack retirement is not production-complete. The bounded
+Until the bounded shared-snapshot deadline artifact passes its production
+monitor and this stacked canonical follow-up merges, the dedicated
+authority-stack retirement is not production-complete. The bounded
 request-binding follow-up remains independently incomplete until issue #1352
 satisfies the R1/R2 evidence above.

@@ -1906,9 +1906,16 @@ def test_role_snapshot_reuses_owner_pods_and_service(monkeypatch):
     owner_read.assert_not_called()
     core.list_namespaced_pod.assert_called_once()
     core.read_namespaced_service.assert_called_once()
+    expected_timeout = constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS
+    assert (core.list_namespaced_pod.call_args.kwargs['_request_timeout'] ==
+            expected_timeout)
+    assert (core.read_namespaced_service.call_args.kwargs['_request_timeout'] ==
+            expected_timeout)
     # The Service supplies the expected owner identity.  One subsequent live
     # Deployment read proves that exact UID without an earlier duplicate GET.
     assert apps.read_namespaced_deployment.call_count == 1
+    assert (apps.read_namespaced_deployment.call_args.kwargs['_request_timeout']
+            == expected_timeout)
     assert set(timings) == {
         'snapshot_pod_list',
         'snapshot_service_read',
@@ -2138,7 +2145,7 @@ def test_role_snapshot_live_owner_validation_rejects_malformed_identity(
 @pytest.mark.parametrize('legacy_selected', [False, True])
 def test_role_snapshot_transition_routing_matches_existing_contract(
         monkeypatch, phase, legacy_selected):
-    _, core = _install(monkeypatch, db_service_names=('svc',))
+    apps, core = _install(monkeypatch, db_service_names=('svc',))
     desired_revision = 'b' * 64
     owner = {
         'hash': 'incarnation',
@@ -2194,6 +2201,11 @@ def test_role_snapshot_transition_routing_matches_existing_contract(
     assert snapshot.routing == lb_k8s.LbServiceTransitionRouting(
         None if legacy_selected else lb_ha.LbSlot.A, legacy_selected,
         None if legacy_selected else 3, 'lb-service-rv', desired_revision)
+    assert '_request_timeout' not in core.list_namespaced_pod.call_args.kwargs
+    assert ('_request_timeout'
+            not in core.read_namespaced_service.call_args.kwargs)
+    assert ('_request_timeout'
+            not in apps.read_namespaced_deployment.call_args.kwargs)
 
 
 def test_external_lb_logs_come_from_current_pod(monkeypatch, capsys):
