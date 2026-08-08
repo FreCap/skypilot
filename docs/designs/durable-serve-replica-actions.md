@@ -1049,6 +1049,41 @@ recorded no Warning event inside the window through +10. The access-log rate
 and +60 latency thresholds remain open and are not inferred from these raw
 client-timeout counters.
 
+The exact +30 window ended at 05:10:17 UTC. Safety and cleanup-state checks
+passed: all 17 workloads remained Ready on the final digest with zero restarts;
+all eight HA pairs remained `STABLE`, correctly routed, synced, non-draining,
+and converged; health, schema heads, empty gated/private state, authority-object
+absence, and the fixed three-node capacity bound were unchanged. The exact
+access-log result was 21 gaps in 1,800 seconds, 971 role completions all HTTP
+200, and one controller sync 503 in 82 attempts (1.2195%). That 04:59:07 sync
+failure had matching proxy/controller/LB records and recovered on the next
+cycle. The window contained 17 ACTIVE-retaining and 14 STANDBY-retaining
+#1349 warnings, no other application warning or severe signature, and no
+Kubernetes Warning event.
+
+The +30 process metrics remained within every +60 ceiling: role p99 was
+8.998/8.990 seconds, controller p99 7.254/7.598, lock-wait maximum 6.500/7.669,
+lock-hold p99 6.849/6.459, pod-authority maximum 7.732/6.703, and routing-read
+maximum 6.043/7.579 for ACTIVE/STANDBY. Both slots ended in success with no
+active failure streak; maximum recovered-failure duration was 21.477/14.778
+seconds, below the cleanup gate's 60-second safety limit but not the stricter
+#1349 qualification. After +30, a second correlated sync 503 recovered at
+05:14:00 UTC. At 05:15:03.842 UTC the exact role-gap numerator reached 25 in
+2,086.842 seconds (43.127/hour), irreversibly exceeding the at-most-24 +60
+limit. Revision 369 therefore cannot close R0 even though its safety and
+retired-state invariants remain intact. The bounded #1349 fix must pass a fresh
+window before the retirement can be declared production-complete.
+
+PR #1355 owns that bounded fix. It replaces the duplicated steady-role Pod and
+Service authority reads with one fail-closed snapshot under the existing role
+lock. The snapshot keeps the PostgreSQL owner/hash/lifecycle/state fence,
+incarnation-scoped Pod UIDs and slots, exact Service ownership and
+resourceVersion, runtime revision, and both live API Deployment UID reads. It
+reduces the successful steady heartbeat from seven sequential Kubernetes
+requests to four without caching authority or adding another execution path.
+Its exact-head CI, merge, immutable-artifact rollout, and fresh 60-minute
+production comparison remain open.
+
 ### R0 manual test plan
 
 Before the compatibility deployment, run the focused Python tests for the
@@ -1159,10 +1194,15 @@ approved canary:
   passed, and physical capacity returned to the 10-node / 80-vCPU baseline.
 - [ ] Merge this canonical follow-up after it records the complete production
   monitor and the third deployment-sequencing departure.
+- [ ] Merge PR #1355 after exact-head CI, deploy its immutable artifact with
+  zero incremental provider capacity, and pass a fresh readiness, +10, +30,
+  and exact 60-minute production window before closing the failed comparator.
 - [ ] Complete PR #1346's production monitoring. Revision 369 deployed the
   exact artifact, all 17 workloads converged at 04:40:17 UTC, and the readiness
-  and +10-minute audits passed; +30 and the issue-#1349-aware +60-minute
-  comparison must still pass before closing R0.
+  and +10-minute audits passed. The +30 safety/state audit passed, but the
+  issue-#1349-aware comparison irreversibly failed at 25 gaps before +60; a
+  bounded fix and fresh passing production window are required before closing
+  R0.
 - [x] Record R1 ownership and its telemetry-first disposition: issue #1352 owns
   an existing-executor durable binding; it is independent of R0 and must not
   revive the authority stack.
