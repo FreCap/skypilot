@@ -1917,7 +1917,7 @@ def test_role_snapshot_joins_independent_kubernetes_reads(monkeypatch):
     ])
     deployment = SimpleNamespace(metadata=SimpleNamespace(
         uid='api-deployment-uid'))
-    reads_started = threading.Barrier(3, timeout=5)
+    reads_started = threading.Barrier(2, timeout=5)
     deployment_call_lock = threading.Lock()
     deployment_calls = 0
     caller_context = contextvars.ContextVar('role_snapshot_caller_context')
@@ -1937,10 +1937,7 @@ def test_role_snapshot_joins_independent_kubernetes_reads(monkeypatch):
         nonlocal deployment_calls
         with deployment_call_lock:
             deployment_calls += 1
-            first_read = deployment_calls == 1
-        if first_read:
-            assert caller_context.get() == 'controller-request'
-            reads_started.wait()
+        assert caller_context.get() == 'controller-request'
         return deployment
 
     core.list_namespaced_pod.side_effect = list_pods
@@ -1963,8 +1960,9 @@ def test_role_snapshot_joins_independent_kubernetes_reads(monkeypatch):
         'slot-a': lb_ha.LbSlot.A,
         'slot-b': lb_ha.LbSlot.B,
     }
-    # The post-join owner validation remains a second live Deployment read.
-    assert deployment_calls == 2
+    # The Service carries the expected identity; one post-join live read is the
+    # final owner-replacement linearization point.
+    assert deployment_calls == 1
 
 
 def test_role_snapshot_fails_closed_on_malformed_shared_service(monkeypatch):

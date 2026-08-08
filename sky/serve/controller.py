@@ -2100,6 +2100,44 @@ class SkyServeController:
                 demand_transition_cancellation = None
                 raise cancellation  # pylint: disable=raising-bad-type
 
+        # A steady role snapshot is read-only, but an occasionally slow
+        # Kubernetes read used to hold the per-service transition lock and
+        # force the peer slot to queue behind it.  Prefetch only a fully
+        # validated STABLE snapshot.  The exact controller fence and frozen
+        # cutover state are re-read under the lock before this snapshot can
+        # influence the session ledger, role decision, or a planned cutover.
+        prefetched_fence = await trace.run_in_executor(loop,
+                                                       'postgresql_fence_read',
+                                                       self._lb_cutover_fence)
+        prefetched_state: lb_ha.LbCutoverState | None = None
+        prefetched_snapshot: lb_k8s.LbRoleSnapshot | None = None
+        if prefetched_fence is not None:
+            prefetched_state = await trace.run_in_executor(
+                loop, 'postgresql_cutover_state_read',
+                serve_state.get_lb_cutover_state, self._service_name)
+        if (prefetched_state is not None and prefetched_state.enabled and
+                prefetched_state.active_slot is not None and
+                prefetched_state.lifecycle_epoch == prefetched_fence[2] and
+                prefetched_state.phase is lb_ha.LbCutoverPhase.STABLE):
+            prefetched_timings: dict[str, float] = {}
+            try:
+                prefetched_snapshot = await trace.run_in_executor(
+                    loop, 'kubernetes_role_snapshot',
+                    lb_k8s.get_lb_role_snapshot, self._service_name,
+                    prefetched_fence, prefetched_state, prefetched_timings)
+            except lb_k8s.LbRoleSnapshotStateMismatchError:
+                trace.add_phases(prefetched_timings)
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+            except lb_k8s.LbRoleSnapshotRoutingError:
+                trace.add_phases(prefetched_timings)
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
+            trace.add_phases(prefetched_timings)
+            if prefetched_snapshot is None:
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+
         lock_wait_started_at = time.monotonic()
         async with role_lock:
             trace.lock_acquired(lock_wait_started_at)
@@ -2116,24 +2154,31 @@ class SkyServeController:
                     state.lifecycle_epoch != fence[2]):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
-            snapshot_timings: dict[str, float] = {}
-            try:
-                snapshot = await trace.run_in_executor(
-                    loop, 'kubernetes_role_snapshot',
-                    lb_k8s.get_lb_role_snapshot, self._service_name, fence,
-                    state, snapshot_timings)
-            except lb_k8s.LbRoleSnapshotStateMismatchError:
+            if prefetched_snapshot is not None:
+                if (fence != prefetched_fence or state != prefetched_state or
+                        state.phase is not lb_ha.LbCutoverPhase.STABLE):
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+                snapshot = prefetched_snapshot
+            else:
+                snapshot_timings: dict[str, float] = {}
+                try:
+                    snapshot = await trace.run_in_executor(
+                        loop, 'kubernetes_role_snapshot',
+                        lb_k8s.get_lb_role_snapshot, self._service_name, fence,
+                        state, snapshot_timings)
+                except lb_k8s.LbRoleSnapshotStateMismatchError:
+                    trace.add_phases(snapshot_timings)
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+                except lb_k8s.LbRoleSnapshotRoutingError:
+                    trace.add_phases(snapshot_timings)
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
                 trace.add_phases(snapshot_timings)
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
-            except lb_k8s.LbRoleSnapshotRoutingError:
-                trace.add_phases(snapshot_timings)
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
-            trace.add_phases(snapshot_timings)
-            if snapshot is None:
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+                if snapshot is None:
+                    return role_response(
+                        lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
             authority = snapshot.authority
             routing = snapshot.routing
             if (session_id not in authority.live_uids or

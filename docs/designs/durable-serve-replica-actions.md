@@ -505,6 +505,53 @@ compatibility diff only deletes an unexecuted disabled-authority preflight
 branch. This is a separate scale-latency issue tracked in #1349, not a retired
 authority state/effect or unsafe role-transition signal.
 
+### HA role latency fix-forward contract (2026-08-08)
+
+The first two bounded #1349 fixes preserved safety but did not meet the exact
+latency gate. Production revision 370 shared the Pod and Service reads, yet the
+two large-fleet slots each added 14 clean-window `client_timeout` outcomes.
+Revision 371 parallelized the independent Pod, Service, and first Deployment
+reads. After clean T0 at 07:48:28 UTC, both slots timed out again at 07:52:20
+UTC. One validated Kubernetes snapshot took 5.53 seconds while its peer waited
+7.40 seconds on the per-service role lock; end-to-end role time reached 8.999
+seconds. All eight pairs retained one ACTIVE and one STANDBY, stayed synced and
+non-draining, and all 17 Pods remained Ready with zero restarts. The source is
+therefore serialized read-side head-of-line blocking, not provider capacity or
+an authority-fence failure.
+
+The next fix-forward removes that blocking only for a validated STABLE
+read-only snapshot:
+
+- Read the controller fence, durable cutover state, and fail-closed Kubernetes
+  role snapshot before acquiring the per-service transition lock. Concurrent
+  slot heartbeats may overlap these independent reads.
+- Enter the existing role lock and re-read both the controller fence and the
+  complete frozen cutover state. Use the prefetched snapshot only when both are
+  byte-for-byte equal and the phase remains STABLE; otherwise return the
+  existing fail-closed `cutover_state_unavailable` outcome and retry from a new
+  snapshot.
+- Keep every MIGRATING, ROLLING_BACK, PREPARING, DRAINING, planned promotion,
+  selector patch, database transition, session-ledger update, and drain-view
+  publication under the existing lock. No prefetched observation can cross a
+  durable transition.
+- For the read-only snapshot, use the Service's exact API Deployment
+  ownerReference as the expected identity, then perform one live Deployment UID
+  read after the Service and require equality. This preserves the prior final
+  replacement linearization point while removing the redundant earlier GET.
+  Mutation callers retain their existing two-read owner fence.
+
+Focused tests must prove that two 143-backend STABLE slot heartbeats overlap
+their snapshot reads, then serialize only the short exact fence/state
+revalidation and decision tail. They must also prove that any fence or state
+change rejects the prefetch, that non-STABLE phases never prefetch, that
+malformed/replaced owners fail closed, and that transition mutation ordering is
+unchanged. Completion still requires one immutable exact-merge artifact, direct
+Helm staging and production rollouts on the existing fixed capacity, and a fresh
+readiness/+10/+30/+60 production window with zero `client_timeout` delta,
+recovered failures at most 15 seconds, no role/controller/phase observation in
+the eight-second bucket, and every safety, health, schema, state, event, and log
+gate passing.
+
 ### Final-removal artifact evidence (2026-08-08)
 
 PR #1346's exact code head
