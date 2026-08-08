@@ -478,18 +478,35 @@ runtime-authority assertion by its canonical schema-qualified name.  The
 application discovers that canonical schema from exactly one persistent
 `alembic_version_serve_state_db = '040'` relation colocated with the assertion,
 gate, and both ledger relations; it never trusts caller-controlled
-`current_schema()` or unqualified name resolution.  The assertion verifies the
-complete 040 catalog, its exact relation/function OIDs, and one coherent open
-or terminal singleton.  The writer-facing interface additionally requires the
-singleton to be open and proves that its own backend still holds the unchanged
-session advisory lock before authoritative DML and again immediately before
-commit.  The operator rejects any same-session `pg_my_temp_schema()` relation
-or assertion-function shadow in its write/read set, binds all SQLAlchemy tables
-to the asserted canonical schema, and schema-qualifies its raw table locks;
-PostgreSQL's implicit `pg_temp` precedence therefore cannot redirect either the
-proof or authoritative DML.  A writer whose preflight overlaps a completed
-preterminal downgrade aborts before DML even if it reaches the advisory lock
-only after downgrade released it.
+`current_schema()` or unqualified name resolution.  Before invoking the
+database function, the application compares its complete `prosrc` byte string
+with the exact expected definition regenerated from the compiled, frozen
+revision-040 contract; function name, owner, signature, configuration, or a
+self-reported `true` result is never a trust root.  The colocated Alembic
+version relation also has an exact application-verified envelope: one
+nonpartitioned persistent ordinary relation, owner-only ACL, no RLS,
+inheritance, rewrite rule, trigger, index, constraint, or default, and exactly
+one nonnullable `varchar(32)` local column named `version_num` containing the
+single value `040`.  The schema-qualified assertion then verifies the complete
+040 catalog, its exact relation/function OIDs, and one coherent open or terminal
+singleton.
+
+There are three named application interfaces rather than one boolean flag.  A
+reader assertion accepts exact open or terminal state and retains an `ACCESS
+SHARE` lock on the canonical gate through its transaction.  A writer assertion
+additionally requires open state and proves that its own physical backend holds
+the unchanged session advisory lock.  A downgrade assertion additionally
+requires open state while relying on downgrade's already-held transaction
+advisory lock.  The writer proves its session lock before authoritative DML and
+again immediately before commit; the same physical connection retains it until
+commit or rollback returns, and only then explicitly releases it.  The operator
+rejects any same-session `pg_my_temp_schema()` relation or assertion-function
+shadow in its write/read set, binds all SQLAlchemy tables to the asserted
+canonical schema, and schema-qualifies its raw table locks; PostgreSQL's
+implicit `pg_temp` precedence therefore cannot redirect either the proof or
+authoritative DML.  A writer whose preflight overlaps a completed preterminal
+downgrade aborts before DML even if it reaches the advisory lock only after
+downgrade released it.
 
 The PostgreSQL ledger is an append-only authority, not a self-authenticating
 JSON document.  Schema revision 040 installs `ENABLE ALWAYS` database triggers
@@ -552,6 +569,17 @@ restricting foreign keys to the run ledger.  The initial row is exactly
 `(true, 0, NULL, NULL, NULL, NULL)`, and upgrade refuses any pre-existing
 protocol-4 terminal tuple instead of seeding an incoherent open fence.
 
+Catalog verification also binds that structural row to immutable ledger
+semantics.  A nonzero generation's latest run must exist and its `xmin` must
+equal `admitted_xid`.  Open state is valid only when no committed exact
+protocol-4 `historical_physical_per_gpu/retired` tuple exists anywhere in the
+ledger.  Terminal state is valid only when the latest run is exact protocol 4
+terminal mode, at least one exact retired row belongs to it, the run and every
+such terminal row have `xmin` equal to `terminal_xid`, and the terminal and
+admission XIDs are equal.  Thus restored trigger definitions cannot make an
+open gate coexist with old terminal evidence or make a fabricated terminal
+gate point at a missing, wrong, or different-transaction tuple.
+
 `ENABLE ALWAYS` singleton triggers reject every direct `INSERT`, `DELETE`, or
 `TRUNCATE`.  Its `UPDATE` guard accepts only one of the two exact state
 transitions above at trigger depth two.  This is not a depth-only bypass: an
@@ -580,9 +608,12 @@ migration failure, not an adoptable state.
 
 Downgrade is serialized with the writer rather than relying on a point-in-time
 terminal query.  It must first acquire the same advisory transaction lock
-without waiting, then take fixed-order `ACCESS EXCLUSIVE` locks on the
-singleton, run ledger, and row ledger, reverify the exact catalog and singleton,
-and recheck terminal state before removing revision 040.  If a writer owns the
+without waiting, resolve the same unique compiled revision-040 identity while
+rejecting temporary shadows, then take fixed-order `ACCESS EXCLUSIVE` locks on
+those exact schema/OID-qualified singleton, run-ledger, and row-ledger
+relations.  It reverifies the exact catalog and open singleton after those
+locks and schema/OID-qualifies every trigger/function removal and gate drop;
+`current_schema()` never chooses a downgrade target.  If a writer owns the
 advisory authority, downgrade fails busy; if downgrade owns it first, a writer
 fails its nonblocking session-lock attempt instead of waiting to enter after the
 catalog removal commits.  If downgrade finishes before that attempt begins, the
@@ -681,11 +712,16 @@ schema identity and invokes the same schema-qualified database-authority
 assertion on the exact ORM connection that reads the receipt.  It accepts a
 coherent open or terminal gate because predecessor receipts remain readable
 after terminal retirement, rejects temporary shadows for every receipt
-relation and the assertion function, and applies the canonical schema map
-before its first table query.  The acknowledgement path repeats that proof
-inside its service-owner/advisory transaction before locking or CASing the
-receipt.  SQLite remains only the existing local/controller test-store path and
-does not pretend to provide this central PostgreSQL authority.
+relation and the assertion function, applies the canonical schema map before
+its first table query, and acquires `ACCESS SHARE` on the exact gate.  Resolver,
+compiled-definition check, database assertion, schema binding, complete bounded
+manifest/live reads, validation, and the returned decision all occur in that
+one uninterrupted ORM transaction; the gate lock prevents downgrade's
+`ACCESS EXCLUSIVE` removal until it ends.  The acknowledgement path repeats
+that proof inside its service-owner/advisory transaction and retains the gate
+lock through receipt CAS commit or rollback.  SQLite remains only the existing
+local/controller test-store path and does not pretend to provide this central
+PostgreSQL authority.
 The protocol-1 through protocol-3 validators retain the historical
 `same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
 must neither emit nor accept that fact: its complete stale-placeholder
@@ -1619,11 +1655,15 @@ Automated coverage must prove:
   race downgrade and terminal admission in both lock orders, including a writer
   whose external preflight predates a downgrade but whose session-lock attempt
   follows its commit, and require exactly one authority to proceed; require the
-  runtime-authority assertion to reject an absent, terminal, or catalog-drifted
-  040 installation before writer DML; require reader assertion to accept the
-  exact terminal installation but reject a missing/wrong/duplicate revision
-  identity, catalog drift, or a terminal UUID inconsistent with the immutable
-  run; create same-session temporary shadows for the assertion name and each
+  named writer assertion to reject an absent, terminal, lock-lost, or
+  catalog-drifted 040 installation before writer DML; require the named reader
+  assertion to accept the exact terminal installation but reject a
+  missing/wrong/duplicate revision identity, any version-table envelope or
+  assertion-body substitution, catalog drift, an open gate with any committed
+  terminal row, or a terminal gate with a missing/wrong-row or xid-mismatched
+  immutable run; hold a reader gate lock while a concurrent downgrade attempts
+  removal and prove downgrade cannot pass until the complete read/return or
+  acknowledgement commit ends; create same-session temporary shadows for the assertion name and each
   operator or receipt relation and prove the schema-qualified assertion plus
   canonical-schema SQL binding rejects them before DML; tamper
   with every singleton
