@@ -1119,8 +1119,12 @@ resourceVersion, runtime revision, and both live API Deployment UID reads. It
 reduces the successful steady heartbeat from seven sequential Kubernetes
 requests to four without caching authority or adding another execution path.
 Its 203 focused tests and exact-head CI passed, and PR #1355 merged as
-`606b4b29703dd2a6e69f57e49db685e85a3c6468`. Immutable-artifact publication,
-the zero-incremental-capacity rollout, and a fresh 60-minute production
+`606b4b29703dd2a6e69f57e49db685e85a3c6468`. Release `1.1.1166` points exactly
+to that merge; its source image digest is
+`sha256:ad1fe699b9b940d669f6161cafcd1d719a5d8e4742572854adc9a7b5bf0c2013`
+and chart digest is
+`sha256:520ffca476dfcdeb8b10a90ce3403a956e9035dc4aeeac3f261951695a7c84e4`.
+The zero-incremental-capacity rollout and a fresh 60-minute production
 qualification remain open.
 
 ### R0 manual test plan
@@ -1233,10 +1237,11 @@ approved canary:
   passed, and physical capacity returned to the 10-node / 80-vCPU baseline.
 - [ ] Merge this canonical follow-up after it records the complete production
   monitor and the third deployment-sequencing departure.
-- [ ] Publish and deploy PR #1355's merged immutable artifact with zero
-  incremental provider capacity, then pass a fresh readiness, +10, +30, and
-  exact 60-minute production window before closing the failed comparator. The
-  PR passed 30/30 checks and merged as `606b4b29703dd2a6e69f57e49db685e85a3c6468`.
+- [ ] Deploy PR #1355's published immutable artifact with zero incremental
+  provider capacity, then pass a fresh readiness, +10, +30, and exact
+  60-minute production window before closing the failed comparator. The PR
+  passed 30/30 checks and release `1.1.1166` points exactly to merge
+  `606b4b29703dd2a6e69f57e49db685e85a3c6468`.
 - [x] Complete PR #1346's production monitoring. Revision 369 deployed the
   exact artifact and passed its readiness, +10, +30 safety/state, sync-rate,
   and 60-second recovery-safety gates. Its exact +60 comparison failed at 64
