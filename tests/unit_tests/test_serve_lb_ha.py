@@ -23,7 +23,7 @@ def _state(phase: lb_ha.LbCutoverPhase,
                                 generation=generation,
                                 pending_slot=pending,
                                 phase=phase,
-                                lifecycle_epoch=9)
+                                lifecycle_epoch=7)
 
 
 def _report(http: dict[str, int], asynchronous: dict[str, int],
@@ -603,6 +603,28 @@ def _role_controller() -> controller.SkyServeController:
     return ctrl
 
 
+@pytest.fixture(autouse=True)
+def _adapt_existing_role_handler_mocks(monkeypatch):
+    """Keep saga tests focused while the handler consumes one snapshot."""
+
+    def read_snapshot(service_name, unused_fence, state, unused_timings=None):
+        authority = lb_k8s.get_lb_pod_authority(service_name)
+        if authority is None:
+            return None
+        try:
+            if state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
+                               lb_ha.LbCutoverPhase.ROLLING_BACK):
+                routing = lb_k8s.get_lb_service_transition_routing(service_name)
+            else:
+                routing = lb_k8s.get_lb_service_routing(service_name)
+        except Exception as e:  # pylint: disable=broad-except
+            raise lb_k8s.LbRoleSnapshotRoutingError(str(e)) from e
+        return lb_k8s.LbRoleSnapshot(authority, routing)
+
+    monkeypatch.setattr(controller.lb_k8s, 'get_lb_role_snapshot',
+                        read_snapshot)
+
+
 def _configure_sync_controller(ctrl: controller.SkyServeController,
                                runtime_tail,
                                prepare_head=None) -> None:
@@ -731,6 +753,127 @@ def test_ordinary_role_heartbeat_does_not_wait_for_sync_demand_head():
 
     assert role_response.status_code == 200
     assert sync_response.status_code == 200
+
+
+def test_role_heartbeat_uses_one_shared_authority_snapshot():
+    ctrl = _role_controller()
+    ctrl._controller_owner = (123, '10.0.0.1')
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1', 'runtime-new')
+    snapshot = lb_k8s.LbRoleSnapshot(_authority(), routing)
+
+    def read_snapshot(service_name, fence, state, timings):
+        assert service_name == 'service'
+        assert fence == ('incarnation', (123, '10.0.0.1'), 7)
+        assert state == stable
+        timings['snapshot_postgresql_owner_read'] = 0.01
+        timings['snapshot_pod_list'] = 0.02
+        timings['snapshot_service_read'] = 0.03
+        return snapshot
+
+    with (mock.patch.object(controller.lb_k8s,
+                            'get_lb_role_snapshot',
+                            side_effect=read_snapshot) as snapshot_read,
+          mock.patch.object(
+              controller.lb_k8s,
+              'get_lb_pod_authority',
+              side_effect=AssertionError('duplicate Pod authority read')),
+          mock.patch.object(
+              controller.lb_k8s,
+              'get_lb_service_routing',
+              side_effect=AssertionError('duplicate Service routing read')),
+          mock.patch.object(controller.serve_state,
+                            'get_lb_cutover_state',
+                            return_value=stable)):
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body['role'] == lb_ha.LbRole.ACTIVE.value
+    assert body['observability']['phases_seconds'][
+        'snapshot_postgresql_owner_read'] == pytest.approx(0.01)
+    assert body['observability']['phases_seconds'][
+        'snapshot_pod_list'] == pytest.approx(0.02)
+    assert body['observability']['phases_seconds'][
+        'snapshot_service_read'] == pytest.approx(0.03)
+    snapshot_read.assert_called_once()
+    ctrl._owns_current_service.assert_not_called()
+    ctrl._lb_cutover_fence.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ('error', 'outcome'),
+    [(lb_k8s.LbRoleSnapshotStateMismatchError('owner changed'),
+      'cutover_state_unavailable'),
+     (lb_k8s.LbRoleSnapshotRoutingError('Service malformed'),
+      'routing_unavailable')])
+def test_role_snapshot_errors_keep_deterministic_outcomes(error, outcome):
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=error), mock.patch.object(
+                               controller.serve_state,
+                               'get_lb_cutover_state',
+                               return_value=stable):
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == outcome
+
+
+def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    authority = lb_k8s.LbPodAuthority(
+        ready_nonterminating_uids={'active', 'standby'},
+        live_uids={'active', 'standby'},
+        slot_by_uid={
+            'active': lb_ha.LbSlot.A,
+            'standby': lb_ha.LbSlot.B,
+        },
+        selected_slot=lb_ha.LbSlot.A)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        authority, lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    observed_fences = []
+    backend_urls = [f'http://replica-{index}' for index in range(143)]
+    large_report = _report({url: 1 for url in backend_urls},
+                           {url: 1 for url in backend_urls},
+                           {url: 1 for url in backend_urls},
+                           {url: 0.0 for url in backend_urls})
+
+    def read_snapshot(unused_name, fence, state, unused_timings):
+        observed_fences.append((fence, state))
+        return snapshot
+
+    async def run_both_slots():
+        active_request = _role_request('active', lb_ha.LbSlot.A)
+        standby_request = _role_request('standby', lb_ha.LbSlot.B)
+        active_request.update(large_report)
+        standby_request.update(large_report)
+        return await asyncio.gather(
+            ctrl._handle_load_balancer_role(active_request),
+            ctrl._handle_load_balancer_role(standby_request))
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_role_snapshot',
+            side_effect=read_snapshot) as snapshot_read, mock.patch.object(
+                controller.serve_state,
+                'get_lb_cutover_state',
+                return_value=stable):
+        active_response, standby_response = asyncio.run(run_both_slots())
+
+    assert json.loads(active_response.body)['role'] == 'ACTIVE'
+    assert json.loads(standby_response.body)['role'] == 'STANDBY'
+    assert snapshot_read.call_count == 2
+    assert observed_fences == [
+        (('incarnation', (123, '10.0.0.1'), 7), stable),
+        (('incarnation', (123, '10.0.0.1'), 7), stable),
+    ]
 
 
 def test_steady_ha_sync_disclosure_does_not_wait_for_role_lock():
@@ -1673,6 +1816,7 @@ def test_role_failures_have_deterministic_outcome_categories():
     assert json.loads(invalid.body)['outcome'] == 'invalid_report'
 
     ctrl._owns_current_service.return_value = False
+    ctrl._lb_cutover_fence.return_value = None
     stale_owner = asyncio.run(
         ctrl._handle_load_balancer_role(_role_request('active',
                                                       lb_ha.LbSlot.A)))
@@ -1733,6 +1877,6 @@ def test_role_observability_measures_second_slot_lock_queueing():
     observation = body['observability']
     assert observation['lock_wait_seconds'] >= 0.01
     assert observation['lock_hold_seconds'] >= 0
-    assert observation['phases_seconds']['kubernetes_pod_authority'] >= 0
+    assert observation['phases_seconds']['kubernetes_role_snapshot'] >= 0
     assert observation['phases_seconds']['postgresql_cutover_state_read'] >= 0
-    assert observation['phases_seconds']['kubernetes_service_routing_read'] >= 0
+    assert observation['phases_seconds']['postgresql_fence_read'] >= 0

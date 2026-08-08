@@ -2041,10 +2041,6 @@ class SkyServeController:
         if not isinstance(session_id, str) or slot is None:
             return role_response(lb_ha_obs.LbRoleOutcome.INVALID_REPORT, 503)
         loop = asyncio.get_running_loop()
-        if not await trace.run_in_executor(loop, 'postgresql_owner_read',
-                                           self._owns_current_service):
-            return role_response(lb_ha_obs.LbRoleOutcome.CONTROLLER_NOT_OWNER,
-                                 503)
         role_lock = self._lb_role_lock
         if role_lock is None:
             role_lock = asyncio.Lock()
@@ -2107,26 +2103,44 @@ class SkyServeController:
         lock_wait_started_at = time.monotonic()
         async with role_lock:
             trace.lock_acquired(lock_wait_started_at)
-            authority = await trace.run_in_executor(loop,
-                                                    'kubernetes_pod_authority',
-                                                    lb_k8s.get_lb_pod_authority,
-                                                    self._service_name)
-            if authority is None or authority.slot_by_uid is None:
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
-            if (session_id not in authority.live_uids or
-                    authority.slot_by_uid.get(session_id) is not slot):
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.POD_NOT_AUTHORITATIVE, 503)
             fence = await trace.run_in_executor(loop, 'postgresql_fence_read',
                                                 self._lb_cutover_fence)
+            if fence is None:
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.CONTROLLER_NOT_OWNER, 503)
             state = await trace.run_in_executor(
                 loop, 'postgresql_cutover_state_read',
                 serve_state.get_lb_cutover_state, self._service_name)
-            if (fence is None or state is None or not state.enabled or
-                    state.active_slot is None):
+            if (state is None or not state.enabled or
+                    state.active_slot is None or
+                    state.lifecycle_epoch != fence[2]):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+            snapshot_timings: dict[str, float] = {}
+            try:
+                snapshot = await trace.run_in_executor(
+                    loop, 'kubernetes_role_snapshot',
+                    lb_k8s.get_lb_role_snapshot, self._service_name, fence,
+                    state, snapshot_timings)
+            except lb_k8s.LbRoleSnapshotStateMismatchError:
+                trace.add_phases(snapshot_timings)
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.CUTOVER_STATE_UNAVAILABLE, 503)
+            except lb_k8s.LbRoleSnapshotRoutingError:
+                trace.add_phases(snapshot_timings)
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
+            trace.add_phases(snapshot_timings)
+            if snapshot is None:
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.POD_AUTHORITY_UNAVAILABLE, 503)
+            authority = snapshot.authority
+            routing = snapshot.routing
+            if (session_id not in authority.live_uids or
+                    authority.slot_by_uid is None or
+                    authority.slot_by_uid.get(session_id) is not slot):
+                return role_response(
+                    lb_ha_obs.LbRoleOutcome.POD_NOT_AUTHORITATIVE, 503)
             promotable = self._lb_promotion_report_is_current(request_data)
             role = state.role_for(slot)
             ledger = self._lb_session_ledger
@@ -2134,25 +2148,6 @@ class SkyServeController:
                     session_id, slot, role, state.generation, request_data):
                 return role_response(lb_ha_obs.LbRoleOutcome.REPORT_REJECTED,
                                      503)
-            try:
-                routing: (lb_k8s.LbServiceRouting |
-                          lb_k8s.LbServiceTransitionRouting)
-                if state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
-                                   lb_ha.LbCutoverPhase.ROLLING_BACK):
-                    routing = await trace.run_in_executor(
-                        loop, 'kubernetes_service_routing_read',
-                        lb_k8s.get_lb_service_transition_routing,
-                        self._service_name)
-                else:
-                    routing = await trace.run_in_executor(
-                        loop, 'kubernetes_service_routing_read',
-                        lb_k8s.get_lb_service_routing, self._service_name)
-            except Exception as e:  # pylint: disable=broad-except
-                logger.warning('Cannot reconcile HA LB Service routing: '
-                               f'{common_utils.format_exception(e)}')
-                return role_response(
-                    lb_ha_obs.LbRoleOutcome.ROUTING_UNAVAILABLE, 503)
-
             service_hash, expected_owner, lifecycle_epoch = fence
             transition_legacy_selected = (isinstance(
                 routing, lb_k8s.LbServiceTransitionRouting) and
