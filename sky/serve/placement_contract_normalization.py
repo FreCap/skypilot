@@ -36,6 +36,7 @@ from sky.container_images import demand_state
 from sky.serve import ephemeral_storage_contract
 from sky.serve import maintenance
 from sky.serve import placement_normalization_identity
+from sky.serve import placement_normalization_manifest
 from sky.serve import placement_policy
 from sky.serve import resource_action_state_schema
 from sky.serve import serve_state
@@ -63,9 +64,19 @@ _SPEC_NAME = 'SkyServiceSpec'
 _SUPPORTED_PROTOCOLS = frozenset({4, 5})
 _SCHEMA_REVISION = '037'
 _ADVISORY_LOCK_NAME = 'skyserve-placement-contract-normalization-v1'
+_DATABASE_AUTHORITY_FUNCTION = (
+    'skyserve040_assert_placement_normalization_authority')
+_DATABASE_AUTHORITY_RELATIONS = (
+    'services',
+    'version_specs',
+    'replicas',
+    'ephemeral_storage_cleanup_intents',
+    'placement_normalization_runs',
+    'placement_normalization_rows',
+)
 _LOCK_TIMEOUT_MS = 5000
 _STATEMENT_TIMEOUT_MS = 60000
-_MAX_INVENTORY_ROWS = 100000
+_MAX_INVENTORY_ROWS = placement_normalization_manifest.MAX_INVENTORY_ROWS
 _MAX_ACTIVE_SERVE_REQUEST_EVIDENCE_ROWS = 10000
 _MAX_PROCESS_EVIDENCE_ROWS = 10000
 _MAX_RESOURCE_ACTION_EVIDENCE_ROWS = 10000
@@ -90,6 +101,19 @@ _CLEANUP_PROTOCOL_V3_ONLY_FIELDS = frozenset({
     'cleanup_candidate_legacy_timestamp_boundary_version',
     'cleanup_timestamp_proof_sha256',
 })
+_STALE_PLACEHOLDER_PROOF_SCHEMA = (
+    placement_normalization_manifest.STALE_PLACEHOLDER_PROOF_SCHEMA)
+_STALE_PLACEHOLDER_EVIDENCE_FACT = (
+    placement_normalization_manifest.STALE_PLACEHOLDER_EVIDENCE_FACT)
+_SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FACT = (
+    placement_normalization_manifest.SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FACT)
+_STALE_PLACEHOLDER_EVIDENCE_FIELDS = (
+    placement_normalization_manifest.STALE_PLACEHOLDER_EVIDENCE_FIELDS)
+_SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS = (
+    placement_normalization_manifest.
+    SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS)
+_STALE_PLACEHOLDER_NULL_COLUMNS = (
+    placement_normalization_manifest.STALE_PLACEHOLDER_NULL_COLUMNS)
 _PREDECESSOR_RECEIPT_SCHEMA = 'skyserve-predecessor-receipt-inventory-v1'
 _POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
 _ROLLING_UPDATE_ENV_VAR = 'SKYPILOT_ROLLING_UPDATE_ENABLED'
@@ -446,11 +470,20 @@ class _RowWork:
     classification: Classification
     outcome: str = 'unchanged'
     dependency_facts: dict[str, Any] = dataclasses.field(default_factory=dict)
+    manifest_classification: (
+        placement_normalization_manifest.ManifestClassification | None) = None
 
     @property
     def identity(self) -> tuple[str, int]:
         return (str(self.original['service_name']),
                 int(self.original['version']))
+
+    @property
+    def ledger_classification(self) -> str:
+        """Return the contextual durable classification for this run."""
+        if self.manifest_classification is not None:
+            return self.manifest_classification.value
+        return self.classification.value
 
 
 @dataclasses.dataclass
@@ -1571,11 +1604,18 @@ def _retirement_evidence_targets(
     rows: Sequence[_RowWork],
 ) -> tuple[frozenset[_ProcessTarget], frozenset[_ResourceActionTarget]]:
     """Build explicit external-proof identities from locked owner facts."""
+    candidate_services = frozenset(
+        row.identity[0]
+        for row in rows
+        if row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU)
     process_targets: set[_ProcessTarget] = set()
     action_targets: set[_ResourceActionTarget] = set()
     for row in rows:
-        if row.classification is not (
-                Classification.HISTORICAL_PHYSICAL_PER_GPU):
+        requires_version_evidence = (
+            row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU or
+            row.identity[0] in candidate_services and
+            row.classification is Classification.PLACEHOLDER)
+        if not requires_version_evidence:
             continue
         service_hash = row.dependency_facts.get('service_hash')
         lifecycle_epoch = row.dependency_facts.get('service_lifecycle_epoch')
@@ -1590,6 +1630,20 @@ def _retirement_evidence_targets(
             _ResourceActionTarget(row.identity[0], row.identity[1],
                                   service_hash))
     return frozenset(process_targets), frozenset(action_targets)
+
+
+def _retirement_version_evidence_rows(
+        rows: Sequence[_RowWork]) -> tuple[_RowWork, ...]:
+    """Return candidates plus every same-service raw placeholder."""
+    candidate_services = frozenset(
+        row.identity[0]
+        for row in rows
+        if row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU)
+    return tuple(
+        row for row in rows
+        if row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU or
+        row.identity[0] in candidate_services and
+        row.classification is Classification.PLACEHOLDER)
 
 
 def _read_cleanup_intent_inventory(session: orm.Session,
@@ -2120,12 +2174,97 @@ def _completed_run_inventory(
             'Predecessor receipt ledger exceeds its explicit row bound.')
     run_dict = dict(run)
     entry_dicts = [dict(entry) for entry in entries]
-    mismatches = _ledger_manifest_mismatches(run_dict, entry_dicts)
+    mismatches = placement_normalization_manifest.manifest_mismatches(
+        run_dict, entry_dicts)
     if mismatches:
         raise NormalizationBlocker(
             'Predecessor receipt run manifest is invalid; first mismatch is '
             f'{mismatches[0]!r}.')
     return run_dict, entry_dicts
+
+
+def _terminal_current_inventory_mismatches(
+    session: orm.Session,
+    run: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, Any], ...]:
+    """Bind one terminal manifest to its current candidate-service rows."""
+    if not placement_normalization_manifest.is_terminal_protocol4_manifest(
+            run, entries):
+        return ()
+    candidate_services = sorted({
+        str(entry['service_name'])
+        for entry in entries
+        if entry.get('classification') == (
+            placement_normalization_manifest.ManifestClassification.
+            HISTORICAL_PHYSICAL_PER_GPU.value) and
+        entry.get('outcome') == 'retired'
+    })
+    version_table = serve_state.version_specs_table
+    frozen_columns = [
+        version_table.c[column]
+        for column in placement_normalization_manifest.VERSION_SPEC_COLUMNS
+    ]
+    current_rows = [
+        dict(row) for row in session.execute(
+            sqlalchemy.select(*frozen_columns).where(
+                version_table.c.service_name.in_(candidate_services)).
+            order_by(version_table.c.service_name,
+                     version_table.c.version).limit(
+                         _MAX_INVENTORY_ROWS + 1)).mappings().all()
+    ]
+    if len(current_rows) > _MAX_INVENTORY_ROWS:
+        return ({
+            'run_id': str(run.get('run_id')),
+            'reason': 'current_candidate_inventory_exceeds_bound',
+        },)
+    current_service_hashes = {
+        service_name:
+            placement_normalization_manifest.ServiceHashObservation(False,
+                                                                    None)
+        for service_name in candidate_services
+    }
+    service_table = serve_state.services_table
+    for row in session.execute(
+            sqlalchemy.select(service_table.c.name, service_table.c.hash).
+            where(service_table.c.name.in_(candidate_services))).all():
+        current_service_hashes[str(row.name)] = (
+            placement_normalization_manifest.ServiceHashObservation(
+                True, row.hash))
+    current_classifications = {
+        (str(row['service_name']), int(row['version'])):
+            analyze_spec_pickle(row['spec']).classification.value
+        for row in current_rows
+    }
+    return tuple(
+        placement_normalization_manifest.current_inventory_mismatches(
+            run, entries, current_rows, current_service_hashes,
+            current_classifications))
+
+
+def _require_no_terminal_protocol4_manifest(session: orm.Session) -> None:
+    """Refuse every write after the durable stale-placeholder generation."""
+    runs = serve_state.placement_normalization_runs_table
+    latest_run_id = session.execute(
+        sqlalchemy.select(runs.c.run_id).order_by(
+            runs.c.completed_at.desc(),
+            runs.c.run_id.desc()).limit(1)).scalar_one_or_none()
+    if latest_run_id is None:
+        return
+    run, entries = _completed_run_inventory(session, latest_run_id,
+                                            _MAX_INVENTORY_ROWS)
+    if not placement_normalization_manifest.is_terminal_protocol4_manifest(
+            run, entries):
+        return
+    live_mismatches = _terminal_current_inventory_mismatches(
+        session, run, entries)
+    if live_mismatches:
+        raise NormalizationBlocker(
+            'Protocol-4 terminal inventory proof no longer matches live '
+            f'state; first mismatch is {live_mismatches[0]!r}.')
+    raise NormalizationBlocker(
+        'Protocol-4 stale-placeholder retirement is terminal; later '
+        'normalization writes are forbidden.')
 
 
 def _predecessor_receipt_evidence(
@@ -2313,6 +2452,140 @@ def _validate_successor_controller_config(row: _RowWork,
             'Recovery successor controller config failed validation.') from exc
 
 
+def _prepare_stale_placeholder_proofs(
+    rows: list[_RowWork],
+    service_rows: Mapping[str, Mapping[str, Any]],
+    image_evidence: Mapping[tuple[str, int], _ExternalEvidence],
+    resource_action_evidence: Mapping[tuple[str, int], _ExternalEvidence],
+    retiring_identities: frozenset[tuple[str, int]],
+) -> dict[str, dict[str, Any]]:
+    """Prove and ledger exact stale placeholders for candidate services."""
+    candidate_services = sorted(
+        {identity[0] for identity in retiring_identities})
+    staged_evidence: list[tuple[_RowWork, dict[str, Any]]] = []
+    summaries: dict[str, dict[str, Any]] = {}
+    for service_name in candidate_services:
+        service = service_rows.get(service_name)
+        if service is None:
+            raise NormalizationBlocker(
+                'Stale-placeholder proof requires a live parent service.')
+        current_version = service.get('current_version')
+        if type(current_version) is not int or current_version < 1:
+            raise NormalizationBlocker(
+                'Stale-placeholder proof requires a positive current version.')
+        service_versions = [
+            row for row in rows if row.identity[0] == service_name
+        ]
+        current_rows = [
+            row for row in service_versions
+            if row.identity[1] == current_version and
+            row.identity not in retiring_identities and
+            row.classification is Classification.EXPLICIT_V2 and row.result.get(
+                'yaml_content') is not None and row.result.get('retired_at') is
+            None and row.result.get('quarantined_at') is None
+        ]
+        if len(current_rows) != 1:
+            raise NormalizationBlocker(
+                'Stale-placeholder proof requires one surviving committed '
+                'explicit-v2 current version.')
+
+        placeholder_rows = sorted(
+            (row for row in service_versions
+             if row.classification is Classification.PLACEHOLDER),
+            key=lambda row: row.identity)
+        service_evidence: list[dict[str, Any]] = []
+        for row in placeholder_rows:
+            identity = row.identity
+            if (row.analysis.classification is not Classification.PLACEHOLDER or
+                    row.outcome != 'unchanged' or
+                    row.manifest_classification is not None or
+                    _as_bytes(row.original['spec']) != _RETIRED_SPEC_BYTES or
+                    _as_bytes(row.result['spec']) != _RETIRED_SPEC_BYTES):
+                raise NormalizationBlocker(
+                    'Historical service placeholder is not the canonical '
+                    'protocol-4 None representation.')
+            if current_version <= identity[1]:
+                raise NormalizationBlocker(
+                    'Historical service has a fillable placeholder without a '
+                    'strictly newer committed version.')
+            if (set(_STALE_PLACEHOLDER_NULL_COLUMNS) - set(row.original) or
+                    set(_STALE_PLACEHOLDER_NULL_COLUMNS) - set(row.result) or
+                    any(row.original[column] is not None or
+                        row.result[column] is not None
+                        for column in _STALE_PLACEHOLDER_NULL_COLUMNS) or
+                    _row_sha256(row.original) != _row_sha256(row.result)):
+                raise NormalizationBlocker(
+                    'Historical service placeholder has live or staged state.')
+            if (row.dependency_facts.get('service_current_version')
+                    != current_version or
+                    row.dependency_facts.get('service_active') is not False or
+                    type(row.dependency_facts.get('replica_count')) is not int
+                    or row.dependency_facts['replica_count'] != 0 or type(
+                        row.dependency_facts.get(
+                            'unknown_version_replica_count')) is not int or
+                    row.dependency_facts['unknown_version_replica_count'] != 0):
+                raise NormalizationBlocker(
+                    'Historical service placeholder is current, active, or '
+                    'replica-owning.')
+            image = image_evidence.get(identity)
+            action = resource_action_evidence.get(identity)
+            if image is None or action is None:
+                raise NormalizationBlocker(
+                    'Stale-placeholder external evidence is incomplete.')
+            image = _validate_external_evidence(
+                image, 'Stale-placeholder container-image demand')
+            action = _validate_external_evidence(
+                action, 'Stale-placeholder resource-action root')
+            if image.count != 0:
+                raise NormalizationBlocker(
+                    'Historical service placeholder has live container-image '
+                    'demand.')
+            if action.count != 0:
+                raise NormalizationBlocker(
+                    'Historical service placeholder has a typed '
+                    'resource-action launch root.')
+            evidence = {
+                'schema': _STALE_PLACEHOLDER_PROOF_SCHEMA,
+                'service_name_sha256': _sha256(service_name.encode()),
+                'version': identity[1],
+                'original_row_sha256': _row_sha256(row.original),
+                'strictly_newer_committed_version': current_version,
+                'image_demand_count': image.count,
+                'image_demand_sha256': image.digest,
+                'resource_action_root_count': action.count,
+                'resource_action_root_sha256': action.digest,
+                'state_clean': True,
+                'fill_stale_proved': True,
+            }
+            assert set(evidence) == _STALE_PLACEHOLDER_EVIDENCE_FIELDS
+            service_evidence.append(evidence)
+            staged_evidence.append((row, evidence))
+
+        summary = {
+            'schema': _STALE_PLACEHOLDER_PROOF_SCHEMA,
+            'service_name_sha256': _sha256(service_name.encode()),
+            'current_version': current_version,
+            'placeholder_count': len(service_evidence),
+            'image_demand_count': 0,
+            'resource_action_root_count': 0,
+            'inventory_sha256': (
+                placement_normalization_manifest.
+                stale_placeholder_inventory_sha256(service_name,
+                                                    current_version,
+                                                    service_evidence)),
+            'fill_stale_proved': True,
+        }
+        assert set(summary) == (_SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS)
+        summaries[service_name] = summary
+
+    for row, evidence in staged_evidence:
+        row.dependency_facts[_STALE_PLACEHOLDER_EVIDENCE_FACT] = evidence
+        row.manifest_classification = (
+            placement_normalization_manifest.ManifestClassification.
+            STALE_PLACEHOLDER)
+    return summaries
+
+
 def _retirement_dependency_facts(
     candidate: _RowWork,
     all_rows: list[_RowWork],
@@ -2326,6 +2599,7 @@ def _retirement_dependency_facts(
     request_evidence: _ExternalEvidence,
     cleanup_plan: _CleanupIntentPlan,
     receipt_evidence: _PredecessorReceiptEvidence,
+    stale_placeholder_proof: Mapping[str, Any],
 ) -> dict[str, Any]:
     name, version = candidate.identity
     service = service_rows.get(name)
@@ -2342,15 +2616,6 @@ def _retirement_dependency_facts(
             'Historical retirement requires the live parent resource-action '
             'mode to remain at the inert legacy default.')
     service_versions = [row for row in all_rows if row.identity[0] == name]
-    pending_versions = [
-        row for row in service_versions
-        if row.result.get('retired_at') is None and
-        row.result.get('yaml_content') is None
-    ]
-    if pending_versions:
-        raise NormalizationBlocker(
-            'Historical service still has a non-retired version placeholder '
-            'or reservation.')
     config_fields = ('controller_config', 'controller_config_digest',
                      'controller_config_snapshot_id')
     incomplete_config_versions = [
@@ -2481,7 +2746,8 @@ def _retirement_dependency_facts(
         'cleanup_dependency_typed': True,
         'bridge_replica_dependency_absent': True,
         'unversioned_replica_dependency_absent': True,
-        'same_service_placeholder_dependency_absent': True,
+        _SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FACT:
+            dict(stale_placeholder_proof),
         'incomplete_staged_config_dependency_absent': True,
         'serve_mutation_request_count': request_evidence.count,
         'serve_mutation_request_sha256': request_evidence.digest,
@@ -2621,25 +2887,31 @@ def _prepare_retirement_rows(
         row.identity
         for row in rows
         if row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU)
+    if any(row.classification in _SUPPORTED_NORMALIZATION_SOURCES
+           for row in rows):
+        raise NormalizationBlocker(
+            'Supported fieldless or explicit-v1 rows remain; run '
+            '--apply-supported before historical retirement.')
+    stale_placeholder_proofs = _prepare_stale_placeholder_proofs(
+        rows, service_rows, image_evidence, resource_action_evidence,
+        retiring_identities)
     dependency_facts: dict[tuple[str, int], dict[str, Any]] = {}
     for row in rows:
-        if row.classification in _SUPPORTED_NORMALIZATION_SOURCES:
-            raise NormalizationBlocker(
-                'Supported fieldless or explicit-v1 rows remain; run '
-                '--apply-supported '
-                'before historical retirement.')
         if row.classification is not Classification.HISTORICAL_PHYSICAL_PER_GPU:
             continue
         identity = row.identity
         evidence = image_evidence.get(identity)
         action_evidence = resource_action_evidence.get(identity)
-        if evidence is None or action_evidence is None:
+        stale_placeholder_proof = stale_placeholder_proofs.get(identity[0])
+        if (evidence is None or action_evidence is None or
+                stale_placeholder_proof is None):
             raise NormalizationBlocker(
                 'Historical candidate changed after external preflight.')
         dependency_facts[identity] = _retirement_dependency_facts(
             row, rows, service_rows, evidence, action_evidence,
             legacy_controller_evidence, retiring_identities, process_evidence,
-            api_pod_identity, request_evidence, cleanup_plan, receipt_evidence)
+            api_pod_identity, request_evidence, cleanup_plan, receipt_evidence,
+            stale_placeholder_proof)
     # Mutate only after every candidate has proved safety against the final
     # post-retirement fleet.  Otherwise an earlier candidate could cite a
     # later candidate that this same transaction also retires as its survivor.
@@ -2771,7 +3043,7 @@ def _insert_ledger(session: orm.Session, rows: list[_RowWork], *,
                    started_at: float, completed_at: float,
                    freeze_evidence_sha256: str, pre_digest: str,
                    post_digest: str) -> None:
-    counts = collections.Counter(row.classification.value for row in rows)
+    counts = collections.Counter(row.ledger_classification for row in rows)
     session.execute(
         serve_state.placement_normalization_runs_table.insert().values(
             run_id=run_id,
@@ -2802,7 +3074,7 @@ def _insert_ledger(session: orm.Session, rows: list[_RowWork], *,
             'run_id': run_id,
             'service_name': row.identity[0],
             'version': row.identity[1],
-            'classification': row.classification.value,
+            'classification': row.ledger_classification,
             'outcome': row.outcome,
             'original_spec_sha256': row.analysis.source_sha256,
             'result_spec_sha256': _sha256(result_spec),
@@ -2820,15 +3092,29 @@ def _insert_ledger(session: orm.Session, rows: list[_RowWork], *,
                         values)
 
 
-def _prehashed_row_sha256(value: Any) -> str | None:
-    if (not isinstance(value, dict) or
-            any(not isinstance(column, str) or not isinstance(digest, str) or
-                len(digest) != 64 or any(character not in '0123456789abcdef'
-                                         for character in digest)
-                for column, digest in value.items())):
-        return None
-    return _sha256(
-        json.dumps(value, sort_keys=True, separators=(',', ':')).encode())
+def _verify_inserted_ledger(session: orm.Session, run_id: uuid.UUID,
+                            row_bound: int) -> None:
+    """Validate the complete planned manifest before any transaction commits."""
+    run = session.execute(
+        sqlalchemy.select(serve_state.placement_normalization_runs_table).where(
+            serve_state.placement_normalization_runs_table.c.run_id ==
+            run_id)).mappings().one()
+    entries = session.execute(
+        sqlalchemy.select(serve_state.placement_normalization_rows_table).where(
+            serve_state.placement_normalization_rows_table.c.run_id ==
+            run_id).order_by(
+                serve_state.placement_normalization_rows_table.c.service_name,
+                serve_state.placement_normalization_rows_table.c.version).limit(
+                    row_bound + 1)).mappings().all()
+    if len(entries) > row_bound:
+        raise NormalizationBlocker(
+            'Inserted normalization ledger exceeds its explicit row bound.')
+    mismatches = placement_normalization_manifest.manifest_mismatches(
+        dict(run), [dict(entry) for entry in entries])
+    if mismatches:
+        raise NormalizationBlocker(
+            'Inserted normalization ledger is invalid; first mismatch is '
+            f'{mismatches[0]!r}.')
 
 
 def _is_sha256(value: Any) -> bool:
@@ -2836,439 +3122,179 @@ def _is_sha256(value: Any) -> bool:
             all(character in '0123456789abcdef' for character in value))
 
 
-def _retirement_ledger_v1_facts_are_complete(entry: Mapping[str, Any]) -> bool:
-    """Validate the frozen protocol-1 retirement-fact contract."""
-    facts = entry.get('dependency_facts')
-    version = entry.get('version')
-    if not isinstance(facts, dict) or type(version) is not int:
-        return False
-    zero_counts = (
-        'replica_count',
-        'unknown_version_replica_count',
-        'cleanup_intent_count',
-        'image_demand_count',
-        'resource_action_root_count',
-        'legacy_controller_cluster_count',
-        'serve_mutation_request_count',
-        'process_quiescence_count',
-    )
-    true_proofs = (
-        'service_present',
-        'serve_consolidation_mode_proved',
-        'parent_non_pool_proved',
-        'resource_action_mode_legacy_inert',
-        'placement_catalog_absent',
-        'cleanup_dependency_absent',
-        'bridge_replica_dependency_absent',
-        'unversioned_replica_dependency_absent',
-        'same_service_placeholder_dependency_absent',
-        'incomplete_staged_config_dependency_absent',
-        'legacy_controller_cluster_absent',
-        'sole_recreate_api_pod_proved',
-        'controller_hold_required',
-    )
-    false_facts = ('service_active', 'quarantined', 'controller_applied')
-    digest_facts = (
-        'image_demand_sha256',
-        'resource_action_root_sha256',
-        'legacy_controller_cluster_sha256',
-        'serve_mutation_request_sha256',
-        'process_quiescence_sha256',
-        'sole_api_pod_sha256',
-    )
-    storage = facts.get('storage_ownership')
-    storage_fields = {
-        'file_mounts', 'storage_mounts', 'volumes', 'volume_mounts', 'workdir',
-        'ephemeral_storage_scope'
+def _frozen_version_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a live row onto the immutable protocol-4 column contract."""
+    try:
+        return {
+            column: row[column]
+            for column in placement_normalization_manifest.VERSION_SPEC_COLUMNS
+        }
+    except KeyError as exc:
+        raise NormalizationBlocker(
+            f'Live version row lacks frozen column {exc.args[0]!r}.') from exc
+
+
+def _is_post_terminal_explicit_v2(work: _RowWork,
+                                  completed_at: float) -> bool:
+    created_at = work.original.get('created_at')
+    return (work.classification is Classification.EXPLICIT_V2 and
+            isinstance(work.original.get('yaml_content'), str) and
+            work.original.get('quarantined_at') is None and
+            work.original.get('retired_at') is None and
+            isinstance(created_at,
+                       (int, float)) and not isinstance(created_at, bool) and
+            math.isfinite(created_at) and created_at > completed_at)
+
+
+def _is_post_terminal_placeholder(work: _RowWork) -> bool:
+    return (work.classification is Classification.PLACEHOLDER and
+            work.original.get('created_at') is None and
+            _as_bytes(work.original['spec']) == _RETIRED_SPEC_BYTES and all(
+                work.original.get(column) is None
+                for column in _STALE_PLACEHOLDER_NULL_COLUMNS))
+
+
+def _terminal_fleet_mismatches(
+    session: orm.Session,
+    run: Mapping[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+    rows: Sequence[_RowWork],
+) -> tuple[dict[str, Any], ...]:
+    """Validate post-terminal rows outside retired candidate services."""
+    mismatches = list(
+        _terminal_current_inventory_mismatches(session, run, entries))
+    candidate_services = {
+        str(manifest_entry['service_name'])
+        for manifest_entry in entries
+        if manifest_entry.get('classification') == (
+            placement_normalization_manifest.ManifestClassification.
+            HISTORICAL_PHYSICAL_PER_GPU.value) and
+        manifest_entry.get('outcome') == 'retired'
     }
-    pod_uid = facts.get('process_quiescence_pod_uid')
-    instance_id = facts.get('sole_api_instance_id')
-    try:
-        parsed_instance_id = uuid.UUID(instance_id)
-    except (AttributeError, TypeError, ValueError):
-        return False
-    return (all(facts.get(field) == 0 for field in zero_counts) and
-            all(facts.get(field) is True for field in true_proofs) and
-            all(facts.get(field) is False for field in false_facts) and
-            all(_is_sha256(facts.get(field)) for field in digest_facts) and
-            type(facts.get('service_pool')) is int and
-            facts['service_pool'] == 0 and
-            facts.get('service_resource_action_mode') == 'legacy' and
-            'service_resource_action_mode_changed_at' in facts and
-            facts['service_resource_action_mode_changed_at'] is None and
-            isinstance(storage, dict) and set(storage) == storage_fields and
-            all(value is False for value in storage.values()) and
-            type(facts.get('service_current_version')) is int and
-            facts['service_current_version'] > version and
-            type(facts.get('strictly_newer_committed_version')) is int and
-            facts['strictly_newer_committed_version'] > version and
-            type(facts.get('recovery_version')) is int and
-            facts['recovery_version'] > version and
-            type(facts.get('service_lifecycle_epoch')) is int and
-            facts['service_lifecycle_epoch'] > 0 and
-            isinstance(facts.get('service_hash'), str) and
-            bool(facts['service_hash']) and
-            not any(character.isspace() for character in facts['service_hash'])
-            and isinstance(pod_uid, str) and bool(pod_uid) and
-            not any(character.isspace() for character in pod_uid) and
-            str(parsed_instance_id) == instance_id and
-            type(facts.get('config_protocol_active')) is bool and
-            facts.get('recovery_config_valid')
-            is facts.get('config_protocol_active'))
+    manifest_by_identity = {
+        (str(manifest_entry['service_name']), int(manifest_entry['version'])):
+            manifest_entry
+        for manifest_entry in entries
+        if str(manifest_entry['service_name']) not in candidate_services
+    }
+    high_waters: dict[tuple[str, Any], int] = {}
+    for entry in manifest_by_identity.values():
+        boundary = (str(entry['service_name']), entry.get('service_hash'))
+        high_waters[boundary] = max(high_waters.get(boundary, 0),
+                                    int(entry['version']))
 
-
-def _retirement_ledger_typed_cleanup_facts_are_complete(
-        entry: Mapping[str, Any]) -> bool:
-    """Validate facts shared by typed cleanup retirement protocols."""
-    facts = entry.get('dependency_facts')
-    version = entry.get('version')
-    if not isinstance(facts, dict) or type(version) is not int:
-        return False
-    zero_counts = (
-        'replica_count',
-        'unknown_version_replica_count',
-        'image_demand_count',
-        'resource_action_root_count',
-        'legacy_controller_cluster_count',
-        'serve_mutation_request_count',
-        'process_quiescence_count',
-        'cleanup_candidate_deletion_target_count',
-        'cleanup_intent_deletion_target_count',
-    )
-    true_proofs = (
-        'service_present',
-        'serve_consolidation_mode_proved',
-        'parent_non_pool_proved',
-        'resource_action_mode_legacy_inert',
-        'placement_catalog_absent',
-        'cleanup_dependency_typed',
-        'bridge_replica_dependency_absent',
-        'unversioned_replica_dependency_absent',
-        'same_service_placeholder_dependency_absent',
-        'incomplete_staged_config_dependency_absent',
-        'legacy_controller_cluster_absent',
-        'sole_recreate_api_pod_proved',
-        'controller_hold_required',
-        'retired_yaml_preserved',
-        'current_cleanup_reader_inventory_preserved',
-        'v1_1_1135_cleanup_omission_lossless',
-        'predecessor_receipts_complete',
-        'predecessor_receipt_requirement_satisfied',
-    )
-    false_facts = ('service_active', 'quarantined', 'controller_applied')
-    digest_facts = (
-        'image_demand_sha256',
-        'resource_action_root_sha256',
-        'legacy_controller_cluster_sha256',
-        'serve_mutation_request_sha256',
-        'process_quiescence_sha256',
-        'sole_api_pod_sha256',
-        'cleanup_intent_pre_inventory_sha256',
-        'cleanup_intent_post_inventory_sha256',
-        'cleanup_match_inventory_sha256',
-        'cleanup_intent_key_sha256',
-        'cleanup_candidate_yaml_sha256',
-        'cleanup_intent_yaml_sha256',
-        'cleanup_candidate_zero_target_projection_sha256',
-        'cleanup_intent_zero_target_projection_sha256',
-        'predecessor_receipt_inventory_sha256',
-        'approved_loaded_image_commit_sha256',
-        'operator_freeze_evidence_input_sha256',
-        'operator_freeze_approved_commit_binding_sha256',
-    )
-    pod_uid = facts.get('process_quiescence_pod_uid')
-    instance_id = facts.get('sole_api_instance_id')
-    try:
-        parsed_instance_id = uuid.UUID(instance_id)
-    except (AttributeError, TypeError, ValueError):
-        return False
-    cleanup_count = facts.get('cleanup_intent_count')
-    inventory_count = facts.get('cleanup_intent_inventory_count')
-    adopted_count = facts.get('cleanup_intent_adopted_count')
-    match_count = facts.get('cleanup_match_inventory_count')
-    receipt_count = facts.get('predecessor_receipt_inventory_count')
-    approved_count = facts.get('approved_loaded_image_commit_count')
-    cleanup_digest_delta_valid = ((adopted_count == 0) == (
-        facts.get('cleanup_intent_pre_inventory_sha256') == facts.get(
-            'cleanup_intent_post_inventory_sha256')))
-    expected_freeze_binding = _canonical_json_sha256({
-        'approved_loaded_image_commit_sha256':
-            facts.get('approved_loaded_image_commit_sha256'),
-        'operator_freeze_evidence_input_sha256':
-            facts.get('operator_freeze_evidence_input_sha256'),
+    relevant_names = sorted({
+        *(str(entry['service_name']) for entry in entries),
+        *(work.identity[0] for work in rows),
     })
-    return (
-        all(
-            type(facts.get(field)) is int and facts[field] == 0
-            for field in zero_counts) and
-        all(facts.get(field) is True for field in true_proofs) and
-        all(facts.get(field) is False for field in false_facts) and
-        all(_is_sha256(facts.get(field)) for field in digest_facts) and
-        facts.get('predecessor_receipt_schema') == _PREDECESSOR_RECEIPT_SCHEMA
-        and type(cleanup_count) is int and type(inventory_count) is int and
-        inventory_count >= 1 and 1 <= cleanup_count <= inventory_count and
-        type(adopted_count) is int and 0 <= adopted_count <= inventory_count and
-        type(match_count) is int and match_count == inventory_count and
-        type(facts.get('cleanup_candidate_match_count')) is int and
-        facts['cleanup_candidate_match_count'] == 1 and
-        cleanup_digest_delta_valid and
-        facts.get('cleanup_candidate_yaml_sha256')
-        == facts.get('cleanup_intent_yaml_sha256') and
-        facts.get('cleanup_candidate_zero_target_projection_sha256')
-        == facts.get('cleanup_intent_zero_target_projection_sha256') and
-        type(receipt_count) is int and receipt_count >= 0 and
-        type(approved_count) is int and approved_count >= 1 and
-        facts.get('operator_freeze_approved_commit_binding_sha256')
-        == expected_freeze_binding and type(
-            facts.get('service_pool')) is int and facts['service_pool'] == 0 and
-        facts.get('service_resource_action_mode') == 'legacy' and
-        'service_resource_action_mode_changed_at' in facts and
-        facts['service_resource_action_mode_changed_at'] is None and
-        type(facts.get('service_current_version')) is int and
-        facts['service_current_version'] > version and
-        type(facts.get('strictly_newer_committed_version')) is int and
-        facts['strictly_newer_committed_version'] > version and
-        type(facts.get('recovery_version')) is int and
-        facts['recovery_version'] > version and
-        type(facts.get('service_lifecycle_epoch')) is int and
-        facts['service_lifecycle_epoch'] > 0 and isinstance(
-            facts.get('service_hash'), str) and facts['service_hash'] != '' and
-        not any(character.isspace() for character in facts['service_hash']) and
-        isinstance(pod_uid, str) and pod_uid != '' and
-        not any(character.isspace() for character in pod_uid) and
-        str(parsed_instance_id) == instance_id and type(
-            facts.get('config_protocol_active')) is bool and
-        facts.get('recovery_config_valid')
-        is facts.get('config_protocol_active'))
+    current_hash_observations = {
+        name: placement_normalization_manifest.ServiceHashObservation(False,
+                                                                      None)
+        for name in relevant_names
+    }
+    service_table = serve_state.services_table
+    if relevant_names:
+        for row in session.execute(
+                sqlalchemy.select(service_table.c.name, service_table.c.hash).
+                where(service_table.c.name.in_(relevant_names))).all():
+            current_hash_observations[str(row.name)] = (
+                placement_normalization_manifest.ServiceHashObservation(
+                    True, row.hash))
 
-
-def _retirement_ledger_v2_facts_are_complete(entry: Mapping[str, Any]) -> bool:
-    """Validate the frozen all-finite protocol-2 retirement evidence."""
-    facts = entry.get('dependency_facts')
-    original_column_sha256s = entry.get('original_column_sha256s')
-    return (isinstance(facts, dict) and
-            isinstance(original_column_sha256s, dict) and
-            _is_sha256(original_column_sha256s.get('created_at')) and
-            original_column_sha256s['created_at'] != _value_sha256(None) and
-            facts.get('cleanup_contract_schema') == _CLEANUP_PROOF_SCHEMA_V2 and
-            not any(field in facts
-                    for field in _CLEANUP_PROTOCOL_V3_ONLY_FIELDS) and
-            _retirement_ledger_typed_cleanup_facts_are_complete(entry))
-
-
-def _retirement_ledger_v3_facts_are_complete(entry: Mapping[str, Any]) -> bool:
-    """Validate timestamp-bound protocol-3 retirement evidence."""
-    facts = entry.get('dependency_facts')
-    service_name = entry.get('service_name')
-    version = entry.get('version')
-    original_column_sha256s = entry.get('original_column_sha256s')
-    if (not isinstance(facts, dict) or type(service_name) is not str or
-            not service_name or type(version) is not int or version < 1 or
-            not isinstance(original_column_sha256s, dict) or
-            not _is_sha256(original_column_sha256s.get('created_at')) or
-            facts.get('cleanup_contract_schema') != _CLEANUP_PROOF_SCHEMA or
-            not _retirement_ledger_typed_cleanup_facts_are_complete(entry)):
-        return False
-
-    service_count = facts.get('cleanup_version_timestamp_service_count')
-    inventory_count = facts.get('cleanup_version_timestamp_inventory_count')
-    matched_count = facts.get('cleanup_version_timestamp_matched_intent_count')
-    legacy_null_count = facts.get('cleanup_legacy_null_version_timestamp_count')
-    boundary_count = facts.get('cleanup_timestamp_boundary_count')
-    mode = facts.get('cleanup_candidate_version_created_at_mode')
-    boundary_version = facts.get(
-        'cleanup_candidate_legacy_timestamp_boundary_version')
-    if (type(service_count) is not int or service_count < 1 or
-            type(inventory_count) is not int or
-            not service_count <= inventory_count <= _MAX_INVENTORY_ROWS or
-            type(matched_count) is not int or
-            matched_count != facts.get('cleanup_match_inventory_count') or
-            matched_count != facts.get('cleanup_intent_inventory_count') or
-            not 1 <= matched_count <= inventory_count or
-            type(legacy_null_count) is not int or
-            not 0 <= legacy_null_count < inventory_count or
-            type(boundary_count) is not int or
-            not 0 <= boundary_count <= service_count or
-            boundary_count > legacy_null_count or
-            boundary_count > inventory_count - legacy_null_count or
-        ((legacy_null_count == 0) != (boundary_count == 0)) or not _is_sha256(
-            facts.get('cleanup_version_timestamp_inventory_sha256')) or
-            not _is_sha256(facts.get('cleanup_timestamp_proof_sha256'))):
-        return False
-
-    if mode == _CLEANUP_CREATED_AT_MODE_FINITE:
-        if (boundary_version is not None or
-                original_column_sha256s['created_at'] == _value_sha256(None)):
-            return False
-    elif mode == _CLEANUP_CREATED_AT_MODE_LEGACY_PREFIX_NULL:
-        current_version = facts.get('service_current_version')
-        if (legacy_null_count < 1 or boundary_count < 1 or
-                original_column_sha256s['created_at'] != _value_sha256(None) or
-                type(boundary_version) is not int or
-                not version < boundary_version or
-                type(current_version) is not int or
-                boundary_version > current_version):
-            return False
-    else:
-        return False
-
-    return facts['cleanup_timestamp_proof_sha256'] == (
-        _cleanup_timestamp_proof_binding_sha256(facts, (service_name, version)))
-
-
-def _retirement_ledger_facts_are_complete(entry: Mapping[str, Any],
-                                          protocol: int) -> bool:
-    if protocol == placement_normalization_identity.PROTOCOL_V1:
-        return _retirement_ledger_v1_facts_are_complete(entry)
-    if protocol == placement_normalization_identity.PROTOCOL_V2:
-        return _retirement_ledger_v2_facts_are_complete(entry)
-    if protocol == placement_normalization_identity.PROTOCOL_V3:
-        return _retirement_ledger_v3_facts_are_complete(entry)
-    return False
-
-
-def _ledger_manifest_mismatches(
-        run: Mapping[str, Any],
-        entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    run_id = str(run.get('run_id'))
-    issues: list[dict[str, Any]] = []
-
-    def add(reason: str, entry: Mapping[str, Any] | None = None) -> None:
-        issue: dict[str, Any] = {'run_id': run_id, 'reason': reason}
-        if entry is not None:
-            issue.update({
-                'service_name': entry.get('service_name'),
-                'version': entry.get('version'),
+    current_hashes: dict[str, str | None] = {}
+    invalid_hash_services: set[str] = set()
+    for service_name, observation in current_hash_observations.items():
+        try:
+            current_hashes[service_name] = observation.validated_value()
+        except ValueError:
+            mismatches.append({
+                'service_name': service_name,
+                'service_hash': observation.value,
+                'reason': 'invalid_current_parent_hash_observation',
             })
-        issues.append(issue)
+            invalid_hash_services.add(service_name)
 
-    row_count = run.get('row_count')
-    row_bound = run.get('row_bound')
-    raw_run_id = run.get('run_id')
-    mode = run.get('mode')
-    started_at = run.get('started_at')
-    completed_at = run.get('completed_at')
-    normalizer_version = run.get('normalizer_version')
-    normalizer_identity: (
-        placement_normalization_identity.PlacementNormalizationIdentity |
-        None) = None
-    parsed_mode: str | None = None
-    if not isinstance(raw_run_id, uuid.UUID):
-        add('invalid_run_id')
-    try:
-        parsed_mode = placement_normalization_identity.parse_manifest_mode(mode)
-    except placement_normalization_identity.PlacementNormalizationIdentityError:
-        add('invalid_run_mode')
-    try:
-        normalizer_identity = (placement_normalization_identity.
-                               parse_normalizer_identity(normalizer_version))
-    except placement_normalization_identity.PlacementNormalizationIdentityError:
-        add('invalid_normalizer_version')
-    allowed_outcomes: frozenset[tuple[str, str]] = frozenset()
-    if normalizer_identity is not None and parsed_mode is not None:
-        allowed_outcomes = (
-            placement_normalization_identity.allowed_manifest_outcomes(
-                normalizer_identity, parsed_mode))
-    if run.get('schema_revision') != _SCHEMA_REVISION:
-        add('invalid_schema_revision')
-    if not isinstance(run.get('release_version'),
-                      str) or not run.get('release_version'):
-        add('invalid_release_version')
-    if (not isinstance(started_at,
-                       (int, float)) or isinstance(started_at, bool) or
-            not math.isfinite(started_at) or started_at < 0 or
-            not isinstance(completed_at,
-                           (int, float)) or isinstance(completed_at, bool) or
-            not math.isfinite(completed_at) or completed_at < started_at):
-        add('invalid_run_times')
-    if not all(
-            _is_sha256(run.get(field))
-            for field in ('pre_inventory_sha256', 'post_inventory_sha256',
-                          'freeze_evidence_sha256')):
-        add('invalid_run_digests')
-    if (type(row_count) is not int or type(row_bound) is not int or
-            not 0 <= row_count <= row_bound <= _MAX_INVENTORY_ROWS):
-        add('invalid_run_row_bound')
-    if type(row_count) is not int or row_count != len(entries):
-        add('incomplete_run_inventory')
-
-    counts: collections.Counter[str] = collections.Counter()
-    pre_inventory: list[tuple[str, int, str]] = []
-    post_inventory: list[tuple[str, int, str]] = []
-    identities: set[tuple[str, int]] = set()
-    for entry in entries:
-        service_name = entry.get('service_name')
-        version = entry.get('version')
-        if (not isinstance(service_name, str) or not service_name or
-                type(version) is not int or version < 1 or
-            (service_name, version) in identities):
-            add('invalid_or_duplicate_row_identity', entry)
+    completed_at = float(run['completed_at'])
+    current_by_identity = {work.identity: work for work in rows}
+    for work in rows:
+        service_name, version = work.identity
+        if service_name in candidate_services:
             continue
-        identities.add((service_name, version))
-        classification = entry.get('classification')
-        outcome = entry.get('outcome')
-        if (classification, outcome) not in allowed_outcomes:
-            add('invalid_classification_outcome', entry)
-        if entry.get('run_id') != raw_run_id:
-            add('row_run_id_mismatch', entry)
-        if not isinstance(classification, str) or not classification:
-            add('invalid_row_classification', entry)
-        else:
-            counts[classification] += 1
-        original_spec_digest = entry.get('original_spec_sha256')
-        result_spec_digest = entry.get('result_spec_sha256')
-        if not (_is_sha256(original_spec_digest) and
-                _is_sha256(result_spec_digest)):
-            add('invalid_spec_digests', entry)
-        elif ((outcome == 'unchanged')
-              != (original_spec_digest == result_spec_digest)):
-            add('spec_digest_outcome_mismatch', entry)
-        if (outcome == 'retired' and
-                result_spec_digest != _sha256(_RETIRED_SPEC_BYTES)):
-            add('invalid_retired_result_digest', entry)
-        original_row_digest = entry.get('original_row_sha256')
-        result_row_digest = entry.get('result_row_sha256')
-        if (_prehashed_row_sha256(entry.get('original_column_sha256s'))
-                != original_row_digest):
-            add('invalid_original_column_inventory', entry)
-        if (_prehashed_row_sha256(entry.get('result_column_sha256s'))
-                != result_row_digest):
-            add('invalid_result_column_inventory', entry)
-        if isinstance(original_row_digest, str):
-            pre_inventory.append((service_name, version, original_row_digest))
-        if isinstance(result_row_digest, str):
-            post_inventory.append((service_name, version, result_row_digest))
-        facts = entry.get('dependency_facts')
-        if (not isinstance(facts, dict) or
-                facts.get('service_hash') != entry.get('service_hash') or
-                facts.get('service_lifecycle_epoch')
-                != entry.get('service_lifecycle_epoch')):
-            add('owner_facts_do_not_match_columns', entry)
-        if (outcome == 'retired' and
-            (normalizer_identity is None or
-             not _retirement_ledger_facts_are_complete(
-                 entry, normalizer_identity.protocol))):
-            add('incomplete_retirement_dependency_facts', entry)
-        if (outcome == 'retired' and normalizer_identity is not None and
-                normalizer_identity.protocol
-                in (placement_normalization_identity.PROTOCOL_V2,
-                    placement_normalization_identity.PROTOCOL_V3) and
-                isinstance(facts, dict) and
-                facts.get('operator_freeze_approved_commit_binding_sha256')
-                != run.get('freeze_evidence_sha256')):
-            add('retirement_freeze_commit_binding_mismatch', entry)
+        if service_name in invalid_hash_services:
+            continue
+        service_hash = current_hashes.get(service_name)
+        tracked_entry = manifest_by_identity.get(work.identity)
+        if service_hash is None:
+            mismatches.append({
+                'service_name': service_name,
+                'version': version,
+                'service_hash': service_hash,
+                'reason': 'current_row_without_parent_service',
+            })
+            continue
+        if (tracked_entry is not None and
+                tracked_entry.get('service_hash') == service_hash):
+            if tracked_entry.get('classification') == (
+                    placement_normalization_manifest.ManifestClassification.
+                    PLACEHOLDER.value):
+                frozen_row = _frozen_version_row(work.original)
+                unchanged = (
+                    _is_post_terminal_placeholder(work) and
+                    _row_sha256(frozen_row) ==
+                    tracked_entry.get('result_row_sha256'))
+                if not (unchanged or
+                        _is_post_terminal_explicit_v2(work, completed_at)):
+                    mismatches.append({
+                        'service_name': service_name,
+                        'version': version,
+                        'service_hash': service_hash,
+                        'reason': 'invalid_terminal_placeholder_transition',
+                    })
+            elif (work.analysis.source_sha256 !=
+                  tracked_entry.get('result_spec_sha256')):
+                mismatches.append({
+                    'service_name': service_name,
+                    'version': version,
+                    'service_hash': service_hash,
+                    'reason': 'tracked_result_spec_drift',
+                })
+            continue
 
-    if run.get('classification_counts') != dict(counts):
-        add('classification_counts_do_not_match_inventory')
-    pre_digest = _sha256(
-        json.dumps(sorted(pre_inventory), separators=(',', ':')).encode())
-    post_digest = _sha256(
-        json.dumps(sorted(post_inventory), separators=(',', ':')).encode())
-    if run.get('pre_inventory_sha256') != pre_digest:
-        add('pre_inventory_digest_mismatch')
-    if run.get('post_inventory_sha256') != post_digest:
-        add('post_inventory_digest_mismatch')
-    return issues
+        boundary = (service_name, service_hash)
+        high_water = high_waters.get(boundary)
+        if high_water is not None:
+            allowed = (version > high_water and
+                       (_is_post_terminal_placeholder(work) or
+                        _is_post_terminal_explicit_v2(work, completed_at)))
+            reason = 'invalid_same_incarnation_post_terminal_row'
+        else:
+            allowed = _is_post_terminal_explicit_v2(work, completed_at)
+            reason = 'invalid_new_incarnation_version_row'
+        if not allowed:
+            mismatches.append({
+                'service_name': service_name,
+                'version': version,
+                'service_hash': service_hash,
+                'reason': reason,
+            })
+
+    for identity, tracked_entry in sorted(manifest_by_identity.items()):
+        if identity[0] in invalid_hash_services:
+            continue
+        current = current_by_identity.get(identity)
+        if current is not None and current_hashes.get(
+                identity[0]) == tracked_entry.get('service_hash'):
+            continue
+        if (current is None and current_hashes.get(identity[0]) ==
+                tracked_entry.get('service_hash') and
+                tracked_entry.get('service_hash') is not None):
+            mismatches.append({
+                'service_name': identity[0],
+                'version': identity[1],
+                'service_hash': tracked_entry.get('service_hash'),
+                'reason': 'tracked_row_absent_from_current_inventory',
+            })
+    return tuple(mismatches)
 
 
 def _prior_ledger_mismatches(
@@ -3291,8 +3317,16 @@ def _prior_ledger_mismatches(
                         ledger.c.service_name, ledger.c.version).limit(
                             _MAX_INVENTORY_ROWS + 1)).mappings().all()
         ]
+        latest_run_dict = dict(latest_run)
         mismatches.extend(
-            _ledger_manifest_mismatches(dict(latest_run), ledger_entries))
+            placement_normalization_manifest.manifest_mismatches(
+                latest_run_dict, ledger_entries))
+        if mismatches:
+            return tuple(mismatches)
+        if placement_normalization_manifest.is_terminal_protocol4_manifest(
+                latest_run_dict, ledger_entries):
+            return _terminal_fleet_mismatches(session, latest_run_dict,
+                                              ledger_entries, rows)
         latest_manifest_identities = {
             (str(entry['service_name']), int(entry['version']),
              entry.get('service_hash'), entry.get('service_lifecycle_epoch'))
@@ -3435,7 +3469,89 @@ def _read_timestamp(now: Callable[[], float], label: str) -> float:
     return float(value)
 
 
-def _acquire_writer_locks(session: orm.Session) -> None:
+def _acquire_writer_session_lock(
+        connection: sqlalchemy.engine.Connection) -> str:
+    """Acquire cross-protocol authority and return its canonical DB schema."""
+    with connection.begin():
+        acquired = connection.execute(
+            sqlalchemy.text('SELECT pg_try_advisory_lock('
+                            'hashtextextended(:name, 0))'),
+            {'name': _ADVISORY_LOCK_NAME}).scalar_one()
+        if acquired is not True:
+            raise NormalizationBlocker(
+                'Another placement-normalization writer or schema migration '
+                'owns the advisory authority.')
+        return _assert_database_write_authority(connection)
+
+
+def _assert_database_write_authority(
+        connection: sqlalchemy.engine.Connection) -> str:
+    """Require revision 040's complete open fence and return its schema."""
+    try:
+        schema = connection.execute(
+            sqlalchemy.text('SELECT current_schema()')).scalar_one()
+        if (type(schema) is not str or not schema or
+                schema.startswith('pg_temp_') or schema == 'pg_catalog'):
+            raise NormalizationBlocker(
+                'Placement-normalization database schema is invalid.')
+        relation_parameters = {
+            f'relation_{index}': relation
+            for index, relation in enumerate(_DATABASE_AUTHORITY_RELATIONS)
+        }
+        relation_placeholders = ', '.join(
+            f':relation_{index}'
+            for index in range(len(_DATABASE_AUTHORITY_RELATIONS)))
+        temporary_shadows = connection.execute(
+            sqlalchemy.text(
+                'SELECT pg_catalog.array_agg(relation.relname '
+                'ORDER BY relation.relname) '
+                'FROM pg_catalog.pg_class AS relation '
+                'WHERE relation.relnamespace = '
+                'pg_catalog.pg_my_temp_schema() '
+                f'AND relation.relname IN ({relation_placeholders})'),
+            relation_parameters).scalar_one()
+        if temporary_shadows is not None:
+            raise NormalizationBlocker(
+                'Placement-normalization database session contains a '
+                f'temporary authority-relation shadow: {temporary_shadows!r}.')
+        quote = connection.dialect.identifier_preparer.quote
+        qualified_function = (
+            f'{quote(schema)}.{quote(_DATABASE_AUTHORITY_FUNCTION)}')
+        asserted = connection.exec_driver_sql(
+            f'SELECT {qualified_function}()').scalar_one()
+    except NormalizationBlocker:
+        raise
+    except sqlalchemy.exc.SQLAlchemyError as exc:
+        raise NormalizationBlocker(
+            'Placement-normalization database write authority is absent or '
+            'invalid.') from exc
+    if asserted is not True:
+        raise NormalizationBlocker(
+            'Placement-normalization database write authority did not prove '
+            'one exact open revision-040 fence.')
+    return schema
+
+
+def _release_writer_session_lock(
+        connection: sqlalchemy.engine.Connection) -> None:
+    """Release the session lock explicitly; closing is the final fallback."""
+    with connection.begin():
+        released = connection.execute(
+            sqlalchemy.text('SELECT pg_advisory_unlock('
+                            'hashtextextended(:name, 0))'),
+            {'name': _ADVISORY_LOCK_NAME}).scalar_one()
+        if released is not True:
+            raise NormalizationBlocker(
+                'Placement-normalization writer session lock was lost.')
+
+
+def _acquire_writer_table_locks(session: orm.Session, schema: str) -> None:
+    bind = session.get_bind()
+    quote = bind.dialect.identifier_preparer.quote
+    relations = ', '.join(
+        f'{quote(schema)}.{quote(relation)}' for relation in (
+            'services', 'version_specs', 'replicas',
+            'ephemeral_storage_cleanup_intents'))
     session.execute(
         sqlalchemy.text(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT_MS}ms'"))
     session.execute(
@@ -3443,12 +3559,7 @@ def _acquire_writer_locks(session: orm.Session) -> None:
             f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT_MS}ms'"))
     session.execute(
         sqlalchemy.text(
-            'SELECT pg_advisory_xact_lock(hashtextextended(:name, 0))'),
-        {'name': _ADVISORY_LOCK_NAME})
-    session.execute(
-        sqlalchemy.text(
-            'LOCK TABLE services, version_specs, replicas, '
-            'ephemeral_storage_cleanup_intents IN SHARE ROW EXCLUSIVE MODE'))
+            f'LOCK TABLE {relations} IN SHARE ROW EXCLUSIVE MODE'))
 
 
 def _verify_version_postimages(session: orm.Session,
@@ -3542,6 +3653,13 @@ def run_operator(
         raise RuntimeError(
             'Placement normalization is supported only on PostgreSQL.')
 
+    if mode is not None:
+        # This read-only fence deliberately precedes every external evidence
+        # getter.  It is repeated under the writer locks below to close two
+        # concurrent first-retirement attempts.
+        with orm.Session(engine) as session:
+            _require_no_terminal_protocol4_manifest(session)
+
     if mode is None:
         with orm.Session(engine) as session:
             rows, service_rows = _scan_inventory(session, row_bound)
@@ -3587,7 +3705,8 @@ def run_operator(
             'Active Serve mutation requests remain during the freeze.')
 
     preflight_images: dict[tuple[str, int], _ExternalEvidence] = {}
-    preflight_identities: set[tuple[str, int]] = set()
+    preflight_candidate_identities: set[tuple[str, int]] = set()
+    preflight_version_evidence_identities: set[tuple[str, int]] = set()
     preflight_process_targets: frozenset[_ProcessTarget] = frozenset()
     preflight_action_targets: frozenset[_ResourceActionTarget] = frozenset()
     resource_actions_before: dict[tuple[str, int], _ExternalEvidence] = {}
@@ -3604,17 +3723,18 @@ def run_operator(
             preflight_rows, _ = _scan_inventory(session, row_bound)
         (preflight_process_targets, preflight_action_targets
         ) = _retirement_evidence_targets(preflight_rows)
-        for row in preflight_rows:
-            if row.classification is not (
+        for row in _retirement_version_evidence_rows(preflight_rows):
+            if row.classification is (
                     Classification.HISTORICAL_PHYSICAL_PER_GPU):
-                continue
-            preflight_identities.add(row.identity)
+                preflight_candidate_identities.add(row.identity)
+            preflight_version_evidence_identities.add(row.identity)
             preflight_images[row.identity] = _validate_external_evidence(
                 image_evidence_getter(row.identity[0], row.identity[1]),
                 'Container-image demand preflight')
             if preflight_images[row.identity].count:
                 raise NormalizationBlocker(
-                    'Historical version has live container-image demand.')
+                    'Historical candidate or same-service placeholder has '
+                    'live container-image demand.')
         process_before = _validate_external_evidence(
             process_evidence_getter(preflight_process_targets,
                                     api_pod_before.pod_uid),
@@ -3623,7 +3743,7 @@ def run_operator(
                                       'Serve controller process evidence')
         resource_actions_before = _validate_external_evidence_map(
             resource_action_evidence_getter(engine, preflight_action_targets),
-            frozenset(preflight_identities),
+            frozenset(preflight_version_evidence_identities),
             'Serve resource-action root preflight')
         _require_stable_zero_evidence_map(
             resource_actions_before, resource_actions_before,
@@ -3631,12 +3751,17 @@ def run_operator(
 
     started_at = _read_timestamp(now, 'Normalization start')
     run_id = uuid.uuid4()
-    connection = engine.connect().execution_options(
-        isolation_level='SERIALIZABLE')
+    connection = engine.connect()
+    writer_lock_acquired = False
     try:
-        with connection, orm.Session(
-                bind=connection) as session, session.begin():
-            _acquire_writer_locks(session)
+        database_schema = _acquire_writer_session_lock(connection)
+        writer_lock_acquired = True
+        connection = connection.execution_options(
+            isolation_level='SERIALIZABLE',
+            schema_translate_map={None: database_schema})
+        with orm.Session(bind=connection) as session, session.begin():
+            _acquire_writer_table_locks(session, database_schema)
+            _require_no_terminal_protocol4_manifest(session)
             rows, service_rows = _scan_inventory(session, row_bound)
             api_pod_locked = _validate_api_pod_identity(
                 api_pod_checker(engine),
@@ -3673,10 +3798,19 @@ def run_operator(
                     row.identity for row in rows if row.classification is
                     Classification.HISTORICAL_PHYSICAL_PER_GPU
                 }
-                if locked_identities != preflight_identities:
+                if locked_identities != preflight_candidate_identities:
                     raise NormalizationBlocker(
                         'Historical candidates changed after external '
                         'preflight.')
+                locked_version_evidence_identities = {
+                    row.identity
+                    for row in _retirement_version_evidence_rows(rows)
+                }
+                if (locked_version_evidence_identities
+                        != preflight_version_evidence_identities):
+                    raise NormalizationBlocker(
+                        'Historical candidate placeholder inventory changed '
+                        'after external preflight.')
                 (locked_process_targets,
                  locked_action_targets) = _retirement_evidence_targets(rows)
                 if (locked_process_targets != preflight_process_targets or
@@ -3692,10 +3826,19 @@ def run_operator(
                 _require_stable_zero_evidence(
                     process_before, process_locked,
                     'Serve controller process evidence')
+                images_locked: dict[tuple[str, int], _ExternalEvidence] = {}
+                for identity in sorted(locked_version_evidence_identities):
+                    locked_image = _validate_external_evidence(
+                        image_evidence_getter(identity[0], identity[1]),
+                        'Container-image demand locked preflight')
+                    _require_stable_zero_evidence(
+                        preflight_images[identity], locked_image,
+                        'Container-image demand evidence')
+                    images_locked[identity] = locked_image
                 resource_actions_locked = _validate_external_evidence_map(
                     resource_action_evidence_getter(engine,
                                                     locked_action_targets),
-                    frozenset(locked_identities),
+                    frozenset(locked_version_evidence_identities),
                     'Serve resource-action root locked preflight')
                 _require_stable_zero_evidence_map(
                     resource_actions_before, resource_actions_locked,
@@ -3721,7 +3864,7 @@ def run_operator(
                 affected_services = _prepare_retirement_rows(
                     rows, service_rows, run_id,
                     _read_timestamp(now, 'Historical retirement'),
-                    preflight_images, resource_actions_locked,
+                    images_locked, resource_actions_locked,
                     legacy_controller_locked, process_locked, api_pod_locked,
                     request_before, cleanup_plan, receipt_evidence)
             post_digest = _fleet_sha256(rows, result=True)
@@ -3740,6 +3883,7 @@ def run_operator(
                 freeze_evidence_sha256=manifest_freeze_evidence_sha256,
                 pre_digest=pre_digest,
                 post_digest=post_digest)
+            _verify_inserted_ledger(session, run_id, row_bound)
             if cleanup_plan is not None:
                 _cas_cleanup_intent_results(session, cleanup_plan)
             for row in rows:
@@ -3781,7 +3925,7 @@ def run_operator(
                 resource_actions_after = _validate_external_evidence_map(
                     resource_action_evidence_getter(engine,
                                                     preflight_action_targets),
-                    frozenset(preflight_identities),
+                    frozenset(preflight_version_evidence_identities),
                     'Serve resource-action root postflight')
                 _require_stable_zero_evidence_map(
                     resource_actions_before, resource_actions_after,
@@ -3806,7 +3950,11 @@ def run_operator(
             _require_stable_api_pod(api_pod_before, api_pod_after)
     finally:
         if not connection.closed:
-            connection.close()
+            try:
+                if writer_lock_acquired:
+                    _release_writer_session_lock(connection)
+            finally:
+                connection.close()
 
     counts = collections.Counter(row.classification.value for row in rows)
     return OperatorResult(

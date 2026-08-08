@@ -621,7 +621,10 @@ def get_live_service_version_demand_evidence_any_incarnation(
     owner_prefix = f'{service_name}:incarnation:'
     version_suffix = f':v{version}'
     target_marker = f'{version_suffix}:target:'
-    owner_pattern = re.compile(rf'^{re.escape(owner_prefix)}[^:]+:v{version}'
+    # Incarnation hashes are opaque legacy values and may themselves contain
+    # colons.  Parse the exact version/optional-target suffix from the right;
+    # a single-component hash grammar would silently drop live old owners.
+    owner_pattern = re.compile(rf'^{re.escape(owner_prefix)}.+:v{version}'
                                r'(?::target:[^:]+)?$')
     demands = schema.demands
     with orm.Session(catalog_state.engine()) as session:
@@ -648,10 +651,15 @@ def get_live_service_version_demand_evidence_any_incarnation(
         raise RuntimeError(
             'Live Serve version image-demand evidence exceeds its explicit '
             'row bound.')
-    rows = [
+    malformed = [
         row for row in candidates
-        if owner_pattern.fullmatch(str(row.consumer_owner)) is not None
+        if owner_pattern.fullmatch(str(row.consumer_owner)) is None
     ]
+    if malformed:
+        raise RuntimeError(
+            'Live Serve version image-demand evidence contains a malformed '
+            'possibly matching owner.')
+    rows = candidates
     canonical = json.dumps(
         [(str(row.id), str(row.consumer_owner), int(
             row.consumer_generation), str(row.target_key), str(row.state))

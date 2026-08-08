@@ -24,6 +24,7 @@ from sky.container_images import demand_state
 from sky.serve import constants as serve_constants
 from sky.serve import ephemeral_storage_contract
 from sky.serve import placement_contract_normalization
+from sky.serve import placement_normalization_manifest
 from sky.serve import placement_policy
 from sky.serve import serve_state
 from sky.serve import service_spec
@@ -143,6 +144,8 @@ def _normalizer_work(payload: bytes,
         'controller_config_digest': None,
         'controller_config_snapshot_id': None,
         'controller_applied_at': None,
+        'resource_action_spec_identity': None,
+        'resource_action_spec_identity_sha256': None,
     }
     analysis, classification = (
         placement_contract_normalization._classify_version_row(row))
@@ -157,6 +160,9 @@ def _normalizer_work(payload: bytes,
             'service_hash': 'current-hash',
             'service_lifecycle_epoch': 7,
             'service_resource_scope': 'current-scope',
+            'service_pool': 0,
+            'service_resource_action_mode': 'legacy',
+            'service_resource_action_mode_changed_at': None,
             'service_status': 'READY',
             'service_active': False,
             'replica_count': 0,
@@ -298,6 +304,126 @@ def _single_cleanup_plan_inputs() -> tuple[
     service_rows = {'svc': _retirement_service_row()}
     intents = _attach_cleanup_intent_inputs(rows, service_rows)
     return intents, rows, service_rows
+
+
+def _stale_placeholder_retirement_inputs():
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    candidate = _normalizer_work(historical_payload, 1)
+    placeholder_two = _normalizer_work(pickle.dumps(None, protocol=4),
+                                       2,
+                                       yaml_content=None)
+    placeholder_three = _normalizer_work(pickle.dumps(None, protocol=4),
+                                         3,
+                                         yaml_content=None)
+    successor = _normalizer_work(_explicit_v2_payload(), 4)
+    rows = [candidate, placeholder_two, placeholder_three, successor]
+    service_rows = {'svc': _retirement_service_row(current_version=4)}
+    for row in rows:
+        row.dependency_facts['service_current_version'] = 4
+        row.dependency_facts['service_active'] = row is successor
+    cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
+    receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
+    image_evidence = {
+        ('svc', 1): placement_contract_normalization._ExternalEvidence(
+            count=0, digest='a' * 64),
+        ('svc', 2): placement_contract_normalization._ExternalEvidence(
+            count=0, digest='b' * 64),
+        ('svc', 3): placement_contract_normalization._ExternalEvidence(
+            count=0, digest='c' * 64),
+    }
+    resource_action_evidence = {
+        ('svc', 1): placement_contract_normalization._ExternalEvidence(
+            count=0, digest='d' * 64),
+        ('svc', 2): placement_contract_normalization._ExternalEvidence(
+            count=0, digest='e' * 64),
+        ('svc', 3): placement_contract_normalization._ExternalEvidence(
+            count=0, digest='f' * 64),
+    }
+    return (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+            resource_action_evidence)
+
+
+def _prepare_stale_placeholder_retirement(
+    rows,
+    service_rows,
+    cleanup_plan,
+    receipt_evidence,
+    image_evidence,
+    resource_action_evidence,
+    run_id=None,
+):
+    no_evidence = placement_contract_normalization._ExternalEvidence(
+        count=0, digest='0' * 64)
+    return placement_contract_normalization._prepare_retirement_rows(
+        rows, service_rows, run_id or uuid.uuid4(), 10.0,
+        image_evidence, resource_action_evidence, no_evidence, no_evidence,
+        _api_pod_identity(), no_evidence, cleanup_plan, receipt_evidence)
+
+
+def _ledger_entry_for_work(row, run_id):
+    return {
+        'run_id': run_id,
+        'service_name': row.identity[0],
+        'version': row.identity[1],
+        'classification': row.ledger_classification,
+        'outcome': row.outcome,
+        'original_spec_sha256': row.analysis.source_sha256,
+        'result_spec_sha256': placement_contract_normalization._sha256(
+            bytes(row.result['spec'])),
+        'original_row_sha256': placement_contract_normalization._row_sha256(
+            row.original),
+        'result_row_sha256': placement_contract_normalization._row_sha256(
+            row.result),
+        'original_column_sha256s':
+            placement_contract_normalization._column_sha256s(row.original),
+        'result_column_sha256s':
+            placement_contract_normalization._column_sha256s(row.result),
+        'contract_projection': row.analysis.contract_projection,
+        'service_hash': row.dependency_facts['service_hash'],
+        'service_lifecycle_epoch':
+            row.dependency_facts['service_lifecycle_epoch'],
+        'dependency_facts': row.dependency_facts,
+    }
+
+
+def _protocol_4_stale_placeholder_manifest():
+    (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+     resource_action_evidence) = _stale_placeholder_retirement_inputs()
+    run_id = uuid.UUID('cccccccc-cccc-4ccc-8ccc-cccccccccccc')
+    _prepare_stale_placeholder_retirement(rows,
+                                          service_rows,
+                                          cleanup_plan,
+                                          receipt_evidence,
+                                          image_evidence,
+                                          resource_action_evidence,
+                                          run_id=run_id)
+    entries = [_ledger_entry_for_work(row, run_id) for row in rows]
+    classification_counts: dict[str, int] = {}
+    for entry in entries:
+        classification = entry['classification']
+        classification_counts[classification] = (
+            classification_counts.get(classification, 0) + 1)
+    run = {
+        'run_id': run_id,
+        'mode': 'retire_terminal_historical',
+        'normalizer_version': f'4:{"a" * 40}',
+        'schema_revision': '037',
+        'release_version': 'test-release',
+        'started_at': 1.0,
+        'completed_at': 2.0,
+        'row_count': len(entries),
+        'row_bound': len(entries),
+        'classification_counts': classification_counts,
+        'pre_inventory_sha256': placement_contract_normalization._fleet_sha256(
+            rows, result=False),
+        'post_inventory_sha256': placement_contract_normalization._fleet_sha256(
+            rows, result=True),
+        'freeze_evidence_sha256':
+            rows[0].
+            dependency_facts['operator_freeze_approved_commit_binding_sha256'],
+    }
+    return run, entries
 
 
 @pytest.mark.parametrize(('policy_name', 'pool', 'expected'), [
@@ -1309,8 +1435,9 @@ def test_multirow_retirement_proves_a_surviving_successor():
                                                                    digest='0' *
                                                                    64)
 
+    retirement_run_id = uuid.uuid4()
     affected = placement_contract_normalization._prepare_retirement_rows(
-        rows, service_rows, uuid.uuid4(), 10.0, {
+        rows, service_rows, retirement_run_id, 10.0, {
             ('svc', 1): no_demand,
             ('svc', 2): no_demand,
         }, {
@@ -1353,28 +1480,37 @@ def test_multirow_retirement_proves_a_surviving_successor():
         'cleanup_candidate_legacy_timestamp_boundary_version'] == 3
     assert placement_contract_normalization._is_sha256(
         historical_one.dependency_facts['cleanup_timestamp_proof_sha256'])
-    ledger_entry = {
-        'service_name': 'svc',
-        'version': 1,
-        'original_column_sha256s': {
-            'created_at': placement_contract_normalization._value_sha256(None),
-        },
-        'dependency_facts': historical_one.dependency_facts,
-    }
+    ledger_entry = _ledger_entry_for_work(historical_one, retirement_run_id)
     assert (
-        placement_contract_normalization._retirement_ledger_facts_are_complete(
+        placement_normalization_manifest._retirement_ledger_facts_are_complete(
+            ledger_entry, protocol=4))
+    assert not (
+        placement_normalization_manifest._retirement_ledger_facts_are_complete(
             ledger_entry, protocol=3))
 
-    protocol_2_facts = {
+    protocol_3_facts = {
         field: value
         for field, value in historical_one.dependency_facts.items()
         if field not in
-        placement_contract_normalization._CLEANUP_PROTOCOL_V3_ONLY_FIELDS
+        placement_normalization_manifest.PROTOCOL_V4_ONLY_FACT_FIELDS
+    }
+    protocol_3_facts['same_service_placeholder_dependency_absent'] = True
+    protocol_3_entry = {
+        **ledger_entry,
+        'dependency_facts': protocol_3_facts,
+    }
+    assert (
+        placement_normalization_manifest._retirement_ledger_facts_are_complete(
+            protocol_3_entry, protocol=3))
+
+    protocol_2_facts = {
+        field: value for field, value in protocol_3_facts.items() if field
+        not in placement_contract_normalization._CLEANUP_PROTOCOL_V3_ONLY_FIELDS
     }
     protocol_2_facts['cleanup_contract_schema'] = (
         placement_contract_normalization._CLEANUP_PROOF_SCHEMA_V2)
     assert (
-        placement_contract_normalization._retirement_ledger_facts_are_complete(
+        placement_normalization_manifest._retirement_ledger_facts_are_complete(
             {
                 'service_name': 'svc',
                 'version': 1,
@@ -1386,22 +1522,22 @@ def test_multirow_retirement_proves_a_surviving_successor():
             },
             protocol=2))
     assert not (
-        placement_contract_normalization._retirement_ledger_facts_are_complete(
+        placement_normalization_manifest._retirement_ledger_facts_are_complete(
             ledger_entry, protocol=2))
     assert not (
-        placement_contract_normalization._retirement_ledger_facts_are_complete(
+        placement_normalization_manifest._retirement_ledger_facts_are_complete(
             {
                 **ledger_entry,
                 'dependency_facts': protocol_2_facts,
             }, protocol=2))
 
     for field in placement_contract_normalization._CLEANUP_PROTOCOL_V3_ONLY_FIELDS:
-        missing_facts = dict(historical_one.dependency_facts)
+        missing_facts = dict(protocol_3_facts)
         missing_facts.pop(field)
-        assert not (placement_contract_normalization.
+        assert not (placement_normalization_manifest.
                     _retirement_ledger_facts_are_complete(
                         {
-                            **ledger_entry,
+                            **protocol_3_entry,
                             'dependency_facts': missing_facts,
                         },
                         protocol=3)), field
@@ -1413,12 +1549,12 @@ def test_multirow_retirement_proves_a_surviving_successor():
         ('cleanup_candidate_legacy_timestamp_boundary_version', 2),
         ('cleanup_timestamp_proof_sha256', 'd' * 64),
     ):
-        tampered_facts = dict(historical_one.dependency_facts)
+        tampered_facts = dict(protocol_3_facts)
         tampered_facts[field] = valid_looking_value
-        assert not (placement_contract_normalization.
+        assert not (placement_normalization_manifest.
                     _retirement_ledger_facts_are_complete(
                         {
-                            **ledger_entry,
+                            **protocol_3_entry,
                             'dependency_facts': tampered_facts,
                         },
                         protocol=3)), field
@@ -1427,12 +1563,12 @@ def test_multirow_retirement_proves_a_surviving_successor():
         ('service_resource_action_mode', 'shadow'),
         ('service_resource_action_mode_changed_at', 1.0),
     ):
-        tampered_facts = dict(historical_one.dependency_facts)
+        tampered_facts = dict(protocol_3_facts)
         tampered_facts[field] = contradictory_value
-        assert not (placement_contract_normalization.
+        assert not (placement_normalization_manifest.
                     _retirement_ledger_facts_are_complete(
                         {
-                            **ledger_entry,
+                            **protocol_3_entry,
                             'dependency_facts': tampered_facts,
                         },
                         protocol=3))
@@ -1448,12 +1584,12 @@ def test_multirow_retirement_proves_a_surviving_successor():
         ('predecessor_receipt_inventory_count', False),
         ('approved_loaded_image_commit_count', True),
     ):
-        tampered_facts = dict(historical_one.dependency_facts)
+        tampered_facts = dict(protocol_3_facts)
         tampered_facts[field] = false_lookalike
-        assert not (placement_contract_normalization.
+        assert not (placement_normalization_manifest.
                     _retirement_ledger_facts_are_complete(
                         {
-                            **ledger_entry,
+                            **protocol_3_entry,
                             'dependency_facts': tampered_facts,
                         },
                         protocol=3)), field
@@ -1497,7 +1633,165 @@ def test_retirement_rejects_catalog_cleanup_and_bridge_dependencies(
             _api_pod_identity(), no_evidence, cleanup_plan, receipt_evidence)
 
 
-def test_retirement_rejects_same_service_placeholder_reservation():
+def test_retirement_accepts_proved_stale_placeholders_below_current():
+    (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+     resource_action_evidence) = _stale_placeholder_retirement_inputs()
+    candidate, placeholder_two, placeholder_three, successor = rows
+    placeholder_preimages = {
+        row.identity: dict(row.original)
+        for row in (placeholder_two, placeholder_three)
+    }
+
+    affected = _prepare_stale_placeholder_retirement(rows, service_rows,
+                                                     cleanup_plan,
+                                                     receipt_evidence,
+                                                     image_evidence,
+                                                     resource_action_evidence)
+
+    assert affected == {'svc'}
+    expected_evidence = []
+    for placeholder in (placeholder_two, placeholder_three):
+        identity = placeholder.identity
+        evidence = {
+            'schema': 'skyserve-stale-placeholder-retirement-v1',
+            'service_name_sha256': hashlib.sha256(b'svc').hexdigest(),
+            'version': identity[1],
+            'original_row_sha256': placement_contract_normalization._row_sha256(
+                placeholder_preimages[identity]),
+            'strictly_newer_committed_version': 4,
+            'image_demand_count': 0,
+            'image_demand_sha256': image_evidence[identity].digest,
+            'resource_action_root_count': 0,
+            'resource_action_root_sha256':
+                resource_action_evidence[identity].digest,
+            'state_clean': True,
+            'fill_stale_proved': True,
+        }
+        expected_evidence.append(evidence)
+        assert placeholder.classification is (
+            placement_contract_normalization.Classification.PLACEHOLDER)
+        assert placeholder.manifest_classification is (
+            placement_normalization_manifest.ManifestClassification.
+            STALE_PLACEHOLDER)
+        assert placeholder.ledger_classification == 'stale_placeholder'
+        assert placeholder.outcome == 'unchanged'
+        assert placeholder.original == placeholder_preimages[identity]
+        assert placeholder.result == placeholder_preimages[identity]
+        assert placeholder.dependency_facts['stale_placeholder_evidence'] == (
+            evidence)
+
+    expected_inventory_sha256 = (
+        placement_contract_normalization._canonical_json_sha256({
+            'schema': 'skyserve-stale-placeholder-retirement-v1',
+            'service_name_sha256': hashlib.sha256(b'svc').hexdigest(),
+            'current_version': 4,
+            'placeholders': expected_evidence,
+        }))
+    assert candidate.dependency_facts[
+        'same_service_stale_placeholder_proof'] == {
+            'schema': 'skyserve-stale-placeholder-retirement-v1',
+            'service_name_sha256': hashlib.sha256(b'svc').hexdigest(),
+            'current_version': 4,
+            'placeholder_count': 2,
+            'image_demand_count': 0,
+            'resource_action_root_count': 0,
+            'inventory_sha256': expected_inventory_sha256,
+            'fill_stale_proved': True,
+        }
+    assert candidate.outcome == 'retired'
+    assert successor.outcome == 'unchanged'
+
+
+@pytest.mark.parametrize(('column', 'value'), [
+    ('yaml_content', 'service: {}'),
+    ('submitted_yaml_content', 'service: {}'),
+    ('placement_catalog', {}),
+    ('controller_config', b'{}'),
+    ('controller_config_digest', '1' * 64),
+    ('controller_config_snapshot_id', '2' * 64),
+    ('controller_applied_at', 1.0),
+    ('quarantined_at', 1.0),
+    ('quarantine_reason', 'quarantined'),
+    ('retired_yaml_content', 'service: {}'),
+    ('retired_at', 1.0),
+    ('retirement_reason', 'retired'),
+    ('retirement_run_id', uuid.UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')),
+    ('resource_action_spec_identity', 'resource-action'),
+    ('resource_action_spec_identity_sha256', '3' * 64),
+])
+def test_retirement_rejects_stale_placeholder_side_state(column, value):
+    (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+     resource_action_evidence) = _stale_placeholder_retirement_inputs()
+    placeholder = rows[1]
+    placeholder.original[column] = value
+    placeholder.result[column] = value
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='live or staged state'):
+        _prepare_stale_placeholder_retirement(rows, service_rows, cleanup_plan,
+                                              receipt_evidence, image_evidence,
+                                              resource_action_evidence)
+
+
+@pytest.mark.parametrize(('fact', 'value'), [
+    ('service_current_version', 3),
+    ('service_active', True),
+    ('replica_count', 1),
+    ('unknown_version_replica_count', 1),
+])
+def test_retirement_rejects_stale_placeholder_owner_state(fact, value):
+    (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+     resource_action_evidence) = _stale_placeholder_retirement_inputs()
+    rows[1].dependency_facts[fact] = value
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='current, active, or replica-owning'):
+        _prepare_stale_placeholder_retirement(rows, service_rows, cleanup_plan,
+                                              receipt_evidence, image_evidence,
+                                              resource_action_evidence)
+
+
+@pytest.mark.parametrize(('source', 'match'), [
+    ('image', 'live container-image demand'),
+    ('resource_action', 'resource-action launch root'),
+    ('missing', 'external evidence is incomplete'),
+])
+def test_retirement_rejects_stale_placeholder_external_evidence(source, match):
+    (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+     resource_action_evidence) = _stale_placeholder_retirement_inputs()
+    identity = rows[1].identity
+    if source == 'image':
+        image_evidence[identity] = (
+            placement_contract_normalization._ExternalEvidence(count=1,
+                                                               digest='1' * 64))
+    elif source == 'resource_action':
+        resource_action_evidence[identity] = (
+            placement_contract_normalization._ExternalEvidence(count=1,
+                                                               digest='2' * 64))
+    else:
+        image_evidence.pop(identity)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match=match):
+        _prepare_stale_placeholder_retirement(rows, service_rows, cleanup_plan,
+                                              receipt_evidence, image_evidence,
+                                              resource_action_evidence)
+
+
+def test_retirement_rejects_noncanonical_stale_placeholder_none_pickle():
+    (rows, service_rows, cleanup_plan, receipt_evidence, image_evidence,
+     resource_action_evidence) = _stale_placeholder_retirement_inputs()
+    rows[1].original['spec'] = pickle.dumps(None, protocol=5)
+    rows[1].result['spec'] = pickle.dumps(None, protocol=5)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='canonical protocol-4 None'):
+        _prepare_stale_placeholder_retirement(rows, service_rows, cleanup_plan,
+                                              receipt_evidence, image_evidence,
+                                              resource_action_evidence)
+
+
+def test_retirement_rejects_trailing_fillable_placeholder_reservation():
     historical_payload = zlib.decompress(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
     candidate = _normalizer_work(historical_payload, 1)
@@ -1511,13 +1805,17 @@ def test_retirement_rejects_same_service_placeholder_reservation():
     receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
     no_evidence = placement_contract_normalization._ExternalEvidence(
         count=0, digest='0' * 64)
+    evidence_by_identity = {
+        ('svc', 1): no_evidence,
+        ('svc', 3): no_evidence,
+    }
 
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
-                       match='placeholder or reservation'):
+                       match='fillable placeholder'):
         placement_contract_normalization._prepare_retirement_rows(
-            rows, service_rows, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
-            {('svc', 1): no_evidence}, no_evidence, no_evidence,
-            _api_pod_identity(), no_evidence, cleanup_plan, receipt_evidence)
+            rows, service_rows, uuid.uuid4(), 10.0, evidence_by_identity,
+            evidence_by_identity, no_evidence, no_evidence, _api_pod_identity(),
+            no_evidence, cleanup_plan, receipt_evidence)
 
 
 @pytest.mark.parametrize(('parent_delta', 'match'), [
@@ -1781,6 +2079,9 @@ def test_postgres_inventory_blocks_live_parent_workload_kind_mismatch(
 def test_postgres_operator_apply_rerun_new_row_and_cas_rollback(
         empty_postgres, monkeypatch):
     engine = empty_postgres
+    monkeypatch.setattr(placement_contract_normalization,
+                        '_assert_database_write_authority',
+                        lambda _connection: 'public')
     serve_state.Base.metadata.create_all(engine)
     fieldless_state = dict(_spec().__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
@@ -2000,8 +2301,11 @@ def test_postgres_operator_apply_rerun_new_row_and_cas_rollback(
 
 
 def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
-        empty_postgres):
+        empty_postgres, monkeypatch):
     engine = empty_postgres
+    monkeypatch.setattr(placement_contract_normalization,
+                        '_assert_database_write_authority',
+                        lambda _connection: 'public')
     serve_state.Base.metadata.create_all(engine)
     historical_payload = zlib.decompress(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
@@ -2199,6 +2503,159 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
     assert dry_run.blockers == ()
 
 
+def test_protocol_4_ledger_verifies_complete_stale_placeholder_inventory():
+    run, entries = _protocol_4_stale_placeholder_manifest()
+    retired_entry = next(
+        entry for entry in entries if entry['outcome'] == 'retired')
+    stale_entries = [
+        entry for entry in entries
+        if entry['classification'] == 'stale_placeholder'
+    ]
+    null_sha256 = placement_contract_normalization._value_sha256(None)
+
+    assert len(stale_entries) == 2
+    assert placement_normalization_manifest._retirement_ledger_v4_facts_are_complete(
+        retired_entry)
+    assert ('same_service_placeholder_dependency_absent'
+            not in retired_entry['dependency_facts'])
+    assert placement_normalization_manifest._retirement_ledger_facts_are_complete(
+        retired_entry, protocol=4)
+    assert not placement_normalization_manifest._retirement_ledger_facts_are_complete(
+        retired_entry, protocol=3)
+    assert placement_normalization_manifest._retirement_ledger_v4_stale_placeholders_are_complete(
+        retired_entry, entries)
+    for entry in stale_entries:
+        assert entry['original_row_sha256'] == entry['result_row_sha256']
+        assert entry['original_column_sha256s'] == entry[
+            'result_column_sha256s']
+        assert all(
+            entry['original_column_sha256s'][column] == null_sha256 for column
+            in placement_contract_normalization._STALE_PLACEHOLDER_NULL_COLUMNS)
+    assert placement_normalization_manifest.manifest_mismatches(
+        run, entries) == []
+
+
+@pytest.mark.parametrize(('target', 'field', 'value'), [
+    ('summary_set', 'placeholder_count', False),
+    ('summary_set', 'inventory_sha256', '1' * 64),
+    ('summary_extra', 'unexpected', True),
+    ('evidence_set', 'image_demand_count', False),
+    ('evidence_set', 'image_demand_sha256', '2' * 64),
+    ('evidence_set', 'resource_action_root_sha256', '3' * 64),
+    ('evidence_remove', 'state_clean', None),
+    ('evidence_extra', 'unexpected', True),
+    ('stale_entry_set', 'classification', 'placeholder'),
+    ('stale_entry_set', 'original_row_sha256', '4' * 64),
+    ('stale_column_set', 'resource_action_spec_identity', '5' * 64),
+    ('current_entry_set', 'classification', 'placeholder'),
+    ('candidate_legacy_fact', '', None),
+    ('drop_stale', '', None),
+    ('swap_evidence', '', None),
+],
+                         ids=[
+                             'bool-summary-count',
+                             'summary-inventory-digest',
+                             'summary-extra-key',
+                             'bool-evidence-count',
+                             'image-evidence-digest',
+                             'action-evidence-digest',
+                             'missing-evidence-key',
+                             'extra-evidence-key',
+                             'stale-classification',
+                             'stale-row-hash',
+                             'stale-null-column-hash',
+                             'current-successor-classification',
+                             'legacy-placeholder-absence-fact',
+                             'missing-stale-row',
+                             'swapped-stale-evidence',
+                         ])
+def test_protocol_4_ledger_rejects_stale_placeholder_tampering(
+        target, field, value):
+    run, entries = _protocol_4_stale_placeholder_manifest()
+    retired_entry = next(
+        entry for entry in entries if entry['outcome'] == 'retired')
+    stale_entries = [
+        entry for entry in entries
+        if entry['classification'] == 'stale_placeholder'
+    ]
+    summary = retired_entry['dependency_facts'][
+        'same_service_stale_placeholder_proof']
+    evidence = stale_entries[0]['dependency_facts'][
+        'stale_placeholder_evidence']
+    if target == 'summary_set':
+        summary[field] = value
+    elif target == 'summary_extra':
+        summary[field] = value
+    elif target == 'evidence_set':
+        evidence[field] = value
+    elif target == 'evidence_remove':
+        evidence.pop(field)
+    elif target == 'evidence_extra':
+        evidence[field] = value
+    elif target == 'stale_entry_set':
+        stale_entries[0][field] = value
+    elif target == 'stale_column_set':
+        stale_entries[0]['original_column_sha256s'][field] = value
+    elif target == 'current_entry_set':
+        current_entry = next(
+            entry for entry in entries if entry['version'] == 4)
+        current_entry[field] = value
+    elif target == 'candidate_legacy_fact':
+        retired_entry['dependency_facts'][
+            'same_service_placeholder_dependency_absent'] = True
+    elif target == 'drop_stale':
+        entries.remove(stale_entries[0])
+    else:
+        assert target == 'swap_evidence'
+        first_facts = stale_entries[0]['dependency_facts']
+        second_facts = stale_entries[1]['dependency_facts']
+        first_facts['stale_placeholder_evidence'], second_facts[
+            'stale_placeholder_evidence'] = (
+                second_facts['stale_placeholder_evidence'],
+                first_facts['stale_placeholder_evidence'])
+
+    assert not placement_normalization_manifest._retirement_ledger_v4_stale_placeholders_are_complete(
+        retired_entry, entries)
+    assert placement_normalization_manifest.manifest_mismatches(
+        run, entries)
+
+
+@pytest.mark.parametrize('replacement_classification',
+                         ['explicit_v2', 'retired'])
+def test_protocol_4_ledger_rejects_coordinated_stale_placeholder_relabel(
+        replacement_classification):
+    run, entries = _protocol_4_stale_placeholder_manifest()
+    retired_entry = next(
+        entry for entry in entries if entry['outcome'] == 'retired')
+    stale_entries = [
+        entry for entry in entries
+        if entry['classification'] == 'stale_placeholder'
+    ]
+    relabeled = stale_entries[0]
+    relabeled['classification'] = replacement_classification
+    relabeled['dependency_facts'].pop('stale_placeholder_evidence')
+
+    remaining_evidence = [
+        entry['dependency_facts']['stale_placeholder_evidence']
+        for entry in stale_entries[1:]
+    ]
+    summary = retired_entry['dependency_facts'][
+        'same_service_stale_placeholder_proof']
+    summary['placeholder_count'] = len(remaining_evidence)
+    summary['inventory_sha256'] = (
+        placement_normalization_manifest.stale_placeholder_inventory_sha256(
+            'svc', summary['current_version'], remaining_evidence))
+    counts = run['classification_counts']
+    counts['stale_placeholder'] -= 1
+    counts[replacement_classification] = (
+        counts.get(replacement_classification, 0) + 1)
+
+    assert not placement_normalization_manifest._retirement_ledger_v4_stale_placeholders_are_complete(
+        retired_entry, entries)
+    assert placement_normalization_manifest.manifest_mismatches(
+        run, entries)
+
+
 def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
     row = _normalizer_work(_explicit_v2_payload(), 1)
     original_columns = placement_contract_normalization._column_sha256s(
@@ -2245,13 +2702,14 @@ def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
         'freeze_evidence_sha256': 'e' * 64,
     }
 
-    assert placement_contract_normalization._ledger_manifest_mismatches(
+    assert placement_normalization_manifest.manifest_mismatches(
         run, [entry]) == []
 
     entry['outcome'] = 'changed'
     tamper_reasons = {
-        issue['reason'] for issue in placement_contract_normalization.
-        _ledger_manifest_mismatches(run, [entry])
+        issue['reason']
+        for issue in placement_normalization_manifest.manifest_mismatches(
+            run, [entry])
     }
     assert 'invalid_classification_outcome' in tamper_reasons
     assert 'spec_digest_outcome_mismatch' in tamper_reasons
@@ -2259,8 +2717,9 @@ def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
 
     entry['result_row_sha256'] = 'f' * 64
     reasons = {
-        issue['reason'] for issue in placement_contract_normalization.
-        _ledger_manifest_mismatches(run, [entry])
+        issue['reason']
+        for issue in placement_normalization_manifest.manifest_mismatches(
+            run, [entry])
     }
     assert 'invalid_result_column_inventory' in reasons
     assert 'post_inventory_digest_mismatch' in reasons

@@ -11,15 +11,17 @@ import re
 PROTOCOL_V1 = 1
 PROTOCOL_V2 = 2
 PROTOCOL_V3 = 3
-CURRENT_PROTOCOL = PROTOCOL_V3
-_SUPPORTED_PROTOCOLS = frozenset({PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3})
+PROTOCOL_V4 = 4
+CURRENT_PROTOCOL = PROTOCOL_V4
+_HISTORICAL_PROTOCOLS = frozenset({PROTOCOL_V1, PROTOCOL_V2, PROTOCOL_V3})
+_SUPPORTED_PROTOCOLS = frozenset({*_HISTORICAL_PROTOCOLS, PROTOCOL_V4})
 APPLY_SUPPORTED_MODE = 'apply_supported'
 RETIRE_TERMINAL_HISTORICAL_MODE = 'retire_terminal_historical'
 _SUPPORTED_MODES = frozenset({
     APPLY_SUPPORTED_MODE,
     RETIRE_TERMINAL_HISTORICAL_MODE,
 })
-_IDENTITY_PATTERN = re.compile(r'^(1|2|3):([0-9a-f]{40})$')
+_IDENTITY_PATTERN = re.compile(r'^(1|2|3|4):([0-9a-f]{40})$')
 _COMMIT_PATTERN = re.compile(r'[0-9a-f]{40}')
 
 
@@ -35,7 +37,7 @@ class PlacementNormalizationIdentity:
     image_commit: str
 
 
-_SUPPORTED_OUTCOMES = frozenset({
+_FROZEN_APPLY_OUTCOMES = frozenset({
     ('placeholder', 'unchanged'),
     ('explicit_v1', 'changed'),
     ('explicit_v2', 'unchanged'),
@@ -43,20 +45,28 @@ _SUPPORTED_OUTCOMES = frozenset({
     ('historical_physical_per_gpu', 'unchanged'),
     ('retired', 'unchanged'),
 })
-_RETIREMENT_OUTCOMES = frozenset({
+_FROZEN_RETIREMENT_OUTCOMES = frozenset({
     ('placeholder', 'unchanged'),
     ('explicit_v2', 'unchanged'),
     ('historical_physical_per_gpu', 'retired'),
     ('retired', 'unchanged'),
 })
+_PROTOCOL_V4_RETIREMENT_OUTCOMES = frozenset({
+    *_FROZEN_RETIREMENT_OUTCOMES,
+    ('stale_placeholder', 'unchanged'),
+})
 _OUTCOMES_BY_PROTOCOL_MODE = {
-    (protocol, APPLY_SUPPORTED_MODE): _SUPPORTED_OUTCOMES
+    (protocol, APPLY_SUPPORTED_MODE): _FROZEN_APPLY_OUTCOMES
     for protocol in _SUPPORTED_PROTOCOLS
 }
 _OUTCOMES_BY_PROTOCOL_MODE.update({
-    (protocol, RETIRE_TERMINAL_HISTORICAL_MODE): _RETIREMENT_OUTCOMES
-    for protocol in _SUPPORTED_PROTOCOLS
+    (protocol, RETIRE_TERMINAL_HISTORICAL_MODE): _FROZEN_RETIREMENT_OUTCOMES
+    for protocol in _HISTORICAL_PROTOCOLS
 })
+_OUTCOMES_BY_PROTOCOL_MODE[(
+    PROTOCOL_V4,
+    RETIRE_TERMINAL_HISTORICAL_MODE,
+)] = _PROTOCOL_V4_RETIREMENT_OUTCOMES
 _LOADABLE_OUTCOMES_BY_MODE = {
     APPLY_SUPPORTED_MODE: frozenset({
         ('fieldless_supported', 'changed'),
@@ -80,7 +90,7 @@ def parse_normalizer_identity(value: object) -> PlacementNormalizationIdentity:
     if match is None:
         raise PlacementNormalizationIdentityError(
             'Placement-normalizer identity must match '
-            '`^(1|2|3):[0-9a-f]{40}$`.')
+            '`^(1|2|3|4):[0-9a-f]{40}$`.')
     protocol = int(match.group(1))
     if protocol not in _SUPPORTED_PROTOCOLS:
         # The regular expression makes this unreachable today, but retaining
@@ -92,7 +102,7 @@ def parse_normalizer_identity(value: object) -> PlacementNormalizationIdentity:
 
 
 def format_normalizer_identity(image_commit: str) -> str:
-    """Format the identity emitted by the current protocol-v3 writer."""
+    """Format the identity emitted by the current protocol-v4 writer."""
     if (type(image_commit) is not str or
             _COMMIT_PATTERN.fullmatch(image_commit) is None):
         raise PlacementNormalizationIdentityError(
@@ -132,6 +142,10 @@ def is_loadable_manifest_outcome(identity: PlacementNormalizationIdentity,
 def is_fillable_manifest_outcome(identity: PlacementNormalizationIdentity,
                                  mode: str, classification: object,
                                  outcome: object) -> bool:
-    """Whether a manifested placeholder may be filled by the v3 writer."""
+    """Whether an ordinary manifested placeholder may be filled.
+
+    Protocol-v4 ``stale_placeholder`` rows have a separate durable outcome and
+    are never part of this fillable set.
+    """
     allowed_manifest_outcomes(identity, mode)
     return (classification, outcome) in _FILLABLE_OUTCOMES_BY_MODE[mode]
