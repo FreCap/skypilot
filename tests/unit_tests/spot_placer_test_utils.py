@@ -32,22 +32,33 @@ def make_location(region: str,
 
 
 def make_placer(
-    costs: Dict[spot_placer.Location, float]
-) -> spot_placer.DynamicFallbackSpotPlacer:
-    """A DynamicFallbackSpotPlacer over `costs` keys (all ACTIVE).
+    costs: Dict[spot_placer.Location, float],
+    placement_contract: placement_policy.PlacementContract | None = None,
+) -> spot_placer.SpotPlacer:
+    """A fully initialized SpotPlacer test double over ACTIVE locations.
 
-    Skips __init__ (task-based location discovery) and wires only the
-    state the selection paths read.
+    Provider enumeration is deliberately bypassed, but every process-local
+    field owned by SpotPlacer is initialized explicitly here. Production no
+    longer carries a ``__new__`` hook solely for lightweight test setup.
     """
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer._placement_contract = placement_policy.resolve_fresh_contract(  # pylint: disable=protected-access
-        placement_policy.SPOT_HEDGE_PLACER,
-        pool=False)
+    placer = object.__new__(spot_placer.SpotPlacer)
+    if placement_contract is None:
+        placement_contract = placement_policy.resolve_fresh_contract(
+            placement_policy.SPOT_HEDGE_PLACER, pool=False)
+    placer._placement_contract = placement_contract  # pylint: disable=protected-access
+    placer._workspace = None  # pylint: disable=protected-access
+    placer.placement_catalog = spot_placer.PlacementCatalog(tuple(
+        sorted(costs.items(), key=lambda item: item[0].sort_key())),
+                                                            num_nodes=1)
     placer.location2status = {
         location: spot_placer.LocationStatus.ACTIVE for location in costs
     }
     placer.location2preempted_at = {}
+    placer.location2preempted_reason = {}
+    placer.location2retry_reserved_at = {}
+    placer.location2observed_free = {}
+    placer._retry_state_dirty = False  # pylint: disable=protected-access
     placer.location2cost = dict(costs)
+    placer.resources = mock.MagicMock(cluster_config_overrides=None)
     placer.num_nodes = 1
     return placer

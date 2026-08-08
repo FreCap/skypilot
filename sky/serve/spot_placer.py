@@ -774,6 +774,7 @@ def _expand_accelerator_counts_for_cloud(
     if not float(configured_count).is_integer():
         return [resources]
     cache_key = (cloud_name, accelerator_name.lower())
+    catalog_counts: list[float]
     if counts_cache is None or cache_key not in counts_cache:
         counts_by_name = catalog.list_accelerator_counts(
             name_filter=f'^{re.escape(accelerator_name)}$',
@@ -932,28 +933,12 @@ def _get_possible_location_from_task(
     return list(possible_locations)
 
 
+@typing.final
 class SpotPlacer:
-    """Spot Placement specification."""
+    """The dynamic-fallback placement engine."""
 
     _RETRY_STATE_VERSION = 1
     _BENCH_REASONS = frozenset({'capacity', 'quota', 'preempted'})
-
-    def __new__(cls, *args: Any, **kwargs: Any) -> 'SpotPlacer':
-        """Allocate the complete process-local compatibility interface.
-
-        Lightweight test construction may skip ``__init__``. Defaults belong
-        at allocation time so runtime methods use one explicit interface
-        instead of probing for fields.
-        """
-        del args, kwargs
-        instance = super().__new__(cls)
-        instance._workspace = None
-        instance.location2preempted_at = {}
-        instance.location2preempted_reason = {}
-        instance.location2retry_reserved_at = {}
-        instance.location2observed_free = {}
-        instance._retry_state_dirty = False
-        return instance
 
     def __init__(
         self,
@@ -965,6 +950,9 @@ class SpotPlacer:
         if not placement_contract.enabled:
             raise ValueError('A placement-disabled contract cannot construct '
                              'a SpotPlacer.')
+        if placement_contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
+            raise ValueError('SpotPlacer requires the dynamic fallback '
+                             'placement engine.')
         self._placement_contract = placement_contract
         if placement_catalog is None:
             catalog_value = PlacementCatalog.from_task(
@@ -1014,6 +1002,46 @@ class SpotPlacer:
         # Already checked there is only one resource in the task.
         self.resources = list(task.resources)[0]
         self.num_nodes = task.num_nodes
+
+        # INVARIANT: the bench TTL must exceed the worst-case launch
+        # FAILURE latency of every managed location, or a full location
+        # ping-pongs (its bench expires exactly as a sibling's launch
+        # times out) and the service never falls through to the next
+        # cost tier. Observed live 2026-07-06 with two Kubernetes shape
+        # locations: provision_timeout (600s default) == TTL (600s) ->
+        # the service never spilled to cloud. Warn loudly; the fix is
+        # kubernetes.provision_timeout << SKYPILOT_SPOT_PLACER_RETRY_SECONDS.
+        ttl = _preemption_retry_seconds()
+        k8s_contexts = sorted({
+            location.region
+            for location in self.location2status
+            if str(location.cloud).lower() == 'kubernetes'
+        })
+        for context in k8s_contexts:
+            # Only an EXPLICITLY configured provision_timeout can violate
+            # the invariant: the built-in kubernetes default is dynamic
+            # (10s, capped at 60s) -- far below any sane TTL.
+            timeout = skypilot_config.get_effective_region_config(
+                cloud='kubernetes',
+                region=context,
+                keys=('provision_timeout',),
+                default_value=None,
+                override_configs=self.resources.cluster_config_overrides)
+            if timeout is None:
+                continue
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                continue
+            if timeout >= ttl:
+                logger.warning(
+                    f'Kubernetes context {context!r} has '
+                    f'provision_timeout={timeout:.0f}s >= the spot placer '
+                    f'bench TTL ({ttl:.0f}s). A full cluster will ping-pong '
+                    'between its locations instead of spilling to the next '
+                    'cost tier. Set kubernetes.provision_timeout well below '
+                    f'{_PREEMPTION_RETRY_SECONDS_ENV_VAR} (or raise the '
+                    'TTL).')
 
     def observe_zero_cost_capacity(self, free_by_location: dict[Location, int],
                                    observed_at: float) -> None:
@@ -1073,15 +1101,41 @@ class SpotPlacer:
             *,
             skip_zero_cost_preference: bool = False,
             allowed_locations: set[Location] | None = None) -> Location | None:
-        """Select next location to place spot instance.
+        """Select the cheapest usable location, preferring the free tier.
 
-        skip_zero_cost_preference disables the fill-the-free-tier-first
-        rule in placers that have one; the placer stays service-agnostic
-        and the decision to skip (the broker's demand-placement gate) is
-        made by the caller in the launch path. ``allowed_locations`` keeps a
-        card-targeted launch inside its exact accelerator subset.
+        ``skip_zero_cost_preference`` is the broker's demand-placement gate:
+        when a service already holds its zero-cost grant, free locations are
+        excluded while a paid candidate exists. A zero-cost-only catalog must
+        still serve, so the gate throttles preference rather than availability.
+        ``allowed_locations`` keeps a card-targeted launch inside its exact
+        accelerator subset.
         """
-        raise NotImplementedError
+        active_locations = [
+            location for location in self.active_locations()
+            if allowed_locations is None or location in allowed_locations
+        ]
+        if not active_locations:
+            return None
+        zero_cost = [
+            location for location in active_locations
+            if self.location2cost.get(location) == 0
+        ]
+        if zero_cost and not skip_zero_cost_preference:
+            active_locations = zero_cost
+        elif zero_cost and skip_zero_cost_preference:
+            paid = [
+                location for location in active_locations
+                if location not in zero_cost
+            ]
+            if paid:
+                active_locations = paid
+        # A failed launch benches the exact selected location, so the next
+        # selection falls through to the next-cheapest ACTIVE candidate.
+        selected = self._min_cost_location(active_locations)
+        self._consume_retry_if_benched(selected)
+        logger.info(f'Active locations: {active_locations}\n'
+                    f'Selected location: {selected}\n')
+        return selected
 
     def ranked_active_locations(
             self,
@@ -1090,8 +1144,8 @@ class SpotPlacer:
 
         This is an observation-only counterpart to repeated
         select_next_location calls over paid candidates. It deliberately
-        delegates every rank to _min_cost_location so specialized placers,
-        such as capacity-aware per-slot pricing, keep identical semantics.
+        delegates every rank to the same _min_cost_location path used for
+        launches, preserving both machine-hour and logical per-GPU pricing.
         """
         remaining = [
             location for location in self.active_locations()
@@ -1614,6 +1668,10 @@ class SpotPlacer:
             self.location2cost.get(location) == 0
         ]
 
+    def is_zero_cost_location(self, location: Location | None) -> bool:
+        """Return whether an exact catalog location has zero launch cost."""
+        return location is not None and self.location2cost.get(location) == 0
+
     def select_next_zero_cost_location(
             self,
             allowed_locations: set[Location] | None = None) -> Location | None:
@@ -1676,111 +1734,7 @@ class SpotPlacer:
         if contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
             raise ValueError(f'Unsupported placement engine: '
                              f'{contract.engine!r}.')
-        return DynamicFallbackSpotPlacer(task,
-                                         contract,
-                                         placement_catalog=placement_catalog,
-                                         workspace=workspace)
-
-
-class DynamicFallbackSpotPlacer(SpotPlacer):
-    """Dynamic Fallback Placer."""
-
-    def __init__(
-        self,
-        task: 'task_lib.Task',
-        placement_contract: placement_policy.PlacementContract,
-        placement_catalog: PlacementCatalog | dict[str, Any] | None = None,
-        workspace: str | None = None,
-    ) -> None:
-        if placement_contract.engine != placement_policy.ENGINE_DYNAMIC_FALLBACK:
-            raise ValueError('DynamicFallbackSpotPlacer requires the dynamic '
-                             'fallback placement engine.')
-        super().__init__(task,
-                         placement_contract,
-                         placement_catalog=placement_catalog,
-                         workspace=workspace)
-        # INVARIANT: the bench TTL must exceed the worst-case launch
-        # FAILURE latency of every managed location, or a full location
-        # ping-pongs (its bench expires exactly as a sibling's launch
-        # times out) and the service never falls through to the next
-        # cost tier. Observed live 2026-07-06 with two Kubernetes shape
-        # locations: provision_timeout (600s default) == TTL (600s) ->
-        # the service never spilled to cloud. Warn loudly; the fix is
-        # kubernetes.provision_timeout << SKYPILOT_SPOT_PLACER_RETRY_SECONDS.
-        ttl = _preemption_retry_seconds()
-        k8s_contexts = sorted({
-            location.region
-            for location in self.location2status
-            if str(location.cloud).lower() == 'kubernetes'
-        })
-        for context in k8s_contexts:
-            # Only an EXPLICITLY configured provision_timeout can violate
-            # the invariant: the built-in kubernetes default is dynamic
-            # (10s, capped at 60s) — far below any sane TTL.
-            timeout = skypilot_config.get_effective_region_config(
-                cloud='kubernetes',
-                region=context,
-                keys=('provision_timeout',),
-                default_value=None,
-                override_configs=self.resources.cluster_config_overrides)
-            if timeout is None:
-                continue
-            try:
-                timeout = float(timeout)
-            except (TypeError, ValueError):
-                continue
-            if timeout >= ttl:
-                logger.warning(
-                    f'Kubernetes context {context!r} has '
-                    f'provision_timeout={timeout:.0f}s >= the spot placer '
-                    f'bench TTL ({ttl:.0f}s). A full cluster will ping-pong '
-                    'between its locations instead of spilling to the next '
-                    'cost tier. Set kubernetes.provision_timeout well below '
-                    f'{_PREEMPTION_RETRY_SECONDS_ENV_VAR} (or raise the '
-                    'TTL).')
-
-    def select_next_location(
-            self,
-            *,
-            skip_zero_cost_preference: bool = False,
-            allowed_locations: set[Location] | None = None) -> Location | None:
-        active_locations = [
-            location for location in self.active_locations()
-            if allowed_locations is None or location in allowed_locations
-        ]
-        if not active_locations:
-            return None
-        # Zero-cost tier first: locations that cost nothing (reserved /
-        # already-paid capacity, e.g. a Kubernetes pool) are filled
-        # COMPLETELY before any paid location is considered, regardless
-        # of load. When such a location is full, its launches fail fast,
-        # it gets benched, and the TTL retry re-probes it as capacity
-        # frees — so load drifts back automatically.
-        # skip_zero_cost_preference (the broker's demand-placement gate:
-        # this service already holds its zero-cost grant) EXCLUDES the
-        # free tier from the candidate set — merely demoting it to
-        # normal competition is not enough because cost-first selection
-        # always prefers a free location. Excluded only while a paid candidate
-        # exists: a zero-cost-only set must still serve (the gate throttles
-        # placement preference, never availability).
-        zero_cost = [
-            location for location in active_locations
-            if self.location2cost.get(location) == 0
-        ]
-        if zero_cost and not skip_zero_cost_preference:
-            active_locations = zero_cost
-        elif zero_cost and skip_zero_cost_preference:
-            paid = [
-                location for location in active_locations
-                if location not in zero_cost
-            ]
-            if paid:
-                active_locations = paid
-        # Keep filling the cheapest usable location. A failed launch benches
-        # that exact location, so the next selection falls through to the
-        # next-cheapest ACTIVE candidate instead of getting stuck retrying it.
-        res = self._min_cost_location(active_locations)
-        self._consume_retry_if_benched(res)
-        logger.info(f'Active locations: {active_locations}\n'
-                    f'Selected location: {res}\n')
-        return res
+        return SpotPlacer(task,
+                          contract,
+                          placement_catalog=placement_catalog,
+                          workspace=workspace)

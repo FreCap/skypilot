@@ -10,8 +10,10 @@ delta.
 import argparse
 import collections
 from collections.abc import Callable
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+import contextlib
 import copyreg
 import dataclasses
 import datetime
@@ -35,6 +37,7 @@ from sky.adaptors import common as adaptors_common
 from sky.container_images import demand_state
 from sky.serve import ephemeral_storage_contract
 from sky.serve import maintenance
+from sky.serve import placement_normalization_authority
 from sky.serve import placement_normalization_identity
 from sky.serve import placement_normalization_manifest
 from sky.serve import placement_policy
@@ -64,16 +67,6 @@ _SPEC_NAME = 'SkyServiceSpec'
 _SUPPORTED_PROTOCOLS = frozenset({4, 5})
 _SCHEMA_REVISION = '037'
 _ADVISORY_LOCK_NAME = 'skyserve-placement-contract-normalization-v1'
-_DATABASE_AUTHORITY_FUNCTION = (
-    'skyserve040_assert_placement_normalization_authority')
-_DATABASE_AUTHORITY_RELATIONS = (
-    'services',
-    'version_specs',
-    'replicas',
-    'ephemeral_storage_cleanup_intents',
-    'placement_normalization_runs',
-    'placement_normalization_rows',
-)
 _LOCK_TIMEOUT_MS = 5000
 _STATEMENT_TIMEOUT_MS = 60000
 _MAX_INVENTORY_ROWS = placement_normalization_manifest.MAX_INVENTORY_ROWS
@@ -110,8 +103,8 @@ _SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FACT = (
 _STALE_PLACEHOLDER_EVIDENCE_FIELDS = (
     placement_normalization_manifest.STALE_PLACEHOLDER_EVIDENCE_FIELDS)
 _SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS = (
-    placement_normalization_manifest.
-    SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS)
+    placement_normalization_manifest.SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS
+)
 _STALE_PLACEHOLDER_NULL_COLUMNS = (
     placement_normalization_manifest.STALE_PLACEHOLDER_NULL_COLUMNS)
 _PREDECESSOR_RECEIPT_SCHEMA = 'skyserve-predecessor-receipt-inventory-v1'
@@ -920,7 +913,7 @@ def _active_serve_request_evidence(
         ))
     active_statuses = tuple(
         status.value for status in requests_lib.RequestStatus.active_statuses())
-    with orm.Session(engine) as session:
+    with _reader_database_authority(engine) as session:
         rows = session.execute(
             sqlalchemy.select(
                 table.c.request_id, table.c.name, table.c.status,
@@ -998,7 +991,7 @@ def _fresh_api_instances(
         engine: sqlalchemy.engine.Engine) -> list[dict[str, Any]]:
     """Read a bounded database-clock snapshot of every fresh API instance."""
     table = request_postgres_schema.SERVER_INSTANCES
-    with orm.Session(engine) as session:
+    with _reader_database_authority(engine) as session:
         return [
             dict(row) for row in session.execute(
                 sqlalchemy.select(
@@ -1272,7 +1265,7 @@ def _resource_action_root_rows(
     """Read a single explicitly bounded typed-launch root inventory."""
     actions = request_postgres_schema.RESOURCE_ACTIONS
     samples = resource_action_state_schema.SHADOW_SAMPLES
-    with orm.Session(engine) as session:
+    with _reader_database_authority(engine) as session:
         action_rows = [
             dict(row) for row in session.execute(
                 sqlalchemy.select(
@@ -2208,10 +2201,10 @@ def _terminal_current_inventory_mismatches(
     current_rows = [
         dict(row) for row in session.execute(
             sqlalchemy.select(*frozen_columns).where(
-                version_table.c.service_name.in_(candidate_services)).
-            order_by(version_table.c.service_name,
-                     version_table.c.version).limit(
-                         _MAX_INVENTORY_ROWS + 1)).mappings().all()
+                version_table.c.service_name.in_(candidate_services)).order_by(
+                    version_table.c.service_name,
+                    version_table.c.version).limit(_MAX_INVENTORY_ROWS +
+                                                   1)).mappings().all()
     ]
     if len(current_rows) > _MAX_INVENTORY_ROWS:
         return ({
@@ -2219,22 +2212,19 @@ def _terminal_current_inventory_mismatches(
             'reason': 'current_candidate_inventory_exceeds_bound',
         },)
     current_service_hashes = {
-        service_name:
-            placement_normalization_manifest.ServiceHashObservation(False,
-                                                                    None)
-        for service_name in candidate_services
+        service_name: placement_normalization_manifest.ServiceHashObservation(
+            False, None) for service_name in candidate_services
     }
     service_table = serve_state.services_table
     for row in session.execute(
-            sqlalchemy.select(service_table.c.name, service_table.c.hash).
-            where(service_table.c.name.in_(candidate_services))).all():
+            sqlalchemy.select(service_table.c.name, service_table.c.hash).where(
+                service_table.c.name.in_(candidate_services))).all():
         current_service_hashes[str(row.name)] = (
             placement_normalization_manifest.ServiceHashObservation(
                 True, row.hash))
     current_classifications = {
-        (str(row['service_name']), int(row['version'])):
-            analyze_spec_pickle(row['spec']).classification.value
-        for row in current_rows
+        (str(row['service_name']), int(row['version'])): analyze_spec_pickle(
+            row['spec']).classification.value for row in current_rows
     }
     return tuple(
         placement_normalization_manifest.current_inventory_mismatches(
@@ -2568,9 +2558,9 @@ def _prepare_stale_placeholder_proofs(
             'placeholder_count': len(service_evidence),
             'image_demand_count': 0,
             'resource_action_root_count': 0,
-            'inventory_sha256': (
-                placement_normalization_manifest.
-                stale_placeholder_inventory_sha256(service_name,
+            'inventory_sha256':
+                (placement_normalization_manifest.
+                 stale_placeholder_inventory_sha256(service_name,
                                                     current_version,
                                                     service_evidence)),
             'fill_stale_proved': True,
@@ -2580,9 +2570,8 @@ def _prepare_stale_placeholder_proofs(
 
     for row, evidence in staged_evidence:
         row.dependency_facts[_STALE_PLACEHOLDER_EVIDENCE_FACT] = evidence
-        row.manifest_classification = (
-            placement_normalization_manifest.ManifestClassification.
-            STALE_PLACEHOLDER)
+        row.manifest_classification = (placement_normalization_manifest.
+                                       ManifestClassification.STALE_PLACEHOLDER)
     return summaries
 
 
@@ -3134,8 +3123,7 @@ def _frozen_version_row(row: Mapping[str, Any]) -> dict[str, Any]:
             f'Live version row lacks frozen column {exc.args[0]!r}.') from exc
 
 
-def _is_post_terminal_explicit_v2(work: _RowWork,
-                                  completed_at: float) -> bool:
+def _is_post_terminal_explicit_v2(work: _RowWork, completed_at: float) -> bool:
     created_at = work.original.get('created_at')
     return (work.classification is Classification.EXPLICIT_V2 and
             isinstance(work.original.get('yaml_content'), str) and
@@ -3172,8 +3160,7 @@ def _terminal_fleet_mismatches(
         manifest_entry.get('outcome') == 'retired'
     }
     manifest_by_identity = {
-        (str(manifest_entry['service_name']), int(manifest_entry['version'])):
-            manifest_entry
+        (str(manifest_entry['service_name']), int(manifest_entry['version'])): manifest_entry
         for manifest_entry in entries
         if str(manifest_entry['service_name']) not in candidate_services
     }
@@ -3188,15 +3175,15 @@ def _terminal_fleet_mismatches(
         *(work.identity[0] for work in rows),
     })
     current_hash_observations = {
-        name: placement_normalization_manifest.ServiceHashObservation(False,
-                                                                      None)
-        for name in relevant_names
+        name: placement_normalization_manifest.ServiceHashObservation(
+            False, None) for name in relevant_names
     }
     service_table = serve_state.services_table
     if relevant_names:
         for row in session.execute(
-                sqlalchemy.select(service_table.c.name, service_table.c.hash).
-                where(service_table.c.name.in_(relevant_names))).all():
+                sqlalchemy.select(
+                    service_table.c.name, service_table.c.hash).where(
+                        service_table.c.name.in_(relevant_names))).all():
             current_hash_observations[str(row.name)] = (
                 placement_normalization_manifest.ServiceHashObservation(
                     True, row.hash))
@@ -3238,10 +3225,9 @@ def _terminal_fleet_mismatches(
                     placement_normalization_manifest.ManifestClassification.
                     PLACEHOLDER.value):
                 frozen_row = _frozen_version_row(work.original)
-                unchanged = (
-                    _is_post_terminal_placeholder(work) and
-                    _row_sha256(frozen_row) ==
-                    tracked_entry.get('result_row_sha256'))
+                unchanged = (_is_post_terminal_placeholder(work) and
+                             _row_sha256(frozen_row)
+                             == tracked_entry.get('result_row_sha256'))
                 if not (unchanged or
                         _is_post_terminal_explicit_v2(work, completed_at)):
                     mismatches.append({
@@ -3250,8 +3236,8 @@ def _terminal_fleet_mismatches(
                         'service_hash': service_hash,
                         'reason': 'invalid_terminal_placeholder_transition',
                     })
-            elif (work.analysis.source_sha256 !=
-                  tracked_entry.get('result_spec_sha256')):
+            elif (work.analysis.source_sha256
+                  != tracked_entry.get('result_spec_sha256')):
                 mismatches.append({
                     'service_name': service_name,
                     'version': version,
@@ -3285,8 +3271,8 @@ def _terminal_fleet_mismatches(
         if current is not None and current_hashes.get(
                 identity[0]) == tracked_entry.get('service_hash'):
             continue
-        if (current is None and current_hashes.get(identity[0]) ==
-                tracked_entry.get('service_hash') and
+        if (current is None and current_hashes.get(
+                identity[0]) == tracked_entry.get('service_hash') and
                 tracked_entry.get('service_hash') is not None):
             mismatches.append({
                 'service_name': identity[0],
@@ -3469,97 +3455,127 @@ def _read_timestamp(now: Callable[[], float], label: str) -> float:
     return float(value)
 
 
+@dataclasses.dataclass(frozen=True)
+class _WriterDatabaseAuthorityLease:
+    """One canonical database authority owned by one physical connection."""
+
+    connection: sqlalchemy.engine.Connection
+    authority: (placement_normalization_authority.
+                PlacementNormalizationDatabaseAuthority)
+
+
+@contextlib.contextmanager
+def _reader_database_authority(
+    engine: sqlalchemy.engine.Engine,) -> Iterator[orm.Session]:
+    """Bind one preliminary read transaction to the canonical DB schema."""
+    with orm.Session(engine) as session, session.begin():
+        try:
+            authority = (placement_normalization_authority.
+                         assert_reader_database_authority(session.connection()))
+            placement_normalization_authority.bind_session_to_authority(
+                session, authority)
+        except (placement_normalization_authority.
+                PlacementNormalizationAuthorityError,
+                sqlalchemy.exc.SQLAlchemyError) as exc:
+            raise NormalizationBlocker(
+                'Placement-normalization database read authority is absent '
+                'or invalid.') from exc
+        yield session
+
+
 def _acquire_writer_session_lock(
-        connection: sqlalchemy.engine.Connection) -> str:
-    """Acquire cross-protocol authority and return its canonical DB schema."""
-    with connection.begin():
-        acquired = connection.execute(
-            sqlalchemy.text('SELECT pg_try_advisory_lock('
-                            'hashtextextended(:name, 0))'),
-            {'name': _ADVISORY_LOCK_NAME}).scalar_one()
-        if acquired is not True:
-            raise NormalizationBlocker(
-                'Another placement-normalization writer or schema migration '
-                'owns the advisory authority.')
-        return _assert_database_write_authority(connection)
-
-
-def _assert_database_write_authority(
-        connection: sqlalchemy.engine.Connection) -> str:
-    """Require revision 040's complete open fence and return its schema."""
+    connection: sqlalchemy.engine.Connection,
+) -> (placement_normalization_authority.PlacementNormalizationDatabaseAuthority
+     ):
+    """Acquire and prove one typed cross-protocol database authority."""
+    busy = False
     try:
-        schema = connection.execute(
-            sqlalchemy.text('SELECT current_schema()')).scalar_one()
-        if (type(schema) is not str or not schema or
-                schema.startswith('pg_temp_') or schema == 'pg_catalog'):
+        with connection.begin():
+            acquired = connection.execute(
+                sqlalchemy.text('SELECT pg_catalog.pg_try_advisory_lock('
+                                'pg_catalog.hashtextextended(:name, 0))'), {
+                                    'name': _ADVISORY_LOCK_NAME
+                                }).scalar_one()
+            if acquired is not True:
+                busy = True
+                raise NormalizationBlocker(
+                    'Another placement-normalization writer or schema '
+                    'migration owns the advisory authority.')
+            authority = (placement_normalization_authority.
+                         assert_writer_database_authority(
+                             connection, _ADVISORY_LOCK_NAME))
+    except BaseException as exc:
+        if not busy and not connection.closed:
+            # The acquisition query or the active exact-session probe may
+            # have changed a backend-level lock before the client observed
+            # its result. Invalidating is the only safe pool cleanup for an
+            # uncertain session-level side effect.
+            connection.invalidate()
+        if isinstance(exc, NormalizationBlocker):
+            raise
+        if isinstance(exc, (placement_normalization_authority.
+                            PlacementNormalizationAuthorityError,
+                            sqlalchemy.exc.SQLAlchemyError)):
             raise NormalizationBlocker(
-                'Placement-normalization database schema is invalid.')
-        relation_parameters = {
-            f'relation_{index}': relation
-            for index, relation in enumerate(_DATABASE_AUTHORITY_RELATIONS)
-        }
-        relation_placeholders = ', '.join(
-            f':relation_{index}'
-            for index in range(len(_DATABASE_AUTHORITY_RELATIONS)))
-        temporary_shadows = connection.execute(
-            sqlalchemy.text(
-                'SELECT pg_catalog.array_agg(relation.relname '
-                'ORDER BY relation.relname) '
-                'FROM pg_catalog.pg_class AS relation '
-                'WHERE relation.relnamespace = '
-                'pg_catalog.pg_my_temp_schema() '
-                f'AND relation.relname IN ({relation_placeholders})'),
-            relation_parameters).scalar_one()
-        if temporary_shadows is not None:
-            raise NormalizationBlocker(
-                'Placement-normalization database session contains a '
-                f'temporary authority-relation shadow: {temporary_shadows!r}.')
-        quote = connection.dialect.identifier_preparer.quote
-        qualified_function = (
-            f'{quote(schema)}.{quote(_DATABASE_AUTHORITY_FUNCTION)}')
-        asserted = connection.exec_driver_sql(
-            f'SELECT {qualified_function}()').scalar_one()
-    except NormalizationBlocker:
+                'Placement-normalization database write authority is absent '
+                'or invalid.') from exc
         raise
-    except sqlalchemy.exc.SQLAlchemyError as exc:
-        raise NormalizationBlocker(
-            'Placement-normalization database write authority is absent or '
-            'invalid.') from exc
-    if asserted is not True:
-        raise NormalizationBlocker(
-            'Placement-normalization database write authority did not prove '
-            'one exact open revision-040 fence.')
-    return schema
+    return authority
 
 
-def _release_writer_session_lock(
-        connection: sqlalchemy.engine.Connection) -> None:
-    """Release the session lock explicitly; closing is the final fallback."""
-    with connection.begin():
-        released = connection.execute(
-            sqlalchemy.text('SELECT pg_advisory_unlock('
-                            'hashtextextended(:name, 0))'),
-            {'name': _ADVISORY_LOCK_NAME}).scalar_one()
-        if released is not True:
-            raise NormalizationBlocker(
-                'Placement-normalization writer session lock was lost.')
+@contextlib.contextmanager
+def _writer_database_authority(
+    engine: sqlalchemy.engine.Engine,
+) -> Iterator[_WriterDatabaseAuthorityLease]:
+    """Own one exact writer session from acquisition through final release."""
+    connection = engine.connect().execution_options(
+        isolation_level='SERIALIZABLE')
+    lease_owned = False
+    try:
+        # The operator is rare and its session-level lock must never survive
+        # on a pooled backend.  Detaching makes close() physically terminate
+        # this DBAPI connection even if an asynchronous exception lands in the
+        # narrow caller boundary immediately after lock acquisition.
+        connection.detach()
+        authority = _acquire_writer_session_lock(connection)
+        lease_owned = True
+        yield _WriterDatabaseAuthorityLease(connection, authority)
+    finally:
+        try:
+            if lease_owned and not connection.closed:
+                with connection.begin():
+                    (placement_normalization_authority.
+                     release_writer_session_lock(connection,
+                                                 _ADVISORY_LOCK_NAME))
+            elif not connection.closed:
+                # Acquisition was attempted but ownership was not durably
+                # observed by this frame.  Invalidate the detached backend;
+                # it is never eligible to re-enter QueuePool.
+                connection.invalidate()
+        except BaseException:
+            if not connection.closed:
+                # Never return a backend with an uncertain or reentrant
+                # session-level authority hold to any subsequent caller.
+                connection.invalidate()
+            raise
+        finally:
+            connection.close()
 
 
 def _acquire_writer_table_locks(session: orm.Session, schema: str) -> None:
     bind = session.get_bind()
     quote = bind.dialect.identifier_preparer.quote
-    relations = ', '.join(
-        f'{quote(schema)}.{quote(relation)}' for relation in (
-            'services', 'version_specs', 'replicas',
-            'ephemeral_storage_cleanup_intents'))
+    relations = ', '.join(f'{quote(schema)}.{quote(relation)}'
+                          for relation in ('services', 'version_specs',
+                                           'replicas',
+                                           'ephemeral_storage_cleanup_intents'))
     session.execute(
         sqlalchemy.text(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT_MS}ms'"))
     session.execute(
         sqlalchemy.text(
             f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT_MS}ms'"))
     session.execute(
-        sqlalchemy.text(
-            f'LOCK TABLE {relations} IN SHARE ROW EXCLUSIVE MODE'))
+        sqlalchemy.text(f'LOCK TABLE {relations} IN SHARE ROW EXCLUSIVE MODE'))
 
 
 def _verify_version_postimages(session: orm.Session,
@@ -3657,11 +3673,11 @@ def run_operator(
         # This read-only fence deliberately precedes every external evidence
         # getter.  It is repeated under the writer locks below to close two
         # concurrent first-retirement attempts.
-        with orm.Session(engine) as session:
+        with _reader_database_authority(engine) as session:
             _require_no_terminal_protocol4_manifest(session)
 
     if mode is None:
-        with orm.Session(engine) as session:
+        with _reader_database_authority(engine) as session:
             rows, service_rows = _scan_inventory(session, row_bound)
             prior_mismatches = _prior_ledger_mismatches(session, rows)
         _prepare_supported_rows(rows, service_rows)
@@ -3719,7 +3735,7 @@ def run_operator(
         _require_stable_zero_evidence(
             legacy_controller_before, legacy_controller_before,
             'Legacy Serve-controller cluster evidence')
-        with orm.Session(engine) as session:
+        with _reader_database_authority(engine) as session:
             preflight_rows, _ = _scan_inventory(session, row_bound)
         (preflight_process_targets, preflight_action_targets
         ) = _retirement_evidence_targets(preflight_rows)
@@ -3751,15 +3767,12 @@ def run_operator(
 
     started_at = _read_timestamp(now, 'Normalization start')
     run_id = uuid.uuid4()
-    connection = engine.connect()
-    writer_lock_acquired = False
-    try:
-        database_schema = _acquire_writer_session_lock(connection)
-        writer_lock_acquired = True
-        connection = connection.execution_options(
-            isolation_level='SERIALIZABLE',
-            schema_translate_map={None: database_schema})
+    with _writer_database_authority(engine) as authority_lease:
+        connection = authority_lease.connection
+        database_schema = authority_lease.authority.schema
         with orm.Session(bind=connection) as session, session.begin():
+            placement_normalization_authority.bind_session_to_authority(
+                session, authority_lease.authority)
             _acquire_writer_table_locks(session, database_schema)
             _require_no_terminal_protocol4_manifest(session)
             rows, service_rows = _scan_inventory(session, row_bound)
@@ -3948,13 +3961,14 @@ def run_operator(
             api_pod_after = _validate_api_pod_identity(
                 api_pod_checker(engine), 'Sole Recreate API pod postflight')
             _require_stable_api_pod(api_pod_before, api_pod_after)
-    finally:
-        if not connection.closed:
             try:
-                if writer_lock_acquired:
-                    _release_writer_session_lock(connection)
-            finally:
-                connection.close()
+                placement_normalization_authority.reassert_writer_session_lock(
+                    connection, _ADVISORY_LOCK_NAME)
+            except (placement_normalization_authority.
+                    PlacementNormalizationAuthorityError) as exc:
+                raise NormalizationBlocker(
+                    'Placement-normalization writer lost its database '
+                    'authority before commit.') from exc
 
     counts = collections.Counter(row.classification.value for row in rows)
     return OperatorResult(

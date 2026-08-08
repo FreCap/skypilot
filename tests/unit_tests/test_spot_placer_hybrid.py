@@ -339,11 +339,10 @@ run: echo hi
         monkeypatch.setattr(spot_placer.skypilot_config, 'get_workspace_cloud',
                             lambda cloud, workspace: {})
 
-        placer = spot_placer.DynamicFallbackSpotPlacer(
-            task,
-            _physical_contract(),
-            placement_catalog=catalog,
-            workspace='default')
+        placer = spot_placer.SpotPlacer(task,
+                                        _physical_contract(),
+                                        placement_catalog=catalog,
+                                        workspace='default')
 
         # The immutable version catalog remains intact, but every runtime
         # placement/reserved-fill view contains eligible locations only.
@@ -397,11 +396,10 @@ run: echo hi
 
         monkeypatch.setattr(spot_placer.skypilot_config, 'get_workspace_cloud',
                             _workspace_cloud)
-        placer = spot_placer.DynamicFallbackSpotPlacer(
-            task,
-            _physical_contract(),
-            placement_catalog=catalog,
-            workspace='research')
+        placer = spot_placer.SpotPlacer(task,
+                                        _physical_contract(),
+                                        placement_catalog=catalog,
+                                        workspace='research')
 
         with mock.patch.object(spot_placer.skypilot_config,
                                'safe_reload_config') as reload_config:
@@ -465,11 +463,10 @@ run: echo hi
             lambda cloud, workspace: config
             if cloud == cloud_name.lower() else {})
 
-        placer = spot_placer.DynamicFallbackSpotPlacer(
-            task,
-            _physical_contract(),
-            placement_catalog=catalog,
-            workspace='research')
+        placer = spot_placer.SpotPlacer(task,
+                                        _physical_contract(),
+                                        placement_catalog=catalog,
+                                        workspace='research')
 
         assert placer.known_locations() == []
         assert placer.active_locations() == []
@@ -498,15 +495,7 @@ def hybrid_placer():
 
 
 def _make_per_gpu_placer(costs):
-    placer = spot_placer.DynamicFallbackSpotPlacer.__new__(
-        spot_placer.DynamicFallbackSpotPlacer)
-    placer._placement_contract = _logical_contract()
-    placer.location2status = {
-        location: spot_placer.LocationStatus.ACTIVE for location in costs
-    }
-    placer.location2preempted_at = {}
-    placer.location2cost = dict(costs)
-    return placer
+    return make_placer(costs, placement_contract=_logical_contract())
 
 
 class TestInstanceTypeLocationIdentity:
@@ -898,7 +887,7 @@ class TestProvisionTimeoutWarning:
         warning = mock.MagicMock()
         monkeypatch.setattr(spot_placer.logger, 'warning', warning)
 
-        spot_placer.DynamicFallbackSpotPlacer(task, _physical_contract())
+        spot_placer.SpotPlacer(task, _physical_contract())
 
         warning.assert_not_called()
         assert get_timeout.call_args.kwargs['override_configs'] == task_override

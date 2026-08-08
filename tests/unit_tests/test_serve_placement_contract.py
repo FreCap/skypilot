@@ -1,4 +1,7 @@
 """Typed SkyServe placement-contract and persistence compatibility tests."""
+# pylint: disable=missing-class-docstring,not-callable,protected-access
+# pylint: disable=redefined-outer-name,too-many-function-args,unused-import
+# pylint: disable=use-implicit-booleaness-not-comparison
 
 import base64
 import hashlib
@@ -474,8 +477,8 @@ def test_fresh_contract_matrix(policy_name, pool, expected):
     (placement_policy.SPOT_HEDGE_PLACER, True, False),
     (placement_policy.CAPACITY_AWARE_SPOT_PLACER, False, True),
 ])
-def test_one_engine_factory_propagates_exact_contract(policy_name, pool,
-                                                      expand):
+def test_one_concrete_engine_propagates_exact_contract(policy_name, pool,
+                                                       expand):
     contract = placement_policy.resolve_fresh_contract(policy_name, pool)
     spec = types.SimpleNamespace(placement_contract=contract)
     task = types.SimpleNamespace(resources=[mock.sentinel.resources],
@@ -491,7 +494,7 @@ def test_one_engine_factory_propagates_exact_contract(policy_name, pool,
                                               task,
                                               placement_catalog=catalog)
 
-    assert type(placer) is spot_placer.DynamicFallbackSpotPlacer
+    assert type(placer) is spot_placer.SpotPlacer
     assert placer.placement_contract == contract
 
 
@@ -517,7 +520,7 @@ def test_historical_contract_uses_one_engine_and_per_gpu_ranking():
                                               task,
                                               placement_catalog=catalog)
 
-    assert type(placer) is spot_placer.DynamicFallbackSpotPlacer
+    assert type(placer) is spot_placer.SpotPlacer
     assert placer.placement_contract == contract
     assert not placer.placement_contract.uses_logical_replicas
     assert placer.select_next_location() == four_gpu
@@ -2045,8 +2048,14 @@ def test_apply_rejects_prior_ledger_drift():
 
 
 def test_postgres_inventory_blocks_live_parent_workload_kind_mismatch(
-        empty_postgres):
+        empty_postgres, monkeypatch):
     engine = empty_postgres
+    authority_module = (
+        placement_contract_normalization.placement_normalization_authority)
+    monkeypatch.setattr(
+        authority_module, 'assert_reader_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
     serve_state.Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(serve_state.services_table.insert().values(
@@ -2079,9 +2088,16 @@ def test_postgres_inventory_blocks_live_parent_workload_kind_mismatch(
 def test_postgres_operator_apply_rerun_new_row_and_cas_rollback(
         empty_postgres, monkeypatch):
     engine = empty_postgres
-    monkeypatch.setattr(placement_contract_normalization,
-                        '_assert_database_write_authority',
-                        lambda _connection: 'public')
+    authority_module = (
+        placement_contract_normalization.placement_normalization_authority)
+    monkeypatch.setattr(
+        authority_module, 'assert_writer_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
+    monkeypatch.setattr(
+        authority_module, 'assert_reader_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
     serve_state.Base.metadata.create_all(engine)
     fieldless_state = dict(_spec().__dict__)
     for field in placement_policy.CONTRACT_FIELDS:
@@ -2303,9 +2319,16 @@ def test_postgres_operator_apply_rerun_new_row_and_cas_rollback(
 def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
         empty_postgres, monkeypatch):
     engine = empty_postgres
-    monkeypatch.setattr(placement_contract_normalization,
-                        '_assert_database_write_authority',
-                        lambda _connection: 'public')
+    authority_module = (
+        placement_contract_normalization.placement_normalization_authority)
+    monkeypatch.setattr(
+        authority_module, 'assert_writer_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
+    monkeypatch.setattr(
+        authority_module, 'assert_reader_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
     serve_state.Base.metadata.create_all(engine)
     historical_payload = zlib.decompress(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
@@ -2531,8 +2554,8 @@ def test_protocol_4_ledger_verifies_complete_stale_placeholder_inventory():
         assert all(
             entry['original_column_sha256s'][column] == null_sha256 for column
             in placement_contract_normalization._STALE_PLACEHOLDER_NULL_COLUMNS)
-    assert placement_normalization_manifest.manifest_mismatches(
-        run, entries) == []
+    assert placement_normalization_manifest.manifest_mismatches(run,
+                                                                entries) == []
 
 
 @pytest.mark.parametrize(('target', 'field', 'value'), [
@@ -2616,8 +2639,7 @@ def test_protocol_4_ledger_rejects_stale_placeholder_tampering(
 
     assert not placement_normalization_manifest._retirement_ledger_v4_stale_placeholders_are_complete(
         retired_entry, entries)
-    assert placement_normalization_manifest.manifest_mismatches(
-        run, entries)
+    assert placement_normalization_manifest.manifest_mismatches(run, entries)
 
 
 @pytest.mark.parametrize('replacement_classification',
@@ -2652,8 +2674,7 @@ def test_protocol_4_ledger_rejects_coordinated_stale_placeholder_relabel(
 
     assert not placement_normalization_manifest._retirement_ledger_v4_stale_placeholders_are_complete(
         retired_entry, entries)
-    assert placement_normalization_manifest.manifest_mismatches(
-        run, entries)
+    assert placement_normalization_manifest.manifest_mismatches(run, entries)
 
 
 def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
@@ -2702,8 +2723,8 @@ def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
         'freeze_evidence_sha256': 'e' * 64,
     }
 
-    assert placement_normalization_manifest.manifest_mismatches(
-        run, [entry]) == []
+    assert placement_normalization_manifest.manifest_mismatches(run,
+                                                                [entry]) == []
 
     entry['outcome'] = 'changed'
     tamper_reasons = {
@@ -3002,5 +3023,6 @@ def test_logical_copy_cannot_change_workload_kind_to_pool():
 
 def test_per_gpu_subclass_and_dynamic_registry_are_removed():
     assert not hasattr(spot_placer, 'CapacityAwareDynamicFallbackSpotPlacer')
+    assert not hasattr(spot_placer, 'DynamicFallbackSpotPlacer')
     assert not hasattr(spot_placer, 'SPOT_PLACERS')
     assert not hasattr(spot_placer, 'DEFAULT_SPOT_PLACER')

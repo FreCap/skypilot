@@ -472,6 +472,13 @@ the staged cleanup removes the transitional writer after its rollout gates.
 The terminal fence is checked against the latest fully validated manifest once
 before any external getter and again after acquiring the unchanged advisory and
 table locks; two concurrent first-retirement attempts cannot both pass it.
+The pre-external terminal check and every read-only dry-run first prove reader
+authority and bind that same session to the proved canonical schema before the
+first protected-table read.  Their inventory can therefore never come from an
+untrusted search path or a pooled temporary-table shadow.  The active-request,
+fresh API-instance, API resource-action, and Serve shadow-action database
+evidence readers use the same typed reader transaction; no external proof reads
+a schema-less pooled session.
 After acquiring its nonblocking session advisory lock and before opening the
 writer snapshot, every protocol-4 apply also invokes revision 040's exact
 runtime-authority assertion by its canonical schema-qualified name.  The
@@ -482,13 +489,20 @@ gate, and both ledger relations; it never trusts caller-controlled
 database function, the application compares its complete `prosrc` byte string
 with the exact expected definition regenerated from the compiled, frozen
 revision-040 contract; function name, owner, signature, configuration, or a
-self-reported `true` result is never a trust root.  The colocated Alembic
+self-reported `true` result is never a trust root.  Before its first catalog
+query, every authority interface freezes the transaction-local search path to
+`pg_catalog`; schema translation then binds all application relations to the
+proved canonical schema.  Caller-defined functions, aggregates, operators, and
+types therefore cannot participate in either proof or inventory reads.  The colocated Alembic
 version relation also has an exact application-verified envelope: one
 nonpartitioned persistent ordinary relation, owner-only ACL, no RLS,
 inheritance, rewrite rule, trigger, or default; exactly one nonnullable
-`varchar(32)` local column named `version_num`; and Alembic's one exact
+`varchar(32)` local column named `version_num` with no column ACL; and Alembic's one exact
 nondeferrable validated primary-key constraint and corresponding one-column
-unique primary index, both named `alembic_version_serve_state_db_pkc`.  Its
+unique primary index, both named `alembic_version_serve_state_db_pkc`.  That
+index is the unparameterized default btree with default opclass, source-column
+collation, ascending/nulls-last key, owner-only ACL, and no predicate,
+expression, exclusion, deferred-validity, or physical storage options.  Its
 single row contains `040`.  The schema-qualified assertion then verifies the complete
 040 catalog, its exact relation/function OIDs, and one coherent open or terminal
 singleton.
@@ -499,9 +513,12 @@ SHARE` lock on the canonical gate through its transaction.  A writer assertion
 additionally requires open state and proves that its own physical backend holds
 the unchanged session advisory lock.  A downgrade assertion additionally
 requires open state while relying on downgrade's already-held transaction
-advisory lock.  The writer proves its session lock before authoritative DML and
-again immediately before commit; the same physical connection retains it until
-commit or rollback returns, and only then explicitly releases it.  The operator
+advisory lock.  The writer actively proves exactly one session-level hold—not a
+transaction-only or reentrant pooled hold—before authoritative DML and again
+immediately before commit; the same physical connection retains it until commit
+or rollback returns, and only then releases exactly one hold and proves none
+remain.  Any uncertain acquisition, probe, or release invalidates the physical
+connection instead of returning it to the pool.  The operator
 rejects any same-session `pg_my_temp_schema()` relation or assertion-function
 shadow in its write/read set, binds all SQLAlchemy tables to the asserted
 canonical schema, and schema-qualifies its raw table locks; PostgreSQL's
@@ -567,7 +584,18 @@ bigint`, `latest_run_id uuid`, `admitted_xid xid8`, `terminal_run_id uuid`, and
 nonnegative; generation zero is equivalent to both admission fields being
 NULL; the two terminal fields are either both NULL or both present; and a
 present terminal UUID equals the latest UUID.  Both UUIDs have nondeferrable,
-restricting foreign keys to the run ledger.  The initial row is exactly
+restricting foreign keys to the run ledger.  Those two foreign keys and the row
+ledger's run foreign key retain their exact PostgreSQL internal RI-trigger
+quartets in canonical standard mode; revision 040 never requires superuser-only
+internal-trigger administration.  The exact internal-trigger inventory across
+the singleton and ledgers is 18: those three authority-FK quartets contribute
+12, while the three revision-037 receipt/retirement foreign keys from
+`services` and `version_specs` contribute their six referenced-side triggers
+on the run ledger.  All six foreign keys are verified against their complete
+source/reference column, action, match, validation, deferrability, parent, and
+delete-column envelope.  Runtime verification independently rejects
+any existing row-ledger orphan, including one introduced by a privileged
+replication-role session, before trusting the authority.  The initial row is exactly
 `(true, 0, NULL, NULL, NULL, NULL)`, and upgrade refuses any pre-existing
 protocol-4 terminal tuple instead of seeding an incoherent open fence.
 
@@ -595,13 +623,18 @@ issue a transition first.
 
 Revision 040 verifies the complete relation, constraint, index,
 trigger/function, owner, ACL, and data envelope: exact columns, PostgreSQL
-types, nullability, defaults, primary/check/foreign-key behavior, one coherent
+types, nullability, defaults, absence of column ACLs, primary/check/foreign-key
+behavior and internal RI triggers, one coherent
 singleton row, relation kind/persistence/RLS state, function owner and revoked
 PUBLIC execution, fixed `pg_catalog` search path, security/volatility/parallel
 attributes, exact relation/function/event and row/statement level,
 always-enabled state, and no `WHEN` predicate, arguments, transition tables,
 unexpected constraint metadata, duplicate name, overload, or extra source
-trigger.  The three relations must have no inheritance parent or child and no
+trigger.  Frozen expression catalogs are compiled with `pg_catalog` first and
+explicit `pg_temp` second, then restore the transaction's frozen `pg_catalog`
+path, so hostile caller schemas or temporary type aliases cannot change the
+expected node tree.
+The three relations must have no inheritance parent or child and no
 non-internal rewrite rule; `pg_inherits`, `relhassubclass`, `pg_rewrite`, and
 `relhasrules` are part of the verified envelope so inherited or redirected DML
 cannot bypass the parent triggers.  A partial, disabled, predicate-gated,
@@ -1166,21 +1199,20 @@ attribute, or private compatibility mirror.
 
 ### One placement engine
 
-`DynamicFallbackSpotPlacer` receives the resolved contract directly.  Catalog
-construction consults `catalog_mode`; ranking consults `cost_unit`.
+The final `SpotPlacer` class is the sole concrete dynamic-fallback engine and
+receives the resolved contract directly.  Catalog construction consults
+`catalog_mode`; ranking consults `cost_unit`.
 Zero-cost-first selection, bench/retry behavior, exact-location filtering,
 workspace policy, and paid launch fencing remain shared and unchanged.
 
-There is no class registry or default flag.  Before deleting
-`CapacityAwareDynamicFallbackSpotPlacer`, the transition audits source imports,
-plugins, retry artifacts, version pickles, controller/local databases,
-snapshots, and rollback backups for its qualified class path.  If any durable
-object references it, a deprecated deserialization-only import shim remains;
-otherwise a real preceding-release pickle fixture must prove the deletion is
-safe.  If a qualified-class reference does exist, a real fixture must prove
-the deserialization-only shim loads it and resolves the typed contract without
-restoring a second runtime engine.  Supported public names are a fixed mapping
-to contract presets.
+There is no class registry, abstract/factory placer, policy subclass, or
+test-only production allocator hook.  The placer itself is not persisted;
+durable service specs and retry artifacts persist the explicit primitive
+contract and placement catalog instead, so deleting the former
+`DynamicFallbackSpotPlacer` name does not require a deserialization shim.
+Tests that bypass provider enumeration construct a complete test double in
+test-only helpers.  Supported public names are a fixed mapping to contract
+presets.
 `spot_placer: null` constructs no placer.
 
 Reserved-capacity validation reads `reserved_fill_mode` from the engine
@@ -1667,13 +1699,23 @@ Automated coverage must prove:
   removal and prove downgrade cannot pass until the complete read/return or
   acknowledgement commit ends; create same-session temporary shadows for the assertion name and each
   operator or receipt relation and prove the schema-qualified assertion plus
-  canonical-schema SQL binding rejects them before DML; tamper
+  canonical-schema SQL binding rejects them before any preliminary dry-run,
+  external-evidence getter, or DML; require transaction-only and reentrant
+  pooled advisory ownership to fail the active writer probe, and fault an
+  acquisition or release response after its possible side effect to prove the
+  physical connection is invalidated rather than pooled; tamper
   with every singleton
   column/default/type/nullability/key/check/FK, singleton row value/count,
-  relation owner/ACL/kind/persistence/RLS/inheritance/rule state, and
+  relation or column ACL, owner/kind/persistence/RLS/inheritance/rule state,
+  index access method/opclass/collation/order/options,
   function/trigger owner, ACL, search-path, body, event, enablement, predicate,
   argument, transition, constraint, overload, or duplicate/extra-source-trigger
-  field and require fail-closed rejection; attempt every top-level singleton
+  field and require fail-closed rejection; replace, disable, or replica-bypass
+  any internal authority-FK trigger and inject an orphan ledger row, requiring
+  both trigger enforcement and the independent data invariant to fail closed;
+  compile the frozen expected catalog under a hostile caller search path with a
+  temporary `uuid` alias and shadow `length(text)` function, and require the exact catalog
+  plus a transaction-local `pg_catalog` path; attempt every top-level singleton
   DML operation and a depth-two update without the exact current-transaction
   source tuples and require rejection;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
@@ -1709,8 +1751,16 @@ and static checks, then a cold service smoke test for each eligible provider
 class.  A paid-capacity smoke requires separate explicit cost authorization;
 zero-cost reserved-capacity tests remain fail closed.
 
-### Verification evidence as of 2026-08-07
+### Verification evidence as of 2026-08-08
 
+- The protocol-4 implementation passed the complete native-PostgreSQL-14
+  schema-040, authority-lock, receipt, and retirement suites; the focused
+  placement-contract, cheapest-first, hybrid, reserved-capacity, measured-
+  availability, and zero-cost-refill suites; repository formatting, mypy,
+  pylint, and dashboard lint/format checks; and an adversarial authority audit
+  with an unconditional GO.  A fresh integration audit found no path,
+  semantic, or merge-tree overlap with the two newer `origin/improvements`
+  commits, which touch only the Managed Jobs dashboard banner.
 - Adversarial review of this exact design and code-level implementation review
   both returned GO for the transition.  A separate final cleanup audit returned
   GO for committing and submitting the blocked cleanup, and NO-GO for merging

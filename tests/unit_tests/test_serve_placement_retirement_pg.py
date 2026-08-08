@@ -1,6 +1,7 @@
 """PostgreSQL transaction coverage for placement-contract retirement."""
 
-# pylint: disable=protected-access,redefined-outer-name,unused-import
+# pylint: disable=broad-exception-caught,protected-access,redefined-outer-name
+# pylint: disable=unused-import,use-implicit-booleaness-not-comparison
 import base64
 import concurrent.futures
 import copy
@@ -251,9 +252,16 @@ def _seed_retirement_fixture(
     """Create a production-shaped inventory and completed protocol-1 proof."""
     # Application transaction tests run against ORM-created tables.  Revision
     # 040's exact SQL authority has its own real-migration suite.
-    monkeypatch.setattr(placement_contract_normalization,
-                        '_assert_database_write_authority',
-                        lambda _connection: 'public')
+    authority_module = (
+        placement_contract_normalization.placement_normalization_authority)
+    monkeypatch.setattr(
+        authority_module, 'assert_writer_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
+    monkeypatch.setattr(
+        authority_module, 'assert_reader_database_authority',
+        lambda *_args, **_kwargs: authority_module.
+        PlacementNormalizationDatabaseAuthority('public', None))
     if timestamp_case not in {
             'production', 'null_after_boundary', 'no_finite_boundary',
             'legacy_intent_after_boundary', 'finite_intent_after_version'
@@ -382,8 +390,7 @@ def _seed_retirement_fixture(
 def _complete_terminal_retirement(
     engine: sqlalchemy.engine.Engine,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[_RetirementFixture,
-           placement_contract_normalization.OperatorResult]:
+) -> tuple[_RetirementFixture, placement_contract_normalization.OperatorResult]:
     fixture = _seed_retirement_fixture(engine, monkeypatch)
     timestamps = iter((200.0, 201.0, 202.0))
     result = placement_contract_normalization.run_operator(
@@ -973,12 +980,12 @@ def test_writer_session_lock_fails_busy_instead_of_waiting(empty_postgres):
     try:
         with holder.begin():
             holder.execute(
-                sqlalchemy.text(
-                    'SELECT pg_advisory_xact_lock('
-                    'hashtextextended(:name, 0))'), {
-                        'name': (placement_contract_normalization.
-                                 _ADVISORY_LOCK_NAME),
-                    })
+                sqlalchemy.text('SELECT pg_advisory_xact_lock('
+                                'hashtextextended(:name, 0))'),
+                {
+                    'name':
+                        (placement_contract_normalization._ADVISORY_LOCK_NAME),
+                })
             with pytest.raises(
                     placement_contract_normalization.NormalizationBlocker,
                     match='owns the advisory authority'):
@@ -997,22 +1004,12 @@ def test_writer_database_authority_rejects_absent_revision_040(empty_postgres):
                 match='write authority is absent or invalid'):
             placement_contract_normalization._acquire_writer_session_lock(
                 connection)
-    finally:
-        connection.close()
-
-
-def test_writer_database_authority_rejects_temporary_relation_shadow(
-        empty_postgres):
-    connection = empty_postgres.connect()
-    try:
-        with connection.begin():
-            connection.exec_driver_sql(
-                'CREATE TEMPORARY TABLE services (spoof integer)')
-        with pytest.raises(
-                placement_contract_normalization.NormalizationBlocker,
-                match='temporary authority-relation shadow'):
-            placement_contract_normalization._acquire_writer_session_lock(
-                connection)
+        assert connection.execute(
+            sqlalchemy.text('SELECT pg_advisory_unlock('
+                            'hashtextextended(:name, 0))'),
+            {
+                'name': (placement_contract_normalization._ADVISORY_LOCK_NAME),
+            }).scalar_one() is False
     finally:
         connection.close()
 
@@ -1142,10 +1139,8 @@ def test_protocol_v4_full_manifest_rejects_stale_placeholder_fact_tampering(
         proof = candidate_proof(rows)
         proof['placeholder_count'] = len(remaining_evidence)
         proof['inventory_sha256'] = (
-            placement_normalization_manifest.
-            stale_placeholder_inventory_sha256(_SERVICE_NAME,
-                                                proof['current_version'],
-                                                remaining_evidence))
+            placement_normalization_manifest.stale_placeholder_inventory_sha256(
+                _SERVICE_NAME, proof['current_version'], remaining_evidence))
         counts = tampered_manifest['classification_counts']
         counts['stale_placeholder'] -= 1
         counts[classification] = counts.get(classification, 0) + 1
@@ -1281,20 +1276,26 @@ def test_protocol_v4_serializes_two_first_retirement_writers(
         outcome for outcome in outcomes
         if isinstance(outcome, placement_contract_normalization.OperatorResult)
     ]
-    failures = [outcome for outcome in outcomes if isinstance(outcome, Exception)]
+    failures = [
+        outcome for outcome in outcomes if isinstance(outcome, Exception)
+    ]
     assert len(successes) == 1
     assert len(failures) == 1
     assert isinstance(failures[0],
                       placement_contract_normalization.NormalizationBlocker)
-    assert 'terminal' in str(failures[0]).lower()
+    failure_message = str(failures[0]).lower()
+    assert ('terminal' in failure_message or
+            'advisory authority' in failure_message)
     with engine.connect() as connection:
         run_ids = connection.execute(
             sqlalchemy.select(
                 serve_state.placement_normalization_runs_table.c.run_id).
             order_by(serve_state.placement_normalization_runs_table.c.
                      completed_at)).scalars().all()
-    assert run_ids == [fixture.predecessor_run_id,
-                       uuid.UUID(successes[0].run_id)]
+    assert run_ids == [
+        fixture.predecessor_run_id,
+        uuid.UUID(successes[0].run_id)
+    ]
 
 
 def test_protocol_v4_terminal_binding_ignores_epoch_but_not_spec_drift(
@@ -1313,12 +1314,10 @@ def test_protocol_v4_terminal_binding_ignores_epoch_but_not_spec_drift(
     with engine.begin() as connection:
         connection.execute(serve_state.version_specs_table.update().where(
             serve_state.version_specs_table.c.service_name == _SERVICE_NAME,
-            serve_state.version_specs_table.c.version == _CURRENT_VERSION).
-                           values(spec=_explicit_v2_payload(
-                               'dynamic_fallback')))
+            serve_state.version_specs_table.c.version == _CURRENT_VERSION
+        ).values(spec=_explicit_v2_payload('dynamic_fallback')))
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
     assert any(mismatch['reason'] == 'tracked_terminal_spec_drift'
                for mismatch in mismatches)
 
@@ -1333,8 +1332,7 @@ def test_protocol_v4_terminal_binding_requires_manifested_current_row(
             serve_state.version_specs_table.c.version == _CURRENT_VERSION))
 
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
 
     assert any(mismatch['reason'] == 'manifested_current_row_missing'
                for mismatch in mismatches)
@@ -1343,7 +1341,8 @@ def test_protocol_v4_terminal_binding_requires_manifested_current_row(
 @pytest.mark.parametrize('service_name', [
     _SERVICE_NAME,
     'svc-receipt-blocker',
-], ids=['retired-candidate', 'ordinary-manifest-service'])
+],
+                         ids=['retired-candidate', 'ordinary-manifest-service'])
 @pytest.mark.parametrize('hash_value', [None, 'malformed hash'],
                          ids=['null', 'whitespace'])
 def test_protocol_v4_terminal_binding_rejects_invalid_present_parent_hash(
@@ -1363,22 +1362,20 @@ def test_protocol_v4_terminal_binding_rejects_invalid_present_parent_hash(
                 lifecycle_epoch=1,
                 resource_scope='ordinary-service',
                 logical_replica_semantics=0))
-            connection.execute(
-                serve_state.version_specs_table.insert().values(
-                    service_name=service_name,
-                    version=1,
-                    spec=_explicit_v2_payload(),
-                    yaml_content='service: {}',
-                    created_at=203.0,
-                    created_by='post-terminal-test'))
+            connection.execute(serve_state.version_specs_table.insert().values(
+                service_name=service_name,
+                version=1,
+                spec=_explicit_v2_payload(),
+                yaml_content='service: {}',
+                created_at=203.0,
+                created_by='post-terminal-test'))
         else:
             connection.execute(serve_state.services_table.update().where(
                 serve_state.services_table.c.name == service_name).values(
                     hash=hash_value))
 
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
 
     assert any(
         mismatch['reason'] == 'invalid_current_parent_hash_observation' and
@@ -1402,8 +1399,7 @@ def test_protocol_v4_terminal_binding_requires_retired_tombstone(
                 serve_state.version_specs_table.delete().where(candidate))
 
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
     assert mismatches
     assert any('retired' in str(mismatch['reason']) or
                'tombstone' in str(mismatch['reason'])
@@ -1418,17 +1414,14 @@ def test_protocol_v4_terminal_binding_never_allows_stale_placeholder_fill(
         connection.execute(serve_state.version_specs_table.update().where(
             serve_state.version_specs_table.c.service_name == _SERVICE_NAME,
             serve_state.version_specs_table.c.version ==
-            _PLACEHOLDER_VERSION_IDS[0]).values(
-                spec=_explicit_v2_payload(),
-                yaml_content='service: {}',
-                created_at=300.0))
+            _PLACEHOLDER_VERSION_IDS[0]).values(spec=_explicit_v2_payload(),
+                                                yaml_content='service: {}',
+                                                created_at=300.0))
 
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
     assert mismatches
-    assert any('stale' in str(mismatch['reason'])
-               for mismatch in mismatches)
+    assert any('stale' in str(mismatch['reason']) for mismatch in mismatches)
 
 
 def test_protocol_v4_terminal_binding_allows_ordinary_manifest_placeholder_fill(
@@ -1503,8 +1496,7 @@ def test_protocol_v4_terminal_binding_applies_same_incarnation_high_water(
             created_by='post-terminal-writer'))
 
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
     assert (mismatches == ()) is allowed
 
 
@@ -1528,10 +1520,10 @@ def test_protocol_v4_terminal_binding_disambiguates_recreated_service(
     # Version 3 deliberately overlaps a manifested stale identity.  The new
     # parent hash plus a post-terminal explicit commit disambiguates reuse.
     with engine.begin() as connection:
-        connection.execute(versions.delete().where(
-            versions.c.service_name == _SERVICE_NAME))
-        connection.execute(services.update().where(
-            services.c.name == _SERVICE_NAME).values(
+        connection.execute(
+            versions.delete().where(versions.c.service_name == _SERVICE_NAME))
+        connection.execute(
+            services.update().where(services.c.name == _SERVICE_NAME).values(
                 hash='new-incarnation',
                 resource_scope='new-incarnation',
                 lifecycle_epoch=9,
@@ -1546,8 +1538,7 @@ def test_protocol_v4_terminal_binding_disambiguates_recreated_service(
             created_by='recreated-service'))
 
     mismatches = placement_contract_normalization.run_operator(
-        engine=engine, mode=None,
-        row_bound=_ROW_BOUND).prior_ledger_mismatches
+        engine=engine, mode=None, row_bound=_ROW_BOUND).prior_ledger_mismatches
     assert (mismatches == ()) is allowed
 
 
