@@ -22,6 +22,18 @@ class ExecutionClass(enum.Enum):
     CONTROLLER = 'controller'
 
 
+class HandlerClaimScope(enum.Enum):
+    """Deprecated compatibility surface for released request plugins.
+
+    The dedicated authority claimant is retired.  ``GENERAL`` remains so
+    plugins written against released SkyPilot versions continue to register;
+    every other scope is rejected by :func:`register_handler`.
+    """
+
+    GENERAL = 'general'
+    RESOURCE_ACTION_AUTHORITY = 'resource_action_authority'
+
+
 class ReplayPolicy(enum.Enum):
     """Policy applied after an execution owner is lost."""
 
@@ -46,6 +58,7 @@ class HandlerRegistration:
     execution_class: ExecutionClass
     replay_policy: ReplayPolicy
     cancellation_policy: CancellationPolicy
+    claim_scope: HandlerClaimScope = HandlerClaimScope.GENERAL
     aliases: tuple[str, ...] = ()
 
 
@@ -140,9 +153,12 @@ def register_handler(
         replay_policy: ReplayPolicy = ReplayPolicy.NEVER,
         cancellation_policy: CancellationPolicy = (
             CancellationPolicy.FENCED_PROCESS),
+        claim_scope: HandlerClaimScope = HandlerClaimScope.GENERAL,
         aliases: tuple[str, ...] = (),
 ) -> HandlerRegistration:
     """Register one durable handler and reject conflicting identities."""
+    if claim_scope is not HandlerClaimScope.GENERAL:
+        raise ValueError('Non-general handler claim scopes have been retired.')
     stable_name = name or _handler_name(func)
     registration = HandlerRegistration(
         name=stable_name,
@@ -150,6 +166,7 @@ def register_handler(
         execution_class=execution_class,
         replay_policy=replay_policy,
         cancellation_policy=cancellation_policy,
+        claim_scope=claim_scope,
         aliases=aliases,
     )
     with _REGISTRY_LOCK:

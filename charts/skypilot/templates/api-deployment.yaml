@@ -1,3 +1,6 @@
+{{- if hasKey .Values "resourceActions" -}}
+{{- fail "resourceActions.authorityWorker has been removed; delete the stored resourceActions value before upgrading" -}}
+{{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}

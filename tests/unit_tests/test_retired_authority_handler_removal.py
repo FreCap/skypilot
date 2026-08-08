@@ -34,16 +34,38 @@ def test_private_authority_handler_is_not_registered(handler_name: str) -> None:
         registry.resolve_handler(handler_name)
 
 
-def test_private_authority_modules_and_claim_scope_are_removed() -> None:
+def test_private_authority_modules_are_removed() -> None:
     assert importlib.util.find_spec(
         'sky.serve.resource_action_handlers') is None
     assert importlib.util.find_spec(
         'sky.serve.resource_action_progress') is None
-    assert 'claim_scope' not in {
-        field.name for field in dataclasses.fields(registry.HandlerRegistration)
-    }
-    assert 'claim_scope' not in inspect.signature(
+
+
+def test_released_general_claim_scope_plugin_api_is_inert_compatibility(
+) -> None:
+    claim_scope_field = next(
+        field for field in dataclasses.fields(registry.HandlerRegistration)
+        if field.name == 'claim_scope')
+    assert claim_scope_field.default is registry.HandlerClaimScope.GENERAL
+    assert inspect.signature(
+        registry.register_handler
+    ).parameters['claim_scope'].default is registry.HandlerClaimScope.GENERAL
+    assert 'claim_scope' in inspect.signature(
         plugins.ExtensionContext.register_request_handler).parameters
+
+
+def test_retired_authority_claim_scope_is_rejected() -> None:
+
+    def handler() -> None:
+        pass
+
+    with pytest.raises(
+            ValueError,
+            match='Non-general handler claim scopes have been retired'):
+        registry.register_handler(
+            handler,
+            name='test.retired_authority_claim_scope_is_rejected',
+            claim_scope=registry.HandlerClaimScope.RESOURCE_ACTION_AUTHORITY)
 
 
 @pytest.mark.parametrize('handler_name', _PRIVATE_HANDLER_NAMES)
