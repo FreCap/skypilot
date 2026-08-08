@@ -485,9 +485,11 @@ revision-040 contract; function name, owner, signature, configuration, or a
 self-reported `true` result is never a trust root.  The colocated Alembic
 version relation also has an exact application-verified envelope: one
 nonpartitioned persistent ordinary relation, owner-only ACL, no RLS,
-inheritance, rewrite rule, trigger, index, constraint, or default, and exactly
-one nonnullable `varchar(32)` local column named `version_num` containing the
-single value `040`.  The schema-qualified assertion then verifies the complete
+inheritance, rewrite rule, trigger, or default; exactly one nonnullable
+`varchar(32)` local column named `version_num`; and Alembic's one exact
+nondeferrable validated primary-key constraint and corresponding one-column
+unique primary index, both named `alembic_version_serve_state_db_pkc`.  Its
+single row contains `040`.  The schema-qualified assertion then verifies the complete
 040 catalog, its exact relation/function OIDs, and one coherent open or terminal
 singleton.
 
