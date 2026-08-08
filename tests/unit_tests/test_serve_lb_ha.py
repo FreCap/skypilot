@@ -1,6 +1,7 @@
 """Deterministic tests for SkyServe external load balancer HA."""
 # pylint: disable=protected-access,unexpected-keyword-arg
 import asyncio
+import concurrent.futures
 import json
 import os
 import threading
@@ -608,6 +609,7 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._service_name = 'service'
     ctrl._resource_scope = None
     ctrl._lb_ha_enabled = True
+    ctrl._lb_role_executor = None
     ctrl._lb_role_lock = None
     ctrl._lb_role_snapshot_task = None
     ctrl._lb_role_snapshot_key = None
@@ -797,6 +799,72 @@ def test_ordinary_role_heartbeat_does_not_wait_for_sync_demand_head():
 
     assert role_response.status_code == 200
     assert sync_response.status_code == 200
+
+
+def test_role_heartbeat_bypasses_saturated_default_executor():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1')
+    release_default = threading.Event()
+    default_started = threading.Event()
+
+    def block_default_executor():
+        default_started.set()
+        assert release_default.wait(timeout=5)
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        default_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        role_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        loop.set_default_executor(default_executor)
+        ctrl._lb_role_executor = role_executor
+        blocker = loop.run_in_executor(None, block_default_executor)
+        while not default_started.is_set():
+            await asyncio.sleep(0)
+        try:
+            response = await asyncio.wait_for(ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)),
+                                              timeout=1)
+            assert not blocker.done()
+            return response
+        finally:
+            release_default.set()
+            await blocker
+            role_executor.shutdown(wait=True, cancel_futures=True)
+            default_executor.shutdown(wait=True, cancel_futures=True)
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_pod_authority',
+                           return_value=_authority()), mock.patch.object(
+                               controller.lb_k8s,
+                               'get_lb_service_routing',
+                               return_value=routing), mock.patch.object(
+                                   controller.serve_state,
+                                   'get_lb_cutover_state',
+                                   return_value=stable):
+        response = asyncio.run(drive())
+
+    assert response.status_code == 200
+    body = json.loads(response.body)
+    assert body['role'] == lb_ha.LbRole.ACTIVE.value
+    phases = body['observability']['phases_seconds']
+    assert phases['postgresql_role_state_read_executor_queue'] >= 0
+    assert phases['kubernetes_role_snapshot_executor_queue'] >= 0
+
+
+def test_controller_lifespan_shuts_down_role_executor():
+    ctrl = _role_controller()
+    role_executor = mock.Mock(spec=concurrent.futures.ThreadPoolExecutor)
+    ctrl._lb_role_executor = role_executor
+
+    async def drive():
+        async with ctrl.lifespan(None):
+            role_executor.shutdown.assert_not_called()
+
+    asyncio.run(drive())
+
+    role_executor.shutdown.assert_called_once_with(wait=False,
+                                                   cancel_futures=True)
 
 
 def test_role_heartbeat_uses_one_shared_authority_snapshot():
