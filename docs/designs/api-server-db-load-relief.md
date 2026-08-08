@@ -494,9 +494,10 @@ Contract:
   timestamp, avoiding catch-up bursts after a pause.
 - Keep deadlines independent per queue backend. Long, short, and controller
   consumers must not suppress each other's recovery duty.
-- Preserve all current schedule, execution-class, controller-leadership,
-  temporary private-handler quarantine, lease, replay, and row-lock predicates
-  byte-for-byte.
+- Preserve all current schedule, execution-class, controller-leadership, lease,
+  replay, and row-lock predicates byte-for-byte. The temporary private-handler
+  quarantine belonged to the retired authority stack and is removed by the
+  final R0 cleanup; it is not part of this milestone's steady-state contract.
 
 Each `PostgresQueueBackend` must remain owned by exactly one dispatcher thread,
 as it is in the current architecture. The cadence state is process-local and

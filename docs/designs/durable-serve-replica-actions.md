@@ -11,14 +11,16 @@ than left import-broken by the retirement of its authority dependencies. PR
 #1333's forward-only Serve038/039 migrations are retained inert while its
 uncalled runtime state layer is removed. The unexercised V2 authority contracts
 merged by PR #1332 and the disabled PR #1232 activation surface are also being
-removed. PR #1340 merged the compatibility cleanup. Draft PR #1346 deletes the
-temporary disabled Helm value, private-handler quarantine, private result
-codecs, and authority routing. Its deployment gates passed on 2026-08-08: the
-exact compatibility artifact was deployed, every private-handler request was
-absent across all statuses at readiness, +10 minutes, and +30 minutes, and the
-only SkyPilot Helm release's stored value was scrubbed. The released plugin
-`claim_scope` API remains as an inert `GENERAL`-only compatibility shim; its
-retired authority value is rejected and does not affect queue selection.
+removed. PR #1340 merged the compatibility cleanup. PR #1346 merged as
+`0b77ca77ae8b099c2de07566670743651744bbe2` and deletes the temporary disabled
+Helm value, private-handler quarantine, private result codecs, and authority
+routing. Its `boltz-test` compatibility-artifact gates passed on 2026-08-08:
+every private-handler request was absent across all statuses at readiness, +10
+minutes, and +30 minutes, and the sole `skypilot` chart release in that cluster
+had its stored value scrubbed. Production compatibility-artifact readiness,
++10, and +30 also passed. The released plugin `claim_scope` API remains as an
+inert `GENERAL`-only compatibility shim; its retired authority value is
+rejected and does not affect queue selection.
 No service was promoted, no authority worker claimed a request, and no provider
 effect ran through the proposed path. Source cleanup is not operationally
 complete until the exact merged compatibility artifact and this final-removal
@@ -394,7 +396,13 @@ not use server-side Helm dry-run, combine `--reset-values` with
 forward-only.
 Verify `helm get values` contains no retired key.
 
-Only then may this final-removal change merge. Its chart intentionally has no
+Only then may this final-removal change merge. PR #1346 instead merged through a
+concurrent workspace action at 03:49:52 UTC, after production +10 but before
+production +30 and before the adversarial-review design corrections were
+committed. This is a process-contract departure, not evidence that the gate was
+waived. Production +30 subsequently passed, but this canonical correction must
+merge before the final artifact is promoted to production. Its chart
+intentionally has no
 `resourceActions.authorityWorker` schema or enabled-value guard, and its
 request registry intentionally has no private handler, authority claim routing,
 codec, or ordinary-queue exclusion. A narrow value tombstone rejects an
@@ -426,6 +434,8 @@ R0 completion requires both the compatibility and final-removal deployments:
   shim remains inert;
 - exact merged SHA and immutable image digest for each rollout;
 - staged `boltz-test` rollout with preserved Helm values;
+- production promotion only after the corresponding `boltz-test` evidence
+  closes;
 - all ordinary control-plane Pods ready with zero new crash loops;
 - authority worker disabled and absent;
 - no unexpected action, policy, cohort, handoff, or authority rows created;
@@ -434,7 +444,7 @@ R0 completion requires both the compatibility and final-removal deployments:
   relevant PR with identical empty authority state and no new error/restart
   trend.
 
-### Compatibility deployment evidence (2026-08-08)
+### `boltz-test` compatibility deployment evidence (2026-08-08)
 
 PR #1340 merged as `66de423064d01b7e0fbeaf552804bd55236d00f6`.
 Its exact chart is `1.1.1159` with OCI digest
@@ -460,14 +470,83 @@ instances, eight of which terminated; the remaining one replaced a consolidated
 baseline node. No on-demand instance ran, and the NodePool returned to its
 captured 10-node / 80-vCPU baseline at 03:02:23 UTC.
 
-The cluster has one SkyPilot Helm release. Its original and sanitized values
-rendered byte-identically with the exact compatibility chart. Revision 94
-applied the sanitized complete values at 03:32 UTC with `--reset-values`, the
-same three image digests, and no `--reuse-values` or `--atomic`. Migration job
-94 succeeded, all six Pod names and creation timestamps remained unchanged,
-all Deployment generations remained observed and 2/2, the database zero-state
-remained unchanged, and `helm get values` now contains no `resourceActions`
-key.
+The `boltz-test` cluster has one `skypilot` chart release. Its original and
+sanitized values rendered byte-identically with the exact compatibility chart.
+Revision 94 applied the sanitized complete values at 03:32 UTC with
+`--reset-values`, the same three image digests, and no `--reuse-values` or
+`--atomic`. Migration job 94 succeeded, all six Pod names and creation
+timestamps remained unchanged, all Deployment generations remained observed
+and 2/2, the database zero-state remained unchanged, and `helm get values` now
+contains no `resourceActions` key.
+
+### Production compatibility deployment evidence (2026-08-08)
+
+Production Helm revision 368 deployed the exact `1.1.1159` compatibility chart
+and central image digest
+`sha256:d4237ec47a2e74d58b93a312157b58cf9066ec134bcce262681ac356087dd4b5`.
+Readiness at 03:38:22 UTC, +10 at 03:49:03 UTC, and +30 at 04:08:49 UTC passed.
+The combined-role API Pod remained Ready with zero restarts, all 16 warm-standby
+load-balancer Pods were Ready on the same digest with zero total restarts, and
+the 31-minute severe-signature scan found no ERROR, CRITICAL, or traceback.
+
+Production stored values contain no `resourceActions` key, no authority object
+exists, and all heads remain API008, Serve039, state028, and capacity001. Every
+private-handler request across all statuses, gated relation, and gated nullable
+column remained zero or null.
+
+The interval was not warning-free. Only the two `boltz-l4-fleet` slots logged
+intermittent HA role-heartbeat client timeouts. Bounded telemetry attributes
+them to the 143-replica controller's unchanged Kubernetes pod-authority and
+Service-routing reads taking 6--8 seconds while its serialized role lock is
+held. Both slots retained their correct ACTIVE/STANDBY roles, recovered to 200,
+remained Ready, and never restarted. The pre-change `1.1.1155` image and both
+retirement commits are byte-identical across the complete heartbeat path; the
+compatibility diff only deletes an unexecuted disabled-authority preflight
+branch. This is a separate scale-latency issue tracked in #1349, not a retired
+authority state/effect or unsafe role-transition signal.
+
+### Final-removal artifact evidence (2026-08-08)
+
+PR #1346's exact code head
+`7a5315d577b54c1ba970991d3ca974b5fbee797c` passed all 32 CI checks. Merge
+`0b77ca77ae8b099c2de07566670743651744bbe2` published release `1.1.1161`. The
+source image digest is
+`sha256:310effb333ad0808b4289f05ee46ac89ea21b156b6e54e5df5e47bbe8198e002`;
+the chart OCI digest is
+`sha256:4bc611db6048419dfd296bf4d82d9542f9a0bb599e54febb5520bcc79b2bf799`.
+The chart metadata records the exact merge and version.
+
+The same image was mirrored into the existing `boltz-test` registry as
+`sha256:b780e6b7c7fcc2606baed83ce06dc2f12a6913db13e01d615d2fcdce48d15eb6`.
+Registry normalization changed the manifest digest, while the image
+configuration digest remained exactly
+`sha256:b31d9b0414aa61fa7b0183d58e5155ddc079838e312c701215e59a059c94543f`.
+The exact chart rendered client-side with complete sanitized values and no
+retired authority reference; a seeded legacy value failed with the final-chart
+tombstone.
+
+### `boltz-test` final-removal deployment evidence (2026-08-08)
+
+A concurrent workspace process started Helm revision 95 at 03:58:59 UTC before
+this correction landed. Kubernetes had already accepted the release when it
+was detected, so no competing rollback or retry was issued. This is a second
+process-contract departure and remains part of the canonical record.
+
+Migration job 95 succeeded once on the exact digest. Readiness at 04:04:08 UTC
+and +10 at 04:14:25 UTC passed with API, controller, and executor each 2/2
+Ready: six Pods on exact mirror digest
+`sha256:b780e6b7c7fcc2606baed83ce06dc2f12a6913db13e01d615d2fcdce48d15eb6`,
+zero restarts, healthy and ready API endpoints at merge `0b77ca77`, and no
+warning or severe log signature. Stored values contain no `resourceActions`
+key, no authority object exists, heads remain API008, Serve039, state028, and
+capacity001, and every private-handler, gated-relation, and gated-nullable check
+remains empty or null.
+
+The rollout created exactly two temporary 8-vCPU nodes, both Spot; on-demand
+exposure was zero. The cluster returned physically to 10 claims / 80 vCPU at
+04:11:35 UTC, with all 10 claims Spot and none deleting. The required +30
+checkpoint remains open. The production final-removal artifact has not been
+deployed.
 
 ### R0 manual test plan
 
@@ -555,11 +634,17 @@ approved canary:
 - [x] Deploy and monitor the compatibility cleanup on `boltz-test`; the
   all-status zero private-handler gate passed at readiness, +10 minutes, and
   +30 minutes.
-- [x] Scrub the only SkyPilot release's stored legacy Helm value and record the
-  sanitized stored values.
-- [ ] Move PR #1346 out of draft, require exact-head CI, then merge, deploy its
-  exact artifact, and repeat readiness, +10-minute, and +30-minute monitoring
-  before closing R0.
+- [x] Scrub the sole `skypilot` chart release in `boltz-test` of its stored
+  legacy Helm value and record the sanitized stored values.
+- [x] Complete production compatibility-artifact monitoring: readiness, +10,
+  and +30 passed on 2026-08-08.
+- [x] Require exact-head CI and merge PR #1346. Its exact head passed 32/32,
+  but the sequencing departure is recorded above.
+- [ ] Merge this canonical-design correction before production promotion.
+- [ ] Complete PR #1346's `boltz-test` +30-minute monitoring; readiness and +10
+  passed, and physical capacity returned to the 10-claim / 80-vCPU baseline.
+- [ ] Deploy PR #1346's exact artifact to production and repeat readiness,
+  +10-minute, and +30-minute monitoring before closing R0.
 - [ ] Establish R1 production telemetry or record the explicit correctness
   decision.
 - [ ] Obtain exact capacity approval before the final HA rollout or any
