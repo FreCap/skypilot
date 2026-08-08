@@ -166,23 +166,18 @@ class ExtensionContext:
             execution_class: 'request_registry_mod.ExecutionClass',
             replay_policy: 'request_registry_mod.ReplayPolicy',
             cancellation_policy: 'request_registry_mod.CancellationPolicy',
-            claim_scope: 'request_registry_mod.HandlerClaimScope | None' = None,
             aliases: tuple[str, ...] = (),
     ) -> None:
         """Register a stable plugin handler in every execution context."""
         # pylint: disable=import-outside-toplevel
         from sky.server.requests import registry as request_registry
-        kwargs: dict[str, Any] = {}
-        if claim_scope is not None:
-            kwargs['claim_scope'] = claim_scope
         request_registry.register_handler(
             func,
             name=name,
             execution_class=execution_class,
             replay_policy=replay_policy,
             cancellation_policy=cancellation_policy,
-            aliases=aliases,
-            **kwargs)
+            aliases=aliases)
 
     def register_request_payload_type(
             self,

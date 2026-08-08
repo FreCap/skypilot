@@ -35,7 +35,6 @@ from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
-from sky.server.requests.serializers import encoders
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -154,23 +153,16 @@ def _supported_handlers(role: str) -> list[str]:
     if role == 'controller':
         return sorted(registration.name
                       for registration in registrations
-                      if registration.execution_class is request_registry.
-                      ExecutionClass.CONTROLLER and registration.claim_scope is
-                      request_registry.HandlerClaimScope.GENERAL)
+                      if registration.execution_class is
+                      request_registry.ExecutionClass.CONTROLLER)
     if role == 'executor':
-        return sorted(
-            registration.name
-            for registration in registrations
-            if registration.execution_class is
-            request_registry.ExecutionClass.NORMAL and registration.claim_scope
-            is request_registry.HandlerClaimScope.GENERAL)
+        return sorted(registration.name
+                      for registration in registrations
+                      if registration.execution_class is
+                      request_registry.ExecutionClass.NORMAL)
     # The compatibility all-role process remains the only consumer for both
-    # execution classes, but private mutation handlers are never compatible
-    # work.
-    return sorted(registration.name
-                  for registration in registrations
-                  if registration.claim_scope is (
-                      request_registry.HandlerClaimScope.GENERAL))
+    # execution classes.
+    return sorted(registration.name for registration in registrations)
 
 
 def _supported_payload_versions() -> dict[str, dict[str, int]]:
@@ -1893,12 +1885,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             request.finished_at = time.time()
             if error is not None:
                 request.set_error(error)
-            should_encode_result = result is not None
-            if status == requests_lib.RequestStatus.SUCCEEDED:
-                should_encode_result = (should_encode_result or
-                                        encoders.requires_strict_return_value(
-                                            request.name))
-            if should_encode_result:
+            if result is not None:
                 try:
                     request.set_return_value(result)
                 except Exception as encoding_error:  # pylint: disable=broad-except
@@ -2230,9 +2217,6 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             predicates.append(sqlalchemy.exists().where(
                 _controller_leadership_is_current_predicate(
                     uuid.UUID(self._instance_id), self._controller_generation)))
-        predicates.append(
-            REQUESTS.c.handler_name.not_in(
-                request_registry.RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST))
         return tuple(predicates)
 
     def _lock_controller_leadership(

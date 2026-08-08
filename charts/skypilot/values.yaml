@@ -357,58 +357,6 @@ controllerService:
   # @schema type: [string, null]
   topologySpreadTopologyKey: kubernetes.io/hostname
 
-# Retired resource-action authority-worker values are retained temporarily so
-# `helm upgrade --reuse-values` can consume releases that stored this block.
-# The chart ignores the legacy fields when `enabled: false` and fails closed
-# with a retirement error when `enabled: true`.
-resourceActions:
-  # @schema additionalProperties: false
-  authorityWorker:
-    # @schema type: [boolean]
-    enabled: false
-    # Immutable installation UUID used to derive database-wide cohort IDs.
-    # Never reuse or change this value while cohort or tombstone rows exist.
-    # @schema type: string; pattern: ^$|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
-    installationId: ""
-    # Cohort selected for new preparation references.  Existing DRAINING
-    # cohorts remain listed until all of their frozen work is released.
-    # @schema type: string; maxLength: 42
-    activeCohort: ""
-    # Retain both the V1 object shape (without manifestContract) and V2 object
-    # shape so stored disabled values from either chart revision survive a
-    # --reuse-values upgrade. Every field is ignored while enabled is false.
-    # @schema type: array; item: object
-    # @schema itemProperties: {"manifestContract":{"allOf":[{"type":"string"},{"const":"provider_authority_worker_cohort_v2"}]},"id":{"type":"string","minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"},"replicas":{"type":"integer","const":2},"image":{"type":"string","minLength":1,"pattern":"^.+@sha256:[0-9a-f]{64}$"},"imagePullPolicy":{"type":"string","const":"Always"},"ociConfigDigest":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"qualificationArtifact":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","minLength":1,"maxLength":253,"pattern":"^charts/skypilot/files/resource-action-qualifications/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*$"},"byteSize":{"type":"integer","minimum":1,"maximum":65536},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"podTemplateContract":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_provider_preflight.py"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"artifactInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/renderer_artifact_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"callableInventory":{"type":"object","additionalProperties":false,"required":["repoPath","byteSize","sha256"],"properties":{"repoPath":{"type":"string","const":"sky/serve/resource_action_artifacts/provider_authority_v1/callable_inventory.json"},"byteSize":{"type":"integer","minimum":1},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
-    # @schema allOf: [{"type":"array","items":{"properties":{"manifestContract":{},"id":{},"replicas":{},"image":{},"imagePullPolicy":{},"ociConfigDigest":{},"qualificationArtifact":{},"podTemplateContract":{},"artifactInventory":{},"callableInventory":{}},"additionalProperties":false,"required":["id","replicas","image","imagePullPolicy","ociConfigDigest","qualificationArtifact","podTemplateContract","artifactInventory","callableInventory"]}}]
-    cohorts: []
-    # Historical cohort IDs retained only for disabled-value compatibility.
-    # @schema type: array; item: string; uniqueItems: true
-    # @schema allOf: [{"type":"array","items":{"minLength":1,"maxLength":42,"pattern":"^[a-z0-9](?:[a-z0-9-]{0,40}[a-z0-9])?$"}}]
-    retirementTombstones: []
-    # @schema type: [integer]; minimum: 1; maximum: 65535
-    healthPort: 46581
-    # Historical preflight port retained only for disabled-value compatibility.
-    # @schema type: [integer]; minimum: 1; maximum: 65535; const: 46583
-    preflightPort: 46583
-    # @schema additionalProperties: false
-    auth:
-      # This purpose-only Secret/key must differ from every external-LB auth
-      # Secret/key. The controller also rejects equal mounted token bytes.
-      # @schema type: string
-      existingSecret: ""
-      # @schema type: string
-      key: tokens
-    # @schema additionalProperties: false
-    tls:
-      # @schema type: string
-      existingSecret: ""
-      # @schema type: string
-      certKey: tls.crt
-      # @schema type: string
-      privateKeyKey: tls.key
-      # @schema type: string
-      caKey: ca.crt
-
 # Environment and files required by every central PostgreSQL client. Use these
 # for private CA bundles, client certificates, or shared libpq settings instead
 # of apiService.extra* so the migration Job and managed image workers receive
