@@ -165,6 +165,21 @@ class LbServiceTransitionRouting(NamedTuple):
     desired_runtime_revision: str | None = None
 
 
+class LbRoleSnapshot(NamedTuple):
+    """One fail-closed Kubernetes authority snapshot for an HA role report."""
+
+    authority: LbPodAuthority
+    routing: LbServiceRouting | LbServiceTransitionRouting
+
+
+class LbRoleSnapshotStateMismatchError(RuntimeError):
+    """The snapshot owner row no longer matches the controller state read."""
+
+
+class LbRoleSnapshotRoutingError(RuntimeError):
+    """The shared Service failed the phase-appropriate routing contract."""
+
+
 def _strategic_merge_patch(context: str, resource_path: str, response_type: str,
                            name: str, namespace: str, body: dict[str,
                                                                  Any]) -> Any:
@@ -2598,6 +2613,241 @@ def ensure_lb_objects_exist(service_name: str,
     return True
 
 
+def _parse_lb_role_pod_authority(
+        pods: Any, service_name: str, resource_scope: str | None,
+        selected_slot: lb_ha.LbSlot | None) -> LbPodAuthority:
+    """Parse an incarnation-scoped HA Pod list without dropping unknown Pods."""
+    live_uids: set[str] = set()
+    ready_nonterminating_uids: set[str] = set()
+    slot_by_uid: dict[str, lb_ha.LbSlot] = {}
+    digest_by_uid: dict[str, str | None] = {}
+    revision_by_uid: dict[str, str | None] = {}
+    legacy_uids: set[str] = set()
+    terminating_uids: set[str] = set()
+    for pod in pods.items:
+        metadata = getattr(pod, 'metadata', None)
+        status = getattr(pod, 'status', None)
+        phase = getattr(status, 'phase', None)
+        if phase in ('Succeeded', 'Failed'):
+            continue
+        uid = getattr(metadata, 'uid', None)
+        if not uid:
+            # Silently dropping an unidentifiable live Pod could make a
+            # second Pod appear to be the sole authority.
+            raise ValueError('live load balancer Pod is missing its UID')
+        uid = str(uid)
+        live_uids.add(uid)
+        terminating = getattr(metadata, 'deletion_timestamp', None)
+        if terminating is not None:
+            terminating_uids.add(uid)
+        labels = getattr(metadata, 'labels', {}) or {}
+        slot = lb_ha.parse_slot(labels.get(LB_SLOT_LABEL_KEY))
+        if slot is None:
+            legacy_labeled = labels.get(APP_LABEL_KEY) == lb_deployment_name(
+                service_name, resource_scope)
+            if not legacy_labeled:
+                raise ValueError('live HA load balancer Pod is missing its '
+                                 'slot label')
+            # A legacy migration/rollback tail remains a possible stream
+            # owner even after the stable Service selects an HA slot.
+            legacy_uids.add(uid)
+        else:
+            slot_by_uid[uid] = slot
+        annotations = getattr(metadata, 'annotations', {}) or {}
+        digest = annotations.get(CONTROLLER_DIGEST_ANNOTATION)
+        digest_by_uid[uid] = str(digest) if digest is not None else None
+        revision = annotations.get(LB_RUNTIME_REVISION_ANNOTATION)
+        revision_by_uid[uid] = (str(revision) if revision is not None else None)
+        conditions = getattr(status, 'conditions', None) or []
+        ready = any(
+            getattr(condition, 'type', None) == 'Ready' and
+            getattr(condition, 'status', None) == 'True'
+            for condition in conditions)
+        if phase == 'Running' and terminating is None and ready:
+            ready_nonterminating_uids.add(uid)
+    return LbPodAuthority(ready_nonterminating_uids, live_uids, slot_by_uid,
+                          selected_slot, digest_by_uid, revision_by_uid,
+                          legacy_uids, terminating_uids)
+
+
+def _lb_service_fields(
+        service: Any) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    if isinstance(service, dict):
+        spec = service.get('spec', {}) or {}
+        annotations = service.get('metadata', {}).get('annotations', {}) or {}
+        selector = spec.get('selector', {}) or {}
+    else:
+        spec = service.spec
+        annotations = getattr(service.metadata, 'annotations', {}) or {}
+        selector = getattr(spec, 'selector', {}) or {}
+    return spec, annotations, selector
+
+
+def _parse_lb_service_routing(service: Any,
+                              resource_version: str) -> LbServiceRouting:
+    spec, annotations, selector = _lb_service_fields(service)
+    traffic_policy = (spec.get('externalTrafficPolicy') if isinstance(
+        spec, dict) else getattr(spec, 'external_traffic_policy', None))
+    active_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
+    annotated_slot = lb_ha.parse_slot(
+        annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
+    raw_generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
+    desired_runtime_revision = annotations.get(
+        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+    try:
+        generation = int(str(raw_generation))
+    except (TypeError, ValueError) as e:
+        raise RuntimeError(
+            'HA LB Service has a malformed cutover generation.') from e
+    if (traffic_policy != 'Cluster' or active_slot is None or
+            active_slot != annotated_slot or generation < 1):
+        raise RuntimeError(
+            'HA LB Service routing authority is malformed or unsupported.')
+    if (not isinstance(desired_runtime_revision, str) or
+            not re.fullmatch(r'[0-9a-f]{64}', desired_runtime_revision)):
+        raise RuntimeError('HA LB Service has a malformed desired runtime '
+                           'revision.')
+    return LbServiceRouting(active_slot, generation, resource_version,
+                            desired_runtime_revision)
+
+
+def _parse_lb_service_transition_routing(
+        service_name: str, resource_scope: str | None, service_hash: str,
+        service: Any, resource_version: str) -> LbServiceTransitionRouting:
+    _, annotations, selector = _lb_service_fields(service)
+    desired_runtime_revision = annotations.get(
+        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+    if (not isinstance(desired_runtime_revision, str) or
+            not re.fullmatch(r'[0-9a-f]{64}', desired_runtime_revision)):
+        raise RuntimeError('LB Service has a malformed desired runtime '
+                           'revision.')
+    active_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
+    legacy_selected = selector == {
+        APP_LABEL_KEY: lb_deployment_name(service_name, resource_scope),
+        SERVICE_HASH_LABEL_KEY: service_hash,
+    }
+    generation = None
+    if active_slot is not None:
+        annotated_slot = lb_ha.parse_slot(
+            annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
+        raw_generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
+        try:
+            generation = int(str(raw_generation))
+        except (TypeError, ValueError) as e:
+            raise RuntimeError(
+                'HA LB Service has a malformed cutover generation.') from e
+        if (active_slot is not annotated_slot or generation < 1 or selector != {
+                LB_SLOT_LABEL_KEY: active_slot.value,
+                SERVICE_HASH_LABEL_KEY: service_hash,
+        }):
+            raise RuntimeError('HA LB Service routing authority is malformed.')
+    if active_slot is None and not legacy_selected:
+        raise RuntimeError('LB Service has neither an exact legacy nor HA '
+                           'selector.')
+    return LbServiceTransitionRouting(active_slot, legacy_selected, generation,
+                                      resource_version,
+                                      desired_runtime_revision)
+
+
+def get_lb_role_snapshot(
+        service_name: str,
+        expected_fence: tuple[str, tuple[int | None, str | None], int],
+        expected_state: lb_ha.LbCutoverState,
+        timings: dict[str, float] | None = None) -> LbRoleSnapshot | None:
+    """Read one fail-closed Pod and Service authority snapshot for a role.
+
+    The common heartbeat path shares one owner-row read, one Pod list, one
+    Service read, and one exact ownership validation.  Ownership validation
+    deliberately retains both Deployment UID reads so replacement between
+    identity resolution and validation still fails closed.
+    """
+    if not _lb_mode_active():
+        return None
+
+    def timed(phase: str, function: Callable, *args: Any, **kwargs: Any) -> Any:
+        started_at = time.monotonic()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            if timings is not None:
+                timings[phase] = (timings.get(phase, 0.0) + time.monotonic() -
+                                  started_at)
+
+    try:
+        owner = timed('snapshot_postgresql_owner_read',
+                      serve_state.get_service_controller_owner,
+                      service_name,
+                      include_lb_state=True)
+        expected_hash, expected_owner, expected_epoch = expected_fence
+        owner_active_slot = (lb_ha.parse_slot(owner.get('lb_active_slot'))
+                             if owner is not None else None)
+        owner_pending_slot = (lb_ha.parse_slot(owner.get('lb_pending_slot'))
+                              if owner is not None else None)
+        owner_phase = (lb_ha.parse_phase(owner.get('lb_cutover_phase'))
+                       if owner is not None else None)
+        owner_identity = ((owner.get('controller_pid'),
+                           owner.get('controller_ip'))
+                          if owner is not None else None)
+        if (owner is None or not owner.get('lb_ha_enabled') or
+                str(owner.get('hash')) != expected_hash or
+                owner_identity != expected_owner or
+                owner.get('lifecycle_epoch') != expected_epoch or
+                expected_state.lifecycle_epoch != expected_epoch or
+                owner_active_slot is not expected_state.active_slot or
+                owner.get('lb_cutover_generation') != expected_state.generation
+                or owner_pending_slot is not expected_state.pending_slot or
+                owner_phase is not expected_state.phase):
+            raise LbRoleSnapshotStateMismatchError(
+                'HA role snapshot owner row changed after the controller '
+                'state fence was read.')
+        service_hash = expected_hash
+        resource_scope = owner.get('resource_scope')
+        context = kubernetes.in_cluster_context_name()
+        namespace = get_lb_namespace()
+        core_api = kubernetes.core_api(context)
+        label_selector = (f'{SERVE_LB_LABEL_KEY}={service_name},'
+                          f'{SERVICE_HASH_LABEL_KEY}={service_hash}')
+        pods = timed('snapshot_pod_list',
+                     core_api.list_namespaced_pod,
+                     namespace,
+                     label_selector=label_selector)
+        try:
+            name = lb_service_name(service_name, resource_scope)
+            service = timed('snapshot_service_read',
+                            core_api.read_namespaced_service, name, namespace)
+            owner_reference = timed('snapshot_owner_identity_read',
+                                    _api_deployment_owner_reference, context,
+                                    namespace)
+            resource_version = timed('snapshot_ownership_validation',
+                                     _require_existing_lb_object_ownership,
+                                     context, namespace, name, service,
+                                     owner_reference, service_hash)
+            if expected_state.phase in (lb_ha.LbCutoverPhase.MIGRATING,
+                                        lb_ha.LbCutoverPhase.ROLLING_BACK):
+                routing: (LbServiceRouting |
+                          LbServiceTransitionRouting) = timed(
+                              'snapshot_parse_routing',
+                              _parse_lb_service_transition_routing,
+                              service_name, resource_scope, service_hash,
+                              service, resource_version)
+            else:
+                routing = timed('snapshot_parse_routing',
+                                _parse_lb_service_routing, service,
+                                resource_version)
+        except Exception as e:  # pylint: disable=broad-except
+            raise LbRoleSnapshotRoutingError(str(e)) from e
+        authority = timed('snapshot_parse_pods', _parse_lb_role_pod_authority,
+                          pods, service_name, resource_scope,
+                          routing.active_slot)
+        return LbRoleSnapshot(authority, routing)
+    except (LbRoleSnapshotStateMismatchError, LbRoleSnapshotRoutingError):
+        raise
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning('Failed to read load balancer role authority for '
+                       f'{service_name!r}: {e}; role reports will fail closed.')
+        return None
+
+
 def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
     """Return the Ready and live LB Pod identities from one Kubernetes list.
 
@@ -2770,37 +3020,7 @@ def get_lb_service_routing(service_name: str) -> LbServiceRouting:
     owner_reference = _api_deployment_owner_reference(context, namespace)
     resource_version = _require_existing_lb_object_ownership(
         context, namespace, name, service, owner_reference, owner['hash'])
-    if isinstance(service, dict):
-        spec = service.get('spec', {}) or {}
-        annotations = service.get('metadata', {}).get('annotations', {}) or {}
-    else:
-        spec = service.spec
-        annotations = getattr(service.metadata, 'annotations', {}) or {}
-    selector = (spec.get('selector', {}) if isinstance(spec, dict) else
-                getattr(spec, 'selector', {}) or {})
-    traffic_policy = (spec.get('externalTrafficPolicy') if isinstance(
-        spec, dict) else getattr(spec, 'external_traffic_policy', None))
-    active_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
-    annotated_slot = lb_ha.parse_slot(
-        annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
-    raw_generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
-    desired_runtime_revision = annotations.get(
-        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
-    try:
-        generation = int(str(raw_generation))
-    except (TypeError, ValueError) as e:
-        raise RuntimeError(
-            'HA LB Service has a malformed cutover generation.') from e
-    if (traffic_policy != 'Cluster' or active_slot is None or
-            active_slot != annotated_slot or generation < 1):
-        raise RuntimeError(
-            'HA LB Service routing authority is malformed or unsupported.')
-    if (not isinstance(desired_runtime_revision, str) or
-            not re.fullmatch(r'[0-9a-f]{64}', desired_runtime_revision)):
-        raise RuntimeError('HA LB Service has a malformed desired runtime '
-                           'revision.')
-    return LbServiceRouting(active_slot, generation, resource_version,
-                            desired_runtime_revision)
+    return _parse_lb_service_routing(service, resource_version)
 
 
 def get_lb_service_transition_routing(
@@ -2820,46 +3040,9 @@ def get_lb_service_transition_routing(
     owner_reference = _api_deployment_owner_reference(context, namespace)
     resource_version = _require_existing_lb_object_ownership(
         context, namespace, name, service, owner_reference, service_hash)
-    if isinstance(service, dict):
-        spec = service.get('spec', {}) or {}
-        annotations = service.get('metadata', {}).get('annotations', {}) or {}
-    else:
-        spec = service.spec
-        annotations = getattr(service.metadata, 'annotations', {}) or {}
-    selector = (spec.get('selector', {}) if isinstance(spec, dict) else
-                getattr(spec, 'selector', {}) or {})
-    desired_runtime_revision = annotations.get(
-        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
-    if (not isinstance(desired_runtime_revision, str) or
-            not re.fullmatch(r'[0-9a-f]{64}', desired_runtime_revision)):
-        raise RuntimeError('LB Service has a malformed desired runtime '
-                           'revision.')
-    active_slot = lb_ha.parse_slot(selector.get(LB_SLOT_LABEL_KEY))
-    legacy_selected = selector == {
-        APP_LABEL_KEY: lb_deployment_name(service_name, resource_scope),
-        SERVICE_HASH_LABEL_KEY: service_hash,
-    }
-    generation = None
-    if active_slot is not None:
-        annotated_slot = lb_ha.parse_slot(
-            annotations.get(ACTIVE_SLOT_ANNOTATION_KEY))
-        raw_generation = annotations.get(CUTOVER_GENERATION_ANNOTATION_KEY)
-        try:
-            generation = int(str(raw_generation))
-        except (TypeError, ValueError) as e:
-            raise RuntimeError(
-                'HA LB Service has a malformed cutover generation.') from e
-        if (active_slot is not annotated_slot or generation < 1 or selector != {
-                LB_SLOT_LABEL_KEY: active_slot.value,
-                SERVICE_HASH_LABEL_KEY: service_hash,
-        }):
-            raise RuntimeError('HA LB Service routing authority is malformed.')
-    if active_slot is None and not legacy_selected:
-        raise RuntimeError('LB Service has neither an exact legacy nor HA '
-                           'selector.')
-    return LbServiceTransitionRouting(active_slot, legacy_selected, generation,
-                                      resource_version,
-                                      desired_runtime_revision)
+    return _parse_lb_service_transition_routing(service_name, resource_scope,
+                                                service_hash, service,
+                                                resource_version)
 
 
 def patch_lb_service_active_slot(service_name: str, expected_service_hash: str,

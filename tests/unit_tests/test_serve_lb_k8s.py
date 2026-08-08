@@ -1736,6 +1736,251 @@ def test_ha_pod_authority_keeps_stable_legacy_migration_tail(
     assert lb_k8s.get_lb_pod_authority('svc') is None
 
 
+def test_role_snapshot_reuses_owner_pods_and_service(monkeypatch):
+    apps, core = _install(monkeypatch, db_service_names=('svc',))
+    desired_revision = 'a' * 64
+    owner = {
+        'hash': 'incarnation',
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        'lifecycle_epoch': 7,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lb_active_slot': lb_ha.LbSlot.A.value,
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+    }
+    owner_read = mock.Mock(return_value=owner)
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_controller_owner',
+                        owner_read)
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(
+            resource_version='lb-service-rv',
+            annotations={
+                lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY: '3',
+                lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+            },
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            owner_references=[_owner_reference()]),
+        spec=SimpleNamespace(external_traffic_policy='Cluster',
+                             selector={
+                                 lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                                 lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+                             }))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _lb_pod('slot-a',
+                labels={
+                    lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                }),
+        _lb_pod('slot-b',
+                labels={
+                    lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.B.value,
+                }),
+    ])
+    timings = {}
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
+                                 lb_ha.LbCutoverPhase.STABLE, 7)
+
+    snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state, timings)
+
+    assert snapshot is not None
+    assert snapshot.routing == lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 3,
+                                                       'lb-service-rv',
+                                                       desired_revision)
+    assert snapshot.authority.slot_by_uid == {
+        'slot-a': lb_ha.LbSlot.A,
+        'slot-b': lb_ha.LbSlot.B,
+    }
+    owner_read.assert_called_once_with('svc', include_lb_state=True)
+    core.list_namespaced_pod.assert_called_once()
+    core.read_namespaced_service.assert_called_once()
+    # Resolve the expected owner identity, then prove the same Deployment UID
+    # is still live.  No second Pod, Service, or owner-row read is needed.
+    assert apps.read_namespaced_deployment.call_count == 2
+    assert set(timings) == {
+        'snapshot_postgresql_owner_read',
+        'snapshot_pod_list',
+        'snapshot_service_read',
+        'snapshot_owner_identity_read',
+        'snapshot_ownership_validation',
+        'snapshot_parse_routing',
+        'snapshot_parse_pods',
+    }
+
+
+def test_role_snapshot_fails_closed_on_malformed_shared_service(monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    owner = {
+        'hash': 'incarnation',
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        'lifecycle_epoch': 7,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lb_active_slot': lb_ha.LbSlot.A.value,
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+    }
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_controller_owner',
+                        lambda *_args, **_kwargs: owner)
+    core.read_namespaced_service.return_value.spec.external_traffic_policy = (
+        'Local')
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[])
+
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
+                                 lb_ha.LbCutoverPhase.STABLE, 7)
+    with pytest.raises(lb_k8s.LbRoleSnapshotRoutingError):
+        lb_k8s.get_lb_role_snapshot('svc', fence, state)
+
+
+def test_role_snapshot_rejects_owner_row_state_mismatch_before_kubernetes(
+        monkeypatch):
+    apps, core = _install(monkeypatch, db_service_names=('svc',))
+    owner = {
+        'hash': 'incarnation',
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        'lifecycle_epoch': 7,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lb_active_slot': lb_ha.LbSlot.A.value,
+        'lb_cutover_generation': 4,
+        'lb_pending_slot': None,
+    }
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_controller_owner',
+                        lambda *_args, **_kwargs: owner)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    stale_state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
+                                       lb_ha.LbCutoverPhase.STABLE, 7)
+
+    with pytest.raises(lb_k8s.LbRoleSnapshotStateMismatchError):
+        lb_k8s.get_lb_role_snapshot('svc', fence, stale_state)
+
+    core.list_namespaced_pod.assert_not_called()
+    core.read_namespaced_service.assert_not_called()
+    apps.read_namespaced_deployment.assert_not_called()
+
+
+def test_role_snapshot_fails_closed_when_owner_deployment_is_replaced(
+        monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    desired_revision = 'a' * 64
+    owner = {
+        'hash': 'incarnation',
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        'lifecycle_epoch': 7,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lb_active_slot': lb_ha.LbSlot.A.value,
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+    }
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_controller_owner',
+                        lambda *_args, **_kwargs: owner)
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(
+            resource_version='lb-service-rv',
+            annotations={
+                lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY: '3',
+                lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+            },
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            owner_references=[_owner_reference()]),
+        spec=SimpleNamespace(external_traffic_policy='Cluster',
+                             selector={
+                                 lb_k8s.LB_SLOT_LABEL_KEY: 'a',
+                                 lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+                             }))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[])
+    monkeypatch.setattr(lb_k8s, '_live_deployment_owner_uid',
+                        lambda *_args: 'replacement-uid')
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
+                                 lb_ha.LbCutoverPhase.STABLE, 7)
+
+    with pytest.raises(lb_k8s.LbRoleSnapshotRoutingError):
+        lb_k8s.get_lb_role_snapshot('svc', fence, state)
+
+
+@pytest.mark.parametrize(
+    'phase',
+    [lb_ha.LbCutoverPhase.MIGRATING, lb_ha.LbCutoverPhase.ROLLING_BACK])
+@pytest.mark.parametrize('legacy_selected', [False, True])
+def test_role_snapshot_transition_routing_matches_existing_contract(
+        monkeypatch, phase, legacy_selected):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    desired_revision = 'b' * 64
+    owner = {
+        'hash': 'incarnation',
+        'resource_scope': None,
+        'lb_ha_enabled': True,
+        'lb_cutover_phase': phase.value,
+        'lifecycle_epoch': 7,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'lb_active_slot': lb_ha.LbSlot.A.value,
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+    }
+    monkeypatch.setattr(lb_k8s.serve_state, 'get_service_controller_owner',
+                        lambda *_args, **_kwargs: owner)
+    selector = ({
+        lb_k8s.APP_LABEL_KEY: lb_k8s.lb_deployment_name('svc'),
+        lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+    } if legacy_selected else {
+        lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+        lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+    })
+    annotations = {
+        lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+    }
+    if not legacy_selected:
+        annotations.update({
+            lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY: lb_ha.LbSlot.A.value,
+            lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY: '3',
+        })
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(
+            resource_version='lb-service-rv',
+            annotations=annotations,
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            owner_references=[_owner_reference()]),
+        spec=SimpleNamespace(selector=selector))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _lb_pod('slot-a',
+                labels={lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value}),
+        _lb_pod('slot-b',
+                labels={lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.B.value}),
+    ])
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    state = lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None, phase, 7)
+
+    snapshot = lb_k8s.get_lb_role_snapshot('svc', fence, state)
+
+    assert snapshot is not None
+    assert snapshot.routing == lb_k8s.LbServiceTransitionRouting(
+        None if legacy_selected else lb_ha.LbSlot.A, legacy_selected,
+        None if legacy_selected else 3, 'lb-service-rv', desired_revision)
+
+
 def test_external_lb_logs_come_from_current_pod(monkeypatch, capsys):
     _, core = _install(monkeypatch, db_service_names=('svc',))
     older = _lb_pod('old')
