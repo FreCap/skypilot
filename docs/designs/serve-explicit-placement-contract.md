@@ -474,15 +474,22 @@ before any external getter and again after acquiring the unchanged advisory and
 table locks; two concurrent first-retirement attempts cannot both pass it.
 After acquiring its nonblocking session advisory lock and before opening the
 writer snapshot, every protocol-4 apply also invokes revision 040's exact
-runtime-authority assertion by its canonical schema-qualified name.  That
-assertion verifies the complete 040 catalog, its exact relation/function OIDs,
-and one coherent open singleton.  The operator rejects any same-session
-`pg_my_temp_schema()` relation shadow for a table in its write/read set, binds
-all SQLAlchemy tables to the asserted canonical schema, and schema-qualifies its
-raw table locks; PostgreSQL's implicit `pg_temp` precedence therefore cannot
-redirect either the proof or authoritative DML.  A writer whose preflight
-overlaps a completed preterminal downgrade aborts before DML even if it reaches
-the advisory lock only after downgrade released it.
+runtime-authority assertion by its canonical schema-qualified name.  The
+application discovers that canonical schema from exactly one persistent
+`alembic_version_serve_state_db = '040'` relation colocated with the assertion,
+gate, and both ledger relations; it never trusts caller-controlled
+`current_schema()` or unqualified name resolution.  The assertion verifies the
+complete 040 catalog, its exact relation/function OIDs, and one coherent open
+or terminal singleton.  The writer-facing interface additionally requires the
+singleton to be open and proves that its own backend still holds the unchanged
+session advisory lock before authoritative DML and again immediately before
+commit.  The operator rejects any same-session `pg_my_temp_schema()` relation
+or assertion-function shadow in its write/read set, binds all SQLAlchemy tables
+to the asserted canonical schema, and schema-qualifies its raw table locks;
+PostgreSQL's implicit `pg_temp` precedence therefore cannot redirect either the
+proof or authoritative DML.  A writer whose preflight overlaps a completed
+preterminal downgrade aborts before DML even if it reaches the advisory lock
+only after downgrade released it.
 
 The PostgreSQL ledger is an append-only authority, not a self-authenticating
 JSON document.  Schema revision 040 installs `ENABLE ALWAYS` database triggers
@@ -668,6 +675,17 @@ live snapshot binding prevents a coherently rewritten ledger from omitting or
 relabeling an unchanged stale placeholder without making later reservations
 part of the terminal proof, and is repeated inside the acknowledgement
 transaction.
+
+On PostgreSQL, the receipt reader first resolves the same unique revision-040
+schema identity and invokes the same schema-qualified database-authority
+assertion on the exact ORM connection that reads the receipt.  It accepts a
+coherent open or terminal gate because predecessor receipts remain readable
+after terminal retirement, rejects temporary shadows for every receipt
+relation and the assertion function, and applies the canonical schema map
+before its first table query.  The acknowledgement path repeats that proof
+inside its service-owner/advisory transaction before locking or CASing the
+receipt.  SQLite remains only the existing local/controller test-store path and
+does not pretend to provide this central PostgreSQL authority.
 The protocol-1 through protocol-3 validators retain the historical
 `same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
 must neither emit nor accept that fact: its complete stale-placeholder
@@ -1602,9 +1620,12 @@ Automated coverage must prove:
   whose external preflight predates a downgrade but whose session-lock attempt
   follows its commit, and require exactly one authority to proceed; require the
   runtime-authority assertion to reject an absent, terminal, or catalog-drifted
-  040 installation before writer DML; create same-session temporary shadows for
-  the assertion name and each operator relation and prove the schema-qualified
-  assertion plus canonical-schema SQL binding rejects them before DML; tamper
+  040 installation before writer DML; require reader assertion to accept the
+  exact terminal installation but reject a missing/wrong/duplicate revision
+  identity, catalog drift, or a terminal UUID inconsistent with the immutable
+  run; create same-session temporary shadows for the assertion name and each
+  operator or receipt relation and prove the schema-qualified assertion plus
+  canonical-schema SQL binding rejects them before DML; tamper
   with every singleton
   column/default/type/nullability/key/check/FK, singleton row value/count,
   relation owner/ACL/kind/persistence/RLS/inheritance/rule state, and
