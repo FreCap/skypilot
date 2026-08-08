@@ -164,6 +164,59 @@ class TestInitialLogStreamSnapshot:
 class TestStreamLogsByIdLifecycle:
     """Checks integration with the full managed-job log follower."""
 
+    @pytest.mark.parametrize('task_filter', [None, 5, 'eval'])
+    def test_batch_jobs_delegate_directly_to_controller_logs(
+            self, monkeypatch, task_filter):
+        batch_stream = mock.Mock(return_value=('controller-log', 0))
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(
+            jobs_utils.rich_utils, 'safe_status',
+            mock.Mock(side_effect=AssertionError(
+                'status display should not start for batch '
+                'log routing')))
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=True))
+        monkeypatch.setattr(
+            managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError('task count queried')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_all_task_ids_names_statuses_logs',
+            mock.Mock(side_effect=AssertionError('task rows scanned')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row queried')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_latest_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('latest snapshot queried')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot queried')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_status',
+            mock.Mock(side_effect=AssertionError('whole-job status queried')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_latest_task_id_status',
+            mock.Mock(side_effect=AssertionError('scalar latest-task queried')))
+        monkeypatch.setattr(jobs_utils, 'stream_logs', batch_stream)
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42,
+                                                          follow=False,
+                                                          tail=17,
+                                                          tail_offset=3,
+                                                          task=task_filter)
+
+        assert message == 'controller-log'
+        assert exit_code == 0
+        batch_stream.assert_called_once_with(42,
+                                             job_name=None,
+                                             controller=True,
+                                             follow=False,
+                                             tail=17,
+                                             tail_offset=3)
+
     @pytest.mark.parametrize(
         ('status', 'cluster_name', 'expected_handle_calls'), [
             (managed_job_state.ManagedJobStatus.PENDING, None, 0),
