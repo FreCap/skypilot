@@ -1,31 +1,36 @@
 # SkyServe System OOM Recovery
 
-_Status: ready for merge. #1182 and the zero-series transition correction
-#1258 are merged. On 2026-08-07 the production `skypilot` Helm release was
-revision 354, chart/application version `1.1.1143`, from exact source
-`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`. That source is the deployed
-pre-cleanup Serve baseline and an ancestor of #1183's current `improvements`
-base at `3d98a371e4d320aa1b9f3067088caa94d620c4f9`; the intervening merges include
-dashboard-only #1329, Helm/API HA rollout #1262, placement-normalization locking
-fix #1330, action-authority v2 #1332, and placement-retirement cleanup #1339.
-The latter changes adjacent PostgreSQL/Serve-state behavior but does not change
-the OOM recovery contract. The API Deployment and all 16 external load
-balancers were Ready on immutable image digest
-`sha256:cefcfc0f4a620707770f0a69e51317b60aab365d331e9dc77877c577c7f6cbc4`,
-the API health endpoint reported the same version and source commit, and the
-revision-354 database migration completed successfully.
+_Status: deployed, verified, monitored, and closed. #1183 merged as
+`f60829c367dc425895a7a30a06922fc81869ae51` and was published as release
+`1.1.1151`. On 2026-08-08 the production `skypilot` release was upgraded
+directly with Helm to revision 363, preserving the existing release values.
+The deployed OCI chart digest is
+`sha256:eee79e70464a155cc4bd583c2d83de11dde0199003e527b8594b65c92f6010b6`;
+the API, its init containers, and all 16 external load balancers run image
+digest
+`sha256:a796cb33ed81aa2a9fc78fe176e8104224bd10b4bc613aa689b418357c091124`.
+The revision-363 migration succeeded, the API and every load balancer were
+Ready with zero restarts, and authenticated health reported version `1.1.1151`,
+API version 73, build 8679, and the exact merge source._
 
-_The complete current deployment audit found no authorization source in Helm
-values, the rendered release, the live API Deployment, or the API process
-environment. PostgreSQL contained 4,158 replica rows across four services;
-every row decoded as `ORDINARY`, and no row contained a recovery intent,
-quarantine reason, or nested recovery state. All 159 replicas active in that
-snapshot were ordinary. The live metrics endpoint emitted exactly the four
-preinitialized deprecated-transition series at zero, and the node-local
-Datadog OpenMetrics check successfully scraped exactly four samples. Therefore
-production never activated either the deprecated compatibility paths or the
-retained v3 recovery path, and there is no live recovery state to migrate or
-drain before removing the deprecated readers._
+_The post-deployment audit found no authorization source in Helm values, the
+rendered release, the live API Deployment, or the API process environment.
+PostgreSQL contained 4,059 replica rows across five services; every row decoded
+as `ORDINARY`, with zero launch intents, quarantine reasons, or nested recovery
+state. The metrics endpoint exposed no system-OOM metric children and none of
+the four removed transition sentinels. A direct live negative probe rejected
+authorization documents v1/v2 and the deprecated event labels. The node-local
+Datadog OpenMetrics check remained healthy with zero samples, which is the
+expected steady state after sentinel removal._
+
+_A 15-minute post-deployment monitor sampled production every 30 seconds
+through 2026-08-08 01:24:59 UTC. Every sample observed API readiness 1/1, all
+16 load-balancer Deployments and pods Ready on the exact digest, zero API or
+load-balancer restarts, and healthy ingress readiness. Targeted API and
+load-balancer log scans found no traceback, panic, fatal, image-pull,
+crash-loop, system-OOM, quarantine, or malformed-state errors. There are no
+remaining implementation, migration, deployment, monitoring, or cleanup gates
+for #1183._
 
 _The removal contract is closed by the exact positive and negative tests in
 #1183: deprecated authorization v1/v2, runtime capability v1, status-only
@@ -45,16 +50,11 @@ pull request is not required and does not establish what is deployed._
 
 _Last updated: 2026-08-08_
 
-_Design baseline: current `origin/improvements` at
-`3d98a371e4d320aa1b9f3067088caa94d620c4f9`, including placement-contract
-normalization PR #1328, dashboard-only PR #1329, and Helm/API HA rollout PR
-#1262, placement-normalization locking fix #1330, action-authority v2 #1332,
-and placement-retirement cleanup #1339. Production release 1.1.1143 at
-`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1` is its audited deployed Serve
-ancestor.
-Transition PR #1258 is merged as
-`004870a6f20ed6a4e783575a858795a0a66e65a8`; #1183 applies the final
-steady-state cleanup to the current source baseline._
+_Design implementation: transition correction #1258 merged as
+`004870a6f20ed6a4e783575a858795a0a66e65a8`; final steady-state cleanup #1183
+merged as `f60829c367dc425895a7a30a06922fc81869ae51` and is the exact source of the
+deployed release above. Later `improvements` commits are outside this deployment
+evidence and do not change the recorded artifact identity._
 
 ## Context and decision
 
@@ -1536,14 +1536,12 @@ deprecated v1/v2 readers and other transition paths.
 
 ### PR 3 / #1183: `[Serve] Remove deprecated direct-shell OOM recovery`
 
-_[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183), refreshed on
-2026-08-08 onto current `improvements` at
-`3d98a371e4d320aa1b9f3067088caa94d620c4f9`, including #1328, #1329, #1262,
-#1330, action-authority v2 #1332, and placement-retirement cleanup #1339. Its
-audited production Serve baseline is
-release 1.1.1143 at
-`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`. Its implementation and completion
-evidence are ready for merge._
+_[PR #1183](https://github.com/boltz-bio/skypilot/pull/1183) was refreshed on
+2026-08-08 onto `improvements` at
+`3d98a371e4d320aa1b9f3067088caa94d620c4f9`, merged as
+`f60829c367dc425895a7a30a06922fc81869ae51`, published as release `1.1.1151`,
+and deployed as Helm revision 363. Its implementation, exact behavior,
+deployment, and monitoring evidence are complete._
 
 This accepts only authorization document v3, removes authorization-document
 readers v1/v2, removes the direct-shell Docker parser and runtime
@@ -1596,6 +1594,25 @@ digest/restarts, API health version and source commit, and the relevant
 behavior/metrics. Roll back directly with `helm rollback <release> <revision>`
 after inspecting `helm history` and `helm get values`. Repository tags, image
 tags, or pull requests alone are not deployment evidence.
+
+### Final cleanup deployment (2026-08-08)
+
+#1183 merged as `f60829c367dc425895a7a30a06922fc81869ae51`; release
+`1.1.1151` published the immutable artifacts recorded in the status above.
+Production was upgraded directly with Helm from known-good revision 360 to
+revision 363 with `--reuse-values`. The first upgrade attempt, revision 361,
+and the requested rollback record, revision 362, failed safely because an
+image-only `extraInitContainers` list override omitted the Kubernetes `name`
+merge key. The revision-361 migration completed, but neither attempt replaced
+the live API workload. A server-side dry run then proved a complete-map
+`--set-json` override retained both init-container names and rendered five new
+digest references, zero old-digest references, and zero recovery-authorization
+references. Revision 363 used that exact input and deployed successfully.
+
+Helm history intentionally retains revisions 361 and 362 as failed audit
+records. They have no live workload residue and must not be deleted to make the
+history appear linear. Revision 360 remains the inspected pre-cleanup rollback
+target. There was no `boltz-platform` change or other deployment authority.
 
 The numbered rollout entries below are a historical investigation ledger.
 They explain how the transition evolved but do not define present deployment
@@ -2286,9 +2303,32 @@ only the eight operational event labels remain.
 Exact per-replica associations remain in current `ReplicaInfo`; bounded
 structured logs supply diagnostic correlation but are not lifecycle authority.
 
-### Verification evidence (updated 2026-08-07)
+### Verification evidence (updated 2026-08-08)
 
-- The authoritative production audit resolved the `skypilot` Helm release to
+- Final Helm revision 363 runs chart/application `1.1.1151` from exact source
+  `f60829c367dc425895a7a30a06922fc81869ae51`, chart digest
+  `sha256:eee79e70464a155cc4bd583c2d83de11dde0199003e527b8594b65c92f6010b6`,
+  and image digest
+  `sha256:a796cb33ed81aa2a9fc78fe176e8104224bd10b4bc613aa689b418357c091124`.
+  Migration revision 363 succeeded. The API Deployment generation 418 was 1/1
+  Ready and Available, all API and init containers and all 16 external load
+  balancers used the exact digest, every init container exited zero, and no
+  monitored container restarted.
+- Authenticated health reported version `1.1.1151`, API version 73, build 8679,
+  and the exact source commit. A post-deployment PostgreSQL snapshot decoded
+  all 4,059 replica rows across five services as `ORDINARY`, with zero launch
+  intents, quarantines, or nested recovery state. The authorization variable
+  remained absent from values, rendered manifests, the Deployment, and the
+  running process.
+- The live endpoint exposed no system-OOM metric children and none of the four
+  removed sentinels. A direct negative probe rejected deprecated
+  authorization documents and event labels. Datadog continued to report a
+  healthy OpenMetrics check with zero samples, the expected post-removal
+  result. A 15-minute, 30-second-cadence monitor observed uninterrupted API,
+  load-balancer, pod, and ingress readiness with zero restarts; targeted logs
+  contained no matching failure signatures.
+
+- The pre-deployment production audit resolved the `skypilot` Helm release to
   revision 354, chart/app 1.1.1143, updated 2026-08-07 22:37 UTC. The API
   Deployment was 1/1 Ready and Available under `Recreate`; its API and metrics
   containers used immutable digest
@@ -2522,29 +2562,24 @@ authority, live version, or cleanup-gate status.
   records as operational history; neither is evidence for or against the OOM
   authorization cleanup gates.
 
-## PR 3 completion gates
+## PR 3 completion and closeout gates
 
-#1183 may merge when each gate below is recorded in this design and the PR.
-The gates prove both that no deployed state needs the compatibility readers and
-that the retained steady-state implementation has the exact intended behavior.
+#1183 is complete because every gate below is recorded in this design and the
+PR. The gates prove both that no deployed state needs the compatibility readers
+and that the retained steady-state implementation has the exact intended
+behavior.
 
 1. **COMPLETE — exact deployment identity.** The live Helm release is revision
-   354, chart/application 1.1.1143, on source
-   `ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`, the audited deployed Serve
-   ancestor of #1183's current base
-   `3d98a371e4d320aa1b9f3067088caa94d620c4f9`; #1329 is dashboard-only,
-   #1262 changes Helm/API HA rollout mechanics, #1330 narrows normalization
-   locking, #1332 adds action-authority v2, and #1339 changes placement
-   retirement cleanup without changing the OOM recovery contract.
-   Its database migration succeeded, API and external-LB Deployments are Ready
-   on the expected image digest, and API health reports the same version and
-   commit.
+   363, chart/application 1.1.1151, on exact #1183 merge source
+   `f60829c367dc425895a7a30a06922fc81869ae51`. Its database migration
+   succeeded, the API and all external-LB Deployments are Ready on the expected
+   image digest, and API health reports the same version and commit.
 2. **COMPLETE — no compatibility-dependent production state.** Helm values,
    rendered release, live Deployment, and API process environment contain no
-   recovery authorization. A current PostgreSQL snapshot decoded all 4,158
-   rows as `ORDINARY`, including all 159 active replicas, with zero recovery
-   intents, recovery quarantines, or nested recovery state. Production could
-   not have emitted an authorized v1/v2 marker or status-only recovery result.
+   recovery authorization. A post-deployment PostgreSQL snapshot decoded all
+   4,059 rows across five services as `ORDINARY`, with zero recovery launch
+   intents, quarantines, or nested recovery state. Production could not have
+   emitted an authorized v1/v2 marker or status-only recovery result.
 3. **COMPLETE — removed behavior stays removed.** Architecture and unit tests
    prove authorization documents v1/v2, runtime marker/capability v1,
    status-only recovery, the four transition telemetry labels, and incomplete
@@ -2559,6 +2594,16 @@ that the retained steady-state implementation has the exact intended behavior.
 5. **COMPLETE — regression and quality verification.** The focused cleanup
    suite, exact end-to-end behavior tests, formatting, typing, linting, and the
    repository's required PostgreSQL/full CI lanes pass on the final PR head.
+6. **COMPLETE — direct Helm rollout and rollback safety.** The reviewed chart
+   was deployed with retained live values and complete init-container maps.
+   The failed revision-361/362 attempts did not replace the live API and remain
+   visible in Helm history; revision 360 remains the inspected rollback target.
+   No platform-repository change was made or required.
+7. **COMPLETE — post-deployment monitoring and cleanup.** Fifteen minutes of
+   30-second samples found uninterrupted readiness, exact image identity, zero
+   restarts, and healthy ingress. Database, metrics, negative behavior, logs,
+   and Datadog checks matched the intended steady state. Temporary access
+   sessions and the merged feature branch were removed after evidence capture.
 
 The earlier seven-day canary, two-pass remote marker scan, paid on-demand/Spot
 OOM injections, and platform-repository rollout plan were designed to validate
