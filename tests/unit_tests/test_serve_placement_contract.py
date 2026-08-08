@@ -19,12 +19,21 @@ import test_serve_resource_actions as resource_action_fixtures
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
+import sky
 from sky.container_images import demand_state
+from sky.serve import constants as serve_constants
+from sky.serve import ephemeral_storage_contract
 from sky.serve import placement_contract_normalization
 from sky.serve import placement_policy
 from sky.serve import serve_state
 from sky.serve import service_spec
 from sky.serve import spot_placer
+
+
+@pytest.fixture(autouse=True)
+def _exact_normalizer_release_commit(monkeypatch):
+    monkeypatch.setattr(sky, '__commit__', 'a' * 40)
+
 
 # Generated with pickle protocol 4 from the unmodified v1.1.1132 release at
 # ab5ec55b89a8c576e20e6ea27cf240e88134bb64.  Keeping the real preceding-
@@ -162,6 +171,133 @@ def _normalizer_work(payload: bytes,
 def _api_pod_identity() -> (placement_contract_normalization._ApiPodIdentity):
     return placement_contract_normalization._canonical_api_pod_identity(
         'pod-a', uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'))
+
+
+def _retirement_service_row(current_version: int = 2) -> dict[str, Any]:
+    return {
+        'name': 'svc',
+        'current_version': current_version,
+        'active_versions': f'[{current_version}]',
+        'hash': 'current-hash',
+        'lifecycle_epoch': 7,
+        'resource_scope': 'current-hash',
+        'workspace': 'workspace',
+        'status': 'READY',
+        'pool': 0,
+        'resource_action_mode': 'legacy',
+        'resource_action_mode_changed_at': None,
+    }
+
+
+def _zero_target_cleanup_yaml(resource_scope: str,
+                              storage_generation: str) -> str:
+    scope_id = ephemeral_storage_contract.canonical_ephemeral_storage_scope_id(
+        resource_scope, storage_generation)
+    metadata_key = serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY
+    return f"""\
+_metadata:
+  {metadata_key}:
+    resource_scope: {resource_scope}
+    scope_id: {scope_id}
+    storage_generation: {storage_generation}
+    storage_mounts: []
+service: {{}}
+"""
+
+
+def _attach_cleanup_intent_inputs(
+    rows: list[placement_contract_normalization._RowWork],
+    service_rows: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach unique typed cleanup YAML and return exact intent preimages."""
+    intents: list[dict[str, Any]] = []
+    candidates = [
+        row for row in rows
+        if row.classification is placement_contract_normalization.
+        Classification.HISTORICAL_PHYSICAL_PER_GPU
+    ]
+    for row in candidates:
+        service_name, version = row.identity
+        service = service_rows[service_name]
+        resource_scope = service['resource_scope']
+        storage_generation = f'generation-{version}'
+        yaml_content = _zero_target_cleanup_yaml(resource_scope,
+                                                 storage_generation)
+        row.original['yaml_content'] = yaml_content
+        row.result['yaml_content'] = yaml_content
+        intents.append({
+            'service_name': service_name,
+            'resource_scope': resource_scope,
+            'storage_generation': storage_generation,
+            'yaml_content': yaml_content,
+            'pool': 0,
+            'lifecycle_epoch': service['lifecycle_epoch'],
+            'provisional': 1,
+            'created_at': 0.5,
+        })
+    intent_counts: dict[str, int] = {}
+    for intent in intents:
+        service_name = intent['service_name']
+        intent_counts[service_name] = intent_counts.get(service_name, 0) + 1
+    for row in rows:
+        row.dependency_facts['cleanup_intent_count'] = intent_counts.get(
+            row.identity[0], 0)
+        row.dependency_facts['service_resource_scope'] = service_rows[
+            row.identity[0]]['resource_scope']
+    return intents
+
+
+def _build_test_cleanup_plan(
+    rows: list[placement_contract_normalization._RowWork],
+    service_rows: dict[str, dict[str, Any]],
+) -> placement_contract_normalization._CleanupIntentPlan:
+    intents = _attach_cleanup_intent_inputs(rows, service_rows)
+    return placement_contract_normalization._build_cleanup_intent_plan(
+        intents, rows, service_rows, row_bound=max(1, len(intents)))
+
+
+def _test_predecessor_receipt_evidence(
+    service_names: set[str],
+) -> placement_contract_normalization._PredecessorReceiptEvidence:
+    approved_commit = 'b' * 40
+    approved_digest = placement_contract_normalization._canonical_json_sha256(
+        [approved_commit])
+    freeze_input_digest = 'c' * 64
+    freeze_binding_digest = (
+        placement_contract_normalization._canonical_json_sha256({
+            'approved_loaded_image_commit_sha256': approved_digest,
+            'operator_freeze_evidence_input_sha256': freeze_input_digest,
+        }))
+    facts = {
+        'predecessor_receipt_schema':
+            placement_contract_normalization._PREDECESSOR_RECEIPT_SCHEMA,
+        'predecessor_receipt_inventory_count': len(service_names),
+        'predecessor_receipt_inventory_sha256':
+            placement_contract_normalization._canonical_json_sha256(
+                sorted(service_names)),
+        'approved_loaded_image_commit_count': 1,
+        'approved_loaded_image_commit_sha256': approved_digest,
+        'operator_freeze_evidence_input_sha256': freeze_input_digest,
+        'operator_freeze_approved_commit_binding_sha256': freeze_binding_digest,
+        'predecessor_receipts_complete': True,
+    }
+    return placement_contract_normalization._PredecessorReceiptEvidence(
+        frozenset(service_names), facts)
+
+
+def _single_cleanup_plan_inputs() -> tuple[
+    list[dict[str, Any]],
+    list[placement_contract_normalization._RowWork],
+    dict[str, dict[str, Any]],
+]:
+    historical_payload = zlib.decompress(
+        base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
+    candidate = _normalizer_work(historical_payload, 1)
+    successor = _normalizer_work(_explicit_v2_payload(), 2)
+    rows = [candidate, successor]
+    service_rows = {'svc': _retirement_service_row()}
+    intents = _attach_cleanup_intent_inputs(rows, service_rows)
+    return intents, rows, service_rows
 
 
 @pytest.mark.parametrize(('policy_name', 'pool', 'expected'), [
@@ -675,25 +811,16 @@ def test_retirement_uses_cross_incarnation_target_demand(monkeypatch):
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
     candidate = _normalizer_work(historical_payload, 1)
     successor = _normalizer_work(_explicit_v2_payload(), 2)
+    service_rows = {'svc': _retirement_service_row()}
+    rows = [candidate, successor]
+    cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
+    receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='live container-image demand'):
         placement_contract_normalization._prepare_retirement_rows(
-            [candidate, successor], {
-                'svc': {
-                    'current_version': 2,
-                    'active_versions': '[2]',
-                    'hash': 'current-hash',
-                    'lifecycle_epoch': 7,
-                    'resource_scope': 'current-scope',
-                    'workspace': 'workspace',
-                    'status': 'READY',
-                    'pool': 0,
-                    'resource_action_mode': 'legacy',
-                    'resource_action_mode_changed_at': None,
-                }
-            }, uuid.uuid4(), 10.0, {('svc', 1): evidence},
+            rows, service_rows, uuid.uuid4(), 10.0, {('svc', 1): evidence},
             {('svc', 1): no_requests}, no_requests, no_requests,
-            _api_pod_identity(), no_requests)
+            _api_pod_identity(), no_requests, cleanup_plan, receipt_evidence)
 
 
 def test_controller_process_evidence_matches_only_exact_service_argv(
@@ -1017,6 +1144,88 @@ def test_legacy_controller_evidence_covers_every_server_identity(monkeypatch):
     assert second == first
 
 
+def test_cleanup_plan_rejects_scope_under_wrong_metadata_key():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    intents[0]['yaml_content'] = intents[0]['yaml_content'].replace(
+        '_metadata:', 'metadata:', 1)
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='wrong Task metadata field'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
+@pytest.mark.parametrize(('field', 'value', 'match'), [
+    ('pool', False, 'exact non-pool parent bit'),
+    ('provisional', False, 'invalid provisional bit'),
+])
+def test_cleanup_plan_rejects_false_lookalike_integer_fields(
+        field, value, match):
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    intents[0][field] = value
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match=match):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
+def test_cleanup_plan_rejects_yaml_scope_mismatch():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    intents[0]['yaml_content'] = _zero_target_cleanup_yaml(
+        'different-scope', intents[0]['storage_generation'])
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='YAML scope disagrees'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
+def test_cleanup_plan_rejects_duplicate_yaml_version_mapping():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    duplicate_yaml = intents[0]['yaml_content']
+    rows[1].original['yaml_content'] = duplicate_yaml
+    rows[1].result['yaml_content'] = duplicate_yaml
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='generation is reused'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
+def test_cleanup_plan_rejects_generation_reused_by_different_version_yaml():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    reused_generation_yaml = intents[0][
+        'yaml_content'] + 'envs:\n  TEST: value\n'
+    rows[1].original['yaml_content'] = reused_generation_yaml
+    rows[1].result['yaml_content'] = reused_generation_yaml
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='generation|multiple live'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
+def test_cleanup_plan_rejects_future_lifecycle_epoch():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    intents[0]['lifecycle_epoch'] = service_rows['svc']['lifecycle_epoch'] + 1
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='future lifecycle epoch'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
+def test_cleanup_plan_rejects_nonzero_deletion_target():
+    intents, rows, service_rows = _single_cleanup_plan_inputs()
+    intents[0]['yaml_content'] += 'workdir: /owned/workdir\n'
+
+    with pytest.raises(placement_contract_normalization.NormalizationBlocker,
+                       match='nonzero deletion target'):
+        placement_contract_normalization._build_cleanup_intent_plan(
+            intents, rows, service_rows, row_bound=1)
+
+
 def test_multirow_retirement_proves_a_surviving_successor():
     historical_payload = zlib.decompress(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
@@ -1024,20 +1233,15 @@ def test_multirow_retirement_proves_a_surviving_successor():
     historical_two = _normalizer_work(historical_payload, 2)
     successor = _normalizer_work(_explicit_v2_payload(), 3)
     rows = [historical_one, historical_two, successor]
-    service_rows = {
-        'svc': {
-            'current_version': 3,
-            'active_versions': '[3]',
-            'hash': 'current-hash',
-            'lifecycle_epoch': 7,
-            'resource_scope': 'current-scope',
-            'workspace': 'workspace',
-            'status': 'READY',
-            'pool': 0,
-            'resource_action_mode': 'legacy',
-            'resource_action_mode_changed_at': None,
-        }
+    service_rows = {'svc': _retirement_service_row(current_version=3)}
+    cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
+    receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
+    historical_generations = {
+        ephemeral_storage_contract.parse_ephemeral_storage_scope(
+            row.original['yaml_content']).storage_generation
+        for row in (historical_one, historical_two)
     }
+    assert historical_generations == {'generation-1', 'generation-2'}
     no_demand = placement_contract_normalization._ExternalEvidence(count=0,
                                                                    digest='0' *
                                                                    64)
@@ -1049,7 +1253,8 @@ def test_multirow_retirement_proves_a_surviving_successor():
         }, {
             ('svc', 1): no_demand,
             ('svc', 2): no_demand,
-        }, no_demand, no_demand, _api_pod_identity(), no_demand)
+        }, no_demand, no_demand, _api_pod_identity(), no_demand, cleanup_plan,
+        receipt_evidence)
 
     assert affected == {'svc'}
     assert historical_one.dependency_facts[
@@ -1070,8 +1275,9 @@ def test_multirow_retirement_proves_a_surviving_successor():
         'version': 1,
         'dependency_facts': historical_one.dependency_facts,
     }
-    assert (placement_contract_normalization.
-            _retirement_ledger_facts_are_complete(ledger_entry))
+    assert (
+        placement_contract_normalization._retirement_ledger_facts_are_complete(
+            ledger_entry, protocol=2))
     for field, contradictory_value in (
         ('service_pool', 1),
         ('service_resource_action_mode', 'shadow'),
@@ -1080,10 +1286,33 @@ def test_multirow_retirement_proves_a_surviving_successor():
         tampered_facts = dict(historical_one.dependency_facts)
         tampered_facts[field] = contradictory_value
         assert not (placement_contract_normalization.
-                    _retirement_ledger_facts_are_complete({
-                        'version': 1,
-                        'dependency_facts': tampered_facts,
-                    }))
+                    _retirement_ledger_facts_are_complete(
+                        {
+                            'version': 1,
+                            'dependency_facts': tampered_facts,
+                        },
+                        protocol=2))
+    for field, false_lookalike in (
+        ('replica_count', False),
+        ('cleanup_candidate_deletion_target_count', False),
+        ('cleanup_intent_deletion_target_count', False),
+        ('cleanup_intent_count', True),
+        ('cleanup_intent_inventory_count', True),
+        ('cleanup_intent_adopted_count', False),
+        ('cleanup_match_inventory_count', True),
+        ('cleanup_candidate_match_count', True),
+        ('predecessor_receipt_inventory_count', False),
+        ('approved_loaded_image_commit_count', True),
+    ):
+        tampered_facts = dict(historical_one.dependency_facts)
+        tampered_facts[field] = false_lookalike
+        assert not (placement_contract_normalization.
+                    _retirement_ledger_facts_are_complete(
+                        {
+                            'version': 1,
+                            'dependency_facts': tampered_facts,
+                        },
+                        protocol=2)), field
     assert historical_one.result['yaml_content'] is None
     assert historical_two.result['yaml_content'] is None
     assert successor.result['yaml_content'] == 'service: {}'
@@ -1091,7 +1320,7 @@ def test_multirow_retirement_proves_a_surviving_successor():
 
 @pytest.mark.parametrize(('column', 'value', 'fact', 'fact_value', 'match'), [
     ('placement_catalog', {}, None, None, 'placement catalog activation'),
-    (None, None, 'cleanup_intent_count', 1, 'storage cleanup intent'),
+    (None, None, 'cleanup_intent_count', 2, 'service-wide intent inventory'),
     (None, None, 'replica_count', 1, 'owns replica rows'),
     (None, None, 'unknown_version_replica_count', 1,
      'NULL or orphan-version replica rows'),
@@ -1107,6 +1336,10 @@ def test_retirement_rejects_catalog_cleanup_and_bridge_dependencies(
     if column is not None:
         candidate.original[column] = value
         candidate.result[column] = value
+    service_rows = {'svc': _retirement_service_row()}
+    rows = [candidate, successor]
+    cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
+    receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
     if fact is not None:
         candidate.dependency_facts[fact] = fact_value
     no_evidence = placement_contract_normalization._ExternalEvidence(
@@ -1115,22 +1348,9 @@ def test_retirement_rejects_catalog_cleanup_and_bridge_dependencies(
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match=match):
         placement_contract_normalization._prepare_retirement_rows(
-            [candidate, successor], {
-                'svc': {
-                    'current_version': 2,
-                    'active_versions': '[2]',
-                    'hash': 'current-hash',
-                    'lifecycle_epoch': 7,
-                    'resource_scope': 'current-scope',
-                    'workspace': 'workspace',
-                    'status': 'READY',
-                    'pool': 0,
-                    'resource_action_mode': 'legacy',
-                    'resource_action_mode_changed_at': None,
-                }
-            }, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
+            rows, service_rows, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
             {('svc', 1): no_evidence}, no_evidence, no_evidence,
-            _api_pod_identity(), no_evidence)
+            _api_pod_identity(), no_evidence, cleanup_plan, receipt_evidence)
 
 
 def test_retirement_rejects_same_service_placeholder_reservation():
@@ -1141,28 +1361,19 @@ def test_retirement_rejects_same_service_placeholder_reservation():
     placeholder = _normalizer_work(pickle.dumps(None, protocol=4),
                                    3,
                                    yaml_content=None)
+    service_rows = {'svc': _retirement_service_row()}
+    rows = [candidate, successor, placeholder]
+    cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
+    receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
     no_evidence = placement_contract_normalization._ExternalEvidence(
         count=0, digest='0' * 64)
 
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match='placeholder or reservation'):
         placement_contract_normalization._prepare_retirement_rows(
-            [candidate, successor, placeholder], {
-                'svc': {
-                    'current_version': 2,
-                    'active_versions': '[2]',
-                    'hash': 'current-hash',
-                    'lifecycle_epoch': 7,
-                    'resource_scope': 'current-scope',
-                    'workspace': 'workspace',
-                    'status': 'READY',
-                    'pool': 0,
-                    'resource_action_mode': 'legacy',
-                    'resource_action_mode_changed_at': None,
-                }
-            }, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
+            rows, service_rows, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
             {('svc', 1): no_evidence}, no_evidence, no_evidence,
-            _api_pod_identity(), no_evidence)
+            _api_pod_identity(), no_evidence, cleanup_plan, receipt_evidence)
 
 
 @pytest.mark.parametrize(('parent_delta', 'match'), [
@@ -1184,28 +1395,21 @@ def test_retirement_rejects_pool_or_active_resource_action_parent(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
     candidate = _normalizer_work(historical_payload, 1)
     successor = _normalizer_work(_explicit_v2_payload(), 2)
-    service = {
-        'current_version': 2,
-        'active_versions': '[2]',
-        'hash': 'current-hash',
-        'lifecycle_epoch': 7,
-        'resource_scope': 'current-scope',
-        'workspace': 'workspace',
-        'status': 'READY',
-        'pool': 0,
-        'resource_action_mode': 'legacy',
-        'resource_action_mode_changed_at': None,
-    }
+    service = _retirement_service_row()
     service.update(parent_delta)
+    service_rows = {'svc': service}
+    rows = [candidate, successor]
+    receipt_evidence = _test_predecessor_receipt_evidence(set(service_rows))
     no_evidence = placement_contract_normalization._ExternalEvidence(
         count=0, digest='0' * 64)
 
     with pytest.raises(placement_contract_normalization.NormalizationBlocker,
                        match=match):
+        cleanup_plan = _build_test_cleanup_plan(rows, service_rows)
         placement_contract_normalization._prepare_retirement_rows(
-            [candidate, successor], {'svc': service}, uuid.uuid4(), 10.0,
-            {('svc', 1): no_evidence}, {('svc', 1): no_evidence}, no_evidence,
-            no_evidence, _api_pod_identity(), no_evidence)
+            rows, service_rows, uuid.uuid4(), 10.0, {('svc', 1): no_evidence},
+            {('svc', 1): no_evidence}, no_evidence, no_evidence,
+            _api_pod_identity(), no_evidence, cleanup_plan, receipt_evidence)
 
 
 def test_terminal_service_normalizes_without_unloadable_receipt():
@@ -1658,6 +1862,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
     historical_payload = zlib.decompress(
         base64.b64decode(_V1_1_247_PHYSICAL_PER_GPU_SPEC_ZLIB_B64))
     successor_payload = _explicit_v2_payload()
+    historical_yaml = _zero_target_cleanup_yaml('service-hash', 'generation-1')
     with engine.begin() as connection:
         connection.execute(serve_state.services_table.insert().values(
             name='svc',
@@ -1672,7 +1877,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
             'service_name': 'svc',
             'version': 1,
             'spec': historical_payload,
-            'yaml_content': 'service: {}',
+            'yaml_content': historical_yaml,
             'created_at': 1.0,
             'created_by': 'test',
         }, {
@@ -1683,9 +1888,47 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
             'created_at': 2.0,
             'created_by': 'test',
         }])
+        connection.execute(
+            serve_state.ephemeral_storage_cleanup_intents_table.insert().values(
+                service_name='svc',
+                resource_scope='service-hash',
+                storage_generation='generation-1',
+                yaml_content=historical_yaml,
+                pool=0,
+                lifecycle_epoch=7,
+                provisional=1,
+                created_at=0.5))
 
     no_evidence = placement_contract_normalization._ExternalEvidence(
         count=0, digest='0' * 64)
+    with orm.Session(engine) as session:
+        predecessor_rows, _ = (placement_contract_normalization._scan_inventory(
+            session, row_bound=10))
+    predecessor_run_id = uuid.uuid4()
+    predecessor_digest = placement_contract_normalization._fleet_sha256(
+        predecessor_rows, result=False)
+    with orm.Session(engine) as session, session.begin():
+        placement_contract_normalization._insert_ledger(
+            session,
+            predecessor_rows,
+            run_id=predecessor_run_id,
+            mode=placement_contract_normalization.ApplyMode.SUPPORTED,
+            row_bound=10,
+            started_at=2.5,
+            completed_at=3.0,
+            freeze_evidence_sha256='e' * 64,
+            pre_digest=predecessor_digest,
+            post_digest=predecessor_digest)
+    with engine.begin() as connection:
+        connection.execute(serve_state.services_table.update().where(
+            serve_state.services_table.c.name == 'svc').values(
+                placement_normalization_requested_run_id=predecessor_run_id,
+                placement_normalization_loaded_run_id=predecessor_run_id,
+                placement_normalization_loaded_image_commit='b' * 40,
+                placement_normalization_loaded_controller_pid=456,
+                placement_normalization_loaded_controller_ip=None,
+                placement_normalization_loaded_boot_id='c' * 32,
+                placement_normalization_loaded_at=4.0))
 
     for replica_id, replica_version in ((1, None), (2, 999)):
         with engine.begin() as connection:
@@ -1718,6 +1961,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
                   RETIRE_TERMINAL_HISTORICAL),
             row_bound=10,
             freeze_evidence_sha256='f' * 64,
+            approved_loaded_image_commits=('b' * 40,),
             consolidation_mode_checker=lambda: False)
 
     common_retirement_kwargs = {
@@ -1726,6 +1970,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
                  RETIRE_TERMINAL_HISTORICAL),
         'row_bound': 10,
         'freeze_evidence_sha256': 'f' * 64,
+        'approved_loaded_image_commits': ('b' * 40,),
         'image_evidence_getter': lambda _name, _version: no_evidence,
         'request_evidence_getter': lambda _engine: no_evidence,
         'process_evidence_getter': lambda _targets, _pod_uid: no_evidence,
@@ -1787,7 +2032,7 @@ def test_postgres_operator_retires_only_historical_row_and_keeps_high_watermark(
     retired, successor = versions
     assert bytes(retired['spec']) == pickle.dumps(None, protocol=4)
     assert retired['yaml_content'] is None
-    assert retired['retired_yaml_content'] == 'service: {}'
+    assert retired['retired_yaml_content'] == historical_yaml
     assert retired['retired_at'] == 11.0
     assert retired['retirement_run_id'] == run_id
     assert bytes(successor['spec']) == successor_payload
@@ -1839,7 +2084,7 @@ def test_ledger_manifest_verifies_complete_pre_and_post_inventory():
     run = {
         'run_id': run_id,
         'mode': 'apply_supported',
-        'normalizer_version': '1:test-commit',
+        'normalizer_version': f'1:{"a" * 40}',
         'schema_revision': '037',
         'release_version': 'test-release',
         'started_at': 1.0,

@@ -27,10 +27,12 @@ from sqlalchemy.dialects import sqlite
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.serve import constants
+from sky.serve import ephemeral_storage_contract
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import maintenance
 from sky.serve import paid_capacity
+from sky.serve import placement_normalization_identity
 from sky.serve import placement_policy
 from sky.serve import serve_state_schema
 from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
@@ -264,25 +266,78 @@ class ReplicaResourceActionIdentity:
 
 
 def _ephemeral_storage_generation_from_yaml(
-        yaml_content: str | None) -> str | None:
-    """Read the scoped storage generation without constructing a Task."""
-    if yaml_content is None:
+        yaml_content: str | None,
+        expected_resource_scope: str | None) -> str | None:
+    """Read and owner-fence the typed internal Task-YAML storage scope."""
+    scope = ephemeral_storage_contract.parse_ephemeral_storage_scope(
+        yaml_content)
+    if scope is None:
         return None
-    try:
-        config = yaml_utils.safe_load(yaml_content)
-    except Exception:  # pylint: disable=broad-except
-        return None
-    if not isinstance(config, dict):
-        return None
-    metadata = config.get('metadata')
-    if not isinstance(metadata, dict):
-        return None
-    scope_metadata = metadata.get(
-        constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY)
-    if not isinstance(scope_metadata, dict):
-        return None
-    storage_generation = scope_metadata.get('storage_generation')
-    return storage_generation if isinstance(storage_generation, str) else None
+    if scope.resource_scope != expected_resource_scope:
+        raise ephemeral_storage_contract.EphemeralStorageContractError(
+            'Task-YAML storage scope does not match its service owner.')
+    return scope.storage_generation
+
+
+def _adopt_exact_ephemeral_storage_cleanup_intent(
+        session: orm.Session, service_name: str, resource_scope: str,
+        storage_generation: str, yaml_content: str, pool: bool,
+        lifecycle_epoch: int | None, version_created_at: Any) -> None:
+    """Commit one exact cleanup intent with an all-column preimage CAS."""
+    if (type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
+            type(pool) is not bool or isinstance(version_created_at, bool) or
+            not isinstance(version_created_at, (int, float)) or
+            not math.isfinite(float(version_created_at)) or
+            version_created_at < 0):
+        raise ephemeral_storage_contract.EphemeralStorageContractError(
+            'Scoped storage handoff requires an exact service owner.')
+    intent = session.execute(
+        sqlalchemy.select(ephemeral_storage_cleanup_intents_table).where(
+            ephemeral_storage_cleanup_intents_table.c.service_name ==
+            service_name,
+            ephemeral_storage_cleanup_intents_table.c.resource_scope ==
+            resource_scope,
+            ephemeral_storage_cleanup_intents_table.c.storage_generation ==
+            storage_generation).with_for_update()).mappings().one_or_none()
+    if intent is None:
+        raise ephemeral_storage_contract.EphemeralStorageContractError(
+            'Scoped storage commit has no exact cleanup intent.')
+    created_at = intent['created_at']
+    intent_lifecycle_epoch = intent['lifecycle_epoch']
+    provisional = intent['provisional']
+    if (type(intent['pool']) is not int or intent['pool'] not in (0, 1) or
+            type(intent_lifecycle_epoch) is not int or
+            intent_lifecycle_epoch < 1 or type(provisional) is not int or
+            provisional not in (0, 1) or isinstance(created_at, bool) or
+            not isinstance(created_at, (int, float)) or
+            not math.isfinite(float(created_at)) or created_at < 0 or
+            float(created_at) > float(version_created_at) or
+            intent['yaml_content'] != yaml_content or
+            intent['pool'] != int(pool) or
+        (provisional == 1 and intent_lifecycle_epoch != lifecycle_epoch) or
+        (provisional == 0 and intent_lifecycle_epoch > lifecycle_epoch)):
+        raise ephemeral_storage_contract.EphemeralStorageContractError(
+            'Scoped storage cleanup intent does not match its commit.')
+    adopted = session.execute(
+        sqlalchemy.update(ephemeral_storage_cleanup_intents_table).where(
+            ephemeral_storage_cleanup_intents_table.c.service_name ==
+            intent['service_name'],
+            ephemeral_storage_cleanup_intents_table.c.resource_scope ==
+            intent['resource_scope'],
+            ephemeral_storage_cleanup_intents_table.c.storage_generation ==
+            intent['storage_generation'],
+            ephemeral_storage_cleanup_intents_table.c.yaml_content ==
+            intent['yaml_content'],
+            ephemeral_storage_cleanup_intents_table.c.pool == intent['pool'],
+            ephemeral_storage_cleanup_intents_table.c.lifecycle_epoch ==
+            intent['lifecycle_epoch'],
+            ephemeral_storage_cleanup_intents_table.c.provisional ==
+            intent['provisional'],
+            ephemeral_storage_cleanup_intents_table.c.created_at ==
+            created_at).values(provisional=0))
+    if adopted.rowcount != 1:
+        raise ephemeral_storage_contract.EphemeralStorageContractError(
+            'Scoped storage cleanup intent changed during commit.')
 
 
 _ReservedFillLockedFunction = typing.TypeVar('_ReservedFillLockedFunction',
@@ -483,7 +538,8 @@ def add_service(name: str,
             engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
         raise RuntimeError('External load balancer high availability requires '
                            'the central PostgreSQL Serve database.')
-    storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
+    storage_generation = _ephemeral_storage_generation_from_yaml(
+        yaml_content, resource_scope)
     try:
         with _replica_launch_authority_write_session(name) as (_, session):
             _begin_immediate_if_sqlite(session, engine, lifecycle_epoch
@@ -646,20 +702,14 @@ def add_service(name: str,
                             version_insert_stmt.excluded.controller_applied_at,
                     })
             session.execute(version_insert_stmt)
-            if resource_scope is not None and storage_generation is not None:
-                session.query(ephemeral_storage_cleanup_intents_table).filter(
-                    ephemeral_storage_cleanup_intents_table.c.service_name ==
-                    name,
-                    ephemeral_storage_cleanup_intents_table.c.resource_scope ==
-                    resource_scope,
-                    ephemeral_storage_cleanup_intents_table.c.storage_generation
-                    == storage_generation,
-                    *([
-                        ephemeral_storage_cleanup_intents_table.c.
-                        lifecycle_epoch == lifecycle_epoch
-                    ] if lifecycle_epoch is not None else []),
-                ).update(
-                    {ephemeral_storage_cleanup_intents_table.c.provisional: 0})
+            if storage_generation is not None:
+                if resource_scope is None:
+                    raise ephemeral_storage_contract.EphemeralStorageContractError(
+                        'Scoped storage commit has no exact service owner.')
+                _adopt_exact_ephemeral_storage_cleanup_intent(
+                    session, name, resource_scope, storage_generation,
+                    yaml_content, pool, lifecycle_epoch,
+                    initial_version_created_at)
             session.commit()
 
     except sqlalchemy_exc.IntegrityError as e:
@@ -5142,8 +5192,9 @@ def add_or_update_version(
         if (not expected_service_hash or expected_controller_owner is None):
             raise ValueError('First protocol activation requires an exact '
                              'service incarnation and controller owner fence.')
-    storage_generation = _ephemeral_storage_generation_from_yaml(yaml_content)
     resource_scope: str | None = None
+    service_pool: bool | None = None
+    service_lifecycle_epoch: int | None = None
     with _replica_launch_authority_write_session(service_name) as (engine,
                                                                    session):
         _begin_immediate_if_sqlite(session, engine)
@@ -5162,7 +5213,8 @@ def add_or_update_version(
                     services_table.c.hash, services_table.c.lifecycle_epoch,
                     services_table.c.controller_pid,
                     services_table.c.controller_ip, services_table.c.status,
-                    services_table.c.resource_scope).where(
+                    services_table.c.resource_scope,
+                    services_table.c.pool).where(
                         services_table.c.name ==
                         service_name).with_for_update()).fetchone()
             if (owner is None or (expected_service_hash is not None and
@@ -5177,6 +5229,13 @@ def add_or_update_version(
                 session.rollback()
                 return VersionCommitResult.REJECTED
             resource_scope = owner[5]
+            if type(owner[6]) is not int or owner[6] not in (0, 1):
+                raise ephemeral_storage_contract.EphemeralStorageContractError(
+                    'Scoped storage commit has an invalid parent pool bit.')
+            service_pool = owner[6] == 1
+            service_lifecycle_epoch = owner[1]
+        storage_generation = _ephemeral_storage_generation_from_yaml(
+            yaml_content, resource_scope)
         if engine.dialect.name not in (
                 db_utils.SQLAlchemyDialect.SQLITE.value,
                 db_utils.SQLAlchemyDialect.POSTGRESQL.value):
@@ -5190,7 +5249,8 @@ def add_or_update_version(
                 version_specs_table.c.controller_config_digest,
                 version_specs_table.c.controller_config_snapshot_id,
                 version_specs_table.c.submitted_yaml_content,
-                version_specs_table.c.retired_at).where(
+                version_specs_table.c.retired_at,
+                version_specs_table.c.created_at).where(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version)).fetchone()
         # A retired history row deliberately resembles an interrupted
@@ -5304,6 +5364,8 @@ def add_or_update_version(
             # version commit cannot safely perform that cross-store mutation.
             session.rollback()
             return VersionCommitResult.LB_HA_CONFLICT
+        committed_version_created_at = (existing[7]
+                                        if identical_retry else time.time())
         if existing is None:
             assert serialized_spec is not None
             session.execute(version_specs_table.insert().values(
@@ -5321,7 +5383,7 @@ def add_or_update_version(
                 controller_config_snapshot_id=(
                     None if controller_config_snapshot is None else
                     controller_config_snapshot[2]),
-                created_at=time.time()))
+                created_at=committed_version_created_at))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
             # lock above serializes the one transition that fills it.
@@ -5345,7 +5407,7 @@ def add_or_update_version(
                         controller_config_snapshot_id=(
                             None if controller_config_snapshot is None else
                             controller_config_snapshot[2]),
-                        created_at=time.time()))
+                        created_at=committed_version_created_at))
             if filled_placeholder.rowcount != 1:
                 session.rollback()
                 return VersionCommitResult.CONTENT_CONFLICT
@@ -5418,19 +5480,14 @@ def add_or_update_version(
                     set_={'script': recovery_insert.excluded.script}))
         # An identical committed YAML is an idempotent retry. Keep both the
         # original YAML and pickled spec bytes untouched.
-        if resource_scope is not None and storage_generation is not None:
-            session.query(ephemeral_storage_cleanup_intents_table).filter(
-                ephemeral_storage_cleanup_intents_table.c.service_name ==
-                service_name,
-                ephemeral_storage_cleanup_intents_table.c.resource_scope ==
-                resource_scope,
-                ephemeral_storage_cleanup_intents_table.c.storage_generation ==
-                storage_generation,
-                *([
-                    ephemeral_storage_cleanup_intents_table.c.lifecycle_epoch
-                    == expected_lifecycle_epoch
-                ] if expected_lifecycle_epoch is not None else []),
-            ).update({ephemeral_storage_cleanup_intents_table.c.provisional: 0})
+        if storage_generation is not None:
+            if resource_scope is None or service_pool is None:
+                raise ephemeral_storage_contract.EphemeralStorageContractError(
+                    'Scoped storage commit has no exact service owner.')
+            _adopt_exact_ephemeral_storage_cleanup_intent(
+                session, service_name, resource_scope, storage_generation,
+                yaml_content, service_pool, service_lifecycle_epoch,
+                committed_version_created_at)
         session.commit()
     return (VersionCommitResult.IDEMPOTENT_RETRY
             if identical_retry else VersionCommitResult.COMMITTED)
@@ -5755,16 +5812,6 @@ def mark_version_controller_applied(
     return True
 
 
-_LOADABLE_NORMALIZATION_LEDGER_OUTCOMES = frozenset({
-    ('fieldless_supported', 'changed'),
-    ('explicit_v1', 'changed'),
-    ('explicit_v2', 'unchanged'),
-})
-_FILLABLE_NORMALIZATION_LEDGER_OUTCOMES = frozenset({
-    ('placeholder', 'unchanged'),
-})
-
-
 def _placement_normalization_raw_spec_bytes(row: Mapping[str, Any],
                                             prefix: str) -> bytes:
     raw_spec = row[f'{prefix}_spec']
@@ -5863,6 +5910,22 @@ def _placement_normalization_receipt_query(
             current_ledger.c.service_name == services_table.c.name,
             current_ledger.c.version == current_version,
         ))
+    service_ledger_anchor = placement_normalization_rows_table.alias(
+        'placement_normalization_service_ledger_anchor')
+    anchor_predicates = (
+        service_ledger_anchor.c.run_id ==
+        services_table.c.placement_normalization_requested_run_id,
+        service_ledger_anchor.c.service_name == services_table.c.name,
+    )
+    service_ledger_anchor_count = sqlalchemy.select(
+        sqlalchemy.func.count(  # pylint: disable=not-callable
+        )).select_from(service_ledger_anchor).where(
+            *anchor_predicates).correlate(services_table).scalar_subquery()
+    service_ledger_matching_hash_count = sqlalchemy.select(
+        sqlalchemy.func.count(  # pylint: disable=not-callable
+        )).select_from(service_ledger_anchor).where(
+            *anchor_predicates, service_ledger_anchor.c.service_hash ==
+            expected_service_hash).correlate(services_table).scalar_subquery()
     return sqlalchemy.select(
         services_table.c.lifecycle_epoch.label('lifecycle_epoch'),
         services_table.c.placement_normalization_requested_run_id.label(
@@ -5912,6 +5975,9 @@ def _placement_normalization_receipt_query(
         current_ledger.c.service_hash.label('current_service_hash'),
         current_ledger.c.service_lifecycle_epoch.label(
             'current_service_lifecycle_epoch'),
+        service_ledger_anchor_count.label('service_ledger_anchor_count'),
+        service_ledger_matching_hash_count.label(
+            'service_ledger_matching_hash_count'),
     ).select_from(source).where(
         services_table.c.name == service_name,
         services_table.c.hash == expected_service_hash,
@@ -5933,19 +5999,30 @@ def _lock_placement_normalization_receipt_query(
     return query
 
 
+def _placement_normalization_manifest_identity(
+    row: Mapping[str, Any],
+) -> tuple[placement_normalization_identity.PlacementNormalizationIdentity,
+           str]:
+    """Parse the shared exact protocol/mode dispatcher inputs."""
+    try:
+        identity = placement_normalization_identity.parse_normalizer_identity(
+            row['manifest_normalizer_version'])
+        mode = placement_normalization_identity.parse_manifest_mode(
+            row['manifest_mode'])
+    except placement_normalization_identity.PlacementNormalizationIdentityError:
+        raise RuntimeError('Placement normalization requested run manifest '
+                           'has invalid release identity.') from None
+    return identity, mode
+
+
 def _validate_placement_normalization_run_manifest(
         row: Mapping[str, Any], requested_run_id: uuid.UUID) -> float:
     """Validate the bounded metadata for a requested completed run."""
     if row['manifest_run_id'] != requested_run_id:
         raise RuntimeError('Placement normalization requested run manifest '
                            'is missing or belongs to another generation.')
-    if row['manifest_mode'] not in ('apply_supported',
-                                    'retire_terminal_historical'):
-        raise RuntimeError('Placement normalization requested run manifest '
-                           'has an invalid mode.')
-    if (not isinstance(row['manifest_normalizer_version'], str) or
-            not row['manifest_normalizer_version'] or
-            not isinstance(row['manifest_release_version'], str) or
+    _placement_normalization_manifest_identity(row)
+    if (not isinstance(row['manifest_release_version'], str) or
             not row['manifest_release_version'] or
             row['manifest_schema_revision'] != '037'):
         raise RuntimeError('Placement normalization requested run manifest '
@@ -5993,7 +6070,9 @@ def _validate_placement_normalization_ledger_result(
     """Validate immutable result bytes and service incarnation in a ledger."""
     classification = row[f'{prefix}_classification']
     outcome = row[f'{prefix}_outcome']
-    if (classification, outcome) not in _LOADABLE_NORMALIZATION_LEDGER_OUTCOMES:
+    identity, mode = _placement_normalization_manifest_identity(row)
+    if not placement_normalization_identity.is_loadable_manifest_outcome(
+            identity, mode, classification, outcome):
         raise RuntimeError(
             f'Placement normalization {prefix} ledger row is absent or does '
             'not prove a loadable explicit contract result.')
@@ -6061,7 +6140,9 @@ def _validate_placement_normalization_completed_ledger_result(
         # A version created after the completed run is an ordinary later
         # version and need not appear in the old inventory.
         return
-    if ledger_outcome in _FILLABLE_NORMALIZATION_LEDGER_OUTCOMES:
+    identity, mode = _placement_normalization_manifest_identity(row)
+    if placement_normalization_identity.is_fillable_manifest_outcome(
+            identity, mode, *ledger_outcome):
         # A placeholder had no contract to load.  Filling it through the
         # v2-only version writer is an ordinary later commit, but the old
         # inventory identity must still belong to this service incarnation.
@@ -6072,8 +6153,24 @@ def _validate_placement_normalization_completed_ledger_result(
                                                     expected_service_hash)
 
 
+def _validate_placement_normalization_completed_service_incarnation(
+        row: Mapping[str, Any], expected_service_hash: str) -> None:
+    """Require one completed run to inventory only this service incarnation."""
+    if not isinstance(expected_service_hash, str) or not expected_service_hash:
+        raise RuntimeError(
+            'Placement normalization service incarnation is invalid.')
+    anchor_count = row['service_ledger_anchor_count']
+    matching_count = row['service_ledger_matching_hash_count']
+    if (type(anchor_count) is not int or anchor_count < 1 or
+            type(matching_count) is not int or matching_count != anchor_count):
+        raise RuntimeError(
+            'Placement normalization completed receipt has no exact '
+            'service incarnation ledger anchor.')
+
+
 def _validate_placement_normalization_loaded_receipt(
-        row: Mapping[str, Any], requested_run_id: uuid.UUID | None) -> None:
+        row: Mapping[str, Any], requested_run_id: uuid.UUID | None,
+        manifest_completed_at: float | None) -> None:
     loaded_values = (
         row['loaded_run_id'],
         row['loaded_image_commit'],
@@ -6084,10 +6181,16 @@ def _validate_placement_normalization_loaded_receipt(
     )
     loaded_run_id = loaded_values[0]
     if requested_run_id is None:
+        if manifest_completed_at is not None:
+            raise RuntimeError('Placement normalization completion exists '
+                               'without a requested run.')
         if any(value is not None for value in loaded_values):
             raise RuntimeError('Placement normalization receipt exists '
                                'without a requested run.')
         return
+    if manifest_completed_at is None:
+        raise RuntimeError('Placement normalization requested run has no '
+                           'validated completion timestamp.')
     if loaded_run_id is None:
         if any(value is not None for value in loaded_values[1:]):
             raise RuntimeError('Placement normalization loaded receipt is '
@@ -6117,6 +6220,9 @@ def _validate_placement_normalization_loaded_receipt(
             not math.isfinite(float(loaded_at)) or loaded_at < 0):
         raise RuntimeError('Placement normalization loaded receipt has an '
                            'invalid timestamp.')
+    if float(loaded_at) < manifest_completed_at:
+        raise RuntimeError('Placement normalization loaded receipt predates '
+                           'its run completion.')
 
 
 def get_placement_normalization_request(
@@ -6183,7 +6289,8 @@ def get_placement_normalization_request(
         row, 'recovery', require_cleanup_contract=require_cleanup_contract)
     _validate_raw_explicit_placement_contract(
         row, 'current', require_cleanup_contract=require_cleanup_contract)
-    _validate_placement_normalization_loaded_receipt(row, requested_run_id)
+    _validate_placement_normalization_loaded_receipt(row, requested_run_id,
+                                                     manifest_completed_at)
     if requested_run_id is None:
         return None
     # The ledger proves the one forced post-normalization load.  A completed
@@ -6193,6 +6300,8 @@ def get_placement_normalization_request(
     # independent of the old run inventory and therefore have no ledger row.
     if row['loaded_run_id'] == requested_run_id:
         assert manifest_completed_at is not None
+        _validate_placement_normalization_completed_service_incarnation(
+            row, expected_service_hash)
         for prefix in ('recovery', 'current'):
             _validate_placement_normalization_completed_ledger_result(
                 row, prefix, expected_service_hash, manifest_completed_at)
@@ -6219,7 +6328,7 @@ def acknowledge_placement_normalization_loaded(
     boot_id: str,
     loaded_at: float | None = None,
 ) -> bool:
-    """CAS a controller-load receipt for one still-requested generation."""
+    """CAS the one-time controller-load receipt for a pending generation."""
     if not isinstance(request, PlacementNormalizationRequest):
         raise TypeError('request must be a PlacementNormalizationRequest.')
     if not isinstance(request.run_id, uuid.UUID):
@@ -6285,11 +6394,22 @@ def acknowledge_placement_normalization_loaded(
         _validate_raw_explicit_placement_contract(row,
                                                   'current',
                                                   require_cleanup_contract=True)
-        _validate_placement_normalization_loaded_receipt(row, request.run_id)
+        manifest_completed_at = _validate_placement_normalization_run_manifest(
+            row, request.run_id)
+        _validate_placement_normalization_loaded_receipt(
+            row, request.run_id, manifest_completed_at)
+        if row['loaded_run_id'] is not None:
+            # A completed receipt is immutable evidence.  Even an exact retry
+            # must not refresh its process identity or observation timestamp.
+            session.rollback()
+            return False
         _validate_placement_normalization_pending_ledger_proof(
             row, 'recovery', expected_service_hash, request.lifecycle_epoch)
         _validate_placement_normalization_pending_ledger_proof(
             row, 'current', expected_service_hash, request.lifecycle_epoch)
+        if float(loaded_at) < manifest_completed_at:
+            raise RuntimeError('Placement normalization load timestamp '
+                               'predates its run completion.')
         predicates = [
             services_table.c.name == service_name,
             services_table.c.hash == expected_service_hash,
@@ -6298,6 +6418,15 @@ def acknowledge_placement_normalization_loaded(
             services_table.c.current_version == request.current_version,
             services_table.c.placement_normalization_requested_run_id ==
             request.run_id,
+            services_table.c.placement_normalization_loaded_run_id.is_(None),
+            services_table.c.placement_normalization_loaded_image_commit.is_(
+                None),
+            services_table.c.placement_normalization_loaded_controller_pid.is_(
+                None),
+            services_table.c.placement_normalization_loaded_controller_ip.is_(
+                None),
+            services_table.c.placement_normalization_loaded_boot_id.is_(None),
+            services_table.c.placement_normalization_loaded_at.is_(None),
         ]
         if request.lifecycle_epoch is not None:
             predicates.append(

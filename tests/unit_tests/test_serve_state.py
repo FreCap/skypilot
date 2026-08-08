@@ -12,6 +12,7 @@ import hashlib
 import json
 import pickle
 import sqlite3
+from unittest import mock
 import uuid
 
 import pytest
@@ -22,6 +23,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky import clouds
 from sky.serve import constants as serve_constants
+from sky.serve import ephemeral_storage_contract
 from sky.serve import paid_capacity
 from sky.serve import placement_contract_normalization
 from sky.serve import placement_policy
@@ -164,7 +166,9 @@ def _insert_placement_normalization_run(engine,
                                         row_count: int = 1,
                                         classification_counts: dict[str, int] |
                                         None = None,
-                                        schema_revision: str = '037') -> None:
+                                        schema_revision: str = '037',
+                                        mode: str = 'apply_supported',
+                                        normalizer_protocol: int = 1) -> None:
     digest = 'a' * 64
     if classification_counts is None:
         classification_counts = {'fieldless_supported': row_count}
@@ -172,8 +176,8 @@ def _insert_placement_normalization_run(engine,
         session.execute(
             serve_state.placement_normalization_runs_table.insert().values(
                 run_id=run_id,
-                mode='apply_supported',
-                normalizer_version='1:test',
+                mode=mode,
+                normalizer_version=f'{normalizer_protocol}:{"a" * 40}',
                 schema_revision=schema_revision,
                 release_version='test',
                 started_at=1.0,
@@ -2758,11 +2762,14 @@ class TestEphemeralStorageCleanupIntents:
 
     @staticmethod
     def _yaml(resource_scope: str, generation: str) -> str:
+        scope_id = (
+            ephemeral_storage_contract.canonical_ephemeral_storage_scope_id(
+                resource_scope, generation))
         return f"""\
-metadata:
+_metadata:
   {serve_constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY}:
     resource_scope: {resource_scope}
-    scope_id: svscope
+    scope_id: {scope_id}
     storage_generation: {generation}
     storage_mounts: []
 service:
@@ -2785,6 +2792,93 @@ service:
         intents = serve_state.get_ephemeral_storage_cleanup_intents('svc')
         assert len(intents) == 1
         assert intents[0]['provisional'] == 0
+
+    def test_exact_handoff_rejects_cas_rowcount_miss(self):
+        yaml_content = self._yaml('incarnation-a', 'generation-1')
+        intent = {
+            'service_name': 'svc',
+            'resource_scope': 'incarnation-a',
+            'storage_generation': 'generation-1',
+            'yaml_content': yaml_content,
+            'pool': 0,
+            'lifecycle_epoch': 1,
+            'provisional': 1,
+            'created_at': 1.0,
+        }
+        select_result = mock.Mock()
+        select_result.mappings.return_value.one_or_none.return_value = intent
+        update_result = mock.Mock(rowcount=0)
+        session = mock.Mock(spec=orm.Session)
+        session.execute.side_effect = [select_result, update_result]
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            serve_state._adopt_exact_ephemeral_storage_cleanup_intent(
+                session, 'svc', 'incarnation-a', 'generation-1', yaml_content,
+                False, 1, 2.0)
+
+        assert session.execute.call_count == 2
+
+    def test_initial_registration_accepts_already_committed_exact_intent(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-1')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', yaml_content, False, epoch,
+            False)
+
+        assert _add_minimal_service('svc',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=epoch,
+                                    resource_scope='incarnation-a',
+                                    yaml_content=yaml_content)
+        intent = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert intent['provisional'] == 0
+
+    def test_initial_registration_requires_matching_intent(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-1')
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            _add_minimal_service('svc',
+                                 service_hash='incarnation-a',
+                                 lifecycle_epoch=epoch,
+                                 resource_scope='incarnation-a',
+                                 yaml_content=yaml_content)
+
+        assert serve_state.get_service_from_name('svc') is None
+
+    @pytest.mark.parametrize('mismatch', ['yaml', 'pool', 'stale_provisional'])
+    def test_initial_registration_requires_exact_intent_preimage(
+            self, _mock_serve_db, mismatch):
+        intent_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        intent_yaml = self._yaml('incarnation-a', 'generation-1')
+        committed_yaml = intent_yaml
+        intent_pool = False
+        if mismatch == 'yaml':
+            committed_yaml += 'envs: {}\n'
+        elif mismatch == 'pool':
+            intent_pool = True
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', intent_yaml, intent_pool,
+            intent_epoch, True)
+        commit_epoch = intent_epoch
+        if mismatch == 'stale_provisional':
+            commit_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            _add_minimal_service('svc',
+                                 service_hash='incarnation-a',
+                                 lifecycle_epoch=commit_epoch,
+                                 resource_scope='incarnation-a',
+                                 yaml_content=committed_yaml)
+
+        assert serve_state.get_service_from_name('svc') is None
+        intent = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert intent['provisional'] == 1
 
     def test_version_commit_adopts_new_generation_atomically(
             self, _mock_serve_db):
@@ -2812,6 +2906,238 @@ service:
         intent = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
         assert intent['storage_generation'] == 'generation-2'
         assert intent['provisional'] == 0
+
+    def test_version_commit_accepts_reused_committed_intent(
+            self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        initial_yaml = self._yaml('incarnation-a', 'generation-1')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', initial_yaml, False,
+            first_epoch, False)
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a',
+                                    yaml_content=initial_yaml)
+
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        update_yaml = f'{initial_yaml}envs: {{}}\n'
+        # Reusing one already-committed generation refreshes its exact YAML but
+        # intentionally retains the original lifecycle/provisional ownership.
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', update_yaml, False,
+            update_epoch, False)
+        before = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert before['lifecycle_epoch'] == first_epoch
+        assert before['provisional'] == 0
+        assert before['yaml_content'] == update_yaml
+
+        assert serve_state.add_or_update_version(
+            'svc',
+            2,
+            _service_spec('generation-2'),
+            update_yaml,
+            expected_service_hash='incarnation-a',
+            expected_lifecycle_epoch=update_epoch,
+            expected_controller_owner=(200, '10.0.0.2'))
+        after = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert after['lifecycle_epoch'] == first_epoch
+        assert after['provisional'] == 0
+
+    def test_version_commit_rejects_future_committed_intent(
+            self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a')
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-2')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-2', yaml_content, False,
+            update_epoch, False)
+        intent_table = serve_state.ephemeral_storage_cleanup_intents_table
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(intent_table).where(
+                    intent_table.c.service_name == 'svc').values(
+                        lifecycle_epoch=update_epoch + 1))
+            session.commit()
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            serve_state.add_or_update_version(
+                'svc',
+                2,
+                _service_spec('generation-2'),
+                yaml_content,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=update_epoch,
+                expected_controller_owner=(200, '10.0.0.2'))
+
+        assert serve_state.get_yaml_content('svc', 2) is None
+
+    def test_version_commit_rejects_intent_created_after_version(
+            self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a')
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-2')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-2', yaml_content, False,
+            update_epoch, True)
+        intent_table = serve_state.ephemeral_storage_cleanup_intents_table
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(intent_table).where(
+                    intent_table.c.service_name == 'svc').values(
+                        created_at=10**12))
+            session.commit()
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            serve_state.add_or_update_version(
+                'svc',
+                2,
+                _service_spec('generation-2'),
+                yaml_content,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=update_epoch,
+                expected_controller_owner=(200, '10.0.0.2'))
+
+        assert serve_state.get_yaml_content('svc', 2) is None
+
+    def test_version_commit_rejects_malformed_parent_pool_bit(
+            self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a')
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-2')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-2', yaml_content, False,
+            update_epoch, True)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == 'svc').values(pool=2))
+            session.commit()
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            serve_state.add_or_update_version(
+                'svc',
+                2,
+                _service_spec('generation-2'),
+                yaml_content,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=update_epoch,
+                expected_controller_owner=(200, '10.0.0.2'))
+
+        assert serve_state.get_yaml_content('svc', 2) is None
+
+    def test_legacy_metadata_alias_blocks_initial_commit(self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-1').replace(
+            '_metadata:', 'metadata:', 1)
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', yaml_content, False, epoch,
+            True)
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            _add_minimal_service('svc',
+                                 service_hash='incarnation-a',
+                                 lifecycle_epoch=epoch,
+                                 resource_scope='incarnation-a',
+                                 yaml_content=yaml_content)
+
+        intent = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert intent['provisional'] == 1
+
+    def test_malformed_internal_metadata_blocks_initial_commit(
+            self, _mock_serve_db):
+        epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-1').replace(
+            '    storage_mounts: []\n', '')
+        assert serve_state.add_ephemeral_storage_cleanup_intent(
+            'svc', 'incarnation-a', 'generation-1', yaml_content, False, epoch,
+            True)
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            _add_minimal_service('svc',
+                                 service_hash='incarnation-a',
+                                 lifecycle_epoch=epoch,
+                                 resource_scope='incarnation-a',
+                                 yaml_content=yaml_content)
+
+        assert serve_state.get_service_from_name('svc') is None
+        intent = serve_state.get_ephemeral_storage_cleanup_intents('svc')[0]
+        assert intent['provisional'] == 1
+
+    def test_scope_owner_mismatch_blocks_version_commit(self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a')
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-b', 'generation-2')
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            serve_state.add_or_update_version(
+                'svc',
+                2,
+                _service_spec('generation-2'),
+                yaml_content,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=update_epoch,
+                expected_controller_owner=(200, '10.0.0.2'))
+
+        assert serve_state.get_yaml_content('svc', 2) is None
+
+    def test_version_commit_requires_matching_intent(self, _mock_serve_db):
+        first_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        assert _add_minimal_service('svc',
+                                    controller_pid=200,
+                                    controller_ip='10.0.0.2',
+                                    service_hash='incarnation-a',
+                                    lifecycle_epoch=first_epoch,
+                                    resource_scope='incarnation-a')
+        update_epoch = serve_state.claim_service_lifecycle_epoch('svc')
+        yaml_content = self._yaml('incarnation-a', 'generation-2')
+
+        with pytest.raises(
+                ephemeral_storage_contract.EphemeralStorageContractError):
+            serve_state.add_or_update_version(
+                'svc',
+                2,
+                _service_spec('generation-2'),
+                yaml_content,
+                expected_service_hash='incarnation-a',
+                expected_lifecycle_epoch=update_epoch,
+                expected_controller_owner=(200, '10.0.0.2'))
+
+        assert serve_state.get_yaml_content('svc', 2) is None
+        service = serve_state.get_service_from_name('svc')
+        assert service is not None
+        assert service['version'] == serve_constants.INITIAL_VERSION
 
 
 class TestGetServiceFromNameReturnsControllerIp:
@@ -4349,6 +4675,19 @@ class TestRecoveryVersionSelection:
             recovery_version=1,
             current_version=1,
             lifecycle_epoch=lifecycle_epoch)
+        with pytest.raises(RuntimeError, match='predates its run completion'):
+            serve_state.acknowledge_placement_normalization_loaded(
+                service_name,
+                request,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner,
+                image_commit='commit-a',
+                child_controller_pid=456,
+                boot_id='a' * 32,
+                loaded_at=1.5)
+        assert _read_row(
+            _mock_serve_db,
+            service_name)['placement_normalization_loaded_run_id'] is None
         assert serve_state.acknowledge_placement_normalization_loaded(
             service_name,
             request,
@@ -4372,6 +4711,28 @@ class TestRecoveryVersionSelection:
                 32)
         assert service_row['placement_normalization_loaded_at'] == 123.0
 
+        assert not serve_state.acknowledge_placement_normalization_loaded(
+            service_name,
+            request,
+            expected_service_hash='incarnation-a',
+            expected_controller_owner=owner,
+            image_commit='commit-b',
+            child_controller_pid=789,
+            boot_id='b' * 32,
+            loaded_at=456.0)
+        immutable_receipt = _read_row(_mock_serve_db, service_name)
+        assert immutable_receipt[
+            'placement_normalization_loaded_run_id'] == run_id
+        assert immutable_receipt[
+            'placement_normalization_loaded_image_commit'] == 'commit-a'
+        assert immutable_receipt[
+            'placement_normalization_loaded_controller_pid'] == 456
+        assert immutable_receipt[
+            'placement_normalization_loaded_controller_ip'] == owner[1]
+        assert immutable_receipt[
+            'placement_normalization_loaded_boot_id'] == 'a' * 32
+        assert immutable_receipt['placement_normalization_loaded_at'] == 123.0
+
         # The receipt is a one-time normalization proof, not a permanent
         # requirement that future ordinary versions appear in the old run.
         assert serve_state.add_or_update_version(
@@ -4383,6 +4744,28 @@ class TestRecoveryVersionSelection:
             current_version=2,
             expected_service_hash='incarnation-a',
             expected_controller_owner=owner) is None
+
+        # Both selected versions are now later than the completed run.  The
+        # immutable v1 ledger row is still the incarnation anchor; copying the
+        # receipt to a different same-name incarnation must fail closed.
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(
+                    serve_state.placement_normalization_rows_table).where(
+                        serve_state.placement_normalization_rows_table.c.run_id
+                        == run_id,
+                        serve_state.placement_normalization_rows_table.c.
+                        service_name == service_name).values(
+                            service_hash='incarnation-b'))
+            session.commit()
+        with pytest.raises(RuntimeError,
+                           match='service incarnation ledger anchor'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=2,
+                current_version=2,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
 
     def test_placement_normalization_receipt_rejects_stale_lifecycle(
             self, _mock_serve_db):
@@ -4558,6 +4941,41 @@ class TestRecoveryVersionSelection:
             session.commit()
 
         with pytest.raises(RuntimeError, match='persisted spec does not match'):
+            serve_state.get_placement_normalization_request(
+                service_name,
+                recovery_version=1,
+                current_version=1,
+                expected_service_hash='incarnation-a',
+                expected_controller_owner=owner)
+
+    def test_pending_receipt_rejects_outcome_disallowed_by_manifest_mode(
+            self, _mock_serve_db):
+        service_name = 'svc-normalization-mode-mismatch'
+        owner = (123, '10.0.0.1')
+        assert _add_minimal_service(service_name,
+                                    service_hash='incarnation-a',
+                                    controller_pid=owner[0],
+                                    controller_ip=owner[1],
+                                    spec=_v2_service_spec('spec-1'))
+        lifecycle_epoch = serve_state.claim_service_lifecycle_epoch(
+            service_name)
+        run_id = uuid.uuid4()
+        _insert_placement_normalization_run(_mock_serve_db,
+                                            run_id,
+                                            mode='retire_terminal_historical',
+                                            normalizer_protocol=2)
+        spec_bytes = _read_version_row(_mock_serve_db, service_name, 1)['spec']
+        _insert_placement_normalization_row(_mock_serve_db, run_id,
+                                            service_name, 1, spec_bytes,
+                                            'incarnation-a', lifecycle_epoch)
+        with orm.Session(_mock_serve_db) as session:
+            session.execute(
+                sqlalchemy.update(serve_state.services_table).where(
+                    serve_state.services_table.c.name == service_name).values(
+                        placement_normalization_requested_run_id=run_id))
+            session.commit()
+
+        with pytest.raises(RuntimeError, match='mode|outcome|ledger'):
             serve_state.get_placement_normalization_request(
                 service_name,
                 recovery_version=1,
@@ -4846,7 +5264,8 @@ class TestRecoveryVersionSelection:
                         == 1))
             session.commit()
 
-        with pytest.raises(RuntimeError, match='predates.*no ledger'):
+        with pytest.raises(RuntimeError,
+                           match='service incarnation ledger anchor'):
             serve_state.get_placement_normalization_request(
                 service_name,
                 recovery_version=1,

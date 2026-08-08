@@ -1,16 +1,27 @@
 # SkyServe explicit placement contract
 
-_Status: transition PR #1318 is merged, released as v1.1.1135, and deployed to
-production as Helm revision 351.  A normalization release is in progress to
-replace every fieldless or explicit-v1 PostgreSQL contract with the sole
-mirror-free v2 representation and to retire only conclusively terminal
-transition-only contracts.  Draft cleanup PR
-#1319's implementation passed 30/30 checks but remains blocked on the measured
-removal gates and is not approved to merge or deploy.  Platform pin PR #8090
-was closed because this SkyPilot control-plane release is deployed directly
-with Helm.  The first production verification passed; normalization, the
-cleanup observation window, and retained-artifact inventory remain open.
-Created 2026-08-07; last updated 2026-08-07._
+_Status: transition PR #1318 is merged, released as v1.1.1135, and deployed.
+Normalization PR #1328 is merged as
+`ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`, released as v1.1.1143, and
+deployed directly with Helm.  Its supported transaction
+converted 156 authoritative fieldless/v1 contracts to mirror-free v2; the
+post-apply inventory is 156 explicit-v2 rows, one terminal historical
+physical/per-GPU row, and seven placeholders, with zero pending supported
+changes or ledger mismatches.  Historical retirement remains blocked in
+production while the protocol-2 follow-up is reviewed and released.  That
+follow-up replaces both incorrect raw cleanup readers with one typed
+`_metadata` contract, all-column intent CAS, and a bounded predecessor-receipt
+proof for the 49 version-referenced cleanup intents whose committed handoff
+flag was missed.  Receipt-lock
+hotfix PR #1330 is merged as
+`ccae3e8ec2caae74a9baff8f0268078d35e03307`, released as v1.1.1146, and
+deployed directly with Helm at revision 357.  All eight requested receipts,
+controller ports, and controller health probes converged after that rollout;
+all 16 external load-balancer deployments are Available.  Draft cleanup PR
+#1319 remains blocked on every measured removal
+gate and is not approved to merge or deploy.  Platform pin PR #8090 remains
+closed because this SkyPilot control-plane release is deployed directly with
+Helm.  Created 2026-08-07; last updated 2026-08-07._
 
 ## Decision summary
 
@@ -374,6 +385,24 @@ records it.  Spec-drift comparison uses the latest result for the exact
 `(service_name, version, service_hash, lifecycle_epoch)` owner generation and
 does not compare unrelated mutable status columns.
 
+The cleanup-contract and receipt additions bump every new run manifest to
+normalizer protocol 2.  Ledger verification continues to accept and exactly
+validate completed protocol-1 manifests from the supported v1.1.1143
+transaction; it dispatches retirement-fact validation by the recorded
+protocol instead of reinterpreting old facts as v2.  Every new write uses
+protocol 2.  The advisory-lock identity remains unchanged so v1 and v2
+operators cannot run concurrently.
+`normalizer_version` has the exact grammar
+`^(1|2):[0-9a-f]{40}$`; apply refuses a build without an exact release commit.
+Protocol 1 keeps its frozen mode/outcome matrix and original retirement-fact
+validator byte-for-byte.  Protocol 2 uses the same supported-row matrix but
+requires the v2 cleanup and predecessor-receipt facts for every retired
+outcome.  This dispatcher is shared by complete-ledger verification,
+controller receipt-manifest validation, and the global predecessor-receipt
+scan; an unknown protocol, a malformed suffix, or protocol/fact mismatch is a
+blocker.  Tests include a secret-free exact manifest/row snapshot of production
+run `3bacd32f-888e-4a1f-af87-8f17dd82f168`, not only a synthetic v1 ledger.
+
 For a supported fieldless or v1 tuple, the result pickle is a real
 `SkyServiceSpec`.  Its raw top-level mapping differs only by the explicit
 policy/pool keys, seven placement keys, and removal of the rollback mirror. The
@@ -437,16 +466,82 @@ malformed possibly matching row, scan overflow, nonzero root count, or changed
    recreate a target root during the three-checkpoint proof.
 The proof deliberately treats retained terminal roots as dependencies rather
 than trying to infer that no down action, attempt, request, coverage, or shadow
-reference can still reach them.  The exact YAML cleanup projection must
-contain no legacy file/storage ownership that v1.1.1135 could strand.  New
-cleanup inventory
-reads both committed and `retired_yaml_content`, so the history-only YAML
-remains available after rollback support advances; the orphan-child-mode
-accessor uses the same history-only fallback instead of interpreting
-`pickle(None)` plus NULL live YAML as an unknown child mode.  If the versioned
-controller-configuration protocol is active for any row of the service, the
-strictly newer elected/recovery successor must carry and validate a complete
-`controller_config`, `controller_config_digest`, and
+reference can still reach them.
+
+Retirement cleanup proof is a typed protocol, not a service-wide count or a
+truthiness test.  Task YAML serializes internal metadata under the exact
+top-level `_metadata` field; `metadata` is not an alias.  A dependency-neutral
+cleanup-contract parser owns that spelling and returns either no scope or an
+exact `EphemeralStorageScope` containing nonempty `resource_scope`,
+`scope_id`, and `storage_generation` strings plus a typed
+`storage_mounts: list[str]`.  It rejects a partial scope, wrong type, empty
+identity, unknown scope field, or a `scope_id` that does not equal the
+canonical function of scope and generation.  The central version-commit
+handoff reader and the retirement normalizer both use this one interface;
+neither reads a second raw key, calls `getattr`, or treats a false-ish malformed
+value as absence.
+
+The v2 retirement cleanup protocol initially accepts only a zero-deletion
+target graph.  Under the existing cleanup-intent table writer lock it scans a
+bounded, stable-PK-ordered inventory for every historical candidate service.
+Each row must have exact nonempty string identity fields, an exact integer pool
+bit matching the non-pool parent, a positive exact-integer lifecycle epoch no
+greater than the parent epoch, a finite nonnegative creation time, and an exact
+integer provisional bit.  Its YAML and the retained cleanup YAML of exactly
+one version must be byte-identical and must independently parse to the same
+canonical scope/generation/scope ID.  Each intent maps to exactly one retained
+version and each historical candidate maps to exactly one intent; collisions,
+missing matches, foreign scopes, or overflow block the whole transaction.
+The parent `hash`, `resource_scope`, YAML scope, and intent scope must all be
+the same nonempty identity.
+Every matched version preimage must still be a genuinely committed live row:
+`yaml_content` is non-NULL, `retired_at` is NULL, `created_at` is finite and
+nonnegative, and `intent.created_at <= version.created_at`.  One generation
+mapping to multiple versions, one version mapping to multiple generations, or
+a reused-generation topology blocks rather than selecting a winner.
+
+The pure cleanup projection performs no filesystem, provider, storage
+construction, or deletion call.  On both the candidate and its matched intent
+it requires `file_mounts`, `storage_mounts`, and `volumes` to be absent/NULL or
+exact empty mappings; `volume_mounts` to be absent/NULL or an exact empty list;
+`workdir` to be absent/NULL; and scoped `storage_mounts` to be exactly `[]`.
+The same zero-target requirement applies to every intent/version match repaired
+in this first protocol.  Nonempty ownership remains unsupported even when an
+intent appears to cover it.
+
+The currently deployed writer missed committed handoff because it inspected
+`metadata` while `Task.to_yaml_config()` emitted `_metadata`.  In the same
+serializable retirement transaction, and before evaluating the final cleanup
+predicate, the v2 protocol CAS-adopts each exactly matched stale intent from
+integer `provisional=1` to `0`.  The CAS binds the primary key and every other
+column preimage and changes no YAML, identity, pool, epoch, or timestamp.
+Already committed integer-zero matches are unchanged; any other value blocks.
+The operator validates and freezes the complete 49-row production repair plan
+before issuing the first CAS; this first protocol deliberately repairs every
+exact service-scoped match, not only the historical candidate's row.  It
+requires the affected-row count to equal the planned one-to-zero count and
+recomputes a post-inventory digest whose only permitted delta is precisely
+those planned `provisional: 1 -> 0` fields.
+All adoptions and the historical retirement commit atomically, so a later
+retirement blocker rolls back the flag repair as well.  This is a durable-state
+repair, not external cleanup, and cannot launch or delete provider resources.
+
+The ledger stores the cleanup-proof protocol, complete intent inventory count
+and secret-free pre/post digests, adopted count, candidate match count, hashed
+intent key, candidate/intent YAML digests, zero-target projection digests and
+counts, exact retired-YAML preservation, and the current-reader and
+v1.1.1135 omission-lossless proofs.  It stores no raw YAML, path, secret, or
+provider credential.  Postimage verification requires every intent column
+except the explicitly adopted bit to remain byte-for-byte unchanged.  The
+current cleanup reader continues to read `coalesce(yaml_content,
+retired_yaml_content)`, so its inventory is unchanged; v1.1.1135 loses the
+candidate's live YAML but retains the exact committed, zero-target intent.
+The orphan-child-mode accessor uses the same history-only fallback instead of
+interpreting `pickle(None)` plus NULL live YAML as an unknown child mode.
+
+If the versioned controller-configuration protocol is active for any row of
+the service, the strictly newer elected/recovery successor must carry and
+validate a complete `controller_config`, `controller_config_digest`, and
 `controller_config_snapshot_id` tuple before the historical row is eligible.
 The ledger retains all pre/post column and payload digests and the terminal
 proof, but none of the legacy pickle bytes.
@@ -476,6 +571,47 @@ identity to the same service incarnation, but does not compare the obsolete
 placeholder digest or lifecycle epoch.  Both cases remain subject to raw v2
 validation; any other inventoried non-loadable outcome rejects.  Pending
 acknowledgement remains exact-epoch fenced.
+Before historical retirement may replace a service's requested receipt with a
+new run UUID, a locked global receipt scan selects every service for which any
+requested or loaded receipt column is non-NULL.  It is ordered by exact service
+name, uses `limit + 1` against an explicit bound, and hashes the complete typed
+tuple.  It therefore catches a NULL requested UUID with a stray loaded field as
+well as ordinary pending/mismatched state.  Each requested UUID must equal its
+loaded UUID; its protocol-1 or protocol-2 manifest, per-version ledger rows,
+and raw current/recovery specs pass the shared full validator.  The loaded
+image commit must be one of an explicit operator-supplied set of approved exact
+40-hex v2-writer commits; PID is a positive exact integer; IP is NULL or a
+nonempty string; boot ID is exactly 32 lowercase hex; and `loaded_at` is
+finite and no earlier than the manifest completion.  A completed receipt is
+historical one-time load evidence: it remains bound to the immutable service
+incarnation hash and raw current/recovery specs through its ledger, but its
+loaded PID/IP and ledger lifecycle epoch need not equal the current owner after
+a later controller restart or lifecycle advance.  Exact current-owner and
+epoch fencing applies only to the pending read/CAS path.  Unknown protocols,
+overflow, duplicate names, partial state, orphan manifests, or unapproved
+commits block.  The approved
+commit set is itself hashed into the operator freeze evidence rather than
+inferred from tags.  Protocol 2 stores the caller's exact 64-hex freeze digest
+and the canonical digest of the sorted approved-commit set in each retirement
+row, and the run manifest stores the canonical SHA-256 of
+`{"approved_loaded_image_commit_sha256": <set digest>,
+"operator_freeze_evidence_input_sha256": <caller digest>}`.  Ledger
+verification recomputes that composition and requires it to equal the manifest
+freeze digest, so neither input can be substituted independently.
+
+A clean pending receipt is a hard blocker, not permission to overwrite
+evidence.  The retirement ledger records the fully validated predecessor
+receipt inventory count and digest.  The eight v1.1.1143 requested receipts
+converged under exact v1.1.1146 commit
+`ccae3e8ec2caae74a9baff8f0268078d35e03307`; that commit must be explicit in
+the production retirement allowlist.  On PostgreSQL the pending
+acknowledgement query locks exactly `services` with `FOR UPDATE OF services`,
+not every joined relation: its requested/current/owner predicates are mutable
+only under that row lock, while version and completed-ledger rows are
+immutable.  An unqualified `FOR UPDATE` is forbidden because the manifest is
+outer-joined and PostgreSQL cannot lock the nullable side.  Real-PostgreSQL
+coverage must execute the pending path and prove the exact owner-fenced CAS;
+SQLite coverage is not a substitute.
 Supported-row normalization may run while controllers serve because it does
 not change decoded semantics.  Historical retirement may run only after the
 Helm value `serve.controllerHold=true` has restarted the sole Recreate API pod
@@ -761,23 +897,40 @@ evidence is attached.
    fixed-order bounded writer locks.  Verify its postimages, then enable the
    Serve-controller recovery hold with `serve.controllerHold=true` and
    terminate every affected controller.
+   Do not enable that hold until every requested supported-normalization load
+   receipt is complete and matching.  If a receipt remains cleanly pending,
+   diagnose controller startup/ownership and roll forward with a v2 writer;
+   never overwrite it with a retirement request.
    Reprove that no controller process, pending/applying update, staged-config
    publication, retry, recovery launch, or replayed persisted provider request
    remains before invoking the separate historical retirement mode.  Verify
    directly that the provider-boundary fence rejects a known-valid non-pool
    launch context under the hold.  That mode must reprove its complete
-   dependency matrix under a new transaction and explicit approval.  Any
+   dependency matrix under a new transaction and explicit approval.  It must
+   also bind the exact `_metadata` cleanup graph, atomically adopt only exact
+   committed intent matches, and prove zero deletion targets and unchanged
+   cleanup YAML/intent postimages.  Any
    digest CAS miss, unknown state, missing inventory entry, or timeout rolls
    back that complete phase; a known nonterminal historical tuple leaves
    normalization committed but retirement blocked.  Keep the hold active
    throughout this transaction.
+   The v2 follow-up rollout is explicitly two-phase.  First deploy the exact
+   corrected image directly with Helm `--reuse-values` while
+   `serve.controllerHold=false`.  Let the Recreate pod recover controllers and
+   require all eight protocol-1 requested receipts to converge, all controller
+   ports and health probes to recover, all endpoint/LB identities and 16 LB
+   deployments to remain healthy, and committed/elected/applied versions,
+   replica inventory, and paid-capacity authority to remain unchanged.  Only
+   after attaching that evidence may a separate Helm revision set the hold to
+   true for retirement.
 6. Clear the recovery hold and start each affected live controller under the
    normalization release's transition-compatible decoder.  Verify
    committed/elected/applied convergence, active versions, endpoint and LB
    identity, replica inventory, paid launch authority, and zero decode/fence
    errors.  Rerun the normalizer in dry-run mode and require zero changes plus
    complete run/inventory/postimage verification and requested/loaded
-   generation receipts for every affected controller.  Start the zero-event
+   generation receipts for every affected controller, including the new
+   retirement run separately from the predecessor receipts.  Start the zero-event
    clock only after this final reload and query.
 7. Migrate eligible physical GPU services only through an explicit rolling
    update.  Require every old replica to drain and the logical bridge to
@@ -826,8 +979,12 @@ The blocked cleanup may merge only when all are true:
   dry-run reports zero pending changes, zero blockers, and zero ledger
   mismatches.  Later mutable status/catalog columns do not invalidate an
   immutable spec proof.
-- No bridge, cleanup record, retryable version, placement catalog, replica row,
-  resource-action root, or shadow root depends on that version.
+- No bridge, retryable version, placement catalog, replica row,
+  resource-action root, or shadow root depends on that version.  A retained
+  cleanup intent is permitted only when the v2 proof records its exact
+  committed match, zero deletion targets, byte-exact retained YAML, and
+  omission-lossless old-reader coverage; every other cleanup dependency
+  blocks.
 - All eligible GPU services have committed/applied logical versions, no
   quarantined version, and zero remaining physical replicas from migration.
 - Pools and intentionally physical services are either still supported by the
@@ -916,6 +1073,13 @@ Automated coverage must prove:
   unchanged replica, catalog, cost, fill, and workload semantics and does not
   elect a retired historical fixture; no post-apply v2-to-v1 write path is
   supported or tested as valid;
+- an exact unmodified v1.1.1135 post-retirement cleanup harness reads the
+  PostgreSQL fixture through its own accessors: its live-version scan omits the
+  candidate's NULL `yaml_content`, its intent scan still enumerates the exact
+  now-committed matched intent, and the resulting deletion-target set is
+  byte-for-byte/canonically identical to the pre-retirement zero-target set;
+  the harness must not substitute the current reader's
+  `retired_yaml_content` fallback;
 - fresh `pool: {}` plus `workers: N` persists and serializes exactly as
   `{'workers': N}`; the exact preceding release reads the same pool kind, size,
   and policy, its rollback reserialization round-trips through the transition
@@ -939,6 +1103,26 @@ Automated coverage must prove:
   target-process evidence before, under, and after locks, including the
   single-string `setproctitle` representation and fail-closed malformed/access/
   overflow cases;
+- `_metadata` is the only internal Task-YAML metadata spelling; initial and
+  later version commits adopt an exact matching cleanup intent, while
+  `metadata`, missing/partial scope objects, wrong types, scope-ID mismatch,
+  parent-scope mismatch, or a future lifecycle epoch fail closed;
+- the production-shaped 49-intent corpus is bounded and maps one-to-one to
+  retained version YAMLs; the retirement transaction CASes only each stale
+  provisional bit, retains every other intent column and every cleanup YAML
+  byte, and rolls all repairs back if retirement or postimage verification
+  fails;
+- either candidate or intent ownership, duplicate/missing/colliding matches,
+  malformed false-ish cleanup fields, noncanonical scope metadata, inventory
+  overflow/drift, or ledger-fact tampering blocks retirement;
+- protocol-2 verification accepts the exact completed protocol-1 supported
+  manifest without weakening its predicates, and a clean pending, partial,
+  mismatched, or orphan-manifest predecessor receipt blocks retirement; a
+  real-PostgreSQL pending acknowledgement emits `FOR UPDATE OF services`, not
+  an unqualified outer-join lock, and commits the exact owner-fenced receipt;
+  after completion the receipt remains valid across controller PID/IP
+  replacement and lifecycle advance, while an uncompleted receipt stays
+  exact-owner/epoch fenced;
 - bounded typed resource-action and shadow scans block every exact candidate
   source root, including retained terminal roots, malformed possible matches,
   overflow, and pre/locked/post evidence drift;
@@ -1108,6 +1292,81 @@ zero-cost reserved-capacity tests remain fail closed.
   All 55 READY replicas belonged to version 58; the preceding 15 minutes had
   zero requests, in-flight work, queued work, or rejections.  This read-only
   snapshot authorizes no capacity launch and is not normalization evidence.
+- Normalization PR #1328 passed 32/32 checks and merged as
+  `ccdb295a4a6065fc72f67571e87a395d1e6ec2a1`.  The deterministic v1.1.1143
+  release image is
+  `sha256:cefcfc0f4a620707770f0a69e51317b60aab365d331e9dc77877c577c7f6cbc4`
+  and the chart digest is
+  `sha256:0cf390a9ce6eb3d36a3cba229ffdcb7c9124ece55c0ae6e5d94de71af6bd7056`.
+  Direct Helm revision 353 deployed that exact image with reused values and
+  schema 037; revisions 354 and 355 exercised and then cleared the explicit
+  controller hold without changing the image or chart.
+- The production supported freeze evidence digest was
+  `7da998baa11b4e0defab15ae9b72987cc7b1862c07f39b3797ec56e40baadba7`.
+  Run `3bacd32f-888e-4a1f-af87-8f17dd82f168` changed 156 rows and committed
+  post-inventory digest
+  `288cc2d84d8e884806797640d3457436f864a6bc5e6872674e1c225403b37716`.
+  A post-apply dry-run reports 156 explicit-v2, one historical, and seven
+  placeholder rows, with zero changes, blockers, or prior-ledger mismatches.
+  The minimum live-database rollback image is therefore v1.1.1143 or newer;
+  v1.1.1135 and all earlier v1 writers are offline fixtures only.
+- The held retirement preflight proved consolidation, a sole fresh Recreate
+  API pod, zero active Serve mutation requests, zero local target processes,
+  zero legacy controller clusters, zero candidate replicas or unknown-version
+  replicas, zero image demand, and zero typed resource-action roots.  It did
+  not apply retirement because `boltz-l4-fleet-test` has 49 cleanup intents.
+  The hold was cleared immediately and all 16 external load-balancer
+  deployments returned Available.
+- A bounded read-only audit found that each of those 49 intents maps one-to-one
+  to a retained live version YAML by exact bytes and by the exact
+  `_metadata.sky_serve_ephemeral_storage_scope` scope/generation.  Every scope
+  equals the parent hash/resource scope, every scope ID recomputes, and every
+  owned-mount list and top-level file/storage/volume/workdir target is empty.
+  All 49 intents nevertheless retain integer `provisional=1`.  The root cause
+  is explicit: both `_ephemeral_storage_generation_from_yaml()` and the first
+  retirement ownership reader looked for `config['metadata']`, while the Task
+  serializer writes `config['_metadata']`.  The candidate historical version
+  2 maps exactly to the intent created at lifecycle epoch 2.  No production
+  row was changed by this audit.
+- Eight services requested by supported normalization initially had clean
+  pending receipts: requested UUID and manifest were present, loaded UUID and
+  all loaded fields were NULL, and there were no partial or mismatched
+  receipts.  Bounded
+  controller-log inspection found the same exact cause for the active main and
+  historical test services:
+  `psycopg2.errors.FeatureNotSupported: FOR UPDATE cannot be applied to the
+  nullable side of an outer join`.  The query joins the optional run manifest
+  and then calls unqualified `with_for_update()`.  The follow-up must use
+  `with_for_update(of=services_table)`.  PR #1330 merged that fix as
+  `ccae3e8ec2caae74a9baff8f0268078d35e03307` and published v1.1.1146 image
+  digest
+  `sha256:4b497fc70e5cee9f58772b66149c837c940ef37e6823719ae1473192096fca1c`.
+  Direct Helm revision 357 deployed that exact digest with hold false.  The API
+  pod and init/migration containers completed with zero restarts; all eight
+  receipts converged, all eight controller ports were present, all eight direct
+  controller health checks returned 200, and all 16 LB deployments became
+  Ready and Available.  PR #1330's compile assertion alone did not execute the
+  PostgreSQL path; the protocol-2 follow-up closes that gap with the exact
+  pending-receipt lock/CAS test below.
+- The protocol-2 follow-up validates the exact secret-free production
+  protocol-1 run `3bacd32f-888e-4a1f-af87-8f17dd82f168` and all 164 ledger
+  rows from a compressed fixture whose canonical JSON SHA-256 is
+  `5067bd30eb5c2b2604ba1302d020e8e609cec81d25afd74702d2917e1af27ef6`.
+  The test asserts the exact schema projection, excludes every raw spec, YAML,
+  and controller-configuration field, and accepts the snapshot through the
+  shared protocol/mode verifier without synthetic identities.  Typed cleanup,
+  shared protocol dispatch, receipt-incarnation anchoring, and retirement
+  ledger tests pass locally; targeted mypy reports no issues in the four
+  changed source modules.  All 11 receipt/retirement cases pass against an
+  isolated native PostgreSQL 14 server: the exact pending-receipt
+  `FOR UPDATE OF services` and one-time all-NULL CAS; pending, partial,
+  mismatched, orphan-manifest, unapproved-commit, and bounded-overflow
+  blockers; the production-shaped 49-intent retirement; both
+  cleanup-CAS/postimage atomic rollbacks; and the exact production snapshot.
+  Final adversarial review returned GO for code review and merge after finding
+  no remaining correctness blocker.  Production execution remains gated on
+  the documented Helm hold, fresh freeze/preflight, and postflight checks;
+  cleanup PR #1319 remains blocked on its separate removal gates.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
 remain open gates.  This is only the first transition production release, and
@@ -1154,17 +1413,17 @@ removal gate are not yet attached.
   lane, completed successfully.  Credentialed AWS catalog coverage remains
   open because it has not been rerun after the operator refreshed SSO for this
   deployment.
-- Production control-plane v1.1.1135 is deployed directly through Helm; closed
-  Platform PR #8090 is not part of the release path.  The existing revision-350
-  rollback is available only before normalization apply.  A post-apply rollback
-  artifact must be the normalization release or newer and still needs a drill.
+- Production control-plane v1.1.1146 is deployed directly through Helm; closed
+  Platform PR #8090 is not part of the release path.  Normalization apply has
+  committed, so a post-apply rollback artifact must be v1.1.1143 or newer and
+  still needs a drill.
 - A second consecutive production release, the retained 45-day log sink, exact
   zero-event query, and 30 continuous qualifying days remain required.
 - The Boltz fleet's canonical service YAML currently keeps warm capacity; its
   separate scale-to-zero policy must be reviewed, deployed/applied, converged,
   and drained before any service update can claim scale-to-zero compliance.
-- Service version 58 still materializes the legacy logical contract.  Its
-  approved in-place normalization, controller reload, zero-change ledger
-  verification, and legacy durable-state inventory across every retained copy
-  remain required before the zero-event window can start.  The one historical
-  test-service tuple separately requires locked terminal-retirement proof.
+- Service version 58 is authoritative mirror-free v2.  Its requested load
+  receipt and the seven other requested receipts converged under v1.1.1146.
+  The one historical test-service tuple separately requires the v2
+  cleanup-intent handoff repair branch to pass review, merge, deploy, and run
+  its locked terminal-retirement proof before the zero-event window can start.
