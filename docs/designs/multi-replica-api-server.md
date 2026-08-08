@@ -6,7 +6,7 @@ PostgreSQL request-store cutover is complete; the Rainier RWX storage,
 role-split HA, and live scrape acceptance are pending; production fleet rollout
 and M5 compatibility cleanup remain fleet-gated
 
-Last updated: 2026-08-07
+Last updated: 2026-08-08
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -40,21 +40,23 @@ of `boltz-platform-test-eks-cluster`. It uses a dedicated namespace and Helm
 release named `skypilot-ha`; it must not modify the existing `test` namespace or
 the shared `gitops-hub-rainier` SkyPilot release.
 
-The 2026-08-04 Rainier production preflight found that the live 1.1.1084 image
-already contains M0-M4 and the split-role metrics correction, but the release
-still has one API replica, `apiService.highAvailability.enabled=false`,
-`apiService.upgradeStrategy=Recreate`, `requestStore.backend=sqlite`, and a
-200-Gi `gp2` `ReadWriteOnce` claim. The hub infrastructure declares only the
-EBS CSI driver and no RWX storage class. Production activation therefore
-requires an infrastructure and data migration; changing only the Deployment
-strategy is invalid and the chart correctly rejects it.
+The 2026-08-04 Rainier preflight originally found an all-role 1.1.1084 pod on
+SQLite and a 200-Gi `gp2` `ReadWriteOnce` claim. Rainier subsequently completed
+the one-way PostgreSQL request-store cutover in release 1.1.1089. That database
+cutover is historical input to this design, not work for the storage migration
+to repeat.
 
-Rainier completed the one-way PostgreSQL request-store cutover in release
-1.1.1089. As of 2026-08-07 its production configuration keeps that backend and
-durable cutover gate explicit, but still uses one all-role API pod with
-`Recreate` and the 200-Gi `gp2` claim with the chart's `ReadWriteOnce` default.
-The request-store prerequisite is therefore complete; the RWX state migration,
-role split, and guarded rolling activation remain pending.
+A read-only production audit on 2026-08-08 found Helm revision 359 running
+1.1.1149 at commit `3d98a371e4d320aa1b9f3067088caa94d620c4f9` with a healthy
+single all-role pod. The pod explicitly uses PostgreSQL and the durable cutover
+gate, but still uses `Recreate` and the same 200-Gi `gp2` `ReadWriteOnce`
+claim. Its exact EBS volume is unencrypted and had no snapshot at audit time.
+The cluster has three on-demand `m6i.8xlarge` nodes, one in each zone, and has
+no EFS filesystem, EFS CSI add-on, or EFS Pod Identity association.
+The request-store prerequisite and guarded rollout implementation are therefore
+complete; the RWX state migration, capacity expansion, role split, and live
+acceptance remain pending. Changing only the Deployment strategy remains
+invalid and the chart correctly rejects it.
 
 That preflight also records the operational reason to complete the migration.
 One Recreate upgrade produced a 94-second interval with no Ready API pod, and a
@@ -683,31 +685,430 @@ Deployment:
 Rainier production uses the same logical boundary with independently managed
 storage:
 
-1. Provision the EFS driver, encrypted filesystem, mount targets, RWX storage
-   class, and replacement claim through reviewed Terragrunt plans. Protect the
-   filesystem and claim from accidental destroy.
+Before any migration plan is saved, operators freeze direct Helm upgrades for
+the Rainier control plane and reconcile platform IaC to the exact frozen live
+runtime and module commits. From that point through HA acceptance, runtime and
+storage mutations use only reviewed, saved Terragrunt plans and human applies.
+An emergency direct Helm change invalidates every outstanding saved plan and
+continuous observation clock; the live change must be backfilled into IaC and
+new plans reviewed before the migration resumes.
+
+1. Provision a dedicated rotation-enabled, `prevent_destroy` SkyPilot-state
+   KMS key, the EFS driver, an encrypted General Purpose filesystem with
+   Elastic Throughput, a dedicated daily AWS Backup plan and vault with at least
+   35 days of retention, and one mount target per availability zone. Create two
+   Terraform-owned static access points and statically bound RWX PV/PVC pairs:
+   the application state root and a distinct authority root. The state access
+   point is owned by UID/GID 0 so migration can preserve existing root-owned
+   `.sky` and `.ssh` metadata. Workloads mount state read-write and authority
+   read-only; they cannot reach the authority directory through the state
+   access point. Only migration Jobs ever mount authority read-write, and their
+   identity and RBAC are removed before application restart. Dynamic
+   access-point UID/GID allocation is not part of production. Protect the
+   filesystem, access points, backup and filesystem policies, PVs, and claims
+   from accidental destroy.
 2. Add `helm.sh/resource-policy: keep` to the legacy release-owned claim in a
    no-pod-change Helm revision and prove the API Deployment and pod identities
    did not change. Platform IaC must assume durable ownership of the kept claim
    before the chart stops rendering it; the annotation alone only orphans the
-   object. This protects the audit source when the chart later stops rendering
-   that claim.
-3. Populate the replacement claim and verify ownership, modes, hashes, and
-   usable capacity before selecting it. `storage.existingClaim` only selects a
-   claim; it deliberately does not copy data or infer that copying was safe.
-4. Block legacy submissions, drain or explicitly interrupt active requests,
-   stop every SQLite writer, perform the final file synchronization, and run
-   the explicit cutover importer. Do not start a PostgreSQL writer until the
-   importer has verified counts and hashes and committed its marker.
-5. Apply a one-API-pod compatibility revision with the replacement claim and
-   PostgreSQL request store, but without split-role HA. Accept this revision as
-   the fix-forward rollback target on the far side of the one-way cutover.
-6. After the compatibility revision is healthy, apply a new guarded Helm
-   upgrade with explicit API/executor/controller roles and RollingUpdate. Keep
-   the legacy claim and SQLite source read-only through the rollback window.
-7. Author the legacy-claim deletion as a stacked cleanup PR during this
-   transition. Keep it draft behind the exact rollback-window, backup, and
-   checksum evidence; do not leave deletion as an operator TODO.
+   object. The imported declaration must reproduce the exact live Helm labels
+   and annotations so Terraform does not strip Helm ownership metadata. The
+   exact legacy PV must be adopted with `Retain` before any cutover can orphan
+   the claim.
+3. Start a unique cutover-attempt generation and run an explicitly armed,
+   non-authoritative online preseed from the live RWO
+   source to the inactive RWX target. Bound both copy and verification I/O,
+   retain aggregate path-free evidence, and treat source churn as expected
+   rather than as a reason to mutate request state. Verify ownership, modes,
+   symlinks, hashes, and usable capacity before selecting the target.
+   In the same reviewed Terraform stage, complete and retain an online baseline
+   EBS snapshot and an encrypted copy under the SkyPilot-state key. This primes
+   the incremental snapshot chains before downtime; it is useful recovery
+   evidence but cannot replace the quiesced snapshots in the final gate. The
+   preseed emits canonical, path-free evidence containing its manifest SHA-256,
+   entry count, byte count, completion time, and source and target identities.
+   That evidence and both baseline snapshot IDs are retained for the attempt;
+   neither an unbound copy nor an unbound baseline can satisfy a later gate.
+   `storage.existingClaim` only selects a claim; it deliberately does not copy
+   data or infer that copying was safe.
+4. Use a quiesce-only apply to drain API traffic, explicitly resolve active
+   requests under the existing PostgreSQL interruption contract, and scale the
+   all-role API Deployment to zero. That apply cannot create a snapshot, run a
+   finalizer, select RWX, or restart traffic. After Kubernetes observes zero API
+   pods and no preseed or application pod mounts either claim, publish one
+   digest-sealed attempt intent on the authority access point. Its exact v1
+   schema records the positive monotonic `attempt_generation`, observed
+   `zero_at`, `work_cutoff` exactly `zero_at + 45 minutes`,
+   `api_ready_deadline` exactly `zero_at + 120 minutes`, source PVC
+   namespace/name/UID, Helm release namespace/name, source PV name/UID and EBS
+   volume ID, target filesystem ID, state access-point ID, state PV name/UID and
+   PVC namespace/name/UID, authority access-point ID, and authority PV name/UID
+   and PVC namespace/name/UID. It also binds the accepted preseed evidence's
+   canonical SHA-256, manifest SHA-256, entry count, byte count, and completion
+   time plus both distinct baseline source/encrypted snapshot IDs. A
+   generation's intent, evidence, identities, snapshots, and deadlines can
+   never be replaced or extended. A retry must publish a new generation
+   containing a new preseed and baseline pair.
+
+   Intent and completion-fence publication share one no-clobber protocol. The
+   writer opens a deterministic generation-scoped same-directory temporary name
+   with `O_CREAT|O_EXCL|O_NOFOLLOW`, writes canonical UTF-8 JSON, removes every
+   write bit, and fsyncs the file. It publishes with `linkat` to a
+   generation-specific intent name or the single canonical completion path
+   `fence.json`, so `EEXIST` fails instead of replacing data, fsyncs the
+   directory, unlinks the temporary name, fsyncs the directory again, and
+   requires the final regular file to have link count one. Only one completion
+   fence may ever commit; its exact bytes record the winning generation. If a
+   writer restarts with a temporary or final name present, it opens without
+   following links and may
+   finish cleanup or re-emit a digest only after proving the inode, exact
+   canonical bytes, schema, generation, and expected hash match. Any differing
+   artifact or unexplained link fails closed. It never renames over, truncates,
+   replaces, or recopies an existing intent or fence.
+
+   A subsequent, independently reviewed saved plan receives the exact intent
+   hash. Its graph prevents the quiesced snapshot resources from starting until
+   the quiescence observations and completed online preseed are accepted. It
+   creates and waits for a retained incremental `aws_ebs_snapshot` of the exact
+   legacy volume, then creates and waits for a retained
+   `aws_ebs_snapshot_copy` encrypted by the dedicated SkyPilot-state KMS key.
+   The 2026-08-08 audit found no existing snapshot for the unencrypted source
+   volume, so a retained source volume alone does not satisfy this gate.
+
+   Only after both quiesced snapshots complete does Terraform start the final
+   pod. Its
+   `request-store-evidence-verifier` init container receives the existing
+   PostgreSQL secret but no state mount, begins an explicit read-only
+   transaction, and emits only the sanitized marker digest/fields, current
+   schema/counts/logical hash, and database observation time into a pod-local
+   shared evidence file. The
+   credential-free filesystem finalizer consumes that evidence, performs one
+   bounded final filesystem sync, and commits an atomic, digest-sealed
+   target-completion fence on the separate authority access point. This stage
+   must not run a SQLite importer, write request rows, alter database schemas,
+   or replace the already-complete PostgreSQL cutover.
+   The fence is the regular, non-symlink, read-only JSON file published through
+   that protocol. Schema version 1 records `status=complete`,
+   `attempt_generation`, `zero_at`, both fixed deadlines, Helm release
+   namespace/name, source PVC namespace/name/UID, PV name/UID and EBS volume ID,
+   all four distinct baseline and quiesced source/encrypted snapshot IDs, target
+   filesystem ID, state access-point ID, state PV name/UID and PVC
+   namespace/name/UID, authority access-point ID, authority PV name/UID and PVC
+   namespace/name/UID, the final path-free manifest SHA-256, entry count, byte
+   count, a sanitized PostgreSQL evidence object and its SHA-256, and completion
+   timestamp. Every preseed and baseline field must exactly match the intent,
+   whose SHA-256 is recorded as `generation_intent_sha256`; the quiesced pair
+   and final manifest are new fields completed under that same intent.
+
+   The PostgreSQL evidence object accepts exactly these v1 keys and no unknown
+   keys: `schema_version=1`,
+   `metadata_key="sqlite-to-postgres-cutover.v1"`,
+   `cutover_marker_sha256`, `cutover_format_version`,
+   `cutover_completed_at`, `cutover_request_count`, `cutover_queue_count`,
+   `cutover_logical_sha256`, `observed_at`, `database_schema_revision`,
+   `current_request_count`, `current_queue_count`,
+   `current_nonterminal_count`, `current_claimed_count`, and
+   `current_logical_sha256`. `cutover_marker_sha256` hashes the complete
+   canonical historical marker without exposing its source path or request IDs.
+   The current fields come from one PostgreSQL
+   `REPEATABLE READ, READ ONLY` transaction, use the database clock, require
+   `current_request_count >= cutover_request_count`, and require the queue,
+   nonterminal, and claimed counts to be literal integer zero. Historical queue
+   count cannot exceed historical request count, and timestamps must prove
+   `cutover_completed_at <= zero_at < observed_at < completed_at < work_cutoff`.
+   The evidence hash covers canonical sorted UTF-8 JSON bytes. The finalizer
+   emits the SHA-256 of the exact fence bytes as gate evidence and never writes
+   the completed status before all copy, snapshot, and verification checks
+   pass. It refuses to publish at or after the 45-minute work cutoff and proves
+   `completed_at < work_cutoff` from the fixed intent.
+
+   A pre-fence abort has two separately reviewed saved-plan phases. Phase A
+   disarms and removes every finalizer, verifier, preseed writer, arming input,
+   and write-capable RBAC while keeping API zero and traffic blocked. Only after
+   those writers are absent may a read-only `O_NOFOLLOW`/`lstat` proof establish
+   that no fence exists. With no remaining writer, phase B rechecks fence
+   absence as an apply-time precondition, removes the drain block, and restarts
+   the accepted one-pod legacy-RWO plus PostgreSQL revision. Fence appearance
+   at any point fails phase B and selects fix-forward recovery. The operator,
+   approved deploy identity, and reviewers must be on call, and a rehearsal
+   must show both abort phases plus pod readiness fit in the reserved 75 minutes
+   before starting cutover; the API must be Ready by the fixed 120-minute
+   deadline. Completed attempt artifacts remain retained.
+
+   An out-of-process `rainier-cutover-watchdog`, started from the approved
+   operator host with the exact intent hash, owns both timers independently of
+   Terragrunt. Snapshot resources have bounded create timeouts and every
+   migration Job has an `activeDeadlineSeconds` no later than the work cutoff.
+   If the fence is absent at the cutoff, the watchdog cancels the active apply,
+   waits at most two minutes for exit, and records the process and backend-lock
+   evidence. A lock may be force-unlocked only by the named deploy lead after
+   two independent checks prove no apply process or session remains. A fresh
+   refresh/discovery step finds every generation-tagged snapshot, adopts any
+   in-progress or completed artifact without waiting for it to finish, and
+   produces a new abort-A plan; a saved plan made before cancellation is
+   invalid. The watchdog continues through
+   abort-A, absence proof, abort-B, and pod readiness, pages on any missed
+   intermediate deadline, and declares an incident rather than success if API
+   Ready is not observed by 120 minutes. The nonproduction rehearsal must cover
+   cancellation, stale-lock recovery, refresh/import, both fresh plans, and the
+   full 75-minute rollback reserve.
+
+   If legacy becomes writable after abort, a retry uses a new generation, new
+   digest-sealed intent and timestamps, a new online preseed and baseline pair,
+   new quiesced snapshots, final sync, manifest, and fence hash. No artifact
+   from an aborted generation can satisfy a later generation. Once a fence
+   commits, abort to legacy is invalid and recovery is fix-forward only.
+5. While the API remains at zero, remove every preseed, intent, PostgreSQL
+   evidence, and final-sync Job plus every ConfigMap, secret reference, service
+   account, Role, RoleBinding, arming input, and read-write authority mount. A
+   reviewed plan and live inventory must prove no migration writer can restart
+   before the first workload mounts the replacement claim.
+6. Apply a one-API-pod compatibility revision with the replacement RWX claim
+   and the unchanged PostgreSQL request store, but without split-role HA.
+   The typed module-native `rwx_authority_fence` input, rather than unrestricted
+   extra Helm values, mounts only the authority claim read-only in a verifier
+   init container running from a digest-pinned helper image. It requires an
+   explicit `storage.existingClaim` equal to the statically provisioned state
+   claim; a chart-created/dynamic claim cannot satisfy the fence. It also
+   requires the PostgreSQL request store's built-in execution-quiescence backend
+   enforcement, so alternate storage or queue plugins cannot sit outside the
+   evidence. Before the workload can start it uses no-follow file
+   operations, requires a regular non-symlink file with no write bits, validates
+   every version/status/identity/deadline field, and matches the exact fence-byte
+   SHA-256 supplied from accepted finalizer evidence. Main containers receive no
+   authority mount. While this input is enabled, the module rejects a nonempty
+   escape-hatch `apiService.sidecarContainers` or
+   `databaseConnection`/`executorService`/`controllerService`
+   `extraVolumes`/`extraVolumeMounts` array; only the typed verifier may mount
+   the authority volume. The digest input has no default, is populated only
+   after step 4, and makes a skipped or partial finalizer fail closed. The same
+   verifier remains on every later role and is not removed by cleanup.
+   Accept this revision as the fix-forward rollback target for the storage
+   boundary. The legacy RWO claim remains retained and unmounted.
+7. In a capacity-only PR and saved plan, create three labeled, zone-scoped
+   two-node groups and select that label for every future SkyPilot role. Each
+   new group has `min=desired=max=2`; the retained legacy group has
+   `min=desired=max=3`. All four managed-node-group update strategies are
+   `MINIMAL`, automatic node repair is disabled, and their Kubernetes release,
+   launch-template/AMI, and scaling inputs are frozen for the overlap. No node
+   update, repair, replacement, or autoscaling plan that can own more than nine
+   instances may run under the nine-node approval.
+
+   Add a durable `NoSchedule` taint to the legacy group and drain all
+   non-DaemonSet workloads after the six target nodes are Ready. The legacy
+   group remains retained but cannot contribute to scheduler capacity. Instead
+   of starting SkyPilot HA early, schedule nine isolated role-shaped capacity
+   probe Pods: two steady and one surge shape for API, executor, and controller.
+   They use the exact role requests/limits, target label, taint tolerations,
+   anti-affinity, and topology-spread constraints, but a non-SkyPilot pause
+   image, unique labels and names, `automountServiceAccountToken=false`, no
+   Service, no storage, no Secret, no SkyPilot service account/RBAC, and no
+   release selector overlap. Five additional inert infrastructure-reservation
+   probes model the exact resources and placement of two state monitors, two
+   authority monitors, and the one-at-a-time observer Job, without mounting
+   storage or receiving their real identities. Prove all fourteen probes
+   schedule simultaneously on only the six target nodes with the documented
+   reserves. A following probe-retirement PR removes them through a reviewed
+   saved plan after the evidence is accepted; live inventory must prove they
+   are gone before the HA activation PR may apply.
+8. In the next PR and saved plan, apply a guarded Helm upgrade with explicit
+   API/executor/controller roles and RollingUpdate. The final plan and render
+   must preserve the typed PostgreSQL request-store input, load-bearing
+   environment variables on every role, nonsticky ingress, role PDBs, topology
+   spreading, `maxSurge: 1`, `maxUnavailable: 0`, `minReadySeconds: 10`, and
+   `progressDeadlineSeconds: 600`. It also installs platform-owned two-replica
+   state and authority monitors. `rwx-state-monitor` writes and fsyncs only its
+   dedicated per-replica sentinel path on the state claim. The two-replica
+   `rwx-authority-monitor` has no state mount, Kubernetes API RBAC, or service
+   account token; it mounts only the authority claim read-only and hashes the
+   accepted fence every 60 seconds. Each monitor container requests and limits
+   50m CPU and 64 MiB memory; both Deployments use topology spreading and a PDB,
+   and their four pods are represented by the accepted infrastructure probes in
+   the capacity proof. The minute observer CronJob is installed suspended and
+   has no activation seed, so applying HA cannot start or backdate the clock.
+9. After HA conformance, takeover, fix-forward rollback proof, and legacy-node
+   taint/drain are accepted, apply a separate observation-activation PR and
+   saved plan. It binds the exact release/fence/node identities and paid-capacity
+   approval, publishes a digest-sealed Terraform-owned activation seed into the
+   retained evidence prefix, and unsuspends the observer with that exact
+   digest. The first eligible interval is the first complete UTC minute after
+   that apply; neither earlier uptime nor pre-activation samples count.
+10. Keep the pre-authored transition cleanup PR draft until the exact 168-hour
+   no-reset observation contract in Monitoring passes, a completed post-copy
+   EFS recovery point, a successful isolated restore rehearsal from that point,
+   effective 35-day retention evidence,
+   fix-forward rollback proof, and exact no-destroy plans pass. Cleanup removes
+   transition code and only forgets retained legacy objects from Terraform
+   state; it does not delete the PVC, PV, EBS volume, snapshots, backups, or
+   data. Any eventual data deletion is a separate explicitly authorized change.
+
+The refreshed platform stack starts by repurposing
+`boltz-bio/boltz-platform#7823` to reconcile the stale desired runtime pin to
+the exact frozen live release and to pin an eventual merged module commit
+containing guarded rollout, migration-switch cleanup, and the typed authority
+fence verifier. Its old 1.1.1087 payload is obsolete. The remaining linear
+stages map to `#7824` (inert EFS and both RWX object pairs), `#7829` (legacy
+retention and generation-scoped online preseed), `#7830` (quiesce only), a new
+finalizer PR, a separate writer-retirement PR, `#7831` (one-pod RWX
+compatibility), a new capacity-only PR, a probe-retirement PR, `#7832`
+(role-split HA only), an observation-activation PR, a later evidence-only PR,
+and `#7833` (non-destructive cleanup). A pre-authored alternative draft stack roots
+abort-A on the finalizer stage and abort-B on abort-A, so B cannot bypass A's
+writer retirement and stable absence proof. It is used only if no fence
+committed and never merges into the successful fix-forward path. Each
+infrastructure stage requires its own complete saved plan and human apply;
+merging a later stack commit is not evidence that an earlier live gate passed.
+
+The current resource candidate preserves the all-role pod's measured 128
+controller-class long-worker budget. Each controller requests 16 CPU, is
+limited to 28 CPU, and requests and limits 110 GiB. Each active-active executor
+requests 8 CPU, is limited to 16 CPU, and requests and limits 64 GiB; each must publish
+`health_detail.long_workers=64`, preserving a combined normal-request budget of
+128. Each stateless API replica requests and is limited to 4 CPU and 8 GiB.
+Memory request equals limit for every role so scheduler placement cannot
+silently overcommit node memory.
+Six `m6i.8xlarge` nodes, exactly two per availability zone, are the minimum
+steady candidate. Five nodes are structurally insufficient: a valid
+steady placement can leave one zone with a single node and force all three
+zone-spread surge pods, requesting 182 GiB in total, into that zone.
+
+The current single three-AZ managed node group cannot make exactly two nodes in
+each zone a declarative invariant. The rollout therefore creates three
+zone-scoped two-node groups before HA and retains the three-node legacy group
+through the observation window, but taints and drains it before any capacity
+proof or observation clock. This temporarily owns nine nodes while only the six
+target nodes remain schedulable. Cleanup retires the legacy group only after
+the seven-day gates, leaving the three zone-scoped groups as the six-node
+steady state.
+
+Moving from three to six steady nodes adds three on-demand instances. At
+2026-08-08 us-east-1 prices, compute is $4.608 per hour, about $3,364 per
+730-hour month, plus about $12 per month for three 50-GiB gp3 root volumes.
+The transition adds all six new nodes before it retires any existing node: the
+maximum nine-node overlap costs an incremental $9.216 per hour, about $1,548 of
+compute plus $5.52 of prorated root-volume storage for seven days. Each extra
+day after a reset adds about $221 of compute. The eventual steady delta is the
+three-node $4.608-per-hour figure above.
+EFS Standard storage is $0.30 per used GiB-month, Elastic Throughput reads are
+$0.03/GiB and writes are $0.06/GiB, and warm EFS backup storage is $0.05 per
+used GiB-month. At 200 GiB used—the claim capacity, not an enforced EFS
+quota—storage is about $60 per month plus $10 per month for one full warm
+backup; one full copy is about $12 of EFS writes and one full verification read
+is about $6. The online baseline source snapshot and encrypted copy add up to
+about $20 per month if each initially bills the full 200 GiB at
+$0.05/GiB-month. The quiesced pair normally bills only changed blocks in those
+primed chains, but four independently full 200-GiB snapshots would cost up to
+about $40 per month. Actual used and changed blocks, incremental backup size,
+EFS usage above 200 GiB, and traffic govern the bill. The retained 200-GiB gp2
+source remains about $20 per month during the rollback window. The dedicated
+customer-managed KMS key adds about $1 per month plus request charges. The
+isolated restore rehearsal temporarily adds restored EFS storage, throughput,
+and any effective backup-restore charges; its actual duration and bytes are
+recorded with the evidence.
+
+Before the capacity-only plan is approved, an identified management approver
+must record approval for at most nine physical `m6i.8xlarge` nodes in us-east-1,
+the $9.216-per-hour / approximately $1,548 minimum seven-day overlap, the
+$4.608-per-hour / approximately $3,364-per-730-hour-month steady increase, and
+an absolute UTC approval end plus maximum billed overlap hours. Generic urgency
+or implementation approval is not this paid-capacity approval. If a clock reset
+makes cleanup eligibility later than that hard end, the observer pages the
+named approver and a new identified approval with a later end is required; a
+status report does not extend authority. Safety resources remain retained while
+approval is escalated, but no later rollout or cleanup apply may proceed under
+an expired approval. New approval is also required before unfreezing any
+managed-node-group update/repair input or accepting a plan whose maximum can
+exceed nine nodes.
+
+Before activation, schedule the steady 2/2/2 topology and all three
+simultaneous role-shaped surge probes against the actual DaemonSets, external
+load balancers, and zone-spread constraints. With all nine role probes and five
+infrastructure-reservation probes scheduled, require at
+least 110 GiB and 16 CPU unrequested cluster-wide, and in every zone require at
+least one node with 32 GiB and 4 CPU unrequested. If any surge pod is Pending
+or either reserve is absent, increase capacity before the Helm rollout;
+reducing `maxSurge` is not an allowed workaround.
+
+Scheduling all fourteen isolated probes is the rollout-capacity proof. The remaining
+aggregate and per-zone thresholds are explicit system and incident-response
+buffers, not a claim that another 110-GiB controller fits contiguously after all
+three surge pods are present. Normal controller availability comes from the
+accepted pair being spread across zones; a further node failure during an
+active rollout halts the rollout and requires capacity restoration before it
+resumes.
+
+Rainier's storage authorization and state boundary are explicit:
+
+- Platform IaC owns a dedicated versioned S3 observation-evidence bucket with
+  Object Lock compliance retention of at least 35 days, default encryption,
+  public-access blocks, and `prevent_destroy`. The observer role can list/read
+  its attempt prefix and append new objects but cannot delete versions or alter
+  retention. A duplicate object version for one UTC-minute key is evidence
+  corruption and fails cleanup validation rather than choosing a winner.
+- The dedicated SkyPilot-state KMS key is owned by platform IaC, has automatic
+  rotation, least-privilege EFS/EBS/Backup use, and `prevent_destroy`. It is not
+  the EKS secrets key and is the sole key accepted for the EFS filesystem and
+  encrypted snapshot copies.
+- The dedicated AWS Backup vault, plan, and selection are Terraform-owned and
+  protected from destroy. The plan runs daily and retains EFS recovery points
+  for at least 35 days; merely enabling EFS automatic backup and inheriting an
+  account-editable default plan is insufficient. HA cleanup requires the
+  effective plan/selection, a post-copy completed recovery point, and a restore
+  rehearsal from that exact point. The rehearsal restores to an isolated
+  temporary filesystem under the same KMS key and never selects either
+  production claim. Scheduled EFS backups taken while the state claim is live
+  are crash-consistent and may observe different mutable files at different
+  instants; the rehearsal therefore must not compare the restored mutable tree
+  with the cutover manifest or claim point-in-time equality. Before the backup
+  window, `rwx-state-monitor` atomically writes and fsyncs a recovery-point
+  sentinel with unique known content. The selected backup must start after that
+  sentinel's completion time. The restore mounts both isolated access-point
+  roots read-only and verifies the exact digest-sealed authority fence bytes,
+  the selected recovery-point sentinel, required directory structure,
+  readability, ownership, modes, and symlink safety. It records a new
+  restore-specific path-free inventory and hashes as evidence, not as an
+  equality assertion against production. The production verifier is expected
+  to reject the restored filesystem's new identities. Temporary-resource
+  cleanup and cost are recorded and authorized separately from rehearsal
+  success.
+- Kubernetes and Helm providers in every Rainier unit use exec-based
+  `aws eks get-token` acquisition at apply time. A 15-minute
+  `data.aws_eks_cluster_auth` token may not be embedded in a saved plan. Every
+  apply requires an approved non-admin hub deploy identity, STS account
+  `255203429798`, and a context that reaches the private EKS endpoint; the
+  read-only administrator audit identity is not apply authorization.
+- The EFS CSI node service account uses its own EKS Pod Identity role. Its
+  identity policy grants `ClientMount`, `ClientWrite`, and `ClientRootAccess`
+  only for the managed filesystem and either exact access point through a mount target.
+  `DescribeMountTargets` is scoped to the same filesystem. The EC2 node role
+  receives no broad EFS client policy.
+- The EFS filesystem policy allows that same role, requires one of the two
+  exact access points through a mount target, and denies
+  unencrypted transport. Both static PVs use `tls` and `iam` mount options, so
+  neither anonymous NFS nor a non-TLS fallback is a supported path. The
+  filesystem pins `performance_mode=generalPurpose` and
+  `throughput_mode=elastic`.
+- Static provisioning needs no controller-side access-point permissions.
+  Rainier therefore has no dynamic EFS StorageClass and does not attach
+  `AmazonEFSCSIDriverPolicy` to the CSI controller. The isolated `skypilot-ha`
+  conformance release keeps its disposable dynamic-provisioning contract; it
+  is not production storage precedent.
+- The cluster Terraform state exports both exact `fs-id::fsap-id` handles only
+  after mount targets, backup and filesystem policies, the node Pod Identity
+  association, and the managed CSI add-on are ready. The control-plane unit
+  consumes that output through a real dependency. Mocks are allowed for plan
+  and validate, never apply, so a fake handle cannot enter Kubernetes state
+  and the two states cannot apply concurrently.
+- The control-plane unit owns both retained, `prevent_destroy` static PV/PVC
+  pairs outside Helm. Each PV is pre-bound to its exact namespaced claim and
+  both objects in a pair use a distinct non-empty sentinel class, for which no
+  StorageClass object exists. This prevents default-class admission from
+  changing a PVC and prevents dynamic provisioning. Both pairs advertise
+  `ReadWriteMany` and mount their exact static access point with `tls`, `iam`,
+  and `noresvport`. The state and authority claims cannot bind to each other's
+  PV. This provisioning revision does not change live Helm claim selection, the
+  `Recreate` strategy, PostgreSQL request-store configuration, or pod identity;
+  those changes occur only at the guarded stages above.
 
 ### M2: Split API and executor roles
 
@@ -1383,6 +1784,66 @@ by HA mode.
   and no startup wipe.
 - Migration tests cover empty bootstrap, additive upgrade, verify-only success,
   verify-only mismatch, and two concurrent migration attempts.
+- Storage-finalizer tests prove the completed fence is absent until both
+  quiesced snapshots, bounded final copy, manifest verification, and read-only
+  PostgreSQL checks succeed. They bind observed API-zero time, fixed deadlines,
+  canonical preseed evidence, both baseline snapshots, and both state and
+  authority AP/PV/PVC identities into the attempt hash, reject extension of one
+  generation, and
+  validate the exact path-free PostgreSQL evidence schema/digest from one
+  repeatable-read, read-only transaction, including all literal-zero
+  queue/active counts and historical-versus-current request counts. They
+  prove an expired work cutoff cannot write the fence. Abort tests prove phase
+  A removes all writers before absence proof, phase B rechecks absence before
+  restart, and any fence appearance fails recovery. An
+  abort-to-legacy-write-to-retry regression requires a fresh generation,
+  preseed, four snapshot IDs, final manifest, and fence. No-clobber publication
+  tests cover crashes before and after `linkat`, exact-existing recovery,
+  `EEXIST`, unexpected hard links, interrupted writes, symlinks, permissions,
+  malformed fields, and stable intent/fence-byte hashing. Watchdog tests cover
+  apply cancellation at the fixed work cutoff, bounded process exit,
+  independently proven stale-lock recovery, discovery/adoption of
+  generation-tagged snapshots, invalidation of old plans, fresh abort plans,
+  and the 120-minute readiness deadline.
+- Fence init-container render and execution tests reject an absent, writable,
+  symlinked, malformed, wrong-identity, or wrong-hash fence and accept only the
+  exact post-finalizer digest. Snapshots prove only the init verifier receives
+  the separate authority claim read-only, the state claim cannot reach that
+  access-point root, and the verifier remains on the compatibility revision and
+  all three HA roles after cleanup. Negative module tests prove sidecars and
+  database/executor/controller volume escape hatches cannot mount or alias the
+  authority claim while the fence is enabled, and reject a mutable helper
+  image, a chart-created claim, or disabled built-in quiescence enforcement.
+- Terraform tests prove the baseline and quiesced snapshot copies use the
+  dedicated KMS key, wait for their source snapshots, and cannot be destroyed;
+  the final snapshot graph first requires observed API zero, resolved active
+  requests, no state-mounting application pod, and completed/absent preseed,
+  then the finalizer depends on completed quiesced copies. Provider tests ban
+  planned static EKS tokens and require exec-based token acquisition. Backup
+  tests prove the dedicated 35-day plan, vault, selection, throughput mode, and
+  destroy protections. Restore tests treat a live EFS recovery point as
+  crash-consistent, require its pre-window sentinel and exact authority-fence
+  bytes, verify safe structure/metadata, and reject equality claims between a
+  mutable restore inventory and the cutover manifest.
+- Capacity tests schedule two steady and one isolated surge-shaped probe for
+  every role against only the three zone-scoped node groups while legacy nodes
+  are tainted and drained. They prove probes have no SkyPilot image, Service,
+  storage, Secret, service-account token, RBAC, or selector overlap; assert
+  memory request equals limit, exact CPU values, and per-zone and aggregate
+  buffers. Five additional pods reserve the exact state-monitor,
+  authority-monitor, and observer resources/placement; tests prove all fourteen
+  schedule together and a subsequent plan removes every probe before activation.
+  HA tests separately require two `long_workers=64` executor reports and 128
+  controller long workers in both original pods and the promoted replacement.
+  Managed-node-group tests require fixed 2/2/2 target and three-node legacy
+  sizes, `MINIMAL` updates, disabled repair, frozen version/AMI inputs, and a
+  plan-time maximum of nine owned instances under the recorded approval.
+- Observation tests exercise the minute CronJob's timeout/concurrency policy,
+  least-privilege identities, append-only Object-Lock evidence, conditional
+  writes, duplicate-version rejection, digest-chain restart, failed and missing
+  minute resets, approval-end enforcement, lossless export, and independent
+  10,080-minute cleanup-CI recomputation. Fixtures include endpoint-bearing
+  warm-standby and retained single-LB services plus a pool with no endpoint/LB.
 - Helm tests cover valid HA render and every invalid prerequisite.
 - Helm metrics tests prove executor and controller pods receive the fixed
   multiprocess environment, expose the configured port, and carry standard or
@@ -1409,6 +1870,10 @@ by HA mode.
   separately from final request outcomes.
 - Drain a node containing an API pod when cluster capacity permits.
 - Delete standby and active controller pods.
+- Capture startup configuration from both original controller pods and require
+  exactly 128 long workers in each. After deleting the active pod, require the
+  promoted standby and its replacement to report the same 128-worker budget
+  before takeover acceptance.
 - Delete idle and busy executor pods.
 - Terminate the active controller advisory-lock database session.
 - During both controller failure modes, keep a long-running managed job active
@@ -1461,13 +1926,98 @@ Kubernetes events, pod logs, PostgreSQL rows, Helm status, and active traffic
 canaries remain separate evidence sources. A green pod rollout alone does not
 prove request continuity.
 
+Rainier's cleanup clock is exactly 168 continuous hours. It starts only after
+the guarded HA revision, controlled rollout and controller-takeover exercises,
+fix-forward one-pod rollback proof, and legacy-node taint/drain have all been
+accepted. A wall-clock timer, PR age, or Helm uptime never unlocks cleanup.
+
+Platform IaC installs a `rainier-ha-observer` CronJob inside the private cluster
+with `* * * * *`, `concurrencyPolicy: Forbid`, a 30-second starting deadline,
+and `activeDeadlineSeconds: 55`. Its narrowly scoped identity has read-only
+Kubernetes, PostgreSQL, and Datadog access plus AWS permissions limited to
+backup observation and evidence `List`/`Get`/append. At most one 250m CPU,
+256-MiB observer pod is represented by the accepted observer-reservation probe.
+Every UTC minute it evaluates the immediately preceding closed UTC-minute slot
+and writes one canonical sample to a
+dedicated versioned, destroy-protected S3 evidence prefix using a unique key and
+`If-None-Match: *`. Its Pod Identity can put new
+sample/reset/checkpoint objects but cannot overwrite or delete them.
+Each sample binds the attempt ID, accepted fence digest, exact Helm revision and
+image/module commits, node-group identities, paid-capacity approval ID and hard
+end, predicate result and source query IDs, prior-sample digest, and observer
+build digest. Failed predicates and missing UTC-minute slots append explicit
+reset events. A Job reads and validates only the deterministic preceding-minute
+object (or the exact digest-sealed activation seed), so every fresh CronJob
+process resumes without a mutable local clock or an ever-growing S3 scan; a
+missing predecessor starts a reset chain. The exporter, not the minute Job,
+scans and validates the full chain. The activation seed contains the first
+lightweight synthetic request. Each Job verifies the preceding Job's request
+was claimed within 60 seconds and submits the next idempotency-keyed request
+before exit, so the 55-second Job deadline never hides a synchronous 60-second
+wait. Native-cadence data still has a declared maximum age that is checked in
+every minute's sample.
+
+An exporter on the same approved network verifies the append-only chain and
+materializes the canonical platform-repository artifact
+`deployment/evidence/rainier-ha-observation.json`. It contains every accepted
+minute or an equivalently lossless interval encoding, the continuous start and
+end, all resets and reasons, source query IDs, fence and release identities,
+approval hard end, chain head and backing S3 object/version manifest, and the
+computed `eligible_at`. Cleanup CI independently validates the schema and hash
+chain, expands the minute sequence, rejects a gap or failed predicate, requires
+at least 10,080 consecutive accepted closed UTC-minute slots, and requires
+`eligible_at <= approval_hard_end`. A scheduled evidence workflow may refresh
+the artifact and cleanup PR, but cannot make the gate pass early. Any direct
+Helm change, rollout revision, observer gap, evidence mismatch, or projected
+eligibility beyond the approval hard end resets the clock and, for the latter,
+also requires renewed identified paid-capacity approval.
+
+The following are evaluated in every minute unless their native cadence is
+slower; any failed, stale, or missing observation resets the clock:
+
+- authenticated in-cluster and external-ingress API canaries succeed with no
+  HTTP 5xx or terminal request failure, and a data-plane canary succeeds for
+  every currently `READY`, endpoint-bearing non-pool Serve service. Pools have
+  no inference endpoint and are verified as having neither an endpoint nor an
+  external load-balancer Deployment;
+- API, executor, and controller Deployments each remain 2/2 Ready, Updated, and
+  Available; every role PDB permits at least one disruption; there are no
+  unexpected restarts, CrashLoops, Pending pods, or unplanned rollout revisions;
+- exactly one current controller generation owns leadership, no stale owner or
+  duplicate execution appears, expired active leases remain zero, each
+  synthetic request is claimed within 60 seconds, and interrupted-request
+  counters have no unexplained increase;
+- only the six labeled target nodes are schedulable for role pods; none reports
+  MemoryPressure, and the 110-GiB/16-CPU aggregate plus 32-GiB/4-CPU-per-zone
+  unrequested reserves remain satisfied after accounting for DaemonSets,
+  external load balancers, and all other workloads;
+- EFS CSI pods and mounts stay healthy, both `rwx-state-monitor` replicas and
+  both `rwx-authority-monitor` replicas stay Ready, the read/write state
+  sentinel and exact-fence read-only digest checks have zero failures and
+  sub-one-second p99 latency, and EFS `PercentIOLimit` remains below 80%;
+- the newest scheduled EFS recovery point is `COMPLETED` and less than 26 hours
+  old, with no failed or expired backup job;
+- PostgreSQL CPU remains below 70% at p95, connections below 70% of the
+  configured maximum, and connection/error counters show no HA-attributable
+  increase; and
+- fleet reconciliation remains `READY`; each endpoint-bearing non-pool service
+  has exactly the replica count required by its persisted durable external-LB
+  mode (two for warm standby, one for a retained single-LB mode); and its LB
+  sync/data-plane canaries stay green. An unrelated update may not silently
+  change that durable mode, and pools continue to require zero endpoint/LB
+  replicas.
+
+The completed isolated restore rehearsal and its restore-specific sentinel and
+inventory evidence are a separate cleanup prerequisite; they do not repair or
+backdate a reset clock.
+
 ## Rollback
 
 - Migrations are additive until the M5 cleanup gate.
 - Every milestone can roll back its Deployment image without dropping new
   tables.
-- HA mode can be disabled to return to one `--role=all` pod during the
-  migration window.
+- HA mode can be disabled to return to one `--role=all` pod on the accepted RWX
+  claim and PostgreSQL request store during the migration window.
 - Rolling back does not delete request, queue, or controller ownership rows.
 - A failed migration hook blocks the rollout and leaves the previous
   Deployments serving.
@@ -1485,17 +2035,27 @@ prove request continuity.
 
 The storage cutover is a deliberate rollback boundary:
 
-1. Before cutover, the compatibility image blocks new submissions, drains or
-   interrupts active legacy requests, imports local rows, verifies counts and
-   hashes, and records a PostgreSQL cutover marker.
-2. After the marker commits, all new requests use PostgreSQL.
-3. A post-cutover rollback may return to the M1 compatibility image, but never
-   to a pre-M1 image that can only read SQLite.
-4. The legacy SQLite database is retained read-only through the rollback window
-   for audit, not used as a second writer.
-5. The independently managed RWX claim remains the mounted claim for every
-   post-cutover rollback; selecting the retained legacy claim would reintroduce
-   a stale writer and is forbidden.
+1. Before the RWX completion fence commits, operators may restart the last
+   accepted one-pod legacy-RWO plus PostgreSQL revision only through abort phase
+   A (remove all writers while API stays zero), stable no-fence proof, and abort
+   phase B (apply-time no-fence recheck and restart). It does not import SQLite
+   rows or alter PostgreSQL. The work cutoff reserves 75 minutes for this path,
+   and API readiness is due by the fixed 120-minute deadline.
+2. The four generation-specific snapshot IDs, bounded final sync, target
+   verification, observed zero time, and unextended deadlines are prerequisites
+   to committing the digest-sealed RWX fence.
+3. Once that fence commits, the legacy RWO claim is never writable or
+   selectable by a workload. Recovery verifies the committed generation while
+   the API remains zero and advances through writer retirement to the accepted
+   one-pod RWX plus PostgreSQL compatibility revision; it does not recopy.
+4. After that compatibility revision is accepted, HA rollback is a fix-forward
+   Terraform-owned Helm revision using the same RWX claim and PostgreSQL store.
+   Native Helm rollback and selection of the retained legacy claim are
+   forbidden.
+5. The legacy PVC, PV, EBS volume, baseline and quiesced source snapshots, and
+   encrypted snapshot copies remain retained for audit and separately
+   authorized disaster recovery; they are not a second writer or an ordinary
+   rollback target.
 
 This avoids an unsafe dual-write protocol and makes the irreversible boundary
 explicit.
@@ -1935,3 +2495,79 @@ pods. Serializing only post-seed waits would not protect Helm upgrades. The HA
 guard accepts the equivalent zero-unavailable forms `0` and `0%`, but keeps
 the surge bound as absolute integer `1` so percentage rounding cannot silently
 increase temporary capacity. Focused boundary tests cover all three choices.
+
+### Review 14: post-PostgreSQL Rainier storage refresh
+
+The 2026-08-08 refresh rejected the old production stack's attempt to repeat
+the SQLite-to-PostgreSQL importer. Rainier's one-way cutover completed in
+1.1.1089 and the live all-role pod already uses PostgreSQL with its durable
+gate. Re-running the importer while changing storage would conflate two
+irreversible boundaries and could rewrite authoritative request history. The
+remaining finalizer is therefore storage-only: it requires API zero, fences
+both filesystems, copies and verifies the final delta, commits the RWX fence,
+and validates PostgreSQL evidence read-only.
+
+The same review rejected treating a Helm keep annotation as durable ownership.
+The exact legacy claim and volume remain the pre-fence recovery and audit
+source, so their live metadata must be adopted without a Terraform/Helm
+ownership fight and the PV's reclaim policy must become `Retain` before Helm
+stops rendering the claim. No snapshot existed at audit time. After API zero
+and quiescence, the final gate therefore requires a completed source snapshot
+and completed encrypted copy before the RWX fence can commit. The review also
+rejected a full-speed post-copy hash pass after a bandwidth-limited copy; every
+source read in the online stage shares the same bounded-I/O contract.
+
+Finally, the review separated migration-writer retirement from the first RWX
+workload start. An inert generation flag is not sufficient steady-state proof:
+the Jobs, scripts, ConfigMaps, RBAC, and arming inputs must be absent while the
+API is still zero. The following one-pod RWX/PostgreSQL revision is the storage
+rollback target; only its acceptance unlocks capacity expansion and role-split
+HA.
+
+### Review 15: fail-closed Rainier activation
+
+Exact-head review on 2026-08-08 rejected a writable in-tree fence, an abort that
+could race fence publication, a deadline chosen before API zero, memory
+overcommit, and a capacity proof that could borrow the legacy nodes. It also
+found that saved cluster plans embedded a short-lived EKS token and that the
+cleanup clock, restore test, EFS throughput mode, controller worker proof, and
+paid-capacity approval were not objective.
+
+The corrected contract isolates a digest-sealed fence behind a distinct EFS
+access point and read-only workload claim, with a typed module verifier and no
+authority mount in application containers. A quiesce-only apply records one
+generation's observed zero time and unextendable deadlines; a graph-ordered
+finalizer plan cannot snapshot before quiescence. Abort first removes all
+writers, then proves absence, and only a second plan may restart legacy. Any
+retry gets entirely new evidence. Memory requests equal limits, the legacy
+group is tainted and drained before six-node-only proof, and capacity and HA
+are separate stack stages.
+
+The same correction requires apply-time exec authentication, an approved
+non-admin deploy context, General Purpose plus Elastic EFS, an isolated
+content-verified restore, exact controller/executor worker evidence, explicit
+on-demand approval, and a 168-hour clock whose enumerated health, capacity,
+storage, backup, database, and data-plane gaps all reset it.
+
+### Review 16: crash and evidence closure
+
+Exact-head adversarial review on 2026-08-08 found that the prior intent did not
+bind its preseed/baseline evidence, rename publication could replace an existing
+fence, a hung provider apply could consume the abort reserve, and the two abort
+PRs were not causally stacked. It also found that a live EFS backup cannot be
+compared with the old cutover manifest as though it were an application-
+consistent snapshot. The corrected contract binds every generation input,
+publishes intent and fence with no-clobber hard-link semantics and exact-
+existing recovery, gives an out-of-process watchdog authority to cancel at the
+fixed cutoff and require fresh abort plans, roots abort-B on abort-A, and uses a
+recovery-point sentinel plus restore-specific inventory for crash-consistent
+backup evidence.
+
+The same review separated isolated role-shaped scheduler probes from HA
+activation, assigned explicit owners to both state and authority monitoring,
+pinned managed-node-group `MINIMAL` updates and repair-off settings to enforce
+the nine-node ceiling, and made extended billed time require renewed identified
+approval. Finally, cleanup now depends on an append-only, reset-aware one-minute
+evidence chain and CI-validated 10,080-minute artifact. Serve predicates derive
+their endpoint and external-LB expectations from pool status and each persisted
+durable mode rather than assuming every service owns two load balancers.
