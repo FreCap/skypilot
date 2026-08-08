@@ -427,13 +427,28 @@ identity set; a later v2 or placeholder row is an explicit
 `untracked_current_row` mismatch until a new zero-change apply records it.
 After the terminal manifest, an untracked row is accepted without a newer
 writer generation only when its version is above the terminal proved current
-version for that service and it is either an ordinary explicit-v2 commit with
-finite `created_at > completed_at` or an exact fillable canonical placeholder
-with SQL-NULL `created_at`.  An older, stale-version, retired, historical, or
-blocker row remains a mismatch.  Spec-drift comparison uses the terminal result
-for the exact
-`(service_name, version, service_hash, lifecycle_epoch)` owner generation and
-does not compare unrelated mutable status columns.
+version and above the maximum version inventoried by that terminal manifest for
+the same service incarnation.  It must be either an ordinary explicit-v2
+commit with finite `created_at > completed_at` or an exact fillable canonical
+placeholder with SQL-NULL `created_at`.  An older, stale-version, retired,
+historical, or blocker row remains a mismatch.  The immutable admission
+boundary is derived from manifested row identities, not today's mutable
+current pointer or a copied dependency fact.  Spec-drift comparison uses the
+terminal result for the exact
+`(service_name, version, service_hash)` incarnation and does not compare
+unrelated mutable status columns.  The ledger's lifecycle epoch is an exact
+commit-time observation and must agree across the protocol-4 candidate,
+current, and stale entries, but a later lifecycle claim on the same service
+hash does not invalidate immutable version bytes or turn manifested rows into
+untracked identities.
+
+A post-terminal same-incarnation row follows the high-water rules above.  A
+genuinely recreated service hash has no terminal version-number boundary: its
+row is accepted only when it is committed explicit v2 with finite
+`created_at > completed_at`.  A new-incarnation NULL-timestamp reservation
+blocks terminal verification until the central writer either commits it with a
+finite timestamp or removes it.  Deleting old-incarnation version rows during
+normal service teardown does not erase their immutable terminal audit entries.
 
 A successful protocol-4 retirement manifest containing any
 `stale_placeholder` entry is the terminal writer generation.  Every later
@@ -489,9 +504,10 @@ rows for every retired candidate service and requires every manifested stale
 identity to remain the exact canonical, unretired pickled-`None` full
 row/column postimage.  Every additional canonical placeholder whose version is
 at or below the proved current version is an omitted stale row and blocks.  A
-later ordinary placeholder is permitted only when its version is above the
-proved current version and its `created_at` remains SQL NULL, matching the
-central reservation writer; it remains `placeholder/unchanged` and fillable.
+later ordinary placeholder is permitted only when its version is above both
+the proved current version and the terminal same-incarnation manifested
+high-water mark, and its `created_at` remains SQL NULL, matching the central
+reservation writer; it remains `placeholder/unchanged` and fillable.
 This
 live snapshot binding prevents a coherently rewritten ledger from omitting or
 relabeling an unchanged stale placeholder without making later reservations
@@ -1235,6 +1251,9 @@ The blocked cleanup may merge only when all are true:
   higher-version and explicit-v2-with-post-completion-timestamp or
   fillable-placeholder-with-NULL-timestamp contract above; it cannot replace
   or mutate a manifested row.
+  A later lifecycle epoch on the same service hash is accepted without
+  rewriting immutable manifest rows; a recreated hash follows the stricter
+  post-completion committed-v2 rule above.
   Every
   terminal retirement includes the locked dependency proof and retired-row
   digests; requested/loaded controller receipts converge; and a post-reload
