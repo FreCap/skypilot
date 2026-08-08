@@ -8,8 +8,8 @@ accepted; the private durable HA-observer canary contract is specified but its
 implementation and independent acceptance remain pending; the Rainier RWX
 storage deployment, role-split HA, and live scrape acceptance are pending;
 production fleet rollout and M5 compatibility cleanup remain fleet-gated; the
-Review-28 cross-repository handoff and capacity correction is independently
-accepted and its implementation remains pending
+Review-29 operator-authorization correction is accepted and its implementation
+remains pending
 
 Last updated: 2026-08-08
 
@@ -881,8 +881,9 @@ SkyPilot Deployments, or mutate chart-owned objects. A SkyPilot build, upgrade,
 or rollback never requires a platform change or apply.
 
 SkyPilot application runtime is owned exclusively by direct Helm operations
-performed by a human operator. Every named release bundle contains an operation
-ID and digest, exact chart archive and SHA-256/OCI provenance, image digest,
+performed by an explicitly authorized operator. Every named release bundle
+contains an operation ID and digest, exact chart archive and SHA-256/OCI
+provenance, image digest,
 secret-free user-values capture, computed all-values audit, complete stage
 overlay and target values, rendered-manifest digest, database-head and
 placement compatibility, preflight, and fix-forward command. Ordinary changes
@@ -1570,9 +1571,9 @@ finalizer stage; its descendant direct-Helm abort-B artifact cannot run before
 abort-A writer retirement and stable absence proof. It is used only if no
 fence committed and never merges into the successful fix-forward path. Each
 infrastructure stage requires its own complete saved plan and human apply, and
-each application stage requires its own reviewed Helm artifact and human
-operation. Merging either repository is not evidence that an earlier live gate
-passed.
+each application stage requires its own reviewed Helm artifact and explicitly
+authorized operation. Merging either repository is not evidence that an earlier
+live gate passed.
 
 The current resource candidate preserves the all-role pod's measured 128
 controller-class long-worker budget. Each controller requests 16 CPU, is
@@ -3700,3 +3701,16 @@ template version as plan no-ops; otherwise an incidental three-node replacement
 could create twelve physical instances and exceed the transient-ten approval.
 Independent exact cross-repository review accepted the corrected contract with
 no remaining blocker; implementation remains gated on preserving these bytes.
+
+### Review 29: authorized direct-Helm operator boundary
+
+Follow-up review found that Review 28 accidentally described every direct-Helm
+application stage as human-only. That is stricter than the organization
+operating contract: an explicitly authorized operator, including an agent
+acting under a user's deployment instruction, may execute the reviewed Helm
+artifact and its monitoring gates. The human-only boundary remains on the
+separately reviewed production Terraform/OpenTofu state handoff and other
+infrastructure applies. The two ownership domains remain disjoint, and an
+ordinary SkyPilot rollout still neither waits for nor modifies
+`boltz-platform`. Exact review accepted this operator-boundary correction with
+no remaining blocker.

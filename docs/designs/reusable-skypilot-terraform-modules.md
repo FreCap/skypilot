@@ -1,7 +1,7 @@
 # Reusable SkyPilot Terraform modules
 
-- **Status:** Review-28 correction independently accepted; implementation and
-  production handoff remain pending
+- **Status:** Review-29 operator-authorization correction accepted;
+  implementation and production handoff remain pending
 - **Last updated:** 2026-08-08
 - **Authoritative repository:** `boltz-bio/skypilot`, branch `improvements`
 
@@ -12,8 +12,9 @@ That makes generally useful control-plane and spoke-workspace-pool building
 blocks depend on an application repository, encourages consumers to copy them,
 and prevents a SkyPilot release from carrying the infrastructure contract needed
 to deploy it. The reusable package owns supporting infrastructure only. The
-SkyPilot control-plane application is deployed by a human operator directly
-through Helm; it is never owned or rolled out by this Terraform module.
+SkyPilot control-plane application is deployed by an authorized operator
+directly through Helm; it is never owned or rolled out by this Terraform
+module.
 
 The modules move to SkyPilot's existing `infra/terraform/modules` tree. The
 first consumer remains `boltz-platform`, but the module APIs and documentation
@@ -39,9 +40,9 @@ comparison, or history source unless a user explicitly requests it.
   the module package source, except for the four intentional state-only
   removals defined below.
 - Hand the existing Helm release and configuration seed/reconcile path from
-  Terraform state to direct human Helm operation without changing or deleting
-  the live release or legacy seed objects during the state operation, and make
-  that separation permanent.
+  Terraform state to direct authorized Helm operation without changing or
+  deleting the live release or legacy seed objects during the state operation,
+  and make that separation permanent.
 - Retain the control-plane's supporting IAM, EKS Pod Identity, optional
   External Secrets Operator resources, and optional namespace. Move the stable
   digest-pinned PostgreSQL configuration seed and role reload into the
@@ -141,8 +142,9 @@ an existing EKS cluster. It creates the namespace when requested, the API-server
 EKS Pod Identity role and association, and optional External Secrets resources
 and read policy. It does not install, read, update, or delete the Helm release;
 mutate the PostgreSQL database; create seed Jobs or ConfigMaps; or restart and
-wait for application Deployments. A human Helm operator owns every application
-deployment and configuration reconciliation after the one-time state handoff.
+wait for application Deployments. An authorized Helm operator owns every
+application deployment and configuration reconciliation after the one-time
+state handoff.
 
 The caller supplies:
 
@@ -383,7 +385,8 @@ with zero managed-resource actions for each other consumer of that pin. A
 source pin cannot be called state-only merely because the Rainier unit's own
 plan is state-only.
 
-After that proof, every application change is a direct human Helm operation.
+After that proof, every application change is a direct authorized Helm
+operation.
 The infrastructure module continues to own only its IAM, Pod Identity, ESO,
 and optional namespace resources. The forgotten legacy seed ConfigMap and
 completed Job remain inert and unmanaged; they are not deleted during the state
@@ -469,7 +472,7 @@ state-aware migration.
 
 ```text
 existing EKS host
-  ├── human-operated direct Helm release (application owner)
+  ├── authorized-operator direct Helm release (application owner)
   │     └── revision-scoped migration → config seed → all/split reload
   └── skypilot-control-plane (supporting-infrastructure owner)
         ├── optional namespace + ESO
@@ -532,8 +535,8 @@ existing EKS host
 1. Add the four modules and their operator documentation.
 2. Add the revision-scoped direct-Helm migration, configuration-seed, and
    all-role/split-role reload contract. Merge it as an application PR and have
-   a human deploy it directly with Helm; it does not wait for or modify
-   `boltz-platform`.
+   an authorized operator deploy it directly with Helm; it does not wait for or
+   modify `boltz-platform`.
 3. Move provider configuration out of the published modules and into
    caller-owned root configuration.
 4. Remove the Helm and Time provider requirements, chart-value assembly, chart
@@ -849,8 +852,9 @@ descriptions must record their exact results when they run.
 - 2026-08-05: the then-current Terraform-owned request-store extension was
   verified and accepted.
 - 2026-08-08: the organization SkyPilot operating contract established direct
-  human Helm ownership. That invalidated the module's Helm-release ownership
-  and Terraform seed/restart ownership as well as the earlier accepted status.
+  authorized-operator Helm ownership. That invalidated the module's Helm-release
+  ownership and Terraform seed/restart ownership as well as the earlier
+  accepted status.
   This revision specifies a permanent, four-address non-destructive state
   handoff and revision-scoped direct-Helm configuration reconciliation.
 - 2026-08-08: exact review rejected a one-address stack-map remnant, a SkyPilot
@@ -873,6 +877,12 @@ descriptions must record their exact results when they run.
   and makes H0 prove raw/canonical database-config and security-key parity.
   Independent exact cross-repository review accepted the correction with no
   remaining blocker.
+- 2026-08-08: operator-boundary follow-up review rejected the accidental
+  human-only restriction on direct Helm. SkyPilot rollouts may be completed by
+  any explicitly authorized operator, including an agent acting under a user's
+  deployment instruction; only the separately reviewed production
+  Terraform/OpenTofu apply remains human-only. Exact review accepted this
+  correction with no remaining blocker.
 
 ## Open gates
 
@@ -885,12 +895,12 @@ descriptions must record their exact results when they run.
 - Phase 2 may use a pushed Phase 1 SHA for draft review, but cannot merge or
   apply until Phase 1 is merged and the pin is reachable from
   `origin/improvements`.
-- The direct-Helm path must be human-deployed and its target parity evidence,
-  exact live-object/state inventory, and an approved non-admin production
-  identity must exist before the handoff plan. The plan must prove the exact
-  four-forget/zero-mutation contract, and every other shared-pin production
-  consumer must have a saved zero-managed-resource-action plan. Only a human
-  may apply it.
+- The direct-Helm path must be deployed by an explicitly authorized operator
+  and its target parity evidence, exact live-object/state inventory, and an
+  approved non-admin production identity must exist before the handoff plan.
+  The plan must prove the exact four-forget/zero-mutation contract, and every
+  other shared-pin production consumer must have a saved zero-managed-resource-
+  action plan. Only a human may apply the production Terraform/OpenTofu plan.
 - Phase 3 remains a stacked draft until Phase 2 is merged, human-applied, and
   verified across all four production units, including state absence and
   unchanged live Helm proof for the control plane.
