@@ -423,6 +423,17 @@ def stream_logs_by_id(job_id: int,
     watchdog = threading.Thread(target=_orphan_watchdog, daemon=True)
     watchdog.start()
 
+    # Batch coordinator jobs never stream worker-task logs: the coordinator
+    # runs inline on the controller, so the controller log is the only durable
+    # log source regardless of any task filter.
+    if managed_job_state.is_batch_job(job_id):
+        return stream_logs(job_id,
+                           job_name=None,
+                           controller=True,
+                           follow=follow,
+                           tail=tail,
+                           tail_offset=tail_offset)
+
     msg = _JOB_WAITING_STATUS_MESSAGE.format(status_str='',
                                              provision_str='',
                                              job_id=job_id)
@@ -523,17 +534,6 @@ def stream_logs_by_id(job_id: int,
                 num_tasks=num_tasks,
                 tail=tail,
                 tail_offset=tail_offset)
-        # Batch coordinator jobs run inline on the controller — no
-        # separate cluster is provisioned. Stream controller logs instead
-        # of trying to find a worker cluster handle.
-        if managed_job_state.is_batch_job(job_id):
-            return stream_logs(job_id,
-                               job_name=None,
-                               controller=True,
-                               follow=follow,
-                               tail=tail,
-                               tail_offset=tail_offset)
-
         backend = backends.CloudVmRayBackend()
 
         while True:
