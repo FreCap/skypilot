@@ -12,6 +12,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import controller
 from sky.serve import lb_ha
 from sky.serve import lb_k8s
+from sky.serve import serve_utils
 
 
 def _state(phase: lb_ha.LbCutoverPhase,
@@ -1405,6 +1406,11 @@ def test_role_database_snapshot_reads_owner_and_complete_state_once():
         'lb_drain_started_at': 123.5,
     }
     owner_read = mock.Mock(return_value=owner)
+    ctrl._controller_owner_fingerprint = (
+        serve_utils.make_controller_owner_fingerprint(owner['hash'],
+                                                      owner['controller_pid'],
+                                                      owner['controller_ip'],
+                                                      owner['controller_port']))
 
     with mock.patch.object(controller.serve_state,
                            'get_service_controller_owner', owner_read):
@@ -1415,6 +1421,86 @@ def test_role_database_snapshot_reads_owner_and_complete_state_once():
         lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
                              lb_ha.LbCutoverPhase.STABLE, 7, 123.5), owner)
     owner_read.assert_called_once_with('service', include_lb_state=True)
+
+
+@pytest.mark.parametrize(('field', 'changed'),
+                         [('hash', 'successor-incarnation'),
+                          ('controller_pid', 456),
+                          ('controller_ip', '10.0.0.2'),
+                          ('controller_port', 20002)])
+def test_role_database_snapshot_rejects_bootstrap_owner_mismatch(
+        field, changed):
+    ctrl = _role_controller()
+    del ctrl.__dict__['_lb_role_database_snapshot']
+    owner = {
+        'hash': 'incarnation',
+        'status': controller.serve_state.ServiceStatus.READY,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'controller_port': 20001,
+        'lifecycle_epoch': 7,
+        'pool': False,
+        'resource_scope': 'scope',
+        'lb_ha_enabled': True,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+        'lb_cutover_phase': 'STABLE',
+        'lb_drain_started_at': None,
+    }
+    ctrl._controller_owner_fingerprint = (
+        serve_utils.make_controller_owner_fingerprint(owner['hash'],
+                                                      owner['controller_pid'],
+                                                      owner['controller_ip'],
+                                                      owner['controller_port']))
+    changed_owner = dict(owner, **{field: changed})
+
+    with mock.patch.object(controller.serve_state,
+                           'get_service_controller_owner',
+                           return_value=changed_owner):
+        snapshot = ctrl._lb_role_database_snapshot()
+
+    assert snapshot is None
+
+
+def test_role_handler_rejects_bootstrap_owner_mismatch_before_prefetch():
+    ctrl = _role_controller()
+    del ctrl.__dict__['_lb_role_database_snapshot']
+    owner = {
+        'hash': 'successor-incarnation',
+        'status': controller.serve_state.ServiceStatus.READY,
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+        'controller_port': 20001,
+        'lifecycle_epoch': 7,
+        'pool': False,
+        'resource_scope': 'scope',
+        'lb_ha_enabled': True,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 3,
+        'lb_pending_slot': None,
+        'lb_cutover_phase': 'STABLE',
+        'lb_drain_started_at': None,
+    }
+    ctrl._controller_owner_fingerprint = (
+        serve_utils.make_controller_owner_fingerprint('incarnation',
+                                                      owner['controller_pid'],
+                                                      owner['controller_ip'],
+                                                      owner['controller_port']))
+
+    with mock.patch.object(controller.serve_state,
+                           'get_service_controller_owner',
+                           return_value=owner), mock.patch.object(
+                               ctrl,
+                               '_get_shared_stable_lb_role_snapshot',
+                               new_callable=mock.AsyncMock) as snapshot_read:
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert response.status_code == 503
+    assert json.loads(response.body)['outcome'] == 'controller_not_owner'
+    snapshot_read.assert_not_awaited()
 
 
 def _authority(*, target_ready: bool = True) -> lb_k8s.LbPodAuthority:

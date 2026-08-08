@@ -589,6 +589,12 @@ eight-second client budget or six-second independent report-freshness gate:
   Kubernetes result may affect the session ledger or role decision. Non-STABLE
   and mutation paths use the record read under the lock and retain all existing
   transition serialization.
+- On both reads, derive the owner fingerprint from the live service hash,
+  controller PID, normalized IP, and controller port and require it to equal
+  the immutable fingerprint with which this controller child booted. Matching
+  only PID/IP is insufficient: a controller restart may reuse them while
+  changing its port, and a service incarnation change must also fence the old
+  child.
 - After that exact under-lock owner proof, the controller may attach its
   existing owner fingerprint to the role response. The stable API proxy accepts
   the attestation only when it exactly equals the owner fingerprint read before
@@ -602,14 +608,26 @@ eight-second client budget or six-second independent report-freshness gate:
   weaken controller-request authentication, accept a stale cutover state, or
   permit a transition outside the lock.
 
+The first merged #1368 implementation compared only PID/IP to the controller's
+bootstrap owner before returning the old bootstrap fingerprint. Pre-production
+adversarial review rejected that implementation: if the database hash or port
+changed after the proxy's first read but before controller prefetch while
+PID/IP were reused, the old child could attest the stale proxy fingerprint and
+incorrectly suppress the final proxy read. Release `1.1.1174` reached only
+`boltz-test`; its interrupted qualification is not promotion evidence. The
+fix-forward must validate the complete live fingerprint on both controller
+database reads and fail closed before any snapshot or attestation when hash,
+PID, IP, or port differs.
+
 Focused tests must prove one SQL read before and one after the Kubernetes
 snapshot, byte-for-byte owner/state mismatch rejection, no snapshot-side SQL
-owner read, exact controller attestation, mixed-version proxy fallback,
+owner read, pre-prefetch rejection for every bootstrap fingerprint component,
+exact controller attestation, mixed-version proxy fallback,
 mismatched-attestation rejection, and unchanged two-read behavior for every
 other proxy route. The 143-backend overlap, owner-replacement, transition, and
 full external-load-balancer suites remain mandatory. The immutable follow-up
-must repeat the same direct-Helm staging and production qualification; revision
-372 does not satisfy completion.
+must repeat the same direct-Helm staging and production qualification; revisions
+372 and the interrupted `1.1.1174` staging window do not satisfy completion.
 PR #1367 subsequently addressed the cross-slot provider amplification exposed
 by the same production evidence. It merged as
 `34822adbbd56d946cd21c70eebf4aa11cb8dc8ac` and release `1.1.1173`, but was not
