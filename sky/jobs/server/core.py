@@ -54,7 +54,6 @@ from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import rich_utils
 from sky.utils import status_lib
-from sky.utils import subprocess_utils
 from sky.utils import timeline
 from sky.utils import ux_utils
 from sky.workspaces import core as workspaces_core
@@ -292,44 +291,6 @@ class _DefaultManagedJobRunner:
             (jobs, total, result_type, total_no_filter, status_counts
             ) = managed_job_utils.load_managed_job_queue(job_table_payload)
         return jobs, total, result_type, total_no_filter, status_counts
-
-    def cancel_managed_jobs(
-        self,
-        *,
-        handle: 'backends.CloudVmRayResourceHandle',
-        backend: 'backends.CloudVmRayBackend',
-        all_users: bool,
-        all: bool,  # pylint: disable=redefined-builtin
-        job_ids: list[int] | None,
-        name: str | None,
-        pool: str | None,
-        graceful: bool,
-        graceful_timeout: int | None,
-    ) -> str:
-        # Single codegen that embeds the dispatcher (``cancel_managed_jobs``)
-        # via ``inspect.getsource`` — keeps the variant selection in one place.
-        code = managed_job_utils.ManagedJobCodeGen.cancel_managed_jobs(
-            name=name,
-            job_ids=job_ids,
-            pool=pool,
-            all=all,
-            all_users=all_users,
-            graceful=graceful,
-            graceful_timeout=graceful_timeout,
-        )
-        # The stderr is redirected to stdout.
-        returncode, stdout, stderr = backend.run_on_head(handle,
-                                                         code,
-                                                         require_outputs=True,
-                                                         stream_logs=False)
-        try:
-            subprocess_utils.handle_returncode(returncode, code,
-                                               'Failed to cancel managed job',
-                                               stdout + stderr)
-        except exceptions.CommandError as e:
-            with ux_utils.print_exception_no_traceback():
-                raise RuntimeError(e.error_msg) from e
-        return stdout
 
     def tail_managed_job_logs(
         self,

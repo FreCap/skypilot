@@ -63,20 +63,6 @@ _CODEGEN_CASES = [
         'submitted_after': 1.25,
         'submitted_before': 9.5,
     }, '9c9a68ee14ab4fff5259b607951684e6cf1ef3f1b305e5e96ed66baaf97c8861'),
-    ('cancel_managed_jobs', (), {
-        'job_ids': [1, 2],
-        'all_users': True,
-        'graceful': True,
-        'graceful_timeout': 30,
-    }, '6cbd7e33cf7123182588a5408b56e3e4a1f1bbbef0fe4e2007fce8b89b94857c'),
-    ('cancel_managed_jobs', (), {
-        'name': 'job name',
-        'graceful': True,
-        'graceful_timeout': 12,
-    }, '129a0378a55745d0802e83ae27dd1a2d5943b4aec5979640d13c92332caf182e'),
-    ('cancel_managed_jobs', (), {
-        'pool': 'pool A',
-    }, 'ec34494a27b122a5b7b25e41afa9d804792eebc50b2ab22348f98c15b46d2cce'),
     ('get_version_and_job_table', (), {},
      '5bd3151698eb24547aaa0f106609fd00fe5361d8919b179a31138df79ab508a5'),
     ('get_version', (), {},
@@ -127,6 +113,11 @@ def test_set_pending_codegen_output_is_stable() -> None:
     assert hashlib.sha256(command.encode()).hexdigest() == (
         '260a0d7364197543a454015ce59ae3ba3b18a1914b1f8b9165a02fed8b0e1c20')
     compile(_extract_generated_python(command), '<managed-job-code>', 'exec')
+
+
+def test_cancel_codegen_surface_is_removed() -> None:
+    assert not hasattr(managed_job_utils.ManagedJobCodeGen,
+                       'cancel_managed_jobs')
 
 
 def test_managed_job_codegen_facade_contract() -> None:
