@@ -6,25 +6,30 @@ Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
 #1335 merged, but its dark V2 preflight and qualification layer is retired by
 this cleanup. PR #1342 also merged after the retirement review began; its dark,
-uncalled renderer and representability evidence is removed atomically rather
+uncalled renderer and representability evidence was removed atomically rather
 than left import-broken by the retirement of its authority dependencies. PR
 #1333's forward-only Serve038/039 migrations are retained inert while its
 uncalled runtime state layer is removed. The unexercised V2 authority contracts
-merged by PR #1332 and the disabled PR #1232 activation surface are also being
+merged by PR #1332 and the disabled PR #1232 activation surface were also
 removed. PR #1340 merged the compatibility cleanup. PR #1346 merged as
 `0b77ca77ae8b099c2de07566670743651744bbe2` and deletes the temporary disabled
 Helm value, private-handler quarantine, private result codecs, and authority
-routing. Its `boltz-test` compatibility-artifact gates passed on 2026-08-08:
-every private-handler request was absent across all statuses at readiness, +10
-minutes, and +30 minutes, and the sole `skypilot` chart release in that cluster
-had its stored value scrubbed. Production compatibility-artifact readiness,
-+10, and +30 also passed. The released plugin `claim_scope` API remains as an
-inert `GENERAL`-only compatibility shim; its retired authority value is
-rejected and does not affect queue selection.
-No service was promoted, no authority worker claimed a request, and no provider
-effect ran through the proposed path. Source cleanup is not operationally
-complete until the exact merged compatibility artifact and this final-removal
-artifact are each deployed and pass their monitoring gates below.
+routing. Its `boltz-test` deployment gates passed on 2026-08-08: the exact
+compatibility artifact passed readiness, +10, and +30, and the sole `skypilot`
+chart release in that cluster had its stored value scrubbed. The exact
+final-removal artifact then passed `boltz-test` readiness, +10, and +30 at
+04:04:08, 04:14:25, and 04:35:25 UTC, with every private-handler request absent
+across all statuses.
+Production reached compatibility-artifact readiness at 03:38:22 UTC and passed
+its +10-minute gate at 03:49:03 UTC and +30-minute gate at 04:08:49 UTC. The
+released plugin `claim_scope` API remains as an inert `GENERAL`-only
+compatibility shim; its retired authority value is rejected and does not affect
+queue selection.
+No service was promoted through the proposed authority path, no authority
+worker claimed a request, and no provider effect ran through that path. Source
+cleanup is not operationally complete until the exact merged compatibility
+artifact and this final-removal artifact are each deployed and pass their
+monitoring gates below.
 
 The combined HA latency fix through PRs #1367, #1369, and #1370 shipped as
 release `1.1.1176` and passed the exact `boltz-test` readiness/+10/+30 window.
@@ -42,7 +47,8 @@ bounded durable binding and adoption mechanism, but ordinary launches do not.
 That gap does not justify a dedicated authority deployment, a native provider
 renderer, a second execution topology, or a universal physical-capacity
 kernel. A bounded fix may proceed only under the contract and evidence gates
-in this document.
+in this document. Issue #1352 owns that telemetry-first follow-up; it is not an
+R0 authority-retirement blocker.
 
 ## Decision record
 
@@ -55,14 +61,17 @@ independent provider-call audit source, empty capacity tables, and zero
 projector database connections. The large payoff therefore remained a
 hypothesis.
 
-Implementation later drifted beyond that decision into a dedicated authority
-stack. The stack had already reached roughly 37,000 changed lines across 113
-files at the original review, and later dark merges expanded it further while
-still leaving no complete admission-to-effect path. It introduced separate
-authority workers, cohort and lease protocols, private transport, native
-rendering, V2 representability inventories, and Serve038/039 state while the
-named legacy mutation owners remained authoritative. That architecture is
-rejected.
+Subsequent user directions explicitly authorized implementation, testing,
+deployment, removal of the old path, and later phases. The defect was not a
+lack of authorization: implementation outran the original 30--60-day,
+two-domain evidence gate and expanded into a dedicated authority stack before
+it proved a complete admission-to-effect path. The stack had already reached
+roughly 37,000 changed lines across 113 files at the original review, and later
+dark merges expanded it further. It introduced separate authority workers,
+cohort and lease protocols, private transport, native rendering, V2
+representability inventories, and Serve038/039 state while the named legacy
+mutation owners remained authoritative. The deployment evidence does not
+justify that architecture, so it is rejected.
 
 The accepted decision is:
 
@@ -378,11 +387,14 @@ non-nullable. Run the same assertions after rollout. This stacked cleanup must
 remain draft if any private-handler row exists in any status; deleting its
 decoder or queue quarantine is forbidden if any assertion fails.
 
-Deploy the exact merged image as one compatible Helm rollout. The live release
-explicitly pins `apiService.image`, `controllerService.image`, and
-`executorService.image`, so `helm upgrade --reuse-values` must set all three to
-the same immutable digest; updating only the API value would leave mixed old
-controller/executor images. A stored
+Deploy the exact merged image as one compatible Helm rollout. The `boltz-test`
+release explicitly pins `apiService.image`, `controllerService.image`, and
+`executorService.image`, so its `helm upgrade --reuse-values` must set all three
+to the same immutable digest; updating only the API value would leave mixed old
+controller/executor images. Production stores only `apiService.image`; its
+controller and executor image values are null and inherit the API value. Its
+ordinary upgrades must use `--reuse-values`, override only the API image, and
+require the exact digest in all three client-rendered chart positions. A stored
 `resourceActions.authorityWorker.enabled: false` value remains schema-valid and
 renders no authority resources. A stored `enabled: true` value fails the
 upgrade with `resourceActions.authorityWorker.enabled=true is no longer
@@ -397,28 +409,53 @@ stacked cleanup. Export each release's complete user values as JSON, remove
 `.resourceActions.authorityWorker`, remove `.resourceActions` too when it is
 then empty, and compare complete client-side renders of the original and
 sanitized values. Upgrade the same compatibility chart and image with
-`--reset-values` and the complete sanitized values file while explicitly
-pinning API, controller, and executor to the same immutable image digest. Do
-not use server-side Helm dry-run, combine `--reset-values` with
+`--reset-values` and the complete sanitized values file. Preserve each
+release's existing image-inheritance topology, set its explicit image value or
+values to the immutable digest, and require that digest in all three rendered
+positions. Do not use server-side Helm dry-run, combine `--reset-values` with
 `--reuse-values`, use a null override, or use `--atomic`; the migrations remain
 forward-only.
 Verify `helm get values` contains no retired key.
 
 Only then may this final-removal change merge. PR #1346 instead merged through a
 concurrent workspace action at 03:49:52 UTC, after production +10 but before
-production +30 and before the adversarial-review design corrections were
+production +30 and before the two adversarial-review design corrections were
 committed. This is a process-contract departure, not evidence that the gate was
-waived. Production +30 subsequently passed, but this canonical correction must
-merge before the final artifact is promoted to production. Its chart
-intentionally has no
+waived. No final-removal artifact had been deployed at merge time. A second
+concurrent action later deployed it to `boltz-test` before the canonical
+corrections landed, as recorded below; at that point, production promotion still
+required the corrected design and completed test monitoring.
+
+PR #1350 merged at 04:35:28 UTC, but its exact-capacity-approval gate remained
+open and it did not yet contain the zero-capacity exception or the reproducible
+60-minute comparison below. A third concurrent action started production
+revision 369 at 04:36:18 UTC. The zero-capacity record was authored only at
+04:38:37 UTC and committed at 04:42:19 UTC. This is a third process-contract
+departure: the later empirical zero-capacity proof and monitoring contract do
+not retroactively satisfy design-first ordering. Kubernetes had already
+accepted the rollout when detected, so no competing rollback or replay was
+issued; every post-deployment gate remains binding.
+
+The final chart has no
 `resourceActions.authorityWorker` schema or enabled-value guard, and its
 request registry intentionally has no private handler, authority claim routing,
 codec, or ordinary-queue exclusion. A narrow value tombstone rejects an
 unscrubbed release, and the released plugin API retains only an inert
 `GENERAL` claim scope. Deploy its exact immutable image to all three roles,
 run the retained migrations forward, and repeat readiness, +10-minute, and
-+30-minute checks. Rollback changes application images/chart only and never
-downgrades the database.
++30-minute checks. Production additionally requires the issue-#1349-aware
++60-minute comparison below. A retired-state write, schema/head mismatch,
+split-brain, unintended failover, health loss, restart, or source-attributed
+regression stops the rollout and restores production revision 368's exact
+`1.1.1159` compatibility chart
+`sha256:07ed313fc8f7e80ea1aaa82f0a2eb0163b0cc9827e46ed0e5c72cb7d4048d6c6`
+and image
+`sha256:d4237ec47a2e74d58b93a312157b58cf9066ec134bcce262681ac356087dd4b5`.
+Rollback changes application images/chart only and never downgrades the
+database. Exceeding only a pre-existing #1349 comparison limit holds R0 open
+for attribution; it does not trigger an automatic rollback to an artifact that
+already exhibited that signal. An unexplained warning or error also holds R0
+open, and requires rollback if investigation connects it to the new artifact.
 
 R2, if authorized, starts with binding writes disabled or validation-only.
 Rollback disables new admission and waits for every bound request to become
@@ -451,6 +488,55 @@ R0 completion requires both the compatibility and final-removal deployments:
 - start, 10-minute, and 30-minute post-readiness checkpoints recorded in the
   relevant PR with identical empty authority state and no new error/restart
   trend.
+
+Because production issue #1349 overlaps the ordinary Serve-health signal, the
+final-removal production rollout also requires an exact 60-minute window from
+the first instant that all 17 API/load-balancer workloads are Ready on the
+final digest. All 16 slots must remain Ready, `STABLE`, synced, non-draining,
+and converged, with exactly one ACTIVE and one STANDBY slot per service. The
+window permits zero restart, split-brain, unintended-failover, or health-loss
+events, and no role-sync failure interval may reach 60 seconds.
+
+For the exact `boltz-l4-fleet` service pair, use the persisted controller logs
+for its current service incarnation, including rotated `controller.log*`
+segments. Deduplicate identical access lines and restrict them to the exact
+window. Sort the completion timestamps of
+`POST /controller/load_balancer_role`; the gap numerator is the number of
+adjacent completion intervals at least eight seconds, and the rate is that
+count divided by window hours. It must not exceed 24.23/hour (therefore at most
+24 in the 60-minute window), which is 125% of the revision-366 baseline of 21
+gaps in 65 minutes. For `POST /controller/load_balancer_sync`, divide access
+lines with status 503 by all access lines for that path. That controller-side
+rate must not exceed 3.44%, which is 125% of the revision-366 baseline of five
+503s in 182 attempts. Do not add a load-balancer proxy log to either the
+controller numerator or denominator. Enumerate it separately; a proxy-side 503
+without a controller-side 503 in the same sync cycle is unexplained and blocks
+closure, while a correlated line is classified once and disclosed.
+
+At +60, query `/_lb/capacity` on both exact `boltz-l4-fleet` Pods. On each slot,
+`ha_observability.role.total_seconds.p99_recent` must be at most 10.32 seconds,
+controller `total_seconds.p99_recent` at most 9.75 seconds, lock-wait maximum at
+most 8.74 seconds, lock-hold p99 at most 9.64 seconds, pod-authority maximum at
+most 9.39 seconds, and Service-routing-read maximum at most 8.75 seconds. These
+are 125% of the worst recorded revision-368 values of respectively 8.25, 7.80,
+6.99, 7.71, 7.51, and 7.00 seconds. The process-local bounded windows include
+startup and are therefore a conservative supplement to the exact access-log
+window. The eight-second gap is also the configured client deadline.
+
+Enumerate every application WARN/WARNING, ERROR, CRITICAL, traceback, FATAL,
+and PANIC line and every Kubernetes Warning event in the exact window. The only
+pre-classified application signature is #1349's recovered
+`HA role heartbeat failed; retaining role ... TimeoutError`; it is acceptable
+for this cleanup-only comparison only when all safety and numeric limits above
+pass. Any other signature is unexplained and blocks R0 until attributed.
+
+This cleanup-only attribution gate is intentionally less strict than the
+existing real-cluster HA `observe` qualification, which permits zero
+`client_timeout` outcomes and caps recovered role-channel failure at 15
+seconds. Passing it establishes that the source cleanup did not worsen the
+pre-existing signal; it does not satisfy the HA qualification, change its SLO,
+or close #1349. That issue remains the owner of eliminating the timeouts and
+qualifying the large-fleet topology under the stricter contract.
 
 ### `boltz-test` compatibility deployment evidence (2026-08-08)
 
@@ -495,23 +581,54 @@ and central image digest
 Readiness at 03:38:22 UTC, +10 at 03:49:03 UTC, and +30 at 04:08:49 UTC passed.
 The combined-role API Pod remained Ready with zero restarts, all 16 warm-standby
 load-balancer Pods were Ready on the same digest with zero total restarts, and
-the 31-minute severe-signature scan found no ERROR, CRITICAL, or traceback.
+the full 31-minute log scan found no ERROR, CRITICAL, or traceback signature.
+The drained old-role heartbeat aged out by +10; exactly one current `all`
+heartbeat was ready and authority heartbeats remained zero.
 
 Production stored values contain no `resourceActions` key, no authority object
 exists, and all heads remain API008, Serve039, state028, and capacity001. Every
 private-handler request across all statuses, gated relation, and gated nullable
 column remained zero or null.
 
-The interval was not warning-free. Only the two `boltz-l4-fleet` slots logged
-intermittent HA role-heartbeat client timeouts. Bounded telemetry attributes
-them to the 143-replica controller's unchanged Kubernetes pod-authority and
-Service-routing reads taking 6--8 seconds while its serialized role lock is
-held. Both slots retained their correct ACTIVE/STANDBY roles, recovered to 200,
-remained Ready, and never restarted. The pre-change `1.1.1155` image and both
-retirement commits are byte-identical across the complete heartbeat path; the
-compatibility diff only deletes an unexecuted disabled-authority preflight
-branch. This is a separate scale-latency issue tracked in #1349, not a retired
-authority state/effect or unsafe role-transition signal.
+The severe-signature scan through +30 was empty, but the interval was not
+warning-free. Across the two `boltz-l4-fleet` slots, 22 HA role-heartbeat
+attempts logged an asyncio `TimeoutError`: 10 while retaining ACTIVE and 12
+while retaining STANDBY. They occurred in clusters at 03:41:15--03:43:15,
+03:54:36--03:56:52, 03:59:41--04:01:27, and 04:04:36--04:04:38 UTC. Both slots
+remained Ready with zero restarts, retained safe roles, and continued returning
+healthy liveness responses; the other 14 load balancers and API logged no
+application warning.
+
+The extended audit through 04:25:04 UTC counted 26 matching warnings, 12 while
+retaining ACTIVE and 14 while retaining STANDBY. Post-+30 recurrences were
+ACTIVE at 04:14:46 and 04:19:30 and STANDBY at 04:16:15 and 04:19:32. The ACTIVE
+slot also logged controller-sync HTTP 503 failures at 04:14:20, 04:19:39, and
+04:23:39, each with one ERROR and one traceback line. Readiness, roles, and zero
+restarts were unchanged. These signatures are disclosed explicitly; the
+post-+30 interval was not a zero-severity quiet window.
+
+Independent pre-change evidence closes attribution to this cleanup. The
+persisted controller access log on production revision 366 had 21 role-response
+gaps of at least eight seconds from 02:25--03:30 UTC, compared with 18 from
+03:40--04:25 on revision 368. The same windows had respectively five
+controller-sync 503s in 182 attempts and two controller-side 503s in 158
+attempts, plus the one post-change proxy-side 503 above. The exact diff from
+revision 366 commit `5eb15b544e6fdb5bf43853b5e753d6e24cf4515e` to compatibility
+merge `66de423064d01b7e0fbeaf552804bd55236d00f6` is a broad authority
+cleanup spanning 122 files; attribution does not depend on characterizing that
+whole diff as small. The executable heartbeat-path comparison leaves
+`load_balancer.py`, `lb_k8s.py`, `controller_proxy.py`, and
+`lb_ha.py`, and `lb_ha_observability.py` unchanged. Within the two changed files
+that overlap the Serve controller package, it deletes retired-authority
+constants from `constants.py` and a startup-only token-isolation check from
+`controller.py`; it does not change the role, proxy, Kubernetes-authority,
+routing, or sync paths. Bounded runtime observations
+locate the latency in pre-existing serialized Kubernetes reads: pod-authority
+and Service-routing reads reached 6.25--7.51 seconds and role-lock wait reached
+6.99 seconds against an eight-second client budget. Issue #1349 owns that
+separate performance defect. The evidence does not support treating it as a
+#1340 or #1346 regression, so it no longer blocks the authority-cleanup
+production promotion.
 
 ### HA role latency fix-forward contract (2026-08-08)
 
@@ -778,10 +895,11 @@ windows remain open gates.
 
 ### Final-removal artifact evidence (2026-08-08)
 
-PR #1346's exact code head
-`7a5315d577b54c1ba970991d3ca974b5fbee797c` passed all 32 CI checks. Merge
-`0b77ca77ae8b099c2de07566670743651744bbe2` published release `1.1.1161`. The
-source image digest is
+Although it merged before the production compatibility gate closed, PR #1346's
+exact code head `7a5315d577b54c1ba970991d3ca974b5fbee797c` passed all 32 CI
+checks, and the adversarial code and migration review found no implementation
+blocker. Merge `0b77ca77ae8b099c2de07566670743651744bbe2` published release
+`1.1.1161`. The source image digest is
 `sha256:310effb333ad0808b4289f05ee46ac89ea21b156b6e54e5df5e47bbe8198e002`;
 the chart OCI digest is
 `sha256:4bc611db6048419dfd296bf4d82d9542f9a0bb599e54febb5520bcc79b2bf799`.
@@ -789,35 +907,135 @@ The chart metadata records the exact merge and version.
 
 The same image was mirrored into the existing `boltz-test` registry as
 `sha256:b780e6b7c7fcc2606baed83ce06dc2f12a6913db13e01d615d2fcdce48d15eb6`.
-Registry normalization changed the manifest digest, while the image
-configuration digest remained exactly
+Registry normalization changed compressed-layer and manifest digests, while the
+image configuration digest remained exactly
 `sha256:b31d9b0414aa61fa7b0183d58e5155ddc079838e312c701215e59a059c94543f`.
-The exact chart rendered client-side with complete sanitized values and no
-retired authority reference; a seeded legacy value failed with the final-chart
-tombstone.
+The local image identity is linux/amd64, version `1.1.1161`, and exact merge
+`0b77ca77ae8b099c2de07566670743651744bbe2`. Publishing and mirroring created no
+compute capacity. The exact chart rendered client-side with the complete
+sanitized `boltz-test` values and all three roles pinned to the mirrored digest
+with SHA-256
+`d6d4af9e2c32db8c4603cdacf9660e4b1d4d5f015da929e5c45735bbde81982a`;
+the render contained no retired authority reference. A seeded disabled legacy
+value failed with the exact chart tombstone.
+
+Production's complete stored values also rendered client-side with the exact
+`1.1.1161` chart and final source digest, with SHA-256
+`557bc456a226cd8959a05aa945eaea1389a90687b0e7fb6d72a27c5505814c6c`.
+The final digest appeared in all three chart-owned image positions, the prior
+digest appeared nowhere, and the render contained no retired-authority
+reference. The three existing fixed nodes are `m6i.8xlarge`, each with about
+31.85 allocatable vCPU and 120.9 GiB. The two non-API nodes had respectively
+1.49 vCPU / 5.1 GiB and 2.24 vCPU / 6.7 GiB requested. One API surge requests
+16 vCPU / 96 GiB; even the conservative simultaneous 16-load-balancer surge
+adds only 1.6 vCPU / 8 GiB. The combined 17.6-vCPU / 104-GiB transient request
+plus the existing load is at most 19.84 vCPU / 110.7 GiB, so it fits either
+non-API node without provider capacity. The sole EKS managed node group and its
+Auto Scaling group are fail-closed at min=max=desired three; the cluster exposes
+no Karpenter/NodeClaim API and runs no Karpenter or cluster-autoscaler workload.
+All 17 new Pods actually scheduled across the same three preflight nodes,
+provider instances `i-003a087558f131dc8`, `i-01d341c152ac226b3`, and
+`i-084d983ca017ad5d8`. At readiness and +10 they retained their June 27 node
+UIDs, remained Healthy/InService, and the Auto Scaling group had no activity
+after 04:30 UTC. The expected and observed incremental node/GPU/cost delta is
+therefore zero; actual placement also proves the workload scheduling
+constraints were eligible on those nodes. If scheduler or scaling state ever
+invalidates that bound or any new provider-capacity request appears, stop
+rather than relying on unapproved expansion.
 
 ### `boltz-test` final-removal deployment evidence (2026-08-08)
 
-A concurrent workspace process started Helm revision 95 at 03:58:59 UTC before
-this correction landed. Kubernetes had already accepted the release when it
-was detected, so no competing rollback or retry was issued. This is a second
-process-contract departure and remains part of the canonical record.
+A concurrent workspace process started Helm revision 95 at 03:58:59 UTC despite
+the recorded deployment hold, before this design correction landed, and without
+the required named capacity approval. This is a second process-contract
+departure. Kubernetes had already accepted the release when it was detected,
+so no competing rollback or retry was issued.
 
-Migration job 95 succeeded once on the exact digest. Readiness at 04:04:08 UTC
-and +10 at 04:14:25 UTC passed with API, controller, and executor each 2/2
-Ready: six Pods on exact mirror digest
+Migration job 95 succeeded once on the exact digest. Readiness at 04:04:08 UTC,
++10 at 04:14:25 UTC, and +30 at 04:35:25 UTC passed with API, controller, and
+executor each 2/2 Ready: six Pods on exact mirror digest
 `sha256:b780e6b7c7fcc2606baed83ce06dc2f12a6913db13e01d615d2fcdce48d15eb6`,
 zero restarts, healthy and ready API endpoints at merge `0b77ca77`, and no
-warning or severe log signature. Stored values contain no `resourceActions`
-key, no authority object exists, heads remain API008, Serve039, state028, and
+targeted error signature. Stored values contain no `resourceActions` key, no
+authority object exists, heads remain API008, Serve039, state028, and
 capacity001, and every private-handler, gated-relation, and gated-nullable check
-remains empty or null.
+remains empty or null. By +10 and again at +30, fresh heartbeats were exactly
+two ready rows per role, drained rows had aged out, and every current role
+application container had zero warning or severe log signature from readiness.
+One Kubernetes Warning event is recorded explicitly: at 04:04:14 UTC, the
+already-draining old executor Pod returned a readiness-probe 503. That Pod is no
+longer present; it produced no current restart or readiness degradation.
 
-The rollout created exactly two temporary 8-vCPU nodes, both Spot; on-demand
-exposure was zero. The cluster returned physically to 10 claims / 80 vCPU at
+The rollout created exactly two temporary 8-vCPU nodes at 03:59:21 UTC, both
+Spot; on-demand exposure was zero. Karpenter returned accounted capacity from
+96 to the captured 80-vCPU baseline by 04:04:41 UTC and began terminating the
+two surplus claims. The cluster returned physically to 10 nodes / 80 vCPU at
 04:11:35 UTC, with all 10 claims Spot and none deleting. The required +30
-checkpoint remains open. The production final-removal artifact has not been
-deployed.
+checkpoint reconfirmed that exact state with zero on-demand exposure.
+
+### Production final-removal deployment evidence (2026-08-08)
+
+Production Helm revision 369 started deploying the exact final-removal chart
+and source image at 04:36:18 UTC. Migration job 369 succeeded once. All 17 API
+and load-balancer workloads first converged on the exact digest with Ready Pods
+and zero restarts at 04:40:17 UTC. The release is deployed on chart/app
+`1.1.1161`, OCI digest
+`sha256:4bc611db6048419dfd296bf4d82d9542f9a0bb599e54febb5520bcc79b2bf799`,
+and central image digest
+`sha256:310effb333ad0808b4289f05ee46ac89ea21b156b6e54e5df5e47bbe8198e002`.
+The API health and readiness endpoints returned 200 at exact merge
+`0b77ca77ae8b099c2de07566670743651744bbe2` and version `1.1.1161`.
+
+Revision 369 used `--reset-values` with the complete sanitized current
+user-values stream and only the `apiService.image` override. The exact
+client-side render had SHA-256
+`557bc456a226cd8959a05aa945eaea1389a90687b0e7fb6d72a27c5505814c6c`,
+preserved the database and credential configuration, and placed the exact image
+in all three chart positions. No `--atomic`, server-side dry-run, schema
+rollback, or platform-level change was used. Because production already had no
+retired stored value, using reset instead of the required `--reuse-values` was
+a process-contract departure and is not precedent for later upgrades.
+
+The readiness invariant audit passed. Stored values contain no
+`resourceActions` key, no authority Kubernetes object exists, and database
+heads remain API008, Serve039, state028, and capacity001. Every private-handler
+request, gated relation, and gated nullable value remains empty or null. All
+eight HA services are `STABLE` with no pending or draining transition, and each
+Service selector and generation matches the durable slot state. The +10-,
++30-, and issue-#1349-aware +60-minute production monitoring gates remain
+required below.
+
+The readiness window was not timeout-free. Counters retained from rollout show
+two and three recovered `client_timeout` outcomes on the `boltz-l4-fleet`
+ACTIVE/STANDBY slots and one on each `boltz-l4-fleet-test` slot. Their maximum
+role durations were 8.464, 8.668, 8.389, and 8.058 seconds; maximum recovered
+failure durations were 5.976, 6.311, 3.421, and 2.995 seconds. All four ended
+with `last_outcome=success`, inactive failure streaks, correct roles, and
+converged durable state; the other 12 slots had success-only counters. These
+values are the explicit T0 process baseline. Post-readiness deltas and the
+comparable controller access-log window determine the +60 result under the
+scoped cleanup gate above.
+
+The +10 audit sampled from 04:50:44 through 04:54:44 UTC and passed. All 17
+workloads remained Ready on the exact digest with zero restarts; all eight
+service pairs remained `STABLE`, synced, non-draining, and converged with one
+ACTIVE and one STANDBY slot. Health still reported exact merge `0b77ca77` and
+version `1.1.1161`; the four schema heads, 30 empty gated relations, four
+private-handler populations, nullable candidate fields, and absence of
+authority objects were unchanged. The same three fixed provider instances
+hosted every Pod and the fixed three-node Auto Scaling group recorded no
+scaling activity.
+
+The only application signature from 04:40:17 through the final +10 sample was
+14 instances of #1349's pre-classified timeout on `boltz-l4-fleet`: nine while
+retaining ACTIVE and five while retaining STANDBY. Both slots ended with
+`last_outcome=success`, inactive failure streaks, and safe roles; the API and
+other 14 slots had zero warning or severe signature. Kubernetes recorded the
+expected startup/readiness probe warnings while old and new Pods overlapped,
+ending at 04:40:15 UTC, two seconds before the exact monitoring window; it
+recorded no Warning event inside the window through +10. The access-log rate
+and +60 latency thresholds remain open and are not inferred from these raw
+client-timeout counters.
 
 ### R0 manual test plan
 
@@ -835,13 +1053,16 @@ branches:
 2. The same client render with `enabled=true` fails with the exact
    retired-feature message above.
 
-For the real rollout, record `helm get values skypilot -n skypilot -o yaml`
+For the `boltz-test` rollout, record
+`helm get values skypilot -n skypilot -o yaml`
 and the current revision first. Upgrade with `--reuse-values` while setting the
 API, controller, and executor images to the same immutable digest. This cleanup
-requires zero GPUs. The guarded HA rollout can request at most two temporary
+requires zero GPUs. That guarded HA rollout can request at most two temporary
 8-vCPU nodes before freed slots are reused; Spot is preferred, and any
 on-demand fallback requires the recorded management approval, price ceiling,
-and hard time window. At readiness, +10 minutes, and +30 minutes:
+and hard time window. Production instead uses the exact zero-incremental-node
+bound above and must stop if scheduler state invalidates it. At readiness, +10
+minutes, and +30 minutes:
 
 - confirm all ordinary control-plane Pods are ready with no new restarts;
 - confirm the namespace has no authority Deployment, Service,
@@ -879,7 +1100,8 @@ disabled and enabled persisted authority values, and the released plugin API
 accepts only the inert `GENERAL` claim scope. Merge only after the compatibility
 evidence and values scrub are recorded. Deploy the exact final digest to API,
 controller, and executor, then repeat every readiness, +10-minute, and
-+30-minute query and health check above before declaring R0 complete.
++30-minute query and health check above. In production, also pass the comparable
++60-minute issue-#1349 gate before declaring R0 complete.
 
 R2 completion, if authorized, requires all of the following in tests and the
 approved canary:
@@ -907,19 +1129,37 @@ approved canary:
   +30 minutes.
 - [x] Scrub the sole `skypilot` chart release in `boltz-test` of its stored
   legacy Helm value and record the sanitized stored values.
-- [x] Complete production compatibility-artifact monitoring: readiness, +10,
-  and +30 passed on 2026-08-08.
-- [x] Require exact-head CI and merge PR #1346. Its exact head passed 32/32,
-  but the sequencing departure is recorded above.
-- [ ] Merge this canonical-design correction before production promotion.
-- [ ] Complete PR #1346's `boltz-test` +30-minute monitoring; readiness and +10
-  passed, and physical capacity returned to the 10-claim / 80-vCPU baseline.
-- [ ] Deploy PR #1346's exact artifact to production and repeat readiness,
-  +10-minute, and +30-minute monitoring before closing R0.
-- [ ] Establish R1 production telemetry or record the explicit correctness
-  decision.
-- [ ] Obtain exact capacity approval before the final HA rollout or any
-  positive launch/down crash canary.
+- [x] Complete the production compatibility-artifact monitoring: readiness at
+  03:38:22 UTC, +10 at 03:49:03 UTC, and +30 at 04:08:49 UTC passed on
+  2026-08-08.
+- [x] Diagnose the production `boltz-l4-fleet` HA role-heartbeat timeout trend.
+  Persisted revision-366 access logs prove the same role stalls and sync 503s
+  predated #1340; exact code comparison excludes the cleanup paths. Issue #1349
+  tracks the separate serialized-Kubernetes-read latency defect.
+- [x] Require exact-head CI and merge PR #1346. The exact head passed 32/32, but
+  the merge occurred before the preceding production gate and is recorded as a
+  process-contract departure above.
+- [x] Merge the canonical-design follow-up that records the corrected retired
+  quarantine contract, scoped deployment evidence, and sequencing departure;
+  PR #1350 merged as `0407c5a7daf65a375c55275b5ff4224f4dfc5154`
+  before production promotion.
+- [x] Complete PR #1346's `boltz-test` monitoring. Readiness, +10, and +30
+  passed, and physical capacity returned to the 10-node / 80-vCPU baseline.
+- [ ] Merge this canonical follow-up after it records the complete production
+  monitor and the third deployment-sequencing departure.
+- [ ] Complete PR #1346's production monitoring. Revision 369 deployed the
+  exact artifact, all 17 workloads converged at 04:40:17 UTC, and the readiness
+  and +10-minute audits passed; +30 and the issue-#1349-aware +60-minute
+  comparison must still pass before closing R0.
+- [x] Record R1 ownership and its telemetry-first disposition: issue #1352 owns
+  an existing-executor durable binding; it is independent of R0 and must not
+  revive the authority stack.
+- [x] Record the final production rollout's exact zero-incremental-capacity
+  bound; the worst-case API plus 16-LB surge fits either existing non-API node.
+- [ ] R2 only: obtain named capacity approval before any positive launch/down
+  crash canary or any rollout that invalidates the zero-capacity bound.
 
-Until those gates close, the dedicated authority stack is retired and the
-bounded request-binding change is not production-complete.
+Until the production monitor and canonical follow-up merge, the dedicated
+authority-stack retirement is not production-complete. The bounded
+request-binding follow-up remains independently incomplete until issue #1352
+satisfies the R1/R2 evidence above.
