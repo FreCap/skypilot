@@ -1,12 +1,20 @@
 # Datadog observability for SkyServe controllers and load balancers
 
-- **Status:** M0 and M1 DEPLOYED and verified on 2026-07-25. M2 to M4 (the
-  SkyPilot-side metrics emission) not started.
-- **Last updated:** 2026-07-25
+- **Status:** M0 and M1 DEPLOYED. M2 to M4 (the SkyPilot-side metrics
+  emission) not started.
+- **Last updated:** 2026-08-08
 
 The rest of this document was written before M1 shipped and still reads as a
 proposal. It is retained as the reasoning that produced the design; the
 deployment record and the departures from it are below.
+
+### Delivery boundary
+
+The one-time Datadog agent infrastructure in M0/M1 was delivered historically
+by boltz-platform PR #7330. That does **not** make boltz-platform a dependency of
+the remaining SkyPilot work. M2 through M4 are SkyPilot application changes and
+must be built from this repository and deployed directly with the SkyPilot Helm
+release. They must not require or modify boltz-platform.
 
 ## Deployment record (2026-07-25)
 
@@ -26,6 +34,10 @@ Verified live, not assumed:
   Searching Datadog for `Reserved-fill broker` and `Concurrency report` returns
   0 hits, because controllers write to `~/.sky/serve/<svc>/controller.log` on
   the state-volume PVC and never to stdout. M2 remains the fix.
+
+Reverified on 2026-08-08: the `hub-datadog` DaemonSet is desired/current/
+updated/ready/available 3/3/3/3/3, the cluster-agent Deployment is 1/1 Ready,
+and all four current Pods have zero restarts.
 
 ### Departures from this design, and why
 
@@ -58,9 +70,12 @@ routine image bump.
 
 ---
 
-## What exists today
+## Pre-deployment baseline (historical)
 
-**ghub-skypilot has no Datadog. It has no observability stack of any kind.**
+The following section records the state before M1. It is retained as design
+evidence and is not a current operational inventory.
+
+**Before M1, ghub-skypilot had no Datadog and no observability stack.**
 
 The SkyPilot control plane runs on the EKS cluster reached by kube context
 `ghub-skypilot` (gitops-hub-rainier, account 255203429798). Verified live:
@@ -123,7 +138,7 @@ that cost. This one does install an agent, and section
   documents as "the durable session identity used to make rollout-overlap drain
   proofs fail closed". Perturbing LB pods perturbs drain proof.
 
-### Release and delivery state
+### Pre-deployment release and delivery state (historical)
 
 - Live release: `skypilot`, revision 286, chart `skypilot-1.1.811`, appVersion
   1.1.811, deployed 2026-07-25 13:42 BST. Eight revisions in ~13 hours that day.
@@ -875,7 +890,8 @@ any value this design writes.
 
 ## Deploy runbook
 
-Nothing below has been executed. All verification performed so far was read-only.
+M0 and M1 are complete. Nothing in the M2-to-M4 application runbook below has
+been executed.
 
 **Restart summary, stated up front.** M0 and M1 restart nothing. **M2 restarts the
 api-server pod.** Because the Deployment strategy is `Recreate` with `replicas: 1`,
@@ -887,19 +903,20 @@ UID that is the drain-proof session identity. **Schedule M2 in a quiet window, a
 check that no service is mid-update or mid-retirement first.** M3 and M4 carry the
 same cost and should ride routine image bumps.
 
-### Step 0: snapshot the release (rollback artifact)
+### Step 0: snapshot the current release (rollback artifact)
 
 ```
-helm get values skypilot -n skypilot --kube-context ghub-skypilot > /tmp/skypilot-values-rev286.yaml
+helm get values skypilot -n skypilot --kube-context ghub-skypilot -o yaml \
+  > /tmp/skypilot-values-before-datadog.yaml
 helm history skypilot -n skypilot --kube-context ghub-skypilot | tail -5
 kubectl --context ghub-skypilot -n skypilot get deploy skypilot-api-server \
   -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
-Expect chart `skypilot-1.1.811`, revision 286, image digest
-`...skypilot-nightly-boltz:1.1.811@sha256:f794cf80f3156449937057c35718ede6757fb2a7c91bc386ae168e91c975bf90`.
+Record the live revision and immutable image digest; do not assume the historical
+revision 286 values elsewhere in this document are still current.
 
-### Step 1 (M0): create the secret, then grant it
+### Historical step 1 (M0 complete; do not repeat): create the secret and grant
 
 Operator supplies the api_key value. Prefer a **fresh, ingestion-scoped key**
 minted in the Datadog org over copying the terraform-provider key.
@@ -923,7 +940,8 @@ aws --profile boltz-gitops-hub iam get-role-policy \
 Expect the ARN to resolve and the policy `Resource` list to contain
 `...:secret:skypilot/gitops-hub-rainier/datadog/credentials-*`.
 
-**Terragrunt pin warning.** If this change is applied via terragrunt against the
+**Historical Terragrunt pin warning.** When this change was applied via
+terragrunt against the
 `skypilot-control-plane` module, bump
 `environments/gitops-hub-rainier/skypilot-control-plane/skypilot-pin.json` from
 `1.1.805` to the live version **in the same commit**, or the apply downgrades the
@@ -932,7 +950,7 @@ version change before applying.
 
 No restart. No SkyPilot impact.
 
-### Step 2 (M1): install the Datadog agent
+### Historical step 2 (M1 complete; do not repeat): install the Datadog agent
 
 Merge the `datadog-hub` ArgoCD Application and `values-hub.yaml`, then sync
 manually (`selfHeal: false` for the first week).
@@ -960,8 +978,9 @@ explicitly if you want a clean teardown).
 ### Step 3 (M2): controller metrics
 
 Merge the fork code, build and push the image, then apply the env additions and the
-new image together in **one** restart. Preferred path is terragrunt (with the pin
-bumped). For an out-of-band deploy, `--reuse-values` is mandatory:
+new image together in **one** restart. Deploy the SkyPilot application directly
+with Helm; do not route this through boltz-platform. Preserve the complete live
+release values, using `--reuse-values` for the routine upgrade:
 
 ```
 helm upgrade skypilot ./charts/skypilot -n skypilot --kube-context ghub-skypilot \
@@ -973,11 +992,10 @@ helm upgrade skypilot ./charts/skypilot -n skypilot --kube-context ghub-skypilot
 OAuth and serve-auth secret refs, the storage and ingress blocks, the resource
 requests, and the two `extraInitContainers`. Dropping it breaks the deployment.
 Note that Helm **replaces** arrays rather than merging them, so the `extraEnvs`
-list must be supplied complete (21 existing entries plus the 5 new ones), which is
-another reason to route this through the terragrunt module rather than by hand.
-
-Anything applied by hand out of band will be **silently reverted by the next
-terragrunt apply** unless the same values land in `terragrunt.hcl`.
+list must be supplied complete (the existing entries plus the new ones). Render
+and inspect the complete values before the upgrade. If a retired chart key must
+be scrubbed, use `--reset-values` only with that complete sanitized values stream
+rather than relying on computed defaults from an older chart.
 
 Verify (read-only):
 
@@ -1018,12 +1036,12 @@ prior art: `monitors/skypilot-low-priority-job-failure-rate.json`. Tag
 2. **Remove the agent:** delete the `datadog-hub` Application, then the
    `observability-datadog` namespace. Metrics and logs stop. SkyPilot is
    unaffected: the emitter swallows `ECONNREFUSED`.
-3. **Revert the env:** terragrunt apply with `local.datadog_envs` removed, or
-   `helm rollback skypilot 286 -n skypilot --kube-context ghub-skypilot` for an
-   emergency. Re-apply terragrunt afterwards or the next apply reintroduces it.
-   One `Recreate` restart.
-4. **Revert the code:** `--set apiService.image=<previous digest>`
-   (rev 286 is `sha256:f794cf80...`). Rolls all 17 LBs again.
+3. **Revert the env:** direct Helm upgrade with the captured complete values and
+   the Datadog env entries removed, or `helm rollback skypilot <captured-revision>
+   -n skypilot --kube-context ghub-skypilot` for an emergency. One `Recreate`
+   restart.
+4. **Revert the code:** direct Helm upgrade with
+   `--set apiService.image=<captured-previous-digest>`. This rolls all LBs again.
 5. **Leave the secret and IAM in place.** They are inert with no agent.
 
 Prefer the targeted `--set` forms over `helm rollback`, which reverts image and
@@ -1033,31 +1051,26 @@ values together. At no point does rollback require touching the request path.
 
 ## Milestones
 
-| # | Deliverable | Effort | Independently shippable? |
-|---|---|---|---|
-| M0 | AWS secret in 255203429798 + `eso_read_secret_keys` grant + pin bump | 0.5d plus review latency on another team's queue | Yes. No runtime effect. |
-| M1 | `datadog-hub` ArgoCD Application, `values-hub.yaml`, agent DaemonSet + cluster-agent | 1d | **Yes, and this is the value gate.** Delivers LB container logs, k8s events, restart and OOMKill visibility, node metrics, with zero SkyPilot code. |
-| M2 | `dogstatsd.py`, `serve_telemetry.py`, emit sites for broker / drain proof / autoscaler / sync-payload LB fields, `local.datadog_envs` | 2d | Yes. Covers problem areas 1, 2, 4 and the cheap half of 3. Includes `demonstrated_need`, the rollout gate. |
-| M3 | `lb_slot` + `ha_observability` + occupancy aggregates into the sync payload (extract the `_capacity` helper), controller-side per-slot keying | 1.5d | Yes. Closes the rest of problem area 3. |
-| M4 | Rejection counter with bounded `reason` across all 4 call sites, dashboards and monitors registered in `environments/global/datadog` | 1d | Yes. |
+| # | Status | Deliverable | Effort | Independently shippable? |
+|---|---|---|---|---|
+| M0 | **Complete** | AWS secret in 255203429798 + `eso_read_secret_keys` grant | 0.5d historical | Yes. No runtime effect. |
+| M1 | **Complete** | `datadog-hub` ArgoCD Application, `values-hub.yaml`, agent DaemonSet + cluster-agent | 1d historical | **Yes, and this was the value gate.** Delivers LB container logs, k8s events, restart and OOMKill visibility, node metrics, with zero SkyPilot code. |
+| M2 | Not started | `dogstatsd.py`, `serve_telemetry.py`, emit sites for broker / drain proof / autoscaler / sync-payload LB fields, complete Helm env values | 2d | Yes. Covers problem areas 1, 2, 4 and the cheap half of 3. Includes `demonstrated_need`, the rollout gate. |
+| M3 | Not started | `lb_slot` + `ha_observability` + occupancy aggregates into the sync payload (extract the `_capacity` helper), controller-side per-slot keying | 1.5d | Yes. Closes the rest of problem area 3. |
+| M4 | Not started | Rejection counter with bounded `reason` across all 4 call sites, dashboards and monitors | 1d | Yes. |
 
-Roughly 6 working days of work, realistically two to three weeks elapsed: M0 sits
-on another team's Terraform queue, and M2 onward each want a scheduled restart
-window.
-
-If only one milestone ships, it should be **M1**: it is the only one with no
-SkyPilot risk, and container logs plus restart visibility for 17 LB pods is real
-value on a cluster that currently has none.
+M2 through M4 are roughly 4.5 working days and each wants a scheduled direct-Helm
+restart window. M1 already provides useful container logs, Kubernetes events,
+restart/OOMKill visibility, and node metrics while the application metrics remain
+pending.
 
 ---
 
 ## Risks
 
-1. **M0 gates everything and is not in this team's control.** It is a Terraform
-   change plus a secret creation in the gitops-hub account. If the org rejects a
-   replicated copy and insists on a single source of truth, scope grows to a
-   resource policy on the 421498156696 secret plus a cross-account `roleARN` store
-   shape that has never been exercised on this cluster.
+1. **M0 is complete.** Its secret and grant are an operational dependency of the
+   current agent, not pending SkyPilot application work. M2 through M4 must not
+   reopen that infrastructure path.
 2. **A fourth copy of the Datadog credential now exists** (prod, test, management,
    gitops-hub). Rotation must remember it. Mitigate with a description field
    pointing at the source ARN and a runbook line. Related: the committed
@@ -1068,13 +1081,12 @@ value on a cluster that currently has none.
    so the first hour of drain-proof and broker data is an artefact of the deploy
    itself, and the "watch `demonstrated_need` for a week" clock starts at deploy,
    not retroactively.
-4. **Terragrunt drift will bite the deploy.** The pin says 1.1.805, live is 1.1.811,
-   with 8 revisions in 13 hours. Any apply that does not bump the pin downgrades
-   the control plane six releases. Conversely, any hand-run `helm upgrade` is
-   silently reverted by the next apply.
+4. **Do not introduce a second deployment authority.** SkyPilot application
+   releases use direct Helm. M2 through M4 must not add a boltz-platform or
+   Terragrunt reconciliation path for the release.
 5. **Helm replaces arrays.** `--reuse-values` does not merge a hand-added
-   `extraEnvs` entry with a later supplied array. The IaC change is mandatory, not
-   documentation.
+   `extraEnvs` entry with a later supplied array. Supply and review the complete
+   array in the Helm upgrade.
 6. **The M3 sync-payload edit sits in a `finally`-restore hazard zone.** A raise
    while building the dict discards a drained request batch with no crash and no
    alert. Only reference verified attributes; add a payload-builds unit test.

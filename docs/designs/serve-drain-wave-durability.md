@@ -1,7 +1,8 @@
 # Drain wave durability
 
-- **Status:** designed, not implemented
-- **Last updated:** 2026-07-25
+- **Status:** designed, not implemented; current-code audit repeated on
+  2026-08-08
+- **Last updated:** 2026-08-08
 - **Milestones:** W1 fresh-demand target gate, W2 bounded recovery hold, W3 wave counters
 - **Hard prerequisites for the reclaim case:** Milestones 1 and 2 of
   `docs/designs/serve-drain-proof-across-lb-restarts.md` (mechanisms A, B, C)
@@ -14,6 +15,28 @@ Read them with `git show 13368520fe:sky/serve/<file>.py`. Note that
 `serve-reserved-fill-utilization-gate.md` cite the deployed SHA
 `a0028d62c7be576a97937d8fe7471bfa7c019849` instead, so their line numbers do not
 match this document's.
+
+### Current-code audit (2026-08-08)
+
+The implementation has moved substantially since the design snapshot, but the
+three proposed milestones have not silently landed. Audited at
+`0407c5a7daf65a375c55275b5ff4224f4dfc5154`:
+
+- W1 is still absent from logical-target publication. The controller gates the
+  separate `target_num_replicas` publication on
+  `has_recomputed_with_fresh_data()` at `controller.py:4346-4358`, but publishes
+  `logical_target_state` without that gate at `controller.py:4386-4398`.
+- W2 is still absent. Recovery initializes a process-local 120-second deadline
+  at `replica_managers.py:7690-7693`, then renews it when evidence remains
+  unavailable or incoherent at `7735-7752`. The triage does not release a member
+  when its durable drain budget expires.
+- The original milestone-0 counters remain in
+  `drain_observability.py:44-100`, but W3's `evidence_gap`, discarded-drain-time,
+  recovery-hold, and stale-target counters are not present.
+
+The historical line references below remain pinned to `13368520fe` so the
+original proof is reproducible. The audit above is the authoritative status
+check against the current branch.
 
 **Headline, stated first because it is the whole argument.** A drain wave does
 not need to become a durable object. Its members already are: seven
