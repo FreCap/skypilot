@@ -450,8 +450,11 @@ blocks terminal verification until the central writer either commits it with a
 finite timestamp or removes it.  Deleting old-incarnation version rows during
 normal service teardown does not erase their immutable terminal audit entries.
 
-A successful protocol-4 retirement manifest containing any
-`stale_placeholder` entry is the terminal writer generation.  Every later
+A successful protocol-4 retirement manifest containing a validated
+`historical_physical_per_gpu/retired` outcome is the terminal writer
+generation, including when its proved stale-placeholder inventory is empty.
+Terminal identity does not depend on the continued presence of the very stale
+entries it protects.  Every later
 `--apply-supported` or `--retire-terminal-historical` invocation must fail
 before external evidence collection or DML instead of emitting a newer
 manifest that could downgrade the durable stale classification to an ordinary
@@ -500,10 +503,15 @@ inventory and validates it before returning a pending request, accepting a
 completed receipt, or acknowledging and CASing a load; validating only the
 selected current and recovery entries is insufficient for protocol 4.  For a
 protocol-4 retirement run it also reads the current bounded `version_specs`
-rows for every retired candidate service and requires every manifested stale
-identity to remain the exact canonical, unretired pickled-`None` full
-row/column postimage.  Every additional canonical placeholder whose version is
-at or below the proved current version is an omitted stale row and blocks.  A
+rows and parent service hash for every retired candidate service.  While that
+same service incarnation exists, every manifested stale identity must remain
+the exact canonical, unretired pickled-`None` full row/column postimage, and
+every additional canonical placeholder whose version is at or below the
+proved current version is an omitted stale row and blocks.  If the old parent
+is absent, missing stale rows are permitted because the immutable audit remains
+in the manifest.  If the name belongs to a different incarnation, every old
+manifested stale identity must be absent; a surviving same-name row would be
+implicitly reassociated with the new parent and blocks.  A
 later ordinary placeholder is permitted only when its version is above both
 the proved current version and the terminal same-incarnation manifested
 high-water mark, and its `created_at` remains SQL NULL, matching the central
