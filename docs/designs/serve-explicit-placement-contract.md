@@ -472,6 +472,12 @@ the staged cleanup removes the transitional writer after its rollout gates.
 The terminal fence is checked against the latest fully validated manifest once
 before any external getter and again after acquiring the unchanged advisory and
 table locks; two concurrent first-retirement attempts cannot both pass it.
+After acquiring its nonblocking session advisory lock and before opening the
+writer snapshot, every protocol-4 apply also invokes revision 040's exact
+runtime-authority assertion.  That assertion verifies the complete 040 catalog
+and one coherent open singleton.  A writer whose preflight overlaps a completed
+preterminal downgrade therefore aborts before DML even if it reaches the
+advisory lock only after downgrade released it.
 
 The PostgreSQL ledger is an append-only authority, not a self-authenticating
 JSON document.  Schema revision 040 installs `ENABLE ALWAYS` database triggers
@@ -498,17 +504,21 @@ cross-protocol advisory identity without waiting; failure to acquire it aborts
 instead of continuing on the statement snapshot.  An `AFTER INSERT FOR EACH
 ROW` trigger then atomically advances the singleton only while its terminal UUID
 is NULL.  Its source run must have PostgreSQL `xmin` equal to
-`pg_current_xact_id()`, and the singleton records that same transaction ID.
+`pg_current_xact_id()::xid`, and the singleton records the corresponding
+`xid8`.  Ledger writes are deliberately top-level transactions: a run or row
+inserted inside a savepoint has a subtransaction `xmin` and fails closed rather
+than weakening the binding.
 Concurrent read-committed statements re-evaluate the updated row after a wait,
 while an older repeatable-read/serializable snapshot receives PostgreSQL's
 concurrent-update serialization failure.
 
 Terminal activation is an `AFTER INSERT FOR EACH ROW`, `DEFERRABLE INITIALLY
 DEFERRED` constraint trigger on the row ledger.  At transaction end it performs
-one conditional `UPDATE ... RETURNING` compare-and-set: the row must be the
-exact protocol-4 `historical_physical_per_gpu/retired` tuple, both the run and
-row `xmin` values must equal the current transaction ID, and the singleton's
-latest run and admitted transaction ID must match them.  A run committed
+an explicit no-op for every nonterminal inventory row.  Only the exact
+protocol-4 `historical_physical_per_gpu/retired` tuple performs one conditional
+`UPDATE ... RETURNING` compare-and-set: both the run and row `xmin` values must
+equal `pg_current_xact_id()::xid`, and the singleton's latest run and admitted
+`xid8` must match them.  A run committed
 without such a row can never be activated by a delayed insert.  The compare-and-
 set accepts an already-terminal singleton only for the same run and same
 transaction, so two or more valid retired candidates in one manifest are
@@ -546,8 +556,12 @@ PUBLIC execution, fixed `pg_catalog` search path, security/volatility/parallel
 attributes, exact relation/function/event and row/statement level,
 always-enabled state, and no `WHEN` predicate, arguments, transition tables,
 unexpected constraint metadata, duplicate name, overload, or extra source
-trigger.  A partial, disabled, predicate-gated, shadowed, or owner/ACL/config-
-drifted catalog is a migration failure, not an adoptable state.
+trigger.  The three relations must have no inheritance parent or child and no
+non-internal rewrite rule; `pg_inherits`, `relhassubclass`, `pg_rewrite`, and
+`relhasrules` are part of the verified envelope so inherited or redirected DML
+cannot bypass the parent triggers.  A partial, disabled, predicate-gated,
+shadowed, inherited, rewrite-enabled, or owner/ACL/config-drifted catalog is a
+migration failure, not an adoptable state.
 
 Downgrade is serialized with the writer rather than relying on a point-in-time
 terminal query.  It must first acquire the same advisory transaction lock
@@ -556,8 +570,10 @@ singleton, run ledger, and row ledger, reverify the exact catalog and singleton,
 and recheck terminal state before removing revision 040.  If a writer owns the
 advisory authority, downgrade fails busy; if downgrade owns it first, a writer
 fails its nonblocking session-lock attempt instead of waiting to enter after the
-catalog removal commits.  A committed terminal UUID always makes downgrade
-fail closed.
+catalog removal commits.  If downgrade finishes before that attempt begins, the
+writer's mandatory runtime-authority assertion observes the absent 040 catalog
+and fails before opening its snapshot.  A committed terminal UUID always makes
+downgrade fail closed.
 
 This database boundary is necessary because a maliciously coherent rewrite of
 the run protocol, every row classification and dependency fact, all counts,
@@ -1570,16 +1586,21 @@ Automated coverage must prove:
   busy advisory gate, observe the terminal singleton, or abort with a
   serialization failure; commit a terminal-mode run without a retired row and
   require a later row insertion to fail its transaction binding; accept two
-  terminal candidates inserted by the same admitted run and reject a competing
-  activation; race downgrade and terminal admission in both lock orders and
-  require exactly one authority to proceed; tamper with every singleton
+  terminal candidates plus ordinary nonterminal inventory rows inserted by the
+  same admitted run and reject a competing activation; insert a run or terminal
+  row under a SAVEPOINT and require the subtransaction `xmin` to fail closed;
+  race downgrade and terminal admission in both lock orders, including a writer
+  whose external preflight predates a downgrade but whose session-lock attempt
+  follows its commit, and require exactly one authority to proceed; require the
+  runtime-authority assertion to reject an absent, terminal, or catalog-drifted
+  040 installation before writer DML; tamper with every singleton
   column/default/type/nullability/key/check/FK, singleton row value/count,
-  relation owner/ACL/kind/persistence/RLS state, and function/trigger owner,
-  ACL, search-path, body, event, enablement, predicate, argument, transition,
-  constraint, overload, or duplicate/extra-source-trigger field and require
-  fail-closed rejection; attempt every top-level singleton DML operation and a
-  depth-two update without the exact current-transaction source tuples and
-  require rejection;
+  relation owner/ACL/kind/persistence/RLS/inheritance/rule state, and
+  function/trigger owner, ACL, search-path, body, event, enablement, predicate,
+  argument, transition, constraint, overload, or duplicate/extra-source-trigger
+  field and require fail-closed rejection; attempt every top-level singleton
+  DML operation and a depth-two update without the exact current-transaction
+  source tuples and require rejection;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
   malformed false-ish cleanup fields, noncanonical scope metadata, inventory
   overflow/drift, or ledger-fact tampering blocks retirement;
