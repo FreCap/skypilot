@@ -473,15 +473,19 @@ before any external getter and again after acquiring the unchanged advisory and
 table locks; two concurrent first-retirement attempts cannot both pass it.
 
 The PostgreSQL ledger is an append-only authority, not a self-authenticating
-JSON document.  The protocol-4 migration installs database triggers that
-reject every `UPDATE` or `DELETE` of a normalization run or row.  After an
+JSON document.  Schema revision 040 installs `ENABLE ALWAYS` database triggers
+that reject every `UPDATE`, `DELETE`, or `TRUNCATE` of a normalization run or
+row, including under PostgreSQL's replica session role.  After an
 immutable protocol-4 terminal `historical_physical_per_gpu/retired` row exists,
 the database also rejects insertion of any later normalization run, including
 one attempted by an older protocol-1/2/3 image.  The terminal transaction
 inserts its run before its rows, so its own first generation remains atomic;
 the insertion fence becomes active for subsequent transactions only after the
-terminal row commits.  Later cleanup must explicitly remove these triggers as
-part of its reviewed schema retirement, never weaken them in place.
+terminal row commits.  Revision 040 may be downgraded cleanly before terminal
+retirement, but its downgrade must fail closed once a terminal row exists.
+Later cleanup must explicitly remove these triggers as part of its reviewed
+schema retirement, never weaken them in place or reuse the generic downgrade
+as a post-terminal escape hatch.
 
 This database boundary is necessary because a maliciously coherent rewrite of
 the run protocol, every row classification and dependency fact, all counts,
@@ -1142,13 +1146,13 @@ fixture before production apply.  Because that release can write v1 and lacks
 the controller hold, it must never be deployed after apply; the normalization
 release is the minimum server rollback floor.
 
-The protocol-4 follow-up adds a PostgreSQL-only schema revision for the
+The protocol-4 follow-up adds PostgreSQL-only schema revision 040 for the
 append-only run/row triggers and the post-terminal run-insert fence described
 above.  It changes no placement pickle during startup.  Reader-first rollout
 must prove the trigger definitions are installed before the held operator
 transaction; after the terminal row commits, rollback to any image that does
-not understand protocol 4 is forbidden independently of the application-level
-writer fence.
+not understand protocol 4 and downgrade of revision 040 are forbidden
+independently of the application-level writer fence.
 
 Production baseline inventory found 155 valid fieldless public contracts,
 seven pickled-`None` placeholders, and one fieldless transition-only
@@ -1482,9 +1486,12 @@ Automated coverage must prove:
   digest, nested key, and `stale_placeholder` classification; partially
   relabel v3 as v4 and v4 as v3 and require full-manifest rejection; attempt a
   coherent whole-manifest v4-to-v3 rewrite in real PostgreSQL and require the
-  first ledger mutation to fail at the append-only trigger; after a successful
-  terminal transaction, attempt a protocol-3 run insert and require the
-  post-terminal database fence to reject it;
+  first ledger mutation to fail at the append-only trigger; prove the trigger
+  also fires for `TRUNCATE` and with `session_replication_role=replica`; after a
+  successful terminal transaction, attempt a protocol-3 run insert and a
+  revision-040 downgrade and require both post-terminal database fences to
+  reject them; prove a pre-terminal downgrade removes exactly the revision-040
+  catalog;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
   malformed false-ish cleanup fields, noncanonical scope metadata, inventory
   overflow/drift, or ledger-fact tampering blocks retirement;
