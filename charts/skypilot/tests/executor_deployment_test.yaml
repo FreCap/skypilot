@@ -24,6 +24,32 @@ tests:
             persistentVolumeClaim:
               claimName: production-rwx-state
 
+  - it: should gate executor startup on a separately mounted read-only authority claim
+    values:
+      - fixtures/rwx-authority-fence-values.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: verify-rwx-authority-fence
+      - equal:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          value:
+            - name: skypilot-rwx-authority-fence
+              mountPath: /var/run/skypilot/rwx-authority
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-rwx-authority-fence
+            persistentVolumeClaim:
+              claimName: skypilot-state-authority
+              readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: skypilot-rwx-authority-fence
+
   - it: should not render an executor deployment in compatibility mode
     asserts:
       - hasDocuments:

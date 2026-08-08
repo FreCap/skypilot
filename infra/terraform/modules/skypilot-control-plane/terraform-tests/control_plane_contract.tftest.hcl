@@ -128,6 +128,17 @@ run "default_contract_is_provider_neutral_and_stable" {
   }
 
   assert {
+    condition = (
+      !contains(keys(yamldecode(helm_release.skypilot.values[0])), "extraInitContainers") &&
+      alltrue([
+        for volume in try(yamldecode(helm_release.skypilot.values[0]).apiService.extraVolumes, []) :
+        volume.name != "skypilot-rwx-authority-fence"
+      ])
+    )
+    error_message = "The default contract must not render an RWX authority verifier or authority volume."
+  }
+
+  assert {
     condition     = output.api_server_role_name == "skypilot-api-platform-eks"
     error_message = "The module must expose the effective API role name."
   }
@@ -168,6 +179,159 @@ run "postgres_request_store_is_rendered" {
       }
     )
     error_message = "The module must map request_store into the chart's requestStore contract."
+  }
+}
+
+run "rwx_authority_fence_is_typed_and_composed" {
+  command = plan
+
+  variables {
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      storage:
+        enabled: true
+        accessMode: ReadWriteMany
+        existingClaim: skypilot-state-rwx
+    EOT
+    rwx_authority_fence = {
+      authority_claim_name              = "skypilot-state-authority"
+      state_claim_name                  = "skypilot-state-rwx"
+      expected_sha256                   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      expected_postgres_evidence_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      identity = {
+        source = {
+          pvc_name      = "skypilot-state"
+          pvc_uid       = "11111111-1111-1111-1111-111111111111"
+          pv_name       = "pvc-11111111-1111-1111-1111-111111111111"
+          pv_uid        = "22222222-2222-2222-2222-222222222222"
+          ebs_volume_id = "vol-11111111111111111"
+        }
+        target = {
+          filesystem_id             = "fs-11111111111111111"
+          state_access_point_id     = "fsap-11111111111111111"
+          state_pv_name             = "skypilot-state-rwx-pv"
+          state_pv_uid              = "33333333-3333-3333-3333-333333333333"
+          state_pvc_uid             = "44444444-4444-4444-4444-444444444444"
+          authority_access_point_id = "fsap-22222222222222222"
+          authority_pv_name         = "skypilot-state-authority-pv"
+          authority_pv_uid          = "55555555-5555-5555-5555-555555555555"
+          authority_pvc_uid         = "66666666-6666-6666-6666-666666666666"
+        }
+      }
+    }
+  }
+
+  assert {
+    condition = one([
+      for volume in yamldecode(helm_release.skypilot.values[0]).apiService.extraVolumes : volume
+      if volume.name == "skypilot-rwx-authority-fence"
+      ]).persistentVolumeClaim == {
+      claimName = "skypilot-state-authority"
+      readOnly  = true
+    }
+    error_message = "The module must render the dedicated authority PVC as a read-only pod volume."
+  }
+
+  assert {
+    condition = alltrue([
+      for mount in try(yamldecode(helm_release.skypilot.values[0]).apiService.extraVolumeMounts, []) :
+      mount.name != "skypilot-rwx-authority-fence"
+    ])
+    error_message = "The module must not expose the authority PVC to long-running role containers."
+  }
+
+  assert {
+    condition = (
+      length([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+      ]) == 1 &&
+      one([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+      ]).image == var.operations_helper_image &&
+      !one([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+      ]).securityContext.allowPrivilegeEscalation &&
+      one([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+      ]).securityContext.readOnlyRootFilesystem &&
+      one([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+      ]).securityContext.capabilities.drop == ["ALL"] &&
+      one([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+        ]).volumeMounts == [{
+        mountPath = "/var/run/skypilot/rwx-authority"
+        name      = "skypilot-rwx-authority-fence"
+        readOnly  = true
+      }] &&
+      strcontains(one([
+        for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+        if container.name == "verify-rwx-authority-fence"
+      ]).command[2], "O_NOFOLLOW")
+    )
+    error_message = "The module must render one hardened, no-follow authority verifier init container."
+  }
+
+  assert {
+    condition = (
+      jsondecode(one([
+        for env in one([
+          for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+          if container.name == "verify-rwx-authority-fence"
+        ]).env : env.value
+        if env.name == "SKYPILOT_RWX_AUTHORITY_FENCE_EXPECTED_IDENTITY"
+        ])) == {
+        namespace    = "skypilot"
+        release_name = "skypilot"
+        source = {
+          pvc_namespace = "skypilot"
+          pvc_name      = "skypilot-state"
+          pvc_uid       = "11111111-1111-1111-1111-111111111111"
+          pv_name       = "pvc-11111111-1111-1111-1111-111111111111"
+          pv_uid        = "22222222-2222-2222-2222-222222222222"
+          ebs_volume_id = "vol-11111111111111111"
+        }
+        target = {
+          state_pvc_namespace       = "skypilot"
+          state_claim_name          = "skypilot-state-rwx"
+          filesystem_id             = "fs-11111111111111111"
+          state_access_point_id     = "fsap-11111111111111111"
+          state_pv_name             = "skypilot-state-rwx-pv"
+          state_pv_uid              = "33333333-3333-3333-3333-333333333333"
+          state_pvc_uid             = "44444444-4444-4444-4444-444444444444"
+          authority_claim_name      = "skypilot-state-authority"
+          authority_pvc_namespace   = "skypilot"
+          authority_access_point_id = "fsap-22222222222222222"
+          authority_pv_name         = "skypilot-state-authority-pv"
+          authority_pv_uid          = "55555555-5555-5555-5555-555555555555"
+          authority_pvc_uid         = "66666666-6666-6666-6666-666666666666"
+        }
+      } &&
+      one([
+        for env in one([
+          for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+          if container.name == "verify-rwx-authority-fence"
+        ]).env : env.value
+        if env.name == "SKYPILOT_RWX_AUTHORITY_FENCE_EXPECTED_SHA256"
+      ]) == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" &&
+      one([
+        for env in one([
+          for container in yamldecode(helm_release.skypilot.values[0]).extraInitContainers : container
+          if container.name == "verify-rwx-authority-fence"
+        ]).env : env.value
+        if env.name == "SKYPILOT_RWX_AUTHORITY_FENCE_EXPECTED_POSTGRES_EVIDENCE_SHA256"
+      ]) == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    )
+    error_message = "The verifier must bind the exact release, source, state, and authority identities."
   }
 }
 

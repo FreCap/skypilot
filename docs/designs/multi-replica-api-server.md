@@ -1,10 +1,12 @@
 # Production-Grade Multi-Replica API Server
 
 Status: M0-M4 merged in PR #1070 and live-accepted on the isolated deployment;
-the split-role metrics-completeness correction is merged and Rainier's
-PostgreSQL request-store cutover is complete; the Rainier RWX storage,
-role-split HA, and live scrape acceptance are pending; production fleet rollout
-and M5 compatibility cleanup remain fleet-gated
+the split-role metrics-completeness correction is merged, Rainier's PostgreSQL
+request-store cutover is complete, and the typed RWX authority-fence verifier
+plus desired-scale role disruption budgets are implemented and statically
+accepted; the Rainier RWX storage deployment, role-split HA, and live scrape
+acceptance are pending; production fleet rollout and M5 compatibility cleanup
+remain fleet-gated
 
 Last updated: 2026-08-08
 
@@ -581,7 +583,14 @@ The chart enforces:
   `apiService.metrics.port` is one consistent chart-wide setting.
 - Pod anti-affinity or topology-spread constraints avoid placing all replicas
   on one node when the cluster has capacity.
-- PodDisruptionBudgets preserve one API, executor, and controller pod.
+- Role PodDisruptionBudgets use the integer `maxUnavailable: 1`, preserving the
+  desired replica count minus one as healthy as a role is deliberately scaled.
+  Kubernetes computes this threshold from the owning Deployment's desired
+  `.spec.replicas`, not the temporary number of healthy surge pods. At desired
+  scale two, a three-healthy-pod surge can therefore report two allowed
+  disruptions; this PDB is an availability floor, not a one-eviction surge
+  mutex. The Deployment's separate `maxUnavailable: 0` contract governs its
+  rolling update.
 - Migration hooks finish before Deployments roll.
 - A successful DB-backed config seed restarts and waits for the API, executor,
   and controller Deployments when guarded HA is active, because every split
@@ -1134,10 +1143,12 @@ promote a standby after session loss. First-writer initialization of the
 server identity is now atomic, and the shared config bootstrap stages complete
 files before an atomic rename so concurrent pods cannot expose partial state.
 HA mode also renders independent API and executor PodDisruptionBudgets with
-`minAvailable: 1`. These are part of M2's role split, not optional rollout
-polish: an autoscaler eviction of the only remaining ready API during a
+integer `maxUnavailable: 1`. These are part of M2's role split, not optional
+rollout polish: an autoscaler eviction of the only remaining ready API during a
 graceful replica deletion otherwise defeats the availability contract even
-when durable request delivery is correct.
+when durable request delivery is correct. Review 17 supersedes the original
+`minAvailable: 1` implementation so the healthy floor follows an intentional
+increase in desired role replicas rather than remaining fixed at one.
 
 The M2 compatibility boundary is explicit. Until M3, executor replicas may
 claim both normal and controller execution classes, and the existing
@@ -1853,7 +1864,8 @@ by HA mode.
   Custom-port rendering proves the API runtime, role pods, API Service, and
   bundled federation discovery all select the same non-default port.
 - Helm snapshots prove Service selectors and PDB selectors do not overlap
-  roles.
+  roles, every role PDB renders integer `maxUnavailable: 1`, and no role PDB
+  renders `minAvailable`.
 - Termination tests prove readiness fails before shutdown and the pre-stop
   budget fits within `terminationGracePeriodSeconds`.
 
@@ -1901,6 +1913,13 @@ by HA mode.
 - Run the API server and PostgreSQL test suites.
 - Run the full repository CI rollup on the exact pushed SHA for every stacked
   pull request before merge.
+
+The typed RWX authority-fence and desired-scale role-PDB implementation was
+statically accepted on 2026-08-08 with 22 verifier unit tests, all 32
+control-plane Terraform tests, 164 targeted Helm cases across role Deployments
+and disruption budgets, all 346 chart cases, strict Mypy, Isort, Pylint, and
+repository diff checks. Its pull request still requires the full exact-head
+repository CI rollup above before merge.
 
 ## Monitoring
 
@@ -1980,9 +1999,11 @@ slower; any failed, stale, or missing observation resets the clock:
   every currently `READY`, endpoint-bearing non-pool Serve service. Pools have
   no inference endpoint and are verified as having neither an endpoint nor an
   external load-balancer Deployment;
-- API, executor, and controller Deployments each remain 2/2 Ready, Updated, and
-  Available; every role PDB permits at least one disruption; there are no
-  unexpected restarts, CrashLoops, Pending pods, or unplanned rollout revisions;
+- API, executor, and controller Deployments each have desired, current, Ready,
+  Updated, and Available counts exactly two. Every role PDB has
+  `currentHealthy=2`, `desiredHealthy=1`, `expectedPods=2`, and
+  `disruptionsAllowed=1`; a surge sample is ineligible. There are no unexpected
+  restarts, CrashLoops, Pending pods, or unplanned rollout revisions;
 - exactly one current controller generation owns leadership, no stale owner or
   duplicate execution appears, expired active leases remain zero, each
   synthetic request is claimed within 60 seconds, and interrupted-request
@@ -2571,3 +2592,18 @@ approval. Finally, cleanup now depends on an append-only, reset-aware one-minute
 evidence chain and CI-validated 10,080-minute artifact. Serve predicates derive
 their endpoint and external-LB expectations from pool status and each persisted
 durable mode rather than assuming every service owns two load balancers.
+
+### Review 17: desired-scale disruption semantics
+
+The final cross-stack audit on 2026-08-08 found that the chart's fixed
+`minAvailable: 1` role budgets diverged from Rainier's desired-scale
+`maxUnavailable: 1` contract. A follow-up semantic review rejected the initial
+claim that changing the field would cap voluntary evictions at one during a
+surge: Kubernetes derives `desiredHealthy` from the owning Deployment's
+desired `.spec.replicas`, so with desired two and three currently healthy pods,
+either form can report two allowed disruptions. The corrected contract is
+instead explicit: integer `maxUnavailable: 1` preserves desired replicas minus
+one and automatically raises the healthy floor if a role is deliberately
+scaled above two. Deployment `maxUnavailable: 0` independently protects the
+rolling update. Focused Helm tests assert the scale-aware PDB field without
+claiming it is a surge mutex.

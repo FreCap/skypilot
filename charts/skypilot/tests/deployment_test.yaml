@@ -25,6 +25,62 @@ tests:
             persistentVolumeClaim:
               claimName: production-rwx-state
 
+  - it: should gate API startup on a separately mounted read-only authority claim
+    values:
+      - fixtures/rwx-authority-fence-values.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: verify-rwx-authority-fence
+      - equal:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          value:
+            - name: skypilot-rwx-authority-fence
+              mountPath: /var/run/skypilot/rwx-authority
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-rwx-authority-fence
+            persistentVolumeClaim:
+              claimName: skypilot-state-authority
+              readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: skypilot-rwx-authority-fence
+
+  - it: should keep the authority fence in one-pod compatibility mode
+    values:
+      - fixtures/rwx-authority-fence-values.yaml
+    set:
+      apiService.highAvailability.enabled: false
+      apiService.replicas: 1
+      apiService.upgradeStrategy: Recreate
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].name
+          value: verify-rwx-authority-fence
+      - equal:
+          path: spec.template.spec.initContainers[0].volumeMounts
+          value:
+            - name: skypilot-rwx-authority-fence
+              mountPath: /var/run/skypilot/rwx-authority
+              readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-rwx-authority-fence
+            persistentVolumeClaim:
+              claimName: skypilot-state-authority
+              readOnly: true
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          any: true
+          content:
+            name: skypilot-rwx-authority-fence
+
   - it: should reject an existing claim when persistence is disabled
     set:
       storage.enabled: false

@@ -47,6 +47,109 @@ SQLite. `cutover_gate_path` defaults to the chart's durable gate location.
 same effective values into `request_store` and remove the old block in one
 plan; this changes ownership without changing the rendered release contract.
 
+## RWX cutover authority fence
+
+After an existing control plane completes a reviewed migration from its legacy
+RWO state volume to static RWX storage, set `rwx_authority_fence`. Leave it null
+before that boundary and on installations which have not migrated. The input
+has no default digest: it needs the SHA-256 of the exact digest-sealed
+`fence.json` bytes emitted by the accepted finalizer, the independently
+accepted PostgreSQL-evidence SHA-256, and the exact source, replacement, and
+authority object identities.
+
+Fence mode requires `storage.enabled=true`, `storage.accessMode=ReadWriteMany`,
+and an explicit nonempty `storage.existingClaim` equal to `state_claim_name`;
+the chart-created default claim is not an accepted static migration target. The
+effective operations helper (or API-image fallback) must be pinned by an exact
+`@sha256` digest because its Python executable enforces the startup gate. It
+also requires PostgreSQL plus
+`enforce_builtin_execution_quiescence_backends=true`, so the accepted evidence
+covers every execution storage and queue backend.
+
+The authority fence must live on a dedicated, statically bound EFS access
+point/PV/PVC which is distinct from the writable state access point/PV/PVC.
+The module exposes that PVC only to one read-only verifier init container. It
+does not add the authority mount to the API, executor, or controller container.
+The verifier is composed onto all three role templates and remains enabled in
+both one-pod compatibility and split-role HA modes. The pinned chart must
+therefore propagate top-level `extraInitContainers` and
+`apiService.extraVolumes` to all three role Deployments, as the chart in this
+repository does.
+
+```hcl
+rwx_authority_fence = {
+  authority_claim_name = "skypilot-state-authority"
+  state_claim_name     = "skypilot-state-rwx"
+  expected_sha256      = "<64 lowercase hex characters>"
+  expected_postgres_evidence_sha256 = "<64 lowercase hex characters>"
+  identity = {
+    source = {
+      pvc_name      = "<legacy PVC name>"
+      pvc_uid       = "<legacy PVC UID>"
+      pv_name       = "<legacy PV name>"
+      pv_uid        = "<legacy PV UID>"
+      ebs_volume_id = "vol-..."
+    }
+    target = {
+      filesystem_id            = "fs-..."
+      state_access_point_id     = "fsap-..."
+      state_pv_name             = "<state PV name>"
+      state_pv_uid              = "<state PV UID>"
+      state_pvc_uid             = "<state PVC UID>"
+      authority_access_point_id = "fsap-..."
+      authority_pv_name         = "<authority PV name>"
+      authority_pv_uid          = "<authority PV UID>"
+      authority_pvc_uid         = "<authority PVC UID>"
+    }
+  }
+}
+```
+
+The exact schema-v1 fence object has these top-level fields:
+`schema_version`, `status`, `identity`, `snapshots`, `manifest`,
+`postgres_evidence`, `postgres_evidence_sha256`,
+`generation_intent_sha256`, `attempt_generation`, `zero_at`, `work_cutoff`,
+`api_ready_deadline`, and `completed_at`. `identity` is the rendered
+expected identity above plus the module-owned namespace/release, the two claim
+names, and source/state/authority PVC namespace fields. All three PVC
+namespaces equal the release namespace because a pod cannot mount a claim from
+another namespace. `snapshots` contains the distinct `baseline_source_id`,
+`baseline_encrypted_id`, `quiesced_source_id`, and `quiesced_encrypted_id`.
+`manifest` contains a lowercase SHA-256, positive entry count, and nonnegative
+byte count. The entire fence uses the same sorted-key, compact, `allow_nan=false`,
+`ensure_ascii=true` UTF-8 canonical encoding described below, with no trailing
+newline or alternate whitespace.
+
+`postgres_evidence` is a sanitized, path-free exact-schema object produced by
+one `REPEATABLE READ READ ONLY` validation transaction. It binds the canonical
+cutover-marker hash/format/timestamp/counts/logical hash to the observed
+database schema revision, current row/logical hashes, and integer-zero queue,
+nonterminal, and claimed counts. `postgres_evidence_sha256` is the SHA-256 of
+its UTF-8 canonical JSON (`allow_nan=false`, `ensure_ascii=true`, compact
+separators, sorted keys), and must also match the independently supplied typed
+input. No source path, request ID, or credential is stored in this evidence.
+The object's fields are exactly `schema_version` (integer 1), `metadata_key`
+(`sqlite-to-postgres-cutover.v1`), `cutover_marker_sha256`,
+`cutover_format_version` (integer 1), `cutover_completed_at`,
+`cutover_request_count`, `cutover_queue_count`, `cutover_logical_sha256`,
+`observed_at`, `database_schema_revision`, `current_request_count`,
+`current_queue_count`, `current_nonterminal_count`, `current_claimed_count`,
+and `current_logical_sha256`. The current request count cannot be lower than
+the historical cutover count; each of the three current work counts must be
+the JSON integer `0` (not a boolean).
+The status must be `complete` and timestamps must be RFC 3339 UTC. Unknown or
+duplicate keys, a writable/symlinked/non-regular/hardlinked file, a digest or
+identity mismatch, or a file replacement during verification prevents every
+affected pod from starting. `attempt_generation` is a positive integer,
+`work_cutoff - zero_at` is exactly 2,700 seconds,
+`api_ready_deadline - zero_at` is exactly 7,200 seconds, and `completed_at`
+must be strictly inside the API-zero work window. Historical queue count cannot
+exceed historical request count, and the timestamps must satisfy
+`cutover_completed_at <= zero_at < observed_at < completed_at < work_cutoff`.
+When the fence is enabled, nonempty escape-hatch API sidecars and
+database/executor/controller extra volume or mount arrays are rejected so no
+long-running container can reference the init-only authority volume.
+
 ## Provider ownership
 
 As a normal child module, configure providers in the root:
@@ -253,6 +356,7 @@ No modules.
 | <a name="input_rbac_default_role"></a> [rbac\_default\_role](#input\_rbac\_default\_role) | Default role for newly auto-provisioned SSO users. SkyPilot ships this as<br/>`admin` to ease setup; we default to `user` for least privilege. NOTE: verify<br/>it actually takes effect on your chart version (see skypilot issue #9271). | `string` | `"user"` | no |
 | <a name="input_release_name"></a> [release\_name](#input\_release\_name) | Helm release name. The chart derives the API service account as <release\_name>-api-sa. | `string` | `"skypilot"` | no |
 | <a name="input_request_store"></a> [request\_store](#input\_request\_store) | API request-envelope persistence settings rendered as the chart's<br/>requestStore values. The SQLite defaults preserve the chart's compatibility<br/>behavior; select PostgreSQL explicitly only after completing the chart's<br/>one-way request-store cutover procedure. Enabling built-in execution<br/>quiescence enforcement requires the PostgreSQL backend. | <pre>object({<br/>    backend                                        = optional(string, "sqlite")<br/>    enforce_builtin_execution_quiescence_backends = optional(bool, false)<br/>    cutover_gate_path                              = optional(string, "/root/.sky/api-request-cutover.json")<br/>  })</pre> | `{}` | no |
+| <a name="input_rwx_authority_fence"></a> [rwx\_authority\_fence](#input\_rwx\_authority\_fence) | Optional steady-state verifier for a completed migration to static RWX storage. The object binds a dedicated authority PVC, exact fence and PostgreSQL-evidence SHA-256 values, and exact source/state/authority identities. | <pre>object({<br/>    authority_claim_name = string<br/>    state_claim_name     = string<br/>    expected_sha256      = string<br/>    expected_postgres_evidence_sha256 = string<br/>    identity = object({<br/>      source = object({<br/>        pvc_name = string<br/>        pvc_uid = string<br/>        pv_name = string<br/>        pv_uid = string<br/>        ebs_volume_id = string<br/>      })<br/>      target = object({<br/>        filesystem_id = string<br/>        state_access_point_id = string<br/>        state_pv_name = string<br/>        state_pv_uid = string<br/>        state_pvc_uid = string<br/>        authority_access_point_id = string<br/>        authority_pv_name = string<br/>        authority_pv_uid = string<br/>        authority_pvc_uid = string<br/>      })<br/>    })<br/>  })</pre> | `null` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags applied to AWS resources created by this module. | `map(string)` | `{}` | no |
 | <a name="input_workspace_email_domain"></a> [workspace\_email\_domain](#input\_workspace\_email\_domain) | Restrict logins to this email domain (auth.oauth.email-domain). Null relies on the OIDC client's audience restriction. | `string` | `null` | no |
 
