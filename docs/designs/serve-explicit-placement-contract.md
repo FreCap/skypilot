@@ -474,10 +474,15 @@ before any external getter and again after acquiring the unchanged advisory and
 table locks; two concurrent first-retirement attempts cannot both pass it.
 After acquiring its nonblocking session advisory lock and before opening the
 writer snapshot, every protocol-4 apply also invokes revision 040's exact
-runtime-authority assertion.  That assertion verifies the complete 040 catalog
-and one coherent open singleton.  A writer whose preflight overlaps a completed
-preterminal downgrade therefore aborts before DML even if it reaches the
-advisory lock only after downgrade released it.
+runtime-authority assertion by its canonical schema-qualified name.  That
+assertion verifies the complete 040 catalog, its exact relation/function OIDs,
+and one coherent open singleton.  The operator rejects any same-session
+`pg_my_temp_schema()` relation shadow for a table in its write/read set, binds
+all SQLAlchemy tables to the asserted canonical schema, and schema-qualifies its
+raw table locks; PostgreSQL's implicit `pg_temp` precedence therefore cannot
+redirect either the proof or authoritative DML.  A writer whose preflight
+overlaps a completed preterminal downgrade aborts before DML even if it reaches
+the advisory lock only after downgrade released it.
 
 The PostgreSQL ledger is an append-only authority, not a self-authenticating
 JSON document.  Schema revision 040 installs `ENABLE ALWAYS` database triggers
@@ -1597,7 +1602,10 @@ Automated coverage must prove:
   whose external preflight predates a downgrade but whose session-lock attempt
   follows its commit, and require exactly one authority to proceed; require the
   runtime-authority assertion to reject an absent, terminal, or catalog-drifted
-  040 installation before writer DML; tamper with every singleton
+  040 installation before writer DML; create same-session temporary shadows for
+  the assertion name and each operator relation and prove the schema-qualified
+  assertion plus canonical-schema SQL binding rejects them before DML; tamper
+  with every singleton
   column/default/type/nullability/key/check/FK, singleton row value/count,
   relation owner/ACL/kind/persistence/RLS/inheritance/rule state, and
   function/trigger owner, ACL, search-path, body, event, enablement, predicate,
