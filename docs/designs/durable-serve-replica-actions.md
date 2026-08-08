@@ -2080,9 +2080,12 @@ now a small closed index rather than a monolithic `cases` array. It contains
 exactly two ordered descriptors for
 `provider_authority_v2/representability_case_inventory/000.json` and
 `provider_authority_v2/representability_case_inventory/001.json`. A descriptor
-contains only its literal package-relative path, zero-based shard ordinal,
-first and last global case sequence, case count, canonical byte count, and
-SHA-256. For the current provisional 366-row implementation set the descriptors
+contains its zero-based shard ordinal, first and last global case sequence,
+case count, and one shared `ProviderRepoArtifactRefV1`. That nested reference
+contains the fixed literal package-relative path, exact LF-inclusive byte size,
+and SHA-256; there is no second ad hoc artifact-reference shape or ambiguous
+canonical-versus-file byte count. For the current provisional 366-row
+implementation set the descriptors
 are exactly `0..182` and `183..365`, 183 rows each. That count and split are
 implementation status, not qualification evidence: only three of the seven
 boundary families are implemented, so authority remains disabled and a final
@@ -2107,11 +2110,13 @@ outcome, retry-decision, observation, effect-trace, partial-down-basis, and
 and proposed `shadow_projection` rows. Ranges, regexes, implicit Cartesian
 products, and "all enum values" placeholders are invalid.
 
-The descriptor-safe loader opens the fixed package root once, rejects absolute
+The descriptor-safe loader opens and pins the fixed package root once for the
+entire artifact-inventory -> case-index -> shard traversal, rejects absolute
 paths, `..`, symlinks, non-regular files, duplicate descriptors, and any path
-other than those two literals, reads each descriptor target through that root
-without a name-based reopen, and verifies byte count, hash, one-LF canonical
-bytes, and unchanged file identity from the same descriptor. Concatenating
+other than those two literals, reads the index and both descriptor targets
+through that same root without a name-based reopen, and verifies byte count,
+hash, one-LF canonical bytes, and unchanged file identity from the same file
+descriptor. Concatenating
 shards in index order must yield global sequences `0..len(cases)-1`, unique
 case IDs, exact descriptor ranges/counts, and canonical equality with the
 production enumerator's complete ordered code tuple. The top artifact inventory
