@@ -202,6 +202,8 @@ export function useManagedJobsPageData() {
       const ownsState = () =>
         mountedRef.current && version === requestVersionRef.current;
       const refreshPromise = (async () => {
+        let childRefreshPromise = null;
+        let poolSnapshotLoaded = false;
         if (isInitialLoad) {
           setPoolsLoading(true);
         }
@@ -224,16 +226,16 @@ export function useManagedJobsPageData() {
           if (!ownsState()) return;
 
           setPreloadingComplete(true);
-          setLastFetchedTime(new Date());
 
           if (refreshJobs) {
-            jobsRefreshRef.current?.();
+            childRefreshPromise = Promise.resolve(jobsRefreshRef.current?.());
           }
           if (forcePoolRefresh) {
             dashboardCache.invalidate(getPoolStatus, [{}]);
           }
 
           const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+          poolSnapshotLoaded = true;
           if (ownsState()) {
             setPoolsData(poolsResponse?.pools || []);
           }
@@ -242,6 +244,18 @@ export function useManagedJobsPageData() {
             console.error('Error fetching data:', error);
           }
         } finally {
+          if (childRefreshPromise != null) {
+            try {
+              await childRefreshPromise;
+            } catch (error) {
+              if (ownsState()) {
+                console.error('Error refreshing managed jobs table:', error);
+              }
+            }
+          }
+          if (ownsState() && poolSnapshotLoaded) {
+            setLastFetchedTime(new Date());
+          }
           if (ownsState() && isInitialLoad) {
             setPoolsLoading(false);
             initialLoadRef.current = false;

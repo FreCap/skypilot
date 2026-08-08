@@ -246,6 +246,40 @@ describe('managed jobs page initialization', () => {
     expect(dashboardCache.invalidate).toHaveBeenCalledWith(getPoolStatus, [{}]);
   });
 
+  it('keeps manual refresh ownership until the child jobs refresh settles', async () => {
+    const childRefresh = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [{ name: 'initial-pool' }] })
+      .mockResolvedValueOnce({ pools: [{ name: 'manual-pool' }] });
+    const { result } = renderHook(() => useManagedJobsPageData());
+
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
+    });
+    result.current.jobsRefreshRef.current = () => childRefresh.promise;
+
+    let refreshSettled = false;
+    let refreshPromise;
+    await act(async () => {
+      refreshPromise = result.current.handleRefresh();
+      refreshPromise.then(() => {
+        refreshSettled = true;
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'manual-pool' }]);
+    });
+    expect(refreshSettled).toBe(false);
+
+    await act(async () => {
+      childRefresh.resolve();
+      await refreshPromise;
+    });
+    expect(refreshSettled).toBe(true);
+  });
+
   it('ignores a stale request failure after a refresh succeeds', async () => {
     const initialPools = deferred();
     const refreshedPools = deferred();
@@ -472,6 +506,49 @@ describe('managed jobs page initialization', () => {
     await waitFor(() => {
       expect(result.current.poolsData).toEqual([{ name: 'post-manual-pool' }]);
     });
+
+    unmount();
+    jest.useRealTimers();
+  });
+
+  it('blocks pool polling while a manual child refresh is still in flight', async () => {
+    jest.useFakeTimers();
+    const childRefresh = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [{ name: 'initial-pool' }] })
+      .mockResolvedValueOnce({ pools: [{ name: 'manual-pool' }] })
+      .mockResolvedValueOnce({ pools: [{ name: 'unexpected-poll-pool' }] });
+
+    const { result, unmount } = renderHook(() => useManagedJobsPageData());
+
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
+    });
+    result.current.jobsRefreshRef.current = () => childRefresh.promise;
+
+    await act(async () => {
+      result.current.handleRefresh();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(result.current.poolsData).toEqual([{ name: 'manual-pool' }]);
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(REFRESH_INTERVAL);
+    });
+    expect(countCacheReads(getPoolStatus)).toBe(2);
+
+    await act(async () => {
+      childRefresh.resolve();
+      await Promise.resolve();
+    });
+
+    act(() => {
+      jest.advanceTimersByTime(REFRESH_INTERVAL);
+    });
+    await waitFor(() => expect(countCacheReads(getPoolStatus)).toBe(3));
 
     unmount();
     jest.useRealTimers();
