@@ -192,12 +192,14 @@ def get_user(session_scope: contextlib.AbstractContextManager[Any],
     )
 
 
-def get_users(engine: sqlalchemy.engine.Engine, session_factory: Any,
+def get_users(session_scope: contextlib.AbstractContextManager[Any],
               user_table: sqlalchemy.Table,
               user_ids: set[str]) -> dict[str, models.User]:
     """Project a batch of user rows keyed by ID."""
-    with session_factory(engine) as session:
-        rows = session.query(user_table).filter(
+    if not user_ids:
+        return {}
+    with session_scope as active_session:
+        rows = active_session.query(user_table).filter(
             user_table.c.id.in_(user_ids)).all()
     return {
         row.id: models.User(

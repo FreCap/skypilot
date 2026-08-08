@@ -597,10 +597,16 @@ def get_user(user_id: str,
                                             user_id)
 
 
+def _get_users_in_session(session: 'orm.Session',
+                          user_ids: set[str]) -> dict[str, models.User]:
+    return global_user_state_users.get_users(_session_scope(session),
+                                             user_table, user_ids)
+
+
 @metrics_lib.time_me
 def get_users(user_ids: set[str]) -> dict[str, models.User]:
-    return global_user_state_users.get_users(_db_manager.get_engine(),
-                                             orm.Session, user_table, user_ids)
+    return global_user_state_users.get_users(_session_scope(None), user_table,
+                                             user_ids)
 
 
 @metrics_lib.time_me
@@ -2287,8 +2293,10 @@ def get_clusters_from_names(
 
     Args:
         cluster_names: List of cluster names to look up.
-        include_user_info: If True, per-row resolve user_hash → user. This
-            re-introduces a per-row DB lookup, so it's off by default.
+        include_user_info: If True, resolve user_hash → user through one
+            batched user snapshot while the cluster batch session is still
+            open. This remains off by default because callers that do not need
+            display names should stay on the plain cluster-row hot path.
 
     Returns:
         Dict mapping ``cluster_name`` to its record, or to ``None`` for
@@ -2319,39 +2327,48 @@ def get_clusters_from_names(
         cluster_table.c.is_managed,
     ]
     with orm.Session(engine) as session:
+        row_snapshots: list[tuple[Any, str | None]] = []
+        effective_user_hashes: set[str] = set()
         for offset in range(0, len(cluster_names),
                             _CLUSTER_IN_QUERY_CHUNK_SIZE):
             batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
             rows = session.query(*query_fields).filter(
                 cluster_table.c.name.in_(batch)).all()
             for row in rows:
-                record: dict[str, Any] = {
-                    'name': row.name,
-                    'launched_at': row.launched_at,
-                    'handle': pickle.loads(row.handle),
-                    'last_use': row.last_use,
-                    'status': status_lib.ClusterStatus[row.status],
-                    'autostop': row.autostop,
-                    'to_down': bool(row.to_down),
-                    'owner': _load_owner(row.owner),
-                    'metadata': json.loads(row.metadata),
-                    'cluster_hash': row.cluster_hash,
-                    'cluster_ever_up': bool(row.cluster_ever_up),
-                    'status_updated_at': row.status_updated_at,
-                    'workspace': row.workspace,
-                    'is_managed': bool(row.is_managed),
-                    'config_hash': row.config_hash,
-                }
+                effective_user_hash = None
                 if include_user_info:
-                    user_hash = _get_user_hash_or_current_user(row.user_hash)
-                    # Reuse this session: get_clusters_from_names holds a pooled
-                    # connection across this loop, and a nested checkout
-                    # self-deadlocks a single-connection sync pool.
-                    user = get_user(user_hash, session=session)
-                    record['user_hash'] = user_hash
-                    record['user_name'] = (user.name
-                                           if user is not None else None)
-                result[row.name] = record
+                    effective_user_hash = _get_user_hash_or_current_user(
+                        row.user_hash)
+                    effective_user_hashes.add(effective_user_hash)
+                row_snapshots.append((row, effective_user_hash))
+        users_by_hash = {}
+        if include_user_info:
+            users_by_hash = _get_users_in_session(session,
+                                                  effective_user_hashes)
+        for row, effective_user_hash in row_snapshots:
+            record: dict[str, Any] = {
+                'name': row.name,
+                'launched_at': row.launched_at,
+                'handle': pickle.loads(row.handle),
+                'last_use': row.last_use,
+                'status': status_lib.ClusterStatus[row.status],
+                'autostop': row.autostop,
+                'to_down': bool(row.to_down),
+                'owner': _load_owner(row.owner),
+                'metadata': json.loads(row.metadata),
+                'cluster_hash': row.cluster_hash,
+                'cluster_ever_up': bool(row.cluster_ever_up),
+                'status_updated_at': row.status_updated_at,
+                'workspace': row.workspace,
+                'is_managed': bool(row.is_managed),
+                'config_hash': row.config_hash,
+            }
+            if include_user_info:
+                assert effective_user_hash is not None, row.name
+                user = users_by_hash.get(effective_user_hash)
+                record['user_hash'] = effective_user_hash
+                record['user_name'] = (user.name if user is not None else None)
+            result[row.name] = record
     return result
 
 

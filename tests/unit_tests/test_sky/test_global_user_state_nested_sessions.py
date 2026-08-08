@@ -14,7 +14,7 @@ Three public operations did exactly that before the fix:
 * ``add_cluster_event(nop_if_duplicate=True)`` -> ``get_last_cluster_event``
 * ``remove_cluster`` -> ``_get_cluster_usage_intervals`` /
   ``_set_cluster_usage_intervals``
-* ``get_clusters_from_names(include_user_info=True)`` -> ``get_user``
+* ``get_clusters_from_names(include_user_info=True)`` -> batched ``get_users``
 
 Each test drives one of these against a real ``QueuePool(pool_size=1,
 max_overflow=0)`` engine. Pre-fix the nested checkout self-deadlocks and raises
