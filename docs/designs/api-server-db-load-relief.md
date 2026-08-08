@@ -47,7 +47,7 @@ migration. No milestone changes a public API or requires an API version bump.
   before/after ownership fence, the controller's early ownership rejection, or
   its in-lock authority check.
 - Keep every optimization safe during a mixed `v1.1.1015` and current-version
-  rollout within the existing authority-routing rollout gate.
+  rollout within the existing HA ownership and rollout gates.
 - Provide an explicit disabled or legacy-equivalent setting for each behavioral
   optimization so production enablement and rollback are configuration-only.
 - Attribute successful physical PostgreSQL connections to a bounded process
@@ -96,8 +96,8 @@ The relevant behavior was compared directly with `v1.1.1015`:
 | Path | `v1.1.1015` and current behavior | Relevant current-only difference |
 |---|---|---|
 | `RequestWorker.process_request()` and `run()` | Function ASTs are identical. An empty `queue.get()` sleeps 100 ms; a nonempty queue immediately starts the next pickup. | None. |
-| `PostgresQueueBackend.get()` | Every call opens a transaction, checks leadership when applicable, runs `_reap_expired_claims()`, then runs `_candidate()`. | Current code scopes work by execution class and controller leadership and temporarily excludes the four retired private handler names. Cadence is unchanged. |
-| `PostgresQueueBackend._reap_expired_claims()` | Selects up to 100 expired claimed rows with `FOR UPDATE SKIP LOCKED`, then requeues replayable work or terminalizes ambiguous mutating work. | Current code applies the same execution-class, controller-leadership, and temporary private-handler quarantine used for pickup. These predicates remain until the monitoring-gated final cleanup. |
+| `PostgresQueueBackend.get()` | Every call opens a transaction, checks leadership when applicable, runs `_reap_expired_claims()`, then runs `_candidate()`. | Current code scopes work by execution class and controller leadership. Cadence is unchanged. |
+| `PostgresQueueBackend._reap_expired_claims()` | Selects up to 100 expired claimed rows with `FOR UPDATE SKIP LOCKED`, then requeues replayable work or terminalizes ambiguous mutating work. | Current code applies the same execution-class and controller-leadership predicates used for pickup. |
 | `SkyPilotReplicaManager._probe_all_replicas()` | Every non-preempted, non-terminal probe result is appended to `pending_writes`, then the whole list is batch-upserted. | Current code also performs typed system-recovery reductions and owner-fenced route suspensions in the probe loop. Changed-only filtering must be limited to ordinary replicas and preserve those recovery writes. |
 | `controller_proxy._proxy_controller_sync()` | Function ASTs are identical. It reads owner before forwarding and after receiving the response. | None. |
 | `SkyServeController._handle_load_balancer_role()` | Function ASTs are identical. It performs an initial owner read, then an in-lock fence read and a separate cutover-state read. | None. |
@@ -862,10 +862,11 @@ response-contract change is accepted.
 - For handlers understood by both versions, old and new queue consumers can run
   together. Old consumers sweep more often; row locks, lease tokens, execution
   generations, and terminal transitions remain authoritative.
-- The dedicated authority-worker routing and its old mixed-version gate are
-  retired. During the compatibility cleanup, current consumers still exclude
-  the four private handler names; the final cleanup may remove that predicate
-  only after the all-status database gate proves no matching request exists.
+- The dedicated authority-worker routing, private-handler quarantine, and old
+  mixed-version gate are retired after the all-status database gate proved no
+  matching request exists. The released plugin `claim_scope` argument remains
+  as a `GENERAL`-only compatibility shim; the retired authority scope is
+  rejected and does not affect queue selection.
 - Old and new idle workers can run together. The faster poller may claim first,
   but the PostgreSQL claim transaction prevents duplicate execution.
 - During a Serve owner handoff, only the fenced current controller may persist

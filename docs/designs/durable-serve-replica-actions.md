@@ -11,11 +11,18 @@ than left import-broken by the retirement of its authority dependencies. PR
 #1333's forward-only Serve038/039 migrations are retained inert while its
 uncalled runtime state layer is removed. The unexercised V2 authority contracts
 merged by PR #1332 and the disabled PR #1232 activation surface are also being
-removed. No service was promoted, no authority worker claimed a request, and
-no provider effect ran through the proposed path. Source cleanup is not
-operationally complete until the exact merged compatibility artifact and its
-stacked final-removal artifact are each deployed and pass their monitoring
-gates below.
+removed. PR #1340 merged the compatibility cleanup. Draft PR #1346 deletes the
+temporary disabled Helm value, private-handler quarantine, private result
+codecs, and authority routing. Its deployment gates passed on 2026-08-08: the
+exact compatibility artifact was deployed, every private-handler request was
+absent across all statuses at readiness, +10 minutes, and +30 minutes, and the
+only SkyPilot Helm release's stored value was scrubbed. The released plugin
+`claim_scope` API remains as an inert `GENERAL`-only compatibility shim; its
+retired authority value is rejected and does not affect queue selection.
+No service was promoted, no authority worker claimed a request, and no provider
+effect ran through the proposed path. Source cleanup is not operationally
+complete until the exact merged compatibility artifact and this final-removal
+artifact are each deployed and pass their monitoring gates below.
 
 The review found one smaller, independent correctness gap in the existing
 Serve controller: an ordinary replica launch records its exact API request ID
@@ -238,21 +245,30 @@ justified by observed retry storms or provider throttling.
   activation surfaces. Remove PR #1335's V2 preflight and qualification-policy
   additions and PR #1342's dark V2 renderer/representability island atomically
   with them. Do not reverse forward-only migrations.
-- Retain the four private handler names as a fail-closed compatibility
-  quarantine. Ordinary executor and compatibility `all` queues must neither
-  advertise nor claim them. Remove that quarantine only in a later,
-  monitoring-gated cleanup after proving no persisted request uses the names.
-- Retain the legacy `resourceActions.authorityWorker` Helm value shape so
-  `--reuse-values` upgrades with `enabled: false` remain valid. Reject
-  `enabled: true` with a clear retired-feature error instead of silently
-  ignoring a previously enabled release.
+- In the compatibility artifact, retain the four private handler names as a
+  fail-closed quarantine. Ordinary executor and compatibility `all` queues must
+  neither advertise nor claim them. This stacked final-removal change deletes
+  the handlers, authority routing, queue exclusion, and codecs only after the
+  all-status zero-request gate below is recorded. Retain the released plugin
+  `claim_scope` parameter and enum as a `GENERAL`-only inert shim; explicitly
+  reject the retired authority scope.
+- In the compatibility artifact, retain the legacy
+  `resourceActions.authorityWorker` Helm value shape so `--reuse-values`
+  upgrades with `enabled: false` remain valid and reject `enabled: true` with a
+  clear retired-feature error. Before this stacked change may merge, scrub the
+  stored value from every release using the exact compatibility chart and
+  image. The final chart omits the key from defaults and schema and keeps a
+  narrow tombstone that rejects any stored `resourceActions` value instead of
+  silently ignoring it.
 - Deploy the exact merged cleanup artifact with existing Helm values and verify
-  that no authority workload or provider effect is introduced.
-- Before that deployment, create the stacked final-removal PR. Keep it blocked
+  that no authority workload or provider effect is introduced. Preserve the HA
+  rollout strategy; temporary CPU surge capacity follows the explicit capacity
+  approval gate below.
+- Keep this already-authored stacked final-removal PR in draft and blocked
   until stored Helm values are scrubbed and the compatibility artifact records
   zero matching private requests across all statuses at readiness, +10 minutes,
-  and +30 minutes. Then remove the disabled-value and private-handler
-  quarantine, deploy the final artifact, and repeat the same checkpoints.
+  and +30 minutes. Then merge and deploy the final artifact and repeat the same
+  checkpoints before closing R0.
 
 ### R1: evidence gate
 
@@ -323,7 +339,8 @@ completed the monitoring gate. Pools and excluded profiles remain unchanged.
 ## Deployment and rollback
 
 R0 is a code cleanup over retained additive forward-only schemas. Before the
-upgrade, prove no nonterminal request uses any of the four private handlers
+compatibility upgrade, prove no request in any status uses any of the four
+private handlers
 `serve_shadow_candidate_launch`, `serve_shadow_candidate_down`,
 `serve_resource_action_launch`, or `serve_resource_action_down`. Prove all
 generic action/attempt, shadow, cohort/reference/coverage, release, and
@@ -347,8 +364,9 @@ relations `serve_resource_action_execution_authority_lineage`,
 All nullable Serve038 candidate/identity columns on services, version specs,
 replicas, worker cohorts, and worker-cohort references must be null. The shadow
 coverage table must itself be empty because its Serve038 candidate columns are
-non-nullable. Run the same assertions after rollout. Deleting a decoder is
-forbidden if any assertion fails.
+non-nullable. Run the same assertions after rollout. This stacked cleanup must
+remain draft if any private-handler row exists in any status; deleting its
+decoder or queue quarantine is forbidden if any assertion fails.
 
 Deploy the exact merged image as one compatible Helm rollout. The live release
 explicitly pins `apiService.image`, `controllerService.image`, and
@@ -362,6 +380,29 @@ supported; the dedicated resource-action authority worker has been retired`.
 Verify no authority Deployment, Service, ServiceAccount, ConfigMap, or Pod
 exists. Rollback is an application-image rollback of all three roles only. Do
 not downgrade PostgreSQL migrations.
+
+After the compatibility artifact passes readiness, +10-minute, and +30-minute
+checks, scrub the retired value from every Helm release before merging this
+stacked cleanup. Export each release's complete user values as JSON, remove
+`.resourceActions.authorityWorker`, remove `.resourceActions` too when it is
+then empty, and compare complete client-side renders of the original and
+sanitized values. Upgrade the same compatibility chart and image with
+`--reset-values` and the complete sanitized values file while explicitly
+pinning API, controller, and executor to the same immutable image digest. Do
+not use server-side Helm dry-run, combine `--reset-values` with
+`--reuse-values`, use a null override, or use `--atomic`; the migrations remain
+forward-only.
+Verify `helm get values` contains no retired key.
+
+Only then may this final-removal change merge. Its chart intentionally has no
+`resourceActions.authorityWorker` schema or enabled-value guard, and its
+request registry intentionally has no private handler, authority claim routing,
+codec, or ordinary-queue exclusion. A narrow value tombstone rejects an
+unscrubbed release, and the released plugin API retains only an inert
+`GENERAL` claim scope. Deploy its exact immutable image to all three roles,
+run the retained migrations forward, and repeat readiness, +10-minute, and
++30-minute checks. Rollback changes application images/chart only and never
+downgrades the database.
 
 R2, if authorized, starts with binding writes disabled or validation-only.
 Rollback disables new admission and waits for every bound request to become
@@ -380,7 +421,10 @@ R0 completion requires both the compatibility and final-removal deployments:
 
 - focused unit tests for the retained generic action substrate and removal
   checker;
-- exact merged SHA and immutable image digest;
+- no registered private handler, private return codec, authority claim routing,
+  or queue exclusion in the final artifact; the released `GENERAL`-only plugin
+  shim remains inert;
+- exact merged SHA and immutable image digest for each rollout;
 - staged `boltz-test` rollout with preserved Helm values;
 - all ordinary control-plane Pods ready with zero new crash loops;
 - authority worker disabled and absent;
@@ -390,25 +434,64 @@ R0 completion requires both the compatibility and final-removal deployments:
   relevant PR with identical empty authority state and no new error/restart
   trend.
 
+### Compatibility deployment evidence (2026-08-08)
+
+PR #1340 merged as `66de423064d01b7e0fbeaf552804bd55236d00f6`.
+Its exact chart is `1.1.1159` with OCI digest
+`sha256:07ed313fc8f7e80ea1aaa82f0a2eb0163b0cc9827e46ed0e5c72cb7d4048d6c6`;
+all three roles use image digest
+`sha256:900c539a4c70264bd6f978bc463be665a57a08d6029552c70dac5b6ba56beb2f`.
+The monitored workload rollout was Helm revision 93; revision 94 later applied
+the stored-value scrub without changing the workload.
+
+The attempted `helm upgrade --dry-run=server` was not read-only in this
+environment: it persisted a release revision, executed its migration hook,
+patched Deployments, and requested surge capacity. Do not use server-side Helm
+dry-run for this release. Interrupted revisions were stopped without a schema
+downgrade; their pending release records were checksum-backed up before
+removal. All forward heads remain API008, Serve039, state028, and capacity001.
+
+Readiness at 03:00:25 UTC, +10 at 03:11:31 UTC, and +30 at 03:31:38 UTC passed
+with all six role Pods on the exact commit and image, zero restarts, no
+post-readiness Warning events, no authority objects, every private-handler/all
+retained authority table count zero, and every candidate nullable-column count
+zero. Recovery and convergence launched nine transient CPU-only Spot
+instances, eight of which terminated; the remaining one replaced a consolidated
+baseline node. No on-demand instance ran, and the NodePool returned to its
+captured 10-node / 80-vCPU baseline at 03:02:23 UTC.
+
+The cluster has one SkyPilot Helm release. Its original and sanitized values
+rendered byte-identically with the exact compatibility chart. Revision 94
+applied the sanitized complete values at 03:32 UTC with `--reset-values`, the
+same three image digests, and no `--reuse-values` or `--atomic`. Migration job
+94 succeeded, all six Pod names and creation timestamps remained unchanged,
+all Deployment generations remained observed and 2/2, the database zero-state
+remained unchanged, and `helm get values` now contains no `resourceActions`
+key.
+
 ### R0 manual test plan
 
-Before deployment, run the focused Python tests for the retained generic
-action substrate and private-handler quarantine, Helm unit tests, chart lint,
-and the image-worker template guard. Against a disposable release seeded with
-the legacy value object, verify both compatibility branches:
+Before the compatibility deployment, run the focused Python tests for the
+retained generic action substrate and private-handler quarantine, Helm unit
+tests, chart lint, and the image-worker template guard. Against a disposable
+release seeded with the legacy value object, verify both compatibility
+branches:
 
-1. `helm upgrade skypilot ./charts/skypilot -n skypilot --reuse-values
-   --dry-run=server --set resourceActions.authorityWorker.enabled=false`
-   succeeds and the rendered output contains none of the retired authority
-   workload, preflight, token, volume, or environment surfaces.
-2. The same command with `enabled=true` fails before mutation with the exact
+1. Render the complete persisted disabled-value fixture with `helm template`.
+   It must succeed and contain none of the retired authority workload,
+   preflight, token, volume, or environment surfaces. Do not use
+   `helm upgrade --dry-run=server`; it executed hooks and mutated the live
+   release during this rollout.
+2. The same client render with `enabled=true` fails with the exact
    retired-feature message above.
 
 For the real rollout, record `helm get values skypilot -n skypilot -o yaml`
 and the current revision first. Upgrade with `--reuse-values` while setting the
 API, controller, and executor images to the same immutable digest. This cleanup
-requires zero GPUs, creates no provider capacity, and has zero incremental
-capacity cost. At readiness, +10 minutes, and +30 minutes:
+requires zero GPUs. The guarded HA rollout can request at most two temporary
+8-vCPU nodes before freed slots are reused; Spot is preferred, and any
+on-demand fallback requires the recorded management approval, price ceiling,
+and hard time window. At readiness, +10 minutes, and +30 minutes:
 
 - confirm all ordinary control-plane Pods are ready with no new restarts;
 - confirm the namespace has no authority Deployment, Service,
@@ -419,6 +502,34 @@ capacity cost. At readiness, +10 minutes, and +30 minutes:
   have no adverse trend; and
 - record the exact image digest, chart revision, queries, and observations in
   the PR before declaring the cleanup done.
+
+After those three checkpoints, export and sanitize every release's complete
+stored values using:
+
+```bash
+jq 'del(.resourceActions.authorityWorker) |
+    if .resourceActions == {} then del(.resourceActions) else . end' \
+  complete-user-values.json > complete-sanitized-values.json
+```
+
+Render the complete original and sanitized value sets client-side with the same
+compatibility chart and exact role images and require byte-identical output.
+Then upgrade with `--reset-values -f complete-sanitized-values.json` plus all
+three exact role image references and prove `helm get values` has no retired
+key. This step must not use server-side Helm dry-run, `--reuse-values`, a null
+override, or `--atomic`.
+
+For this final-removal source, regenerate `values.schema.json`, run focused
+generic request/action tests, Helm unit tests and lint, and verify that neither
+the defaults nor generated schema defines `resourceActions.authorityWorker`.
+Verify the request registry has none of the four private names, the default
+encoder/decoder is used for their old request-name strings, and ordinary queue
+SQL has no special handler exclusion. Verify the final chart rejects both
+disabled and enabled persisted authority values, and the released plugin API
+accepts only the inert `GENERAL` claim scope. Merge only after the compatibility
+evidence and values scrub are recorded. Deploy the exact final digest to API,
+controller, and executor, then repeat every readiness, +10-minute, and
++30-minute query and health check above before declaring R0 complete.
 
 R2 completion, if authorized, requires all of the following in tests and the
 approved canary:
@@ -440,14 +551,19 @@ approved canary:
 
 ## Open gates
 
-- Complete and merge the compatibility R0 cleanup.
-- Deploy and monitor the compatibility cleanup on `boltz-test`.
-- Scrub every release's stored legacy Helm value, merge the already-authored
-  stacked final-removal PR only after its all-status zero-row gate passes, then
-  deploy and monitor that exact artifact.
-- Establish R1 production telemetry or record the explicit correctness
+- [x] Complete and merge the compatibility R0 cleanup.
+- [x] Deploy and monitor the compatibility cleanup on `boltz-test`; the
+  all-status zero private-handler gate passed at readiness, +10 minutes, and
+  +30 minutes.
+- [x] Scrub the only SkyPilot release's stored legacy Helm value and record the
+  sanitized stored values.
+- [ ] Move PR #1346 out of draft, require exact-head CI, then merge, deploy its
+  exact artifact, and repeat readiness, +10-minute, and +30-minute monitoring
+  before closing R0.
+- [ ] Establish R1 production telemetry or record the explicit correctness
   decision.
-- Obtain exact capacity approval before any positive launch/down crash canary.
+- [ ] Obtain exact capacity approval before the final HA rollout or any
+  positive launch/down crash canary.
 
 Until those gates close, the dedicated authority stack is retired and the
 bounded request-binding change is not production-complete.

@@ -264,9 +264,7 @@ def _encoded_return_value(name: str, request_id: str, return_value: Any) -> Any:
     """Encode a return value.
 
     Durable terminal-transition implementations catch encoder failures and
-    atomically persist FAILED plus the encoding error.  Keeping this helper
-    strict prevents a malformed private-handler result from becoming a
-    successful JSON null.
+    atomically persist FAILED plus the encoding error.
     """
     encoder = encoders.get_encoder(name)
     del request_id
@@ -1851,11 +1849,7 @@ def _finish_request_update_sql(request_id: str, status: RequestStatus,
     """
     serialized_result = None
     result_encoding_failed = False
-    should_encode_result = result is not None
-    if (name is not None and status == RequestStatus.SUCCEEDED and
-            encoders.requires_strict_return_value(name)):
-        should_encode_result = True
-    if should_encode_result:
+    if result is not None:
         assert name is not None, request_id
         serializer = return_value_serializers.get_serializer(name)
         # A serializer failure must not raise: an exception here escapes the
@@ -2500,7 +2494,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                              result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None or status == RequestStatus.SUCCEEDED:
+        if result is not None:
             # The return-value encoder is looked up by request name; a
             # single-column primary-key read is far cheaper than the full
             # row (which would unpickle entrypoint and request_body).
@@ -2537,7 +2531,7 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                                          result: Any | None = None) -> bool:
         assert _DB is not None
         name = None
-        if result is not None or status == RequestStatus.SUCCEEDED:
+        if result is not None:
             async with _DB.execute_fetchall_async(
                     f'SELECT name FROM {REQUEST_TABLE} WHERE request_id = ?',
                 (request_id,)) as rows:

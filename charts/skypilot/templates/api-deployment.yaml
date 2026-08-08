@@ -1,3 +1,6 @@
+{{- if hasKey .Values "resourceActions" -}}
+{{- fail "resourceActions.authorityWorker has been removed; delete the stored resourceActions value before upgrading" -}}
+{{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
@@ -17,10 +20,6 @@
 {{- $executorReplicas := dig "replicas" 2 $executorService -}}
 {{- $controllerService := .Values.controllerService | default (dict) -}}
 {{- $controllerReplicas := dig "replicas" 2 $controllerService -}}
-{{- $legacyAuthorityWorker := get (.Values.resourceActions | default (dict)) "authorityWorker" | default (dict) -}}
-{{- if (get $legacyAuthorityWorker "enabled" | default false) -}}
-{{- fail "resourceActions.authorityWorker.enabled=true is no longer supported; the dedicated resource-action authority worker has been retired" -}}
-{{- end -}}
 {{- $externalLB := .Values.serve.externalLoadBalancer | default (dict) -}}
 {{- $externalLBEnabled := get $externalLB "enabled" | default false -}}
 {{- $externalLBResources := get $externalLB "resources" | default (dict) -}}
