@@ -1732,7 +1732,7 @@ def test_pod_authority_missing_live_uid_fails_closed(monkeypatch):
 @pytest.mark.parametrize('deleting', [False, True])
 def test_ha_pod_authority_keeps_stable_legacy_migration_tail(
         monkeypatch, deleting):
-    _, core = _install(monkeypatch, db_service_names=('svc',))
+    apps, core = _install(monkeypatch, db_service_names=('svc',))
     desired_revision = 'a' * 64
     monkeypatch.setattr(
         lb_k8s.serve_state, 'get_service_controller_owner',
@@ -1788,12 +1788,57 @@ def test_ha_pod_authority_keeps_stable_legacy_migration_tail(
         },
         legacy_uids={'legacy'},
         terminating_uids=({'legacy'} if deleting else set()))
+    # The read-only HA authority path should validate the Service's owner
+    # identity with one live Deployment UID check, not a duplicate pre-read.
+    assert apps.read_namespaced_deployment.call_count == 1
 
     # A slotless Pod without the exact legacy Deployment label is malformed
     # and still fails closed instead of joining HA authority.
     core.list_namespaced_pod.return_value.items[1].metadata.labels = {
         lb_k8s.APP_LABEL_KEY: 'unexpected-deployment',
     }
+    assert lb_k8s.get_lb_pod_authority('svc') is None
+
+
+def test_ha_pod_authority_fails_closed_when_owner_deployment_is_replaced(
+        monkeypatch):
+    _, core = _install(monkeypatch, db_service_names=('svc',))
+    desired_revision = 'a' * 64
+    monkeypatch.setattr(
+        lb_k8s.serve_state, 'get_service_controller_owner',
+        lambda *_args, **_kwargs: {
+            'hash': 'incarnation',
+            'resource_scope': None,
+            'lb_ha_enabled': True,
+            'lb_cutover_phase': lb_ha.LbCutoverPhase.STABLE.value,
+        })
+    core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(
+            resource_version='lb-service-rv',
+            annotations={
+                lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY: '1',
+                lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
+            },
+            labels={
+                lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            },
+            owner_references=[_owner_reference()]),
+        spec=SimpleNamespace(
+            selector={
+                lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
+            }))
+    core.list_namespaced_pod.return_value = SimpleNamespace(items=[
+        _lb_pod('slot-a',
+                labels={
+                    lb_k8s.LB_SLOT_LABEL_KEY: lb_ha.LbSlot.A.value,
+                }),
+    ])
+    monkeypatch.setattr(lb_k8s, '_live_deployment_owner_uid',
+                        lambda *_args: 'replacement-uid')
+
     assert lb_k8s.get_lb_pod_authority('svc') is None
 
 

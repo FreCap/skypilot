@@ -3000,11 +3000,9 @@ def get_lb_pod_authority(service_name: str) -> LbPodAuthority | None:
             service_name_k8s = lb_service_name(service_name, resource_scope)
             service = core_api.read_namespaced_service(service_name_k8s,
                                                        namespace)
-            owner_reference = _api_deployment_owner_reference(
-                context, namespace)
-            _require_existing_lb_object_ownership(context, namespace,
-                                                  service_name_k8s, service,
-                                                  owner_reference, service_hash)
+            _require_existing_lb_object_live_ownership(context, namespace,
+                                                       service_name_k8s,
+                                                       service, service_hash)
             if isinstance(service, dict):
                 selector = service.get('spec', {}).get('selector', {}) or {}
                 annotations = service.get('metadata', {}).get(
