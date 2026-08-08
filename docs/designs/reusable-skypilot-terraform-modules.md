@@ -1,7 +1,7 @@
 # Reusable SkyPilot Terraform modules
 
-- **Status:** Accepted after adversarial review; implementation and production
-  handoff remain pending
+- **Status:** Review-28 correction independently accepted; implementation and
+  production handoff remain pending
 - **Last updated:** 2026-08-08
 - **Authoritative repository:** `boltz-bio/skypilot`, branch `improvements`
 
@@ -125,9 +125,9 @@ exec-auth configuration into generated root files while retaining the same AWS
 and Kubernetes provider addresses.
 
 The supported consumer language floor is Terraform or OpenTofu `>= 1.7.0`,
-because the permanent consumer-root `removed` blocks are part of the safety
-contract. SkyPilot CI tests Terraform 1.14.8. The first consumer additionally
-tests OpenTofu 1.11.5 through Terragrunt. Provider floors remain AWS
+because the permanent control-plane-module-root `removed` blocks are part of
+the safety contract. SkyPilot CI tests Terraform 1.14.8. The first consumer
+additionally tests OpenTofu 1.11.5 through Terragrunt. Provider floors remain AWS
 `>= 6.24.0` and Kubernetes `>= 2.20`;
 the three committed consumer lock files retain their exact selected versions
 and hashes. Historical unused Helm and Time selections may remain locked during
@@ -215,6 +215,50 @@ fails before mutation on a missing schema, invalid stored/configured shape,
 helper mismatch, or migration failure. A readback hash after commit must equal
 the deterministic expected merge result.
 
+The first production takeover, H0, has an additional fail-closed
+`configReconciliation.handoffGuard`. Its reviewed bundle sets both
+`expectedRawConfigSha256`, over the exact live
+`config_yaml.api_server_config` text bytes, and `expectedConfigSha256`, over
+canonical JSON decoded from that row. Both are 64-character lowercase hashes
+and are included in the seed generation. `requiredPaths` is a string array
+containing `/gcp/vpc_name`, `/aws/ingress_source_ranges`, and
+`/kubernetes/allowed_contexts` plus an exact, exclusive enumeration of every
+live workspace. For workspace name `N`, its RFC 6901 component `E(N)` escapes
+`~` as `~0` and `/` as `~1`. A disabled workspace
+contributes only `/workspaces/E(N)/kubernetes/disabled`, whose value must be the
+JSON Boolean `true`; an enabled workspace contributes exactly
+`/workspaces/E(N)/kubernetes/namespace` and
+`/workspaces/E(N)/kubernetes/allowed_contexts`. Missing, extra, mixed, or
+incomplete workspace coverage fails closed. Both row hashes bind the exact
+pointed values, and every pointer must resolve. Before mutation, the seed Job
+requires both digests and every pointed value to match its captured evidence.
+It also
+requires the deterministic merge to be a complete configuration no-op. It
+writes only the separate `api_server_config_seed_generation` row, then proves
+the raw configuration-row bytes, canonical digest, and required values are
+unchanged after commit. The post-upgrade verifier repeats both raw and
+canonical digests plus the required-path checks in a new read-only transaction.
+H0 therefore proves that taking over
+reconciliation did not alter the security-load-bearing configuration; a new
+generation marker alone is insufficient evidence.
+
+The transition supports only the built-in config schema. Every enabled bundle
+sets literal `configReconciliation.pluginsUnsupported: true`; that attestation
+is part of the generation and is allowed only after proving Rainier has no API
+config plugins. The helper rejects a nonempty stored top-level `plugins` value
+and applies strict built-in unknown-field validation to the complete row. It
+never loads or installs plugins, and any plugin-provided config field fails
+closed rather than being preserved without validation.
+
+Setting only one hash or paths without both hashes is invalid. Helm persists the
+armed guard through the ownership handoff and later no-pod-change H2/H0-C
+operations must retain it. It may be explicitly cleared only by a reviewed
+application operation after the state handoff whose contract already permits a
+generation rollout. That operation then uses the ordinary deterministic merge
+contract. A stale H0 guard inherited through `--reuse-values` fails closed
+instead of silently permitting configuration drift or causing an unreviewed
+rollout merely to clear itself.
+
 After the pre-upgrade seed commits, regular rendered Deployments carry the
 generation annotation and Helm applies them under bounded `--wait`. Compatibility
 topology rolls the single all-role `${release_name}-api-server` Deployment.
@@ -253,8 +297,9 @@ as its root module:
 - `kubernetes_job_v1.seed_config`
 - `terraform_data.reconcile_api_server`
 
-The reusable module revision deletes those resource blocks. The Rainier
-consumer root generates and permanently retains these exact tombstones:
+The reusable module revision deletes those resource blocks and permanently
+retains these exact tombstones in the same downloaded control-plane module
+root:
 
 ```hcl
 removed {
@@ -290,10 +335,16 @@ removed {
 }
 ```
 
-All four `removed` blocks are permanent Rainier root policy. They are not
-deleted after the handoff, and neither this module nor later consumer code may
-reuse those or alternate Terraform addresses for the release, seed ConfigMap,
-seed Job, or rollout reconciler. A `manage_release = false` count toggle,
+All four `removed` blocks are permanent control-plane module policy. They are
+not generated beside the downloaded module by Terragrunt: that would conflict
+with the predecessor module's still-declared resources and would silently lose
+the tombstones on a later source-pin change. They are not deleted after the
+handoff, and neither this module nor later consumer code may reuse those or
+alternate Terraform addresses for the release, seed ConfigMap, seed Job, or
+rollout reconciler. A repository guard asserts that every supported
+control-plane module revision contains exactly these four `destroy = false`
+tombstones and none of the retired resource blocks. A
+`manage_release = false` count toggle,
 `lifecycle.ignore_changes`, manual `state rm`, and repinning the old module
 after the forget are not valid alternatives: each either retains unsafe
 ownership, plans destruction, evades review, or can recreate live objects.
@@ -303,6 +354,7 @@ the expected state and captures the three corresponding live Kubernetes/Helm
 objects. The evidence includes release name, namespace, revision, status,
 complete `helm get values --all`, manifest, history, chart identity, every
 image digest, seed ConfigMap content hash, completed seed Job identity/status,
+the canonical pre-H0 `api_server_config` digest and required-path projection,
 and a secret-redacted SHA-256 for the bundle. `terraform_data` has no live
 object, so its state identity is the proof. If any address or live object is
 missing or divergent, stop; do not weaken the four-address contract.
@@ -323,6 +375,13 @@ addresses absent, a second plan empty, and the live Helm release, seed
 ConfigMap, and completed seed Job byte-for-byte/identity unchanged. Refresh-only
 reads are not mutations, but they cannot obscure the exact four-action plan
 assertion.
+
+The immutable SkyPilot commit used for this handoff is shared by every
+`boltz-platform` production module consumer. Before the control-plane plan can
+be accepted, the same source-pin revision must produce a reviewed saved plan
+with zero managed-resource actions for each other consumer of that pin. A
+source pin cannot be called state-only merely because the Rainier unit's own
+plan is state-only.
 
 After that proof, every application change is a direct human Helm operation.
 The infrastructure module continues to own only its IAM, Pod Identity, ESO,
@@ -422,7 +481,8 @@ existing EKS host
 
 - Remaining infrastructure resource and module labels are preserved from the
   deployed modules. The four application/reconciliation labels are retired
-  together through root `removed` blocks, not renamed.
+  together through permanent control-plane-module-root `removed` blocks, not
+  renamed.
 - Existing `count` and `for_each` shapes, partition keys, and volume keys are
   preserved.
 - The package-directory rename does not rename remaining internal Terraform
@@ -439,7 +499,8 @@ existing EKS host
   `kubernetes_job_v1.seed_config`, and
   `terraform_data.reconcile_api_server`; every infrastructure address remains
   stable.
-- All four permanent Rainier root `removed` tombstones use `destroy = false`,
+- All four permanent control-plane-module-root `removed` tombstones use
+  `destroy = false`,
   and no Terraform resource may subsequently own the application release,
   seed artifacts, or rollout reconciliation.
 - Optional permissions boundaries default to `null`, preserving existing plans.
@@ -478,8 +539,9 @@ existing EKS host
 4. Remove the Helm and Time provider requirements, chart-value assembly, chart
    registry lookup, all four application/reconciliation resources, the seed
    script and local-exec restart, and every application/seed input and output
-   from the reusable module. Do not put consumer-specific tombstones in the
-   reusable package.
+   from the reusable module. In their place, add the exact four permanent
+   `destroy = false` tombstones to the control-plane module root; they are the
+   only application-address declarations retained by the package.
 5. Remove deployment-specific prose and examples.
 6. Add a configurable API role name, optional
    permissions boundaries, partition-aware IAM/FSx values, validations, and
@@ -501,23 +563,29 @@ existing EKS host
    and must not issue a Helm mutation.
 3. Generate the existing EKS exec-auth provider only where used: Kubernetes in
    the control-plane and EKS-pool roots, and no additional provider in the
-   AWS-VM root. Change all three live callers to the corresponding remote module
-   source. Do not generate or pass a Helm provider.
-4. Remove chart/application/seed/restart inputs from the control-plane consumer
-   and generate the four permanent root `removed` blocks exactly as written
-   above. These edits must leave the live release, legacy seed ConfigMap, and
-   completed seed Job untouched.
+   AWS-VM root. Change all four production units to the corresponding remote
+   module source. Do not generate or pass a Helm provider.
+4. Remove chart/application/seed/restart inputs, Helm provider generation,
+   registry-auth data, and application-value guards from the control-plane
+   consumer. Pin the module revision that carries the four permanent root
+   tombstones exactly as written above. Replace obsolete application-value
+   assertions with an ownership guard scoped to the SkyPilot control-plane
+   consumer that rejects any Helm provider, release, seed/restart resource, and
+   application input there; unrelated platform-owned Helm releases remain in
+   their existing infrastructure roots. Application and security-config
+   assertions move to the reviewed direct-Helm
+   H0 artifact and canonical database parity evidence. These edits must leave
+   the live release, legacy seed ConfigMap, and completed seed Job untouched.
 5. Synchronize and retain the local module copies temporarily so a source
    rollback remains valid with caller-owned providers. The retained local
-   control-plane copy must also be infrastructure-only; the permanent
-   tombstones stay in generated Rainier root configuration regardless of module
-   source. The local copy must never be a path back to Terraform Helm or seed
-   ownership. Preserve the legacy
+   control-plane copy must also be infrastructure-only and contain the same
+   four permanent tombstones. The local copy must never be a path back to
+   Terraform Helm or seed ownership. Preserve the legacy
    underscore directory layout and the EKS module's valid
    `../skypilot_pool_rbac` sibling path; initialize and validate every retained
    local source as well as every remote source.
 6. Split tests: generic module and chart-hook tests live in SkyPilot; Rainier
-   pin, paid-capacity, auth-ring, PVC, ownership, four-tombstone, and exact-plan
+   pin, paid-capacity, infrastructure ownership, module-tombstone, and exact-plan
    assertions remain in `boltz-platform` at an environment-owned path. Update
    pre-commit, CI, the GCP pool README, and runbook references.
 7. Keep all three committed environment `.terraform.lock.hcl` files
@@ -529,9 +597,12 @@ existing EKS host
    synchronized compatibility copies on the migration branch. The
    control-plane plan's only non-no-op managed-resource actions must be four
    `["forget"]` actions at the exact root addresses in the handoff contract,
-   with zero AWS, Kubernetes, or Helm mutations. The EKS-pool and AWS-VM plans
-   must have no managed-resource actions. Output-only changes, if any, are
-   enumerated and reviewed separately and may not mask a resource action.
+   with zero AWS, Kubernetes, or Helm mutations. Every other production unit
+   consuming the shared SkyPilot module pin--currently the research-production
+   EKS pool, research-usw2 spoke-workspace EKS pool, and multi-tenant AWS-VM
+   account--must have its own saved plan with no managed-resource actions.
+   Output-only changes, if any, are enumerated and reviewed separately and may
+   not mask a resource action.
 9. After review, a human applies each plan. Automation and agents do not apply
    production Terraform/OpenTofu. The control-plane handoff is applied exactly
    once and immediately followed by the state/live-release proof below.
@@ -540,9 +611,9 @@ existing EKS host
 
 Open a stacked draft that deletes the four unused local module directories and
 updates stale local-path documentation. It retains the four permanent
-tombstones in generated Rainier root configuration. It must not merge until
-Phase 2 is merged, human-applied, and operationally verified in all three
-Terraform states.
+tombstones in the synchronized and remote control-plane module roots. It must
+not merge until Phase 2 is merged, human-applied, and operationally verified
+across all four production units.
 
 ### Phase 4: remove inert legacy seed objects through direct Helm operations
 
@@ -557,19 +628,21 @@ direct-Helm cleanup, never a Terraform action. The cleanup artifact carries the
 captured exact legacy names, UIDs, content/generation hashes, and terminal Job
 status; it fails closed instead of deleting an object when any identity differs.
 Its temporary RBAC is scoped to those object names and removed with the cleanup
-hook. The Rainier root tombstones are retained permanently after cleanup.
+hook. The control-plane module-root tombstones are retained permanently after
+cleanup.
 
 ### Pull-request stack and cross-repository gates
 
 The SkyPilot stack contains: (S1) the direct-Helm hook transition and parity
 tests; (S2) the infrastructure-only reusable module; and (S3) the draft legacy
 seed-object cleanup. S3 names S1's production parity evidence as its merge gate.
-The first-consumer stack contains: (P1) the remote pin plus four permanent root
-tombstones and (P2) the draft local-module-copy deletion. P1 cannot merge until
+The first-consumer stack contains: (P1) the remote pin, inert application-input
+retirement, and ownership/plan guards and (P2) the draft local-module-copy
+deletion. The four permanent root tombstones ship in S2. P1 cannot merge until
 S2 is reachable from `origin/improvements`; its human apply is additionally
 blocked on S1's direct-Helm production proof. P2 cannot merge until P1 has been
-human-applied and verified in all three states. S3 cannot merge merely because
-P1 merged: it requires the successful P1 apply, exact state-absence evidence,
+human-applied and verified across all four production units. S3 cannot merge
+merely because P1 merged: it requires the successful P1 apply, exact state-absence evidence,
 and S1 target parity. These are explicit cross-repository gates, not a reason to
 route an ordinary SkyPilot rollout through `boltz-platform`.
 
@@ -578,8 +651,8 @@ route an ordinary SkyPilot rollout through `boltz-platform`.
 No infrastructure is applied by these pull requests.
 
 Before the Phase 2 handoff apply, rollback is a source change to the synchronized
-infrastructure-only local copy; the generated Rainier root retains all four
-tombstones. After the four addresses have been forgotten, Terraform ownership
+infrastructure-only local copy, which retains all four tombstones. After the
+four addresses have been forgotten, Terraform ownership
 is not rolled back: operators must not import any of them, repin a module that
 contains any retired resource, or remove a tombstone. A module defect is
 corrected forward with a new pinned module commit that still excludes the
@@ -621,12 +694,17 @@ Required before opening the pull requests:
   idempotency, the 262,144-byte canonical input bound, complete all-role/split-
   role generation reloads, the separate post-rollout verifier, same-name retry,
   failure retention, bounded Job TTLs, interrupted-client-after-success, and
-  uninstall residue
+  uninstall residue; the suite also requires literal
+  `pluginsUnsupported: true` in every enabled contract and its generation,
+  rejects omitted/false attestation, a nonempty stored `plugins` value, and an
+  ordinary or plugin-provided unknown field under strict built-in validation,
+  and proves no plugin loader, import, or installer is invoked
 - Terraform 1.14.8 and OpenTofu 1.11.5 tests proving the language floor is
-  `>= 1.7.0` and the generated Rainier root contains exactly four permanent
+  `>= 1.7.0` and the control-plane module root contains exactly four permanent
   `removed` blocks with `destroy = false`
 - CI searches proving the reusable control-plane module has no Helm or Time
-  provider, `helm_release`, seed ConfigMap/Job, `terraform_data` reconciler,
+  provider and no `resource` block for `helm_release`, seed ConfigMap/Job, or
+  `terraform_data` reconciler,
   local-exec restart, chart lookup, values rendering, application/seed input,
   or application/seed output
 - tests proving the direct-Helm revision-scoped objects cannot collide with the
@@ -639,8 +717,8 @@ Required before opening the pull requests:
 - automated checks for unchanged remaining resource/module labels,
   `count`/`for_each` shapes and identity keys, exact retirement of only the four
   named labels, full 40-hex source pins, and unchanged consumer lock files
-- Terragrunt/OpenTofu 1.11.5 source initialization and validation for all three
-  `boltz-platform` callers
+- Terragrunt/OpenTofu 1.11.5 source initialization and validation for all four
+  `boltz-platform` production units consuming the shared module pin
 - fixture-state plan JSON proving exactly four root `forget` actions for the
   named addresses, zero mutation actions, and an empty follow-up plan
 - old-source and new-source plan JSON comparison where the required backend and
@@ -667,7 +745,15 @@ fi
 Manual verification for the eventual rollout:
 
 1. Verify the revision-scoped direct-Helm hook path is deployed and its target
-   parity/idempotency evidence is accepted. Confirm all four Terraform state
+   parity/idempotency evidence is accepted, including identical canonical and
+   raw `api_server_config` SHA-256 before and after H0 and identical
+   `gcp.vpc_name`, `aws.ingress_source_ranges`, global
+   `kubernetes.allowed_contexts`, and complete per-workspace Kubernetes-boundary
+   projections: either exact disabled state or the namespace/allowed-context
+   pair. Prove the live row has no configured API plugins, set literal
+   `pluginsUnsupported: true`, and retain evidence that the helper used strict
+   built-in validation without loading, importing, or installing plugin code.
+   Confirm all four Terraform state
    addresses exist, then capture the release and legacy seed-object evidence
    bundle: redacted values/manifest hashes, revision, status, chart identity,
    image digests, seed ConfigMap content hash, and completed seed Job identity
@@ -684,10 +770,13 @@ Manual verification for the eventual rollout:
    For the release, compare revision, Helm release Secret identity/resource
    version, redacted values/manifest hashes, Helm-owned workload object
    UIDs/generations, pod-template hashes, and image digests.
-4. Plan the EKS pool and verify the access entry, every
+4. Plan every other production unit that consumes the shared module pin. For
+   the research-production and research-usw2 EKS pools, verify the access
+   entry, every
    `module.rbac[namespace]`, admission object, FSx PV/PVC, Pod Identity
    association, and security-group rule remain at their existing addresses.
-5. Plan the AWS VM pool and verify both IAM roles, the instance profile,
+5. Plan the multi-tenant AWS VM pool and verify both IAM roles, the instance
+   profile,
    policies, and attachments remain in place.
 6. Human-apply only the reviewed zero-mutation consumer plans, then verify the
    SkyPilot API health endpoint and read-only workspace/cloud checks. Do not
@@ -764,8 +853,8 @@ descriptions must record their exact results when they run.
   and Terraform seed/restart ownership as well as the earlier accepted status.
   This revision specifies a permanent, four-address non-destructive state
   handoff and revision-scoped direct-Helm configuration reconciliation.
-- 2026-08-08: exact review rejected a one-address stack-map remnant, an
-  infrastructure Helm provider, and a single-hook/ConfigMap seed lifecycle that
+- 2026-08-08: exact review rejected a one-address stack-map remnant, a SkyPilot
+  control-plane Helm provider, and a single-hook/ConfigMap seed lifecycle that
   could neither verify the later rollout nor bound orphaned hook objects. The
   correction requires four forgets, separate direct-Helm authentication, a
   weighted pre-upgrade seed Job with embedded bounded input, regular
@@ -775,6 +864,15 @@ descriptions must record their exact results when they run.
   miss `hook-succeeded` eager cleanup.
   Independent exact review accepted commit
   `e7d484f85571e89887ad903d8d59df9b9681e437` with no remaining blocker.
+- 2026-08-08: cross-repository implementation review found that Terragrunt
+  downloads the control-plane module as the root, so platform-generated
+  tombstones would conflict before the pin change and disappear after a later
+  pin. Review 28 moves the four permanent tombstones into the SkyPilot module,
+  requires a guard against their removal, expands shared-pin planning to every
+  production consumer, retires inert platform application inputs and guards,
+  and makes H0 prove raw/canonical database-config and security-key parity.
+  Independent exact cross-repository review accepted the correction with no
+  remaining blocker.
 
 ## Open gates
 
@@ -782,17 +880,20 @@ descriptions must record their exact results when they run.
   any behavioral departure updates this file and reopens exact review first.
 - Phase 1 must implement and test the direct-Helm migration/seed/reload path,
   Terraform/OpenTofu `>= 1.7.0` floor, infrastructure-only module, and absence
-  of all module-owned Helm, seed, and restart behavior.
+  of all module-owned Helm, seed, and restart behavior. It must retain the exact
+  four module-root tombstones and implement the H0 no-op config parity guard.
 - Phase 2 may use a pushed Phase 1 SHA for draft review, but cannot merge or
   apply until Phase 1 is merged and the pin is reachable from
   `origin/improvements`.
 - The direct-Helm path must be human-deployed and its target parity evidence,
   exact live-object/state inventory, and an approved non-admin production
   identity must exist before the handoff plan. The plan must prove the exact
-  four-forget/zero-mutation contract. Only a human may apply it.
+  four-forget/zero-mutation contract, and every other shared-pin production
+  consumer must have a saved zero-managed-resource-action plan. Only a human
+  may apply it.
 - Phase 3 remains a stacked draft until Phase 2 is merged, human-applied, and
-  verified against all three states, including state absence and unchanged live
-  Helm proof for the control plane.
+  verified across all four production units, including state absence and
+  unchanged live Helm proof for the control plane.
 - Phase 4 stays blocked until the direct-Helm hook path and the state handoff
   pass their production gates. It removes only the two inert live seed objects;
   all four `removed` tombstones are permanent and are not cleanup gates.
