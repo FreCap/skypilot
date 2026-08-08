@@ -630,16 +630,20 @@ def _serialize_k8s_object(obj):
 
 def _lb_runtime_revision(controller_image_digest: str | None,
                          termination_grace_period_seconds: int,
-                         service_hash: str | None) -> str:
+                         service_hash: str | None,
+                         priority_class_name: str | None = None) -> str:
     """Fingerprint the active-capable Pod fields that require slot rotation."""
-    payload = json.dumps(
-        {
-            'controller_image_digest': controller_image_digest,
-            'termination_grace_period_seconds': termination_grace_period_seconds,
-            'service_hash': service_hash,
-        },
-        sort_keys=True,
-        separators=(',', ':'))
+    revision_fields = {
+        'controller_image_digest': controller_image_digest,
+        'termination_grace_period_seconds': termination_grace_period_seconds,
+        'service_hash': service_hash,
+    }
+    # Preserve the historical revision exactly when the compatibility value is
+    # empty. A configured class is part of the immutable active-slot runtime
+    # identity and therefore participates in standby-first rotation.
+    if priority_class_name:
+        revision_fields['priority_class_name'] = priority_class_name
+    payload = json.dumps(revision_fields, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
@@ -971,6 +975,13 @@ def _lb_resources() -> dict:
     return resources
 
 
+def _lb_priority_class_name() -> str | None:
+    """Return the exact server-owned PriorityClass, or compatibility-empty."""
+    priority_class_name = os.environ.get(
+        constants.LB_PRIORITY_CLASS_NAME_ENV_VAR)
+    return priority_class_name or None
+
+
 def _lb_pod_runtime_fields(pod_runtime_fields: dict, service_name: str,
                            service_hash: str | None,
                            slot: lb_ha.LbSlot | None) -> dict:
@@ -1040,7 +1051,8 @@ def _build_deployment_dict(service_name: str,
                            service_hash: str | None = None,
                            resources: dict | None = None,
                            owner_reference: dict | None = None,
-                           slot: lb_ha.LbSlot | None = None) -> dict:
+                           slot: lb_ha.LbSlot | None = None,
+                           priority_class_name: str | None = None) -> dict:
     container = {
         'name': 'load-balancer',
         'image': image,
@@ -1137,8 +1149,8 @@ def _build_deployment_dict(service_name: str,
     if slot is not None:
         template_annotations[LB_RUNTIME_REVISION_ANNOTATION] = (
             _lb_runtime_revision(controller_image_digest,
-                                 termination_grace_period_seconds,
-                                 service_hash))
+                                 termination_grace_period_seconds, service_hash,
+                                 priority_class_name))
     if template_annotations:
         template_metadata['annotations'] = template_annotations
     pod_spec = {
@@ -1148,6 +1160,9 @@ def _build_deployment_dict(service_name: str,
         # Kubernetes credentials, so do not expose the namespace-scoped
         # service-account token to this data-plane process.
         'automountServiceAccountToken': False,
+        **({
+            'priorityClassName': priority_class_name,
+        } if priority_class_name else {}),
         'containers': [container],
         'volumes': auth_volumes,
         **({
@@ -1581,6 +1596,12 @@ def _deployment_patch_body(deployment_dict: dict,
                            data_plane_auth_enabled: bool) -> dict:
     """Return a create-compatible strategic patch for one LB Deployment."""
     deployment_patch = copy.deepcopy(deployment_dict)
+    pod_spec = deployment_patch['spec']['template']['spec']
+    if 'priorityClassName' not in pod_spec:
+        # Strategic-merge omission retains an old scalar. Explicit null makes
+        # a configured -> compatibility-empty transition remove the class,
+        # while the separate create body remains valid and omits the field.
+        pod_spec['priorityClassName'] = None
     if data_plane_auth_enabled:
         return deployment_patch
     # Strategic-merge omission does not delete named list entries. Explicitly
@@ -1836,8 +1857,10 @@ def _create_ha_lb_objects(
     controller_pod = _read_controller_pod(namespace, context)
     image, image_pull_policy, controller_digest = _resolve_lb_image(
         namespace, context, pod=controller_pod)
+    priority_class_name = _lb_priority_class_name()
     desired_runtime_revision = _lb_runtime_revision(
-        controller_digest, termination_grace_period_seconds, service_hash)
+        controller_digest, termination_grace_period_seconds, service_hash,
+        priority_class_name)
     (auth_envs, auth_volumes, auth_mounts, image_pull_secrets,
      pod_runtime_fields, container_runtime_fields,
      data_plane_auth_enabled) = _resolve_lb_auth_projection(namespace,
@@ -1882,7 +1905,8 @@ def _create_ha_lb_objects(
             service_hash,
             resources,
             owner_reference,
-            slot=slot)
+            slot=slot,
+            priority_class_name=priority_class_name)
         _reconcile_owned_deployment(
             context, namespace, deployment_dict,
             _deployment_patch_body(deployment_dict, data_plane_auth_enabled),
@@ -2003,39 +2027,31 @@ def create_lb_deployment_and_service(
      data_plane_auth_enabled) = _resolve_lb_auth_projection(namespace,
                                                             context,
                                                             pod=controller_pod)
+    priority_class_name = _lb_priority_class_name()
 
     deployment_dict = _build_deployment_dict(
-        service_name, deployment_name, image, auth_envs, auth_volumes,
-        auth_mounts, image_pull_secrets, pod_runtime_fields,
-        container_runtime_fields, image_pull_policy,
-        termination_grace_period_seconds, controller_digest, service_hash,
-        _lb_resources(), owner_reference)
+        service_name,
+        deployment_name,
+        image,
+        auth_envs,
+        auth_volumes,
+        auth_mounts,
+        image_pull_secrets,
+        pod_runtime_fields,
+        container_runtime_fields,
+        image_pull_policy,
+        termination_grace_period_seconds,
+        controller_digest,
+        service_hash,
+        _lb_resources(),
+        owner_reference,
+        priority_class_name=priority_class_name)
     service_dict = _build_service_dict(service_name, service_name_k8s,
                                        deployment_name, service_hash,
                                        owner_reference)
 
-    deployment_patch = deployment_dict
-    if not data_plane_auth_enabled:
-        # Strategic-merge omission does not delete named list entries.
-        # Explicitly remove projections left by a prior auth-enabled
-        # Deployment while keeping the create body valid Kubernetes.
-        deployment_patch = copy.deepcopy(deployment_dict)
-        container = deployment_patch['spec']['template']['spec']['containers'][
-            0]
-        container['env'].append({
-            'name': constants.LB_AUTH_TOKENS_FILE_ENV_VAR,
-            '$patch': 'delete',
-        })
-        container['volumeMounts'].append({
-            # volumeMounts uses mountPath (not name) as its strategic merge
-            # key. Omitting it makes the API reject the patch.
-            'mountPath': _LB_DATA_PLANE_AUTH_MOUNT_PATH,
-            '$patch': 'delete',
-        })
-        deployment_patch['spec']['template']['spec']['volumes'].append({
-            'name': LB_DATA_PLANE_AUTH_VOLUME_NAME,
-            '$patch': 'delete',
-        })
+    deployment_patch = _deployment_patch_body(deployment_dict,
+                                              data_plane_auth_enabled)
 
     def _retry_reconciliation_or_raise(kind: str, name: str, deadline: float,
                                        error: Exception) -> None:
@@ -2374,6 +2390,7 @@ def ensure_lb_objects_exist(service_name: str,
         raise RuntimeError('External load balancer requires a service hash.')
     context = kubernetes.in_cluster_context_name()
     namespace = get_lb_namespace()
+    desired_priority_class_name = _lb_priority_class_name()
 
     cutover_state = (serve_state.get_lb_cutover_state(service_name)
                      if high_availability else None)
@@ -2420,6 +2437,7 @@ def ensure_lb_objects_exist(service_name: str,
                 pod_metadata = pod_spec.get('metadata', {}) or {}
                 pod_spec = pod_spec.get('spec', {}) or {}
                 existing_grace = pod_spec.get('terminationGracePeriodSeconds')
+                existing_priority_class_name = pod_spec.get('priorityClassName')
                 labels = pod_metadata.get('labels', {}) or {}
                 annotations = pod_metadata.get('annotations', {}) or {}
             else:
@@ -2428,6 +2446,9 @@ def ensure_lb_objects_exist(service_name: str,
                 existing_grace = getattr(getattr(template, 'spec', None),
                                          'termination_grace_period_seconds',
                                          None)
+                existing_priority_class_name = getattr(
+                    getattr(template, 'spec', None), 'priority_class_name',
+                    None)
                 labels = getattr(getattr(template, 'metadata', None), 'labels',
                                  {}) or {}
                 annotations = getattr(getattr(template, 'metadata', None),
@@ -2435,6 +2456,7 @@ def ensure_lb_objects_exist(service_name: str,
             digest_by_slot[slot] = annotations.get(CONTROLLER_DIGEST_ANNOTATION)
             grace_or_hash_drifted = grace_or_hash_drifted or (
                 existing_grace != termination_grace_period_seconds or
+                existing_priority_class_name != desired_priority_class_name or
                 labels.get(SERVICE_HASH_LABEL_KEY) != service_hash or
                 labels.get(LB_SLOT_LABEL_KEY) != slot.value)
 
@@ -2532,15 +2554,26 @@ def ensure_lb_objects_exist(service_name: str,
         lb_deployment_name(service_name, resource_scope), service_hash)
 
     grace_drifted = False
+    priority_class_drifted = False
     if deployment is not None:
         if isinstance(deployment, dict):
-            existing_grace = deployment.get('spec', {}).get('template', {}).get(
-                'spec', {}).get('terminationGracePeriodSeconds')
+            existing_pod_spec = deployment.get('spec',
+                                               {}).get('template',
+                                                       {}).get('spec', {})
+            existing_grace = existing_pod_spec.get(
+                'terminationGracePeriodSeconds')
+            existing_priority_class_name = existing_pod_spec.get(
+                'priorityClassName')
         else:
-            existing_grace = getattr(
-                getattr(getattr(deployment.spec, 'template', None), 'spec',
-                        None), 'termination_grace_period_seconds', None)
+            existing_pod_spec = getattr(
+                getattr(deployment.spec, 'template', None), 'spec', None)
+            existing_grace = getattr(existing_pod_spec,
+                                     'termination_grace_period_seconds', None)
+            existing_priority_class_name = getattr(existing_pod_spec,
+                                                   'priority_class_name', None)
         grace_drifted = existing_grace != termination_grace_period_seconds
+        priority_class_drifted = (existing_priority_class_name
+                                  != desired_priority_class_name)
     hash_drifted = False
     if service_hash and deployment is not None:
         if isinstance(deployment, dict):
@@ -2556,7 +2589,8 @@ def ensure_lb_objects_exist(service_name: str,
         service is not None and
         not _service_has_desired_routing(service, desired_service))
     if (not deployment_missing and not service_missing and not grace_drifted and
-            not hash_drifted and not routing_drifted):
+            not priority_class_drifted and not hash_drifted and
+            not routing_drifted):
         assert deployment is not None
         assert service is not None
         deployment_ready = _lb_deployment_is_ready(deployment)
@@ -2594,6 +2628,7 @@ def ensure_lb_objects_exist(service_name: str,
                    f'reconciliation (deployment_missing={deployment_missing}, '
                    f'service_missing={service_missing}, '
                    f'grace_drifted={grace_drifted}, '
+                   f'priority_class_drifted={priority_class_drifted}, '
                    f'hash_drifted={hash_drifted}, '
                    f'routing_drifted={routing_drifted}); applying desired '
                    'state.')

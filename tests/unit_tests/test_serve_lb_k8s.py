@@ -102,6 +102,7 @@ def _install(monkeypatch,
              affinity=None,
              runtime_class_name=None,
              priority_class_name=None,
+             lb_priority_class_name=None,
              scheduler_name=None,
              image_pull_secrets=({
                  'name': 'registry-credentials'
@@ -167,6 +168,12 @@ def _install(monkeypatch,
         monkeypatch.delenv(constants.RELEASE_NAME_ENV_VAR, raising=False)
     else:
         monkeypatch.setenv(constants.RELEASE_NAME_ENV_VAR, release_name)
+    if lb_priority_class_name is None:
+        monkeypatch.delenv(constants.LB_PRIORITY_CLASS_NAME_ENV_VAR,
+                           raising=False)
+    else:
+        monkeypatch.setenv(constants.LB_PRIORITY_CLASS_NAME_ENV_VAR,
+                           lb_priority_class_name)
     if pod_namespace is None:
         monkeypatch.delenv(constants.POD_NAMESPACE_ENV_VAR, raising=False)
     else:
@@ -539,7 +546,11 @@ def test_ha_create_builds_two_warm_slots_stable_service_and_pdb(monkeypatch):
         raise _ApiException(404)
 
     apps.read_namespaced_deployment.side_effect = _missing_slot_deployment
-    _install(monkeypatch, apps_api=apps, core_api=core, policy_api=policy)
+    _install(monkeypatch,
+             apps_api=apps,
+             core_api=core,
+             policy_api=policy,
+             lb_priority_class_name='skypilot-serve-lb')
     state = lb_ha.LbCutoverState(enabled=True,
                                  active_slot=lb_ha.LbSlot.A,
                                  generation=1,
@@ -570,6 +581,8 @@ def test_ha_create_builds_two_warm_slots_stable_service_and_pdb(monkeypatch):
     }
     assert len(revisions) == 1
     for deployment in deployments:
+        assert (deployment['spec']['template']['spec']['priorityClassName'] ==
+                'skypilot-serve-lb')
         required = deployment['spec']['template']['spec']['affinity'][
             'podAntiAffinity']['requiredDuringSchedulingIgnoredDuringExecution']
         assert required[-1]['topologyKey'] == 'kubernetes.io/hostname'
@@ -899,6 +912,52 @@ def test_create_mirrors_tainted_pool_and_runtime_scheduling(monkeypatch):
     assert pod_spec['runtimeClassName'] == 'gvisor'
     assert 'priorityClassName' not in pod_spec
     assert pod_spec['schedulerName'] == 'custom-scheduler'
+
+
+@pytest.mark.parametrize('lb_priority_class_name', [None, ''])
+def test_create_omits_empty_server_owned_lb_priority_class(
+        monkeypatch, lb_priority_class_name):
+    apps, _ = _install(monkeypatch,
+                       priority_class_name='source-controller-priority',
+                       lb_priority_class_name=lb_priority_class_name)
+
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225, 'incarnation')
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    assert 'priorityClassName' not in deployment['spec']['template']['spec']
+
+
+def test_create_uses_exact_server_owned_lb_priority_class(monkeypatch):
+    apps, _ = _install(monkeypatch,
+                       priority_class_name='source-controller-priority',
+                       lb_priority_class_name='skypilot-serve-lb')
+
+    lb_k8s.create_lb_deployment_and_service('svc-a', 225, 'incarnation')
+
+    deployment = apps.create_namespaced_deployment.call_args.args[1]
+    assert (deployment['spec']['template']['spec']['priorityClassName'] ==
+            'skypilot-serve-lb')
+
+
+def test_lb_priority_class_changes_ha_runtime_revision():
+    compatibility_revision = lb_k8s._lb_runtime_revision(
+        _DIGEST_A, 225, 'incarnation')
+    assert compatibility_revision == lb_k8s._lb_runtime_revision(
+        _DIGEST_A, 225, 'incarnation', '')
+    assert compatibility_revision != lb_k8s._lb_runtime_revision(
+        _DIGEST_A, 225, 'incarnation', 'skypilot-serve-lb')
+
+
+def test_empty_lb_priority_class_patch_removes_previous_value(monkeypatch):
+    monkeypatch.setenv('SKYPILOT_SERVE_API_SERVICE_URL',
+                       'http://sky-api.skypilot.svc.cluster.local')
+    deployment = lb_k8s._build_deployment_dict('svc', 'deploy', 'image:tag', [],
+                                               [], [], [], {}, {},
+                                               'IfNotPresent', 30)
+
+    assert 'priorityClassName' not in deployment['spec']['template']['spec']
+    patch = lb_k8s._deployment_patch_body(deployment, True)
+    assert patch['spec']['template']['spec']['priorityClassName'] is None
 
 
 def test_api_pod_namespace_wins_over_workload_context(monkeypatch):

@@ -266,6 +266,7 @@ LB_POD_UID_ENV_VAR = 'SKYPILOT_SERVE_LB_POD_UID'
 LB_SLOT_ENV_VAR = 'SKYPILOT_SERVE_LB_SLOT'
 LB_IMAGE_DIGEST_ENV_VAR = 'SKYPILOT_SERVE_LB_IMAGE_DIGEST'
 LB_RESOURCES_ENV_VAR = 'SKYPILOT_SERVE_LB_RESOURCES_JSON'
+LB_PRIORITY_CLASS_NAME_ENV_VAR = 'SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME'
 
 # The load balancer's readiness route; exempt from inbound bearer auth so the
 # k8s readinessProbe (and any LB-level health check) can reach it. Kept here so

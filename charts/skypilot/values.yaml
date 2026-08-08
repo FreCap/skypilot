@@ -588,6 +588,12 @@ serve:
     # and verify no skypilot-serve-lb labeled Deployment or Service remains in
     # the Helm release namespace.
     enabled: false
+    # Exact PriorityClass assigned to every controller-generated external-LB
+    # Pod. Empty preserves the historical behavior. Guarded installations
+    # should use a dedicated immutable class whose admission and quota policy
+    # binds the LB workload identity and resource profile.
+    # @schema type: string; maxLength: 253; pattern: ^$|^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?(\.[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)*$
+    priorityClassName: ""
     # Resources for each per-service LB container. Explicit requests keep LBs
     # out of the BestEffort QoS class and make fleet-scale scheduling visible.
     # Set this to null to omit resource requests and limits.

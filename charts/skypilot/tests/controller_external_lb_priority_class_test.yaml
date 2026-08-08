@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: controller_external_lb_priority_class_test
+templates:
+  - templates/controller-deployment.yaml
+tests:
+  - it: should propagate the exact typed class to the split controller path
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      apiService.highAvailability.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME
+            value: skypilot-serve-lb
+
+  - it: should reserve the class across controller-specific extra environments
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      apiService.highAvailability.enabled: true
+      controllerService.extraEnvs:
+        - name: SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME
+          value: attacker-controlled
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME" is duplicated or reserved by the chart
