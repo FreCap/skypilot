@@ -25,9 +25,12 @@ Helm.  Protocol-2 retirement PR #1339 is merged as
 deployed directly with Helm.  Its first held production retirement attempt
 failed closed before mutation because six older-writer retained versions have
 `created_at=NULL`; revision 360 cleared the hold and restored all eight
-controllers and 16 load balancers.  The timestamp-proof hotfix described
-below is implemented and locally verified on
-`fix/serve-retirement-legacy-created-at`; merge, release, and reader-first
+controllers and 16 load balancers.  The unrelated direct-shell OOM cleanup
+PR #1183 subsequently deployed v1.1.1151 directly with Helm at revision 363,
+with the controller hold disabled and the sole Recreate API pod healthy.  The
+timestamp-proof hotfix described below is implemented, locally verified, and
+open as PR #1341 at
+`2e6ab8924c3626ec47ed65aedf48f97f718fa4f1`; merge, release, and reader-first
 rollout remain pending.  Created 2026-08-07; last updated 2026-08-08._
 
 ## Decision summary
@@ -1511,11 +1514,14 @@ removal gate are not yet attached.
   lane, completed successfully.  Credentialed AWS catalog coverage remains
   open because it has not been rerun after the operator refreshed SSO for this
   deployment.
-- Production control-plane v1.1.1149 is deployed directly through Helm at
-  revision 360 with the controller hold disabled; closed Platform PR #8090 is
-  not part of the release path.  Protocol-2 retirement made no mutation.  The
-  protocol-3 hotfix must complete its reader-first Helm rollout before a
-  separate hold revision and retirement attempt.  Normalization apply has
+- Production control-plane v1.1.1151 is deployed directly through Helm at
+  revision 363 with the controller hold disabled; closed Platform PR #8090 is
+  not part of the release path.  Its source is the unrelated OOM cleanup merge
+  `f60829c367dc425895a7a30a06922fc81869ae51`; the sole Recreate API pod is
+  healthy on the matching immutable image with both containers Ready and zero
+  restarts.  Protocol-2 retirement made no mutation.  Protocol-3 hotfix PR
+  #1341 must merge, release, and complete its reader-first Helm rollout before
+  a separate hold revision and retirement attempt.  Normalization apply has
   committed, so the current rollback floor is v1.1.1143; after any protocol-3
   manifest or request exists, the protocol-3-capable hotfix becomes the floor
   and older rollback requires a pre-protocol-3 database restore.  That restore
@@ -1527,7 +1533,7 @@ removal gate are not yet attached.
   and drained before any service update can claim scale-to-zero compliance.
 - Service version 58 is authoritative mirror-free placement-contract v2.  Its
   requested load receipt and the seven other requested receipts converged
-  under v1.1.1146 and remained healthy through v1.1.1149.  The one historical
+  under v1.1.1146 and remained healthy through v1.1.1151.  The one historical
   test-service tuple requires the protocol-3 NULL-timestamp hotfix to pass
   review, merge, deploy reader-first, and run its locked terminal-retirement
   proof before the zero-event window can start.
