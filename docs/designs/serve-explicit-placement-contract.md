@@ -442,6 +442,14 @@ current, and stale entries, but a later lifecycle claim on the same service
 hash does not invalidate immutable version bytes or turn manifested rows into
 untracked identities.
 
+One same-identity mutation is explicit and asymmetric: a terminal-manifest
+`placeholder/unchanged` entry is ordinary and may become a committed
+explicit-v2 row for the same service hash when the central writer records a
+finite `created_at > completed_at`.  This is the existing fillable reservation
+contract.  A `stale_placeholder/unchanged` entry is never fillable and any
+spec, YAML, side-state, row-hash, or identity change remains terminal proof
+drift.
+
 A post-terminal same-incarnation row follows the high-water rules above.  A
 genuinely recreated service hash has no terminal version-number boundary: its
 row is accepted only when it is committed explicit v2 with finite
