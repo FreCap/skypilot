@@ -976,6 +976,10 @@ The stacked bounded correction retains #1373 and adds these invariants:
   state-machine, demand-lock, transition, and mutation fences are unchanged.
   There is no TTL, completed-result cache, fallback authority, stale result, or
   capacity change.
+- The dedicated role executor is a constructor-established typed field. Role
+  handling and shared snapshot submission access that field directly; there is
+  no missing-attribute compatibility fallback that can silently select a
+  different executor contract.
 
 Focused tests must jointly prove default-executor isolation, fixed shared-task
 expiry for both slots, a late waiter's inability to extend the deadline, fresh
@@ -991,7 +995,7 @@ bucket, recovery at most 15 seconds, unchanged fixed capacity, and every
 safety, state, schema, event, log, health, and restart gate passing. The
 combined local verification passed: eight focused executor/deadline/transport
 cases and the complete 21-file controller/external-load-balancer selection
-passed with 912 tests, the configured mypy run passed 884 source files, Pylint
+passed with 912 tests, the configured mypy run passed 887 source files, Pylint
 rated the changed Python files 10.00/10, dashboard lint/format passed, and
 `git diff --check` passed. Exact-head CI and both deployment windows remain open
 gates.
