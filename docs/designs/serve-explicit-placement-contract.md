@@ -7,10 +7,12 @@ deployed directly with Helm.  Its supported transaction
 converted 156 authoritative fieldless/v1 contracts to mirror-free v2; the
 post-apply inventory is 156 explicit-v2 rows, one terminal historical
 physical/per-GPU row, and seven placeholders, with zero pending supported
-changes or ledger mismatches.  Historical retirement is blocked while this
-design and implementation are corrected for 49 version-referenced cleanup
-intents whose committed handoff flag was missed because two raw readers used
-`metadata` instead of Task YAML's explicit `_metadata` field.  Receipt-lock
+changes or ledger mismatches.  Historical retirement remains blocked in
+production while the protocol-2 follow-up is reviewed and released.  That
+follow-up replaces both incorrect raw cleanup readers with one typed
+`_metadata` contract, all-column intent CAS, and a bounded predecessor-receipt
+proof for the 49 version-referenced cleanup intents whose committed handoff
+flag was missed.  Receipt-lock
 hotfix PR #1330 is merged as
 `ccae3e8ec2caae74a9baff8f0268078d35e03307`, released as v1.1.1146, and
 deployed directly with Helm at revision 357.  All eight requested receipts,
@@ -589,7 +591,13 @@ epoch fencing applies only to the pending read/CAS path.  Unknown protocols,
 overflow, duplicate names, partial state, orphan manifests, or unapproved
 commits block.  The approved
 commit set is itself hashed into the operator freeze evidence rather than
-inferred from tags.
+inferred from tags.  Protocol 2 stores the caller's exact 64-hex freeze digest
+and the canonical digest of the sorted approved-commit set in each retirement
+row, and the run manifest stores the canonical SHA-256 of
+`{"approved_loaded_image_commit_sha256": <set digest>,
+"operator_freeze_evidence_input_sha256": <caller digest>}`.  Ledger
+verification recomputes that composition and requires it to equal the manifest
+freeze digest, so neither input can be substituted independently.
 
 A clean pending receipt is a hard blocker, not permission to overwrite
 evidence.  The retirement ledger records the fully validated predecessor
@@ -1337,9 +1345,28 @@ zero-cost reserved-capacity tests remain fail closed.
   pod and init/migration containers completed with zero restarts; all eight
   receipts converged, all eight controller ports were present, all eight direct
   controller health checks returned 200, and all 16 LB deployments became
-  Ready and Available.  The follow-up still owes the mandatory real-PostgreSQL
-  CAS regression test because PR #1330's compile assertion alone did not
-  execute the PostgreSQL path.
+  Ready and Available.  PR #1330's compile assertion alone did not execute the
+  PostgreSQL path; the protocol-2 follow-up closes that gap with the exact
+  pending-receipt lock/CAS test below.
+- The protocol-2 follow-up validates the exact secret-free production
+  protocol-1 run `3bacd32f-888e-4a1f-af87-8f17dd82f168` and all 164 ledger
+  rows from a compressed fixture whose canonical JSON SHA-256 is
+  `5067bd30eb5c2b2604ba1302d020e8e609cec81d25afd74702d2917e1af27ef6`.
+  The test asserts the exact schema projection, excludes every raw spec, YAML,
+  and controller-configuration field, and accepts the snapshot through the
+  shared protocol/mode verifier without synthetic identities.  Typed cleanup,
+  shared protocol dispatch, receipt-incarnation anchoring, and retirement
+  ledger tests pass locally; targeted mypy reports no issues in the four
+  changed source modules.  All 11 receipt/retirement cases pass against an
+  isolated native PostgreSQL 14 server: the exact pending-receipt
+  `FOR UPDATE OF services` and one-time all-NULL CAS; pending, partial,
+  mismatched, orphan-manifest, unapproved-commit, and bounded-overflow
+  blockers; the production-shaped 49-intent retirement; both
+  cleanup-CAS/postimage atomic rollbacks; and the exact production snapshot.
+  Final adversarial review returned GO for code review and merge after finding
+  no remaining correctness blocker.  Production execution remains gated on
+  the documented Helm hold, fresh freeze/preflight, and postflight checks;
+  cleanup PR #1319 remains blocked on its separate removal gates.
 
 Credentialed provider catalog coverage and zero-cost production smoke evidence
 remain open gates.  This is only the first transition production release, and
@@ -1398,5 +1425,5 @@ removal gate are not yet attached.
 - Service version 58 is authoritative mirror-free v2.  Its requested load
   receipt and the seven other requested receipts converged under v1.1.1146.
   The one historical test-service tuple separately requires the v2
-  cleanup-intent handoff repair and locked terminal-retirement proof above
-  before the zero-event window can start.
+  cleanup-intent handoff repair branch to pass review, merge, deploy, and run
+  its locked terminal-retirement proof before the zero-event window can start.

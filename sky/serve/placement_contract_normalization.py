@@ -33,7 +33,9 @@ from sqlalchemy import orm
 import sky
 from sky.adaptors import common as adaptors_common
 from sky.container_images import demand_state
+from sky.serve import ephemeral_storage_contract
 from sky.serve import maintenance
+from sky.serve import placement_normalization_identity
 from sky.serve import placement_policy
 from sky.serve import resource_action_state_schema
 from sky.serve import serve_state
@@ -44,7 +46,6 @@ from sky.server.requests import postgres_schema as request_postgres_schema
 from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
 from sky.utils import common as sky_common
-from sky.utils import yaml_utils
 from sky.utils.db import db_utils
 
 if TYPE_CHECKING:
@@ -60,7 +61,6 @@ global_user_state = adaptors_common.LazyImport('sky.global_user_state')
 _SPEC_MODULE = 'sky.serve.service_spec'
 _SPEC_NAME = 'SkyServiceSpec'
 _SUPPORTED_PROTOCOLS = frozenset({4, 5})
-_NORMALIZER_VERSION = '1'
 _SCHEMA_REVISION = '037'
 _ADVISORY_LOCK_NAME = 'skyserve-placement-contract-normalization-v1'
 _LOCK_TIMEOUT_MS = 5000
@@ -75,6 +75,8 @@ _RESOURCE_ACTION_EVIDENCE_SCHEMA = 'skyserve-resource-action-roots-v1'
 _API_POD_EVIDENCE_SCHEMA = 'skyserve-sole-api-pod-v1'
 _LEGACY_CONTROLLER_EVIDENCE_SCHEMA = (
     'skyserve-legacy-controller-cluster-absence-v2')
+_CLEANUP_PROOF_SCHEMA = 'skyserve-ephemeral-storage-retirement-v2'
+_PREDECESSOR_RECEIPT_SCHEMA = 'skyserve-predecessor-receipt-inventory-v1'
 _POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
 _ROLLING_UPDATE_ENV_VAR = 'SKYPILOT_ROLLING_UPDATE_ENABLED'
 _RETIREMENT_REASON = (
@@ -437,6 +439,42 @@ class _RowWork:
                 int(self.original['version']))
 
 
+@dataclasses.dataclass
+class _CleanupIntentWork:
+    """One exact cleanup-intent preimage and its planned postimage."""
+
+    original: dict[str, Any]
+    result: dict[str, Any]
+    matched_version: tuple[str, int]
+    projection_sha256: str
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        return (self.original['service_name'], self.original['resource_scope'],
+                self.original['storage_generation'])
+
+    @property
+    def adopted(self) -> bool:
+        return self.original['provisional'] == 1
+
+
+@dataclasses.dataclass(frozen=True)
+class _CleanupIntentPlan:
+    """Complete validated cleanup-intent repair plan for one transaction."""
+
+    rows: tuple[_CleanupIntentWork, ...]
+    candidate_facts: Mapping[tuple[str, int], Mapping[str, Any]]
+    global_facts: Mapping[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class _PredecessorReceiptEvidence:
+    """Typed completed-receipt inventory that may be atomically replaced."""
+
+    service_names: frozenset[str]
+    facts: Mapping[str, Any]
+
+
 @dataclasses.dataclass(frozen=True)
 class _ExternalEvidence:
     """Bounded count and canonical digest from an external authority."""
@@ -529,6 +567,22 @@ def _row_sha256(row: Mapping[str, Any]) -> str:
                          sort_keys=True,
                          separators=(',', ':')).encode()
     return _sha256(encoded)
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return _sha256(
+        json.dumps(value,
+                   sort_keys=True,
+                   separators=(',', ':'),
+                   default=_json_default).encode())
+
+
+def _cleanup_intent_fleet_sha256(rows: Sequence[_CleanupIntentWork], *,
+                                 result: bool) -> str:
+    inventory = [(work.identity[0], work.identity[1], work.identity[2],
+                  _row_sha256(work.result if result else work.original))
+                 for work in sorted(rows, key=lambda item: item.identity)]
+    return _canonical_json_sha256(inventory)
 
 
 def _fleet_sha256(rows: list[_RowWork], *, result: bool) -> str:
@@ -1495,23 +1549,283 @@ def _retirement_evidence_targets(
     return frozenset(process_targets), frozenset(action_targets)
 
 
-def _storage_ownership_facts(yaml_content: str) -> dict[str, bool]:
-    try:
-        config = yaml_utils.safe_load(yaml_content)
-    except Exception as exc:
+def _read_cleanup_intent_inventory(session: orm.Session,
+                                   service_names: frozenset[str],
+                                   row_bound: int) -> list[dict[str, Any]]:
+    """Read a complete, stably ordered candidate-service intent inventory."""
+    if not service_names:
+        return []
+    table = serve_state.ephemeral_storage_cleanup_intents_table
+    raw_rows = session.execute(
+        sqlalchemy.select(table).where(
+            table.c.service_name.in_(sorted(service_names))).order_by(
+                table.c.service_name, table.c.resource_scope,
+                table.c.storage_generation).limit(row_bound +
+                                                  1)).mappings().all()
+    if len(raw_rows) > row_bound:
         raise NormalizationBlocker(
-            'Historical compiled YAML cannot be decoded for cleanup proof.') \
-            from exc
-    if not isinstance(config, dict):
-        raise NormalizationBlocker('Historical compiled YAML is not a mapping.')
-    ownership_fields = ('file_mounts', 'storage_mounts', 'volumes',
-                        'volume_mounts', 'workdir')
-    facts = {field: bool(config.get(field)) for field in ownership_fields}
-    metadata = config.get('metadata')
-    scope_key = serve_state.constants.EPHEMERAL_STORAGE_SCOPE_METADATA_KEY
-    facts['ephemeral_storage_scope'] = bool(
-        isinstance(metadata, dict) and metadata.get(scope_key))
-    return facts
+            'Cleanup-intent inventory exceeds its explicit row bound.')
+    return [dict(row) for row in raw_rows]
+
+
+def _finite_nonnegative(value: Any) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float)) and
+            math.isfinite(float(value)) and value >= 0)
+
+
+def _zero_target_projection(yaml_content: str, source: str) -> tuple[Any, str]:
+    try:
+        projection = (ephemeral_storage_contract.
+                      require_zero_deletion_target_projection(yaml_content))
+    except ephemeral_storage_contract.EphemeralStorageContractError as exc:
+        raise NormalizationBlocker(
+            f'{source} does not have an exact zero-target cleanup contract: '
+            f'{exc}') from exc
+    projection_dict = projection.to_dict()
+    return projection, _canonical_json_sha256(projection_dict)
+
+
+def _build_cleanup_intent_plan(
+    raw_intents: Sequence[Mapping[str, Any]],
+    rows: Sequence[_RowWork],
+    service_rows: Mapping[str, Mapping[str, Any]],
+    row_bound: int,
+) -> _CleanupIntentPlan:
+    """Build the all-or-nothing typed cleanup adoption and match proof."""
+    if len(raw_intents) > row_bound:
+        raise NormalizationBlocker(
+            'Cleanup-intent inventory exceeds its explicit row bound.')
+    candidates = [
+        row for row in rows
+        if row.classification is Classification.HISTORICAL_PHYSICAL_PER_GPU
+    ]
+    candidate_services = frozenset(row.identity[0] for row in candidates)
+    expected_columns = {
+        column.name for column in
+        serve_state.ephemeral_storage_cleanup_intents_table.columns
+    }
+    live_versions_by_yaml: dict[tuple[str, str], list[_RowWork]] = (
+        collections.defaultdict(list))
+    live_versions_by_generation: dict[tuple[str, str, str], _RowWork] = {}
+    for row in rows:
+        yaml_content = row.original.get('yaml_content')
+        if (row.identity[0] in candidate_services and
+                isinstance(yaml_content, str) and
+                row.original.get('retired_at') is None):
+            live_versions_by_yaml[(row.identity[0], yaml_content)].append(row)
+            try:
+                scope = (ephemeral_storage_contract.
+                         parse_ephemeral_storage_scope(yaml_content))
+            except ephemeral_storage_contract.EphemeralStorageContractError as exc:
+                raise NormalizationBlocker(
+                    'Live version has a malformed cleanup scope: '
+                    f'{exc}') from exc
+            if scope is None:
+                continue
+            parent = service_rows.get(row.identity[0])
+            if (parent is None or scope.resource_scope != parent.get('hash') or
+                    scope.resource_scope != parent.get('resource_scope')):
+                raise NormalizationBlocker(
+                    'Live version cleanup scope disagrees with its parent.')
+            generation_key = (row.identity[0], scope.resource_scope,
+                              scope.storage_generation)
+            if generation_key in live_versions_by_generation:
+                raise NormalizationBlocker(
+                    'A cleanup generation is reused by multiple live '
+                    'versions.')
+            live_versions_by_generation[generation_key] = row
+
+    work_rows: list[_CleanupIntentWork] = []
+    match_inventory: list[dict[str, Any]] = []
+    intent_by_candidate_yaml: dict[tuple[str, str],
+                                   list[_CleanupIntentWork]] = (
+                                       collections.defaultdict(list))
+    seen_intent_identities: set[tuple[str, str, str]] = set()
+    seen_generations: set[tuple[str, str]] = set()
+    seen_versions: set[tuple[str, int]] = set()
+    for raw_intent in raw_intents:
+        original = dict(raw_intent)
+        if set(original) != expected_columns:
+            raise NormalizationBlocker(
+                'Cleanup-intent inventory has an incomplete row projection.')
+        service_name = original.get('service_name')
+        resource_scope = original.get('resource_scope')
+        storage_generation = original.get('storage_generation')
+        yaml_content = original.get('yaml_content')
+        if (type(service_name) is not str or not service_name or
+                type(resource_scope) is not str or not resource_scope or
+                type(storage_generation) is not str or not storage_generation or
+                type(yaml_content) is not str):
+            raise NormalizationBlocker(
+                'Cleanup-intent identity and YAML fields must be exact '
+                'nonempty strings.')
+        if service_name not in candidate_services:
+            raise NormalizationBlocker(
+                'Cleanup-intent inventory contains an unexpected service.')
+        identity = (service_name, resource_scope, storage_generation)
+        if identity in seen_intent_identities:
+            raise NormalizationBlocker(
+                'Cleanup-intent inventory contains a duplicate identity.')
+        seen_intent_identities.add(identity)
+        generation_identity = (service_name, storage_generation)
+        if generation_identity in seen_generations:
+            raise NormalizationBlocker(
+                'A cleanup generation is reused within one service.')
+        seen_generations.add(generation_identity)
+
+        parent = service_rows.get(service_name)
+        if parent is None:
+            raise NormalizationBlocker(
+                'Cleanup intent has no live parent service.')
+        parent_hash = parent.get('hash')
+        parent_scope = parent.get('resource_scope')
+        parent_pool = parent.get('pool')
+        parent_epoch = parent.get('lifecycle_epoch')
+        if (type(parent_hash) is not str or not parent_hash or
+                type(parent_scope) is not str or not parent_scope or
+                parent_hash != parent_scope or resource_scope != parent_scope):
+            raise NormalizationBlocker(
+                'Cleanup intent does not match the exact parent resource '
+                'scope and service incarnation.')
+        pool = original.get('pool')
+        lifecycle_epoch = original.get('lifecycle_epoch')
+        provisional = original.get('provisional')
+        created_at = original.get('created_at')
+        if (type(parent_pool) is not int or parent_pool != 0 or
+                type(pool) is not int or pool != parent_pool):
+            raise NormalizationBlocker(
+                'Cleanup intent does not have the exact non-pool parent bit.')
+        if (type(parent_epoch) is not int or parent_epoch < 1 or
+                type(lifecycle_epoch) is not int or lifecycle_epoch < 1 or
+                lifecycle_epoch > parent_epoch):
+            raise NormalizationBlocker(
+                'Cleanup intent has an invalid or future lifecycle epoch.')
+        if type(provisional) is not int or provisional not in (0, 1):
+            raise NormalizationBlocker(
+                'Cleanup intent has an invalid provisional bit.')
+        if not _finite_nonnegative(created_at):
+            raise NormalizationBlocker(
+                'Cleanup intent has an invalid creation timestamp.')
+
+        intent_projection, projection_sha256 = _zero_target_projection(
+            yaml_content, 'Cleanup-intent YAML')
+        scope = intent_projection.scope
+        if (scope.resource_scope != resource_scope or
+                scope.storage_generation != storage_generation):
+            raise NormalizationBlocker(
+                'Cleanup-intent YAML scope disagrees with its row identity.')
+        matching_versions = live_versions_by_yaml.get(
+            (service_name, yaml_content), [])
+        if len(matching_versions) != 1:
+            raise NormalizationBlocker(
+                'Cleanup intent does not map byte-for-byte to exactly one '
+                'live committed version YAML.')
+        matched = matching_versions[0]
+        generation_match = live_versions_by_generation.get(identity)
+        if generation_match is not matched:
+            raise NormalizationBlocker(
+                'Cleanup generation does not identify its unique matched '
+                'version.')
+        matched_created_at = matched.original.get('created_at')
+        if not _finite_nonnegative(matched_created_at):
+            raise NormalizationBlocker(
+                'Matched version has an invalid creation timestamp.')
+        assert isinstance(created_at, (int, float))
+        assert isinstance(matched_created_at, (int, float))
+        if float(created_at) > float(matched_created_at):
+            raise NormalizationBlocker(
+                'Cleanup intent was created after its matched version.')
+        matched_projection, matched_projection_sha256 = (
+            _zero_target_projection(yaml_content, 'Matched version YAML'))
+        if (matched_projection.scope != scope or
+                matched_projection_sha256 != projection_sha256):
+            raise NormalizationBlocker(
+                'Cleanup intent and matched version have different scopes.')
+        if matched.identity in seen_versions:
+            raise NormalizationBlocker(
+                'Multiple cleanup intents map to one retained version.')
+        seen_versions.add(matched.identity)
+
+        result = dict(original)
+        result['provisional'] = 0
+        work = _CleanupIntentWork(original, result, matched.identity,
+                                  projection_sha256)
+        work_rows.append(work)
+        intent_by_candidate_yaml[(service_name, yaml_content)].append(work)
+        key_sha256 = _canonical_json_sha256(list(identity))
+        yaml_sha256 = _sha256(yaml_content.encode())
+        match_inventory.append({
+            'intent_key_sha256': key_sha256,
+            'matched_service_name_sha256': _sha256(service_name.encode()),
+            'matched_version': matched.identity[1],
+            'yaml_sha256': yaml_sha256,
+            'zero_target_projection_sha256': projection_sha256,
+        })
+
+    candidate_facts: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for candidate in candidates:
+        yaml_content = candidate.original.get('yaml_content')
+        if not isinstance(yaml_content, str):
+            raise NormalizationBlocker(
+                'Historical candidate has no committed compiled YAML.')
+        matches = intent_by_candidate_yaml.get(
+            (candidate.identity[0], yaml_content), [])
+        if len(matches) != 1:
+            raise NormalizationBlocker(
+                'Historical candidate does not map to exactly one cleanup '
+                'intent.')
+        candidate_projection, candidate_projection_sha256 = (
+            _zero_target_projection(yaml_content, 'Historical candidate YAML'))
+        match = matches[0]
+        parent = service_rows[candidate.identity[0]]
+        if (candidate_projection.scope.resource_scope != parent.get('hash') or
+                candidate_projection.scope.resource_scope
+                != parent.get('resource_scope')):
+            raise NormalizationBlocker(
+                'Historical candidate YAML does not match its parent scope.')
+        intent_yaml = match.original['yaml_content']
+        candidate_yaml_sha256 = _sha256(yaml_content.encode())
+        intent_yaml_sha256 = _sha256(intent_yaml.encode())
+        candidate_facts[candidate.identity] = {
+            'cleanup_candidate_match_count': 1,
+            'cleanup_intent_key_sha256': _canonical_json_sha256(
+                list(match.identity)),
+            'cleanup_candidate_yaml_sha256': candidate_yaml_sha256,
+            'cleanup_intent_yaml_sha256': intent_yaml_sha256,
+            'cleanup_candidate_zero_target_projection_sha256': candidate_projection_sha256,
+            'cleanup_intent_zero_target_projection_sha256':
+                match.projection_sha256,
+            'cleanup_candidate_deletion_target_count': 0,
+            'cleanup_intent_deletion_target_count': 0,
+            'retired_yaml_preserved': candidate_yaml_sha256 ==
+                                      intent_yaml_sha256,
+            'current_cleanup_reader_inventory_preserved': True,
+            'v1_1_1135_cleanup_omission_lossless': True,
+        }
+
+    if set(candidate_facts) != {candidate.identity for candidate in candidates}:
+        raise NormalizationBlocker(
+            'Cleanup proof does not cover every historical candidate.')
+    ordered_work = tuple(sorted(work_rows, key=lambda work: work.identity))
+    pre_digest = _cleanup_intent_fleet_sha256(ordered_work, result=False)
+    post_digest = _cleanup_intent_fleet_sha256(ordered_work, result=True)
+    adopted_count = sum(work.adopted for work in ordered_work)
+    if (pre_digest == post_digest) != (adopted_count == 0):
+        raise NormalizationBlocker(
+            'Cleanup-intent plan digest does not match its provisional delta.')
+    global_facts = {
+        'cleanup_contract_schema': _CLEANUP_PROOF_SCHEMA,
+        'cleanup_intent_inventory_count': len(ordered_work),
+        'cleanup_intent_pre_inventory_sha256': pre_digest,
+        'cleanup_intent_post_inventory_sha256': post_digest,
+        'cleanup_intent_adopted_count': adopted_count,
+        'cleanup_match_inventory_count': len(match_inventory),
+        'cleanup_match_inventory_sha256': _canonical_json_sha256(
+            sorted(match_inventory,
+                   key=lambda item: (item['matched_service_name_sha256'], item[
+                       'matched_version'], item['intent_key_sha256']))),
+    }
+    return _CleanupIntentPlan(ordered_work, candidate_facts, global_facts)
 
 
 def _select_recovery_version(
@@ -1545,6 +1859,200 @@ def _select_recovery_version(
         (latest_applicable is None or latest_applicable < latest_quarantined)):
         return latest_applied
     return latest_applicable
+
+
+def _validate_approved_loaded_image_commits(
+        values: Sequence[str]) -> frozenset[str]:
+    commits = frozenset(values)
+    if (not commits or len(commits) != len(values) or any(
+            type(commit) is not str or len(commit) != 40 or any(
+                character not in '0123456789abcdef'
+                for character in commit)
+            for commit in commits)):
+        raise ValueError(
+            'Historical retirement requires a nonempty, duplicate-free set '
+            'of exact 40-hex approved loaded image commits.')
+    return commits
+
+
+def _completed_run_inventory(
+        session: orm.Session, run_id: uuid.UUID,
+        row_bound: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    runs = serve_state.placement_normalization_runs_table
+    ledger = serve_state.placement_normalization_rows_table
+    run = session.execute(
+        sqlalchemy.select(runs).where(
+            runs.c.run_id == run_id)).mappings().one_or_none()
+    if run is None:
+        raise NormalizationBlocker(
+            'Predecessor receipt references an absent run manifest.')
+    entries = session.execute(
+        sqlalchemy.select(ledger).where(ledger.c.run_id == run_id).order_by(
+            ledger.c.service_name,
+            ledger.c.version).limit(row_bound + 1)).mappings().all()
+    if len(entries) > row_bound:
+        raise NormalizationBlocker(
+            'Predecessor receipt ledger exceeds its explicit row bound.')
+    run_dict = dict(run)
+    entry_dicts = [dict(entry) for entry in entries]
+    mismatches = _ledger_manifest_mismatches(run_dict, entry_dicts)
+    if mismatches:
+        raise NormalizationBlocker(
+            'Predecessor receipt run manifest is invalid; first mismatch is '
+            f'{mismatches[0]!r}.')
+    return run_dict, entry_dicts
+
+
+def _predecessor_receipt_evidence(
+    session: orm.Session,
+    rows: Sequence[_RowWork],
+    service_rows: Mapping[str, Mapping[str, Any]],
+    approved_loaded_image_commits: frozenset[str],
+    row_bound: int,
+    freeze_evidence_sha256: str,
+) -> _PredecessorReceiptEvidence:
+    """Validate every nonempty receipt tuple as completed immutable evidence."""
+    table = serve_state.services_table
+    receipt_columns = (
+        table.c.placement_normalization_requested_run_id,
+        table.c.placement_normalization_loaded_run_id,
+        table.c.placement_normalization_loaded_image_commit,
+        table.c.placement_normalization_loaded_controller_pid,
+        table.c.placement_normalization_loaded_controller_ip,
+        table.c.placement_normalization_loaded_boot_id,
+        table.c.placement_normalization_loaded_at,
+    )
+    receipt_services = session.execute(
+        sqlalchemy.select(table).where(
+            sqlalchemy.or_(
+                *(column.isnot(None) for column in receipt_columns))).order_by(
+                    table.c.name).limit(row_bound + 1)).mappings().all()
+    if len(receipt_services) > row_bound:
+        raise NormalizationBlocker(
+            'Predecessor receipt inventory exceeds its explicit row bound.')
+    versions_by_service: dict[str,
+                              list[_RowWork]] = collections.defaultdict(list)
+    for row in rows:
+        versions_by_service[row.identity[0]].append(row)
+    validated_manifests: dict[uuid.UUID, tuple[dict[str, Any],
+                                               list[dict[str, Any]]]] = {}
+    inventory: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for raw_service in receipt_services:
+        service = dict(raw_service)
+        service_name = service.get('name')
+        if (type(service_name) is not str or not service_name or
+                service_name in names):
+            raise NormalizationBlocker(
+                'Predecessor receipt inventory has an invalid or duplicate '
+                'service name.')
+        names.add(service_name)
+        if service_rows.get(service_name) != service:
+            raise NormalizationBlocker(
+                'Predecessor receipt service is absent from the locked '
+                'version inventory or changed during its scan.')
+        requested_run_id = service.get(
+            'placement_normalization_requested_run_id')
+        loaded_run_id = service.get('placement_normalization_loaded_run_id')
+        if not isinstance(requested_run_id, uuid.UUID):
+            raise NormalizationBlocker(
+                'Predecessor receipt has loaded state without a requested '
+                'run UUID.')
+        if loaded_run_id != requested_run_id:
+            raise NormalizationBlocker(
+                'Predecessor receipt is pending or belongs to another run.')
+        service_hash = service.get('hash')
+        current_version = service.get('current_version')
+        if (type(service_hash) is not str or not service_hash or
+                type(current_version) is not int or current_version < 1):
+            raise NormalizationBlocker(
+                'Predecessor receipt has an invalid service incarnation or '
+                'current version.')
+        service_versions = versions_by_service.get(service_name, [])
+        recovery_version = _select_recovery_version(service_versions)
+        if recovery_version is None:
+            raise NormalizationBlocker(
+                'Predecessor receipt has no live recovery version.')
+        receipt_row = session.execute(
+            serve_state._placement_normalization_receipt_query(  # pylint: disable=protected-access
+                service_name,
+                recovery_version,
+                current_version,
+                service_hash,
+                (service.get('controller_pid'), service.get('controller_ip')),
+                require_ledger=False)).mappings().one_or_none()
+        if receipt_row is None:
+            raise NormalizationBlocker(
+                'Predecessor receipt lost its current/recovery version '
+                'snapshot.')
+        receipt = dict(receipt_row)
+        try:
+            manifest_completed_at = (
+                serve_state._validate_placement_normalization_run_manifest(  # pylint: disable=protected-access
+                    receipt, requested_run_id))
+            serve_state._validate_raw_explicit_placement_contract(  # pylint: disable=protected-access
+                receipt,
+                'recovery',
+                require_cleanup_contract=True)
+            serve_state._validate_raw_explicit_placement_contract(  # pylint: disable=protected-access
+                receipt,
+                'current',
+                require_cleanup_contract=True)
+            serve_state._validate_placement_normalization_loaded_receipt(  # pylint: disable=protected-access
+                receipt, requested_run_id, manifest_completed_at)
+            serve_state._validate_placement_normalization_completed_service_incarnation(  # pylint: disable=protected-access
+                receipt, service_hash)
+            for prefix in ('recovery', 'current'):
+                serve_state._validate_placement_normalization_completed_ledger_result(  # pylint: disable=protected-access
+                    receipt, prefix, service_hash, manifest_completed_at)
+        except RuntimeError as exc:
+            raise NormalizationBlocker(
+                f'Predecessor receipt validation failed: {exc}') from exc
+        loaded_commit = receipt['loaded_image_commit']
+        loaded_at = receipt['loaded_at']
+        if loaded_commit not in approved_loaded_image_commits:
+            raise NormalizationBlocker(
+                'Predecessor receipt was loaded by an unapproved image '
+                'commit.')
+        if requested_run_id not in validated_manifests:
+            validated_manifests[requested_run_id] = _completed_run_inventory(
+                session, requested_run_id, row_bound)
+        manifest, _ = validated_manifests[requested_run_id]
+        inventory.append({
+            'service_name_sha256': _sha256(service_name.encode()),
+            'service_hash_sha256': _sha256(service_hash.encode()),
+            'requested_run_id': str(requested_run_id),
+            'loaded_run_id': str(loaded_run_id),
+            'loaded_image_commit': loaded_commit,
+            'loaded_controller_pid': receipt['loaded_controller_pid'],
+            'loaded_controller_ip_sha256':
+                (None if receipt['loaded_controller_ip'] is None else _sha256(
+                    receipt['loaded_controller_ip'].encode())),
+            'loaded_boot_id': receipt['loaded_boot_id'],
+            'loaded_at': float(loaded_at),
+            'normalizer_version': manifest['normalizer_version'],
+            'current_version': current_version,
+            'recovery_version': recovery_version,
+        })
+    approved_commit_sha256 = _canonical_json_sha256(
+        sorted(approved_loaded_image_commits))
+    freeze_binding_sha256 = _canonical_json_sha256({
+        'approved_loaded_image_commit_sha256': approved_commit_sha256,
+        'operator_freeze_evidence_input_sha256': freeze_evidence_sha256,
+    })
+    facts = {
+        'predecessor_receipt_schema': _PREDECESSOR_RECEIPT_SCHEMA,
+        'predecessor_receipt_inventory_count': len(inventory),
+        'predecessor_receipt_inventory_sha256':
+            _canonical_json_sha256(inventory),
+        'approved_loaded_image_commit_count':
+            len(approved_loaded_image_commits),
+        'approved_loaded_image_commit_sha256': approved_commit_sha256,
+        'operator_freeze_evidence_input_sha256': freeze_evidence_sha256,
+        'operator_freeze_approved_commit_binding_sha256': freeze_binding_sha256,
+        'predecessor_receipts_complete': True,
+    }
+    return _PredecessorReceiptEvidence(frozenset(names), facts)
 
 
 def _validate_successor_controller_config(row: _RowWork,
@@ -1591,6 +2099,8 @@ def _retirement_dependency_facts(
     process_evidence: _ExternalEvidence,
     api_pod_identity: _ApiPodIdentity,
     request_evidence: _ExternalEvidence,
+    cleanup_plan: _CleanupIntentPlan,
+    receipt_evidence: _PredecessorReceiptEvidence,
 ) -> dict[str, Any]:
     name, version = candidate.identity
     service = service_rows.get(name)
@@ -1660,11 +2170,22 @@ def _retirement_dependency_facts(
         raise NormalizationBlocker(
             'Historical service still has NULL or orphan-version replica '
             'rows.')
-    if candidate.dependency_facts['cleanup_intent_count']:
+    service_cleanup_count = sum(
+        intent.identity[0] == name for intent in cleanup_plan.rows)
+    if (candidate.dependency_facts['cleanup_intent_count']
+            != service_cleanup_count):
         raise NormalizationBlocker(
-            'Historical service still has a durable storage cleanup intent; '
-            'the intent is not version-keyed, so retirement cannot prove it '
-            'belongs only to a successor.')
+            'Typed cleanup proof does not cover the service-wide intent '
+            'inventory.')
+    cleanup_facts = cleanup_plan.candidate_facts.get(candidate.identity)
+    if cleanup_facts is None:
+        raise NormalizationBlocker(
+            'Historical candidate has no typed cleanup-intent match proof.')
+    if (_service_requires_normalization_receipt(service) and
+            name not in receipt_evidence.service_names):
+        raise NormalizationBlocker(
+            'Live historical service has no completed predecessor load '
+            'receipt.')
     if candidate.original.get('placement_catalog') is not None:
         raise NormalizationBlocker(
             'Historical version still has a placement catalog activation.')
@@ -1690,15 +2211,6 @@ def _retirement_dependency_facts(
     if config_protocol_active:
         _validate_successor_controller_config(recovery_row,
                                               service.get('workspace'))
-    yaml_content = candidate.original.get('yaml_content')
-    if not isinstance(yaml_content, str):
-        raise NormalizationBlocker(
-            'Historical version has no committed compiled YAML.')
-    storage_facts = _storage_ownership_facts(yaml_content)
-    if any(storage_facts.values()):
-        raise NormalizationBlocker(
-            'Historical YAML retains file, volume, workdir, or ephemeral '
-            'storage ownership.')
     if image_evidence.count != 0:
         raise NormalizationBlocker(
             'Historical version still owns live container-image demand.')
@@ -1726,7 +2238,10 @@ def _retirement_dependency_facts(
         'recovery_version': recovery_version,
         'config_protocol_active': config_protocol_active,
         'recovery_config_valid': config_protocol_active,
-        'storage_ownership': storage_facts,
+        **cleanup_plan.global_facts,
+        **cleanup_facts,
+        **receipt_evidence.facts,
+        'predecessor_receipt_requirement_satisfied': True,
         'image_demand_count': image_evidence.count,
         'image_demand_sha256': image_evidence.digest,
         'resource_action_root_count': resource_action_evidence.count,
@@ -1738,7 +2253,7 @@ def _retirement_dependency_facts(
         'parent_non_pool_proved': True,
         'resource_action_mode_legacy_inert': True,
         'placement_catalog_absent': True,
-        'cleanup_dependency_absent': True,
+        'cleanup_dependency_typed': True,
         'bridge_replica_dependency_absent': True,
         'unversioned_replica_dependency_absent': True,
         'same_service_placeholder_dependency_absent': True,
@@ -1865,17 +2380,17 @@ def _prepare_supported_rows(
     return affected_services
 
 
-def _prepare_retirement_rows(rows: list[_RowWork],
-                             service_rows: dict[str, dict[str, Any]],
-                             run_id: uuid.UUID, retired_at: float,
-                             image_evidence: dict[tuple[str, int],
-                                                  _ExternalEvidence],
-                             resource_action_evidence: dict[tuple[str, int],
-                                                            _ExternalEvidence],
-                             legacy_controller_evidence: _ExternalEvidence,
-                             process_evidence: _ExternalEvidence,
-                             api_pod_identity: _ApiPodIdentity,
-                             request_evidence: _ExternalEvidence) -> set[str]:
+def _prepare_retirement_rows(
+        rows: list[_RowWork], service_rows: dict[str,
+                                                 dict[str,
+                                                      Any]], run_id: uuid.UUID,
+        retired_at: float, image_evidence: dict[tuple[str, int],
+                                                _ExternalEvidence],
+        resource_action_evidence: dict[tuple[str, int], _ExternalEvidence],
+        legacy_controller_evidence: _ExternalEvidence,
+        process_evidence: _ExternalEvidence, api_pod_identity: _ApiPodIdentity,
+        request_evidence: _ExternalEvidence, cleanup_plan: _CleanupIntentPlan,
+        receipt_evidence: _PredecessorReceiptEvidence) -> set[str]:
     affected_services: set[str] = set()
     retiring_identities = frozenset(
         row.identity
@@ -1899,7 +2414,7 @@ def _prepare_retirement_rows(rows: list[_RowWork],
         dependency_facts[identity] = _retirement_dependency_facts(
             row, rows, service_rows, evidence, action_evidence,
             legacy_controller_evidence, retiring_identities, process_evidence,
-            api_pod_identity, request_evidence)
+            api_pod_identity, request_evidence, cleanup_plan, receipt_evidence)
     # Mutate only after every candidate has proved safety against the final
     # post-retirement fleet.  Otherwise an earlier candidate could cite a
     # later candidate that this same transaction also retires as its survivor.
@@ -1979,6 +2494,55 @@ def _cas_version_result(session: orm.Session, row: _RowWork) -> None:
         raise NormalizationBlocker(f'Version CAS failed for {row.identity!r}.')
 
 
+def _cas_cleanup_intent_results(session: orm.Session,
+                                plan: _CleanupIntentPlan) -> None:
+    """Adopt exactly the planned provisional intents by full-row CAS."""
+    table = serve_state.ephemeral_storage_cleanup_intents_table
+    changed_count = 0
+    for work in plan.rows:
+        if not work.adopted:
+            continue
+        predicates = []
+        for column in table.columns:
+            value = work.original[column.name]
+            predicates.append(
+                column.is_(None) if value is None else column == value)
+        changed = session.execute(
+            table.update().where(*predicates).values(provisional=0)).rowcount
+        if changed != 1:
+            raise NormalizationBlocker(
+                f'Cleanup-intent CAS failed for {work.identity!r}.')
+        changed_count += 1
+    if changed_count != plan.global_facts['cleanup_intent_adopted_count']:
+        raise NormalizationBlocker(
+            'Cleanup-intent CAS count disagrees with the frozen repair plan.')
+
+
+def _verify_cleanup_intent_postimages(session: orm.Session,
+                                      plan: _CleanupIntentPlan,
+                                      row_bound: int) -> None:
+    service_names = frozenset(work.identity[0] for work in plan.rows)
+    observed_rows = _read_cleanup_intent_inventory(session, service_names,
+                                                   row_bound)
+    observed_by_identity = {
+        (row['service_name'], row['resource_scope'], row['storage_generation']):
+            _row_sha256(row) for row in observed_rows
+    }
+    expected_by_identity = {
+        work.identity: _row_sha256(work.result) for work in plan.rows
+    }
+    if observed_by_identity != expected_by_identity:
+        raise NormalizationBlocker(
+            'Locked cleanup-intent postimages do not match the frozen plan.')
+    observed_work = tuple(
+        _CleanupIntentWork(row, row, ('', 0), '') for row in observed_rows)
+    if (_cleanup_intent_fleet_sha256(observed_work, result=False)
+            != plan.global_facts['cleanup_intent_post_inventory_sha256']):
+        raise NormalizationBlocker(
+            'Locked cleanup-intent postimage digest does not match the '
+            'retirement ledger.')
+
+
 def _insert_ledger(session: orm.Session, rows: list[_RowWork], *,
                    run_id: uuid.UUID, mode: ApplyMode, row_bound: int,
                    started_at: float, completed_at: float,
@@ -1989,7 +2553,9 @@ def _insert_ledger(session: orm.Session, rows: list[_RowWork], *,
         serve_state.placement_normalization_runs_table.insert().values(
             run_id=run_id,
             mode=mode.value,
-            normalizer_version=f'{_NORMALIZER_VERSION}:{sky.__commit__}',
+            normalizer_version=(
+                placement_normalization_identity.format_normalizer_identity(
+                    sky.__commit__)),
             schema_revision=_SCHEMA_REVISION,
             release_version=sky.__version__,
             started_at=started_at,
@@ -2047,25 +2613,8 @@ def _is_sha256(value: Any) -> bool:
             all(character in '0123456789abcdef' for character in value))
 
 
-_LEDGER_OUTCOMES_BY_MODE = {
-    ApplyMode.SUPPORTED.value: frozenset({
-        (Classification.PLACEHOLDER.value, 'unchanged'),
-        (Classification.EXPLICIT_V1.value, 'changed'),
-        (Classification.EXPLICIT_V2.value, 'unchanged'),
-        (Classification.FIELDLESS_SUPPORTED.value, 'changed'),
-        (Classification.HISTORICAL_PHYSICAL_PER_GPU.value, 'unchanged'),
-        (Classification.RETIRED.value, 'unchanged'),
-    }),
-    ApplyMode.RETIRE_TERMINAL_HISTORICAL.value: frozenset({
-        (Classification.PLACEHOLDER.value, 'unchanged'),
-        (Classification.EXPLICIT_V2.value, 'unchanged'),
-        (Classification.HISTORICAL_PHYSICAL_PER_GPU.value, 'retired'),
-        (Classification.RETIRED.value, 'unchanged'),
-    }),
-}
-
-
-def _retirement_ledger_facts_are_complete(entry: Mapping[str, Any]) -> bool:
+def _retirement_ledger_v1_facts_are_complete(entry: Mapping[str, Any]) -> bool:
+    """Validate the frozen protocol-1 retirement-fact contract."""
     facts = entry.get('dependency_facts')
     version = entry.get('version')
     if not isinstance(facts, dict) or type(version) is not int:
@@ -2145,6 +2694,140 @@ def _retirement_ledger_facts_are_complete(entry: Mapping[str, Any]) -> bool:
             is facts.get('config_protocol_active'))
 
 
+def _retirement_ledger_v2_facts_are_complete(entry: Mapping[str, Any]) -> bool:
+    """Validate typed cleanup and predecessor-receipt retirement evidence."""
+    facts = entry.get('dependency_facts')
+    version = entry.get('version')
+    if not isinstance(facts, dict) or type(version) is not int:
+        return False
+    zero_counts = (
+        'replica_count',
+        'unknown_version_replica_count',
+        'image_demand_count',
+        'resource_action_root_count',
+        'legacy_controller_cluster_count',
+        'serve_mutation_request_count',
+        'process_quiescence_count',
+        'cleanup_candidate_deletion_target_count',
+        'cleanup_intent_deletion_target_count',
+    )
+    true_proofs = (
+        'service_present',
+        'serve_consolidation_mode_proved',
+        'parent_non_pool_proved',
+        'resource_action_mode_legacy_inert',
+        'placement_catalog_absent',
+        'cleanup_dependency_typed',
+        'bridge_replica_dependency_absent',
+        'unversioned_replica_dependency_absent',
+        'same_service_placeholder_dependency_absent',
+        'incomplete_staged_config_dependency_absent',
+        'legacy_controller_cluster_absent',
+        'sole_recreate_api_pod_proved',
+        'controller_hold_required',
+        'retired_yaml_preserved',
+        'current_cleanup_reader_inventory_preserved',
+        'v1_1_1135_cleanup_omission_lossless',
+        'predecessor_receipts_complete',
+        'predecessor_receipt_requirement_satisfied',
+    )
+    false_facts = ('service_active', 'quarantined', 'controller_applied')
+    digest_facts = (
+        'image_demand_sha256',
+        'resource_action_root_sha256',
+        'legacy_controller_cluster_sha256',
+        'serve_mutation_request_sha256',
+        'process_quiescence_sha256',
+        'sole_api_pod_sha256',
+        'cleanup_intent_pre_inventory_sha256',
+        'cleanup_intent_post_inventory_sha256',
+        'cleanup_match_inventory_sha256',
+        'cleanup_intent_key_sha256',
+        'cleanup_candidate_yaml_sha256',
+        'cleanup_intent_yaml_sha256',
+        'cleanup_candidate_zero_target_projection_sha256',
+        'cleanup_intent_zero_target_projection_sha256',
+        'predecessor_receipt_inventory_sha256',
+        'approved_loaded_image_commit_sha256',
+        'operator_freeze_evidence_input_sha256',
+        'operator_freeze_approved_commit_binding_sha256',
+    )
+    pod_uid = facts.get('process_quiescence_pod_uid')
+    instance_id = facts.get('sole_api_instance_id')
+    try:
+        parsed_instance_id = uuid.UUID(instance_id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    cleanup_count = facts.get('cleanup_intent_count')
+    inventory_count = facts.get('cleanup_intent_inventory_count')
+    adopted_count = facts.get('cleanup_intent_adopted_count')
+    match_count = facts.get('cleanup_match_inventory_count')
+    receipt_count = facts.get('predecessor_receipt_inventory_count')
+    approved_count = facts.get('approved_loaded_image_commit_count')
+    cleanup_digest_delta_valid = ((adopted_count == 0) == (
+        facts.get('cleanup_intent_pre_inventory_sha256') == facts.get(
+            'cleanup_intent_post_inventory_sha256')))
+    expected_freeze_binding = _canonical_json_sha256({
+        'approved_loaded_image_commit_sha256':
+            facts.get('approved_loaded_image_commit_sha256'),
+        'operator_freeze_evidence_input_sha256':
+            facts.get('operator_freeze_evidence_input_sha256'),
+    })
+    return (
+        all(
+            type(facts.get(field)) is int and facts[field] == 0
+            for field in zero_counts) and
+        all(facts.get(field) is True for field in true_proofs) and
+        all(facts.get(field) is False for field in false_facts) and
+        all(_is_sha256(facts.get(field)) for field in digest_facts) and
+        facts.get('cleanup_contract_schema') == _CLEANUP_PROOF_SCHEMA and
+        facts.get('predecessor_receipt_schema') == _PREDECESSOR_RECEIPT_SCHEMA
+        and type(cleanup_count) is int and type(inventory_count) is int and
+        inventory_count >= 1 and 1 <= cleanup_count <= inventory_count and
+        type(adopted_count) is int and 0 <= adopted_count <= inventory_count and
+        type(match_count) is int and match_count == inventory_count and
+        type(facts.get('cleanup_candidate_match_count')) is int and
+        facts['cleanup_candidate_match_count'] == 1 and
+        cleanup_digest_delta_valid and
+        facts.get('cleanup_candidate_yaml_sha256')
+        == facts.get('cleanup_intent_yaml_sha256') and
+        facts.get('cleanup_candidate_zero_target_projection_sha256')
+        == facts.get('cleanup_intent_zero_target_projection_sha256') and
+        type(receipt_count) is int and receipt_count >= 0 and
+        type(approved_count) is int and approved_count >= 1 and
+        facts.get('operator_freeze_approved_commit_binding_sha256')
+        == expected_freeze_binding and type(
+            facts.get('service_pool')) is int and facts['service_pool'] == 0 and
+        facts.get('service_resource_action_mode') == 'legacy' and
+        'service_resource_action_mode_changed_at' in facts and
+        facts['service_resource_action_mode_changed_at'] is None and
+        type(facts.get('service_current_version')) is int and
+        facts['service_current_version'] > version and
+        type(facts.get('strictly_newer_committed_version')) is int and
+        facts['strictly_newer_committed_version'] > version and
+        type(facts.get('recovery_version')) is int and
+        facts['recovery_version'] > version and
+        type(facts.get('service_lifecycle_epoch')) is int and
+        facts['service_lifecycle_epoch'] > 0 and isinstance(
+            facts.get('service_hash'), str) and facts['service_hash'] != '' and
+        not any(character.isspace() for character in facts['service_hash']) and
+        isinstance(pod_uid, str) and pod_uid != '' and
+        not any(character.isspace() for character in pod_uid) and
+        str(parsed_instance_id) == instance_id and type(
+            facts.get('config_protocol_active')) is bool and
+        facts.get('recovery_config_valid')
+        is facts.get('config_protocol_active'))
+
+
+def _retirement_ledger_facts_are_complete(entry: Mapping[str, Any],
+                                          protocol: int) -> bool:
+    if protocol == placement_normalization_identity.PROTOCOL_V1:
+        return _retirement_ledger_v1_facts_are_complete(entry)
+    if protocol == placement_normalization_identity.PROTOCOL_V2:
+        return _retirement_ledger_v2_facts_are_complete(entry)
+    return False
+
+
 def _ledger_manifest_mismatches(
         run: Mapping[str, Any],
         entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -2167,16 +2850,26 @@ def _ledger_manifest_mismatches(
     started_at = run.get('started_at')
     completed_at = run.get('completed_at')
     normalizer_version = run.get('normalizer_version')
+    normalizer_identity: (
+        placement_normalization_identity.PlacementNormalizationIdentity |
+        None) = None
+    parsed_mode: str | None = None
     if not isinstance(raw_run_id, uuid.UUID):
         add('invalid_run_id')
-    if mode not in _LEDGER_OUTCOMES_BY_MODE:
+    try:
+        parsed_mode = placement_normalization_identity.parse_manifest_mode(mode)
+    except placement_normalization_identity.PlacementNormalizationIdentityError:
         add('invalid_run_mode')
-    allowed_outcomes = (_LEDGER_OUTCOMES_BY_MODE.get(mode, frozenset())
-                        if isinstance(mode, str) else frozenset())
-    if (not isinstance(normalizer_version, str) or
-            not normalizer_version.startswith(f'{_NORMALIZER_VERSION}:') or
-            not normalizer_version.removeprefix(f'{_NORMALIZER_VERSION}:')):
+    try:
+        normalizer_identity = (placement_normalization_identity.
+                               parse_normalizer_identity(normalizer_version))
+    except placement_normalization_identity.PlacementNormalizationIdentityError:
         add('invalid_normalizer_version')
+    allowed_outcomes: frozenset[tuple[str, str]] = frozenset()
+    if normalizer_identity is not None and parsed_mode is not None:
+        allowed_outcomes = (
+            placement_normalization_identity.allowed_manifest_outcomes(
+                normalizer_identity, parsed_mode))
     if run.get('schema_revision') != _SCHEMA_REVISION:
         add('invalid_schema_revision')
     if not isinstance(run.get('release_version'),
@@ -2253,8 +2946,17 @@ def _ledger_manifest_mismatches(
                 != entry.get('service_lifecycle_epoch')):
             add('owner_facts_do_not_match_columns', entry)
         if (outcome == 'retired' and
-                not _retirement_ledger_facts_are_complete(entry)):
+            (normalizer_identity is None or
+             not _retirement_ledger_facts_are_complete(
+                 entry, normalizer_identity.protocol))):
             add('incomplete_retirement_dependency_facts', entry)
+        if (outcome == 'retired' and normalizer_identity is not None and
+                normalizer_identity.protocol
+                == placement_normalization_identity.PROTOCOL_V2 and
+                isinstance(facts, dict) and
+                facts.get('operator_freeze_approved_commit_binding_sha256')
+                != run.get('freeze_evidence_sha256')):
+            add('retirement_freeze_commit_binding_mismatch', entry)
 
     if run.get('classification_counts') != dict(counts):
         add('classification_counts_do_not_match_inventory')
@@ -2390,20 +3092,39 @@ def _require_prior_ledger_consistency(
             f'first mismatch is {blocking[0]!r}.')
 
 
-def _validate_operator_inputs(mode: ApplyMode | None, row_bound: int,
-                              freeze_evidence_sha256: str | None) -> None:
+def _validate_operator_inputs(
+    mode: ApplyMode | None,
+    row_bound: int,
+    freeze_evidence_sha256: str | None,
+    approved_loaded_image_commits: Sequence[str],
+) -> frozenset[str]:
+    if mode is not None and not isinstance(mode, ApplyMode):
+        raise ValueError('mode must be an ApplyMode value or None.')
     if (type(row_bound) is not int or
             not 1 <= row_bound <= _MAX_INVENTORY_ROWS):
         raise ValueError(
             f'row_bound must be an integer in [1, {_MAX_INVENTORY_ROWS}].')
+    if mode is not ApplyMode.RETIRE_TERMINAL_HISTORICAL:
+        if approved_loaded_image_commits:
+            raise ValueError('Approved loaded image commits are accepted only '
+                             'for historical retirement.')
+        approved_commits: frozenset[str] = frozenset()
+    else:
+        approved_commits = _validate_approved_loaded_image_commits(
+            approved_loaded_image_commits)
     if mode is None:
-        return
+        return approved_commits
     if (not isinstance(freeze_evidence_sha256, str) or
             len(freeze_evidence_sha256) != 64 or
             any(character not in '0123456789abcdef'
                 for character in freeze_evidence_sha256)):
         raise ValueError(
             'Apply mode requires a lowercase SHA-256 freeze evidence digest.')
+    # Refuse a dirty checkout, tag, or abbreviated revision before acquiring
+    # any external evidence or database lock.  Every durable writer identity
+    # must be attributable to one exact released image commit.
+    placement_normalization_identity.format_normalizer_identity(sky.__commit__)
+    return approved_commits
 
 
 def _read_timestamp(now: Callable[[], float], label: str) -> float:
@@ -2488,6 +3209,7 @@ def run_operator(
     mode: ApplyMode | None = None,
     row_bound: int,
     freeze_evidence_sha256: str | None = None,
+    approved_loaded_image_commits: Sequence[str] = (),
     image_evidence_getter: Callable[[str, int],
                                     _ExternalEvidence] = _image_demand_evidence,
     request_evidence_getter: Callable[
@@ -2511,7 +3233,9 @@ def run_operator(
     now: Callable[[], float] = time.time,
 ) -> OperatorResult:
     """Dry-run or atomically apply one explicit normalization phase."""
-    _validate_operator_inputs(mode, row_bound, freeze_evidence_sha256)
+    approved_commits = _validate_operator_inputs(mode, row_bound,
+                                                 freeze_evidence_sha256,
+                                                 approved_loaded_image_commits)
     if engine is None:
         engine = serve_state.get_database_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
@@ -2632,8 +3356,10 @@ def run_operator(
             prior_mismatches = _prior_ledger_mismatches(session, rows)
             _require_prior_ledger_consistency(prior_mismatches)
             pre_digest = _fleet_sha256(rows, result=False)
+            manifest_freeze_evidence_sha256 = freeze_evidence_sha256
             if mode is ApplyMode.SUPPORTED:
                 affected_services = _prepare_supported_rows(rows, service_rows)
+                cleanup_plan: _CleanupIntentPlan | None = None
             else:
                 if consolidation_mode_checker() is not True:
                     raise NormalizationBlocker(
@@ -2681,27 +3407,41 @@ def run_operator(
                 _require_stable_zero_evidence(
                     legacy_controller_before, legacy_controller_locked,
                     'Legacy Serve-controller cluster evidence')
+                candidate_services = frozenset(
+                    identity[0] for identity in locked_identities)
+                raw_cleanup_intents = _read_cleanup_intent_inventory(
+                    session, candidate_services, row_bound)
+                cleanup_plan = _build_cleanup_intent_plan(
+                    raw_cleanup_intents, rows, service_rows, row_bound)
+                receipt_evidence = _predecessor_receipt_evidence(
+                    session, rows, service_rows, approved_commits, row_bound,
+                    freeze_evidence_sha256)
+                manifest_freeze_evidence_sha256 = receipt_evidence.facts[
+                    'operator_freeze_approved_commit_binding_sha256']
                 affected_services = _prepare_retirement_rows(
                     rows, service_rows, run_id,
-                    _read_timestamp(now,
-                                    'Historical retirement'), preflight_images,
-                    resource_actions_locked, legacy_controller_locked,
-                    process_locked, api_pod_locked, request_before)
+                    _read_timestamp(now, 'Historical retirement'),
+                    preflight_images, resource_actions_locked,
+                    legacy_controller_locked, process_locked, api_pod_locked,
+                    request_before, cleanup_plan, receipt_evidence)
             post_digest = _fleet_sha256(rows, result=True)
             completed_at = _read_timestamp(now, 'Normalization completion')
             if completed_at < started_at:
                 raise NormalizationBlocker(
                     'Normalization completion precedes its start.')
-            _insert_ledger(session,
-                           rows,
-                           run_id=run_id,
-                           mode=mode,
-                           row_bound=row_bound,
-                           started_at=started_at,
-                           completed_at=completed_at,
-                           freeze_evidence_sha256=freeze_evidence_sha256,
-                           pre_digest=pre_digest,
-                           post_digest=post_digest)
+            _insert_ledger(
+                session,
+                rows,
+                run_id=run_id,
+                mode=mode,
+                row_bound=row_bound,
+                started_at=started_at,
+                completed_at=completed_at,
+                freeze_evidence_sha256=manifest_freeze_evidence_sha256,
+                pre_digest=pre_digest,
+                post_digest=post_digest)
+            if cleanup_plan is not None:
+                _cas_cleanup_intent_results(session, cleanup_plan)
             for row in rows:
                 _cas_version_result(session, row)
             receipt_services: set[str] = set()
@@ -2712,6 +3452,9 @@ def run_operator(
                                                  run_id)
                     receipt_services.add(service_name)
             _verify_version_postimages(session, rows, row_bound, post_digest)
+            if cleanup_plan is not None:
+                _verify_cleanup_intent_postimages(session, cleanup_plan,
+                                                  row_bound)
             _verify_service_receipts(session, receipt_services, run_id)
             request_after = _validate_external_evidence(
                 request_evidence_getter(engine), 'Serve request postflight')
@@ -2789,6 +3532,9 @@ def _parse_args() -> argparse.Namespace:
     mode.add_argument('--retire-terminal-historical', action='store_true')
     parser.add_argument('--max-rows', type=int, required=True)
     parser.add_argument('--freeze-evidence-sha256')
+    parser.add_argument('--approved-loaded-image-commit',
+                        action='append',
+                        default=[])
     return parser.parse_args()
 
 
@@ -2799,9 +3545,11 @@ def main() -> None:
         mode = ApplyMode.SUPPORTED
     elif args.retire_terminal_historical:
         mode = ApplyMode.RETIRE_TERMINAL_HISTORICAL
-    result = run_operator(mode=mode,
-                          row_bound=args.max_rows,
-                          freeze_evidence_sha256=args.freeze_evidence_sha256)
+    result = run_operator(
+        mode=mode,
+        row_bound=args.max_rows,
+        freeze_evidence_sha256=args.freeze_evidence_sha256,
+        approved_loaded_image_commits=(args.approved_loaded_image_commit))
     print(json.dumps(result.as_dict(), sort_keys=True, separators=(',', ':')))
 
 
