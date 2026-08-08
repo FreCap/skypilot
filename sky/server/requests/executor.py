@@ -55,7 +55,6 @@ from sky.server import plugins
 from sky.server import versions
 from sky.server import watchdog
 from sky.server.events import models as event_models
-from sky.server.requests import authority_worker
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import process
@@ -193,10 +192,7 @@ _queue_factory: queue_base.QueueBackendFactory | None = None
 
 def executor_initializer(proc_group: str,
                          clean_env: dict[str, str] | None = None):
-    server_role = os.environ.get('SKYPILOT_API_SERVER_ROLE', 'all')
-    metrics_process_role = ('authority-worker' if server_role
-                            == 'authority-worker' else 'executor')
-    db_utils.set_postgres_connection_metrics_process_role(metrics_process_role)
+    db_utils.set_postgres_connection_metrics_process_role('executor')
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
     # This runs in a child process of the API server. If the main process
@@ -1675,8 +1671,6 @@ def start(
     *,
     execution_classes: frozenset[request_registry.ExecutionClass] | None = None,
     controller_generation: int | None = None,
-    authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
-                             None) = None,
 ) -> tuple[multiprocessing.Process | None, list[RequestWorker]]:
     """Start the request workers.
 
@@ -1691,7 +1685,7 @@ def start(
     factory = queue_base.get_registered_queue_backend_factory()
     # Explicitly registered plugin backends take precedence over config.
     if factory is not None:
-        if execution_classes is not None or authority_claim_config is not None:
+        if execution_classes is not None:
             raise RuntimeError(
                 'Explicit queue plugins cannot be used with role-scoped '
                 'request execution because QueueBackendFactory has no closed '
@@ -1707,15 +1701,14 @@ def start(
                            if execution_classes is not None else None)
         _queue_factory = postgres.PostgresQueueFactory(
             execution_classes=allowed_classes,
-            controller_generation=controller_generation,
-            authority_claim_config=authority_claim_config)
+            controller_generation=controller_generation)
     elif config.queue_backend == server_config.QueueBackend.MULTIPROCESSING:
-        if execution_classes is not None or authority_claim_config is not None:
+        if execution_classes is not None:
             raise RuntimeError('Role-scoped request execution requires the '
                                'PostgreSQL request backend.')
         _queue_factory = queue_base.MultiprocessingQueueFactory()
     elif config.queue_backend == server_config.QueueBackend.LOCAL:
-        if execution_classes is not None or authority_claim_config is not None:
+        if execution_classes is not None:
             raise RuntimeError('Role-scoped request execution requires the '
                                'PostgreSQL request backend.')
         _queue_factory = queue_base.LocalQueueFactory()

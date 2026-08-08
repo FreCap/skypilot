@@ -40,27 +40,7 @@
 {{- $lbDataPlaneSecret := get $lbDataPlaneAuth "existingSecret" | default "" -}}
 {{- $lbDataPlaneKey := get $lbDataPlaneAuth "key" | default "" -}}
 {{- $lbDataPlaneAuthEnabled := and $externalLBEnabled (not (empty $lbDataPlaneSecret)) (not (empty $lbDataPlaneKey)) -}}
-{{- $resourceActions := .Values.resourceActions | default (dict) -}}
-{{- $authorityWorker := get $resourceActions "authorityWorker" | default (dict) -}}
-{{- $authorityWorkerEnabled := get $authorityWorker "enabled" | default false -}}
-{{- $authorityV1RetirementPhase := .Values.databaseMigration.authorityV1RetirementPhase | default "none" -}}
-{{- $authorityV1RetirementActive := ne $authorityV1RetirementPhase "none" -}}
-{{- $authorityActiveCohort := get $authorityWorker "activeCohort" | default "" -}}
-{{- $authorityCohorts := get $authorityWorker "cohorts" | default (list) -}}
-{{- $authorityPreflightEnabled := and $authorityWorkerEnabled (gt (len $authorityCohorts) 0) (not $authorityV1RetirementActive) -}}
-{{- $authorityAuth := get $authorityWorker "auth" | default (dict) -}}
-{{- $authorityTLS := get $authorityWorker "tls" | default (dict) -}}
-{{- $authorityAuthSecret := get $authorityAuth "existingSecret" | default "" -}}
-{{- $authorityAuthKey := get $authorityAuth "key" | default "" -}}
-{{- $authorityTLSSecret := get $authorityTLS "existingSecret" | default "" -}}
-{{- $authorityTLSCAKey := get $authorityTLS "caKey" | default "" -}}
-{{- $authorityManifestConfigMap := printf "%s-authority-%s-manifest" $fullName $authorityActiveCohort -}}
-{{- /* The activation marker has no user-owned compatibility meaning. Keep it
-      reserved even when this role has no live authority preflight wiring. */ -}}
-{{- $controllerReservedEnvNames := list "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
-{{- if $authorityPreflightEnabled -}}
-{{- $controllerReservedEnvNames = append $controllerReservedEnvNames "SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE" -}}
-{{- end -}}
+{{- $controllerReservedEnvNames := list "KUBECONFIG" "POD_IP" "PROMETHEUS_MULTIPROC_DIR" "SKY_API_SERVER_METRICS_ENABLED" "SKYPILOT_API_DEPLOYMENT_NAME" "SKYPILOT_API_REQUEST_BACKEND" "SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH" "SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS" "SKYPILOT_API_SERVER_ENDPOINT" "SKYPILOT_API_SERVER_INSTANCE_ID" "SKYPILOT_API_SERVER_ROLE" "SKYPILOT_API_SERVER_STORAGE_ENABLED" "SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS" "SKYPILOT_DB_CONNECTION_URI" "SKYPILOT_DEV" "SKYPILOT_GRACE_PERIOD_SECONDS" "SKYPILOT_IN_CLUSTER_NAMESPACE" "SKYPILOT_POD_CPU_CORE_LIMIT" "SKYPILOT_POD_MEMORY_BYTES_LIMIT" "SKYPILOT_POD_NAME" "SKYPILOT_POD_NAMESPACE" "SKYPILOT_POD_UID" "SKYPILOT_RELEASE_NAME" "SKYPILOT_ROLLING_UPDATE_ENABLED" "SKYPILOT_SERVE_API_SERVICE_URL" "SKYPILOT_SERVE_CONTROLLER_ADMIN_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_EXTERNAL_LB_ENABLED" "SKYPILOT_SERVE_LB_AUTH_TOKENS_FILE" "SKYPILOT_SERVE_LB_DATA_PLANE_AUTH_ENABLED" "SKYPILOT_SERVE_LB_HA_RBAC_READY" "SKYPILOT_SERVE_LB_RESOURCES_JSON" "SKYPILOT_SERVE_LB_SYNC_AUTH_TOKENS_FILE" "SKYPILOT_STATE_DB_MIGRATION_MODE" -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $controllerReservedEnvNames = concat $controllerReservedEnvNames (list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY") -}}
 {{- end -}}
@@ -84,9 +64,6 @@
 {{- end -}}
 
 {{- $controllerReservedVolumeNames := list "skypilot-config" "skypilot-role-runtime" "skypilot-serve-controller-admin-auth" "skypilot-serve-lb-auth" "skypilot-serve-lb-sync-auth" "skypilot-server-config" "skypilot-ssh-identity" "skypilot-ssh-node-pools" "state-volume" -}}
-{{- if $authorityPreflightEnabled -}}
-{{- $controllerReservedVolumeNames = concat $controllerReservedVolumeNames (list "skypilot-resource-action-authority-auth" "skypilot-resource-action-authority-ca" "skypilot-resource-action-authority-manifest") -}}
-{{- end -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $controllerReservedVolumeNames = concat $controllerReservedVolumeNames (list "aws-config" "aws-config-files") -}}
 {{- end -}}
@@ -122,9 +99,6 @@
 {{- end -}}
 
 {{- $controllerReservedMountPaths := list "/etc/skypilot/serve-auth/controller-admin" "/etc/skypilot/serve-auth/lb-data-plane" "/etc/skypilot/serve-auth/lb-sync" "/root/.sky" "/root/.sky/.server.yaml" "/root/.ssh" "/root/sky_logs" "/var/run/skypilot" "/var/skypilot/config" "/var/skypilot/ssh_keys" "/var/skypilot/ssh_node_pool" -}}
-{{- if $authorityPreflightEnabled -}}
-{{- $controllerReservedMountPaths = concat $controllerReservedMountPaths (list "/etc/skypilot/resource-action-authority/auth" "/etc/skypilot/resource-action-authority/manifest.json" "/etc/skypilot/resource-action-authority/tls") -}}
-{{- end -}}
 {{- if .Values.awsCredentials.enabled -}}
 {{- $controllerReservedMountPaths = append $controllerReservedMountPaths "/root/.aws" -}}
 {{- end -}}
@@ -305,10 +279,6 @@ spec:
         {{- end }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: verify
-        {{- if $authorityV1RetirementActive }}
-        - name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
-          value: "037"
-        {{- end }}
         - name: SKYPILOT_POD_CPU_CORE_LIMIT
           valueFrom:
             resourceFieldRef:
@@ -333,12 +303,6 @@ spec:
         {{- end }}
         - name: SKYPILOT_SERVE_EXTERNAL_LB_ENABLED
           value: {{ ternary "true" "false" $externalLBEnabled | quote }}
-        {{- if $authorityPreflightEnabled }}
-        - name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
-          value: "true"
-        - name: SKYPILOT_RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE
-          value: /etc/skypilot/resource-action-authority/auth/tokens
-        {{- end }}
         {{- if $externalLBEnabled }}
         - name: SKYPILOT_SERVE_LB_HA_RBAC_READY
           value: "true"
@@ -560,18 +524,6 @@ spec:
           mountPath: /etc/skypilot/serve-auth/lb-data-plane
           readOnly: true
         {{- end }}
-        {{- end }}
-        {{- if $authorityPreflightEnabled }}
-        - name: skypilot-resource-action-authority-manifest
-          mountPath: /etc/skypilot/resource-action-authority/manifest.json
-          subPath: manifest.json
-          readOnly: true
-        - name: skypilot-resource-action-authority-auth
-          mountPath: /etc/skypilot/resource-action-authority/auth
-          readOnly: true
-        - name: skypilot-resource-action-authority-ca
-          mountPath: /etc/skypilot/resource-action-authority/tls
-          readOnly: true
         {{- end }}
         {{- with .Values.databaseConnection.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
@@ -853,29 +805,6 @@ spec:
               - key: {{ $lbDataPlaneKey | quote }}
                 path: tokens
       {{- end }}
-      {{- end }}
-      {{- if $authorityPreflightEnabled }}
-      - name: skypilot-resource-action-authority-manifest
-        configMap:
-          name: {{ $authorityManifestConfigMap | quote }}
-          defaultMode: 0444
-          items:
-          - key: manifest.json
-            path: manifest.json
-      - name: skypilot-resource-action-authority-auth
-        secret:
-          secretName: {{ $authorityAuthSecret | quote }}
-          defaultMode: 0400
-          items:
-          - key: {{ $authorityAuthKey | quote }}
-            path: tokens
-      - name: skypilot-resource-action-authority-ca
-        secret:
-          secretName: {{ $authorityTLSSecret | quote }}
-          defaultMode: 0400
-          items:
-          - key: {{ $authorityTLSCAKey | quote }}
-            path: ca.crt
       {{- end }}
       {{- with .Values.databaseConnection.extraVolumes }}
       {{- toYaml . | nindent 6 }}

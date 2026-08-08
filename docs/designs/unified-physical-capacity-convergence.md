@@ -75,44 +75,22 @@ configuration.
 
 ### Forward-only continuation after retirement
 
-Retirement is not a rollback target and does not restore the scanner. The
-accepted sequence is deliberately asymmetric:
+Retirement is not a rollback target and does not restore the scanner. Keep
+capacity001 and its five empty additive tables while the C2 runtime remains
+absent. The proposed Serve M4/M5a authority continuation was never activated
+and is now also retired; it supplied no evidence for the capacity hypothesis.
 
-1. keep capacity001 and its five empty additive tables while the retired C2
-   runtime remains absent;
-2. complete the bounded Serve resource-action M4/M5a stack for central
-   PostgreSQL, non-pool Kubernetes, and
-   `ordinary_ondemand_physical_width1_v1`, proving that durable physical-
-   generation ownership removes named legacy mutation owners;
-3. only then rewrite and adversarially review a separate bounded,
-   materialized, read-only capacity projection against the exact deployed
-   schemas before reintroducing any capacity runtime; and
-4. promote read authority one owner/service at a time, followed by separately
-   reviewed jobs and pool identity profiles. Mutation authority never follows
-   automatically from read convergence.
+The only surviving Serve issue is localized ordinary-launch API request
+binding across controller restart. Its bounded design explicitly reuses the
+ordinary request executor and does not introduce a shared capacity projector,
+reservation/occupancy ledger, provider renderer, or mutation authority.
 
-Step 2 is not a shared-capacity projector. Its ordinary counted
-`PROVISIONING` and down-`RUNNING` replica projections stay Serve-owned and
-preserve the existing mixed weighted provider-work budget across action and
-legacy routing. With `P` equal to all action plus legacy `PROVISIONING` rows,
-`D` equal to all action plus legacy down-`RUNNING` rows, and `C` equal to the
-existing non-pool request-parallelism cap, both paths use the exact predicate
-`2P + D < 2C`; launches have weight two, downs weight one, and a row satisfying
-both predicates contributes both weights. This is a Serve-owned projection of
-already-persisted work, not a mutable capacity occupancy ledger, and no
-reservation/occupancy table or scanner is revived.
-M4's initial active authority policy approves exact M4 only. After its
-authoritative window and the normal M5a merge, an admission-closed zero-work
-monotonic rotation activates a successor approving exact M4 plus exact M5a;
-exact M5a -> exact M4 -> exact M5a binary verification and the final exact-M5a
-soak keep action authority and additive schema throughout. They are not a
-capacity coordinator or an ownership revert. Paid-capacity, reserved-fill,
-spot/fallback, cost-rebalance, and logical-width state machines remain explicit
-legacy profiles. Step 3 remains unauthorized in this file until its exact
-materialized schema, ownership, freshness, absence, rollout, compatible-binary
-recovery, and consumer contract replaces this paragraph in the canonical
-design. Even then, the first accepted product is read-only and cannot introduce
-a mutable allocation, reservation, or occupancy ledger.
+No capacity runtime may return without a newly accepted design based on
+30--60 days of production evidence across at least two domains. That design
+must name one read-only consumer and specify exact materialized schema,
+ownership, freshness, absence, rollout, compatible-binary recovery, and value
+gates. Mutation or admission authority cannot follow automatically from read
+convergence.
 
 The archived universal B0--B8 graph is rejected, not deployed state. The
 forward path adds no universal lifecycle DAG, API008 capacity plane,

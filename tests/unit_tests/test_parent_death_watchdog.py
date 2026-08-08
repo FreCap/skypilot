@@ -115,8 +115,7 @@ class _FakeThread:
 
 @pytest.mark.parametrize('has_parent', [True, False])
 @pytest.mark.parametrize(('server_role', 'expected_metrics_role'),
-                         [('all', 'executor'), ('executor', 'executor'),
-                          ('authority-worker', 'authority-worker')])
+                         [('all', 'executor'), ('executor', 'executor')])
 def test_executor_initializer_arms_watchdog_only_in_child(
         monkeypatch, has_parent, server_role, expected_metrics_role):
     """executor_initializer arms the watchdog iff a parent process exists.

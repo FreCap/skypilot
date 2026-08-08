@@ -523,9 +523,9 @@ def _cleanup(service_name: str,
             for info, _ in cleanup_entries:
                 _set_to_failed_cleanup(info, reason)
             cleanup_entries = []
-    # TODO(fcapponi): DEPRECATED resource-action teardown owner. Remove this
-    # whole-service thread loop at M5 for eligible authoritative services after
-    # durable down actions cover cleanup and rollback.
+    # This remains the whole-service teardown owner.  Cleanup intent and exact
+    # replica identity are durable; the retired action-authority proposal does
+    # not replace this thread loop.
     info2thr: dict[replica_managers.ReplicaInfo,
                    thread_utils.SafeThread] = dict()
     for info, cleanup_fence in cleanup_entries:

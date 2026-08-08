@@ -337,53 +337,6 @@ class TestGetEngine:
             assert call.kwargs['pool_size'] == 1
             assert call.kwargs['max_overflow'] == 0
 
-    def test_authority_preflight_namespace_is_one_bounded_isolated_pool(
-            self, monkeypatch):
-        """The hard-deadline reader cannot borrow the shared role pool."""
-
-        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
-        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
-                           'postgresql://user:pass@localhost/db')
-        db_utils.set_max_connections(1)
-        ordinary_engine = mock.MagicMock()
-        preflight_engine = mock.MagicMock()
-
-        with mock.patch('sqlalchemy.create_engine',
-                        side_effect=[ordinary_engine,
-                                     preflight_engine]) as mock_create:
-            ordinary = db_utils.get_engine('serve/services')
-            preflight = db_utils.get_engine(
-                'serve/services',
-                engine_namespace=(
-                    db_utils.AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE))
-            assert db_utils.get_engine(
-                'ignored',
-                engine_namespace=(
-                    db_utils.AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE)) is preflight
-
-        assert ordinary is ordinary_engine
-        assert preflight is preflight_engine
-        assert ordinary is not preflight
-        assert mock_create.call_count == 2
-        call = mock_create.call_args_list[1]
-        assert call.kwargs['poolclass'] == sqlalchemy.pool.QueuePool
-        assert call.kwargs['pool_size'] == 1
-        assert call.kwargs['max_overflow'] == 0
-        assert call.kwargs['pool_timeout'] == 0.25
-        assert call.kwargs['pool_pre_ping'] is False
-        assert call.kwargs['pool_recycle'] == 60
-        assert call.kwargs['connect_args'] == {
-            'connect_timeout': 1,
-            'application_name': 'skypilot-authority-preflight',
-            'options': ('-c statement_timeout=3500 -c lock_timeout=750 '
-                        '-c idle_in_transaction_session_timeout=4000'),
-            'keepalives': 1,
-            'keepalives_idle': 1,
-            'keepalives_interval': 1,
-            'keepalives_count': 1,
-            'tcp_user_timeout': 4_000,
-        }
-
     def test_postgres_lock_connections_use_separate_nullpool(self):
         """Session locks must not consume an ordinary QueuePool checkout."""
         ordinary_engine = mock.MagicMock()
@@ -600,7 +553,6 @@ class TestGetEngine:
     @pytest.mark.parametrize(('namespace', 'expected'),
                              [(None, 'shared'), ('', 'shared'),
                               ('api-requests-control', 'api-requests-control'),
-                              ('authority-preflight', 'other'),
                               ('advisory-lock', 'advisory-lock'),
                               ('physical-capacity-evidence', 'other'),
                               ('caller-controlled-value', 'other')])
@@ -615,7 +567,6 @@ class TestGetEngine:
             'api',
             'executor',
             'controller',
-            'authority-worker',
             'managed-job-controller',
             'serve-controller',
             'unknown',
@@ -626,7 +577,6 @@ class TestGetEngine:
                 'api',
                 'executor',
                 'controller',
-                'authority-worker',
             }))
         assert db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES == (
             frozenset({
@@ -639,7 +589,7 @@ class TestGetEngine:
             {'sync', 'async'})
         assert (len(db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES) *
                 len(db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES) *
-                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 64)
+                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 56)
 
     def test_postgres_connection_metric_process_role_is_write_once(
             self, monkeypatch):

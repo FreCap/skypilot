@@ -2,11 +2,6 @@
 set -euo pipefail
 
 chart_dir=${1:-charts/skypilot}
-script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-bash "$script_dir/resource_action_authority_workers_schema_guards.sh" \
-  "$chart_dir"
-bash "$script_dir/resource_action_qualification_policy_guards.sh" \
-  "$chart_dir"
 temporary_dir=$(mktemp -d)
 trap 'rm -rf "$temporary_dir"' EXIT
 cp -R "$chart_dir" "$temporary_dir/chart"
@@ -47,5 +42,3 @@ expect_failure \
 expect_failure \
   'imageCanaryWorker.terminationGracePeriodSeconds must be an integer' \
   --set-string imageCanaryWorker.terminationGracePeriodSeconds=600
-
-bash "$script_dir/resource_action_authority_workers_template_guards.sh" "$chart_dir"

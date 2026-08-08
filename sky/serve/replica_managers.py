@@ -842,9 +842,9 @@ def launch_cluster(
 
     if availability_max_retry is None:
         availability_max_retry = max_retry
-    # TODO(fcapponi): DEPRECATED resource-action retry/request association
-    # owner. Remove at M5 after action-only launch proves its rollback gate;
-    # never use this loop for an eligible authoritative service.
+    # This remains the current launch retry/request owner.  A future bounded
+    # request-binding change may make the exact request association durable,
+    # but the retired action-authority design does not deprecate this loop.
     retry_cnt = 0
     availability_retry_cnt = 0
     backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
@@ -1292,9 +1292,8 @@ def terminate_cluster(
     else:
         time.sleep(replica_drain_delay_seconds)
 
-    # TODO(fcapponi): DEPRECATED resource-action retry owner. Remove at M5
-    # after action-only down proves its rollback gate; never use this loop for
-    # an eligible authoritative service.
+    # This remains the current down retry owner.  Cleanup intent is durable;
+    # the retired action-authority design does not replace this loop.
     retry_cnt = 0
     backoff = common_utils.Backoff()
     while True:
@@ -2369,11 +2368,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._logical_exact_accelerator_shapes: dict[str, int] = {}
         self._spot_placement_state_restored = False
         self._fill_skip_last_log_time = 0.0
-        # TODO(fcapponi): DEPRECATED resource-action owner. Remove this whole
-        # legacy/shadow runtime at M5 after action-only launch/down proves its
-        # rollback gate; never select it for an eligible authoritative service.
-        # Its logical-launch fence is assigned when a queued thread is admitted
-        # and rechecked immediately before sdk.launch().
+        # Process-local adapters and caches for the current Serve mutation
+        # implementation.  The retired resource-action authority proposal no
+        # longer makes this runtime a deprecated removal target.  Its logical
+        # launch fence is assigned when a queued thread is admitted and
+        # rechecked immediately before sdk.launch().
         self._publish_legacy_mutation_runtime_state(
             _LegacyReplicaMutationRuntime())
         # Ownership loss and update-recovery are distinct terminal signals:
@@ -3519,8 +3518,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         embedders, tests, and upgrade/recovery paths that reconstruct a manager
         without replaying the newest initializer in full.
         """
-        # TODO(fcapponi): DEPRECATED resource-action retry-clock owner. Remove
-        # at M5 after action-only down proves its rollback gate.
+        # These process-local clocks rate-limit a durable cleanup intent.  A
+        # restart may reset backoff but cannot forget the cleanup.
         runtime = self._legacy_mutation_runtime_state()
         return (runtime.failed_cleanup_retry_attempts,
                 runtime.failed_cleanup_retry_at)
@@ -3730,7 +3729,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             stop_event=self._manager_daemon_stop)
 
     def _recover_replica_operations(self):
-        """Route restart inference through the removable legacy runtime."""
+        """Route restart inference through the current mutation runtime."""
         self._legacy_mutation_runtime_state().recover(
             self._recover_legacy_replica_operations)
 
@@ -3740,9 +3739,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         Runs in the dedicated recovery thread started by __init__, which
         holds the manager lock for the whole pass (see __init__ for the
         lock-ordering handshake with the daemon threads)."""
-        # TODO(fcapponi): DEPRECATED status-inference owner. Remove the
-        # launch/down reconstruction branches at M5 after durable action links
-        # become the sole recovery source for eligible authoritative services.
+        # This remains the current launch/down restart-recovery owner.  A
+        # future bounded ordinary-launch association may replace only its
+        # duplicate-request inference after independent qualification.
         legacy_runtime = self._legacy_mutation_runtime_state()
         if (legacy_runtime.launch_thread_pool or
                 legacy_runtime.down_thread_pool):
@@ -6597,9 +6596,8 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _handle_sky_down_finish(self, info: ReplicaInfo,
                                 format_exc: str | None) -> None:
-        # TODO(fcapponi): DEPRECATED resource-action result reducer. Remove at
-        # M5 for eligible authoritative services after the durable reducer
-        # owns this projection.
+        # This is the current down-result projection owner.  It is not
+        # deprecated by the retired action-authority proposal.
         if format_exc is not None:
             logger.error(f'Down thread for replica {info.replica_id} '
                          f'exited abnormally with exception {format_exc}.')
@@ -6681,9 +6679,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'Refusing to terminate replica %s because the controller '
                 'update requires supervised recovery.', replica_id)
             return
-        # TODO(fcapponi): DEPRECATED resource-action scheduler. Remove at M5
-        # for eligible authoritative services after durable down admission
-        # owns scheduling and retry.
+        # This is the current down scheduler.  The bounded ordinary-launch
+        # request-binding design does not replace it.
         legacy_runtime = self._legacy_mutation_runtime_state()
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
@@ -7022,9 +7019,8 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _reconcile_failed_cleanup(self,
                                   replica_infos: list[ReplicaInfo]) -> None:
         """Re-drive every durable cleanup failure until absence is proven."""
-        # TODO(fcapponi): DEPRECATED resource-action retry scheduler. Remove at
-        # M5 for eligible authoritative services after database-clock action
-        # retries own cleanup.
+        # This is the current cleanup retry scheduler.  Its intent and target
+        # are durable even though the backoff clock is process-local.
         legacy_runtime = self._legacy_mutation_runtime_state()
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
@@ -9063,7 +9059,7 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     @with_lock
     def _refresh_thread_pool(self) -> None:
-        """Route mutation completion through the removable legacy runtime."""
+        """Route mutation completion through the current mutation runtime."""
         if self._update_recovery_required:
             return
         self._legacy_mutation_runtime_state().refresh(
@@ -9077,9 +9073,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         the fly. If any of them finished, it will update the status of the
         corresponding replica.
         """
-        # TODO(fcapponi): DEPRECATED launch/down mutation owner. Remove its
-        # eligible authoritative branches at M5 after action-only execution
-        # and the compatible rollback gate are proven.
+        # This remains the current launch/down completion owner.  It is not
+        # deprecated by the retired action-authority proposal.
         legacy_runtime = self._legacy_mutation_runtime_state()
         # A pre-field SCHEDULED retirement stays off-route across an upgrade
         # until current replacement capacity proves it can be re-driven.

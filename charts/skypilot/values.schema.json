@@ -559,14 +559,6 @@
                         "null"
                     ]
                 },
-                "authorityV1RetirementPhase": {
-                    "type": "string",
-                    "enum": [
-                        "none",
-                        "deselect",
-                        "tombstone"
-                    ]
-                },
                 "backoffLimit": {
                     "type": "integer",
                     "minimum": 0
@@ -1582,61 +1574,6 @@
                                 }
                             },
                             "additionalProperties": false
-                        }
-                    }
-                },
-                "qualificationPolicy": {
-                    "oneOf": [
-                        {
-                            "required": [
-                                "repoPath",
-                                "byteSize",
-                                "sha256"
-                            ],
-                            "properties": {
-                                "byteSize": {
-                                    "const": 0
-                                },
-                                "repoPath": {
-                                    "const": ""
-                                },
-                                "sha256": {
-                                    "const": ""
-                                }
-                            }
-                        },
-                        {
-                            "required": [
-                                "repoPath",
-                                "byteSize",
-                                "sha256"
-                            ],
-                            "properties": {
-                                "byteSize": {
-                                    "minimum": 1
-                                },
-                                "repoPath": {
-                                    "minLength": 1
-                                },
-                                "sha256": {
-                                    "minLength": 64
-                                }
-                            }
-                        }
-                    ],
-                    "properties": {
-                        "byteSize": {
-                            "type": "integer",
-                            "maximum": 65536,
-                            "minimum": 0
-                        },
-                        "repoPath": {
-                            "type": "string",
-                            "pattern": "^$|^charts/skypilot/files/resource-action-qualification-policies/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*\\.json$"
-                        },
-                        "sha256": {
-                            "type": "string",
-                            "pattern": "^$|^[0-9a-f]{64}$"
                         }
                     },
                     "additionalProperties": false

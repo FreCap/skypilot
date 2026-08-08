@@ -1159,9 +1159,10 @@ shelter them.
    Once the durable broker gate is v2, MAIN
    startup for the `all`, `api`, `controller`, and `executor` roles
    independently requires that preparation flag and exact built-ins, so a
-   later new-code rollout cannot silently disable the guard. The separately
-   attested resource-action authority-worker role is outside reserved-fill
-   launch execution and is not coupled to this protocol gate.
+   later new-code rollout cannot silently disable the guard. The proposed
+   resource-action authority-worker role was retired before activation and is
+   absent; reserved-fill has no separate authority-role exception to this
+   protocol gate.
 4. Verify healthy legacy rounds, then run the zero-argument explicit activation
    action inside an API pod. The action takes the global broker lock,
    mechanically verifies exact Serve schema head 035, exact API-request schema
@@ -1179,7 +1180,8 @@ shelter them.
    inventories, and combined pod/process inventory count/hash.
 5. Let every live fill controller atomically adopt an authoritative v2 claim
    set. Verify generation/edge-count integrity, integer grants, and fresh 035
-   resource-action evidence before separately re-enabling any authority mode.
+   reserved-fill evidence. The retired dedicated authority mode cannot be
+   re-enabled.
 6. Before materializing PHX eligibility, deploy the phase-scope hotfix to every
    API/controller/executor process and prove one immutable digest. While normal
    load-balancer sync, job-status, readiness, and broker pollers remain active,

@@ -14,7 +14,6 @@ import dataclasses
 import datetime
 import enum
 import ipaddress
-import json
 import re
 from typing import Any, ClassVar, TypeAlias
 import uuid
@@ -182,44 +181,6 @@ def _uuid(value: Any, *, name: str) -> uuid.UUID:
     if str(parsed) != value:
         raise ValueError(f'{name} must be lowercase hyphenated UUID text.')
     return parsed
-
-
-def _resource_action_identity_from_value(
-    value: Any,) -> kernel_actions.ResourceActionIdentity:
-    """Parse the complete, provider-independent resource-action identity."""
-
-    raw = _closed_object(value,
-                         name='resource action identity',
-                         keys=frozenset({
-                             'version', 'domain', 'resource_type',
-                             'service_hash', 'service_incarnation',
-                             'replica_id', 'replica_incarnation',
-                             'desired_generation', 'action_kind'
-                         }))
-    _version_one(raw['version'], name='resource action identity version')
-    if raw['domain'] != 'serve' or raw['resource_type'] != 'replica':
-        raise ValueError('resource action identity must name a Serve replica.')
-    try:
-        action_kind = kernel_actions.ActionKind(raw['action_kind'])
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            'resource action identity kind is unsupported.') from error
-    identity = kernel_actions.ResourceActionIdentity(
-        service_hash=_text(raw['service_hash'],
-                           name='resource_identity.service_hash'),
-        service_incarnation=_uuid(raw['service_incarnation'],
-                                  name='resource_identity.service_incarnation'),
-        replica_id=_nonnegative_integer(raw['replica_id'],
-                                        name='resource_identity.replica_id'),
-        replica_incarnation=_uuid(raw['replica_incarnation'],
-                                  name='resource_identity.replica_incarnation'),
-        desired_generation=_positive_integer(
-            raw['desired_generation'],
-            name='resource_identity.desired_generation'),
-        action_kind=action_kind)
-    if identity.canonical_value() != raw:
-        raise ValueError('resource action identity is not canonical.')
-    return identity
 
 
 def _timestamp(value: Any, *, name: str) -> str:
@@ -2762,20 +2723,12 @@ class ServeProviderProgressContractV1:
         execution_fence: kernel_actions.AttemptExecutionFence | None,
     ) -> None:
         del execution_fence
+        context = _ActionContext.from_record(action)
         expected_request_id = kernel_actions.request_id_for_attempt(
             action.action_id, attempt.attempt)
         if (attempt.action_id != action.action_id or
                 attempt.request_id != expected_request_id):
             raise ValueError('attempt identity differs from its action.')
-        if (attempt.mutation_boundary is kernel_actions.MutationBoundary.SETTLED
-                and type(attempt.typed_outcome) is dict and
-                type(attempt.typed_outcome.get('basis')) is dict and
-                attempt.typed_outcome['basis'].get('basis_kind')
-                == 'direct_no_effect_cancellation'):
-            _validate_settled_direct_no_effect_outcome(action, predecessor,
-                                                       attempt)
-            return
-        context = _ActionContext.from_record(action)
         if (attempt.mutation_boundary is kernel_actions.MutationBoundary.SETTLED
                 and type(attempt.typed_outcome) is dict and
                 type(attempt.typed_outcome.get('basis')) is dict and
@@ -4120,264 +4073,6 @@ class ServeLaunchNoIoPrefixV1(_CanonicalContract):
             'prefix_sha256': self.prefix_sha256,
         }
 
-    @classmethod
-    def empty(cls) -> ServeLaunchNoIoPrefixV1:
-        """Return the sole legal count-zero direct-cancellation prefix."""
-
-        return cls(count=0,
-                   previous_prefix_sha256=None,
-                   current_attempt=None,
-                   prefix_sha256=kernel_actions.canonical_sha256([]))
-
-
-class DirectNoEffectProofKindV1(str, enum.Enum):
-    UNMATERIALIZED = 'unmaterialized'
-    TERMINAL_REQUEST_UNSETTLED = 'terminal_request_unsettled'
-    RETAINED_SETTLED_ATTEMPT = 'retained_settled_attempt'
-
-
-class DirectNoEffectRequestRowDispositionV1(str, enum.Enum):
-    NOT_APPLICABLE = 'not_applicable'
-    RETAINED_TERMINAL = 'retained_terminal'
-    GARBAGE_COLLECTED = 'garbage_collected'
-
-
-@dataclasses.dataclass(frozen=True)
-class ServeReplicaActionDirectNoEffectCancellationV1(_CanonicalContract):
-    """Reducer-owned proof that a launch has no provider-I/O history.
-
-    This is intentionally distinct from ``ProviderLaunchNoEffectResolutionV1``:
-    a direct cancellation proves that no provider intent exists at all.
-    """
-
-    proof_kind: DirectNoEffectProofKindV1
-    action_id: uuid.UUID
-    resource_identity: kernel_actions.ResourceActionIdentity
-    source_action_revision: int
-    current_attempt: int
-    no_io_prefix: ServeLaunchNoIoPrefixV1
-    request_id: uuid.UUID | None
-    request_terminal_state: str | None
-    request_row_disposition: DirectNoEffectRequestRowDispositionV1
-    request_finished_at: str | None
-    active_claim: bool
-    provider_io_boundary: kernel_actions.ProviderIOBoundary | None
-    provider_progress_revision: int | None
-    provider_progress_sha256: str | None
-    provider_operation_id: str | None
-    current_typed_outcome_sha256: str | None
-    attempt_settled_at: str | None
-    cancelled_at: str
-
-    _KEYS: ClassVar[frozenset[str]] = frozenset({
-        'version', 'proof_kind', 'action_id', 'resource_identity',
-        'source_action_revision', 'current_attempt', 'no_io_prefix',
-        'request_id', 'request_terminal_state', 'request_row_disposition',
-        'request_finished_at', 'active_claim', 'provider_io_boundary',
-        'provider_progress_revision', 'provider_progress_sha256',
-        'provider_operation_id', 'current_typed_outcome_sha256',
-        'attempt_settled_at', 'cancelled_at'
-    })
-
-    def __post_init__(self) -> None:
-        if type(self.proof_kind) is not DirectNoEffectProofKindV1:
-            raise TypeError('direct no-effect proof kind has an invalid type.')
-        if type(self.action_id) is not uuid.UUID:
-            raise TypeError('direct no-effect action ID must be a UUID.')
-        if type(self.resource_identity) is not (
-                kernel_actions.ResourceActionIdentity):
-            raise TypeError('direct no-effect resource identity is invalid.')
-        if (self.resource_identity.action_kind
-                is not kernel_actions.ActionKind.LAUNCH or
-                self.resource_identity.action_id != self.action_id):
-            raise ValueError('direct no-effect identity must name its launch.')
-        object.__setattr__(
-            self, 'source_action_revision',
-            _nonnegative_integer(self.source_action_revision,
-                                 name='direct source action revision'))
-        current_attempt = _nonnegative_integer(self.current_attempt,
-                                               name='direct current attempt')
-        if current_attempt > _MAX_RESOURCE_ACTION_ATTEMPT_V1:
-            raise ValueError('direct current attempt exceeds attempt domain.')
-        object.__setattr__(self, 'current_attempt', current_attempt)
-        if type(self.no_io_prefix) is not ServeLaunchNoIoPrefixV1:
-            raise TypeError('direct no-effect prefix is invalid.')
-        if self.no_io_prefix.count != current_attempt:
-            raise ValueError('direct no-effect prefix count differs from the '
-                             'current attempt.')
-        if self.request_id is not None and type(
-                self.request_id) is not uuid.UUID:
-            raise TypeError('direct no-effect request ID must be a UUID.')
-        if (self.request_terminal_state is not None and
-                self.request_terminal_state
-                not in ('SUCCEEDED', 'FAILED', 'CANCELLED')):
-            raise ValueError('direct request terminal state is unsupported.')
-        if type(self.request_row_disposition) is not (
-                DirectNoEffectRequestRowDispositionV1):
-            raise TypeError('direct request-row disposition is invalid.')
-        if self.request_finished_at is not None:
-            object.__setattr__(
-                self, 'request_finished_at',
-                _timestamp(self.request_finished_at,
-                           name='direct request_finished_at'))
-        if type(self.active_claim) is not bool or self.active_claim:
-            raise ValueError('direct no-effect proof requires no active claim.')
-        if (self.provider_io_boundary is not None and
-                type(self.provider_io_boundary)
-                is not kernel_actions.ProviderIOBoundary):
-            raise TypeError('direct provider-I/O boundary is invalid.')
-        if self.provider_progress_revision is not None:
-            object.__setattr__(
-                self, 'provider_progress_revision',
-                _nonnegative_integer(self.provider_progress_revision,
-                                     name='direct provider progress revision'))
-        object.__setattr__(
-            self, 'provider_progress_sha256',
-            _optional_sha256(self.provider_progress_sha256,
-                             name='direct provider progress hash'))
-        object.__setattr__(
-            self, 'provider_operation_id',
-            _optional_text(self.provider_operation_id,
-                           name='direct provider operation ID'))
-        object.__setattr__(
-            self, 'current_typed_outcome_sha256',
-            _optional_sha256(self.current_typed_outcome_sha256,
-                             name='direct current outcome hash'))
-        if self.attempt_settled_at is not None:
-            object.__setattr__(
-                self, 'attempt_settled_at',
-                _timestamp(self.attempt_settled_at,
-                           name='direct attempt_settled_at'))
-        object.__setattr__(
-            self, 'cancelled_at',
-            _timestamp(self.cancelled_at, name='direct cancelled_at'))
-        self._validate_variant()
-        _ = self.canonical_bytes
-
-    def _validate_variant(self) -> None:
-        if self.proof_kind is DirectNoEffectProofKindV1.UNMATERIALIZED:
-            if (self.current_attempt != 0 or self.no_io_prefix.count != 0 or
-                    self.request_id is not None or
-                    self.request_terminal_state is not None or
-                    self.request_row_disposition
-                    is not DirectNoEffectRequestRowDispositionV1.NOT_APPLICABLE
-                    or self.request_finished_at is not None or
-                    self.provider_io_boundary is not None or
-                    self.provider_progress_revision is not None or
-                    self.provider_progress_sha256 is not None or
-                    self.provider_operation_id is not None or
-                    self.current_typed_outcome_sha256 is not None or
-                    self.attempt_settled_at is not None):
-                raise ValueError('unmaterialized direct proof has a crossed '
-                                 'attempt/request shape.')
-            return
-
-        if (self.current_attempt == 0 or self.request_id is None or
-                self.request_terminal_state is None or self.provider_io_boundary
-                is not kernel_actions.ProviderIOBoundary.NOT_STARTED or
-                self.provider_progress_revision != 0 or
-                self.provider_progress_sha256 is not None or
-                self.provider_operation_id is not None or
-                str(self.request_id) != kernel_actions.request_id_for_attempt(
-                    self.action_id, self.current_attempt)):
-            raise ValueError('materialized direct proof lacks its exact '
-                             'revision-zero attempt identity.')
-
-        if self.proof_kind is (
-                DirectNoEffectProofKindV1.TERMINAL_REQUEST_UNSETTLED):
-            if (self.request_row_disposition is
-                    not DirectNoEffectRequestRowDispositionV1.RETAINED_TERMINAL
-                    or self.request_finished_at is None or
-                    self.current_typed_outcome_sha256 is not None or
-                    self.attempt_settled_at is None or
-                    self.attempt_settled_at != self.cancelled_at):
-                raise ValueError('terminal-request-unsettled direct proof has '
-                                 'a crossed terminal shape.')
-            return
-
-        assert self.proof_kind is (
-            DirectNoEffectProofKindV1.RETAINED_SETTLED_ATTEMPT)
-        retained = (self.request_row_disposition
-                    is DirectNoEffectRequestRowDispositionV1.RETAINED_TERMINAL)
-        if self.request_row_disposition not in (
-                DirectNoEffectRequestRowDispositionV1.RETAINED_TERMINAL,
-                DirectNoEffectRequestRowDispositionV1.GARBAGE_COLLECTED):
-            raise ValueError('retained-settled proof has an invalid request '
-                             'disposition.')
-        if retained != (self.request_finished_at is not None):
-            raise ValueError('retained-settled request presence differs from '
-                             'its finish timestamp.')
-        if (self.current_typed_outcome_sha256 is None or
-                self.attempt_settled_at is None or
-                self.cancelled_at < self.attempt_settled_at):
-            raise ValueError('retained-settled proof lacks its historical '
-                             'outcome/time ordering.')
-
-    @classmethod
-    def from_value(
-            cls, value: Any) -> ServeReplicaActionDirectNoEffectCancellationV1:
-        raw = _closed_object(value,
-                             name='Serve direct no-effect cancellation',
-                             keys=cls._KEYS)
-        _version_one(raw['version'], name='direct no-effect proof version')
-        try:
-            proof_kind = DirectNoEffectProofKindV1(raw['proof_kind'])
-            request_disposition = DirectNoEffectRequestRowDispositionV1(
-                raw['request_row_disposition'])
-            provider_boundary = (None if raw['provider_io_boundary'] is None
-                                 else kernel_actions.ProviderIOBoundary(
-                                     raw['provider_io_boundary']))
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                'direct no-effect proof enum is unsupported.') from error
-        return cls(
-            proof_kind=proof_kind,
-            action_id=_uuid(raw['action_id'], name='direct action_id'),
-            resource_identity=_resource_action_identity_from_value(
-                raw['resource_identity']),
-            source_action_revision=raw['source_action_revision'],
-            current_attempt=raw['current_attempt'],
-            no_io_prefix=ServeLaunchNoIoPrefixV1.from_value(
-                raw['no_io_prefix']),
-            request_id=(None if raw['request_id'] is None else _uuid(
-                raw['request_id'], name='direct request_id')),
-            request_terminal_state=raw['request_terminal_state'],
-            request_row_disposition=request_disposition,
-            request_finished_at=raw['request_finished_at'],
-            active_claim=raw['active_claim'],
-            provider_io_boundary=provider_boundary,
-            provider_progress_revision=raw['provider_progress_revision'],
-            provider_progress_sha256=raw['provider_progress_sha256'],
-            provider_operation_id=raw['provider_operation_id'],
-            current_typed_outcome_sha256=raw['current_typed_outcome_sha256'],
-            attempt_settled_at=raw['attempt_settled_at'],
-            cancelled_at=raw['cancelled_at'])
-
-    def canonical_value(self) -> kernel_actions.JsonObject:
-        return {
-            'version': 1,
-            'proof_kind': self.proof_kind.value,
-            'action_id': str(self.action_id),
-            'resource_identity': self.resource_identity.canonical_value(),
-            'source_action_revision': self.source_action_revision,
-            'current_attempt': self.current_attempt,
-            'no_io_prefix': self.no_io_prefix.canonical_value(),
-            'request_id':
-                (None if self.request_id is None else str(self.request_id)),
-            'request_terminal_state': self.request_terminal_state,
-            'request_row_disposition': self.request_row_disposition.value,
-            'request_finished_at': self.request_finished_at,
-            'active_claim': False,
-            'provider_io_boundary': (None if self.provider_io_boundary is None
-                                     else self.provider_io_boundary.value),
-            'provider_progress_revision': self.provider_progress_revision,
-            'provider_progress_sha256': self.provider_progress_sha256,
-            'provider_operation_id': self.provider_operation_id,
-            'current_typed_outcome_sha256': self.current_typed_outcome_sha256,
-            'attempt_settled_at': self.attempt_settled_at,
-            'cancelled_at': self.cancelled_at,
-        }
-
 
 @dataclasses.dataclass(frozen=True)
 class ServeReplicaActionHandlerOutcomeV1(_CanonicalContract):
@@ -4465,102 +4160,6 @@ class ServeReplicaActionHandlerOutcomeV1(_CanonicalContract):
                 (None if self.launch_no_io_prefix is None else
                  self.launch_no_io_prefix.canonical_value()),
         }
-
-
-@dataclasses.dataclass(frozen=True)
-class ServeReplicaActionDirectNoEffectOutcomeV1(_CanonicalContract):
-    """Reducer-owned direct-cancellation member of the action outcome union."""
-
-    cancellation: ServeReplicaActionDirectNoEffectCancellationV1
-    provider_result: ServeReplicaActionProviderResultV1
-
-    _KEYS: ClassVar[frozenset[str]] = frozenset({
-        'version', 'basis', 'provider_result', 'supersession_quiescence',
-        'launch_no_io_prefix'
-    })
-    _BASIS_KEYS: ClassVar[frozenset[str]] = frozenset({
-        'version', 'basis_kind', 'request_terminal_state',
-        'handler_terminal_result_sha256', 'direct_no_effect_cancellation',
-        'request_fallback_evidence'
-    })
-
-    def __post_init__(self) -> None:
-        if type(self.cancellation) is not (
-                ServeReplicaActionDirectNoEffectCancellationV1):
-            raise TypeError('direct outcome cancellation proof is invalid.')
-        if type(self.provider_result) is not ServeReplicaActionProviderResultV1:
-            raise TypeError('direct outcome provider result is invalid.')
-        expected = {
-            'disposition': 'cancelled',
-            'certainty': 'observed',
-            'provider_operation_id': None,
-            'provider_code': None,
-            'retry_class': None,
-            'retry_after_seconds': None,
-            'observation': None,
-            'normalized_message': None,
-        }
-        if self.provider_result.canonical_value() != expected:
-            raise ValueError('direct outcome provider tuple is not exact.')
-        _ = self.canonical_bytes
-
-    @classmethod
-    def from_value(cls,
-                   value: Any) -> ServeReplicaActionDirectNoEffectOutcomeV1:
-        raw = _closed_object(value,
-                             name='Serve direct no-effect outcome',
-                             keys=cls._KEYS)
-        _version_one(raw['version'], name='direct outcome version')
-        basis = _closed_object(raw['basis'],
-                               name='direct outcome basis',
-                               keys=cls._BASIS_KEYS)
-        _version_one(basis['version'], name='direct outcome basis version')
-        if (basis['basis_kind'] != 'direct_no_effect_cancellation' or
-                basis['handler_terminal_result_sha256'] is not None or
-                basis['request_fallback_evidence'] is not None or
-                raw['supersession_quiescence'] is not None):
-            raise ValueError('direct outcome has a crossed basis/null shape.')
-        cancellation = (
-            ServeReplicaActionDirectNoEffectCancellationV1.from_value(
-                basis['direct_no_effect_cancellation']))
-        expected_terminal_state = (None if cancellation.proof_kind
-                                   is DirectNoEffectProofKindV1.UNMATERIALIZED
-                                   else cancellation.request_terminal_state)
-        if basis['request_terminal_state'] != expected_terminal_state:
-            raise ValueError('direct basis terminal state differs from its '
-                             'proof.')
-        prefix = ServeLaunchNoIoPrefixV1.from_value(raw['launch_no_io_prefix'])
-        if prefix.canonical_bytes != cancellation.no_io_prefix.canonical_bytes:
-            raise ValueError('direct outcome prefix differs from its proof.')
-        return cls(
-            cancellation=cancellation,
-            provider_result=ServeReplicaActionProviderResultV1.from_value(
-                raw['provider_result']))
-
-    def canonical_value(self) -> kernel_actions.JsonObject:
-        terminal_state = (None if self.cancellation.proof_kind
-                          is DirectNoEffectProofKindV1.UNMATERIALIZED else
-                          self.cancellation.request_terminal_state)
-        return {
-            'version': 1,
-            'basis': {
-                'version': 1,
-                'basis_kind': 'direct_no_effect_cancellation',
-                'request_terminal_state': terminal_state,
-                'handler_terminal_result_sha256': None,
-                'direct_no_effect_cancellation':
-                    self.cancellation.canonical_value(),
-                'request_fallback_evidence': None,
-            },
-            'provider_result': self.provider_result.canonical_value(),
-            'supersession_quiescence': None,
-            'launch_no_io_prefix':
-                self.cancellation.no_io_prefix.canonical_value(),
-        }
-
-    @property
-    def launch_no_io_prefix(self) -> ServeLaunchNoIoPrefixV1:
-        return self.cancellation.no_io_prefix
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4755,31 +4354,19 @@ class ServeReplicaActionRequestFallbackOutcomeV1(_CanonicalContract):
 
 PersistedServeReplicaActionOutcomeV1 = (
     ServeReplicaActionHandlerOutcomeV1 |
-    ServeReplicaActionDirectNoEffectOutcomeV1 |
     ServeReplicaActionRequestFallbackOutcomeV1)
 
 
-def serve_replica_action_outcome_from_value_v1(
+def _parse_persisted_outcome(
     value: Any,) -> PersistedServeReplicaActionOutcomeV1:
-    """Parse the closed authoritative handler/direct/fallback union."""
-
     if type(value) is not dict or type(value.get('basis')) is not dict:
         raise ValueError('Serve action outcome lacks its closed basis.')
     basis_kind = value['basis'].get('basis_kind')
     if basis_kind == 'handler_terminal_result':
         return ServeReplicaActionHandlerOutcomeV1.from_value(value)
-    if basis_kind == 'direct_no_effect_cancellation':
-        return ServeReplicaActionDirectNoEffectOutcomeV1.from_value(value)
     if basis_kind == 'request_terminal_fallback':
         return ServeReplicaActionRequestFallbackOutcomeV1.from_value(value)
     raise ValueError('Serve action outcome basis is unsupported.')
-
-
-def _parse_persisted_outcome(
-    value: Any,) -> PersistedServeReplicaActionOutcomeV1:
-    """Compatibility-private spelling for existing reducer call sites."""
-
-    return serve_replica_action_outcome_from_value_v1(value)
 
 
 def _validate_persisted_provider_result_shape(
@@ -4905,7 +4492,8 @@ def _validate_retry_authorizing_predecessor(
                 outcome.supersession_quiescence is not None):
             raise ValueError('handler predecessor outcome does not authorize '
                              'retry or observation.')
-    elif type(outcome) is ServeReplicaActionRequestFallbackOutcomeV1:
+    else:
+        assert type(outcome) is ServeReplicaActionRequestFallbackOutcomeV1
         evidence = outcome.evidence
         if (str(evidence.request_id) != predecessor.request_id or
                 evidence.attempt != predecessor.attempt or
@@ -4926,8 +4514,6 @@ def _validate_retry_authorizing_predecessor(
                                           'valid_nonterminal'):
             raise ValueError('fallback predecessor outcome does not authorize '
                              'retry or observation.')
-    else:
-        raise ValueError('a direct-cancelled action cannot authorize retry.')
     if result.provider_operation_id != predecessor.provider_operation_id:
         raise ValueError('retry predecessor provider operation ID differs from '
                          'its attempt journal.')
@@ -5219,71 +4805,6 @@ def _validate_settled_fallback_outcome(
                                    parsed)
 
 
-def _validate_settled_direct_no_effect_outcome(
-    action: kernel_actions.ActionRecord,
-    predecessor: kernel_actions.AttemptRecord | None,
-    attempt: kernel_actions.AttemptRecord,
-) -> None:
-    """Validate the sole direct outcome that is written to an attempt row."""
-
-    if (attempt.typed_outcome is None or
-            attempt.typed_outcome_sha256 != kernel_actions.canonical_sha256(
-                attempt.typed_outcome) or attempt.settled_at is None or
-            attempt.request_terminal_state not in ('SUCCEEDED', 'FAILED',
-                                                   'CANCELLED') or
-            attempt.provider_io_boundary
-            is not kernel_actions.ProviderIOBoundary.NOT_STARTED or
-            attempt.provider_progress is not None or
-            attempt.provider_progress_sha256 is not None or
-            attempt.provider_progress_revision != 0 or
-            attempt.provider_operation_id is not None):
-        raise ValueError('settled direct attempt lacks its exact no-I/O '
-                         'terminal evidence.')
-    outcome = ServeReplicaActionDirectNoEffectOutcomeV1.from_value(
-        attempt.typed_outcome)
-    proof = outcome.cancellation
-    if proof.proof_kind is not (
-            DirectNoEffectProofKindV1.TERMINAL_REQUEST_UNSETTLED):
-        raise ValueError('only terminal-request-unsettled direct proof may be '
-                         'stored on an attempt.')
-    identity = _direct_resource_action_identity(action)
-    settled_text = _timestamp_from_datetime(attempt.settled_at,
-                                            name='direct attempt settled_at')
-    current = proof.no_io_prefix.current_attempt
-    assert current is not None
-    previous = _predecessor_no_io_prefix(predecessor, attempt.attempt)
-    previous_hash = None if previous is None else previous.prefix_sha256
-    if (proof.action_id != action.action_id or
-            proof.resource_identity.canonical_value()
-            != identity.canonical_value() or
-            proof.current_attempt != attempt.attempt or
-            proof.request_id != uuid.UUID(attempt.request_id) or
-            proof.request_terminal_state != attempt.request_terminal_state or
-            proof.provider_io_boundary is not attempt.provider_io_boundary or
-            proof.provider_progress_revision
-            != attempt.provider_progress_revision or
-            proof.provider_progress_sha256 is not None or
-            proof.provider_operation_id is not None or
-            proof.attempt_settled_at != settled_text or
-            proof.cancelled_at != settled_text or
-            proof.no_io_prefix.previous_prefix_sha256 != previous_hash or
-            current.request_input_sha256 != attempt.request_input_sha256 or
-            current.request_terminal_state != attempt.request_terminal_state or
-            current.settled_at != settled_text):
-        raise ValueError('settled direct outcome differs from its locked '
-                         'attempt/predecessor projection.')
-    if (action.kernel_state is not kernel_actions.KernelState.TERMINAL or
-            action.terminal_disposition != 'CANCELLED_NO_EFFECT' or
-            action.terminal_at is None or _timestamp_from_datetime(
-                action.terminal_at,
-                name='direct action terminal_at') != proof.cancelled_at or
-            action.revision != proof.source_action_revision + 1 or
-            action.last_result != attempt.typed_outcome or
-            action.last_result_sha256 != attempt.typed_outcome_sha256):
-        raise ValueError('terminal action projection differs from its direct '
-                         'outcome.')
-
-
 def _terminal_progress(
     attempt: kernel_actions.AttemptRecord,
 ) -> ProviderLifecycleProgressV1 | None:
@@ -5297,91 +4818,12 @@ def _terminal_progress(
     return progress
 
 
-class ProviderResourceActionJournalClassV1(str, enum.Enum):
-    NOT_STARTED_EMPTY = 'not_started_empty'
-    VALID_NONTERMINAL = 'valid_nonterminal'
-    VALID_SUCCEEDED = 'valid_succeeded'
-    INVALID = 'invalid'
-
-
-class ProviderResourceActionRawInvalidJournalProfileV2(str, enum.Enum):
-    """Closed classifier branches that can produce fallback X."""
-
-    MISSING_PROGRESS = 'missing_progress'
-    PROGRESS_PARSE_FAILED = 'progress_parse_failed'
-    PROGRESS_HASH_OR_REVISION_CROSSED = 'progress_hash_or_revision_crossed'
-    ATTEMPT_BINDING_CROSSED = 'attempt_binding_crossed'
-    OPERATION_ID_CROSSED = 'operation_id_crossed'
-    ACTION_CONTEXT_CROSSED = 'action_context_crossed'
-    INHERITED_NOT_STARTED_CROSSED = 'inherited_not_started_crossed'
-    INTENT_COMMITTED_CROSSED = 'intent_committed_crossed'
-    SUBMITTED_ATTESTATION_MISSING = 'submitted_attestation_missing'
-    WATERMARK_UNSUPPORTED = 'watermark_unsupported'
-    ACTIVE_WATERMARK_CROSSED = 'active_watermark_crossed'
-    SUCCEEDED_PROOF_CROSSED = 'succeeded_proof_crossed'
-
-
-PROVIDER_RESOURCE_ACTION_RAW_INVALID_JOURNAL_PROFILES_V2: tuple[str, ...] = (
-    'missing_progress',
-    'progress_parse_failed',
-    'progress_hash_or_revision_crossed',
-    'attempt_binding_crossed',
-    'operation_id_crossed',
-    'action_context_crossed',
-    'inherited_not_started_crossed',
-    'intent_committed_crossed',
-    'submitted_attestation_missing',
-    'watermark_unsupported',
-    'active_watermark_crossed',
-    'succeeded_proof_crossed',
-)
-
-
-@dataclasses.dataclass(frozen=True)
-class ProviderResourceActionJournalClassificationV1:
-    """Closed classification of one persisted provider progress journal."""
-
-    journal_class: ProviderResourceActionJournalClassV1
-    parsed_progress: ProviderLifecycleProgressV1 | None
-    invalid_profile: ProviderResourceActionRawInvalidJournalProfileV2 | None
-
-    def __post_init__(self) -> None:
-        if type(self.journal_class) is not ProviderResourceActionJournalClassV1:
-            raise TypeError('journal classification kind is invalid.')
-        if (self.parsed_progress is not None and
-                type(self.parsed_progress) is not ProviderLifecycleProgressV1):
-            raise TypeError('journal classification progress is invalid.')
-        invalid = self.journal_class is ProviderResourceActionJournalClassV1.INVALID
-        if invalid != (self.invalid_profile is not None):
-            raise ValueError('journal invalid class/profile presence differs.')
-        if invalid and self.parsed_progress is not None:
-            raise ValueError('invalid journal cannot expose parsed progress.')
-        if (self.journal_class
-                is ProviderResourceActionJournalClassV1.NOT_STARTED_EMPTY and
-                self.parsed_progress is not None):
-            raise ValueError('empty journal cannot expose parsed progress.')
-        if self.journal_class in (
-                ProviderResourceActionJournalClassV1.VALID_NONTERMINAL,
-                ProviderResourceActionJournalClassV1.VALID_SUCCEEDED
-        ) and self.parsed_progress is None:
-            raise ValueError('valid journal classification requires progress.')
-
-
-def _invalid_journal_classification(
-    profile: ProviderResourceActionRawInvalidJournalProfileV2,
-) -> ProviderResourceActionJournalClassificationV1:
-    return ProviderResourceActionJournalClassificationV1(
-        journal_class=ProviderResourceActionJournalClassV1.INVALID,
-        parsed_progress=None,
-        invalid_profile=profile)
-
-
-def classify_provider_resource_action_request_terminal_journal_v1(
+def _classify_request_terminal_journal_v1(
     _action: kernel_actions.ActionRecord,
     predecessor: kernel_actions.AttemptRecord | None,
     attempt: kernel_actions.AttemptRecord,
     context: _ActionContext,
-) -> ProviderResourceActionJournalClassificationV1:
+) -> tuple[str, ProviderLifecycleProgressV1 | None]:
     """Classify one outer-bounded raw journal without trusting domain bytes."""
 
     if (attempt.provider_io_boundary
@@ -5393,104 +4835,53 @@ def classify_provider_resource_action_request_terminal_journal_v1(
         (attempt.mutation_boundary is kernel_actions.MutationBoundary.SETTLED or
          attempt.mutation_boundary
          is kernel_actions.MutationBoundary.NOT_STARTED)):
-        return ProviderResourceActionJournalClassificationV1(
-            journal_class=(
-                ProviderResourceActionJournalClassV1.NOT_STARTED_EMPTY),
-            parsed_progress=None,
-            invalid_profile=None)
+        return 'not_started_empty', None
     if attempt.provider_progress is None:
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.MISSING_PROGRESS)
+        return 'invalid', None
     try:
         parsed = ProviderLifecycleProgressV1.from_value(
             attempt.provider_progress)
-    except (AssertionError, TypeError, ValueError):
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.
-            PROGRESS_PARSE_FAILED)
-    if (attempt.provider_progress_sha256 != parsed.sha256 or
-            attempt.provider_progress_revision <= 0):
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.
-            PROGRESS_HASH_OR_REVISION_CROSSED)
-    try:
+        if (attempt.provider_progress_sha256 != parsed.sha256 or
+                attempt.provider_progress_revision <= 0):
+            raise ValueError('progress hash/revision is crossed.')
         _validate_progress_attempt_binding(parsed, attempt)
-    except (AssertionError, TypeError, ValueError):
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.
-            ATTEMPT_BINDING_CROSSED)
-    try:
         _validate_progress_operation_ids(parsed, attempt)
-    except (AssertionError, TypeError, ValueError):
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.
-            OPERATION_ID_CROSSED)
-    try:
         parsed.validate_action_context(context)
+        boundary = attempt.provider_io_boundary
+        if boundary is kernel_actions.ProviderIOBoundary.NOT_STARTED:
+            if (attempt.provider_progress_revision != 1 or
+                    parsed.worker_attestation is not None or
+                    not _is_exact_inherited_cursor(
+                        parsed,
+                        predecessor,
+                        attempt,
+                        allow_bound_attestation=False)):
+                raise ValueError('invalid inherited journal.')
+        elif boundary is kernel_actions.ProviderIOBoundary.INTENT_COMMITTED:
+            if (parsed.worker_attestation is None or
+                    not _is_admitted_intent_committed_cursor(
+                        parsed, predecessor, attempt)):
+                raise ValueError('invalid intent-committed journal.')
+        elif boundary is (
+                kernel_actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS):
+            if parsed.worker_attestation is None:
+                raise ValueError('submitted journal lacks attestation.')
+        else:
+            raise ValueError('unsupported journal watermark.')
+        if attempt.mutation_boundary is not kernel_actions.MutationBoundary.SETTLED:
+            if attempt.mutation_boundary is not kernel_actions.MutationBoundary(
+                    boundary.value):
+                raise ValueError('crossed active journal watermarks.')
+        if parsed.is_succeeded:
+            if (boundary is not kernel_actions.ProviderIOBoundary.
+                    SUBMITTED_OR_AMBIGUOUS or
+                    parsed.worker_attestation is None or
+                    parsed.worker_attestation.after is None):
+                raise ValueError('succeeded cursor lacks post-effect proof.')
+            return 'valid_succeeded', parsed
+        return 'valid_nonterminal', parsed
     except (AssertionError, TypeError, ValueError):
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.
-            ACTION_CONTEXT_CROSSED)
-    boundary = attempt.provider_io_boundary
-    if boundary is kernel_actions.ProviderIOBoundary.NOT_STARTED:
-        if (attempt.provider_progress_revision != 1 or
-                parsed.worker_attestation is not None or
-                not _is_exact_inherited_cursor(
-                    parsed, predecessor, attempt,
-                    allow_bound_attestation=False)):
-            return _invalid_journal_classification(
-                ProviderResourceActionRawInvalidJournalProfileV2.
-                INHERITED_NOT_STARTED_CROSSED)
-    elif boundary is kernel_actions.ProviderIOBoundary.INTENT_COMMITTED:
-        if (parsed.worker_attestation is None or
-                not _is_admitted_intent_committed_cursor(
-                    parsed, predecessor, attempt)):
-            return _invalid_journal_classification(
-                ProviderResourceActionRawInvalidJournalProfileV2.
-                INTENT_COMMITTED_CROSSED)
-    elif boundary is kernel_actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS:
-        if parsed.worker_attestation is None:
-            return _invalid_journal_classification(
-                ProviderResourceActionRawInvalidJournalProfileV2.
-                SUBMITTED_ATTESTATION_MISSING)
-    else:
-        return _invalid_journal_classification(
-            ProviderResourceActionRawInvalidJournalProfileV2.
-            WATERMARK_UNSUPPORTED)
-    if attempt.mutation_boundary is not kernel_actions.MutationBoundary.SETTLED:
-        if attempt.mutation_boundary is not kernel_actions.MutationBoundary(
-                boundary.value):
-            return _invalid_journal_classification(
-                ProviderResourceActionRawInvalidJournalProfileV2.
-                ACTIVE_WATERMARK_CROSSED)
-    if parsed.is_succeeded:
-        if (boundary
-                is not kernel_actions.ProviderIOBoundary.SUBMITTED_OR_AMBIGUOUS
-                or parsed.worker_attestation is None or
-                parsed.worker_attestation.after is None):
-            return _invalid_journal_classification(
-                ProviderResourceActionRawInvalidJournalProfileV2.
-                SUCCEEDED_PROOF_CROSSED)
-        return ProviderResourceActionJournalClassificationV1(
-            journal_class=ProviderResourceActionJournalClassV1.VALID_SUCCEEDED,
-            parsed_progress=parsed,
-            invalid_profile=None)
-    return ProviderResourceActionJournalClassificationV1(
-        journal_class=ProviderResourceActionJournalClassV1.VALID_NONTERMINAL,
-        parsed_progress=parsed,
-        invalid_profile=None)
-
-
-def _classify_request_terminal_journal_v1(
-    action: kernel_actions.ActionRecord,
-    predecessor: kernel_actions.AttemptRecord | None,
-    attempt: kernel_actions.AttemptRecord,
-    context: _ActionContext,
-) -> tuple[str, ProviderLifecycleProgressV1 | None]:
-    classification = (
-        classify_provider_resource_action_request_terminal_journal_v1(
-            action, predecessor, attempt, context))
-    return (classification.journal_class.value, classification.parsed_progress)
+        return 'invalid', None
 
 
 def _attestation_can_complete(
@@ -5756,15 +5147,14 @@ def _predecessor_no_io_prefix(
     if type(outcome) is ServeReplicaActionHandlerOutcomeV1:
         _validate_persisted_provider_result_shape(outcome.provider_result)
         quiescence = outcome.supersession_quiescence
-    elif type(outcome) is ServeReplicaActionRequestFallbackOutcomeV1:
+    else:
+        assert type(outcome) is ServeReplicaActionRequestFallbackOutcomeV1
         _validate_fallback_provider_tuple(outcome.evidence.journal_class,
                                           outcome.provider_result)
         if outcome.evidence.journal_class != 'not_started_empty':
             raise ValueError('revision-zero retry predecessor fallback class '
                              'is not P0.')
         quiescence = None
-    else:
-        raise ValueError('a direct-cancelled action cannot seed a retry.')
     if (outcome.provider_result.disposition
             not in (ProviderResultDispositionV1.RETRYABLE,
                     ProviderResultDispositionV1.UNCERTAIN,
@@ -5815,325 +5205,6 @@ def _launch_no_io_prefix(
         settled_at=_timestamp_from_datetime(database_now,
                                             name='reduction.database_now'))
     return ServeLaunchNoIoPrefixV1.append(previous, current)
-
-
-def _direct_resource_action_identity(
-    action: kernel_actions.ActionRecord,
-) -> kernel_actions.ResourceActionIdentity:
-    if type(action) is not kernel_actions.ActionRecord:
-        raise TypeError('direct no-effect action snapshot is invalid.')
-    if (action.domain != 'serve' or action.resource_type != 'replica' or
-            action.action_type != kernel_actions.ActionKind.LAUNCH.value):
-        raise ValueError('direct no-effect cancellation is launch-only.')
-    try:
-        resource_value = json.loads(action.resource_identity)
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            'action resource identity is not canonical JSON.') from error
-    resource = _closed_object(resource_value,
-                              name='action resource identity',
-                              keys=frozenset({
-                                  'version', 'service_hash',
-                                  'service_incarnation', 'replica_id',
-                                  'replica_incarnation'
-                              }))
-    _version_one(resource['version'], name='action resource identity version')
-    if (kernel_actions.canonical_json_bytes(resource).decode('utf-8')
-            != action.resource_identity):
-        raise ValueError('action resource identity bytes are not canonical.')
-    identity = kernel_actions.ResourceActionIdentity(
-        service_hash=_text(resource['service_hash'],
-                           name='action resource service hash'),
-        service_incarnation=_uuid(resource['service_incarnation'],
-                                  name='action resource service incarnation'),
-        replica_id=_nonnegative_integer(resource['replica_id'],
-                                        name='action resource replica ID'),
-        replica_incarnation=_uuid(resource['replica_incarnation'],
-                                  name='action resource replica incarnation'),
-        desired_generation=_positive_integer(action.desired_generation,
-                                             name='action desired generation'),
-        action_kind=kernel_actions.ActionKind.LAUNCH)
-    if (identity.service_hash != str(identity.service_incarnation) or
-            identity.action_id != action.action_id):
-        raise ValueError(
-            'action ID differs from its canonical launch identity.')
-    return identity
-
-
-def _direct_request_terminal_snapshot(
-    request: requests_lib.Request,
-    *,
-    action_id: uuid.UUID,
-    attempt: int,
-) -> tuple[str, str]:
-    if type(request) is not requests_lib.Request:
-        raise TypeError('retained terminal request snapshot is invalid.')
-    expected_request_id = kernel_actions.request_id_for_attempt(
-        action_id, attempt)
-    if (request.request_id != expected_request_id or
-            request.handler_name != 'serve_resource_action_launch' or
-            request.status not in requests_lib.RequestStatus.finished_status()
-            or request.claim_token is not None or
-            request.worker_instance_id is not None):
-        raise ValueError('retained terminal request is crossed or claimed.')
-    return request.status.value, _request_finished_at(request)
-
-
-def _validate_direct_action_last_result(
-    action: kernel_actions.ActionRecord,
-    expected: kernel_actions.JsonObject | None,
-    expected_sha256: str | None,
-) -> None:
-    if (action.last_result is None) != (action.last_result_sha256 is None):
-        raise ValueError('action last-result/hash presence is crossed.')
-    if action.last_result is not None:
-        parsed = serve_replica_action_outcome_from_value_v1(action.last_result)
-        if action.last_result_sha256 != parsed.sha256:
-            raise ValueError('action last-result hash differs from its bytes.')
-    if action.last_result != expected or action.last_result_sha256 != (
-            expected_sha256):
-        raise ValueError('action last result differs from the required '
-                         'historical attempt outcome.')
-
-
-def _validate_direct_attempt_identity(
-    action: kernel_actions.ActionRecord,
-    predecessor: kernel_actions.AttemptRecord | None,
-    current: kernel_actions.AttemptRecord,
-) -> ServeLaunchNoIoPrefixV1 | None:
-    if type(current) is not kernel_actions.AttemptRecord:
-        raise TypeError('direct current attempt snapshot is invalid.')
-    attempt = _resource_action_attempt(current.attempt,
-                                       name='direct current attempt')
-    if (current.action_id != action.action_id or
-            attempt != action.current_attempt or
-            current.request_id != kernel_actions.request_id_for_attempt(
-                action.action_id, attempt) or current.provider_io_boundary
-            is not kernel_actions.ProviderIOBoundary.NOT_STARTED or
-            current.provider_progress is not None or
-            current.provider_progress_sha256 is not None or
-            current.provider_progress_revision != 0 or
-            current.provider_operation_id is not None):
-        raise ValueError('direct current attempt is not the exact '
-                         'revision-zero no-I/O journal.')
-    if attempt == 1:
-        if predecessor is not None:
-            raise ValueError('direct attempt one cannot have a predecessor.')
-        return None
-    if (predecessor is None or
-            type(predecessor) is not kernel_actions.AttemptRecord or
-            predecessor.action_id != action.action_id):
-        raise ValueError('direct attempt lacks its exact predecessor.')
-    return _predecessor_no_io_prefix(predecessor, attempt)
-
-
-def build_serve_replica_action_direct_no_effect_outcome_v1(
-    action: kernel_actions.ActionRecord,
-    predecessor: kernel_actions.AttemptRecord | None,
-    current: kernel_actions.AttemptRecord | None,
-    *,
-    request_row_disposition: DirectNoEffectRequestRowDispositionV1 | str,
-    retained_terminal_request: requests_lib.Request | None,
-    cancelled_at: datetime.datetime | str,
-) -> ServeReplicaActionDirectNoEffectOutcomeV1:
-    """Build the only legal owner-fenced, no-provider-I/O cancellation.
-
-    The caller supplies locked production snapshots, never a proof kind,
-    prefix, provider tuple, or candidate outcome.  This function derives all
-    of those values and rejects crossed or non-O(1) history.
-    """
-
-    identity = _direct_resource_action_identity(action)
-    if (action.kernel_state not in (kernel_actions.KernelState.READY,
-                                    kernel_actions.KernelState.QUEUED,
-                                    kernel_actions.KernelState.BLOCKED) or
-            action.terminal_disposition is not None or
-            action.terminal_at is not None):
-        raise ValueError('direct no-effect action must be nonterminal.')
-    revision = _nonnegative_integer(action.revision,
-                                    name='direct source action revision')
-    if type(cancelled_at) is datetime.datetime:
-        cancellation_time = _timestamp_from_datetime(
-            cancelled_at, name='direct cancellation time')
-    elif type(cancelled_at) is str:
-        cancellation_time = _timestamp(cancelled_at,
-                                       name='direct cancellation time')
-    else:
-        raise TypeError('direct cancellation time must be datetime or text.')
-    try:
-        row_disposition = (
-            request_row_disposition if type(request_row_disposition)
-            is DirectNoEffectRequestRowDispositionV1 else
-            DirectNoEffectRequestRowDispositionV1(request_row_disposition))
-    except (TypeError, ValueError) as error:
-        raise ValueError(
-            'direct request-row disposition is unsupported.') from error
-
-    if action.current_attempt == 0:
-        if (predecessor is not None or current is not None or
-                retained_terminal_request is not None or row_disposition
-                is not DirectNoEffectRequestRowDispositionV1.NOT_APPLICABLE):
-            raise ValueError('unmaterialized direct source has attempt/request '
-                             'evidence.')
-        _validate_direct_action_last_result(action, None, None)
-        proof = ServeReplicaActionDirectNoEffectCancellationV1(
-            proof_kind=DirectNoEffectProofKindV1.UNMATERIALIZED,
-            action_id=action.action_id,
-            resource_identity=identity,
-            source_action_revision=revision,
-            current_attempt=0,
-            no_io_prefix=ServeLaunchNoIoPrefixV1.empty(),
-            request_id=None,
-            request_terminal_state=None,
-            request_row_disposition=row_disposition,
-            request_finished_at=None,
-            active_claim=False,
-            provider_io_boundary=None,
-            provider_progress_revision=None,
-            provider_progress_sha256=None,
-            provider_operation_id=None,
-            current_typed_outcome_sha256=None,
-            attempt_settled_at=None,
-            cancelled_at=cancellation_time)
-    else:
-        if current is None:
-            raise ValueError(
-                'materialized direct source lacks current attempt.')
-        previous_prefix = _validate_direct_attempt_identity(
-            action, predecessor, current)
-        request_id = uuid.UUID(current.request_id)
-        if current.mutation_boundary is kernel_actions.MutationBoundary.SETTLED:
-            if (current.settled_at is None or current.typed_outcome is None or
-                    current.typed_outcome_sha256
-                    != kernel_actions.canonical_sha256(current.typed_outcome) or
-                    current.request_terminal_state
-                    not in ('SUCCEEDED', 'FAILED', 'CANCELLED')):
-                raise ValueError('retained-settled direct source lacks its '
-                                 'immutable terminal outcome.')
-            historical = serve_replica_action_outcome_from_value_v1(
-                current.typed_outcome)
-            if type(historical) is ServeReplicaActionDirectNoEffectOutcomeV1:
-                raise ValueError(
-                    'direct cancellation cannot be based on a '
-                    'prior direct cancellation of the same action.')
-            prefix = historical.launch_no_io_prefix
-            if prefix is None or prefix.count != current.attempt:
-                raise ValueError('retained-settled direct source lacks its '
-                                 'complete no-I/O prefix.')
-            current_link = prefix.current_attempt
-            assert current_link is not None
-            settled_text = _timestamp_from_datetime(
-                current.settled_at, name='direct current settled_at')
-            expected_previous_hash = (None if previous_prefix is None else
-                                      previous_prefix.prefix_sha256)
-            if (prefix.previous_prefix_sha256 != expected_previous_hash or
-                    str(current_link.request_id) != current.request_id or
-                    current_link.request_input_sha256
-                    != current.request_input_sha256 or
-                    current_link.request_terminal_state
-                    != current.request_terminal_state or
-                    current_link.settled_at != settled_text):
-                raise ValueError('retained-settled no-I/O prefix differs from '
-                                 'the locked current/predecessor attempts.')
-            _validate_direct_action_last_result(action, current.typed_outcome,
-                                                current.typed_outcome_sha256)
-            if row_disposition is (
-                    DirectNoEffectRequestRowDispositionV1.RETAINED_TERMINAL):
-                if retained_terminal_request is None:
-                    raise ValueError('retained request disposition lacks its '
-                                     'terminal request row.')
-                request_state, request_finished_at = (
-                    _direct_request_terminal_snapshot(
-                        retained_terminal_request,
-                        action_id=action.action_id,
-                        attempt=current.attempt))
-                if request_state != current.request_terminal_state:
-                    raise ValueError('retained request state differs from its '
-                                     'settled attempt.')
-            elif row_disposition is (
-                    DirectNoEffectRequestRowDispositionV1.GARBAGE_COLLECTED):
-                if retained_terminal_request is not None:
-                    raise ValueError('garbage-collected disposition retains a '
-                                     'request row.')
-                request_state = current.request_terminal_state
-                request_finished_at = None
-            else:
-                raise ValueError('settled direct source has an inapplicable '
-                                 'request disposition.')
-            proof = ServeReplicaActionDirectNoEffectCancellationV1(
-                proof_kind=DirectNoEffectProofKindV1.RETAINED_SETTLED_ATTEMPT,
-                action_id=action.action_id,
-                resource_identity=identity,
-                source_action_revision=revision,
-                current_attempt=current.attempt,
-                no_io_prefix=prefix,
-                request_id=request_id,
-                request_terminal_state=request_state,
-                request_row_disposition=row_disposition,
-                request_finished_at=request_finished_at,
-                active_claim=False,
-                provider_io_boundary=current.provider_io_boundary,
-                provider_progress_revision=current.provider_progress_revision,
-                provider_progress_sha256=current.provider_progress_sha256,
-                provider_operation_id=current.provider_operation_id,
-                current_typed_outcome_sha256=current.typed_outcome_sha256,
-                attempt_settled_at=settled_text,
-                cancelled_at=cancellation_time)
-        else:
-            if (current.mutation_boundary
-                    is not kernel_actions.MutationBoundary.NOT_STARTED or
-                    current.typed_outcome is not None or
-                    current.typed_outcome_sha256 is not None or
-                    current.settled_at is not None or
-                    retained_terminal_request is None or
-                    row_disposition is not DirectNoEffectRequestRowDispositionV1
-                    .RETAINED_TERMINAL):
-                raise ValueError('terminal-request-unsettled direct source is '
-                                 'not the exact pre-settlement shape.')
-            request_state, request_finished_at = (
-                _direct_request_terminal_snapshot(retained_terminal_request,
-                                                  action_id=action.action_id,
-                                                  attempt=current.attempt))
-            if current.request_terminal_state not in (None, request_state):
-                raise ValueError('unsettled attempt terminal state is crossed.')
-            expected_last = None if predecessor is None else predecessor.typed_outcome
-            expected_last_hash = (None if predecessor is None else
-                                  predecessor.typed_outcome_sha256)
-            _validate_direct_action_last_result(action, expected_last,
-                                                expected_last_hash)
-            current_projection = ServeLaunchNoIoAttemptProjectionV1(
-                attempt=current.attempt,
-                request_id=request_id,
-                request_input_sha256=current.request_input_sha256,
-                request_terminal_state=request_state,
-                settled_at=cancellation_time)
-            prefix = ServeLaunchNoIoPrefixV1.append(previous_prefix,
-                                                    current_projection)
-            proof = ServeReplicaActionDirectNoEffectCancellationV1(
-                proof_kind=(
-                    DirectNoEffectProofKindV1.TERMINAL_REQUEST_UNSETTLED),
-                action_id=action.action_id,
-                resource_identity=identity,
-                source_action_revision=revision,
-                current_attempt=current.attempt,
-                no_io_prefix=prefix,
-                request_id=request_id,
-                request_terminal_state=request_state,
-                request_row_disposition=row_disposition,
-                request_finished_at=request_finished_at,
-                active_claim=False,
-                provider_io_boundary=current.provider_io_boundary,
-                provider_progress_revision=current.provider_progress_revision,
-                provider_progress_sha256=current.provider_progress_sha256,
-                provider_operation_id=current.provider_operation_id,
-                current_typed_outcome_sha256=None,
-                attempt_settled_at=cancellation_time,
-                cancelled_at=cancellation_time)
-
-    result = _provider_result(ProviderResultDispositionV1.CANCELLED,
-                              ProviderResultCertaintyV1.OBSERVED, None)
-    return ServeReplicaActionDirectNoEffectOutcomeV1(cancellation=proof,
-                                                     provider_result=result)
 
 
 def reduce_handler_terminal_result_v1(

@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/helm-unittest/helm-unittest/main/schema/helm-testsuite.json
+suite: resource_action_authority_retirement_test
+templates:
+  - templates/api-deployment.yaml
+tests:
+  - it: should accept persisted disabled V1 and V2 values from reuse-values
+    values:
+      - fixtures/resource-action-authority-retired-disabled-values.yaml
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_INSTALLATION_ID
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_COHORT_SUFFIXES_JSON
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_TOMBSTONES_JSON
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_RESOURCE_ACTION_AUTHORITY_RETIREMENT_VERIFIER_ENABLED
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: skypilot-resource-action-qualification-policy
+      - notExists:
+          path: spec.template.metadata.annotations["skypilot.co/resource-action-qualification-policy-config-map"]
+
+  - it: should fail closed when a legacy release still enables the retired worker
+    set:
+      resourceActions.authorityWorker.enabled: true
+    asserts:
+      - failedTemplate:
+          errorMessage: resourceActions.authorityWorker.enabled=true is no longer supported; the dedicated resource-action authority worker has been retired

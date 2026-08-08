@@ -15,7 +15,6 @@ import pytest
 
 from sky.jobs import managed_job_refresh_thread
 from sky.jobs.server import server as jobs_server
-from sky.serve import constants as serve_constants
 from sky.server import runtime
 from sky.server.requests import cutover as request_cutover
 from sky.server.requests import registry as request_registry
@@ -43,8 +42,7 @@ class _BackgroundLoop:
 def _args() -> SimpleNamespace:
     return SimpleNamespace(host='127.0.0.1',
                            metrics_port=9090,
-                           role_health_port=46581,
-                           authority_preflight_port=46583)
+                           role_health_port=46581)
 
 
 @pytest.mark.parametrize(('phase', 'backend_kind', 'raises'), [
@@ -142,17 +140,6 @@ def test_reserved_fill_v1_preserves_unguarded_backend_compatibility(
     validate.assert_not_called()
 
 
-def test_active_reserved_fill_v2_does_not_gate_authority_worker(monkeypatch):
-    state_reader = mock.Mock(return_value={'protocol_version': 2})
-    monkeypatch.setattr(runtime.serve_state, 'get_reserved_fill_protocol_state',
-                        state_reader)
-
-    # pylint: disable-next=protected-access
-    runtime._guard_active_reserved_fill_protocol('authority-worker')
-
-    state_reader.assert_not_called()
-
-
 def test_role_drain_marker_fails_readiness_before_shutdown(
         monkeypatch, tmp_path):
     drain_marker = tmp_path / 'draining'
@@ -171,41 +158,6 @@ def test_role_drain_marker_fails_readiness_before_shutdown(
     assert not values['ready']
     assert values['draining_at'] is not None
     assert values['health_detail'] == {'phase': 'draining'}
-
-
-def test_authority_health_splits_bootstrap_from_claim_readiness(
-        monkeypatch, tmp_path):
-    monkeypatch.setattr(runtime.request_postgres, 'ROLE_DRAIN_MARKER_PATH',
-                        str(tmp_path / 'draining'))
-    lease = mock.Mock()
-    lease.role = 'authority-worker'
-    lease.is_locally_ready.return_value = False
-    bootstrap_ready = True
-    server = runtime._RoleHealthServer(  # pylint: disable=protected-access
-        '127.0.0.1',
-        0,
-        lease,
-        bootstrap_ready=lambda: bootstrap_ready)
-    server.start()
-    port = server._server.server_port  # pylint: disable=protected-access
-
-    def status(path: str) -> int:
-        connection = http.client.HTTPConnection('127.0.0.1', port, timeout=2)
-        connection.request('GET', path)
-        response = connection.getresponse()
-        response.read()
-        connection.close()
-        return response.status
-
-    try:
-        assert status('/livez') == 200
-        assert status('/bootstrapz') == 200
-        assert status('/readyz') == 503
-        (tmp_path / 'draining').touch()
-        assert status('/bootstrapz') == 503
-    finally:
-        bootstrap_ready = False
-        server.stop()
 
 
 def test_api_role_starts_only_public_server(monkeypatch):
@@ -271,181 +223,6 @@ def test_executor_role_starts_workers_without_public_server(monkeypatch):
     assert background.stopped
 
 
-def test_authority_role_is_preflight_only(monkeypatch):
-    lease = mock.Mock()
-    lease.instance_id = '00000000-0000-4000-8000-000000000001'
-    config = mock.Mock()
-    state = runtime.RuntimeState('authority-worker', config, lease, False)
-    health_server = mock.Mock()
-    preflight_server = mock.Mock()
-    preflight_server.is_transport_ready.return_value = True
-    coordinator = mock.Mock()
-    coordinator.failure = None
-    manifest = mock.sentinel.manifest
-    pod_identity = SimpleNamespace(uid=lease.instance_id)
-    events = []
-    health_server.start.side_effect = lambda: events.append('health-start')
-    preflight_server.start.side_effect = lambda: events.append('preflight-start'
-                                                              )
-    coordinator.start.side_effect = lambda: events.append('coordinator-start')
-    coordinator.clear_acceptance.side_effect = lambda: events.append(
-        'acceptance-clear')
-    preflight_server.stop.side_effect = lambda: events.append('preflight-stop')
-    coordinator.stop.side_effect = lambda: events.append('coordinator-stop')
-    health_server.stop.side_effect = lambda: events.append('health-stop')
-    start_workers = mock.Mock(side_effect=AssertionError('executor started'))
-    start_background = mock.Mock(
-        side_effect=AssertionError('background loop started'))
-    capture_env = mock.Mock(side_effect=AssertionError('claim env captured'))
-    evaluator = mock.Mock()
-    evaluator_v2 = mock.Mock()
-    accepted_callbacks = []
-    health_kwargs = {}
-
-    def build_evaluator(accepted_manifest):
-        accepted_callbacks.append(accepted_manifest)
-        assert accepted_manifest() is None
-        return evaluator
-
-    evaluator_type = mock.Mock(side_effect=build_evaluator)
-    preflight_type = mock.Mock(return_value=preflight_server)
-    monkeypatch.setattr(runtime, '_start_background_loop', start_background)
-    monkeypatch.setattr(runtime.executor, 'start', start_workers)
-    monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
-                        capture_env)
-
-    def build_health_server(*args, **kwargs):
-        del args
-        health_kwargs.update(kwargs)
-        return health_server
-
-    monkeypatch.setattr(runtime, '_RoleHealthServer', build_health_server)
-
-    def load_manifest():
-        assert events == ['health-start', 'preflight-start']
-        assert not health_kwargs['bootstrap_ready']()
-        events.append('manifest-load')
-        return manifest
-
-    def build_coordinator(*args):
-        assert args == (manifest, pod_identity)
-        assert events == ['health-start', 'preflight-start', 'manifest-load']
-        assert health_kwargs['bootstrap_ready']()
-        events.append('coordinator-build')
-        return coordinator
-
-    monkeypatch.setattr(runtime, '_load_authority_static_manifest',
-                        load_manifest)
-    monkeypatch.setattr(runtime, '_build_authority_bootstrap_coordinator',
-                        build_coordinator)
-    monkeypatch.setattr(
-        'sky.serve.resource_action_provider_preflight.InitialProviderPreflightEvaluator',
-        evaluator_type)
-    build_evaluator_v2 = mock.Mock(return_value=evaluator_v2)
-    monkeypatch.setattr(runtime, '_build_authority_preflight_evaluator_v2',
-                        build_evaluator_v2)
-    monkeypatch.setattr(
-        'sky.server.requests.authority_worker_bootstrap.AuthorityWorkerPodIdentity.from_environment',
-        lambda: pod_identity)
-    monkeypatch.setattr(
-        'sky.server.authority_preflight.AuthorityPreflightServer',
-        preflight_type)
-    monkeypatch.setattr(
-        'sky.server.authority_preflight.authority_preflight_service_dns',
-        mock.Mock(return_value='test-authority-preflight.ns.svc'))
-
-    def wait_for_shutdown(value):
-        assert value is coordinator
-        events.append('wait')
-
-    monkeypatch.setattr(runtime, '_wait_for_authority_shutdown',
-                        wait_for_shutdown)
-    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [])
-
-    runtime.run_role(state, _args())
-
-    start_workers.assert_not_called()
-    start_background.assert_not_called()
-    capture_env.assert_not_called()
-    lease.set_ready.assert_called_once_with(
-        False, health_detail={'phase': 'preflight-only'})
-    health_server.start.assert_called_once_with()
-    health_server.stop.assert_called_once_with()
-    evaluator_type.assert_called_once_with(accepted_callbacks[0])
-    build_evaluator_v2.assert_called_once_with(pod_identity.uid)
-    # A non-V1 coordinator result cannot cross into the frozen V1 evaluator.
-    assert accepted_callbacks[0]() is None
-    preflight_type.assert_called_once_with('127.0.0.1',
-                                           46583,
-                                           'test-authority-preflight.ns.svc',
-                                           evaluator,
-                                           on_transport_invalid=mock.ANY,
-                                           evaluator_v2=evaluator_v2)
-    assert callable(preflight_type.call_args.kwargs['on_transport_invalid'])
-    assert events == [
-        'health-start', 'preflight-start', 'manifest-load', 'coordinator-build',
-        'coordinator-start', 'wait', 'acceptance-clear', 'preflight-stop',
-        'coordinator-stop', 'health-stop'
-    ]
-    lease.stop.assert_called_once_with()
-
-
-def test_authority_role_unwinds_bound_listeners_if_bootstrap_build_fails(
-        monkeypatch):
-    lease = mock.Mock()
-    lease.instance_id = '00000000-0000-4000-8000-000000000001'
-    state = runtime.RuntimeState('authority-worker', mock.Mock(), lease, False)
-    pod_identity = SimpleNamespace(uid=lease.instance_id)
-    events = []
-    health_server = mock.Mock()
-    preflight_server = mock.Mock()
-    preflight_server.is_transport_ready.return_value = True
-    health_server.start.side_effect = lambda: events.append('health-start')
-    preflight_server.start.side_effect = lambda: events.append('preflight-start'
-                                                              )
-    preflight_server.stop.side_effect = lambda: events.append('preflight-stop')
-    health_server.stop.side_effect = lambda: events.append('health-stop')
-    preflight_type = mock.Mock(return_value=preflight_server)
-    monkeypatch.setattr(runtime, '_RoleHealthServer',
-                        lambda *args, **kwargs: health_server)
-    monkeypatch.setattr(
-        runtime, '_load_authority_static_manifest',
-        lambda: events.append('manifest-load') or mock.sentinel.manifest)
-    monkeypatch.setattr(runtime, '_build_authority_preflight_evaluator_v2',
-                        lambda worker_instance_id: mock.Mock())
-
-    def fail_build(*args):
-        del args
-        assert events == ['health-start', 'preflight-start', 'manifest-load']
-        raise RuntimeError('in-cluster client unavailable')
-
-    monkeypatch.setattr(runtime, '_build_authority_bootstrap_coordinator',
-                        fail_build)
-    monkeypatch.setattr(
-        'sky.serve.resource_action_provider_preflight.InitialProviderPreflightEvaluator',
-        lambda accepted_manifest: mock.Mock())
-    monkeypatch.setattr(
-        'sky.server.requests.authority_worker_bootstrap.AuthorityWorkerPodIdentity.from_environment',
-        lambda: pod_identity)
-    monkeypatch.setattr(
-        'sky.server.authority_preflight.AuthorityPreflightServer',
-        preflight_type)
-    monkeypatch.setattr(
-        'sky.server.authority_preflight.authority_preflight_service_dns',
-        mock.Mock(return_value='test-authority-preflight.ns.svc'))
-
-    with pytest.raises(RuntimeError, match='in-cluster client unavailable'):
-        runtime._run_authority_preflight_role(  # pylint: disable=protected-access
-            state, _args())
-
-    assert events == [
-        'health-start', 'preflight-start', 'manifest-load', 'preflight-stop',
-        'health-stop'
-    ]
-    lease.set_ready.assert_called_once_with(
-        False, health_detail={'phase': 'preflight-only'})
-
-
 def test_stop_queue_server_is_idempotent_after_child_cleanup():
     queue_server = mock.Mock()
     queue_server.is_alive.return_value = False
@@ -455,54 +232,6 @@ def test_stop_queue_server_is_idempotent_after_child_cleanup():
 
     queue_server.kill.assert_not_called()
     queue_server.join.assert_called_once_with()
-
-
-def test_controller_supervisor_validates_preflight_auth_before_readiness(
-        monkeypatch):
-    lease = mock.Mock()
-    state = runtime.RuntimeState('controller', mock.Mock(), lease, False)
-    monkeypatch.setenv(
-        serve_constants.RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR,
-        '/purpose/tokens')
-    monkeypatch.setenv(
-        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR, 'true')
-    validate = mock.Mock(side_effect=RuntimeError('rings overlap'))
-    monkeypatch.setattr(
-        runtime.auth_tokens,
-        'validate_resource_action_preflight_auth_token_isolation', validate)
-
-    with pytest.raises(RuntimeError, match='rings overlap'):
-        runtime._run_controller_role(  # pylint: disable=protected-access
-            state, _args())
-
-    validate.assert_called_once_with(required=True)
-    lease.set_ready.assert_not_called()
-
-
-def test_controller_supervisor_ignores_custom_preflight_env_while_disabled(
-        monkeypatch):
-    lease = mock.Mock()
-    state = runtime.RuntimeState('controller', mock.Mock(), lease, False)
-    monkeypatch.delenv(
-        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
-        raising=False)
-    monkeypatch.setenv(
-        serve_constants.RESOURCE_ACTION_PREFLIGHT_AUTH_TOKENS_FILE_ENV_VAR,
-        '/compatibility/tokens')
-    validate = mock.Mock()
-    monkeypatch.setattr(
-        runtime.auth_tokens,
-        'validate_resource_action_preflight_auth_token_isolation', validate)
-    monkeypatch.setattr(
-        runtime.request_postgres, 'ControllerLeaderLease',
-        mock.Mock(side_effect=RuntimeError('past activation gate')))
-
-    with pytest.raises(RuntimeError, match='past activation gate'):
-        runtime._run_controller_role(  # pylint: disable=protected-access
-            state, _args())
-
-    validate.assert_not_called()
-    lease.set_ready.assert_not_called()
 
 
 def test_controller_role_fences_children_and_exits_on_lock_loss(monkeypatch):
@@ -1095,8 +824,7 @@ def test_role_health_and_metrics_ports_must_differ(monkeypatch, role):
                            deploy=True,
                            metrics_port=9090,
                            role=role,
-                           role_health_port=9090,
-                           authority_preflight_port=46583)
+                           role_health_port=9090)
     parser = mock.Mock()
     parser.parse_args.return_value = args
     monkeypatch.setenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED, 'true')
@@ -1110,125 +838,3 @@ def test_role_health_and_metrics_ports_must_differ(monkeypatch, role):
     with pytest.raises(ValueError,
                        match='role-health-port and metrics-port cannot be'):
         runtime.main()
-
-
-def test_api_background_uses_release_scoped_retirement_singleton(monkeypatch):
-    background = mock.Mock()
-    singleton_coroutine = mock.sentinel.singleton_coroutine
-    scope = SimpleNamespace(singleton_name=(
-        'resource-action-authority-retirement:installation:release-digest'))
-    from_environment = mock.Mock(return_value=scope)
-    run_singleton = mock.Mock(return_value=singleton_coroutine)
-    monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
-                       raising=False)
-    monkeypatch.setenv(
-        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR, 'true')
-    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
-    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: True)
-    monkeypatch.setattr(
-        runtime.authority_worker_retirement.AuthorityWorkerRetirementScope,
-        'from_environment', from_environment)
-    monkeypatch.setattr(runtime.request_postgres, 'run_distributed_singleton',
-                        run_singleton)
-
-    result = runtime._start_background_loop(  # pylint: disable=protected-access
-        'api')
-
-    assert result is background
-    from_environment.assert_called_once_with()
-    run_singleton.assert_called_once_with(
-        'skypilot:api-server-runtime:v1:' + scope.singleton_name,
-        runtime.authority_worker_retirement.retirement_verifier_daemon)
-    background.create_task.assert_called_once_with(singleton_coroutine)
-    background.start.assert_called_once_with()
-
-
-def test_api_background_runs_explicit_retirement_only_verifier(monkeypatch):
-    background = mock.Mock()
-    singleton_coroutine = mock.sentinel.singleton_coroutine
-    scope = SimpleNamespace(singleton_name=(
-        'resource-action-authority-retirement:installation:release-digest'))
-    from_environment = mock.Mock(return_value=scope)
-    run_singleton = mock.Mock(return_value=singleton_coroutine)
-    monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
-                       raising=False)
-    monkeypatch.delenv(
-        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
-        raising=False)
-    monkeypatch.setenv(
-        runtime.authority_worker_retirement.RETIREMENT_VERIFIER_ENABLED_ENV_VAR,
-        'true')
-    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
-    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: True)
-    monkeypatch.setattr(
-        runtime.authority_worker_retirement.AuthorityWorkerRetirementScope,
-        'from_environment', from_environment)
-    monkeypatch.setattr(runtime.request_postgres, 'run_distributed_singleton',
-                        run_singleton)
-
-    result = runtime._start_background_loop(  # pylint: disable=protected-access
-        'api')
-
-    assert result is background
-    from_environment.assert_called_once_with()
-    run_singleton.assert_called_once_with(
-        'skypilot:api-server-runtime:v1:' + scope.singleton_name,
-        runtime.authority_worker_retirement.retirement_verifier_daemon)
-    background.create_task.assert_called_once_with(singleton_coroutine)
-    background.start.assert_called_once_with()
-
-
-def test_api_background_ignores_legacy_authority_envs_while_disabled(
-        monkeypatch):
-    background = mock.Mock()
-    monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
-                       raising=False)
-    monkeypatch.delenv(
-        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR,
-        raising=False)
-    monkeypatch.delenv(
-        runtime.authority_worker_retirement.RETIREMENT_VERIFIER_ENABLED_ENV_VAR,
-        raising=False)
-    monkeypatch.setenv(
-        runtime.authority_worker_retirement.INSTALLATION_ID_ENV_VAR,
-        'compatibility-installation')
-    monkeypatch.setenv(
-        runtime.authority_worker_retirement.COHORT_SUFFIXES_ENV_VAR, '[]')
-    monkeypatch.setenv(
-        runtime.authority_worker_retirement.RETIREMENT_TOMBSTONES_ENV_VAR, '[]')
-    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
-    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: True)
-    from_environment = mock.Mock(
-        side_effect=AssertionError('disabled scope was parsed'))
-    monkeypatch.setattr(
-        runtime.authority_worker_retirement.AuthorityWorkerRetirementScope,
-        'from_environment', from_environment)
-
-    result = runtime._start_background_loop(  # pylint: disable=protected-access
-        'api')
-
-    assert result is background
-    from_environment.assert_not_called()
-    background.create_task.assert_not_called()
-    background.start.assert_called_once_with()
-
-
-def test_api_background_enabled_authority_requires_complete_scope(monkeypatch):
-    background = mock.Mock()
-    monkeypatch.delenv(runtime.constants.ENV_VAR_SERVER_METRICS_ENABLED,
-                       raising=False)
-    monkeypatch.setenv(
-        serve_constants.RESOURCE_ACTION_AUTHORITY_ENABLED_ENV_VAR, 'true')
-    for name in (
-            runtime.authority_worker_retirement.INSTALLATION_ID_ENV_VAR,
-            runtime.authority_worker_retirement.COHORT_SUFFIXES_ENV_VAR,
-            runtime.authority_worker_retirement.RETIREMENT_TOMBSTONES_ENV_VAR):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(runtime, '_BackgroundLoop', lambda: background)
-    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: True)
-
-    with pytest.raises(ValueError, match='environment is incomplete'):
-        runtime._start_background_loop(  # pylint: disable=protected-access
-            'api')
-
-    background.start.assert_not_called()

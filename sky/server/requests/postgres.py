@@ -28,7 +28,6 @@ from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server.events import emission as event_emission
 from sky.server.events import models as event_models
-from sky.server.requests import authority_worker
 from sky.server.requests import payloads
 from sky.server.requests import postgres_schema
 from sky.server.requests import preconditions
@@ -69,8 +68,7 @@ _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 # Public because operational safety checks outside the request backend must
 # use the same freshness boundary as the instance registry itself.
 INSTANCE_STALE_AFTER_SECONDS = 20
-_VALID_SERVER_ROLES = frozenset(
-    {'all', 'api', 'executor', 'controller', 'authority-worker'})
+_VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
 _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
 _CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
 _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
@@ -166,12 +164,6 @@ def _supported_handlers(role: str) -> list[str]:
             if registration.execution_class is
             request_registry.ExecutionClass.NORMAL and registration.claim_scope
             is request_registry.HandlerClaimScope.GENERAL)
-    if role == 'authority-worker':
-        return sorted(
-            registration.name
-            for registration in registrations
-            if registration.claim_scope is (
-                request_registry.HandlerClaimScope.RESOURCE_ACTION_AUTHORITY))
     # The compatibility all-role process remains the only consumer for both
     # execution classes, but private mutation handlers are never compatible
     # work.
@@ -2208,8 +2200,6 @@ class PostgresQueueBackend(queue_base.QueueBackend):
         *,
         execution_classes: frozenset[str] | None = None,
         controller_generation: int | None = None,
-        authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
-                                 None) = None,
     ):
         self._schedule_type = schedule_type
         self._instance_id = ensure_server_instance_id()
@@ -2228,21 +2218,8 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                 os.environ.get(SERVER_ROLE_ENV_VAR, 'all') != 'all'):
             raise ValueError('A controller-scoped queue requires an active '
                              'controller generation.')
-        role = os.environ.get(SERVER_ROLE_ENV_VAR, 'all')
-        if authority_claim_config is not None:
-            if role != 'authority-worker':
-                raise ValueError('Authority claim routing requires the '
-                                 'authority-worker server role.')
-            if execution_classes != frozenset(
-                {request_registry.ExecutionClass.NORMAL.value}):
-                raise ValueError('Authority claim routing requires exactly '
-                                 'the normal execution class.')
-        elif role == 'authority-worker':
-            raise ValueError('The authority-worker role requires a resolved '
-                             'claim configuration.')
         self._execution_classes = execution_classes
         self._controller_generation = controller_generation
-        self._authority_claim_config = authority_claim_config
 
     def _role_predicates(self) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
         predicates: list[sqlalchemy.ColumnElement[bool]] = []
@@ -2253,14 +2230,9 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             predicates.append(sqlalchemy.exists().where(
                 _controller_leadership_is_current_predicate(
                     uuid.UUID(self._instance_id), self._controller_generation)))
-        if self._authority_claim_config is None:
-            predicates.append(
-                REQUESTS.c.handler_name.not_in(
-                    request_registry.RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST
-                ))
-        else:
-            predicates.append(
-                authority_worker.claim_predicate(self._authority_claim_config))
+        predicates.append(
+            REQUESTS.c.handler_name.not_in(
+                request_registry.RESOURCE_ACTION_AUTHORITY_HANDLER_ALLOWLIST))
         return tuple(predicates)
 
     def _lock_controller_leadership(
@@ -2667,16 +2639,12 @@ class PostgresQueueFactory(queue_base.QueueBackendFactory):
         *,
         execution_classes: frozenset[str] | None = None,
         controller_generation: int | None = None,
-        authority_claim_config: (authority_worker.AuthorityWorkerClaimConfig |
-                                 None) = None,
     ) -> None:
         self._execution_classes = execution_classes
         self._controller_generation = controller_generation
-        self._authority_claim_config = authority_claim_config
 
     def create_queue(self, schedule_type: str) -> queue_base.QueueBackend:
         return PostgresQueueBackend(
             schedule_type,
             execution_classes=self._execution_classes,
-            controller_generation=self._controller_generation,
-            authority_claim_config=self._authority_claim_config)
+            controller_generation=self._controller_generation)

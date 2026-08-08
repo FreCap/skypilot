@@ -3,7 +3,6 @@
 
 import os
 import pathlib
-import pickle
 import shutil
 import uuid
 
@@ -135,9 +134,9 @@ def _coverage_values(sample: dict) -> dict:
         'action_type': sample['action_type'],
         'normalizer_contract_version': 1,
         'normalization_outcome': 'REPRESENTABLE',
-        'candidate_epoch': uuid.UUID('22222222-2222-4222-8222-222222222222'),
-        'qualification_policy_sha256': 'c' * 64,
-        'qualification_binding_sha256': 'd' * 64,
+        'candidate_epoch': uuid.uuid4(),
+        'qualification_policy_sha256': 'd' * 64,
+        'qualification_binding_sha256': 'e' * 64,
     }
 
 
@@ -153,7 +152,6 @@ def _drop_pre_033_resource_action_columns(engine) -> None:
         'sky_cluster_record_uuid',
         'desired_generation',
         'replica_incarnation',
-        'resource_action_spec_identity_sha256',
     )
     with engine.begin() as connection:
         for column in replica_columns:
@@ -163,19 +161,6 @@ def _drop_pre_033_resource_action_columns(engine) -> None:
                                    'resource_action_mode_changed_at')
         connection.exec_driver_sql(
             'ALTER TABLE services DROP COLUMN resource_action_mode')
-        for column in (
-                'resource_action_candidate_binding_sha256',
-                'resource_action_candidate_policy_sha256',
-                'resource_action_candidate_epoch',
-        ):
-            connection.exec_driver_sql(
-                f'ALTER TABLE services DROP COLUMN {column}')
-        for column in (
-                'resource_action_spec_identity_sha256',
-                'resource_action_spec_identity',
-        ):
-            connection.exec_driver_sql(
-                f'ALTER TABLE version_specs DROP COLUMN {column}')
 
 
 def _assert_upstream_request_classification_catalog(engine) -> None:
@@ -311,16 +296,9 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     _assert_upstream_request_classification_catalog(engine)
     _assert_classification_rows_retained(engine)
 
-    migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.SERVE_DB_NAME,
-        migration_utils.SERVE_NON_POSTGRES_VERSION)
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         migration_utils.SERVE_VERSION)
     alembic_command.stamp(config, '033')
-    migration_utils.safe_alembic_upgrade(
-        engine, migration_utils.SERVE_DB_NAME,
-        migration_utils.SERVE_NON_POSTGRES_VERSION)
-    assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.SERVE_DB_NAME) == (
-            migration_utils.SERVE_NON_POSTGRES_VERSION)
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
                                          migration_utils.SERVE_VERSION)
     assert migration_utils.get_current_alembic_revision(
@@ -336,19 +314,6 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     }
     assert service_columns['resource_action_mode']['nullable'] is False
     assert service_columns['resource_action_mode']['default'] is not None
-    assert {
-        'resource_action_candidate_epoch',
-        'resource_action_candidate_policy_sha256',
-        'resource_action_candidate_binding_sha256',
-    } <= set(service_columns)
-    version_columns = {
-        column['name']: column
-        for column in inspector.get_columns('version_specs')
-    }
-    assert {
-        'resource_action_spec_identity',
-        'resource_action_spec_identity_sha256',
-    } <= set(version_columns)
     replica_columns = {
         column['name']: column for column in inspector.get_columns('replicas')
     }
@@ -366,7 +331,6 @@ def test_pg_upgrade_from_032_and_catalog_are_exact(empty_postgres):
     assert action_columns <= set(replica_columns)
     for name in action_columns - {'desired_generation'}:
         assert isinstance(replica_columns[name]['type'], postgresql.UUID)
-    assert 'resource_action_spec_identity_sha256' in replica_columns
 
     sample_indexes = {
         index['name']: index
@@ -494,14 +458,13 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
         engine, migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
 
 
-def test_sqlite_gets_only_inert_common_columns_and_refuses_down(
-        tmp_path, monkeypatch):
+def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
     database_path = pathlib.Path(tmp_path) / 'serve.db'
     engine = sqlalchemy.create_engine(f'sqlite:///{database_path}')
     try:
         migration_utils.safe_alembic_upgrade(
             engine, migration_utils.SERVE_DB_NAME,
-            migration_utils.serve_target_version(engine))
+            migration_utils.SERVE_NON_POSTGRES_VERSION)
         inspector = sqlalchemy.inspect(engine)
         assert 'resource_action_mode' in {
             column['name'] for column in inspector.get_columns('services')
@@ -517,31 +480,10 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(
             'launch_shadow_sample_id',
             'down_shadow_sample_id',
         } <= {column['name'] for column in inspector.get_columns('replicas')}
-        assert 'resource_action_candidate_epoch' not in {
-            column['name'] for column in inspector.get_columns('services')
-        }
-        assert 'resource_action_spec_identity_sha256' not in {
-            column['name'] for column in inspector.get_columns('replicas')
-        }
         assert action_schema.SHADOW_SAMPLES.name not in inspector.get_table_names(
         )
         assert action_schema.SHADOW_ATTEMPTS.name not in inspector.get_table_names(
         )
-
-        # The public tables retain the canonical Serve039 metadata graph, but
-        # legacy whole-row reads must compile against the physical Serve037
-        # column inventory on SQLite.
-        with engine.begin() as connection:
-            connection.execute(serve_state.services_table.insert().values(
-                name='sqlite-service', status='READY'))
-            connection.execute(serve_state.version_specs_table.insert().values(
-                service_name='sqlite-service',
-                version=1,
-                spec=pickle.dumps(None),
-                yaml_content='service: {}'))
-        monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
-        assert serve_state.get_service_from_name(
-            'sqlite-service')['name'] == 'sqlite-service'
 
         config = migration_utils.get_alembic_config(
             engine, migration_utils.SERVE_DB_NAME)
@@ -550,7 +492,7 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
             engine, migration_utils.SERVE_DB_NAME) == (
-                migration_utils.serve_target_version(engine))
+                migration_utils.SERVE_NON_POSTGRES_VERSION)
     finally:
         engine.dispose()
 
@@ -592,7 +534,7 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             'down_shadow_sample_id':
                 (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 6)
                 ),
-            'resource_action_spec_identity_sha256': 'e' * 64,
+            'resource_action_spec_identity_sha256': 'f' * 64,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(engine) as session:

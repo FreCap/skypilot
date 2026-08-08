@@ -35,7 +35,6 @@ from sky import serve
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
-from sky.serve import auth_tokens
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
@@ -547,13 +546,6 @@ class SkyServeController:
 
     @contextlib.asynccontextmanager
     async def lifespan(self, _: fastapi.FastAPI):
-        if auth_tokens.is_resource_action_authority_enabled():
-            # Refuse to publish controller routes if the private authority
-            # credential overlaps any other ring mounted in this process.
-            # Reads remain fresh in the request client so later projected
-            # Secret rotations keep the same fail-closed boundary.
-            auth_tokens.validate_resource_action_preflight_auth_token_isolation(
-                required=True)
         uvicorn_access_logger = logging.getLogger('uvicorn.access')
         for handler in uvicorn_access_logger.handlers:
             handler.setFormatter(sky_logging.FORMATTER)

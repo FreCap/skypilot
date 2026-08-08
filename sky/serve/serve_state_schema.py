@@ -838,22 +838,7 @@ def get_database_engine() -> sqlalchemy.engine.Engine:
     return _db_manager.get_engine()
 
 
-def get_authority_preflight_database_engine() -> sqlalchemy.engine.Engine:
-    """Return the isolated one-connection engine for mutation-free V2 trust."""
-
-    default_engine = get_database_engine()
-    if default_engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        raise RuntimeError('Authority preflight requires central PostgreSQL.')
-    # Schema initialization deliberately stays on the ordinary manager.  This
-    # namespaced pool is for bounded, mutation-free trust transactions only and
-    # must never run migrations or bootstrap/heartbeat work.
-    return db_utils.get_engine(
-        'serve/services',
-        engine_namespace=db_utils.AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE)
-
-
 # Preserve the historical public identity exposed by sky.serve.serve_state.
 create_table.__module__ = 'sky.serve.serve_state'
 ensure_tables_initialized.__module__ = 'sky.serve.serve_state'
 get_database_engine.__module__ = 'sky.serve.serve_state'
-get_authority_preflight_database_engine.__module__ = 'sky.serve.serve_state'

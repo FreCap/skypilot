@@ -547,7 +547,7 @@ def test_store_and_activation_contract_fail_closed_on_old_dialects() -> None:
     assert schema037_dispatch.private_handler_dispatch_ready
     assert schema037_dispatch.authority_ready
     with pytest.raises(ValueError,
-                       match='Serve schema revision 035, 036, 037, or 038'):
+                       match='Serve schema revision 035, 036, or 037'):
         _activation_evidence(api_revision='007', serve_revision='034')
 
 

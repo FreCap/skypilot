@@ -96,8 +96,8 @@ The relevant behavior was compared directly with `v1.1.1015`:
 | Path | `v1.1.1015` and current behavior | Relevant current-only difference |
 |---|---|---|
 | `RequestWorker.process_request()` and `run()` | Function ASTs are identical. An empty `queue.get()` sleeps 100 ms; a nonempty queue immediately starts the next pickup. | None. |
-| `PostgresQueueBackend.get()` | Every call opens a transaction, checks leadership when applicable, runs `_reap_expired_claims()`, then runs `_candidate()`. | Current code adds authority-worker claim predicates and rechecks those predicates when claiming. Cadence is unchanged. |
-| `PostgresQueueBackend._reap_expired_claims()` | Selects up to 100 expired claimed rows with `FOR UPDATE SKIP LOCKED`, then requeues replayable work or terminalizes ambiguous mutating work. | Current code scopes the sweep with the same authority-worker role predicates used for pickup. These predicates must be preserved. |
+| `PostgresQueueBackend.get()` | Every call opens a transaction, checks leadership when applicable, runs `_reap_expired_claims()`, then runs `_candidate()`. | Current code scopes work by execution class and controller leadership and temporarily excludes the four retired private handler names. Cadence is unchanged. |
+| `PostgresQueueBackend._reap_expired_claims()` | Selects up to 100 expired claimed rows with `FOR UPDATE SKIP LOCKED`, then requeues replayable work or terminalizes ambiguous mutating work. | Current code applies the same execution-class, controller-leadership, and temporary private-handler quarantine used for pickup. These predicates remain until the monitoring-gated final cleanup. |
 | `SkyPilotReplicaManager._probe_all_replicas()` | Every non-preempted, non-terminal probe result is appended to `pending_writes`, then the whole list is batch-upserted. | Current code also performs typed system-recovery reductions and owner-fenced route suspensions in the probe loop. Changed-only filtering must be limited to ordinary replicas and preserve those recovery writes. |
 | `controller_proxy._proxy_controller_sync()` | Function ASTs are identical. It reads owner before forwarding and after receiving the response. | None. |
 | `SkyServeController._handle_load_balancer_role()` | Function ASTs are identical. It performs an initial owner read, then an in-lock fence read and a separate cutover-state read. | None. |
@@ -274,18 +274,16 @@ which is SQLAlchemy's supported event target for the adapted DBAPI connection.
 Attribution uses closed labels only. The process role is resolved when the
 physical connection opens, not when the engine is created, because cached
 engines can be inherited by child processes. The server's existing
-`SKYPILOT_API_SERVER_ROLE` supplies `all`, `api`, `executor`, `controller`, and
-`authority-worker`. A validated write-once process-local override identifies
+`SKYPILOT_API_SERVER_ROLE` supplies `all`, `api`, `executor`, and `controller`.
+A validated write-once process-local override identifies
 request executor children, consolidated managed-job controllers, and
 consolidated Serve controllers before plugins or database state initialize.
-Authority-worker executor children retain `authority-worker` rather than being
-collapsed into `executor`. An unexpected role maps to `unknown` instead of
-becoming a label.
+An unexpected role maps to `unknown` instead of becoming a label.
 
 Engine namespaces are normalized to `shared`, `api-requests-control`,
 `advisory-lock`, or `other`. Sync and async are the only mode values. The
-complete Cartesian bound is therefore 8 process roles times 4 namespaces times
-2 modes, or at most 64 labeled combinations.
+complete Cartesian bound is therefore 7 process roles times 4 namespaces times
+2 modes, or at most 56 labeled combinations.
 The production multiprocess collector exports one `_total` series for each
 combination. A non-multiprocess local registry may also expose Prometheus
 client's `_created` companion series. Database URLs, users, process IDs, job
@@ -296,8 +294,8 @@ The first production attribution canary is deliberately limited to the current
 monolithic deployment: `apiService.highAvailability.enabled=false`, one API
 pod, and executor and controller children that share the pod's metrics
 environment and `/tmp/metrics` directory. With high availability enabled, the
-chart runs API, controller, executor, and authority-worker roles in separate
-pods, while `apiService.metrics.enabled` currently exposes only the API
+chart runs API, controller, and executor roles in separate pods, while
+`apiService.metrics.enabled` currently exposes only the API
 deployment's metrics endpoint. The aggregate must not be treated as complete
 in that topology until every database-owning role has a scraped endpoint or an
 equivalent cross-pod aggregation path. Adding that HA metrics topology is
@@ -398,16 +396,14 @@ Resolve the process role inside the event callback. Add a validated
 process-local setter in `db_utils` and call it before plugin or database
 initialization in:
 
-- `sky/server/requests/executor.py:executor_initializer()` with
-  `authority-worker` when the inherited server role is `authority-worker`, and
-  `executor` otherwise;
+- `sky/server/requests/executor.py:executor_initializer()` with `executor`;
 - `sky/jobs/controller.py:main()` with `managed-job-controller`; and
 - `sky/serve/controller.py:run_controller()` with `serve-controller`.
 
 This explicit override is required because the current consolidated Serve
 controller sets the same `IS_SKYPILOT_JOB_CONTROLLER` compatibility marker as
 the managed-job controller. The base server role remains the fallback for
-ordinary API, executor, controller, and authority-worker processes. Invalid
+ordinary API, executor, and controller processes. Invalid
 base roles map to `unknown`; invalid explicit setter values raise before any
 engine can be opened. Repeating the same explicit value is idempotent, while an
 attempt to change an already-set explicit process role raises. Entrypoint tests
@@ -452,8 +448,8 @@ Focused tests:
   establishment fail;
 - executor, managed-job controller, and Serve controller entrypoints install
   their explicit role before plugins or database initialization;
-- authority-worker executor children retain `authority-worker`, repeated
-  same-role initialization is allowed, and cross-role reassignment fails; and
+- the seven-label role allowlist stays bounded, repeated same-role
+  initialization is allowed, and cross-role reassignment fails; and
 - Prometheus multiprocess collection exposes the counter without a PID label.
 
 ### Milestone 1: throttle expired-claim reaping independently
@@ -496,10 +492,11 @@ Contract:
   leaves the sweep due so the next pickup retries it.
 - A successful under-cap sweep sets the next deadline from a fresh monotonic
   timestamp, avoiding catch-up bursts after a pause.
-- Keep deadlines independent per queue backend. Long, short, controller, and
-  authority-worker consumers must not suppress each other's recovery duty.
-- Preserve all current schedule, execution-class, authority-worker, controller
-  leadership, lease, replay, and row-lock predicates byte-for-byte.
+- Keep deadlines independent per queue backend. Long, short, and controller
+  consumers must not suppress each other's recovery duty.
+- Preserve all current schedule, execution-class, controller-leadership,
+  temporary private-handler quarantine, lease, replay, and row-lock predicates
+  byte-for-byte.
 
 Each `PostgresQueueBackend` must remain owned by exactly one dispatcher thread,
 as it is in the current architecture. The cadence state is process-local and
@@ -865,10 +862,10 @@ response-contract change is accepted.
 - For handlers understood by both versions, old and new queue consumers can run
   together. Old consumers sweep more often; row locks, lease tokens, execution
   generations, and terminal transitions remain authoritative.
-- `v1.1.1015` predates the current authority-worker claim predicates. Authority
-  routing must remain disabled until all `v1.1.1015` consumers are drained. This
-  is an existing mixed-version gate, not a consequence of the cadence changes,
-  and every new queue query must preserve the current predicates.
+- The dedicated authority-worker routing and its old mixed-version gate are
+  retired. During the compatibility cleanup, current consumers still exclude
+  the four private handler names; the final cleanup may remove that predicate
+  only after the all-status database gate proves no matching request exists.
 - Old and new idle workers can run together. The faster poller may claim first,
   but the PostgreSQL claim transaction prevents duplicate execution.
 - During a Serve owner handoff, only the fenced current controller may persist
