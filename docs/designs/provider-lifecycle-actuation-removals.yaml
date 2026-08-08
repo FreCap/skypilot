@@ -2,8 +2,8 @@ schema_version: 1
 coverage_gaps:
 - id: PLA-GAP-001
   milestone: M4
-  responsibility: Complete provider-local run_instances actuation ownership across every concrete built-in
-    new-provisioner implementation
+  responsibility: Complete provider-local run_instances actuation ownership across every remaining concrete
+    built-in new-provisioner implementation after the DigitalOcean transcription
   candidate_locators:
   - kind: python_symbol
     path: sky/provision/aws/instance.py
@@ -13,9 +13,6 @@ coverage_gaps:
     symbol: run_instances
   - kind: python_symbol
     path: sky/provision/cudo/instance.py
-    symbol: run_instances
-  - kind: python_symbol
-    path: sky/provision/do/instance.py
     symbol: run_instances
   - kind: python_symbol
     path: sky/provision/fluidstack/instance.py
@@ -78,9 +75,9 @@ coverage_gaps:
     path: sky/provision/yotta/instance.py
     symbol: run_instances
   owner: M4 cluster actuation migration
-  reason: Existing M4 artifacts cover selected waits and shared retry policy but do not transcribe every
-    concrete provider-local owner of target-count, head-selection, resume, creation, readiness, error
-    projection, and ProvisionRecord behavior
+  reason: Exact DigitalOcean artifacts now exist, but M4 still does not transcribe every remaining concrete
+    provider-local owner of target-count, head-selection, resume, creation, readiness, error projection,
+    and ProvisionRecord behavior
   closure_gate: Replace this gap with dependency-closed exact artifacts for every candidate symbol and
     every owned mutation and observation helper reachable from it; close only after the shared planner
     and reconciler are authoritative for each provider, frozen and bounded live create, restart, scale,
@@ -10686,7 +10683,7 @@ artifacts:
     path: sky/provision/aws/instance.py
     symbol: run_instances
     call: time.sleep
-  replacement: ProvisioningAttemptV1 effect observation
+  replacement: Shared durable cluster effect reconciler observation
   dependencies: []
   status: present
   status_history:
@@ -13446,7 +13443,7 @@ artifacts:
     path: sky/clouds/do.py
     symbol: DO.zones_provision_loop
     call: cls.regions_with_offering
-  replacement: DigitalOcean RawOfferSnapshotV1 and shared pure offer policy
+  replacement: DigitalOcean ProviderDescriptorV1 OFFER_SOURCE facet over ProviderObservationSnapshotV1 and shared pure offer policy
   dependencies: []
   status: present
   status_history:
@@ -13469,7 +13466,7 @@ artifacts:
       satisfied: false
       evidence: []
     release_window:
-    - id: do_raw_offer_source_rollback_window_closed
+    - id: do_descriptor_offer_source_rollback_window_closed
       satisfied: false
       evidence: []
     schema:
@@ -15640,7 +15637,7 @@ artifacts:
     domain: cluster_lifecycle
     store: process_memory
     provider: do
-    operation: legacy_target_count_head_repair_and_create_policy
+    operation: legacy_target_count_head_repair_resume_and_create_policy
   runtime_affecting: true
   locators:
   - kind: python_call_within
@@ -15654,12 +15651,16 @@ artifacts:
   - kind: python_call_within
     path: sky/provision/do/instance.py
     symbol: run_instances
+    call: utils.start_instance
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: run_instances
     call: utils.rename_instance
   - kind: python_call_within
     path: sky/provision/do/instance.py
     symbol: run_instances
     call: utils.create_instance
-  replacement: Shared immutable inventory planner plus provider-local single-effect node actuation
+  replacement: Shared immutable target-count, head-role, and resume planner plus descriptor-bound NodeActuationFacetV1 and durable effect reconciler
   dependencies: []
   status: present
   status_history:
@@ -15671,7 +15672,7 @@ artifacts:
       satisfied: false
       evidence: []
     test:
-    - id: digitalocean_target_head_create_and_identity_conformance
+    - id: digitalocean_target_head_resume_create_and_identity_conformance
       satisfied: false
       evidence: []
     telemetry:
@@ -15885,6 +15886,1507 @@ artifacts:
       - The ordinary-status legacy codegen and decoder own no database schema.
   retained_references:
   - tests/unit_tests/test_sky/backends/test_cloud_vm_ray_backend_system_oom_recovery.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-107
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_name_keyed_discovery_and_filtering
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: filter_instances
+  replacement: Descriptor-bound NodeActuationFacetV1 discover over immutable duplicate-preserving numeric-ID inventory
+  dependencies:
+  - PLA-M4-108
+  - PLA-M4-110
+  - PLA-M4-111
+  - PLA-M4-113
+  - PLA-M4-114
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_name_keyed_discovery_helper
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_duplicate_preserving_numeric_id_scope_incarnation_and_completeness_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_name_keyed_inventory_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_descriptor_discovery_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_name_keyed_discovery_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean discovery helper owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-108
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_bulk_run_orchestration
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/instance.py
+    symbol: run_instances
+  replacement: Shared cluster planner and durable effect reconciler over dependency-closed NodeActuationFacetV1 operations
+  dependencies:
+  - PLA-M4-006
+  - PLA-M4-102
+  - PLA-M4-103
+  - PLA-M4-110
+  - PLA-M4-111
+  - PLA-M4-112
+  - PLA-M4-113
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_bulk_run_orchestration
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_resume_no_resume_head_count_readiness_partial_create_and_projection_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_bulk_run_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_shared_reconciler_run_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_bulk_run_owner_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean bulk run owner owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-109
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_noop_wait_facade
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/instance.py
+    symbol: wait_instances
+  replacement: Descriptor-derived InstanceLifecycleV1 compatibility projection over durable reconciler observation
+  dependencies:
+  - PLA-M4-108
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_provider_local_wait_facade
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_pending_success_timeout_and_partial_effect_observation_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_wait_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_reconciler_wait_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_noop_wait_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean no-op wait facade owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-110
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_stop_targeting_submission_and_polling
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/instance.py
+    symbol: stop_instances
+  replacement: Shared worker-only planner and durable exact-ID stop effect reconciliation through NodeActuationFacetV1
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_legacy_stop_owner
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_exact_id_worker_only_stop_action_observation_timeout_and_stale_incarnation_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_stop_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_exact_id_stop_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_stop_owner_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean stop owner owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-111
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_terminate_targeting_dangerous_submission_and_count_absence
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/instance.py
+    symbol: terminate_instances
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: down_instance
+  replacement: Shared worker-only planner and durable ordinary exact-ID droplet plus owned-volume deletion with foreign associated-resource preservation and complete absence proof
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_legacy_terminate_owner
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_exact_id_terminate_lost_response_same_name_recreation_foreign_resource_preservation_and_compound_absence_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_terminate_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_exact_id_terminate_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_terminate_owner_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean terminate owner owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-112
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_compound_create_orchestration
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+  replacement: Durable CREATE_DROPLET CREATE_VOLUME ATTACH_VOLUME effect DAG prepared by NodeActuationFacetV1
+  dependencies:
+  - PLA-M4-103
+  - PLA-M4-111
+  - PLA-M4-115
+  - PLA-M4-118
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_compound_create_helper
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_crash_before_and_after_each_create_effect_lost_response_adoption_and_quarantine_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_compound_create_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_durable_create_lifecycle_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_compound_create_helper_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean compound create helper owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-113
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_domain_projection_ownership
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: run_instances
+    call: common.ProvisionRecord
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: get_cluster_info
+    call: utils.filter_instances
+  - kind: python_ast_pattern
+    path: sky/provision/do/instance.py
+    symbol: get_cluster_info
+    pattern: "if instance_name.endswith('-head'):\n    head_instance = instance_name"
+  - kind: python_ast_pattern
+    path: sky/provision/do/instance.py
+    symbol: get_cluster_info
+    pattern: "for net in instance_meta['networks']['v4']:\n    if net['type'] == 'public':\n        instance_ip = net['ip_address']\n        break"
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: get_cluster_info
+    call: common.InstanceInfo
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: get_cluster_info
+    call: common.ClusterInfo
+  replacement: Shared cluster-domain ProvisionRecord and ClusterInfo projectors over provider-normalized immutable NodeConnectionObservationV1 values
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_provider_local_domain_projection_calls
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_provision_record_cluster_info_typed_connection_identity_network_and_order_projection_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_domain_projection_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_shared_domain_projection_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_domain_projection_calls_own_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean domain projection calls own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-114
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_query_discovery_route
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/provision/do/instance.py
+    symbol: query_instances
+    call: utils.filter_instances
+  replacement: Descriptor-bound immutable node discovery plus retained provider-local query status projection
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_query_name_keyed_discovery_call
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_query_same_read_numeric_identity_native_state_and_legacy_result_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_query_discovery_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_descriptor_query_discovery_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_query_discovery_call_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean query discovery call owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-115
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_create_submission_observation_mix
+  runtime_affecting: true
+  locators:
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: _create_droplet
+    pattern: client().droplets.get(droplet_id)
+  replacement: CREATE_DROPLET submit evidence followed by EffectHandleRefV1 provider-handle or locator-only observe_effect readback
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_create_submission_followup_get
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_create_response_id_and_all_locator_only_readback_reason_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_create_observation_mix_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_create_submit_observe_split_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_create_observation_mix_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local DigitalOcean create submission helper owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-116
+  milestone: M4
+  introduced_by: 44add3fa3c0bc346ed957c666e7ceb1c034ab021
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_incarnation_marker_namespace_projection_and_writer
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: TAG_SKYPILOT_CLUSTER_INCARNATION
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: _INCARNATION_DOMAIN_SEPARATOR
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: _INCARNATION_TAG_PREFIX
+  - kind: python_symbol
+    path: sky/provision/do/incarnation_tags.py
+    symbol: project_instance_tags
+  - kind: python_call_within
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    call: incarnation_tags.project_instance_tags
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    pattern: "instance_request = {'name': instance_name, 'region': region, 'size': config.node_config['InstanceType'], 'image': image_id, 'ssh_keys': [ssh_key_id(config.authentication_config['ssh_public_key'])['fingerprint']], 'tags': tags}"
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    pattern: "volume_request = {'size_gigabytes': config.node_config['DiskSize'], 'name': instance_name, 'region': region, 'filesystem_type': 'ext4', 'tags': tags}"
+  replacement: Descriptor-owned dual incarnation and provider-create-attempt tag projection inserted identically into exact droplet and volume requests
+  dependencies:
+  - PLA-M4-112
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_legacy_digitalocean_incarnation_marker_writer_or_reader
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_exact_incarnation_and_attempt_tag_bytes_dual_request_and_reserved_namespace_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_digitalocean_marker_projection_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_descriptor_owned_dual_tag_projection_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_legacy_incarnation_marker_writer_owns_no_schema
+      satisfied: true
+      evidence:
+      - The legacy marker projector and writer own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  - tests/unit_tests/test_sky/provision/test_do_incarnation_tags.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-117
+  milestone: M4
+  introduced_by: 44add3fa3c0bc346ed957c666e7ceb1c034ab021
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_incarnation_marker_generic_propagation_bridge
+  runtime_affecting: true
+  locators:
+  - kind: python_ast_pattern
+    path: sky/provision/common.py
+    symbol: ProvisionConfig
+    pattern: 'cluster_incarnation: str | None = dataclasses.field(default=None, kw_only=True, repr=False)'
+  - kind: python_ast_pattern
+    path: sky/provision/common.py
+    symbol: ProvisionConfig.get_redacted_config
+    pattern: config.pop('cluster_incarnation', None)
+  - kind: python_ast_pattern
+    path: sky/provision/provisioner.py
+    symbol: bulk_provision
+    pattern: "bootstrap_config = provision_common.ProvisionConfig(provider_config=original_config['provider'], authentication_config=original_config['auth'], docker_config=original_config.get('docker', {}), node_config=original_config['available_node_types'][head_node_type]['node_config'], count=num_nodes, tags={}, resume_stopped_nodes=True, ports_to_open_on_launch=ports_to_open_on_launch, cluster_incarnation=cluster_incarnation)"
+  - kind: python_ast_pattern
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: RetryingVmProvisioner._retry_zones
+    pattern: "getattr(provisioner, '_BUILTIN_BULK_PROVISION', None)"
+  - kind: python_ast_pattern
+    path: sky/backends/cloud_vm_ray_backend.py
+    symbol: RetryingVmProvisioner._retry_zones
+    pattern: bulk_provision_kwargs['cluster_incarnation'] = self._active_cluster_hash
+  replacement: Descriptor-bound ActuationBindingV1 carries durable cluster incarnation and create-attempt identity without a compatibility-only ProvisionConfig field or builtin-call seam
+  dependencies:
+  - PLA-M4-112
+  - PLA-M4-116
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_legacy_incarnation_keyword_field_redaction_and_builtin_dispatch_bridge
+      satisfied: false
+      evidence: []
+    test:
+    - id: descriptor_binding_incarnation_attempt_identity_and_old_new_client_compatibility_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_incarnation_propagation_bridge_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: descriptor_binding_identity_propagation_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: legacy_incarnation_propagation_bridge_owns_no_schema
+      satisfied: true
+      evidence:
+      - The compatibility-only field and call seam own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  - tests/unit_tests/test_sky/provision/test_provision_cluster_incarnation.py
+  - tests/unit_tests/test_sky/test_failover_classification.py
+  evidence: {}
+  blocker: null
+- id: PLA-M4-118
+  milestone: M4
+  introduced_by: 51bca2273a8e95b6458352015a91a0f15975df15
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_process_cached_ssh_key_lookup_and_creation_effect
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: SSH_KEY_NAME_ON_DO_PREFIX
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: _ssh_key_id
+  - kind: python_symbol
+    path: sky/provision/do/utils.py
+    symbol: ssh_key_id
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: ssh_key_id
+    pattern: client().ssh_keys.list(per_page=50, page=page)
+  - kind: python_ast_pattern
+    path: sky/provision/do/utils.py
+    symbol: ssh_key_id
+    pattern: client().ssh_keys.create(body=request)
+  - kind: python_call_within
+    path: sky/provision/do/utils.py
+    symbol: create_instance
+    call: ssh_key_id
+  replacement: Descriptor-bound NodeAccessBindingFacetV1 and durable preexisting DigitalOceanSshKeyBindingV1 with no V1 key creation or generated legacy key name
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_digitalocean_legacy_ssh_key_name_cache_lookup_or_create_effect
+      satisfied: false
+      evidence: []
+    test:
+    - id: digitalocean_preexisting_ssh_key_unique_binding_revalidation_missing_duplicate_stale_no_generated_name_and_no_create_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_digitalocean_legacy_ssh_key_create_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: digitalocean_preexisting_ssh_key_binding_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: digitalocean_legacy_ssh_key_helper_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local SSH key cache and helper own no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M4-119
+  milestone: M4
+  introduced_by: 44add3fa3c0bc346ed957c666e7ceb1c034ab021
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: cluster_lifecycle
+    store: process_memory
+    provider: do
+    operation: legacy_builtin_bulk_provision_incarnation_compatibility_alias
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/provision/provisioner.py
+    symbol: _BUILTIN_BULK_PROVISION
+  replacement: Descriptor dispatch carries the pinned actuation binding without callable-identity-gated keyword injection
+  dependencies:
+  - PLA-M4-117
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_builtin_bulk_provision_incarnation_compatibility_alias
+      satisfied: false
+      evidence: []
+    test:
+    - id: descriptor_dispatch_old_new_provisioner_signature_compatibility_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_incarnation_compatibility_alias_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: descriptor_dispatch_binding_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: builtin_bulk_provision_compatibility_alias_owns_no_schema
+      satisfied: true
+      evidence:
+      - The process-local compatibility alias owns no database schema.
+  retained_references:
+  - docs/designs/provider-lifecycle-actuation.md
+  evidence: {}
+  blocker: null
+- id: PLA-M5-001
+  milestone: M5
+  introduced_by: 0a3fa136b881602ebff7c63bd09c45dbe881bbdb
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: replica_request_execution
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: sdk.launch
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: sdk.api_cancel
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: common_utils.Backoff
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    pattern: retry_cnt >= max_retry
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    pattern: availability_retry_cnt >= availability_max_retry
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: backoff.current_backoff
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: core.down
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: common_utils.Backoff
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    pattern: retry_cnt >= max_retry
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: backoff.current_backoff
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: time.sleep
+  replacement: M5 durable Serve action runtime
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_central_postgresql_serve_request_execution_calls
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_launch_scale_down_rollout_epoch_incarnation_and_retry_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_central_serve_request_legacy_execution_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: m5_serve_request_runtime_rollback_window_closed
+      satisfied: false
+      evidence: []
+    - id: m5_s4_pilot_provider_actuation_and_receipt_qualified
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_request_helpers_own_no_schema
+      satisfied: true
+      evidence:
+      - The in-process Serve request helpers own no database schema.
+  retained_references:
+  - PLA-GAP-005
+  evidence: {}
+  blocker: null
+- id: PLA-M5-002
+  milestone: M5
+  introduced_by: 5a380e9d31e840b2e475307d547a71bbc41fe26c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: duplicate_replica_scheduling
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_legacy_mutation_runtime
+    call: t.start
+  replacement: M5 durable Serve action runtime
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_central_postgresql_serve_thread_start_scheduling
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_duplicate_scheduling_and_same_name_recreation_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_central_serve_duplicate_schedule_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: m5_serve_scheduler_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_thread_scheduler_owns_no_schema
+      satisfied: true
+      evidence:
+      - The Serve thread scheduler owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-003
+  milestone: M5
+  introduced_by: 6585dc9d5bcb87b2e6d3cc993153611d294dd90d
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: failed_cleanup_retry
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._schedule_failed_cleanup_retry
+  replacement: M5 durable Serve action runtime
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_central_postgresql_failed_cleanup_retry_helper
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_failed_cleanup_and_rollout_recovery_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_failed_cleanup_retry_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: m5_serve_cleanup_runtime_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_cleanup_retry_helper_owns_no_schema
+      satisfied: true
+      evidence:
+      - The Serve failed cleanup retry helper owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-004
+  milestone: M5
+  introduced_by: cddfef839c60432da7c1b20660cb83757f476e70
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: controller_sqlite
+    provider: provider_agnostic
+    operation: replica_request_execution
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: sdk.launch
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: sdk.api_cancel
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: common_utils.Backoff
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    pattern: retry_cnt >= max_retry
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    pattern: availability_retry_cnt >= availability_max_retry
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: backoff.current_backoff
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: core.down
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: common_utils.Backoff
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    pattern: retry_cnt >= max_retry
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: backoff.current_backoff
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: time.sleep
+  replacement: Dialect-capable durable Serve runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: sqlite_serve_legacy_locator_absent
+      satisfied: false
+      evidence: []
+    test:
+    - id: sqlite_serve_retirement_qualification
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_sqlite_serve_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: sqlite_serve_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: no_schema_contraction_required
+      satisfied: true
+      evidence:
+      - This in-process SQLite Serve responsibility owns no central PostgreSQL schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-005
+  milestone: M5
+  introduced_by: 5a380e9d31e840b2e475307d547a71bbc41fe26c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: controller_sqlite
+    provider: provider_agnostic
+    operation: duplicate_replica_scheduling
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_legacy_mutation_runtime
+    call: t.start
+  replacement: Dialect-capable durable Serve runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_sqlite_serve_thread_start_scheduling
+      satisfied: false
+      evidence: []
+    test:
+    - id: sqlite_serve_duplicate_scheduling_retirement_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_sqlite_duplicate_schedule_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: sqlite_serve_scheduler_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: sqlite_serve_thread_scheduler_owns_no_schema
+      satisfied: true
+      evidence:
+      - The controller SQLite Serve thread scheduler owns no central PostgreSQL schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-006
+  milestone: M5
+  introduced_by: 6585dc9d5bcb87b2e6d3cc993153611d294dd90d
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: controller_sqlite
+    provider: provider_agnostic
+    operation: failed_cleanup_retry
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._schedule_failed_cleanup_retry
+  replacement: Dialect-capable durable Serve runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_sqlite_serve_failed_cleanup_retry_helper
+      satisfied: false
+      evidence: []
+    test:
+    - id: sqlite_serve_failed_cleanup_retirement_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_sqlite_cleanup_retry_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: sqlite_serve_cleanup_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: sqlite_serve_cleanup_retry_owns_no_schema
+      satisfied: true
+      evidence:
+      - The controller SQLite Serve cleanup retry owns no central PostgreSQL schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-007
+  milestone: M5
+  introduced_by: cddfef839c60432da7c1b20660cb83757f476e70
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: process_memory
+    provider: skylet
+    operation: observe_child_status
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._fetch_job_status
+    call: backend.get_job_status
+  replacement: ChildWorkloadObservationV1
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_serve_direct_backend_job_status_call
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_replica_status_preemption_pool_timeout_and_lock_free_polling_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_serve_direct_child_status_transport_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: serve_child_observation_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_child_status_transport_owns_no_schema
+      satisfied: true
+      evidence:
+      - The Serve direct child status transport owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-008
+  milestone: M5
+  introduced_by: cddfef839c60432da7c1b20660cb83757f476e70
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: local_sqlite
+    provider: provider_agnostic
+    operation: replica_request_execution
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: sdk.launch
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: sdk.api_cancel
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: common_utils.Backoff
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    pattern: retry_cnt >= max_retry
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    pattern: availability_retry_cnt >= availability_max_retry
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+    call: backoff.current_backoff
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: core.down
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: common_utils.Backoff
+  - kind: python_ast_pattern
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    pattern: retry_cnt >= max_retry
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: backoff.current_backoff
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+    call: time.sleep
+  replacement: Dialect-capable durable Serve runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: local_sqlite_serve_legacy_execution_absent
+      satisfied: false
+      evidence: []
+    test:
+    - id: local_sqlite_serve_launch_cancel_down_retirement
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_local_sqlite_serve_execution
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: local_sqlite_serve_execution_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: local_sqlite_serve_execution_owns_no_central_schema
+      satisfied: true
+      evidence:
+      - This local SQLite Serve execution path owns no central PostgreSQL schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-009
+  milestone: M5
+  introduced_by: 5a380e9d31e840b2e475307d547a71bbc41fe26c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: local_sqlite
+    provider: provider_agnostic
+    operation: duplicate_replica_scheduling
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._refresh_legacy_mutation_runtime
+    call: t.start
+  replacement: Dialect-capable durable Serve runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_local_sqlite_serve_thread_start_scheduling
+      satisfied: false
+      evidence: []
+    test:
+    - id: local_sqlite_serve_duplicate_scheduling_retirement
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_local_sqlite_duplicate_schedule_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: local_sqlite_serve_scheduler_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: local_sqlite_serve_scheduler_owns_no_central_schema
+      satisfied: true
+      evidence:
+      - This local SQLite Serve scheduler owns no central PostgreSQL schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-010
+  milestone: M5
+  introduced_by: 6585dc9d5bcb87b2e6d3cc993153611d294dd90d
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: local_sqlite
+    provider: provider_agnostic
+    operation: failed_cleanup_retry
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._schedule_failed_cleanup_retry
+  replacement: Dialect-capable durable Serve runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_local_sqlite_serve_failed_cleanup_retry_helper
+      satisfied: false
+      evidence: []
+    test:
+    - id: local_sqlite_serve_failed_cleanup_retirement
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_local_sqlite_cleanup_retry_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: local_sqlite_serve_cleanup_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: local_sqlite_serve_cleanup_owns_no_central_schema
+      satisfied: true
+      evidence:
+      - This local SQLite Serve cleanup retry owns no central PostgreSQL schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-011
+  milestone: M5
+  introduced_by: 5a380e9d31e840b2e475307d547a71bbc41fe26c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: central_postgresql
+    provider: provider_agnostic
+    operation: replica_request_cancellation
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._terminate_replica
+    call: sdk.api_cancel
+  replacement: M5 durable Serve action cancellation runtime
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_central_postgresql_serve_replica_cancel_call
+      satisfied: false
+      evidence: []
+    test:
+    - id: central_postgresql_serve_cancel_epoch_incarnation_and_retry_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_central_serve_legacy_cancel_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: m5_serve_cancel_runtime_rollback_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_cancel_path_owns_no_schema
+      satisfied: true
+      evidence:
+      - The in-process Serve cancellation path owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-012
+  milestone: M5
+  introduced_by: 5a380e9d31e840b2e475307d547a71bbc41fe26c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: controller_sqlite
+    provider: provider_agnostic
+    operation: replica_request_cancellation
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._terminate_replica
+    call: sdk.api_cancel
+  replacement: Dialect-capable durable Serve cancellation runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_controller_sqlite_serve_replica_cancel_call
+      satisfied: false
+      evidence: []
+    test:
+    - id: controller_sqlite_serve_cancel_retirement_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_controller_sqlite_serve_cancel_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: controller_sqlite_serve_cancel_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_cancel_path_owns_no_schema
+      satisfied: true
+      evidence:
+      - The in-process Serve cancellation path owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-013
+  milestone: M5
+  introduced_by: 5a380e9d31e840b2e475307d547a71bbc41fe26c
+  obligation: must_remove
+  disposition: replace_content
+  scope:
+    domain: serve
+    store: local_sqlite
+    provider: provider_agnostic
+    operation: replica_request_cancellation
+  runtime_affecting: true
+  locators:
+  - kind: python_call_within
+    path: sky/serve/replica_managers.py
+    symbol: SkyPilotReplicaManager._terminate_replica
+    call: sdk.api_cancel
+  replacement: Dialect-capable durable Serve cancellation runtime or product deprecation
+  dependencies: []
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_local_sqlite_serve_replica_cancel_call
+      satisfied: false
+      evidence: []
+    test:
+    - id: local_sqlite_serve_cancel_retirement_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_supported_local_sqlite_serve_cancel_use
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: local_sqlite_serve_cancel_deprecation_or_runtime_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_cancel_path_owns_no_schema
+      satisfied: true
+      evidence:
+      - The in-process Serve cancellation path owns no database schema.
+  retained_references: []
+  evidence: {}
+  blocker: null
+- id: PLA-M5-014
+  milestone: M5
+  introduced_by: cddfef839c60432da7c1b20660cb83757f476e70
+  obligation: must_remove
+  disposition: delete_symbol
+  scope:
+    domain: serve
+    store: process_memory
+    provider: provider_agnostic
+    operation: legacy_replica_retry_loop_owners
+  runtime_affecting: true
+  locators:
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: launch_cluster
+  - kind: python_symbol
+    path: sky/serve/replica_managers.py
+    symbol: terminate_cluster
+  replacement: M5 durable Serve action execution and retry runtime
+  dependencies:
+  - PLA-M5-001
+  - PLA-M5-004
+  - PLA-M5-008
+  status: present
+  status_history:
+  - planned
+  - present
+  gates:
+    source:
+    - id: zero_legacy_serve_launch_and_terminate_retry_loop_owners
+      satisfied: false
+      evidence: []
+    test:
+    - id: serve_launch_terminate_retry_backoff_cancellation_and_rollout_conformance
+      satisfied: false
+      evidence: []
+    telemetry:
+    - id: zero_legacy_serve_retry_loop_dispatch_one_release
+      satisfied: false
+      evidence: []
+    release_window:
+    - id: m5_physical_retry_loop_removal_window_closed
+      satisfied: false
+      evidence: []
+    schema:
+    - id: serve_retry_loop_symbols_own_no_schema
+      satisfied: true
+      evidence:
+      - The legacy Serve retry-loop symbols own no database schema.
+  retained_references: []
   evidence: {}
   blocker: null
 - id: PLA-M5-015
