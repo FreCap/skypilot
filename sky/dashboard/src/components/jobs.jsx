@@ -203,6 +203,7 @@ export function useManagedJobsPageData() {
         mountedRef.current && version === requestVersionRef.current;
       const refreshPromise = (async () => {
         let childRefreshPromise = null;
+        let childRefreshSucceeded = true;
         let poolSnapshotLoaded = false;
         if (isInitialLoad) {
           setPoolsLoading(true);
@@ -248,12 +249,13 @@ export function useManagedJobsPageData() {
             try {
               await childRefreshPromise;
             } catch (error) {
+              childRefreshSucceeded = false;
               if (ownsState()) {
                 console.error('Error refreshing managed jobs table:', error);
               }
             }
           }
-          if (ownsState() && poolSnapshotLoaded) {
+          if (ownsState() && poolSnapshotLoaded && childRefreshSucceeded) {
             setLastFetchedTime(new Date());
           }
           if (ownsState() && isInitialLoad) {

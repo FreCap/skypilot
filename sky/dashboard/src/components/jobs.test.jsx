@@ -280,6 +280,57 @@ describe('managed jobs page initialization', () => {
     expect(refreshSettled).toBe(true);
   });
 
+  it('does not advance last updated when the child jobs refresh fails', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const childRefresh = deferred();
+    dashboardCache.get
+      .mockResolvedValueOnce({ pools: [{ name: 'initial-pool' }] })
+      .mockResolvedValueOnce({ pools: [{ name: 'manual-pool' }] });
+    const consoleError = jest
+      .spyOn(console, 'error')
+      .mockImplementation(() => {});
+    const { result, unmount } = renderHook(() => useManagedJobsPageData());
+
+    try {
+      await waitFor(() => {
+        expect(result.current.poolsData).toEqual([{ name: 'initial-pool' }]);
+      });
+      const initialTimestamp = result.current.lastFetchedTime?.getTime();
+      expect(initialTimestamp).not.toBeNull();
+
+      result.current.jobsRefreshRef.current = () => childRefresh.promise;
+      jest.setSystemTime(new Date('2026-01-01T01:00:00Z'));
+
+      let refreshPromise;
+      await act(async () => {
+        refreshPromise = result.current.handleRefresh();
+        await Promise.resolve();
+      });
+
+      await waitFor(() => {
+        expect(result.current.poolsData).toEqual([{ name: 'manual-pool' }]);
+      });
+
+      await act(async () => {
+        childRefresh.reject(new Error('child refresh failed'));
+        await refreshPromise;
+      });
+
+      await waitFor(() => {
+        expect(consoleError).toHaveBeenCalledWith(
+          'Error refreshing managed jobs table:',
+          expect.objectContaining({ message: 'child refresh failed' })
+        );
+      });
+      expect(result.current.lastFetchedTime?.getTime()).toBe(initialTimestamp);
+    } finally {
+      unmount();
+      consoleError.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
   it('ignores a stale request failure after a refresh succeeds', async () => {
     const initialPools = deferred();
     const refreshedPools = deferred();
