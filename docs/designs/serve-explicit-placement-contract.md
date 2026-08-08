@@ -491,27 +491,71 @@ An advisory-lock wait inside a trigger is not this fence: a repeatable-read or
 serializable transaction may keep a snapshot taken before the wait and miss the
 newly committed terminal row.  Revision 040 therefore owns one internal
 singleton write-fence row containing a monotonic generation, the latest
-admitted run UUID, and an optional terminal run UUID.  Every run `BEFORE
-INSERT` takes the unchanged cross-protocol advisory identity without waiting;
-failure to acquire it aborts instead of continuing on the statement snapshot.
-It then atomically updates that singleton only while the terminal UUID is NULL.
+admitted run UUID and transaction ID, and optional terminal run UUID and
+transaction ID.  A run `BEFORE INSERT FOR EACH ROW` trigger takes the unchanged
+cross-protocol advisory identity without waiting; failure to acquire it aborts
+instead of continuing on the statement snapshot.  An `AFTER INSERT FOR EACH
+ROW` trigger then atomically advances the singleton only while its terminal UUID
+is NULL.  Its source run must have PostgreSQL `xmin` equal to
+`pg_current_xact_id()`, and the singleton records that same transaction ID.
 Concurrent read-committed statements re-evaluate the updated row after a wait,
 while an older repeatable-read/serializable snapshot receives PostgreSQL's
-concurrent-update serialization failure.  A terminal ledger-row `BEFORE
-INSERT` verifies that its protocol-4 run is the singleton's latest admitted
-run and sets the terminal UUID in the same transaction.  Rollback therefore
-rolls back both admission and terminal activation; no nontransactional marker
-may poison the fence.
+concurrent-update serialization failure.
 
-The singleton is migration-private state, not an application interface.  Its
-own `ENABLE ALWAYS` trigger rejects direct `INSERT`, `DELETE`, `TRUNCATE`, and
-top-level `UPDATE`; only the nested updates issued by the exact run-admission
-and terminal-activation trigger functions are accepted.  Revision 040 verifies
-the complete trigger/function envelope: exact relation, function, event,
-row/statement level, always-enabled state, no `WHEN` predicate, arguments,
-transition tables, constraint metadata, duplicate name, overload, or function
-configuration.  A partial, disabled, predicate-gated, or same-name shadow
-catalog is a migration failure, not an adoptable state.
+Terminal activation is an `AFTER INSERT FOR EACH ROW`, `DEFERRABLE INITIALLY
+DEFERRED` constraint trigger on the row ledger.  At transaction end it performs
+one conditional `UPDATE ... RETURNING` compare-and-set: the row must be the
+exact protocol-4 `historical_physical_per_gpu/retired` tuple, both the run and
+row `xmin` values must equal the current transaction ID, and the singleton's
+latest run and admitted transaction ID must match them.  A run committed
+without such a row can never be activated by a delayed insert.  The compare-and-
+set accepts an already-terminal singleton only for the same run and same
+transaction, so two or more valid retired candidates in one manifest are
+idempotent while a competing activation fails.  Rollback rolls back admission
+and terminal activation together; no nontransactional marker may poison the
+fence.
+
+The singleton is migration-private state, not an application interface.  It
+has exactly one row and the exact columns `singleton boolean`, `generation
+bigint`, `latest_run_id uuid`, `admitted_xid xid8`, `terminal_run_id uuid`, and
+`terminal_xid xid8`.  `singleton` is the true primary key; generation is
+nonnegative; generation zero is equivalent to both admission fields being
+NULL; the two terminal fields are either both NULL or both present; and a
+present terminal UUID equals the latest UUID.  Both UUIDs have nondeferrable,
+restricting foreign keys to the run ledger.  The initial row is exactly
+`(true, 0, NULL, NULL, NULL, NULL)`, and upgrade refuses any pre-existing
+protocol-4 terminal tuple instead of seeding an incoherent open fence.
+
+`ENABLE ALWAYS` singleton triggers reject every direct `INSERT`, `DELETE`, or
+`TRUNCATE`.  Its `UPDATE` guard accepts only one of the two exact state
+transitions above at trigger depth two.  This is not a depth-only bypass: an
+admission transition must be a one-generation advance to a newly inserted run
+whose unforgeable `xmin` is the recorded current transaction, and an activation
+transition must retain every admission field and prove a newly inserted exact
+terminal row with that same `xmin`.  Once the source trigger has made either
+transition, a top-level replay cannot make another valid state change.  The
+verified source-table trigger inventory admits no additional trigger that could
+issue a transition first.
+
+Revision 040 verifies the complete relation, constraint, index,
+trigger/function, owner, ACL, and data envelope: exact columns, PostgreSQL
+types, nullability, defaults, primary/check/foreign-key behavior, one coherent
+singleton row, relation kind/persistence/RLS state, function owner and revoked
+PUBLIC execution, fixed `pg_catalog` search path, security/volatility/parallel
+attributes, exact relation/function/event and row/statement level,
+always-enabled state, and no `WHEN` predicate, arguments, transition tables,
+unexpected constraint metadata, duplicate name, overload, or extra source
+trigger.  A partial, disabled, predicate-gated, shadowed, or owner/ACL/config-
+drifted catalog is a migration failure, not an adoptable state.
+
+Downgrade is serialized with the writer rather than relying on a point-in-time
+terminal query.  It must first acquire the same advisory transaction lock
+without waiting, then take fixed-order `ACCESS EXCLUSIVE` locks on the
+singleton, run ledger, and row ledger, reverify the exact catalog and singleton,
+and recheck terminal state before removing revision 040.  If a writer owns the
+advisory authority, downgrade fails busy; if downgrade owns it first, a writer
+cannot enter before the catalog removal commits.  A committed terminal UUID
+always makes downgrade fail closed.
 
 This database boundary is necessary because a maliciously coherent rewrite of
 the run protocol, every row classification and dependency fact, all counts,
@@ -1174,7 +1218,7 @@ release is the minimum server rollback floor.
 
 The protocol-4 follow-up adds PostgreSQL-only schema revision 040 for the
 append-only run/row triggers and the post-terminal run-insert fence described
-above, including its single internal transactional gate row.  It changes no
+above, including its single internal transaction-bound gate row.  It changes no
 placement pickle during startup.  Reader-first rollout
 must prove the trigger definitions are installed before the held operator
 transaction; after the terminal row commits, rollback to any image that does
@@ -1522,8 +1566,18 @@ Automated coverage must prove:
   serializable old-writer transactions whose snapshots precede or overlap the
   terminal commit and require every physically later run either to fail at the
   busy advisory gate, observe the terminal singleton, or abort with a
-  serialization failure; tamper with each function/trigger envelope field and
-  the singleton through top-level DML and require fail-closed rejection;
+  serialization failure; commit a terminal-mode run without a retired row and
+  require a later row insertion to fail its transaction binding; accept two
+  terminal candidates inserted by the same admitted run and reject a competing
+  activation; race downgrade and terminal admission in both lock orders and
+  require exactly one authority to proceed; tamper with every singleton
+  column/default/type/nullability/key/check/FK, singleton row value/count,
+  relation owner/ACL/kind/persistence/RLS state, and function/trigger owner,
+  ACL, search-path, body, event, enablement, predicate, argument, transition,
+  constraint, overload, or duplicate/extra-source-trigger field and require
+  fail-closed rejection; attempt every top-level singleton DML operation and a
+  depth-two update without the exact current-transaction source tuples and
+  require rejection;
 - either candidate or intent ownership, duplicate/missing/colliding matches,
   malformed false-ish cleanup fields, noncanonical scope metadata, inventory
   overflow/drift, or ledger-fact tampering blocks retirement;
