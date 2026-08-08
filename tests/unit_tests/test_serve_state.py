@@ -808,6 +808,7 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             'down_shadow_coverage_id': down_shadow_coverage_id,
             'launch_shadow_sample_id': launch_shadow_coverage_id,
             'down_shadow_sample_id': down_shadow_coverage_id,
+            'resource_action_spec_identity_sha256': None,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(_mock_serve_db) as session:
@@ -1186,7 +1187,7 @@ def test_replica_index_migration_rejects_same_name_with_wrong_columns(tmp_path):
 def test_elected_version_migration_backfills_latest_committed_version(
         tmp_path, monkeypatch):
     engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
-    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '013')
+    monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '013')
     serve_state.create_table(engine)
     with engine.begin() as connection:
         connection.execute(serve_state.services_table.insert().values(
@@ -1208,10 +1209,15 @@ def test_elected_version_migration_backfills_latest_committed_version(
             'yaml_content': None,
         }])
 
-    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '014')
+    monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '014')
     serve_state.create_table(engine)
 
-    assert _read_row(engine, 'svc')['current_version'] == 2
+    with engine.connect() as connection:
+        current_version = connection.execute(
+            sqlalchemy.select(
+                serve_state.services_table.c.current_version).where(
+                    serve_state.services_table.c.name == 'svc')).scalar_one()
+    assert current_version == 2
 
 
 def test_version_provenance_migration_adds_nullable_columns(
@@ -1235,7 +1241,7 @@ def test_version_provenance_migration_adds_nullable_columns(
             sqlalchemy.text(
                 "INSERT INTO alembic_version_serve_state_db VALUES ('014')"))
 
-    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '015')
+    monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '015')
     serve_state.create_table(engine)
 
     columns = {
@@ -1268,7 +1274,7 @@ def test_submitted_version_yaml_migration_adds_nullable_column(
             sqlalchemy.text(
                 "INSERT INTO alembic_version_serve_state_db VALUES ('016')"))
 
-    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '017')
+    monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '017')
     serve_state.create_table(engine)
 
     columns = {
@@ -1310,7 +1316,7 @@ def test_placement_catalog_migration_adds_nullable_column(
                             '(service_name, version, yaml_content) '
                             "VALUES ('legacy-svc', 1, 'yaml: v1')"))
 
-    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '028')
+    monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '028')
     serve_state.create_table(engine)
 
     columns = {
@@ -1353,7 +1359,7 @@ def test_controller_config_migration_adds_nullable_applied_receipt(
             spec=b'opaque',
             yaml_content='yaml: legacy'))
 
-    monkeypatch.setattr(migration_utils, 'SERVE_VERSION', '036')
+    monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '036')
     serve_state.create_table(engine)
 
     columns = {

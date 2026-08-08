@@ -18,6 +18,7 @@ only sqlite. This module:
 """
 # pylint: disable=cell-var-from-loop,missing-class-docstring
 # pylint: disable=protected-access,redefined-outer-name,unused-import
+import contextlib
 import datetime
 import importlib
 import os
@@ -86,6 +87,17 @@ pytestmark = pytest.mark.skipif(
     reason='docker unavailable; skipping real-Postgres broker tests')
 if _DOCKER_UNAVAILABLE and _POSTGRES_REQUIRED:
     pytest.fail('Docker is required for Serve PostgreSQL tests.', pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_disposable_database_migrations(monkeypatch):
+    """Do not serialize migrations across independent throwaway databases."""
+
+    @contextlib.contextmanager
+    def _unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', _unlocked)
 
 
 def _service_spec(*, pool: bool = False) -> service_spec.SkyServiceSpec:
@@ -3517,121 +3529,50 @@ class TestMigrationChainPG:
         """Both pre-merge revision 016 schemas converge on PostgreSQL."""
         url = _create_database(pg_server, f'migration_{uuid.uuid4().hex[:8]}')
         engine = create_engine(url)
-        metadata = sqlalchemy.MetaData()
-        service_columns = [
-            sqlalchemy.Column('name', sqlalchemy.Text, primary_key=True)
-        ]
-        if preview_workspace_016:
-            service_columns.append(
-                sqlalchemy.Column('workspace', sqlalchemy.Text))
-        else:
-            service_columns.extend([
-                sqlalchemy.Column('lb_ha_enabled',
-                                  sqlalchemy.Integer,
-                                  nullable=False,
-                                  server_default='0'),
-                sqlalchemy.Column('lb_active_slot', sqlalchemy.Text),
-                sqlalchemy.Column('lb_cutover_generation',
-                                  sqlalchemy.Integer,
-                                  nullable=False,
-                                  server_default='0'),
-                sqlalchemy.Column('lb_pending_slot', sqlalchemy.Text),
-                sqlalchemy.Column('lb_cutover_phase',
-                                  sqlalchemy.Text,
-                                  nullable=False,
-                                  server_default='STABLE'),
-                sqlalchemy.Column('lb_drain_started_at', sqlalchemy.Float),
-                sqlalchemy.Column('lb_demand_handoff_generation',
-                                  sqlalchemy.Integer),
-                sqlalchemy.Column('lb_demand_handoff_snapshot',
-                                  sqlalchemy.Text),
-                sqlalchemy.Column('lb_demand_handoff_complete_at',
-                                  sqlalchemy.Float),
-                sqlalchemy.Column('lb_last_demand_snapshot', sqlalchemy.Text),
-            ])
-        services = sqlalchemy.Table('services', metadata, *service_columns)
-        versions = sqlalchemy.Table(
-            'version_specs', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
-            sqlalchemy.Column('created_at', sqlalchemy.Float),
-            sqlalchemy.Column('created_by', sqlalchemy.Text))
-        sqlalchemy.Table(
-            'replicas', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('replica_id',
-                              sqlalchemy.Integer,
-                              primary_key=True),
-            sqlalchemy.Column('version', sqlalchemy.Integer))
-        sqlalchemy.Table(
-            'serve_replica_status_history', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('service_hash', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('version', sqlalchemy.Integer, primary_key=True),
-            sqlalchemy.Column('bucket_start',
-                              sqlalchemy.DateTime(timezone=True),
-                              primary_key=True),
-            sqlalchemy.Column('observed_at',
-                              sqlalchemy.DateTime(timezone=True),
-                              nullable=False),
-            sqlalchemy.Column('ready_count', sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('provisioning_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('not_ready_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('errored_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('preempted_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('stopping_count',
-                              sqlalchemy.Integer,
-                              nullable=False),
-            sqlalchemy.Column('total_count', sqlalchemy.Integer,
-                              nullable=False))
-        sqlalchemy.Table(
-            'serve_request_activity_history', metadata,
-            sqlalchemy.Column('service_name', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('service_hash', sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('reporter_session_id',
-                              sqlalchemy.Text,
-                              primary_key=True),
-            sqlalchemy.Column('bucket_start',
-                              sqlalchemy.DateTime(timezone=True),
-                              primary_key=True),
-            sqlalchemy.Column('observed_at',
-                              sqlalchemy.DateTime(timezone=True),
-                              nullable=False),
-            sqlalchemy.Column('request_count',
-                              sqlalchemy.Integer,
-                              nullable=False))
-        metadata.create_all(engine)
         try:
+            migration_utils.safe_alembic_upgrade(engine,
+                                                 migration_utils.SERVE_DB_NAME,
+                                                 '015')
             with engine.begin() as connection:
-                connection.execute(services.insert().values(name='legacy-svc'))
-                connection.execute(versions.insert().values(
-                    service_name='legacy-svc',
-                    version=1,
-                    created_at=1.0,
-                    created_by='legacy-writer'))
+                collision_columns = ('workspace', 'lb_ha_enabled',
+                                     'lb_active_slot', 'lb_cutover_generation',
+                                     'lb_pending_slot', 'lb_cutover_phase',
+                                     'lb_drain_started_at',
+                                     'lb_demand_handoff_generation',
+                                     'lb_demand_handoff_snapshot',
+                                     'lb_demand_handoff_complete_at',
+                                     'lb_last_demand_snapshot')
+                for column in collision_columns:
+                    connection.exec_driver_sql(
+                        f'ALTER TABLE services DROP COLUMN IF EXISTS {column}')
+                if preview_workspace_016:
+                    connection.exec_driver_sql(
+                        'ALTER TABLE services ADD COLUMN workspace TEXT')
+                else:
+                    for definition in (
+                            'lb_ha_enabled INTEGER NOT NULL DEFAULT 0',
+                            'lb_active_slot TEXT',
+                            'lb_cutover_generation INTEGER NOT NULL DEFAULT 0',
+                            'lb_pending_slot TEXT',
+                            "lb_cutover_phase TEXT NOT NULL DEFAULT 'STABLE'",
+                            'lb_drain_started_at DOUBLE PRECISION',
+                            'lb_demand_handoff_generation INTEGER',
+                            'lb_demand_handoff_snapshot TEXT',
+                            'lb_demand_handoff_complete_at DOUBLE PRECISION',
+                            'lb_last_demand_snapshot TEXT'):
+                        connection.exec_driver_sql(
+                            f'ALTER TABLE services ADD COLUMN {definition}')
+                connection.execute(serve_state.services_table.insert().values(
+                    name='legacy-svc'))
                 connection.execute(
-                    sqlalchemy.text(
-                        'CREATE TABLE alembic_version_serve_state_db '
-                        '(version_num VARCHAR(32) NOT NULL)'))
+                    serve_state.version_specs_table.insert().values(
+                        service_name='legacy-svc',
+                        version=1,
+                        created_at=1.0,
+                        created_by='legacy-writer'))
                 connection.execute(
-                    sqlalchemy.text(
-                        "INSERT INTO alembic_version_serve_state_db "
-                        "VALUES ('016')"))
+                    sqlalchemy.text('UPDATE alembic_version_serve_state_db '
+                                    "SET version_num = '016'"))
 
             migration_utils.safe_alembic_upgrade(engine,
                                                  migration_utils.SERVE_DB_NAME,

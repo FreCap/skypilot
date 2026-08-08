@@ -759,7 +759,7 @@ serve_resource_action_shadow_admission_fallback_history
   committed_at                  TIMESTAMPTZ not null
   unique (operation_id)
 
-serve_resource_action_shadow_admission_fallback_progress_history
+serve_resource_action_shadow_admission_fallback_progress_log
   decision_id                   UUID primary key
   fallback_operation_id         UUID not null
   progress_operation_id         UUID not null

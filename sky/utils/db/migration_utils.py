@@ -52,8 +52,64 @@ SPOT_JOBS_VERSION = '027'  # ordered managed-job scheduler lookup
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '037'  # placement normalization and retirement ledger
+SERVE_VERSION = '039'  # durable resource-action execution history
+SERVE_NON_POSTGRES_VERSION = '037'  # retained local/controller SQLite head
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
+SERVE_MIGRATION_CEILING_ENV_VAR = (
+    'SKYPILOT_SERVER_SERVE_SCHEMA_MIGRATION_CEILING')
+
+
+def serve_target_version(engine: sqlalchemy.engine.Engine) -> str:
+    """Return the dialect-safe Serve migration target.
+
+    Serve038+ install PostgreSQL-only authority state and deliberately refuse
+    a SQLite stamp.  The chart-owned cleanup ceiling is meaningful only for
+    the consolidated PostgreSQL database.  Local/controller SQLite remains at
+    its independent 037 head; every other dialect is unsupported.
+    """
+    configured_ceiling = os.environ.get(SERVE_MIGRATION_CEILING_ENV_VAR)
+    dialect = engine.dialect.name
+    if configured_ceiling is not None:
+        if configured_ceiling != SERVE_NON_POSTGRES_VERSION:
+            raise RuntimeError(
+                f'{SERVE_MIGRATION_CEILING_ENV_VAR} must be exactly '
+                f'{SERVE_NON_POSTGRES_VERSION!r} when present.')
+        if dialect != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError(
+                f'{SERVE_MIGRATION_CEILING_ENV_VAR} applies only to the '
+                'PostgreSQL Serve database.')
+        return configured_ceiling
+    if dialect == db_utils.SQLAlchemyDialect.SQLITE.value:
+        return SERVE_NON_POSTGRES_VERSION
+    if dialect == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return SERVE_VERSION
+    raise RuntimeError(f'Unsupported SkyServe database dialect {dialect!r}.')
+
+
+def _require_exact_serve_migration_ceiling(
+    engine: sqlalchemy.engine.Engine,
+    section: str,
+    target_revision: str,
+    alembic_ini_path: str | None,
+) -> None:
+    """Fail closed unless a configured retirement pin is already exact."""
+    configured_ceiling = os.environ.get(SERVE_MIGRATION_CEILING_ENV_VAR)
+    if configured_ceiling is None or section != SERVE_DB_NAME:
+        return
+    if target_revision != configured_ceiling:
+        raise RuntimeError(
+            f'{SERVE_MIGRATION_CEILING_ENV_VAR}={configured_ceiling!r} '
+            f'conflicts with Serve target {target_revision!r}.')
+    current_revision = get_current_alembic_revision(engine, section,
+                                                    alembic_ini_path)
+    if current_revision != configured_ceiling:
+        observed = current_revision or 'uninitialized'
+        raise RuntimeError(
+            f'{section} database is at revision {observed}, but '
+            f'{SERVE_MIGRATION_CEILING_ENV_VAR} requires exact revision '
+            f'{configured_ceiling}. Accepted-V1 retirement must finish before '
+            'the Serve schema advances.')
+
 
 SKYPILOT_CONFIG_DB_NAME = 'sky_config_db'
 SKYPILOT_CONFIG_VERSION = '001'  # initial alembic for config_yaml table
@@ -336,6 +392,8 @@ def safe_alembic_upgrade(engine: sqlalchemy.engine.Engine,
     """
     if mode not in ('auto', 'upgrade', 'bootstrap', 'verify'):
         raise ValueError(f'Invalid database migration mode: {mode!r}.')
+    _require_exact_serve_migration_ceiling(engine, section, target_revision,
+                                           alembic_ini_path)
     # set alembic logger to warning level
     alembic_logger = logging.getLogger('alembic')
     alembic_logger.setLevel(logging.WARNING)

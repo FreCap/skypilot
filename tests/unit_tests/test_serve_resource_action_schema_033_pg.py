@@ -635,7 +635,7 @@ def _install_old_feature_draft(engine: sqlalchemy.engine.Engine) -> None:
                                                           checkfirst=True)
 
 
-def test_serve_alembic_lineage_has_033_through_normalization_037() -> None:
+def test_serve_alembic_lineage_has_033_through_action_history_039() -> None:
     engine = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
@@ -643,13 +643,15 @@ def test_serve_alembic_lineage_has_033_through_normalization_037() -> None:
     revisions = list(scripts.walk_revisions())
     revision_ids = [revision.revision for revision in revisions]
     assert len(revision_ids) == len(set(revision_ids))
-    assert scripts.get_heads() == ['037']
+    assert scripts.get_heads() == ['039']
     revision_032 = scripts.get_revision('032')
     revision_033 = scripts.get_revision('033')
     revision_034 = scripts.get_revision('034')
     revision_035 = scripts.get_revision('035')
     revision_036 = scripts.get_revision('036')
     revision_037 = scripts.get_revision('037')
+    revision_038 = scripts.get_revision('038')
+    revision_039 = scripts.get_revision('039')
     assert Path(revision_032.path).name == (
         '032_serve_request_rejection_classification.py')
     assert revision_032.down_revision == '031'
@@ -665,7 +667,14 @@ def test_serve_alembic_lineage_has_033_through_normalization_037() -> None:
     assert Path(
         revision_037.path).name == ('037_placement_normalization_ledger.py')
     assert revision_037.down_revision == '036'
-    assert migration_utils.SERVE_VERSION == '037'
+    assert Path(
+        revision_038.path).name == ('038_serve_resource_action_authority.py')
+    assert revision_038.down_revision == '037'
+    assert Path(revision_039.path).name == (
+        '039_serve_resource_action_execution_history.py')
+    assert revision_039.down_revision == '038'
+    assert migration_utils.SERVE_VERSION == '039'
+    assert migration_utils.SERVE_NON_POSTGRES_VERSION == '037'
 
 
 def test_staged_and_head_schema_aliases_are_disjoint_and_complete() -> None:

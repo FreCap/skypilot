@@ -64,6 +64,20 @@ _POSTGRES_LOCK_APPLICATION_NAME = 'skypilot-advisory-lock'
 # or unexpectedly long transaction must not leave a worker waiting forever for
 # another connection from its process-local budget.
 _POSTGRES_POOL_TIMEOUT_SECONDS = 15
+# The authority-preflight transport has a five-second absolute request
+# deadline.  This reserved namespace is a separate one-connection pool so a
+# quarantined read cannot consume either the authority worker's shared
+# bootstrap pool or its API-instance heartbeat pool.  Its short graceful
+# limits complement (but do not replace) the transport-owned hard publication
+# deadline.
+AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE = 'authority-preflight'
+AUTHORITY_PREFLIGHT_POOL_SIZE = 1
+_AUTHORITY_PREFLIGHT_POOL_TIMEOUT_SECONDS = 0.25
+_AUTHORITY_PREFLIGHT_CONNECT_TIMEOUT_SECONDS = 1
+_AUTHORITY_PREFLIGHT_STATEMENT_TIMEOUT_MILLISECONDS = 3_500
+_AUTHORITY_PREFLIGHT_LOCK_TIMEOUT_MILLISECONDS = 750
+_AUTHORITY_PREFLIGHT_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS = 4_000
+_AUTHORITY_PREFLIGHT_APPLICATION_NAME = 'skypilot-authority-preflight'
 
 _API_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 _POSTGRES_CONNECTION_METRIC_PROCESS_ROLES = frozenset({
@@ -634,7 +648,11 @@ class DatabaseManager:
         # Use asyncio.to_thread to avoid blocking the event loop, matching the
         # original _init_db_async pattern.
         await asyncio.to_thread(init_db)
-        return self._engine_async
+        engine = self._engine_async
+        if engine is None:
+            raise RuntimeError('Async database engine initialization '
+                               'completed without an engine.')
+        return engine
 
 
 _max_connections = 0
@@ -921,6 +939,43 @@ def get_engine(
                         created_engine,
                         engine_namespace=engine_namespace,
                         mode='async')
+                elif (engine_namespace == AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE):
+                    created_engine = sqlalchemy.create_engine(
+                        conn_string,
+                        poolclass=sqlalchemy.pool.QueuePool,
+                        pool_size=AUTHORITY_PREFLIGHT_POOL_SIZE,
+                        max_overflow=0,
+                        pool_timeout=(
+                            _AUTHORITY_PREFLIGHT_POOL_TIMEOUT_SECONDS),
+                        # A pre-ping would precede transaction-local limits,
+                        # so do not issue one.  A stale connection instead
+                        # fails the read closed and is invalidated by the
+                        # driver/SQLAlchemy path.
+                        pool_pre_ping=False,
+                        pool_recycle=60,
+                        connect_args={
+                            'connect_timeout':
+                                (_AUTHORITY_PREFLIGHT_CONNECT_TIMEOUT_SECONDS),
+                            'application_name':
+                                (_AUTHORITY_PREFLIGHT_APPLICATION_NAME),
+                            'options': (
+                                '-c statement_timeout='
+                                f'{_AUTHORITY_PREFLIGHT_STATEMENT_TIMEOUT_MILLISECONDS} '
+                                '-c lock_timeout='
+                                f'{_AUTHORITY_PREFLIGHT_LOCK_TIMEOUT_MILLISECONDS} '
+                                '-c idle_in_transaction_session_timeout='
+                                f'{_AUTHORITY_PREFLIGHT_IDLE_TRANSACTION_TIMEOUT_MILLISECONDS}'
+                            ),
+                            'keepalives': 1,
+                            'keepalives_idle': 1,
+                            'keepalives_interval': 1,
+                            'keepalives_count': 1,
+                            'tcp_user_timeout': 4_000,
+                        })
+                    _install_postgres_connection_metrics_listener(
+                        created_engine,
+                        engine_namespace=engine_namespace,
+                        mode='sync')
                 elif _max_connections == 0:
                     created_engine = sqlalchemy.create_engine(
                         conn_string,

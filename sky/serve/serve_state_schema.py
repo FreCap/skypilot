@@ -9,6 +9,7 @@ from sqlalchemy.ext import declarative
 
 from sky.serve import constants
 from sky.serve import lb_ha
+from sky.serve import resource_action_m4_state_schema
 from sky.utils import common_utils
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -63,6 +64,7 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('resource_action_mode_changed_at',
                       sqlalchemy.DateTime(timezone=True),
                       server_default=None),
+    *resource_action_m4_state_schema.service_candidate_columns(),
     # Monotonic name-fence token claimed by the lifecycle operation that most
     # recently owns this row.  Unlike ``hash`` (which changes only when the
     # service is recreated), this advances on every up/update/down/purge lock
@@ -193,6 +195,7 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column('down_shadow_coverage_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('launch_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('down_shadow_sample_id', sqlalchemy.Uuid(as_uuid=True)),
+    *resource_action_m4_state_schema.replica_spec_identity_columns(),
 )
 sqlalchemy.Index('replicas_service_status_idx', replicas_table.c.service_name,
                  replicas_table.c.status)
@@ -252,6 +255,7 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_applied_at',
                       sqlalchemy.Float,
                       server_default=None),
+    *resource_action_m4_state_schema.version_spec_identity_columns(),
     sqlalchemy.CheckConstraint(
         '((retired_at IS NULL AND retired_yaml_content IS NULL AND '
         'retirement_reason IS NULL AND retirement_run_id IS NULL) OR '
@@ -817,7 +821,7 @@ def create_table(engine: sqlalchemy.engine.Engine):
     migration_utils.safe_alembic_upgrade(
         engine,
         migration_utils.SERVE_DB_NAME,
-        migration_utils.SERVE_VERSION,
+        migration_utils.serve_target_version(engine),
         mode=migration_utils.configured_migration_mode())
 
 
@@ -834,7 +838,22 @@ def get_database_engine() -> sqlalchemy.engine.Engine:
     return _db_manager.get_engine()
 
 
+def get_authority_preflight_database_engine() -> sqlalchemy.engine.Engine:
+    """Return the isolated one-connection engine for mutation-free V2 trust."""
+
+    default_engine = get_database_engine()
+    if default_engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError('Authority preflight requires central PostgreSQL.')
+    # Schema initialization deliberately stays on the ordinary manager.  This
+    # namespaced pool is for bounded, mutation-free trust transactions only and
+    # must never run migrations or bootstrap/heartbeat work.
+    return db_utils.get_engine(
+        'serve/services',
+        engine_namespace=db_utils.AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE)
+
+
 # Preserve the historical public identity exposed by sky.serve.serve_state.
 create_table.__module__ = 'sky.serve.serve_state'
 ensure_tables_initialized.__module__ = 'sky.serve.serve_state'
 get_database_engine.__module__ = 'sky.serve.serve_state'
+get_authority_preflight_database_engine.__module__ = 'sky.serve.serve_state'

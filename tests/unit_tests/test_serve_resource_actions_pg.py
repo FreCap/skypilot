@@ -13,6 +13,7 @@ from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
 from sky.serve import replica_managers
+from sky.serve import resource_action_m4_state_schema as m4_schema
 from sky.serve import resource_action_state_schema as action_schema
 from sky.serve import serve_state
 from sky.utils.db import migration_utils
@@ -133,6 +134,9 @@ def _coverage_values(sample: dict) -> dict:
         'action_type': sample['action_type'],
         'normalizer_contract_version': 1,
         'normalization_outcome': 'REPRESENTABLE',
+        'candidate_epoch': uuid.uuid4(),
+        'qualification_policy_sha256': 'd' * 64,
+        'qualification_binding_sha256': 'e' * 64,
     }
 
 
@@ -389,7 +393,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
                                          migration_utils.SERVE_VERSION)
     sample = _sample_values()
     with engine.begin() as connection:
-        connection.execute(sqlalchemy.insert(action_schema.SHADOW_COVERAGE),
+        connection.execute(sqlalchemy.insert(m4_schema.SHADOW_COVERAGE_V2),
                            _coverage_values(sample))
         connection.execute(sqlalchemy.insert(action_schema.SHADOW_SAMPLES),
                            sample)
@@ -409,14 +413,14 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
     invalid_parent['immutable_spec'] = []
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         with engine.begin() as connection:
-            connection.execute(sqlalchemy.insert(action_schema.SHADOW_COVERAGE),
+            connection.execute(sqlalchemy.insert(m4_schema.SHADOW_COVERAGE_V2),
                                _coverage_values(invalid_parent))
             connection.execute(sqlalchemy.insert(action_schema.SHADOW_SAMPLES),
                                invalid_parent)
 
     sample = _sample_values()
     with engine.begin() as connection:
-        connection.execute(sqlalchemy.insert(action_schema.SHADOW_COVERAGE),
+        connection.execute(sqlalchemy.insert(m4_schema.SHADOW_COVERAGE_V2),
                            _coverage_values(sample))
         connection.execute(sqlalchemy.insert(action_schema.SHADOW_SAMPLES),
                            sample)
@@ -458,9 +462,9 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
     database_path = pathlib.Path(tmp_path) / 'serve.db'
     engine = sqlalchemy.create_engine(f'sqlite:///{database_path}')
     try:
-        migration_utils.safe_alembic_upgrade(engine,
-                                             migration_utils.SERVE_DB_NAME,
-                                             migration_utils.SERVE_VERSION)
+        migration_utils.safe_alembic_upgrade(
+            engine, migration_utils.SERVE_DB_NAME,
+            migration_utils.SERVE_NON_POSTGRES_VERSION)
         inspector = sqlalchemy.inspect(engine)
         assert 'resource_action_mode' in {
             column['name'] for column in inspector.get_columns('services')
@@ -487,8 +491,8 @@ def test_sqlite_gets_only_inert_common_columns_and_refuses_down(tmp_path):
                            match='additive and cannot be downgraded'):
             alembic_command.downgrade(config, '031')
         assert migration_utils.get_current_alembic_revision(
-            engine,
-            migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
+            engine, migration_utils.SERVE_DB_NAME) == (
+                migration_utils.SERVE_NON_POSTGRES_VERSION)
     finally:
         engine.dispose()
 
@@ -530,6 +534,7 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
             'down_shadow_sample_id':
                 (None if replica_id % 2 else uuid.UUID(int=replica_id * 100 + 6)
                 ),
+            'resource_action_spec_identity_sha256': 'f' * 64,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(engine) as session:

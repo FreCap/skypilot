@@ -34,6 +34,7 @@ from sky.serve import maintenance
 from sky.serve import paid_capacity
 from sky.serve import placement_normalization_identity
 from sky.serve import placement_policy
+from sky.serve import resource_action_m4_state_schema
 from sky.serve import serve_state_schema
 from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
@@ -71,9 +72,18 @@ _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 _REPLICA_LAUNCH_AUTHORITY_LOCK_PREFIX = 'skyserve-replica-launch-authority'
 
 Base = serve_state_schema.Base
+# Keep every public Serve table on the one canonical metadata graph.  Local
+# SQLite remains physically capped at Serve037, so the one legacy whole-row
+# query below explicitly selects only columns present at that revision.
 services_table = serve_state_schema.services_table
 replicas_table = serve_state_schema.replicas_table
 version_specs_table = serve_state_schema.version_specs_table
+_SERVE038_SERVICE_COLUMN_NAMES = frozenset(
+    column.name
+    for column in resource_action_m4_state_schema.service_candidate_columns())
+_SERVE037_SERVICE_COLUMNS = tuple(
+    column for column in services_table.c
+    if column.name not in _SERVE038_SERVICE_COLUMN_NAMES)
 placement_normalization_runs_table = (
     serve_state_schema.placement_normalization_runs_table)
 placement_normalization_rows_table = (
@@ -1432,7 +1442,7 @@ def _build_services_with_latest_version_query(
     Returns:
         A SQLAlchemy selectable for fetching rows, including columns:
         - max_version (latest version per service)
-        - services_table.*
+        - Serve037 service columns (the legacy adapter contract)
         - spec/yaml_content (from version_specs_table for latest version)
     """
     subquery = sqlalchemy.select(
@@ -1442,7 +1452,7 @@ def _build_services_with_latest_version_query(
 
     query = sqlalchemy.select(
         subquery.c.max_version,
-        services_table,
+        *_SERVE037_SERVICE_COLUMNS,
         version_specs_table.c.spec,
         version_specs_table.c.yaml_content,
     ).select_from(
@@ -2519,6 +2529,7 @@ _ACTION_OWNED_REPLICA_COLUMNS = frozenset({
     'down_shadow_coverage_id',
     'launch_shadow_sample_id',
     'down_shadow_sample_id',
+    'resource_action_spec_identity_sha256',
 })
 _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PENDING.value,

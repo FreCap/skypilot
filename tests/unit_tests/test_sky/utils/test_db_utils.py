@@ -75,6 +75,16 @@ class TestSkyRuntimeDirEnvVar:
             assert expected_path in db_path
 
 
+@pytest.mark.asyncio
+async def test_database_manager_async_initialization_fails_without_engine(
+        monkeypatch):
+    manager = db_utils.DatabaseManager('test', lambda _: None)
+    monkeypatch.setattr(db_utils, 'get_engine', lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match='completed without an engine'):
+        await manager.get_async_engine()
+
+
 @pytest_asyncio.fixture
 async def isolated_database(tmp_path):
     """Create an isolated SQLiteConn backed by a real SQLite file."""
@@ -327,6 +337,53 @@ class TestGetEngine:
             assert call.kwargs['pool_size'] == 1
             assert call.kwargs['max_overflow'] == 0
 
+    def test_authority_preflight_namespace_is_one_bounded_isolated_pool(
+            self, monkeypatch):
+        """The hard-deadline reader cannot borrow the shared role pool."""
+
+        monkeypatch.setenv('IS_SKYPILOT_SERVER', 'true')
+        monkeypatch.setenv('SKYPILOT_DB_CONNECTION_URI',
+                           'postgresql://user:pass@localhost/db')
+        db_utils.set_max_connections(1)
+        ordinary_engine = mock.MagicMock()
+        preflight_engine = mock.MagicMock()
+
+        with mock.patch('sqlalchemy.create_engine',
+                        side_effect=[ordinary_engine,
+                                     preflight_engine]) as mock_create:
+            ordinary = db_utils.get_engine('serve/services')
+            preflight = db_utils.get_engine(
+                'serve/services',
+                engine_namespace=(
+                    db_utils.AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE))
+            assert db_utils.get_engine(
+                'ignored',
+                engine_namespace=(
+                    db_utils.AUTHORITY_PREFLIGHT_ENGINE_NAMESPACE)) is preflight
+
+        assert ordinary is ordinary_engine
+        assert preflight is preflight_engine
+        assert ordinary is not preflight
+        assert mock_create.call_count == 2
+        call = mock_create.call_args_list[1]
+        assert call.kwargs['poolclass'] == sqlalchemy.pool.QueuePool
+        assert call.kwargs['pool_size'] == 1
+        assert call.kwargs['max_overflow'] == 0
+        assert call.kwargs['pool_timeout'] == 0.25
+        assert call.kwargs['pool_pre_ping'] is False
+        assert call.kwargs['pool_recycle'] == 60
+        assert call.kwargs['connect_args'] == {
+            'connect_timeout': 1,
+            'application_name': 'skypilot-authority-preflight',
+            'options': ('-c statement_timeout=3500 -c lock_timeout=750 '
+                        '-c idle_in_transaction_session_timeout=4000'),
+            'keepalives': 1,
+            'keepalives_idle': 1,
+            'keepalives_interval': 1,
+            'keepalives_count': 1,
+            'tcp_user_timeout': 4_000,
+        }
+
     def test_postgres_lock_connections_use_separate_nullpool(self):
         """Session locks must not consume an ordinary QueuePool checkout."""
         ordinary_engine = mock.MagicMock()
@@ -543,6 +600,7 @@ class TestGetEngine:
     @pytest.mark.parametrize(('namespace', 'expected'),
                              [(None, 'shared'), ('', 'shared'),
                               ('api-requests-control', 'api-requests-control'),
+                              ('authority-preflight', 'other'),
                               ('advisory-lock', 'advisory-lock'),
                               ('physical-capacity-evidence', 'other'),
                               ('caller-controlled-value', 'other')])
