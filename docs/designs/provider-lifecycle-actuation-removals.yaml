@@ -17292,7 +17292,7 @@ artifacts:
   blocker: null
 - id: PLA-M5-022
   milestone: M5
-  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  introduced_by: null
   bundle: serve.resource_action.contracts.022-025
   obligation: must_remove
   disposition: delete_symbol
@@ -17308,10 +17308,9 @@ artifacts:
     symbol: ServeReplicaMutationRouter._route_launch_with_transitional_legacy_compatibility
   replacement: Direct durable Serve launch action routing for the qualified exact M4 cohort
   dependencies: []
-  status: present
+  status: planned
   status_history:
   - planned
-  - present
   gates:
     source:
     - id: transitional_authoritative_launch_routing_symbol_absent
@@ -17348,7 +17347,7 @@ artifacts:
   blocker: null
 - id: PLA-M5-023
   milestone: M5
-  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  introduced_by: null
   bundle: serve.resource_action.contracts.022-025
   obligation: must_remove
   disposition: delete_symbol
@@ -17364,10 +17363,9 @@ artifacts:
     symbol: ServeReplicaMutationRouter._route_down_with_transitional_legacy_compatibility
   replacement: Direct durable Serve down and exact-incarnation cleanup routing for the qualified exact M4 cohort
   dependencies: []
-  status: present
+  status: planned
   status_history:
   - planned
-  - present
   gates:
     source:
     - id: transitional_authoritative_down_routing_symbol_absent
@@ -17407,7 +17405,7 @@ artifacts:
   blocker: null
 - id: PLA-M5-024
   milestone: M5
-  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  introduced_by: null
   bundle: serve.resource_action.contracts.022-025
   obligation: must_remove
   disposition: delete_symbol
@@ -17423,10 +17421,9 @@ artifacts:
     symbol: ServeReplicaMutationRouter._read_transitional_legacy_operation_state
   replacement: Durable Serve action, attempt, request, and database-clock state for the qualified exact M4 cohort
   dependencies: []
-  status: present
+  status: planned
   status_history:
   - planned
-  - present
   gates:
     source:
     - id: transitional_legacy_operation_state_reader_symbol_absent
@@ -17463,7 +17460,7 @@ artifacts:
   blocker: null
 - id: PLA-M5-025
   milestone: M5
-  introduced_by: 5ea73888bcf31e715cf097b4596e117ad47ca9ed
+  introduced_by: null
   bundle: serve.resource_action.contracts.022-025
   obligation: must_remove
   disposition: delete_symbol
@@ -17479,10 +17476,9 @@ artifacts:
     symbol: ServeReplicaMutationRouter._recover_transitional_legacy_operation
   replacement: Durable Serve dispatcher and reducer recovery for the qualified exact M4 cohort
   dependencies: []
-  status: present
+  status: planned
   status_history:
   - planned
-  - present
   gates:
     source:
     - id: transitional_legacy_operation_recovery_symbol_absent

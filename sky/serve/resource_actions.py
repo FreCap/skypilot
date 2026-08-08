@@ -610,6 +610,12 @@ def _version_one(value: Any, *, name: str) -> int:
     return value
 
 
+def _version_two(value: Any, *, name: str) -> int:
+    if type(value) is not int or value != 2:
+        raise ValueError(f'{name} must be integer 2.')
+    return value
+
+
 def _optional_nonnegative_integer(value: Any, *, name: str) -> int | None:
     if value is None:
         return None
@@ -14193,6 +14199,1711 @@ def provider_authority_preflight_response_from_value_v1(
 
 
 @dataclasses.dataclass(frozen=True)
+class ProviderAuthorityWorkerCohortReferenceV1(_CanonicalContract):
+    """Compact, non-authorizing reference to one retained worker cohort."""
+
+    version: int
+    cohort_id: str
+    cohort_identity_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'version', 'cohort_id', 'cohort_identity_sha256'})
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='worker cohort reference version')
+        object.__setattr__(
+            self, 'cohort_id',
+            _authority_cohort_id(self.cohort_id,
+                                 name='worker cohort reference cohort_id'))
+        object.__setattr__(
+            self, 'cohort_identity_sha256',
+            _sha256(self.cohort_identity_sha256,
+                    name=('worker cohort reference '
+                          'cohort_identity_sha256')))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderAuthorityWorkerCohortReferenceV1:
+        raw = _closed_object(value,
+                             name='worker cohort reference',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'cohort_id': self.cohort_id,
+            'cohort_identity_sha256': self.cohort_identity_sha256,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesExecutionCapsuleV2(_CanonicalContract):
+    """Compact live launch capsule resolved against a locked cohort row."""
+
+    version: int
+    implementation_contract: str
+    executor_cohort: ProviderAuthorityWorkerCohortReferenceV1
+    config_projection: ProviderKubernetesConfigProjectionV1
+    config_projection_sha256: str
+    scope: ProviderKubernetesScopeV1
+    principals: ProviderKubernetesPrincipalsV1
+    prerequisites: tuple[ProviderKubernetesPrerequisiteV1, ...]
+    request_identity: ProviderKubernetesRequestIdentityV1
+    resources: ProviderKubernetesResourceContractV1
+    renderer: ProviderKubernetesRendererV1
+    objects: tuple[ProviderKubernetesObjectPlanV1, ...]
+    post_provision: ProviderKubernetesPostProvisionV1
+    endpoint: ProviderKubernetesEndpointContractV1
+    scheduling: ProviderKubernetesSchedulingContractV1
+    storage: ProviderKubernetesStorageContractV1
+    metadata: ProviderKubernetesMetadataContractV1
+    security: ProviderKubernetesSecurityContractV1
+    topology: ProviderPodTopologyV1
+    mutation_contract: ProviderKubernetesLaunchMutationContractV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'implementation_contract', 'executor_cohort',
+        'config_projection', 'config_projection_sha256', 'scope', 'principals',
+        'prerequisites', 'request_identity', 'resources', 'renderer', 'objects',
+        'post_provision', 'endpoint', 'scheduling', 'storage', 'metadata',
+        'security', 'topology', 'mutation_contract'
+    })
+    _IMPLEMENTATION_CONTRACT: ClassVar[
+        str] = 'kubernetes_serve_prebooted_runtime_v1'
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='launch execution capsule V2 version')
+        if self.implementation_contract != self._IMPLEMENTATION_CONTRACT:
+            raise ValueError('launch execution capsule V2 '
+                             'implementation_contract is unsupported.')
+        child_types: tuple[tuple[str, type[Any]], ...] = (
+            ('executor_cohort', ProviderAuthorityWorkerCohortReferenceV1),
+            ('config_projection', ProviderKubernetesConfigProjectionV1),
+            ('scope', ProviderKubernetesScopeV1),
+            ('principals', ProviderKubernetesPrincipalsV1),
+            ('request_identity', ProviderKubernetesRequestIdentityV1),
+            ('resources', ProviderKubernetesResourceContractV1),
+            ('renderer', ProviderKubernetesRendererV1),
+            ('post_provision', ProviderKubernetesPostProvisionV1),
+            ('endpoint', ProviderKubernetesEndpointContractV1),
+            ('scheduling', ProviderKubernetesSchedulingContractV1),
+            ('storage', ProviderKubernetesStorageContractV1),
+            ('metadata', ProviderKubernetesMetadataContractV1),
+            ('security', ProviderKubernetesSecurityContractV1),
+            ('topology', ProviderPodTopologyV1),
+            ('mutation_contract', ProviderKubernetesLaunchMutationContractV1),
+        )
+        for field, expected_type in child_types:
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'launch execution capsule V2 {field} has an '
+                                'invalid type.')
+        object.__setattr__(
+            self, 'prerequisites',
+            _provider_kubernetes_prerequisite_inventory_tuple(
+                self.prerequisites,
+                name='launch execution capsule V2 prerequisites'))
+        if (type(self.objects) is not tuple or len(self.objects)
+                != len(PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1) or any(
+                    type(item) is not ProviderKubernetesObjectPlanV1
+                    for item in self.objects)):
+            raise ValueError('launch execution capsule V2 objects must contain '
+                             'the exact three typed plans.')
+        expected_objects = tuple(
+            (entry.create_sequence, entry.role, entry.kind)
+            for entry in PROVIDER_KUBERNETES_OBJECT_ROLE_MAP_V1)
+        if tuple((item.sequence, item.role, item.kind)
+                 for item in self.objects) != expected_objects:
+            raise ValueError('launch execution capsule V2 objects do not '
+                             'match the exact create order.')
+        projection_hash = _sha256(
+            self.config_projection_sha256,
+            name='launch execution capsule V2 config_projection_sha256')
+        object.__setattr__(self, 'config_projection_sha256', projection_hash)
+        if projection_hash != self.config_projection.sha256:
+            raise ValueError('launch execution capsule V2 config projection '
+                             'hash does not match.')
+        if (self.renderer.source.canonical_bytes !=
+                self.post_provision.job_submission.run_source.canonical_bytes):
+            raise ValueError('launch execution capsule V2 renderer and run '
+                             'source must be byte-equal.')
+        if (self.config_projection.config_access_inventory.canonical_bytes
+                != self.renderer.config_access_inventory.canonical_bytes):
+            raise ValueError('launch execution capsule V2 config-access '
+                             'inventories must be byte-equal.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesExecutionCapsuleV2:
+        _bounded_canonical_json_bytes(value,
+                                      name=('Kubernetes launch execution '
+                                            'capsule V2'),
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name=('Kubernetes launch execution '
+                                           'capsule V2'),
+                                     keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            implementation_contract=raw['implementation_contract'],
+            executor_cohort=(
+                ProviderAuthorityWorkerCohortReferenceV1.from_value(
+                    raw['executor_cohort'])),
+            config_projection=ProviderKubernetesConfigProjectionV1.from_value(
+                raw['config_projection']),
+            config_projection_sha256=raw['config_projection_sha256'],
+            scope=ProviderKubernetesScopeV1.from_value(raw['scope']),
+            principals=ProviderKubernetesPrincipalsV1.from_value(
+                raw['principals']),
+            prerequisites=_provider_kubernetes_prerequisite_inventory_from_value(
+                raw['prerequisites'],
+                name='launch execution capsule V2 prerequisites'),
+            request_identity=ProviderKubernetesRequestIdentityV1.from_value(
+                raw['request_identity']),
+            resources=ProviderKubernetesResourceContractV1.from_value(
+                raw['resources']),
+            renderer=ProviderKubernetesRendererV1.from_value(raw['renderer']),
+            objects=tuple(
+                ProviderKubernetesObjectPlanV1.from_value(item)
+                for item in raw['objects']),
+            post_provision=ProviderKubernetesPostProvisionV1.from_value(
+                raw['post_provision']),
+            endpoint=ProviderKubernetesEndpointContractV1.from_value(
+                raw['endpoint']),
+            scheduling=ProviderKubernetesSchedulingContractV1.from_value(
+                raw['scheduling']),
+            storage=ProviderKubernetesStorageContractV1.from_value(
+                raw['storage']),
+            metadata=ProviderKubernetesMetadataContractV1.from_value(
+                raw['metadata']),
+            security=ProviderKubernetesSecurityContractV1.from_value(
+                raw['security']),
+            topology=ProviderPodTopologyV1.from_value(raw['topology']),
+            mutation_contract=(
+                ProviderKubernetesLaunchMutationContractV1.from_value(
+                    raw['mutation_contract'])))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'implementation_contract': self._IMPLEMENTATION_CONTRACT,
+            'executor_cohort': self.executor_cohort.canonical_value(),
+            'config_projection': self.config_projection.canonical_value(),
+            'config_projection_sha256': self.config_projection_sha256,
+            'scope': self.scope.canonical_value(),
+            'principals': self.principals.canonical_value(),
+            'prerequisites': [
+                item.canonical_value() for item in self.prerequisites
+            ],
+            'request_identity': self.request_identity.canonical_value(),
+            'resources': self.resources.canonical_value(),
+            'renderer': self.renderer.canonical_value(),
+            'objects': [item.canonical_value() for item in self.objects],
+            'post_provision': self.post_provision.canonical_value(),
+            'endpoint': self.endpoint.canonical_value(),
+            'scheduling': self.scheduling.canonical_value(),
+            'storage': self.storage.canonical_value(),
+            'metadata': self.metadata.canonical_value(),
+            'security': self.security.canonical_value(),
+            'topology': self.topology.canonical_value(),
+            'mutation_contract': self.mutation_contract.canonical_value(),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesDownExecutionCapsuleV2(_CanonicalContract):
+    """Compact live down capsule resolved against a locked cohort row."""
+
+    version: int
+    implementation_contract: str
+    executor_cohort: ProviderAuthorityWorkerCohortReferenceV1
+    config_projection: ProviderKubernetesConfigProjectionV1
+    config_projection_sha256: str
+    scope: ProviderKubernetesScopeV1
+    principals: ProviderKubernetesPrincipalsV1
+    prerequisites: tuple[ProviderKubernetesPrerequisiteV1, ...]
+    cleanup_target: ProviderKubernetesCleanupTargetV1
+    cleanup_target_sha256: str
+    mutation_contract: ProviderKubernetesDownMutationContractV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'implementation_contract', 'executor_cohort',
+        'config_projection', 'config_projection_sha256', 'scope', 'principals',
+        'prerequisites', 'cleanup_target', 'cleanup_target_sha256',
+        'mutation_contract'
+    })
+    _IMPLEMENTATION_CONTRACT: ClassVar[
+        str] = 'kubernetes_serve_exact_cleanup_v1'
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='down execution capsule V2 version')
+        if self.implementation_contract != self._IMPLEMENTATION_CONTRACT:
+            raise ValueError('down execution capsule V2 '
+                             'implementation_contract is unsupported.')
+        for field, expected_type in (
+            ('executor_cohort', ProviderAuthorityWorkerCohortReferenceV1),
+            ('config_projection', ProviderKubernetesConfigProjectionV1),
+            ('scope', ProviderKubernetesScopeV1),
+            ('principals', ProviderKubernetesPrincipalsV1),
+            ('cleanup_target', ProviderKubernetesCleanupTargetV1),
+            ('mutation_contract', ProviderKubernetesDownMutationContractV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'down execution capsule V2 {field} has an '
+                                'invalid type.')
+        object.__setattr__(
+            self, 'prerequisites',
+            _provider_kubernetes_prerequisite_inventory_tuple(
+                self.prerequisites,
+                name='down execution capsule V2 prerequisites'))
+        projection_hash = _sha256(
+            self.config_projection_sha256,
+            name='down execution capsule V2 config_projection_sha256')
+        cleanup_hash = _sha256(
+            self.cleanup_target_sha256,
+            name='down execution capsule V2 cleanup_target_sha256')
+        object.__setattr__(self, 'config_projection_sha256', projection_hash)
+        object.__setattr__(self, 'cleanup_target_sha256', cleanup_hash)
+        if projection_hash != self.config_projection.sha256:
+            raise ValueError('down execution capsule V2 config projection '
+                             'hash does not match.')
+        if cleanup_hash != self.cleanup_target.sha256:
+            raise ValueError('down execution capsule V2 cleanup target hash '
+                             'does not match.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesDownExecutionCapsuleV2:
+        _bounded_canonical_json_bytes(value,
+                                      name=('Kubernetes down execution '
+                                            'capsule V2'),
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name=('Kubernetes down execution '
+                                           'capsule V2'),
+                                     keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            implementation_contract=raw['implementation_contract'],
+            executor_cohort=(
+                ProviderAuthorityWorkerCohortReferenceV1.from_value(
+                    raw['executor_cohort'])),
+            config_projection=ProviderKubernetesConfigProjectionV1.from_value(
+                raw['config_projection']),
+            config_projection_sha256=raw['config_projection_sha256'],
+            scope=ProviderKubernetesScopeV1.from_value(raw['scope']),
+            principals=ProviderKubernetesPrincipalsV1.from_value(
+                raw['principals']),
+            prerequisites=_provider_kubernetes_prerequisite_inventory_from_value(
+                raw['prerequisites'],
+                name='down execution capsule V2 prerequisites'),
+            cleanup_target=ProviderKubernetesCleanupTargetV1.from_value(
+                raw['cleanup_target']),
+            cleanup_target_sha256=raw['cleanup_target_sha256'],
+            mutation_contract=(
+                ProviderKubernetesDownMutationContractV1.from_value(
+                    raw['mutation_contract'])))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'implementation_contract': self._IMPLEMENTATION_CONTRACT,
+            'executor_cohort': self.executor_cohort.canonical_value(),
+            'config_projection': self.config_projection.canonical_value(),
+            'config_projection_sha256': self.config_projection_sha256,
+            'scope': self.scope.canonical_value(),
+            'principals': self.principals.canonical_value(),
+            'prerequisites': [
+                item.canonical_value() for item in self.prerequisites
+            ],
+            'cleanup_target': self.cleanup_target.canonical_value(),
+            'cleanup_target_sha256': self.cleanup_target_sha256,
+            'mutation_contract': self.mutation_contract.canonical_value(),
+        }
+
+
+def _validate_provider_launch_resource_translation_v2(
+    resources: ProviderPodResourceSnapshotV1,
+    topology: ProviderPodTopologyV1,
+    capsule: ProviderKubernetesExecutionCapsuleV2,
+) -> None:
+    """Require the unchanged resource projection into a compact V2 capsule."""
+
+    if type(capsule) is not ProviderKubernetesExecutionCapsuleV2:
+        raise TypeError('launch resource translation V2 capsule has an '
+                        'invalid type.')
+    capsule_resources = capsule.resources
+    expected_instance_type = (f'{capsule_resources.source_cpus}CPU--'
+                              f'{capsule_resources.source_memory_gb}GB')
+    if (resources.namespace != capsule.scope.namespace or
+            resources.instance_type != expected_instance_type or
+            resources.accelerator is not None or
+            resources.cpus != capsule_resources.source_cpus or
+            resources.memory != capsule_resources.source_memory_gb or
+            resources.image_id
+            != capsule_resources.image.qualification.requested_reference or
+            resources.ports != capsule_resources.resources_ports or
+            resources.labels or resources.use_spot or
+            topology.canonical_bytes != capsule.topology.canonical_bytes or
+            topology.application_port != capsule_resources.application_port or
+            topology.resources_ports != capsule_resources.resources_ports):
+        raise ValueError('launch resources do not match the exact compact V2 '
+                         'execution capsule translation.')
+
+
+def project_provider_launch_policy_subject_v2(
+    resource_identity: ProviderResourceIdentityV1,
+    source: ProviderLaunchSourceV1,
+    requested_target: ProviderLocatorV1,
+    resources: ProviderPodResourceSnapshotV1,
+    topology: ProviderPodTopologyV1,
+    replica_id: int,
+    retry_until_up: bool,
+    capsule: ProviderKubernetesExecutionCapsuleV2,
+) -> ProviderLaunchPolicySubjectV1:
+    """Project the unchanged policy subject from the compact V2 capsule."""
+
+    exact_inputs: tuple[tuple[str, Any, type[Any]], ...] = (
+        ('resource_identity', resource_identity, ProviderResourceIdentityV1),
+        ('source', source, ProviderLaunchSourceV1),
+        ('requested_target', requested_target, ProviderLocatorV1),
+        ('resources', resources, ProviderPodResourceSnapshotV1),
+        ('topology', topology, ProviderPodTopologyV1),
+        ('capsule', capsule, ProviderKubernetesExecutionCapsuleV2),
+    )
+    for name, value, expected_type in exact_inputs:
+        if type(value) is not expected_type:
+            raise TypeError(f'launch policy projector V2 {name} has an '
+                            'invalid type.')
+    if type(replica_id) is not int:
+        raise TypeError('launch policy projector V2 replica_id must be an '
+                        'integer.')
+    if replica_id != resource_identity.replica_id:
+        raise ValueError('launch policy projector V2 replica ID does not '
+                         'match resource identity.')
+    _boolean(retry_until_up, name='launch policy projector V2 retry_until_up')
+    proof_identity = source.identity_canonicalization.context.input.resource_identity
+    if proof_identity.canonical_bytes != resource_identity.canonical_bytes:
+        raise ValueError('launch policy projector V2 resource identity does '
+                         'not match the source proof.')
+    if source.content.canonical_bytes != capsule.renderer.source.canonical_bytes:
+        raise ValueError('launch policy projector V2 source does not match '
+                         'the execution capsule.')
+    if source.content.workspace != capsule.config_projection.workspace:
+        raise ValueError('launch policy projector V2 source workspace does '
+                         'not match the execution capsule.')
+    proof = source.identity_canonicalization
+    kubernetes = requested_target.kubernetes
+    if kubernetes is None:
+        raise ValueError('launch policy projector V2 requires a Kubernetes '
+                         'requested target.')
+    projected_identity = project_provider_kubernetes_request_identity_v1(
+        proof.effective_original_user, kubernetes.name_basis)
+    if (proof.context.cohort_id != capsule.executor_cohort.cohort_id or
+            proof.effective_user_hash != kubernetes.name_basis.frozen_user_hash
+            or kubernetes.replica_incarnation_label != str(
+                resource_identity.replica_incarnation) or
+            projected_identity.canonical_bytes
+            != capsule.request_identity.canonical_bytes):
+        raise ValueError('launch policy projector V2 request identity does '
+                         'not match the source proof and target name basis.')
+    if (requested_target.sky_cluster_name != kubernetes.name_basis.display_name
+            or
+            kubernetes.scope.canonical_bytes != capsule.scope.canonical_bytes or
+            kubernetes.topology.canonical_bytes
+            != capsule.topology.canonical_bytes or
+            topology.canonical_bytes != kubernetes.topology.canonical_bytes):
+        raise ValueError('launch policy projector V2 topology does not match '
+                         'the requested target and execution capsule.')
+    if (resources.cluster_fingerprint_sha256
+            != kubernetes.cluster_fingerprint_sha256 or
+            resources.namespace != kubernetes.namespace or
+            resources.namespace != capsule.scope.namespace or
+            resources.namespace != capsule.config_projection.target_namespace):
+        raise ValueError('launch policy projector V2 target, resources, and '
+                         'capsule scope do not match.')
+    _validate_provider_launch_resource_translation_v2(resources, topology,
+                                                      capsule)
+    pod_spec = capsule.objects[2].request_body.canonical_value()['spec']
+    container = pod_spec['containers'][0]
+    replica_entries = [
+        entry for entry in container['env'] if type(entry) is dict and
+        entry.get('name') == 'SKYPILOT_SERVE_REPLICA_ID'
+    ]
+    if (len(replica_entries) != 1 or
+            replica_entries[0]['value'] != str(replica_id)):
+        raise ValueError('launch policy projector V2 replica ID does not '
+                         'match the Pod request environment.')
+    return ProviderLaunchPolicySubjectV1(
+        version=1,
+        source=source,
+        requested_target=requested_target,
+        resources=resources,
+        topology=topology,
+        execution_capsule_sha256=capsule.sha256,
+        replica_id_text=str(replica_id),
+        security_group_scope='not_applicable:kubernetes',
+        admin_policy_mode='absent_controller_and_executor',
+        managed_secrets_mode='absent',
+        retry_until_up=retry_until_up,
+        exact_resources_override=True,
+        backend='cloud_vm_ray',
+        optimize_target='cost',
+        dryrun=False,
+        no_setup=False,
+        clone_disk_from=None,
+        fast=False,
+        file_mounts_blob_id=None,
+        tls_material_ref=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesExecutionConfigV2(_CanonicalContract):
+    """V2 launch capsule and unchanged policy proofs in one closed graph."""
+
+    version: int
+    capsule: ProviderKubernetesExecutionCapsuleV2
+    execution_capsule_sha256: str
+    policy_subject: ProviderLaunchPolicySubjectV1
+    policy_subject_sha256: str
+    controller: ProviderPolicyBoundaryProofV1
+    executor: ProviderPolicyBoundaryProofV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'capsule', 'execution_capsule_sha256', 'policy_subject',
+        'policy_subject_sha256', 'policy'
+    })
+    _POLICY_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'controller', 'executor'})
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='launch execution config V2 version')
+        for field, expected_type in (
+            ('capsule', ProviderKubernetesExecutionCapsuleV2),
+            ('policy_subject', ProviderLaunchPolicySubjectV1),
+            ('controller', ProviderPolicyBoundaryProofV1),
+            ('executor', ProviderPolicyBoundaryProofV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'launch execution config V2 {field} has an '
+                                'invalid type.')
+        capsule_hash = _sha256(
+            self.execution_capsule_sha256,
+            name='launch execution config V2 execution_capsule_sha256')
+        subject_hash = _sha256(
+            self.policy_subject_sha256,
+            name='launch execution config V2 policy_subject_sha256')
+        object.__setattr__(self, 'execution_capsule_sha256', capsule_hash)
+        object.__setattr__(self, 'policy_subject_sha256', subject_hash)
+        if capsule_hash != self.capsule.sha256:
+            raise ValueError('launch execution config V2 capsule hash does '
+                             'not match.')
+        if (self.policy_subject.execution_capsule_sha256 != capsule_hash or
+                subject_hash != self.policy_subject.sha256):
+            raise ValueError('launch execution config V2 policy subject is '
+                             'not bound to its capsule and hash.')
+        subject = self.policy_subject
+        resource_identity = (subject.source.identity_canonicalization.context.
+                             input.resource_identity)
+        projected = project_provider_launch_policy_subject_v2(
+            resource_identity, subject.source, subject.requested_target,
+            subject.resources, subject.topology, resource_identity.replica_id,
+            subject.retry_until_up, self.capsule)
+        if projected.canonical_bytes != subject.canonical_bytes:
+            raise ValueError('launch execution config V2 policy subject is '
+                             'not byte-equal to its capsule projection.')
+        if self.controller.boundary != 'serve_controller_prepare':
+            raise ValueError('launch execution config V2 controller proof is '
+                             'in the wrong boundary slot.')
+        if self.executor.boundary != 'api_executor_pre_io':
+            raise ValueError('launch execution config V2 executor proof is '
+                             'in the wrong boundary slot.')
+        for field, proof in (('controller', self.controller), ('executor',
+                                                               self.executor)):
+            if proof.config_projection_sha256 != (
+                    self.capsule.config_projection_sha256):
+                raise ValueError(f'launch execution config V2 {field} proof '
+                                 'config projection hash does not match.')
+            if (proof.policy_subject_sha256 != subject_hash or
+                    proof.projection_before_sha256 != subject_hash or
+                    proof.projection_after_sha256 != subject_hash):
+                raise ValueError(f'launch execution config V2 {field} proof '
+                                 'projection hashes do not match.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesExecutionConfigV2:
+        _bounded_canonical_json_bytes(value,
+                                      name=('Kubernetes launch execution '
+                                            'config V2'),
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name=('Kubernetes launch execution '
+                                           'config V2'),
+                                     keys=cls._KEYS)
+        policy = _closed_object_shallow(
+            raw['policy'],
+            name='launch execution config V2 policy',
+            keys=cls._POLICY_KEYS)
+        return cls(version=raw['version'],
+                   capsule=ProviderKubernetesExecutionCapsuleV2.from_value(
+                       raw['capsule']),
+                   execution_capsule_sha256=raw['execution_capsule_sha256'],
+                   policy_subject=ProviderLaunchPolicySubjectV1.from_value(
+                       raw['policy_subject']),
+                   policy_subject_sha256=raw['policy_subject_sha256'],
+                   controller=ProviderPolicyBoundaryProofV1.from_value(
+                       policy['controller']),
+                   executor=ProviderPolicyBoundaryProofV1.from_value(
+                       policy['executor']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'capsule': self.capsule.canonical_value(),
+            'execution_capsule_sha256': self.execution_capsule_sha256,
+            'policy_subject': self.policy_subject.canonical_value(),
+            'policy_subject_sha256': self.policy_subject_sha256,
+            'policy': {
+                'controller': self.controller.canonical_value(),
+                'executor': self.executor.canonical_value(),
+            },
+        }
+
+
+def project_provider_down_policy_subject_v2(
+    requested_target: ProviderLocatorV1,
+    workspace: str,
+    prior_launch_basis: PriorLaunchBasisV1,
+    capsule: ProviderKubernetesDownExecutionCapsuleV2,
+) -> ProviderDownPolicySubjectV1:
+    """Project the unchanged down policy subject from a compact V2 capsule."""
+
+    for field, value, expected_types in (
+        ('requested_target', requested_target, (ProviderLocatorV1,)),
+        ('prior_launch_basis', prior_launch_basis,
+         (CompletedLaunchBasisV1, PartialLaunchCleanupBasisV1)),
+        ('capsule', capsule, (ProviderKubernetesDownExecutionCapsuleV2,)),
+    ):
+        if type(value) not in expected_types:
+            raise TypeError(f'down policy projector V2 {field} has an invalid '
+                            'type.')
+    workspace = _text(workspace, name='down policy projector V2 workspace')
+    if prior_launch_basis.launch_requested_target.canonical_bytes != (
+            requested_target.canonical_bytes):
+        raise ValueError('down policy projector V2 requested target does not '
+                         'match its prior launch basis.')
+    if prior_launch_basis.launch_workspace_identity.workspace != workspace:
+        raise ValueError('down policy projector V2 workspace does not match '
+                         'its prior launch basis.')
+    cleanup_target = capsule.cleanup_target
+    _validate_prior_launch_cleanup_target_binding_v1(prior_launch_basis,
+                                                     cleanup_target)
+    cleanup_hash = cleanup_target.sha256
+    if capsule.cleanup_target_sha256 != cleanup_hash:
+        raise ValueError('down policy projector V2 cleanup target hashes do '
+                         'not match the complete input.')
+    cleanup_target.validate_requested_target(requested_target)
+    kubernetes = requested_target.kubernetes
+    assert kubernetes is not None
+    if (kubernetes.scope.canonical_bytes != capsule.scope.canonical_bytes or
+            capsule.config_projection.workspace != workspace or
+            capsule.config_projection.target_namespace != kubernetes.namespace):
+        raise ValueError('down policy projector V2 target, workspace, and '
+                         'capsule scope do not match.')
+    return ProviderDownPolicySubjectV1(
+        version=1,
+        requested_target=requested_target,
+        workspace=workspace,
+        prior_launch_basis_sha256=prior_launch_basis.sha256,
+        cleanup_target_sha256=cleanup_hash,
+        execution_capsule_sha256=capsule.sha256,
+        admin_policy_mode='absent_controller_and_executor',
+        managed_secrets_mode='absent',
+        purge=False,
+        graceful=False,
+        graceful_timeout=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderKubernetesDownExecutionConfigV2(_CanonicalContract):
+    """V2 down capsule and unchanged policy proofs in one closed graph."""
+
+    version: int
+    capsule: ProviderKubernetesDownExecutionCapsuleV2
+    execution_capsule_sha256: str
+    policy_subject: ProviderDownPolicySubjectV1
+    policy_subject_sha256: str
+    controller: ProviderPolicyBoundaryProofV1
+    executor: ProviderPolicyBoundaryProofV1
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'capsule', 'execution_capsule_sha256', 'policy_subject',
+        'policy_subject_sha256', 'policy'
+    })
+    _POLICY_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'controller', 'executor'})
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='down execution config V2 version')
+        for field, expected_type in (
+            ('capsule', ProviderKubernetesDownExecutionCapsuleV2),
+            ('policy_subject', ProviderDownPolicySubjectV1),
+            ('controller', ProviderPolicyBoundaryProofV1),
+            ('executor', ProviderPolicyBoundaryProofV1),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'down execution config V2 {field} has an '
+                                'invalid type.')
+        capsule_hash = _sha256(
+            self.execution_capsule_sha256,
+            name='down execution config V2 execution_capsule_sha256')
+        subject_hash = _sha256(
+            self.policy_subject_sha256,
+            name='down execution config V2 policy_subject_sha256')
+        object.__setattr__(self, 'execution_capsule_sha256', capsule_hash)
+        object.__setattr__(self, 'policy_subject_sha256', subject_hash)
+        if capsule_hash != self.capsule.sha256:
+            raise ValueError('down execution config V2 capsule hash does not '
+                             'match its complete preimage.')
+        if subject_hash != self.policy_subject.sha256:
+            raise ValueError('down execution config V2 policy subject hash '
+                             'does not match its complete preimage.')
+        subject = self.policy_subject
+        if (subject.execution_capsule_sha256 != capsule_hash or
+                subject.cleanup_target_sha256
+                != self.capsule.cleanup_target_sha256 or
+                subject.workspace != self.capsule.config_projection.workspace):
+            raise ValueError('down execution config V2 policy subject is not '
+                             'bound to its capsule.')
+        if self.controller.boundary != 'serve_controller_prepare':
+            raise ValueError('down execution config V2 controller proof is in '
+                             'the wrong boundary slot.')
+        if self.executor.boundary != 'api_executor_pre_io':
+            raise ValueError('down execution config V2 executor proof is in '
+                             'the wrong boundary slot.')
+        for field, proof in (('controller', self.controller), ('executor',
+                                                               self.executor)):
+            if proof.config_projection_sha256 != (
+                    self.capsule.config_projection_sha256):
+                raise ValueError(f'down execution config V2 {field} proof '
+                                 'config projection hash does not match.')
+            if (proof.policy_subject_sha256 != subject_hash or
+                    proof.projection_before_sha256 != subject_hash or
+                    proof.projection_after_sha256 != subject_hash):
+                raise ValueError(f'down execution config V2 {field} proof '
+                                 'projection hashes do not match.')
+        _ = self.canonical_bytes
+
+    def validate_outer_projection(
+        self,
+        requested_target: ProviderLocatorV1,
+        workspace: str,
+        prior_launch_basis: PriorLaunchBasisV1,
+    ) -> None:
+        projected = project_provider_down_policy_subject_v2(
+            requested_target, workspace, prior_launch_basis, self.capsule)
+        if projected.canonical_bytes != self.policy_subject.canonical_bytes:
+            raise ValueError('down execution config V2 policy subject is not '
+                             'byte-equal to its outer projection.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderKubernetesDownExecutionConfigV2:
+        _bounded_canonical_json_bytes(value,
+                                      name=('Kubernetes down execution config '
+                                            'V2'),
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name=('Kubernetes down execution config '
+                                           'V2'),
+                                     keys=cls._KEYS)
+        policy = _closed_object_shallow(raw['policy'],
+                                        name='down execution config V2 policy',
+                                        keys=cls._POLICY_KEYS)
+        return cls(version=raw['version'],
+                   capsule=ProviderKubernetesDownExecutionCapsuleV2.from_value(
+                       raw['capsule']),
+                   execution_capsule_sha256=raw['execution_capsule_sha256'],
+                   policy_subject=ProviderDownPolicySubjectV1.from_value(
+                       raw['policy_subject']),
+                   policy_subject_sha256=raw['policy_subject_sha256'],
+                   controller=ProviderPolicyBoundaryProofV1.from_value(
+                       policy['controller']),
+                   executor=ProviderPolicyBoundaryProofV1.from_value(
+                       policy['executor']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'capsule': self.capsule.canonical_value(),
+            'execution_capsule_sha256': self.execution_capsule_sha256,
+            'policy_subject': self.policy_subject.canonical_value(),
+            'policy_subject_sha256': self.policy_subject_sha256,
+            'policy': {
+                'controller': self.controller.canonical_value(),
+                'executor': self.executor.canonical_value(),
+            },
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLaunchInvocationV2(_CanonicalContract):
+    """Redacted launch invocation selecting only the compact V2 config."""
+
+    source: ProviderLaunchSourceV1
+    resources: ProviderPodResourceSnapshotV1
+    topology: ProviderPodTopologyV1
+    execution_config: ProviderKubernetesExecutionConfigV2
+    replica_id_text: str
+    security_group_scope: str
+    admin_policy_mode: str
+    managed_secrets_mode: str
+    retry_until_up: bool
+    exact_resources_override: bool
+    backend: str
+    optimize_target: str
+    dryrun: bool
+    no_setup: bool
+    clone_disk_from: None
+    fast: bool
+    file_mounts_blob_id: str | None
+    tls_material_ref: str | None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'source', 'resources', 'topology', 'execution_config', 'replica_env',
+        'security_group_scope', 'admin_policy_mode', 'managed_secrets_mode',
+        'retry_until_up', 'exact_resources_override', 'backend',
+        'optimize_target', 'dryrun', 'no_setup', 'clone_disk_from', 'fast',
+        'file_mounts_blob_id', 'tls_material_ref'
+    })
+    _REPLICA_ENV_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {'SKYPILOT_SERVE_REPLICA_ID'})
+
+    def __post_init__(self) -> None:
+        for field, expected_type in (
+            ('source', ProviderLaunchSourceV1),
+            ('resources', ProviderPodResourceSnapshotV1),
+            ('topology', ProviderPodTopologyV1),
+            ('execution_config', ProviderKubernetesExecutionConfigV2),
+        ):
+            if type(getattr(self, field)) is not expected_type:
+                raise TypeError(f'launch invocation V2 {field} has an invalid '
+                                'type.')
+        object.__setattr__(
+            self, 'replica_id_text',
+            _decimal_integer_text(self.replica_id_text,
+                                  name='launch invocation V2 replica ID'))
+        for field, expected in (
+            ('security_group_scope', 'not_applicable:kubernetes'),
+            ('admin_policy_mode', 'absent_controller_and_executor'),
+            ('managed_secrets_mode', 'absent'),
+            ('backend', 'cloud_vm_ray'),
+            ('optimize_target', 'cost'),
+        ):
+            if type(getattr(self, field)) is not str:
+                raise TypeError(f'launch invocation V2 {field} must be text.')
+            if getattr(self, field) != expected:
+                raise ValueError(f'launch invocation V2 {field} is '
+                                 'unsupported.')
+        _boolean(self.retry_until_up,
+                 name='launch invocation V2 retry_until_up')
+        for field, expected in (
+            ('exact_resources_override', True),
+            ('dryrun', False),
+            ('no_setup', False),
+            ('fast', False),
+        ):
+            if _boolean(getattr(self, field),
+                        name=f'launch invocation V2 {field}') is not expected:
+                raise ValueError(f'launch invocation V2 {field} has an '
+                                 'unsupported value.')
+        for field in ('clone_disk_from', 'file_mounts_blob_id',
+                      'tls_material_ref'):
+            if getattr(self, field) is not None:
+                raise ValueError(f'launch invocation V2 {field} must be null.')
+        subject = self.execution_config.policy_subject
+        for field, outer, projected in (
+            ('source', self.source, subject.source),
+            ('resources', self.resources, subject.resources),
+            ('topology', self.topology, subject.topology),
+        ):
+            if outer.canonical_bytes != projected.canonical_bytes:
+                raise ValueError(f'launch invocation V2 {field} is not '
+                                 'byte-equal to the policy subject.')
+        _validate_provider_launch_resource_translation_v2(
+            self.resources, self.topology, self.execution_config.capsule)
+        scalar_fields = ('replica_id_text', 'security_group_scope',
+                         'admin_policy_mode', 'managed_secrets_mode',
+                         'retry_until_up', 'exact_resources_override',
+                         'backend', 'optimize_target', 'dryrun', 'no_setup',
+                         'clone_disk_from', 'fast', 'file_mounts_blob_id',
+                         'tls_material_ref')
+        if any(
+                getattr(self, field) != getattr(subject, field)
+                for field in scalar_fields):
+            raise ValueError('launch invocation V2 options are not '
+                             'byte-equal to the policy subject.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderLaunchInvocationV2:
+        _bounded_canonical_json_bytes(value,
+                                      name='launch invocation V2',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='launch invocation V2',
+                                     keys=cls._KEYS)
+        replica_env = _closed_object_shallow(
+            raw['replica_env'],
+            name='launch invocation V2 replica_env',
+            keys=cls._REPLICA_ENV_KEYS)
+        return cls(
+            source=ProviderLaunchSourceV1.from_value(raw['source']),
+            resources=ProviderPodResourceSnapshotV1.from_value(
+                raw['resources']),
+            topology=ProviderPodTopologyV1.from_value(raw['topology']),
+            execution_config=ProviderKubernetesExecutionConfigV2.from_value(
+                raw['execution_config']),
+            replica_id_text=replica_env['SKYPILOT_SERVE_REPLICA_ID'],
+            security_group_scope=raw['security_group_scope'],
+            admin_policy_mode=raw['admin_policy_mode'],
+            managed_secrets_mode=raw['managed_secrets_mode'],
+            retry_until_up=raw['retry_until_up'],
+            exact_resources_override=raw['exact_resources_override'],
+            backend=raw['backend'],
+            optimize_target=raw['optimize_target'],
+            dryrun=raw['dryrun'],
+            no_setup=raw['no_setup'],
+            clone_disk_from=raw['clone_disk_from'],
+            fast=raw['fast'],
+            file_mounts_blob_id=raw['file_mounts_blob_id'],
+            tls_material_ref=raw['tls_material_ref'])
+
+    def validate_outer_projection(self,
+                                  resource_identity: ProviderResourceIdentityV1,
+                                  requested_target: ProviderLocatorV1) -> None:
+        projected = project_provider_launch_policy_subject_v2(
+            resource_identity, self.source, requested_target, self.resources,
+            self.topology, resource_identity.replica_id, self.retry_until_up,
+            self.execution_config.capsule)
+        if projected.canonical_bytes != (
+                self.execution_config.policy_subject.canonical_bytes):
+            raise ValueError('launch invocation V2 policy subject is not '
+                             'byte-equal to the outer projection.')
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'source': self.source.canonical_value(),
+            'resources': self.resources.canonical_value(),
+            'topology': self.topology.canonical_value(),
+            'execution_config': self.execution_config.canonical_value(),
+            'replica_env': {
+                'SKYPILOT_SERVE_REPLICA_ID': self.replica_id_text
+            },
+            'security_group_scope': 'not_applicable:kubernetes',
+            'admin_policy_mode': 'absent_controller_and_executor',
+            'managed_secrets_mode': 'absent',
+            'retry_until_up': self.retry_until_up,
+            'exact_resources_override': True,
+            'backend': 'cloud_vm_ray',
+            'optimize_target': 'cost',
+            'dryrun': False,
+            'no_setup': False,
+            'clone_disk_from': None,
+            'fast': False,
+            'file_mounts_blob_id': None,
+            'tls_material_ref': None,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderDownInvocationV2(_CanonicalContract):
+    """Identity-fenced down invocation selecting only the compact V2 config."""
+
+    cluster_name: str
+    expected_cluster_record_uuid: uuid.UUID
+    workspace: str
+    prior_launch_basis: PriorLaunchBasisV1
+    execution_config: ProviderKubernetesDownExecutionConfigV2
+    purge: bool
+    graceful: bool
+    graceful_timeout: None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'cluster_name', 'expected_cluster_record_uuid', 'workspace',
+        'prior_launch_basis', 'execution_config', 'purge', 'graceful',
+        'graceful_timeout'
+    })
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'cluster_name',
+            _text(self.cluster_name,
+                  name='down invocation V2 cluster_name',
+                  maximum_bytes=_MAX_SHORT_TEXT_BYTES))
+        object.__setattr__(
+            self, 'expected_cluster_record_uuid',
+            _uuid(self.expected_cluster_record_uuid,
+                  name='down invocation V2 expected_cluster_record_uuid'))
+        object.__setattr__(
+            self, 'workspace',
+            _text(self.workspace, name='down invocation V2 workspace'))
+        if type(self.prior_launch_basis) not in (CompletedLaunchBasisV1,
+                                                 PartialLaunchCleanupBasisV1):
+            raise TypeError('down invocation V2 prior_launch_basis has an '
+                            'invalid type.')
+        if type(self.execution_config) is not (
+                ProviderKubernetesDownExecutionConfigV2):
+            raise TypeError('down invocation V2 execution_config has an '
+                            'invalid type.')
+        for name, value in (('purge', self.purge), ('graceful', self.graceful)):
+            _boolean(value, name=f'down invocation V2 {name}')
+            if value:
+                raise ValueError(f'down invocation V2 {name} must be false.')
+        if self.graceful_timeout is not None:
+            raise ValueError('down invocation V2 graceful_timeout must be '
+                             'null.')
+        self.validate_outer_projection(
+            self.prior_launch_basis.launch_requested_target)
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderDownInvocationV2:
+        _bounded_canonical_json_bytes(value,
+                                      name='down invocation V2',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object_shallow(value,
+                                     name='down invocation V2',
+                                     keys=cls._KEYS)
+        return cls(cluster_name=raw['cluster_name'],
+                   expected_cluster_record_uuid=_uuid(
+                       raw['expected_cluster_record_uuid'],
+                       name='down invocation V2 expected_cluster_record_uuid'),
+                   workspace=raw['workspace'],
+                   prior_launch_basis=prior_launch_basis_from_value_v1(
+                       raw['prior_launch_basis']),
+                   execution_config=(
+                       ProviderKubernetesDownExecutionConfigV2.from_value(
+                           raw['execution_config'])),
+                   purge=raw['purge'],
+                   graceful=raw['graceful'],
+                   graceful_timeout=raw['graceful_timeout'])
+
+    def validate_outer_projection(self,
+                                  requested_target: ProviderLocatorV1) -> None:
+        if type(requested_target) is not ProviderLocatorV1:
+            raise TypeError('down invocation V2 requested target has an '
+                            'invalid type.')
+        basis = self.prior_launch_basis
+        cleanup_target = self.execution_config.capsule.cleanup_target
+        if requested_target.canonical_bytes != (
+                basis.launch_requested_target.canonical_bytes):
+            raise ValueError('down invocation V2 requested target is not '
+                             'byte-equal to its prior launch basis.')
+        if (self.cluster_name != requested_target.sky_cluster_name or
+                self.cluster_name != cleanup_target.cluster_name or
+                self.expected_cluster_record_uuid
+                != requested_target.sky_cluster_record_uuid or
+                self.expected_cluster_record_uuid
+                != cleanup_target.cluster_record_uuid):
+            raise ValueError('down invocation V2 cluster identity does not '
+                             'match target and cleanup evidence.')
+        if self.workspace != basis.launch_workspace_identity.workspace:
+            raise ValueError('down invocation V2 workspace does not match its '
+                             'prior launch basis.')
+        self.execution_config.validate_outer_projection(requested_target,
+                                                        self.workspace, basis)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'cluster_name': self.cluster_name,
+            'expected_cluster_record_uuid': str(
+                self.expected_cluster_record_uuid),
+            'workspace': self.workspace,
+            'prior_launch_basis': self.prior_launch_basis.canonical_value(),
+            'execution_config': self.execution_config.canonical_value(),
+            'purge': False,
+            'graceful': False,
+            'graceful_timeout': None,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLifecycleInvocationV2(_CanonicalContract):
+    """Exact compact launch/down invocation union committed by M4."""
+
+    version: int
+    profile: ProviderProfile
+    redaction_profile: str
+    action_kind: kernel_actions.ActionKind
+    resource_identity: ProviderResourceIdentityV1
+    requested_target: ProviderLocatorV1
+    launch: ProviderLaunchInvocationV2 | None
+    down: ProviderDownInvocationV2 | None
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'profile', 'redaction_profile', 'action_kind',
+        'resource_identity', 'requested_target', 'launch', 'down'
+    })
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='lifecycle invocation V2 version')
+        profile = (self.profile if isinstance(self.profile, ProviderProfile)
+                   else _enum_value(ProviderProfile,
+                                    self.profile,
+                                    name='lifecycle invocation V2 profile'))
+        object.__setattr__(self, 'profile', profile)
+        if self.redaction_profile != 'provider_lifecycle_redaction_v1':
+            raise ValueError('lifecycle invocation V2 redaction profile is '
+                             'unsupported.')
+        action_kind = _action_kind(self.action_kind,
+                                   name='lifecycle invocation V2 action_kind')
+        object.__setattr__(self, 'action_kind', action_kind)
+        if type(self.resource_identity) is not ProviderResourceIdentityV1:
+            raise TypeError('lifecycle invocation V2 resource identity has '
+                            'an invalid type.')
+        if type(self.requested_target) is not ProviderLocatorV1:
+            raise TypeError('lifecycle invocation V2 requested target has an '
+                            'invalid type.')
+        if self.requested_target.profile is not profile:
+            raise ValueError('lifecycle invocation V2 and locator profiles do '
+                             'not match.')
+        if (self.requested_target.kubernetes is not None and
+                self.requested_target.kubernetes.replica_incarnation_label
+                != str(self.resource_identity.replica_incarnation)):
+            raise ValueError('lifecycle invocation V2 Kubernetes replica '
+                             'label does not match resource identity.')
+        if action_kind is kernel_actions.ActionKind.LAUNCH:
+            if type(self.launch) is not ProviderLaunchInvocationV2 or (
+                    self.down is not None):
+                raise ValueError('lifecycle invocation V2 launch requires '
+                                 'only launch.')
+            launch = self.launch
+            if launch.source.content.service_incarnation != (
+                    self.resource_identity.service_incarnation):
+                raise ValueError('lifecycle invocation V2 launch source '
+                                 'service incarnation does not match.')
+            if launch.replica_id_text != str(self.resource_identity.replica_id):
+                raise ValueError('lifecycle invocation V2 launch replica '
+                                 'environment does not match.')
+            kube = self.requested_target.kubernetes
+            if (kube is not None and
+                (launch.resources.cluster_fingerprint_sha256
+                 != kube.cluster_fingerprint_sha256 or
+                 launch.resources.namespace != kube.namespace)):
+                raise ValueError('lifecycle invocation V2 resource snapshot '
+                                 'does not match the requested target.')
+            launch.validate_outer_projection(self.resource_identity,
+                                             self.requested_target)
+        else:
+            if type(self.down) is not ProviderDownInvocationV2 or (self.launch
+                                                                   is not None):
+                raise ValueError('lifecycle invocation V2 down requires only '
+                                 'down.')
+            if (self.down.cluster_name != self.requested_target.sky_cluster_name
+                    or self.down.expected_cluster_record_uuid
+                    != self.requested_target.sky_cluster_record_uuid):
+                raise ValueError('lifecycle invocation V2 down does not match '
+                                 'the requested target.')
+            self.down.validate_outer_projection(self.requested_target)
+            prior_identity = self.down.prior_launch_basis.launch_resource_identity
+            stable_fields = ('service_hash', 'service_incarnation',
+                             'replica_id', 'replica_incarnation')
+            if any(
+                    getattr(self.resource_identity, field) != getattr(
+                        prior_identity, field) for field in stable_fields):
+                raise ValueError('lifecycle invocation V2 down identity does '
+                                 'not match its prior launch identity.')
+            if self.resource_identity.desired_generation != (
+                    prior_identity.desired_generation + 1):
+                raise ValueError('lifecycle invocation V2 down generation '
+                                 'must immediately follow launch.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderLifecycleInvocationV2:
+        shallow = _closed_object_shallow(
+            value, name='provider lifecycle invocation V2', keys=cls._KEYS)
+        raw_action_kind = shallow['action_kind']
+        if type(raw_action_kind) is not str:
+            raise TypeError('lifecycle invocation V2 action_kind must be text.')
+        _action_kind(raw_action_kind,
+                     name='lifecycle invocation V2 action_kind')
+        _bounded_canonical_json_bytes(value,
+                                      name='provider lifecycle invocation V2',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_action_kind_object(
+            value,
+            name='provider lifecycle invocation V2',
+            keys=cls._KEYS,
+            action_kind_name='lifecycle invocation V2 action_kind')
+        action_kind = _enum_value(kernel_actions.ActionKind,
+                                  raw['action_kind'],
+                                  name='lifecycle invocation V2 action_kind')
+        launch = (None if raw['launch'] is None else
+                  ProviderLaunchInvocationV2.from_value(raw['launch']))
+        down = (None if raw['down'] is None else
+                ProviderDownInvocationV2.from_value(raw['down']))
+        return cls(version=raw['version'],
+                   profile=_enum_value(ProviderProfile,
+                                       raw['profile'],
+                                       name='lifecycle invocation V2 profile'),
+                   redaction_profile=raw['redaction_profile'],
+                   action_kind=action_kind,
+                   resource_identity=ProviderResourceIdentityV1.from_value(
+                       raw['resource_identity']),
+                   requested_target=ProviderLocatorV1.from_value(
+                       raw['requested_target']),
+                   launch=launch,
+                   down=down)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'profile': self.profile.value,
+            'redaction_profile': self.redaction_profile,
+            'action_kind': self.action_kind.value,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'requested_target': self.requested_target.canonical_value(),
+            'launch':
+                (None if self.launch is None else self.launch.canonical_value()
+                ),
+            'down':
+                (None if self.down is None else self.down.canonical_value()),
+        }
+
+    @property
+    def action_id(self) -> uuid.UUID:
+        return self.resource_identity.action_identity(
+            self.action_kind).action_id
+
+    def require_launch(self) -> ProviderLaunchInvocationV2:
+        if (self.action_kind is not kernel_actions.ActionKind.LAUNCH or
+                self.launch is None):
+            raise ValueError('provider lifecycle invocation V2 is not launch.')
+        return self.launch
+
+    def require_down(self) -> ProviderDownInvocationV2:
+        if (self.action_kind is not kernel_actions.ActionKind.DOWN or
+                self.down is None):
+            raise ValueError('provider lifecycle invocation V2 is not down.')
+        return self.down
+
+    @property
+    def executor_cohort_reference(
+            self) -> ProviderAuthorityWorkerCohortReferenceV1:
+        if self.action_kind is kernel_actions.ActionKind.LAUNCH:
+            return self.require_launch(
+            ).execution_config.capsule.executor_cohort
+        return self.require_down().execution_config.capsule.executor_cohort
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderLifecyclePlanV2(_CanonicalContract):
+    """Version-2 plan binding only the compact lifecycle invocation."""
+
+    version: int
+    profile: ProviderProfile
+    action_kind: kernel_actions.ActionKind
+    resource_identity: ProviderResourceIdentityV1
+    placement_decision_sha256: str
+    resources_snapshot_sha256: str
+    workspace_identity_sha256: str
+    requested_target: ProviderLocatorV1
+    prior_launch_basis_sha256: str | None
+    prior_cleanup_target_sha256: str | None
+    request_payload_sha256: str
+    redaction_profile: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'profile', 'action_kind', 'resource_identity',
+        'placement_decision_sha256', 'resources_snapshot_sha256',
+        'workspace_identity_sha256', 'requested_target',
+        'prior_launch_basis_sha256', 'prior_cleanup_target_sha256',
+        'request_payload_sha256', 'redaction_profile'
+    })
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='provider lifecycle plan V2 version')
+        profile = (self.profile if isinstance(self.profile, ProviderProfile)
+                   else _enum_value(
+                       ProviderProfile, self.profile, name='plan V2 profile'))
+        action_kind = _action_kind(self.action_kind, name='plan V2 action_kind')
+        object.__setattr__(self, 'profile', profile)
+        object.__setattr__(self, 'action_kind', action_kind)
+        if type(self.resource_identity) is not ProviderResourceIdentityV1:
+            raise TypeError('plan V2 resource identity has an invalid type.')
+        for field in ('placement_decision_sha256', 'resources_snapshot_sha256',
+                      'workspace_identity_sha256', 'request_payload_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field), name=f'plan V2 {field}'))
+        if type(self.requested_target) is not ProviderLocatorV1:
+            raise TypeError('plan V2 requested target has an invalid type.')
+        if self.requested_target.profile is not profile:
+            raise ValueError('plan V2 and locator profiles do not match.')
+        if (self.requested_target.kubernetes is not None and
+                self.requested_target.kubernetes.replica_incarnation_label
+                != str(self.resource_identity.replica_incarnation)):
+            raise ValueError('plan V2 locator label does not match resource '
+                             'identity.')
+        for field in ('prior_launch_basis_sha256',
+                      'prior_cleanup_target_sha256'):
+            value = getattr(self, field)
+            if value is not None:
+                object.__setattr__(self, field,
+                                   _sha256(value, name=f'plan V2 {field}'))
+        if action_kind is kernel_actions.ActionKind.LAUNCH:
+            if (self.prior_launch_basis_sha256 is not None or
+                    self.prior_cleanup_target_sha256 is not None):
+                raise ValueError('launch plan V2 prior hashes must be null.')
+        elif (self.prior_launch_basis_sha256 is None or
+              self.prior_cleanup_target_sha256 is None):
+            raise ValueError('down plan V2 prior hashes must be nonnull.')
+        if self.redaction_profile != 'provider_lifecycle_redaction_v1':
+            raise ValueError('plan V2 redaction profile is unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ProviderLifecyclePlanV2:
+        raw = _closed_action_kind_object(value,
+                                         name='provider lifecycle plan V2',
+                                         keys=cls._KEYS,
+                                         action_kind_name='plan V2 action_kind')
+        return cls(
+            version=raw['version'],
+            profile=_enum_value(ProviderProfile,
+                                raw['profile'],
+                                name='plan V2 profile'),
+            action_kind=_enum_value(kernel_actions.ActionKind,
+                                    raw['action_kind'],
+                                    name='plan V2 action_kind'),
+            resource_identity=ProviderResourceIdentityV1.from_value(
+                raw['resource_identity']),
+            placement_decision_sha256=raw['placement_decision_sha256'],
+            resources_snapshot_sha256=raw['resources_snapshot_sha256'],
+            workspace_identity_sha256=raw['workspace_identity_sha256'],
+            requested_target=ProviderLocatorV1.from_value(
+                raw['requested_target']),
+            prior_launch_basis_sha256=raw['prior_launch_basis_sha256'],
+            prior_cleanup_target_sha256=raw['prior_cleanup_target_sha256'],
+            request_payload_sha256=raw['request_payload_sha256'],
+            redaction_profile=raw['redaction_profile'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'profile': self.profile.value,
+            'action_kind': self.action_kind.value,
+            'resource_identity': self.resource_identity.canonical_value(),
+            'placement_decision_sha256': self.placement_decision_sha256,
+            'resources_snapshot_sha256': self.resources_snapshot_sha256,
+            'workspace_identity_sha256': self.workspace_identity_sha256,
+            'requested_target': self.requested_target.canonical_value(),
+            'prior_launch_basis_sha256': self.prior_launch_basis_sha256,
+            'prior_cleanup_target_sha256': self.prior_cleanup_target_sha256,
+            'request_payload_sha256': self.request_payload_sha256,
+            'redaction_profile': self.redaction_profile,
+        }
+
+    @property
+    def action_id(self) -> uuid.UUID:
+        return self.resource_identity.action_identity(
+            self.action_kind).action_id
+
+    def validate_invocation(self,
+                            invocation: ProviderLifecycleInvocationV2) -> None:
+        if type(invocation) is not ProviderLifecycleInvocationV2:
+            raise TypeError('plan V2 invocation has an invalid type.')
+        if (self.profile is not invocation.profile or
+                self.action_kind is not invocation.action_kind or
+                self.resource_identity != invocation.resource_identity or
+                self.requested_target != invocation.requested_target):
+            raise ValueError('plan V2 and invocation identities differ.')
+        if self.request_payload_sha256 != invocation.sha256:
+            raise ValueError('plan V2 request payload hash does not match '
+                             'invocation.')
+        if (invocation.launch is not None and self.resources_snapshot_sha256
+                != invocation.launch.resources.sha256):
+            raise ValueError('plan V2 resource snapshot hash does not match '
+                             'launch.')
+        if invocation.down is not None:
+            basis = invocation.down.prior_launch_basis
+            cleanup = invocation.down.execution_config.capsule.cleanup_target
+            if self.prior_launch_basis_sha256 != basis.sha256:
+                raise ValueError('down plan V2 prior launch basis hash does '
+                                 'not match the invocation preimage.')
+            if self.prior_cleanup_target_sha256 != cleanup.sha256:
+                raise ValueError('down plan V2 cleanup target hash does not '
+                                 'match the invocation preimage.')
+            _validate_prior_launch_cleanup_target_binding_v1(basis, cleanup)
+            if basis.launch_requested_target.canonical_bytes != (
+                    self.requested_target.canonical_bytes):
+                raise ValueError('down plan V2 target is not byte-equal to '
+                                 'the prior launch basis.')
+            stable_fields = ('service_hash', 'service_incarnation',
+                             'replica_id', 'replica_incarnation')
+            if any(
+                    getattr(self.resource_identity, field) != getattr(
+                        basis.launch_resource_identity, field)
+                    for field in stable_fields):
+                raise ValueError('down plan V2 identity does not match the '
+                                 'prior launch identity.')
+            if self.resource_identity.desired_generation != (
+                    basis.launch_resource_identity.desired_generation + 1):
+                raise ValueError('down plan V2 generation must immediately '
+                                 'follow launch.')
+            if self.resources_snapshot_sha256 != basis.launch_resources.sha256:
+                raise ValueError('down plan V2 resources hash does not match '
+                                 'the prior launch resources.')
+            if self.workspace_identity_sha256 != (
+                    basis.launch_workspace_identity.sha256):
+                raise ValueError('down plan V2 workspace hash does not match '
+                                 'the prior launch workspace.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ServeActionCapacityProfileV1(_CanonicalContract):
+    """The sole physical-width-one capacity profile eligible for M4."""
+
+    version: int
+    profile: str
+    pool: bool
+    replica_unit: str
+    planned_capacity: int
+    node_count: int
+    use_spot: bool
+    accelerator: None
+    spot_placer: None
+    reserved_capacity_fill: bool
+    cost_rebalance: bool
+    dynamic_ondemand_fallback: bool
+    base_ondemand_fallback_replicas: int
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'profile', 'pool', 'replica_unit', 'planned_capacity',
+        'node_count', 'use_spot', 'accelerator', 'spot_placer',
+        'reserved_capacity_fill', 'cost_rebalance', 'dynamic_ondemand_fallback',
+        'base_ondemand_fallback_replicas'
+    })
+    _PROFILE: ClassVar[str] = 'ordinary_ondemand_physical_width1_v1'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='Serve action capacity profile version')
+        for field, expected in (
+            ('profile', self._PROFILE),
+            ('replica_unit', 'physical_backend'),
+        ):
+            value = getattr(self, field)
+            if type(value) is not str:
+                raise TypeError(f'capacity_profile.{field} must be text.')
+            if value != expected:
+                raise ValueError(f'capacity_profile.{field} is unsupported.')
+        for field, expected in (
+            ('pool', False),
+            ('use_spot', False),
+            ('reserved_capacity_fill', False),
+            ('cost_rebalance', False),
+            ('dynamic_ondemand_fallback', False),
+        ):
+            value = _boolean(getattr(self, field),
+                             name=f'capacity_profile.{field}')
+            if value is not expected:
+                raise ValueError(f'capacity_profile.{field} must be false.')
+        for field in ('planned_capacity', 'node_count'):
+            value = _positive_integer(getattr(self, field),
+                                      name=f'capacity_profile.{field}')
+            if value != 1:
+                raise ValueError(f'capacity_profile.{field} must be integer 1.')
+        fallback_replicas = _nonnegative_integer(
+            self.base_ondemand_fallback_replicas,
+            name='capacity_profile.base_ondemand_fallback_replicas')
+        if fallback_replicas != 0:
+            raise ValueError('capacity_profile.'
+                             'base_ondemand_fallback_replicas must be '
+                             'integer 0.')
+        if self.accelerator is not None:
+            raise ValueError('capacity_profile.accelerator must be null.')
+        if self.spot_placer is not None:
+            raise ValueError('capacity_profile.spot_placer must be null.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def ordinary_ondemand_physical_width1(cls) -> ServeActionCapacityProfileV1:
+        """Construct the one M4-eligible immutable capacity profile."""
+
+        return cls(version=1,
+                   profile=cls._PROFILE,
+                   pool=False,
+                   replica_unit='physical_backend',
+                   planned_capacity=1,
+                   node_count=1,
+                   use_spot=False,
+                   accelerator=None,
+                   spot_placer=None,
+                   reserved_capacity_fill=False,
+                   cost_rebalance=False,
+                   dynamic_ondemand_fallback=False,
+                   base_ondemand_fallback_replicas=0)
+
+    @classmethod
+    def from_value(cls, value: Any) -> ServeActionCapacityProfileV1:
+        raw = _closed_object(value,
+                             name='Serve action capacity profile',
+                             keys=cls._KEYS)
+        return cls(**raw)
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'profile': self._PROFILE,
+            'pool': False,
+            'replica_unit': 'physical_backend',
+            'planned_capacity': 1,
+            'node_count': 1,
+            'use_spot': False,
+            'accelerator': None,
+            'spot_placer': None,
+            'reserved_capacity_fill': False,
+            'cost_rebalance': False,
+            'dynamic_ondemand_fallback': False,
+            'base_ondemand_fallback_replicas': 0,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ServeServiceVersionSpecIdentityV1(_CanonicalContract):
+    """Closed effective identity of one immutable SkyServe version YAML."""
+
+    version: int
+    service_name: str
+    service_incarnation: uuid.UUID
+    service_version: int
+    effective_service_config_sha256: str
+    effective_task_config_sha256: str
+    capacity_profile: ServeActionCapacityProfileV1
+    provider_profile: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'service_name', 'service_incarnation', 'service_version',
+        'effective_service_config_sha256', 'effective_task_config_sha256',
+        'capacity_profile', 'provider_profile'
+    })
+
+    def __post_init__(self) -> None:
+        _version_one(self.version,
+                     name='Serve service-version identity version')
+        object.__setattr__(
+            self, 'service_name',
+            _text(self.service_name,
+                  name='service_version_identity.service_name',
+                  maximum_bytes=_MAX_SERVICE_NAME_BYTES))
+        object.__setattr__(
+            self, 'service_incarnation',
+            _schema_uuid(self.service_incarnation,
+                         name=('service_version_identity.'
+                               'service_incarnation')))
+        object.__setattr__(
+            self, 'service_version',
+            _positive_integer(self.service_version,
+                              name=('service_version_identity.'
+                                    'service_version')))
+        for field in ('effective_service_config_sha256',
+                      'effective_task_config_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field),
+                        name=f'service_version_identity.{field}'))
+        if type(self.capacity_profile) is not ServeActionCapacityProfileV1:
+            raise TypeError('service_version_identity.capacity_profile has '
+                            'an invalid type.')
+        if type(self.provider_profile) is not str:
+            raise TypeError('service_version_identity.provider_profile must '
+                            'be text.')
+        if self.provider_profile != ProviderProfile.POD_CLUSTER_V1.value:
+            raise ValueError('service_version_identity.provider_profile is '
+                             'unsupported.')
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ServeServiceVersionSpecIdentityV1:
+        raw = _closed_object(value,
+                             name='Serve service-version identity',
+                             keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            service_name=raw['service_name'],
+            service_incarnation=_schema_uuid(
+                raw['service_incarnation'],
+                name='service_version_identity.service_incarnation'),
+            service_version=raw['service_version'],
+            effective_service_config_sha256=raw[
+                'effective_service_config_sha256'],
+            effective_task_config_sha256=raw['effective_task_config_sha256'],
+            capacity_profile=ServeActionCapacityProfileV1.from_value(
+                raw['capacity_profile']),
+            provider_profile=raw['provider_profile'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'service_name': self.service_name,
+            'service_incarnation': str(self.service_incarnation),
+            'service_version': self.service_version,
+            'effective_service_config_sha256':
+                self.effective_service_config_sha256,
+            'effective_task_config_sha256': self.effective_task_config_sha256,
+            'capacity_profile': self.capacity_profile.canonical_value(),
+            'provider_profile': ProviderProfile.POD_CLUSTER_V1.value,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ShadowCandidateActionBindingV1(_CanonicalContract):
+    """Candidate qualification tuple frozen into a private-shadow action."""
+
+    version: int
+    binding_kind: str
+    candidate_epoch: uuid.UUID
+    qualification_policy_sha256: str
+    qualification_binding_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'binding_kind', 'candidate_epoch',
+        'qualification_policy_sha256', 'qualification_binding_sha256'
+    })
+    BINDING_KIND: ClassVar[str] = 'shadow_candidate'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='shadow candidate binding version')
+        if type(self.binding_kind) is not str:
+            raise TypeError('shadow candidate binding_kind must be text.')
+        if self.binding_kind != self.BINDING_KIND:
+            raise ValueError('shadow candidate binding_kind is unsupported.')
+        object.__setattr__(
+            self, 'candidate_epoch',
+            _uuid(self.candidate_epoch,
+                  name='shadow candidate binding candidate_epoch'))
+        for field in ('qualification_policy_sha256',
+                      'qualification_binding_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field),
+                        name=f'shadow candidate binding {field}'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> ShadowCandidateActionBindingV1:
+        raw = _closed_object(value,
+                             name='shadow candidate action binding',
+                             keys=cls._KEYS)
+        return cls(
+            version=raw['version'],
+            binding_kind=raw['binding_kind'],
+            candidate_epoch=_uuid(
+                raw['candidate_epoch'],
+                name='shadow candidate binding candidate_epoch'),
+            qualification_policy_sha256=raw['qualification_policy_sha256'],
+            qualification_binding_sha256=raw['qualification_binding_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'binding_kind': self.BINDING_KIND,
+            'candidate_epoch': str(self.candidate_epoch),
+            'qualification_policy_sha256': self.qualification_policy_sha256,
+            'qualification_binding_sha256': self.qualification_binding_sha256,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class AuthoritativeActionPolicyBindingV1(_CanonicalContract):
+    """Active authority-policy tuple frozen into an authoritative action."""
+
+    version: int
+    binding_kind: str
+    policy_epoch: uuid.UUID
+    policy_sha256: str
+    authority_binding_sha256: str
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'binding_kind', 'policy_epoch', 'policy_sha256',
+        'authority_binding_sha256'
+    })
+    BINDING_KIND: ClassVar[str] = 'authoritative_action'
+
+    def __post_init__(self) -> None:
+        _version_one(self.version, name='authoritative action binding version')
+        if type(self.binding_kind) is not str:
+            raise TypeError('authoritative action binding_kind must be text.')
+        if self.binding_kind != self.BINDING_KIND:
+            raise ValueError('authoritative action binding_kind is '
+                             'unsupported.')
+        object.__setattr__(
+            self, 'policy_epoch',
+            _uuid(self.policy_epoch,
+                  name='authoritative action binding policy_epoch'))
+        for field in ('policy_sha256', 'authority_binding_sha256'):
+            object.__setattr__(
+                self, field,
+                _sha256(getattr(self, field),
+                        name=f'authoritative action binding {field}'))
+        _ = self.canonical_bytes
+
+    @classmethod
+    def from_value(cls, value: Any) -> AuthoritativeActionPolicyBindingV1:
+        raw = _closed_object(value,
+                             name='authoritative action policy binding',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   binding_kind=raw['binding_kind'],
+                   policy_epoch=_uuid(
+                       raw['policy_epoch'],
+                       name='authoritative action binding policy_epoch'),
+                   policy_sha256=raw['policy_sha256'],
+                   authority_binding_sha256=raw['authority_binding_sha256'])
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 1,
+            'binding_kind': self.BINDING_KIND,
+            'policy_epoch': str(self.policy_epoch),
+            'policy_sha256': self.policy_sha256,
+            'authority_binding_sha256': self.authority_binding_sha256,
+        }
+
+
+ServeReplicaActionAdmissionBindingV1 = (ShadowCandidateActionBindingV1 |
+                                        AuthoritativeActionPolicyBindingV1)
+
+
+def serve_replica_action_admission_binding_from_value_v1(
+        value: Any) -> ServeReplicaActionAdmissionBindingV1:
+    """Parse the exact admission-binding union by its closed discriminator."""
+
+    if type(value) is not dict:
+        raise TypeError('Serve replica action admission binding must be an '
+                        'object.')
+    binding_kind = value.get('binding_kind')
+    if type(binding_kind) is not str:
+        raise TypeError('Serve replica action admission binding_kind must be '
+                        'text.')
+    if binding_kind == ShadowCandidateActionBindingV1.BINDING_KIND:
+        return ShadowCandidateActionBindingV1.from_value(value)
+    if binding_kind == AuthoritativeActionPolicyBindingV1.BINDING_KIND:
+        return AuthoritativeActionPolicyBindingV1.from_value(value)
+    raise ValueError('Serve replica action admission binding_kind is '
+                     'unsupported.')
+
+
+@dataclasses.dataclass(frozen=True)
 class ServeReplicaActionSpecV1(_CanonicalContract):
     """Closed immutable Serve wrapper around one provider action plan."""
 
@@ -14304,6 +16015,271 @@ class ServeReplicaActionSpecV1(_CanonicalContract):
         if invocation.canonical_bytes != expected.canonical_bytes:
             raise ValueError('child invocation is not byte-equal to the '
                              'immutable action spec invocation.')
+
+
+@dataclasses.dataclass(frozen=True)
+class ServeReplicaActionSpecV2(_CanonicalContract):
+    """Live M4 action envelope with complete version and admission identity."""
+
+    version: int
+    service_version_spec_identity: ServeServiceVersionSpecIdentityV1
+    service_version_spec_identity_sha256: str
+    admission_binding: ServeReplicaActionAdmissionBindingV1
+    provider_plan: ProviderLifecyclePlanV2
+    invocation: ProviderLifecycleInvocationV2
+
+    _KEYS: ClassVar[frozenset[str]] = frozenset({
+        'version', 'service_version_spec_identity',
+        'service_version_spec_identity_sha256', 'admission_binding',
+        'provider_plan', 'invocation'
+    })
+    _MAX_QUALIFIED_BYTES: ClassVar[int] = 60_000
+
+    def __post_init__(self) -> None:
+        _version_two(self.version, name='Serve replica action spec version')
+        if type(self.service_version_spec_identity) is not (
+                ServeServiceVersionSpecIdentityV1):
+            raise TypeError('service_version_spec_identity has an invalid '
+                            'type.')
+        identity_sha256 = _sha256(self.service_version_spec_identity_sha256,
+                                  name='service_version_spec_identity_sha256')
+        if identity_sha256 != self.service_version_spec_identity.sha256:
+            raise ValueError('service-version identity hash does not match '
+                             'its complete embedded identity.')
+        object.__setattr__(self, 'service_version_spec_identity_sha256',
+                           identity_sha256)
+        if type(self.admission_binding) not in (
+                ShadowCandidateActionBindingV1,
+                AuthoritativeActionPolicyBindingV1):
+            raise TypeError('admission_binding has an invalid type.')
+        if type(self.provider_plan) is not ProviderLifecyclePlanV2:
+            raise TypeError('provider_plan has an invalid type.')
+        if type(self.invocation) is not ProviderLifecycleInvocationV2:
+            raise TypeError('invocation has an invalid type.')
+        if self.provider_plan.action_id != self.invocation.action_id:
+            raise ValueError('provider plan and invocation action IDs differ.')
+        self.provider_plan.validate_invocation(self.invocation)
+        self._validate_service_version_identity()
+        encoded = self.canonical_bytes
+        if len(encoded) > self._MAX_QUALIFIED_BYTES:
+            raise ValueError('Serve replica action spec V2 exceeds the 60000-'
+                             'byte qualification budget.')
+
+    def _validate_service_version_identity(self) -> None:
+        identity = self.service_version_spec_identity
+        resource_identity = self.invocation.resource_identity
+        if (identity.service_incarnation
+                != resource_identity.service_incarnation or
+                str(identity.service_incarnation)
+                != resource_identity.service_hash):
+            raise ValueError('service-version identity does not match the '
+                             'action resource incarnation.')
+        if identity.provider_profile != self.provider_plan.profile.value:
+            raise ValueError('service-version identity provider profile does '
+                             'not match the provider plan.')
+        if self.invocation.action_kind is kernel_actions.ActionKind.LAUNCH:
+            launch = self.invocation.require_launch()
+            source = launch.source.content
+            if (source.service_name != identity.service_name or
+                    source.service_incarnation != identity.service_incarnation
+                    or source.service_version != identity.service_version):
+                raise ValueError('service-version identity does not match the '
+                                 'launch retained-source tuple.')
+        else:
+            prior_identity = self.invocation.require_down(
+            ).prior_launch_basis.launch_resource_identity
+            if (prior_identity.service_incarnation
+                    != identity.service_incarnation or
+                    prior_identity.service_hash != str(
+                        identity.service_incarnation)):
+                raise ValueError('service-version identity does not match the '
+                                 'down prior-launch resource incarnation.')
+
+    @classmethod
+    def from_value(cls, value: Any) -> ServeReplicaActionSpecV2:
+        _bounded_canonical_json_bytes(value,
+                                      name='Serve replica action spec V2',
+                                      require_object=True,
+                                      allow_empty_strings=True)
+        raw = _closed_object(value,
+                             name='Serve replica action spec V2',
+                             keys=cls._KEYS)
+        return cls(version=raw['version'],
+                   service_version_spec_identity=(
+                       ServeServiceVersionSpecIdentityV1.from_value(
+                           raw['service_version_spec_identity'])),
+                   service_version_spec_identity_sha256=raw[
+                       'service_version_spec_identity_sha256'],
+                   admission_binding=(
+                       serve_replica_action_admission_binding_from_value_v1(
+                           raw['admission_binding'])),
+                   provider_plan=ProviderLifecyclePlanV2.from_value(
+                       raw['provider_plan']),
+                   invocation=ProviderLifecycleInvocationV2.from_value(
+                       raw['invocation']))
+
+    def canonical_value(self) -> JsonObject:
+        return {
+            'version': 2,
+            'service_version_spec_identity':
+                self.service_version_spec_identity.canonical_value(),
+            'service_version_spec_identity_sha256':
+                self.service_version_spec_identity_sha256,
+            'admission_binding': self.admission_binding.canonical_value(),
+            'provider_plan': self.provider_plan.canonical_value(),
+            'invocation': self.invocation.canonical_value(),
+        }
+
+    @property
+    def action_id(self) -> uuid.UUID:
+        return self.provider_plan.action_id
+
+    def require_shadow_candidate_binding(
+            self) -> ShadowCandidateActionBindingV1:
+        if type(self.admission_binding) is not ShadowCandidateActionBindingV1:
+            raise ValueError('action spec does not carry a shadow-candidate '
+                             'binding.')
+        return self.admission_binding
+
+    def require_authoritative_action_binding(
+            self) -> AuthoritativeActionPolicyBindingV1:
+        if type(self.admission_binding) is not (
+                AuthoritativeActionPolicyBindingV1):
+            raise ValueError('action spec does not carry an authoritative '
+                             'policy binding.')
+        return self.admission_binding
+
+    def validate_admission_binding(
+            self, binding: ServeReplicaActionAdmissionBindingV1) -> None:
+        """Require a locked row's typed binding to equal the immutable spec."""
+
+        if type(binding) not in (ShadowCandidateActionBindingV1,
+                                 AuthoritativeActionPolicyBindingV1):
+            raise TypeError('locked admission binding has an invalid type.')
+        if (type(binding) is not type(self.admission_binding) or
+                binding.canonical_bytes
+                != self.admission_binding.canonical_bytes):
+            raise ValueError('locked admission binding is not byte-equal to '
+                             'the immutable action spec binding.')
+
+    def validate_parent_provider_plan(
+            self, provider_plan: ProviderLifecyclePlanV2) -> None:
+        """Require a shadow parent's indexed plan to be the wrapper member."""
+
+        if type(provider_plan) is not ProviderLifecyclePlanV2:
+            raise TypeError('parent provider_plan has an invalid type.')
+        if provider_plan.canonical_bytes != self.provider_plan.canonical_bytes:
+            raise ValueError('parent provider plan is not byte-equal to the '
+                             'immutable spec provider plan.')
+
+    def validate_down_prior_launch_spec(
+            self, prior_launch_spec: ServeReplicaActionSpecV2) -> None:
+        """Bind a down envelope to the exact stored launch-version envelope.
+
+        A down basis carries only the prior immutable-spec hash.  The store
+        boundary must resolve that hash to a retained V2 launch spec and call
+        this method before admitting or executing the down action.  This keeps
+        the launch version identity across later service-version elections
+        without trusting a current-row reconstruction.
+        """
+
+        if self.invocation.action_kind is not kernel_actions.ActionKind.DOWN:
+            raise ValueError('prior-launch spec validation requires a down '
+                             'action spec.')
+        if type(prior_launch_spec) is not ServeReplicaActionSpecV2:
+            raise TypeError('prior_launch_spec has an invalid type.')
+        if prior_launch_spec.invocation.action_kind is not (
+                kernel_actions.ActionKind.LAUNCH):
+            raise ValueError('prior_launch_spec must be a launch action spec.')
+        basis = self.invocation.require_down().prior_launch_basis
+        if basis.launch_immutable_spec_sha256 != prior_launch_spec.sha256:
+            raise ValueError('down prior-launch immutable-spec hash does not '
+                             'match the retained launch action spec.')
+        if basis.launch_action_id != prior_launch_spec.action_id:
+            raise ValueError('down prior-launch action ID does not match the '
+                             'retained launch action spec.')
+        if (basis.launch_resource_identity.canonical_bytes != prior_launch_spec.
+                invocation.resource_identity.canonical_bytes or
+                basis.launch_requested_target.canonical_bytes !=
+                prior_launch_spec.invocation.requested_target.canonical_bytes):
+            raise ValueError('down prior-launch resource identity or target '
+                             'does not match the retained launch action spec.')
+        if (self.service_version_spec_identity_sha256
+                != prior_launch_spec.service_version_spec_identity_sha256 or
+                self.service_version_spec_identity.canonical_bytes
+                != prior_launch_spec.service_version_spec_identity.
+                canonical_bytes):
+            raise ValueError('down service-version identity is not byte-equal '
+                             'to the retained launch action spec identity.')
+
+    def launch_cleanup_down_invocation(
+            self) -> ServeLegacyLaunchCleanupDownInvocationV1:
+        """Derive cleanup I/O without replacing version/admission identity."""
+
+        if self.invocation.action_kind is not kernel_actions.ActionKind.LAUNCH:
+            raise ValueError('cleanup down requires a launch action spec.')
+        launch = self.invocation.launch
+        if launch is None:
+            raise ValueError('cleanup down requires a launch invocation.')
+        target = self.invocation.requested_target
+        return ServeLegacyLaunchCleanupDownInvocationV1(
+            version=1,
+            contract='serve_legacy_launch_cleanup_down_v1',
+            request_role=ShadowRequestRole.LAUNCH_CLEANUP_DOWN,
+            effect_kind=kernel_actions.ActionKind.DOWN,
+            profile=self.invocation.profile,
+            redaction_profile=self.invocation.redaction_profile,
+            parent_launch_action_id=self.action_id,
+            parent_launch_request_payload_sha256=self.invocation.sha256,
+            resource_identity=self.invocation.resource_identity,
+            requested_target=target,
+            legacy_down_request=ServeLegacyDownRequestV1(
+                cluster_name=target.sky_cluster_name,
+                expected_cluster_record_uuid=target.sky_cluster_record_uuid,
+                workspace=launch.source.content.workspace,
+                purge=False,
+                graceful=False,
+                graceful_timeout=None))
+
+    def validate_shadow_child_invocation(
+        self, role: ShadowRequestRole,
+        invocation: ProviderLifecycleInvocationV2 |
+        ServeLegacyLaunchCleanupDownInvocationV1
+    ) -> None:
+        """Require the exact primary invocation or derived cleanup exception."""
+
+        if type(role) is not ShadowRequestRole:
+            raise TypeError('shadow request role has an invalid type.')
+        expected: (ProviderLifecycleInvocationV2 |
+                   ServeLegacyLaunchCleanupDownInvocationV1)
+        if role is ShadowRequestRole.LAUNCH_CLEANUP_DOWN:
+            if type(invocation) is not (
+                    ServeLegacyLaunchCleanupDownInvocationV1):
+                raise TypeError('cleanup child invocation has an invalid '
+                                'type.')
+            expected = self.launch_cleanup_down_invocation()
+        else:
+            if type(invocation) is not ProviderLifecycleInvocationV2:
+                raise TypeError('primary child invocation has an invalid '
+                                'type.')
+            expected_role = (ShadowRequestRole.PRIMARY_LAUNCH
+                             if self.invocation.action_kind
+                             is kernel_actions.ActionKind.LAUNCH else
+                             ShadowRequestRole.PRIMARY_DOWN)
+            if role is not expected_role:
+                raise ValueError('primary child role does not match the action '
+                                 'spec action kind.')
+            expected = self.invocation
+        if invocation.canonical_bytes != expected.canonical_bytes:
+            raise ValueError('child invocation is not byte-equal to the '
+                             'immutable action spec invocation.')
+
+
+def serve_replica_action_spec_from_value_v2(
+        value: Any) -> ServeReplicaActionSpecV2:
+    """The sole parser authorized at every live M4 execution boundary."""
+
+    return ServeReplicaActionSpecV2.from_value(value)
 
 
 @dataclasses.dataclass(frozen=True)

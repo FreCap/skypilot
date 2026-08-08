@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
 import hashlib
 import pathlib
 import re
@@ -21,11 +22,16 @@ import typing
 
 import yaml
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _ARTIFACT_ID_RE = re.compile(r'PLA-(BASE|M[0-7])-\d{3}\Z')
 _COVERAGE_GAP_ID_RE = re.compile(r'PLA-GAP-\d{3}\Z')
+_BUNDLE_ID_RE = re.compile(r'[a-z][a-z0-9_.-]*[a-z0-9]\Z')
+_ROLLOUT_ARTIFACT_RE = re.compile(r'M[0-9]+[a-z]?\Z')
 _SHA_RE = re.compile(r'[0-9a-f]{40}\Z')
 _SHA256_RE = re.compile(r'[0-9a-f]{64}\Z')
+_OCI_DIGEST_RE = re.compile(r'sha256:[0-9a-f]{64}\Z')
+_UTC_TIMESTAMP_RE = re.compile(
+    r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z')
 _NAME_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_.:-]*\Z')
 _SCOPE_VALUE_RE = re.compile(r'[a-z][a-z0-9_]*\Z')
 _GLOB_CHARS = frozenset('*?[]{}')
@@ -109,7 +115,12 @@ _BROAD_SCOPE_VALUES = frozenset({
     'all promoted providers',
 })
 
-_TOP_LEVEL_KEYS = frozenset({'schema_version', 'coverage_gaps', 'artifacts'})
+_TOP_LEVEL_KEYS = frozenset({
+    'schema_version',
+    'coverage_gaps',
+    'removal_bundles',
+    'artifacts',
+})
 _COVERAGE_GAP_KEYS = frozenset({
     'id',
     'milestone',
@@ -138,8 +149,41 @@ _ARTIFACT_REQUIRED_KEYS = frozenset({
     'blocker',
 })
 _ARTIFACT_OPTIONAL_KEYS = frozenset({
+    'bundle',
     'checksum_sha256',
     'linked_contractions',
+})
+_REMOVAL_BUNDLE_KEYS = frozenset({
+    'id',
+    'members',
+    'retained_locators',
+    'required_feature_merge',
+    'rollout_contract',
+    'evidence',
+})
+_ROLLOUT_STAGE_KEYS = frozenset({
+    'id',
+    'artifacts',
+    'minimum_duration_hours',
+    'minimum_launches',
+    'minimum_downs',
+    'requirements',
+})
+_ROLLOUT_EVIDENCE_KEYS = frozenset({
+    'artifact_shas',
+    'image_digests',
+    'authority_policy_sha256',
+    'started_at',
+    'completed_at',
+    'clean_launch_graphs',
+    'clean_down_graphs',
+    'eligible_legacy_route_count',
+    'unresolved_crash_intents',
+    'stale_claim_count',
+    'duplicate_provider_effects',
+    'divergence_count',
+    'blocker_count',
+    'evidence',
 })
 _SCOPE_KEYS = frozenset({'domain', 'store', 'provider', 'operation'})
 _GATE_KEYS = frozenset({'id', 'satisfied', 'evidence'})
@@ -149,6 +193,7 @@ _BLOCKER_KEYS = frozenset({
     'issue',
     'evidence',
 })
+_BLOCKER_OPTIONAL_KEYS = frozenset({'draft_source_removal'})
 _EVIDENCE_KEYS = frozenset({
     'removal_sha',
     'exact_head_ci',
@@ -207,6 +252,12 @@ def _is_nonempty_string(value: typing.Any) -> bool:
 
 def _format_key_set(keys: typing.Iterable[typing.Any]) -> str:
     return ', '.join(sorted(str(key) for key in keys))
+
+
+def _canonical_yaml_bytes(value: typing.Any) -> bytes:
+    """Return stable bytes for exact cross-row evidence comparisons."""
+    return yaml.safe_dump(value, sort_keys=True,
+                          default_flow_style=False).encode('utf-8')
 
 
 def _assignment_names(node: ast.AST) -> typing.Set[str]:
@@ -362,12 +413,15 @@ class ManifestChecker:
         self._artifacts_by_id: typing.Dict[str,
                                            typing.Mapping[str,
                                                           typing.Any]] = {}
+        self._removal_bundles_by_id: typing.Dict[str, typing.Mapping[
+            str, typing.Any]] = {}
         self._coverage_gap_ids: typing.Set[str] = set()
         self._mutable_node_owners: typing.Dict[int, str] = {}
         self._ast_cache: typing.Dict[pathlib.Path,
                                      typing.Optional[ast.Module]] = {}
         self._git_available = self._detect_git_checkout()
         self._provenance_cache: typing.Dict[str, typing.Tuple[bool, bool]] = {}
+        self._ancestry_cache: typing.Dict[typing.Tuple[str, str], bool] = {}
 
     def _detect_git_checkout(self) -> bool:
         try:
@@ -432,6 +486,79 @@ class ManifestChecker:
                         f'{label} commit is not an ancestor of HEAD')
         return exists and ancestor
 
+    def _git_is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return whether two known commits have the required ancestry."""
+        if not self._git_available:
+            return True
+        key = (ancestor, descendant)
+        cached = self._ancestry_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            result = subprocess.run([
+                'git', '-C',
+                str(self._repo_root), 'merge-base', '--is-ancestor', ancestor,
+                descendant
+            ],
+                                    check=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            is_ancestor = False
+        else:
+            is_ancestor = result.returncode == 0
+        self._ancestry_cache[key] = is_ancestor
+        return is_ancestor
+
+    def _check_normal_merge_commit(self, label: str, sha: str) -> None:
+        """Require an exact Git commit to be a normal two-parent merge."""
+        if not self._git_available:
+            return
+        try:
+            result = subprocess.run([
+                'git', '-C',
+                str(self._repo_root), 'rev-list', '--parents', '-n', '1', sha
+            ],
+                                    check=False,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    text=True)
+        except OSError:
+            result = None
+        parents = [] if result is None else result.stdout.strip().split()
+        if result is None or result.returncode != 0:
+            self._error(label, 'normal merge parents cannot be inspected')
+        elif len(parents) != 3:
+            self._error(
+                label, 'required_feature_merge must be a normal '
+                'two-parent merge')
+
+    def _introduction_parent(self, label: str,
+                             sha: str) -> typing.Optional[str]:
+        """Return an ordinary introducing commit's parent, if it has one."""
+        if not self._git_available:
+            return None
+        try:
+            result = subprocess.run([
+                'git', '-C',
+                str(self._repo_root), 'rev-list', '--parents', '-n', '1', sha
+            ],
+                                    check=False,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL,
+                                    text=True)
+        except OSError:
+            result = None
+        parents = [] if result is None else result.stdout.strip().split()
+        if result is None or result.returncode != 0 or not parents:
+            self._error(label, 'introduced_by parents cannot be inspected')
+            return None
+        if len(parents) > 2:
+            self._error(label,
+                        'introduced_by must be an ordinary source commit')
+            return None
+        return None if len(parents) == 1 else parents[1]
+
     def check(self, document: typing.Any) -> typing.List[str]:
         if not isinstance(document, dict):
             return ['manifest: top level must be a mapping']
@@ -441,6 +568,24 @@ class ManifestChecker:
             self._error('manifest', f'schema_version must be {_SCHEMA_VERSION}')
 
         self._check_coverage_gaps(document.get('coverage_gaps'))
+
+        bundles = document.get('removal_bundles')
+        if not isinstance(bundles, list):
+            self._error('manifest', 'removal_bundles must be a list')
+            bundles = []
+        for index, bundle in enumerate(bundles):
+            label = f'removal_bundles[{index}]'
+            if not isinstance(bundle, dict):
+                self._error(label, 'removal bundle must be a mapping')
+                continue
+            bundle_id = bundle.get('id')
+            if not _is_nonempty_string(bundle_id):
+                self._error(label, 'id must be a nonempty string')
+                continue
+            if bundle_id in self._removal_bundles_by_id:
+                self._error(bundle_id, 'duplicate removal bundle id')
+                continue
+            self._removal_bundles_by_id[bundle_id] = bundle
 
         artifacts = document.get('artifacts')
         if not isinstance(artifacts, list) or not artifacts:
@@ -464,6 +609,7 @@ class ManifestChecker:
         for artifact_id in sorted(self._artifacts_by_id):
             self._check_artifact(artifact_id,
                                  self._artifacts_by_id[artifact_id])
+        self._check_removal_bundles()
         self._check_references()
         self._check_history_reverse_links()
         self._check_dependency_cycles()
@@ -559,6 +705,11 @@ class ManifestChecker:
             self._error(artifact_id, 'runtime_affecting must be a boolean')
         if not _is_nonempty_string(artifact.get('replacement')):
             self._error(artifact_id, 'replacement must be a nonempty string')
+        bundle = artifact.get('bundle')
+        if bundle is not None and (not isinstance(bundle, str) or
+                                   _BUNDLE_ID_RE.fullmatch(bundle) is None):
+            self._error(artifact_id,
+                        'bundle must be an exact removal bundle id')
 
         self._check_string_list(artifact_id, 'dependencies',
                                 artifact.get('dependencies'))
@@ -569,6 +720,21 @@ class ManifestChecker:
         self._check_status_history(artifact_id, status,
                                    artifact.get('status_history'),
                                    artifact.get('blocker'))
+        blocker = artifact.get('blocker')
+        if (isinstance(blocker, dict) and
+                blocker.get('draft_source_removal') is True):
+            if obligation not in ('must_remove', 'must_contract'):
+                self._error(
+                    artifact_id,
+                    'draft source removal requires a removal obligation')
+            if bundle is None:
+                self._error(
+                    artifact_id,
+                    'draft source removal requires an atomic removal bundle')
+            if artifact.get('introduced_by') is None:
+                self._error(
+                    artifact_id,
+                    'draft source removal requires introducing provenance')
         gates_valid = self._check_gates(artifact_id, artifact.get('gates'))
         self._check_evidence(artifact_id, artifact, gates_valid)
 
@@ -647,6 +813,10 @@ class ManifestChecker:
                 self._error(
                     artifact_id,
                     'introduced_by may be null only while effectively planned')
+            return
+        if effective_status == 'planned':
+            self._error(artifact_id,
+                        'introduced_by must be null while effectively planned')
             return
         if not isinstance(introduced_by,
                           str) or _SHA_RE.fullmatch(introduced_by) is None:
@@ -744,7 +914,7 @@ class ManifestChecker:
                             'blocked status requires a blocker mapping')
                 return
             self._check_keys(f'{artifact_id}.blocker', blocker, _BLOCKER_KEYS,
-                             _BLOCKER_KEYS)
+                             _BLOCKER_KEYS | _BLOCKER_OPTIONAL_KEYS)
             blocked_from = blocker.get('blocked_from_status')
             expected_from = history[-2] if len(history) >= 2 else None
             if blocked_from != expected_from or blocked_from not in _INCOMPLETE_STATUSES:
@@ -760,6 +930,16 @@ class ManifestChecker:
                                         'blocker.evidence',
                                         blocker.get('evidence'),
                                         required=True)
+            draft_source_removal = blocker.get('draft_source_removal')
+            if (draft_source_removal is not None and
+                    draft_source_removal is not True):
+                self._error(
+                    artifact_id,
+                    'blocker.draft_source_removal must be true when present')
+            if (draft_source_removal is True and blocked_from != 'present'):
+                self._error(
+                    artifact_id,
+                    'draft source removal must be blocked from present')
         elif blocker is not None:
             self._error(artifact_id,
                         'blocker must be null unless status is blocked')
@@ -1020,6 +1200,9 @@ class ManifestChecker:
 
     def _expected_presence(self, status: typing.Any,
                            blocker: typing.Any) -> typing.Optional[bool]:
+        if (status == 'blocked' and isinstance(blocker, dict) and
+                blocker.get('draft_source_removal') is True):
+            return False
         effective_status = status
         if status == 'blocked' and isinstance(blocker, dict):
             effective_status = blocker.get('blocked_from_status')
@@ -1324,6 +1507,574 @@ class ManifestChecker:
                 artifact_id,
                 f'retained history checksum mismatch: expected {checksum}, got {actual}'
             )
+
+    def _effective_artifact_status(
+            self, artifact: typing.Mapping[str, typing.Any]) -> typing.Any:
+        status = artifact.get('status')
+        blocker = artifact.get('blocker')
+        if status == 'blocked' and isinstance(blocker, dict):
+            return blocker.get('blocked_from_status')
+        return status
+
+    def _check_rollout_contract(
+        self, bundle_id: str, contract: typing.Any
+    ) -> typing.Dict[str, typing.Mapping[str, typing.Any]]:
+        stages: typing.Dict[str, typing.Mapping[str, typing.Any]] = {}
+        if not isinstance(contract, list) or not contract:
+            self._error(bundle_id, 'rollout_contract must be a nonempty list')
+            return stages
+        for index, stage in enumerate(contract):
+            label = f'rollout_contract[{index}]'
+            if not isinstance(stage, dict):
+                self._error(bundle_id, f'{label} must be a mapping')
+                continue
+            self._check_keys(f'{bundle_id}.{label}', stage, _ROLLOUT_STAGE_KEYS,
+                             _ROLLOUT_STAGE_KEYS)
+            stage_id = stage.get('id')
+            if (not isinstance(stage_id, str) or
+                    _NAME_RE.fullmatch(stage_id) is None or
+                    _has_glob(stage_id)):
+                self._error(bundle_id,
+                            f'{label}.id must be an exact identifier')
+            elif stage_id in stages:
+                self._error(bundle_id,
+                            f'rollout_contract has duplicate id {stage_id!r}')
+            else:
+                stages[stage_id] = stage
+
+            artifacts = stage.get('artifacts')
+            if not isinstance(artifacts, list) or not artifacts:
+                self._error(bundle_id,
+                            f'{label}.artifacts must be a nonempty list')
+            else:
+                for artifact_index, artifact in enumerate(artifacts):
+                    if (not isinstance(artifact, str) or
+                            _ROLLOUT_ARTIFACT_RE.fullmatch(artifact) is None):
+                        self._error(
+                            bundle_id,
+                            f'{label}.artifacts[{artifact_index}] must be an '
+                            'exact release artifact')
+
+            thresholds: typing.List[int] = []
+            for key in ('minimum_duration_hours', 'minimum_launches',
+                        'minimum_downs'):
+                value = stage.get(key)
+                if isinstance(value,
+                              bool) or not isinstance(value, int) or value < 0:
+                    self._error(bundle_id,
+                                f'{label}.{key} must be a nonnegative integer')
+                else:
+                    thresholds.append(value)
+            requirements = stage.get('requirements')
+            if not isinstance(requirements, list) or not requirements:
+                self._error(bundle_id,
+                            f'{label}.requirements must be a nonempty list')
+            else:
+                self._check_evidence_values(bundle_id,
+                                            f'{label}.requirements',
+                                            requirements,
+                                            required=True)
+            if (len(thresholds) == 3 and not any(thresholds) and
+                    isinstance(artifacts, list) and len(artifacts) < 2):
+                self._error(
+                    bundle_id, f'{label} must define a measurable window or a '
+                    'multi-artifact transition')
+        return stages
+
+    def _check_bundle_evidence(self, bundle_id: str, evidence: typing.Any,
+                               stages: typing.Mapping[str, typing.Mapping[
+                                   str, typing.Any]], terminal: bool) -> None:
+        if not isinstance(evidence, dict):
+            self._error(bundle_id, 'evidence must be a mapping')
+            return
+        self._claim_mutable_tree(f'bundle {bundle_id}', 'evidence', evidence,
+                                 self._mutable_node_owners)
+        stage_ids = set(stages)
+        evidence_ids = set(evidence)
+        unknown = evidence_ids - stage_ids
+        if unknown:
+            self._error(
+                bundle_id, 'evidence has unknown rollout stages: ' +
+                _format_key_set(unknown))
+        if terminal:
+            missing = stage_ids - evidence_ids
+            if missing:
+                self._error(
+                    bundle_id, 'terminal bundle evidence is incomplete: ' +
+                    _format_key_set(missing))
+        for stage_id, values in evidence.items():
+            stage = stages.get(stage_id)
+            if stage is None:
+                continue
+            self._check_rollout_evidence(bundle_id, stage_id, stage, values)
+
+    def _check_rollout_evidence(self, bundle_id: str, stage_id: str,
+                                stage: typing.Mapping[str, typing.Any],
+                                values: typing.Any) -> None:
+        """Validate one exact, machine-checkable operational rollout tuple."""
+        label = f'evidence.{stage_id}'
+        if not isinstance(values, dict):
+            self._error(bundle_id, f'{label} must be a mapping')
+            return
+        self._check_keys(f'{bundle_id}.{label}', values, _ROLLOUT_EVIDENCE_KEYS,
+                         _ROLLOUT_EVIDENCE_KEYS)
+
+        artifacts = stage.get('artifacts')
+        expected_count = len(artifacts) if isinstance(artifacts, list) else 0
+        artifact_shas = values.get('artifact_shas')
+        if (not isinstance(artifact_shas, list) or
+                len(artifact_shas) != expected_count):
+            self._error(
+                bundle_id, f'{label}.artifact_shas must have exactly '
+                f'{expected_count} entries')
+        else:
+            for index, sha in enumerate(artifact_shas):
+                if (not isinstance(sha, str) or _SHA_RE.fullmatch(sha) is None):
+                    self._error(
+                        bundle_id,
+                        f'{label}.artifact_shas[{index}] must be a lowercase '
+                        '40-hex SHA')
+                else:
+                    self._check_git_commit(bundle_id,
+                                           f'{label}.artifact_shas[{index}]',
+                                           sha)
+
+        image_digests = values.get('image_digests')
+        if (not isinstance(image_digests, list) or
+                len(image_digests) != expected_count):
+            self._error(
+                bundle_id, f'{label}.image_digests must have exactly '
+                f'{expected_count} entries')
+        else:
+            for index, digest in enumerate(image_digests):
+                if (not isinstance(digest, str) or
+                        _OCI_DIGEST_RE.fullmatch(digest) is None):
+                    self._error(
+                        bundle_id,
+                        f'{label}.image_digests[{index}] must be an exact '
+                        'sha256 OCI digest')
+
+        policy_sha = values.get('authority_policy_sha256')
+        if (not isinstance(policy_sha, str) or
+                _SHA256_RE.fullmatch(policy_sha) is None):
+            self._error(
+                bundle_id, f'{label}.authority_policy_sha256 must be '
+                'a lowercase SHA-256')
+
+        parsed_times: typing.Dict[str, datetime.datetime] = {}
+        for key in ('started_at', 'completed_at'):
+            value = values.get(key)
+            if (not isinstance(value, str) or
+                    _UTC_TIMESTAMP_RE.fullmatch(value) is None):
+                self._error(bundle_id,
+                            f'{label}.{key} must be a canonical UTC timestamp')
+                continue
+            try:
+                parsed_times[key] = datetime.datetime.fromisoformat(value[:-1] +
+                                                                    '+00:00')
+            except ValueError:
+                self._error(bundle_id,
+                            f'{label}.{key} must be a valid UTC timestamp')
+        if set(parsed_times) == {'started_at', 'completed_at'}:
+            elapsed = (parsed_times['completed_at'] -
+                       parsed_times['started_at']).total_seconds()
+            minimum_hours = stage.get('minimum_duration_hours')
+            if elapsed < 0:
+                self._error(bundle_id,
+                            f'{label}.completed_at precedes started_at')
+            elif (isinstance(minimum_hours, int) and
+                  elapsed < minimum_hours * 3600):
+                self._error(
+                    bundle_id,
+                    f'{label} duration is shorter than its rollout contract')
+
+        for evidence_key, minimum_key in (
+            ('clean_launch_graphs', 'minimum_launches'),
+            ('clean_down_graphs', 'minimum_downs'),
+        ):
+            value = values.get(evidence_key)
+            minimum = stage.get(minimum_key)
+            if isinstance(value,
+                          bool) or not isinstance(value, int) or value < 0:
+                self._error(bundle_id,
+                            f'{label}.{evidence_key} must be nonnegative')
+            elif isinstance(minimum, int) and value < minimum:
+                self._error(
+                    bundle_id, f'{label}.{evidence_key} is below its '
+                    'rollout-contract minimum')
+
+        for key in ('eligible_legacy_route_count', 'unresolved_crash_intents',
+                    'stale_claim_count', 'duplicate_provider_effects',
+                    'divergence_count', 'blocker_count'):
+            value = values.get(key)
+            if isinstance(value, bool) or value != 0:
+                self._error(bundle_id, f'{label}.{key} must equal zero')
+        self._check_evidence_values(bundle_id,
+                                    f'{label}.evidence',
+                                    values.get('evidence'),
+                                    required=True)
+
+    def _historical_locator_resolves(self,
+                                     bundle_id: str,
+                                     index: int,
+                                     locator: typing.Mapping[str, typing.Any],
+                                     sha: str,
+                                     revision_label: str,
+                                     locator_field: str = 'retained_locators',
+                                     expected: bool = True) -> None:
+        """Check one locator's exact presence in an immutable Git tree."""
+        if not self._git_available:
+            return
+        kind = locator.get('kind')
+        relative_path = locator.get('path')
+        if (kind not in _LOCATOR_KINDS or
+                not _is_nonempty_string(relative_path) or
+                _has_glob(relative_path)):
+            return
+        relative = pathlib.PurePosixPath(relative_path)
+        if relative.is_absolute() or '..' in relative.parts:
+            return
+        object_name = f'{sha}:{relative_path}'
+        try:
+            exists = subprocess.run([
+                'git', '-C',
+                str(self._repo_root), 'cat-file', '-e', object_name
+            ],
+                                    check=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except OSError:
+            exists = None
+        label = f'{locator_field}[{index}]'
+        if exists is None or exists.returncode != 0:
+            if expected:
+                self._error(
+                    bundle_id,
+                    f'{label} does not resolve at {revision_label} {sha}')
+            return
+        if kind in ('path', 'packaged_path'):
+            if not expected:
+                self._error(
+                    bundle_id,
+                    f'{label} unexpectedly resolves at {revision_label} {sha}')
+            return
+        try:
+            shown = subprocess.run(
+                ['git', '-C',
+                 str(self._repo_root), 'show', object_name],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+        except OSError:
+            shown = None
+        if shown is None or shown.returncode != 0:
+            self._error(bundle_id,
+                        f'{label} cannot be read at {revision_label} {sha}')
+            return
+        content = shown.stdout
+        if kind == 'file_digest':
+            resolved = hashlib.sha256(content).hexdigest() == locator.get(
+                'sha256')
+        else:
+            try:
+                source = content.decode('utf-8')
+            except UnicodeError:
+                self._error(bundle_id,
+                            f'{label} is not UTF-8 at {revision_label} {sha}')
+                return
+            if kind == 'sql_object':
+                name = locator.get('name')
+                resolved = bool(
+                    isinstance(name, str) and re.search(
+                        rf'(?<![A-Za-z0-9_]){re.escape(name)}'
+                        r'(?![A-Za-z0-9_])', source))
+            else:
+                try:
+                    tree = ast.parse(source, filename=f'{sha}:{relative_path}')
+                    if kind == 'python_symbol':
+                        resolved = _resolve_python_symbol(
+                            tree, locator.get('symbol', '')) is not None
+                    elif kind == 'python_attribute':
+                        owner = _resolve_python_symbol(
+                            tree, locator.get('symbol', ''))
+                        resolved = owner is not None and _contains_attribute(
+                            owner, locator.get('attribute', ''))
+                    elif kind == 'python_call_within':
+                        owner = _resolve_python_symbol(
+                            tree, locator.get('symbol', ''))
+                        resolved = owner is not None and _contains_call(
+                            owner, locator.get('call', ''))
+                    elif kind == 'python_enum_member':
+                        owner = _resolve_python_symbol(
+                            tree, locator.get('symbol', ''))
+                        resolved = owner is not None and _contains_enum_member(
+                            owner, locator.get('member', ''))
+                    elif kind == 'python_ast_pattern':
+                        owner = tree
+                        symbol = locator.get('symbol')
+                        if symbol is not None:
+                            resolved_owner = _resolve_python_symbol(
+                                tree, symbol)
+                            if resolved_owner is None:
+                                resolved = False
+                                owner = tree
+                            else:
+                                owner = resolved_owner
+                                resolved = _contains_ast_pattern(
+                                    owner, locator.get('pattern', ''))
+                        else:
+                            resolved = _contains_ast_pattern(
+                                owner, locator.get('pattern', ''))
+                    elif kind == 'runtime_metadata':
+                        resolved = _contains_runtime_metadata(
+                            tree, locator.get('name', ''))
+                    elif kind == 'runtime_import':
+                        resolved = _contains_runtime_import(
+                            tree, locator.get('module', ''),
+                            locator.get('symbol'))
+                    elif kind == 'test_node':
+                        node = locator.get('node',
+                                           '').split('[',
+                                                     1)[0].replace('::', '.')
+                        resolved = _resolve_python_symbol(tree,
+                                                          node) is not None
+                    else:
+                        resolved = False
+                except (SyntaxError, ValueError, TypeError):
+                    resolved = False
+        if resolved != expected:
+            qualifier = 'does not resolve' if expected else 'unexpectedly resolves'
+            self._error(bundle_id,
+                        f'{label} {qualifier} at {revision_label} {sha}')
+
+    def _check_removal_bundles(self) -> None:
+        member_owners: typing.Dict[str, str] = {}
+        for bundle_id in sorted(self._removal_bundles_by_id):
+            bundle = self._removal_bundles_by_id[bundle_id]
+            self._check_keys(bundle_id, bundle, _REMOVAL_BUNDLE_KEYS,
+                             _REMOVAL_BUNDLE_KEYS)
+            if _BUNDLE_ID_RE.fullmatch(bundle_id) is None:
+                self._error(bundle_id,
+                            'id must be a canonical removal bundle id')
+
+            members = bundle.get('members')
+            member_artifacts: typing.List[typing.Tuple[str, typing.Mapping[
+                str, typing.Any]]] = []
+            if not isinstance(members, list) or len(members) < 2:
+                self._error(bundle_id,
+                            'members must contain at least two artifact ids')
+                members = []
+            elif members != sorted(
+                    set(member for member in members
+                        if isinstance(member, str))):
+                self._error(bundle_id,
+                            'members must be sorted and contain no duplicates')
+            for index, member_id in enumerate(members):
+                if (not isinstance(member_id, str) or
+                        _ARTIFACT_ID_RE.fullmatch(member_id) is None):
+                    self._error(
+                        bundle_id,
+                        f'members[{index}] must be an exact artifact id')
+                    continue
+                prior_owner = member_owners.get(member_id)
+                if prior_owner is not None:
+                    self._error(
+                        bundle_id, f'member {member_id!r} is already owned by '
+                        f'{prior_owner!r}')
+                    continue
+                member_owners[member_id] = bundle_id
+                artifact = self._artifacts_by_id.get(member_id)
+                if artifact is None:
+                    self._error(bundle_id,
+                                f'unknown member artifact {member_id!r}')
+                    continue
+                member_artifacts.append((member_id, artifact))
+                if artifact.get('bundle') != bundle_id:
+                    self._error(member_id,
+                                f'bundle cross-link must equal {bundle_id!r}')
+                if artifact.get('obligation') not in ('must_remove',
+                                                      'must_contract'):
+                    self._error(
+                        member_id,
+                        'removal bundle members must be removal obligations')
+                introduced_by = artifact.get('introduced_by')
+                if (isinstance(introduced_by, str) and
+                        _SHA_RE.fullmatch(introduced_by) is not None and
+                    (not self._git_available or
+                     self._git_commit_state(introduced_by)[0])):
+                    introduction_parent = self._introduction_parent(
+                        member_id, introduced_by)
+                    locators = artifact.get('locators')
+                    if isinstance(locators, list):
+                        for locator_index, locator in enumerate(locators):
+                            if isinstance(locator, dict):
+                                self._historical_locator_resolves(
+                                    member_id,
+                                    locator_index,
+                                    locator,
+                                    introduced_by,
+                                    'introduced_by',
+                                    locator_field='locators')
+                                if introduction_parent is not None:
+                                    self._historical_locator_resolves(
+                                        member_id,
+                                        locator_index,
+                                        locator,
+                                        introduction_parent,
+                                        'introduced_by parent',
+                                        locator_field='locators',
+                                        expected=False)
+
+            rollout_stages = self._check_rollout_contract(
+                bundle_id, bundle.get('rollout_contract'))
+
+            common_status: typing.Any = None
+            reference_id: typing.Optional[str] = None
+            reference: typing.Optional[typing.Mapping[str, typing.Any]] = None
+            if member_artifacts:
+                reference_id, reference = member_artifacts[0]
+                common_status = reference.get('status')
+                for member_id, artifact in member_artifacts[1:]:
+                    for field in ('status', 'status_history', 'blocker',
+                                  'introduced_by'):
+                        if artifact.get(field) != reference.get(field):
+                            self._error(
+                                member_id,
+                                f'{field} must exactly equal {reference_id} '
+                                f'for atomic bundle {bundle_id}')
+                    if _canonical_yaml_bytes(
+                            artifact.get('evidence')) != _canonical_yaml_bytes(
+                                reference.get('evidence')):
+                        self._error(
+                            member_id, f'evidence must be byte-equivalent to '
+                            f'{reference_id} for atomic bundle {bundle_id}')
+
+            terminal = common_status == 'removed'
+            self._check_bundle_evidence(bundle_id, bundle.get('evidence'),
+                                        rollout_stages, terminal)
+
+            feature_merge = bundle.get('required_feature_merge')
+            feature_merge_valid = False
+            effective_status = (self._effective_artifact_status(reference)
+                                if reference is not None else None)
+            feature_required = effective_status in {
+                'gating', 'ready_to_remove', 'removal_in_progress', 'removed'
+            }
+            if feature_merge is None:
+                if feature_required:
+                    self._error(
+                        bundle_id,
+                        'required_feature_merge is required from gating onward')
+            elif (not isinstance(feature_merge, str) or
+                  _SHA_RE.fullmatch(feature_merge) is None):
+                self._error(
+                    bundle_id,
+                    'required_feature_merge must be null or a lowercase '
+                    '40-hex SHA')
+            else:
+                if effective_status == 'planned':
+                    self._error(
+                        bundle_id,
+                        'required_feature_merge must be null while planned')
+                feature_merge_valid = self._check_git_commit(
+                    bundle_id, 'required_feature_merge', feature_merge)
+                if feature_merge_valid:
+                    self._check_normal_merge_commit(bundle_id, feature_merge)
+                    for member_id, artifact in member_artifacts:
+                        introduced_by = artifact.get('introduced_by')
+                        if (isinstance(introduced_by, str) and
+                                _SHA_RE.fullmatch(introduced_by) is not None and
+                                not self._git_is_ancestor(
+                                    introduced_by, feature_merge)):
+                            self._error(
+                                member_id, 'introduced_by is not contained in '
+                                'required_feature_merge')
+
+            historical_revisions: typing.List[typing.Tuple[str, str]] = []
+            if feature_merge_valid and isinstance(feature_merge, str):
+                historical_revisions.append(
+                    ('required_feature_merge', feature_merge))
+
+            if terminal and reference is not None:
+                evidence = reference.get('evidence')
+                merge = evidence.get('merge') if isinstance(evidence,
+                                                            dict) else None
+                first_parent = (merge.get('first_parent') if isinstance(
+                    merge, dict) else None)
+                if (feature_merge_valid and isinstance(feature_merge, str) and
+                        isinstance(first_parent, str) and
+                        _SHA_RE.fullmatch(first_parent) is not None and
+                        not self._git_is_ancestor(feature_merge, first_parent)):
+                    self._error(
+                        bundle_id,
+                        'required_feature_merge must be an ancestor of the '
+                        'removal merge first parent')
+                if isinstance(evidence, dict):
+                    removal_sha = evidence.get('removal_sha')
+                    if (feature_merge_valid and
+                            isinstance(feature_merge, str) and
+                            isinstance(removal_sha, str) and
+                            _SHA_RE.fullmatch(removal_sha) is not None and
+                            not self._git_is_ancestor(feature_merge,
+                                                      removal_sha)):
+                        self._error(
+                            bundle_id,
+                            'required_feature_merge must be an ancestor of '
+                            'the removal source commit')
+                    revision_values = [
+                        ('removal_sha', removal_sha),
+                        ('removal_merge',
+                         merge.get('sha') if isinstance(merge, dict) else None),
+                        ('removal_first_parent', first_parent),
+                    ]
+                    for revision_label, sha in revision_values:
+                        if (isinstance(sha, str) and
+                                _SHA_RE.fullmatch(sha) is not None and
+                            (not self._git_available or
+                             self._git_commit_state(sha)[0])):
+                            historical_revisions.append((revision_label, sha))
+
+            retained_locators = bundle.get('retained_locators')
+            if not isinstance(retained_locators, list) or not retained_locators:
+                self._error(bundle_id,
+                            'retained_locators must be a nonempty list')
+            else:
+                retained_paths: typing.Set[str] = set()
+                for index, locator in enumerate(retained_locators):
+                    self._check_locator(bundle_id, index, locator, True)
+                    if not isinstance(locator, dict):
+                        continue
+                    path = locator.get('path')
+                    if _is_nonempty_string(path):
+                        retained_paths.add(path)
+                    seen_revisions: typing.Set[str] = set()
+                    for revision_label, sha in historical_revisions:
+                        if sha in seen_revisions:
+                            continue
+                        seen_revisions.add(sha)
+                        self._historical_locator_resolves(
+                            bundle_id, index, locator, sha, revision_label)
+                for member_id, artifact in member_artifacts:
+                    references = artifact.get('retained_references')
+                    missing_paths = retained_paths - set(
+                        references if isinstance(references, list) else [])
+                    if missing_paths:
+                        self._error(
+                            member_id,
+                            'retained_references must include bundle retained '
+                            'locators: ' + _format_key_set(missing_paths))
+
+        for artifact_id, artifact in sorted(self._artifacts_by_id.items()):
+            bundle_id = artifact.get('bundle')
+            if bundle_id is None:
+                continue
+            if bundle_id not in self._removal_bundles_by_id:
+                self._error(artifact_id,
+                            f'unknown removal bundle {bundle_id!r}')
+            elif member_owners.get(artifact_id) != bundle_id:
+                self._error(
+                    artifact_id,
+                    f'bundle {bundle_id!r} does not list this artifact')
 
     def _check_references(self) -> None:
         for artifact_id in sorted(self._artifacts_by_id):

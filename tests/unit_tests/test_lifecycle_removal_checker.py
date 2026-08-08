@@ -1,5 +1,6 @@
 """Tests for the executable provider lifecycle removal manifest checker."""
 
+import copy
 import hashlib
 import importlib.util
 import pathlib
@@ -19,6 +20,7 @@ _INTRODUCING_SHA = '1' * 40
 _REMOVAL_SHA = '2' * 40
 _MERGE_SHA = '3' * 40
 _FIRST_PARENT_SHA = '4' * 40
+_BUNDLE_ID = 'test.atomic.bundle'
 
 
 def _pending_gates():
@@ -120,14 +122,60 @@ def _artifact(*,
     }
 
 
-def _write_manifest(tmp_path, artifacts, coverage_gaps=None):
+def _removal_bundle(member_ids, retained_path='design.md'):
+    return {
+        'id': _BUNDLE_ID,
+        'members': member_ids,
+        'retained_locators': [{
+            'kind': 'path',
+            'path': retained_path,
+        }],
+        'required_feature_merge': None,
+        'rollout_contract': [{
+            'id': 'qualified_window',
+            'artifacts': ['M4'],
+            'minimum_duration_hours': 1,
+            'minimum_launches': 1,
+            'minimum_downs': 1,
+            'requirements': ['Run the exact qualified artifact.'],
+        }],
+        'evidence': {},
+    }
+
+
+def _rollout_evidence(artifact_shas):
+    return {
+        'artifact_shas': artifact_shas,
+        'image_digests': ['sha256:' + 'a' * 64 for _ in artifact_shas],
+        'authority_policy_sha256': 'b' * 64,
+        'started_at': '2026-08-01T00:00:00Z',
+        'completed_at': '2026-08-01T01:00:00Z',
+        'clean_launch_graphs': 1,
+        'clean_down_graphs': 1,
+        'eligible_legacy_route_count': 0,
+        'unresolved_crash_intents': 0,
+        'stale_claim_count': 0,
+        'duplicate_provider_effects': 0,
+        'divergence_count': 0,
+        'blocker_count': 0,
+        'evidence': ['rollout-ledger.json'],
+    }
+
+
+def _write_manifest(tmp_path,
+                    artifacts,
+                    coverage_gaps=None,
+                    removal_bundles=None):
     if coverage_gaps is None:
         coverage_gaps = []
+    if removal_bundles is None:
+        removal_bundles = []
     manifest_path = tmp_path / 'removals.yaml'
     manifest_path.write_text(yaml.safe_dump(
         {
-            'schema_version': 1,
+            'schema_version': 2,
             'coverage_gaps': coverage_gaps,
+            'removal_bundles': removal_bundles,
             'artifacts': artifacts,
         },
         sort_keys=False),
@@ -135,8 +183,13 @@ def _write_manifest(tmp_path, artifacts, coverage_gaps=None):
     return manifest_path
 
 
-def _check(tmp_path, artifacts, phase='current', coverage_gaps=None):
-    manifest_path = _write_manifest(tmp_path, artifacts, coverage_gaps)
+def _check(tmp_path,
+           artifacts,
+           phase='current',
+           coverage_gaps=None,
+           removal_bundles=None):
+    manifest_path = _write_manifest(tmp_path, artifacts, coverage_gaps,
+                                    removal_bundles)
     return check_lifecycle_removals.check_manifest(manifest_path,
                                                    phase,
                                                    repo_root=tmp_path)
@@ -960,6 +1013,304 @@ def test_sql_contraction_requires_reverse_history_link(tmp_path):
                for error in errors)
 
 
+def test_removal_bundle_enforces_cross_links_and_atomic_state(tmp_path):
+    (tmp_path / 'design.md').write_text('retained contract\n', encoding='utf-8')
+    first = _artifact(artifact_id='PLA-M5-022',
+                      status='planned',
+                      status_history=['planned'],
+                      locators=[{
+                          'kind': 'python_symbol',
+                          'path': 'future.py',
+                          'symbol': 'LegacyOne',
+                      }])
+    second = _artifact(artifact_id='PLA-M5-023',
+                       status='planned',
+                       status_history=['planned'],
+                       locators=[{
+                           'kind': 'python_symbol',
+                           'path': 'future.py',
+                           'symbol': 'LegacyTwo',
+                       }])
+    for artifact in (first, second):
+        artifact['introduced_by'] = None
+        artifact['bundle'] = _BUNDLE_ID
+        artifact['retained_references'] = ['design.md']
+    bundle = _removal_bundle([first['id'], second['id']])
+
+    assert _check(tmp_path, [first, second], removal_bundles=[bundle]) == []
+
+    first['introduced_by'] = _INTRODUCING_SHA
+    errors = _check(tmp_path, [first, second], removal_bundles=[bundle])
+    assert any('introduced_by must be null while effectively planned' in error
+               for error in errors)
+    assert any('introduced_by must exactly equal PLA-M5-022' in error
+               for error in errors)
+
+    first['introduced_by'] = None
+    second['status'] = 'present'
+    second['status_history'] = ['planned', 'present']
+    second['introduced_by'] = _INTRODUCING_SHA
+    errors = _check(tmp_path, [first, second], removal_bundles=[bundle])
+    assert any(
+        'status must exactly equal PLA-M5-022' in error for error in errors)
+    assert any('status_history must exactly equal PLA-M5-022' in error
+               for error in errors)
+
+    second['status'] = 'planned'
+    second['status_history'] = ['planned']
+    second['introduced_by'] = None
+    bundle['required_feature_merge'] = _INTRODUCING_SHA
+    errors = _check(tmp_path, [first, second], removal_bundles=[bundle])
+    assert any('required_feature_merge must be null while planned' in error
+               for error in errors)
+    bundle['required_feature_merge'] = None
+    bundle['members'] = [first['id'], 'PLA-M5-024']
+    errors = _check(tmp_path, [first, second], removal_bundles=[bundle])
+    assert any(
+        "unknown member artifact 'PLA-M5-024'" in error for error in errors)
+    assert any('does not list this artifact' in error for error in errors)
+
+
+def test_removal_bundle_accepts_atomic_blocked_draft_source_removal(tmp_path):
+    (tmp_path / 'design.md').write_text('retained contract\n', encoding='utf-8')
+    (tmp_path / 'future.py').write_text('class PermanentOwner:\n    pass\n',
+                                        encoding='utf-8')
+    artifacts = []
+    blocker = {
+        'blocked_from_status': 'present',
+        'owner': 'stacked cleanup PR',
+        'issue': 'https://example.invalid/pull/2',
+        'evidence': ['Exact pre-merge rollout gate is documented.'],
+        'draft_source_removal': True,
+    }
+    for artifact_id, symbol in [('PLA-M5-022', 'LegacyOne'),
+                                ('PLA-M5-023', 'LegacyTwo')]:
+        artifact = _artifact(artifact_id=artifact_id,
+                             status='blocked',
+                             status_history=['planned', 'present', 'blocked'],
+                             locators=[{
+                                 'kind': 'python_symbol',
+                                 'path': 'future.py',
+                                 'symbol': symbol,
+                             }])
+        artifact['bundle'] = _BUNDLE_ID
+        artifact['blocker'] = copy.deepcopy(blocker)
+        artifact['retained_references'] = ['design.md']
+        artifacts.append(artifact)
+    bundle = _removal_bundle([artifact['id'] for artifact in artifacts])
+
+    assert _check(tmp_path, artifacts, removal_bundles=[bundle]) == []
+
+    artifacts[1]['blocker']['draft_source_removal'] = False
+    errors = _check(tmp_path, artifacts, removal_bundles=[bundle])
+    assert any('draft_source_removal must be true' in error for error in errors)
+    assert any(
+        'blocker must exactly equal PLA-M5-022' in error for error in errors)
+
+    artifacts[1]['blocker'] = copy.deepcopy(blocker)
+    artifacts[1].pop('bundle')
+    errors = _check(tmp_path, artifacts, removal_bundles=[bundle])
+    assert any('draft source removal requires an atomic removal bundle' in error
+               for error in errors)
+
+
+def test_removal_bundle_requires_feature_merge_from_gating(tmp_path):
+    (tmp_path / 'design.md').write_text('retained contract\n', encoding='utf-8')
+    (tmp_path / 'sample.py').write_text(
+        'class LegacyOne:\n    pass\n\nclass LegacyTwo:\n    pass\n',
+        encoding='utf-8')
+    artifacts = []
+    for artifact_id, symbol in [('PLA-M5-022', 'LegacyOne'),
+                                ('PLA-M5-023', 'LegacyTwo')]:
+        artifact = _artifact(artifact_id=artifact_id,
+                             status='gating',
+                             status_history=['planned', 'present', 'gating'],
+                             locators=[{
+                                 'kind': 'python_symbol',
+                                 'path': 'sample.py',
+                                 'symbol': symbol,
+                             }])
+        artifact['bundle'] = _BUNDLE_ID
+        artifact['retained_references'] = ['design.md']
+        artifacts.append(artifact)
+    bundle = _removal_bundle([artifact['id'] for artifact in artifacts])
+
+    errors = _check(tmp_path, artifacts, removal_bundles=[bundle])
+    assert any('required_feature_merge is required from gating onward' in error
+               for error in errors)
+
+    bundle['required_feature_merge'] = _INTRODUCING_SHA
+    assert _check(tmp_path, artifacts, removal_bundles=[bundle]) == []
+
+
+def test_terminal_removal_bundle_proves_shared_evidence_and_git_ancestry(
+        tmp_path):
+
+    def git(*args, capture=False):
+        return subprocess.run(['git', '-C', str(tmp_path), *args],
+                              check=True,
+                              stdout=(subprocess.PIPE if capture else None),
+                              text=True)
+
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test')
+    git('config', 'user.email', 'test@example.invalid')
+    (tmp_path / 'design.md').write_text('retained contract\n', encoding='utf-8')
+    git('add', 'design.md')
+    git('commit', '-qm', 'initial')
+    git('switch', '-qc', 'feature')
+    (tmp_path / 'sample.py').write_text(
+        'class LegacyOne:\n    pass\n\nclass LegacyTwo:\n    pass\n',
+        encoding='utf-8')
+    (tmp_path / 'feature.txt').write_text('durable authority\n',
+                                          encoding='utf-8')
+    git('add', 'feature.txt', 'sample.py')
+    git('commit', '-qm', 'introduce transition owners')
+    introduction_sha = git('rev-parse', 'HEAD', capture=True).stdout.strip()
+    (tmp_path / 'feature.txt').write_text('durable authority qualified\n',
+                                          encoding='utf-8')
+    git('add', 'feature.txt')
+    git('commit', '-qm', 'later feature evidence')
+    late_introduction_sha = git('rev-parse', 'HEAD',
+                                capture=True).stdout.strip()
+    git('switch', '-q', 'main')
+    git('merge', '--no-ff', 'feature', '-qm', 'merge M4 feature')
+    feature_merge = git('rev-parse', 'HEAD', capture=True).stdout.strip()
+    git('switch', '-qc', 'removal')
+    (tmp_path / 'sample.py').write_text('class Replacement:\n    pass\n',
+                                        encoding='utf-8')
+    git('add', 'sample.py')
+    git('commit', '-qm', 'remove transition owners')
+    removal_sha = git('rev-parse', 'HEAD', capture=True).stdout.strip()
+    git('switch', '-q', 'main')
+    git('merge', '--no-ff', 'removal', '-qm', 'merge M5a removal')
+    removal_merge = git('rev-parse', 'HEAD', capture=True).stdout.strip()
+
+    shared_evidence = {
+        'removal_sha': removal_sha,
+        'exact_head_ci': {
+            'sha': removal_sha,
+            'evidence': ['ci-build.txt'],
+        },
+        'merge': {
+            'sha': removal_merge,
+            'first_parent': feature_merge,
+            'second_parent': removal_sha,
+            'evidence': ['merge-proof.txt'],
+        },
+        'deployment': {
+            'sha': removal_merge,
+            'evidence': ['deployment-proof.txt'],
+        },
+    }
+    artifacts = []
+    for artifact_id, symbol in [('PLA-M5-022', 'LegacyOne'),
+                                ('PLA-M5-023', 'LegacyTwo')]:
+        artifact = _artifact(artifact_id=artifact_id,
+                             status='removed',
+                             status_history=[
+                                 'planned', 'present', 'gating',
+                                 'ready_to_remove', 'removal_in_progress',
+                                 'removed'
+                             ],
+                             locators=[{
+                                 'kind': 'python_symbol',
+                                 'path': 'sample.py',
+                                 'symbol': symbol,
+                             }],
+                             gates=_passed_gates(),
+                             runtime_affecting=True)
+        artifact['introduced_by'] = introduction_sha
+        artifact['bundle'] = _BUNDLE_ID
+        artifact['retained_references'] = ['design.md']
+        artifact['evidence'] = copy.deepcopy(shared_evidence)
+        artifacts.append(artifact)
+    bundle = _removal_bundle([artifact['id'] for artifact in artifacts])
+    bundle['required_feature_merge'] = feature_merge
+    bundle['evidence'] = {
+        'qualified_window': _rollout_evidence([feature_merge])
+    }
+
+    assert _check(tmp_path, artifacts, phase='final',
+                  removal_bundles=[bundle]) == []
+
+    for artifact in artifacts:
+        artifact['introduced_by'] = late_introduction_sha
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any(
+        'locators[0] unexpectedly resolves at introduced_by parent' in error
+        for error in errors)
+    for artifact in artifacts:
+        artifact['introduced_by'] = introduction_sha
+
+    artifacts[1]['evidence']['deployment']['evidence'] = [
+        'different-deployment-proof.txt'
+    ]
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any('evidence must be byte-equivalent to PLA-M5-022' in error
+               for error in errors)
+    artifacts[1]['evidence'] = copy.deepcopy(shared_evidence)
+
+    bundle['evidence'] = {}
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any(
+        'terminal bundle evidence is incomplete' in error for error in errors)
+    bundle['evidence'] = {
+        'qualified_window': _rollout_evidence([feature_merge])
+    }
+
+    bundle['evidence']['qualified_window']['eligible_legacy_route_count'] = 1
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any('eligible_legacy_route_count must equal zero' in error
+               for error in errors)
+    bundle['evidence']['qualified_window']['eligible_legacy_route_count'] = 0
+
+    original_symbol = artifacts[0]['locators'][0]['symbol']
+    artifacts[0]['locators'][0]['symbol'] = 'NeverIntroduced'
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any('locators[0] does not resolve at introduced_by' in error
+               for error in errors)
+    artifacts[0]['locators'][0]['symbol'] = original_symbol
+
+    bundle['required_feature_merge'] = removal_sha
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any('must be an ancestor of the removal merge first parent' in error
+               for error in errors)
+    bundle['required_feature_merge'] = feature_merge
+
+    (tmp_path / 'late.md').write_text('created only after removal\n',
+                                      encoding='utf-8')
+    git('add', 'late.md')
+    git('commit', '-qm', 'add late retained path')
+    bundle['retained_locators'] = [{'kind': 'path', 'path': 'late.md'}]
+    for artifact in artifacts:
+        artifact['retained_references'] = ['late.md']
+    errors = _check(tmp_path,
+                    artifacts,
+                    phase='final',
+                    removal_bundles=[bundle])
+    assert any('does not resolve at required_feature_merge' in error
+               for error in errors)
+
+
 def test_line_only_locator_and_duplicate_yaml_keys_are_rejected(tmp_path):
     (tmp_path / 'sample.py').write_text('class Legacy:\n    pass\n',
                                         encoding='utf-8')
@@ -970,7 +1321,7 @@ def test_line_only_locator_and_duplicate_yaml_keys_are_rejected(tmp_path):
 
     manifest_path = tmp_path / 'duplicate.yaml'
     manifest_path.write_text(
-        'schema_version: 1\nschema_version: 1\nartifacts: []\n',
+        'schema_version: 2\nschema_version: 2\nartifacts: []\n',
         encoding='utf-8')
     errors = check_lifecycle_removals.check_manifest(manifest_path,
                                                      'current',
