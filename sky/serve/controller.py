@@ -2097,9 +2097,8 @@ class SkyServeController:
 
                 try:
                     snapshot = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            getattr(self, '_lb_role_executor', None),
-                            get_snapshot),
+                        loop.run_in_executor(self._lb_role_executor,
+                                             get_snapshot),
                         timeout=serve_constants.LB_ROLE_SNAPSHOT_TIMEOUT_SECONDS
                     )
                     return _StableLbRoleSnapshotRead(snapshot, timings, None)
@@ -2140,8 +2139,7 @@ class SkyServeController:
     async def _handle_load_balancer_role(
             self, request_data: dict[str, Any]) -> fastapi.Response:
         """Ingest a fast HA report and advance the recoverable cutover saga."""
-        trace = lb_ha_obs.RoleRequestTrace(
-            getattr(self, '_lb_role_executor', None))
+        trace = lb_ha_obs.RoleRequestTrace(self._lb_role_executor)
         verified_owner_fingerprint: str | None = None
 
         def role_response(
