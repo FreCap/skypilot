@@ -50,6 +50,7 @@ export function ClusterOperationalEvents({
   const [error, setError] = useState(null);
   const controllerRef = useRef(null);
   const requestVersionRef = useRef(0);
+  const hasItems = items.length > 0;
 
   useEffect(() => {
     const requestVersion = requestVersionRef.current + 1;
@@ -102,6 +103,7 @@ export function ClusterOperationalEvents({
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
+    setError(null);
     setLoadingMore(true);
     try {
       const page = await getOperationalEvents(
@@ -148,16 +150,22 @@ export function ClusterOperationalEvents({
           <CircularProgress size={20} className="mr-2" />
           <span>Loading operational history...</span>
         </div>
-      ) : error ? (
+      ) : error && !hasItems ? (
         <div className="px-4 pb-6 text-sm text-gray-500">
           {errorMessage(error)}
         </div>
-      ) : items.length === 0 ? (
+      ) : !hasItems ? (
         <div className="px-4 pb-6 text-sm text-gray-500">
           No operational events recorded for this cluster.
         </div>
       ) : (
         <>
+          {error && (
+            <div className="px-4 pb-3 text-sm text-gray-500">
+              Operational history refresh failed. Showing the last available
+              page.
+            </div>
+          )}
           <Table>
             <TableHeader>
               <TableRow>
