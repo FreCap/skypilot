@@ -465,7 +465,13 @@ Both operator-side validation and the controller receipt reader call that same
 validator.  The receipt reader loads the requested run's complete bounded row
 inventory and validates it before returning a pending request, accepting a
 completed receipt, or acknowledging and CASing a load; validating only the
-selected current and recovery entries is insufficient for protocol 4.
+selected current and recovery entries is insufficient for protocol 4.  For a
+protocol-4 retirement run it also reads the current bounded `version_specs`
+rows for every retired candidate service and requires the exact canonical,
+unretired pickled-`None` row identities and full row/column hashes to equal the
+manifest's `stale_placeholder` inventory.  This live snapshot binding prevents
+a coherently rewritten ledger from omitting or relabeling an unchanged stale
+placeholder and is repeated inside the acknowledgement transaction.
 The protocol-1 through protocol-3 validators retain the historical
 `same_service_placeholder_dependency_absent=true` fact exactly.  Protocol 4
 must neither emit nor accept that fact: its complete stale-placeholder
@@ -501,7 +507,12 @@ row, it must be absent from `active_versions`, and its exact replica count must
 be zero.  The service-wide unknown-version-replica proof remains zero.  After
 this proof its separate manifest classification changes from raw `PLACEHOLDER`
 to durable `stale_placeholder`; its raw classification and database row do not
-change.
+change.  Its contextual dependency facts must also retain exact
+`service_present=true`, `service_pool=0`, `service_active=false`,
+`quarantined=false`, `controller_applied=false`, and `retired=false` values and
+the same nonempty service hash and positive lifecycle epoch as the retired
+candidate; contradictory fact booleans invalidate the complete manifest even
+when the side-column hashes remain clean.
 
 The preflight, locked, and postflight image-demand and typed resource-action
 scans include both historical candidates and these stale placeholders.  Every
