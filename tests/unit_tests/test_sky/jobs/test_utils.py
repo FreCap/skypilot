@@ -1449,14 +1449,28 @@ class TestStreamLogsByIdTaskFiltering:
         tasks = [(0, 'train')]
         task_info = self._create_task_info(tasks)
         self._stub_stream_frontend(monkeypatch)
+        lookup_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    None, None, None, None, None, None),
+                local_log_file=None,
+                logs_cleaned_at=None,
+                num_tasks=len(tasks),
+            ))
 
-        monkeypatch.setattr(jobs_utils.managed_job_state, 'get_num_tasks',
-                            lambda jid: len(tasks))
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError('count query used')))
         monkeypatch.setattr(
             jobs_utils.managed_job_state,
             'get_all_task_ids_names_statuses_logs',
             lambda jid: task_info,
         )
+        monkeypatch.setattr(jobs_utils.managed_job_state,
+                            'get_task_log_stream_lookup', lookup_read)
+        monkeypatch.setattr(
+            jobs_utils.managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot poll used')))
 
         msg, exit_code = jobs_utils.stream_logs_by_id(job_id,
                                                       follow=False,
@@ -1465,6 +1479,7 @@ class TestStreamLogsByIdTaskFiltering:
         assert exit_code == exceptions.JobExitCode.NOT_FOUND
         # Single task should show '0' not '0-0'
         assert 'Valid task IDs are 0.' in msg or 'Valid task IDs are 0,' in msg
+        lookup_read.assert_called_once_with(job_id, 5)
 
 
 class TestFormatJobDetails:
