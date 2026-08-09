@@ -397,9 +397,6 @@ class TestBecomeLeaderOrdering:
 
         def on_sleep(seconds, *_args, **_kwargs):
             sleep_calls.append(seconds)
-            if seconds == mjrt._ACQUIRE_RETRY_INTERVAL_SECONDS:
-                raise AssertionError(
-                    'run() took the retry backoff instead of becoming leader')
 
         def on_suicide(_thread):
             suicides.append(True)
@@ -422,10 +419,60 @@ class TestBecomeLeaderOrdering:
             thread.run()
 
         lock.acquire.assert_called_once_with()
-        assert sleep_calls == [1]
+        assert sleep_calls == [mjrt._LOCK_PROBE_INTERVAL_SECONDS]
         event_cls.return_value.run.assert_called_once_with()
         assert suicides == [True]
         assert signal_file.parent.exists()
+
+    def test_steady_state_sleeps_until_the_next_deadline(
+            self, tmp_path, monkeypatch):
+        """Healthy leaders should wake only when a probe or event is due."""
+        signal_file = tmp_path / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+        monkeypatch.setattr(mjrt.managed_job_state,
+                            'has_jobs_requiring_recovery_grace_wait',
+                            lambda: False)
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        lock.is_locked.return_value = True
+        thread._lock = lock
+
+        sleep_calls = []
+        event_runs = []
+        suicides = []
+
+        with mock.patch.object(
+                mjrt.managed_job_utils,
+                'ha_recovery_for_consolidation_mode'), \
+                mock.patch.object(
+                    mjrt.ManagedJobRefreshDaemonThread,
+                    '_lock_still_held',
+                    side_effect=[True, True, True, True, True, False]), \
+                mock.patch.object(
+                    mjrt.ManagedJobRefreshDaemonThread,
+                    '_suicide_on_lock_loss',
+                    autospec=True,
+                    side_effect=lambda _thread: suicides.append(True)), \
+                mock.patch('sky.skylet.events.ManagedJobEvent') as event_cls, \
+                mock.patch.object(
+                    mjrt.time,
+                    'monotonic',
+                    side_effect=[0, 0, 5, 10, 15, 20, 25]), \
+                mock.patch.object(mjrt.time,
+                                  'sleep',
+                                  side_effect=sleep_calls.append):
+            event_cls.return_value.run.side_effect = lambda: event_runs.append(
+                True)
+            thread._become_leader_and_run()
+
+        assert sleep_calls == [mjrt._LOCK_PROBE_INTERVAL_SECONDS] * 5
+        assert len(event_runs) == 2
+        assert suicides == [True]
 
     def test_skips_wait_when_no_jobs_require_grace_period(
             self, tmp_path, monkeypatch):

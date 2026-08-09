@@ -143,26 +143,29 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         finally:
             signal_file.unlink(missing_ok=True)
 
-        # Event-loop tick at events.EVENT_CHECKING_INTERVAL_SECONDS,
-        # lock probe at _LOCK_PROBE_INTERVAL_SECONDS, sleep 1s between.
+        # Event-loop tick at events.EVENT_CHECKING_INTERVAL_SECONDS and lock
+        # probe at _LOCK_PROBE_INTERVAL_SECONDS. Sleep until the earlier
+        # deadline instead of waking every second to re-check both.
         refresh_event = events.ManagedJobEvent()
         now = time.monotonic()
-        last_probe = now
-        last_event = now - events.EVENT_CHECKING_INTERVAL_SECONDS
+        next_probe = now + _LOCK_PROBE_INTERVAL_SECONDS
+        next_event = now
         while True:
             now = time.monotonic()
-            if now - last_probe >= _LOCK_PROBE_INTERVAL_SECONDS:
+            if now >= next_probe:
                 if not self._lock_still_held():
                     self._suicide_on_lock_loss()
                     return
-                last_probe = now
-            if now - last_event >= events.EVENT_CHECKING_INTERVAL_SECONDS:
+                next_probe = now + _LOCK_PROBE_INTERVAL_SECONDS
+            if now >= next_event:
                 try:
                     refresh_event.run()
                 except Exception:  # pylint: disable=broad-except
                     logger.exception('ManagedJobEvent tick failed; will retry')
-                last_event = now
-            time.sleep(1)
+                next_event = now + events.EVENT_CHECKING_INTERVAL_SECONDS
+            sleep_seconds = max(0.0, min(next_probe, next_event) - now)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
 
     def _wait_for_recovery_grace(self) -> bool:
         """Wait for old controllers while probing this leader's lock.
