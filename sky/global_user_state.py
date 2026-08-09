@@ -2615,6 +2615,9 @@ def get_clusters(
     # we treat it as belonging to the current user.
     current_user_hash = common_utils.get_user_hash()
     engine = _db_manager.get_engine()
+    deduped_cluster_names = None
+    if cluster_names is not None:
+        deduped_cluster_names = list(dict.fromkeys(cluster_names))
     query_fields = [
         cluster_table.c.name,
         cluster_table.c.launched_at,
@@ -2661,10 +2664,20 @@ def get_clusters(
             else:
                 query = query.filter(
                     cluster_table.c.user_hash.in_(user_hashes_filter))
-        if cluster_names is not None:
-            query = query.filter(cluster_table.c.name.in_(cluster_names))
         query = query.order_by(sqlalchemy.desc(cluster_table.c.launched_at))
-        rows = query.all()
+        if deduped_cluster_names is None:
+            rows = query.all()
+        elif len(deduped_cluster_names) <= _CLUSTER_IN_QUERY_CHUNK_SIZE:
+            rows = query.filter(
+                cluster_table.c.name.in_(deduped_cluster_names)).all()
+        else:
+            rows = []
+            for offset in range(0, len(deduped_cluster_names),
+                                _CLUSTER_IN_QUERY_CHUNK_SIZE):
+                batch = deduped_cluster_names[offset:offset +
+                                              _CLUSTER_IN_QUERY_CHUNK_SIZE]
+                rows.extend(query.filter(cluster_table.c.name.in_(batch)).all())
+            rows.sort(key=lambda row: row.launched_at, reverse=True)
     records = []
 
     # Check if we need to fetch the current user's name,
