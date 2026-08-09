@@ -386,6 +386,69 @@ def test_get_clusters_from_names_matches_single_helper(tmp_path, monkeypatch):
             assert batched[key] == single[key], f'mismatch on {key}'
 
 
+def test_get_cluster_from_name_with_user_info_uses_joined_user_projection(
+        tmp_path, monkeypatch):
+    """The single-cluster hot path should resolve explicit user metadata from
+    the same snapshot instead of issuing a second user SELECT."""
+    _fresh_db(tmp_path, monkeypatch)
+    global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
+    _add_cluster('alive-1', ready=True)
+    _set_cluster_user_hash('alive-1', 'user-a')
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        record = global_user_state.get_cluster_from_name('alive-1',
+                                                         include_user_info=True,
+                                                         summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert record is not None
+    assert record['user_hash'] == 'user-a'
+    assert record['user_name'] == 'Alice'
+    assert len(select_statements) == 1
+
+
+def test_get_cluster_from_name_current_user_fallback_uses_bounded_queries(
+        tmp_path, monkeypatch):
+    """Legacy NULL user_hash rows must still map to the current user without
+    reintroducing unbounded extra lookups."""
+    _fresh_db(tmp_path, monkeypatch)
+    global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
+    _add_cluster('legacy-null-user', ready=True)
+    _set_cluster_user_hash('legacy-null-user', None)
+
+    engine = global_user_state._db_manager.get_engine()
+    select_statements = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_selects(_conn, _cursor, statement, *_args):
+        if statement.lstrip().upper().startswith('SELECT'):
+            select_statements.append(statement)
+
+    try:
+        with mock.patch('sky.global_user_state.common_utils.get_user_hash',
+                        return_value='user-a'):
+            record = global_user_state.get_cluster_from_name(
+                'legacy-null-user',
+                include_user_info=True,
+                summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_selects)
+
+    assert record is not None
+    assert record['user_hash'] == 'user-a'
+    assert record['user_name'] == 'Alice'
+    assert len(select_statements) == 2
+
+
 def test_get_clusters_from_names_batches_user_info_once_per_cluster_snapshot(
         tmp_path, monkeypatch):
     """include_user_info should add one batched user snapshot, not one query
