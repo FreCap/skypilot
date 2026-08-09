@@ -64,6 +64,15 @@ def _set_cluster_user_hash(name: str, user_hash: str | None) -> None:
                     user_hash=user_hash))
 
 
+def _set_cluster_launched_at(name: str, launched_at: int) -> None:
+    engine = global_user_state._db_manager.get_engine()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(global_user_state.cluster_table).where(
+                global_user_state.cluster_table.c.name == name).values(
+                    launched_at=launched_at))
+
+
 def test_get_clusters_from_names_empty_input_returns_empty(
         tmp_path, monkeypatch):
     """Empty input must NOT hit the DB and must return {} so callers can
@@ -519,6 +528,95 @@ def test_get_clusters_current_user_filter_includes_legacy_null_user_hash(
     assert legacy_record['user_hash'] == 'user-a'
     assert legacy_record['user_name'] == 'Alice'
     assert len(select_statements) == 2
+
+
+def test_get_clusters_cluster_name_filter_chunks_large_input(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    names = [f'c-{i}' for i in range(5)]
+    for launched_at, name in enumerate(names, start=10):
+        _add_cluster(name, ready=True)
+        _set_cluster_launched_at(name, launched_at)
+
+    engine = global_user_state._db_manager.get_engine()
+    cluster_selects = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_cluster_selects(_conn, _cursor, statement, parameters, *_args):
+        if ('FROM clusters LEFT OUTER JOIN users' in statement and
+                statement.lstrip().upper().startswith('SELECT')):
+            cluster_selects.append((statement, parameters))
+
+    try:
+        records = global_user_state.get_clusters(cluster_names=names +
+                                                 ['missing'],
+                                                 summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_cluster_selects)
+
+    assert [record['name'] for record in records] == list(reversed(names))
+    assert len(cluster_selects) == 3
+    assert max(
+        len(parameters) if isinstance(parameters, tuple) else len(parameters[0])
+        for _, parameters in cluster_selects) == 2
+
+
+def test_get_clusters_cluster_name_filter_dedupes_cross_chunk_duplicates(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    for launched_at, name in enumerate(['c-0', 'c-1', 'c-2'], start=10):
+        _add_cluster(name, ready=True)
+        _set_cluster_launched_at(name, launched_at)
+
+    engine = global_user_state._db_manager.get_engine()
+    cluster_selects = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_cluster_selects(_conn, _cursor, statement, parameters, *_args):
+        if ('FROM clusters LEFT OUTER JOIN users' in statement and
+                statement.lstrip().upper().startswith('SELECT')):
+            cluster_selects.append((statement, parameters))
+
+    try:
+        records = global_user_state.get_clusters(
+            cluster_names=['c-0', 'c-1', 'c-0', 'c-2'], summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_cluster_selects)
+
+    assert [record['name'] for record in records] == ['c-2', 'c-1', 'c-0']
+    assert len(cluster_selects) == 2
+    assert max(
+        len(parameters) if isinstance(parameters, tuple) else len(parameters[0])
+        for _, parameters in cluster_selects) == 2
+
+
+def test_get_clusters_cluster_name_filter_small_input_uses_one_select(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 5)
+    names = [f'c-{i}' for i in range(3)]
+    for name in names:
+        _add_cluster(name, ready=True)
+
+    engine = global_user_state._db_manager.get_engine()
+    cluster_selects = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_cluster_selects(_conn, _cursor, statement, *_args):
+        if ('FROM clusters LEFT OUTER JOIN users' in statement and
+                statement.lstrip().upper().startswith('SELECT')):
+            cluster_selects.append(statement)
+
+    try:
+        records = global_user_state.get_clusters(cluster_names=names,
+                                                 summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_cluster_selects)
+
+    assert {record['name'] for record in records} == set(names)
+    assert len(cluster_selects) == 1
 
 
 def test_get_clusters_other_user_filter_excludes_legacy_null_user_hash(
