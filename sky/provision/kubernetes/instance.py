@@ -682,6 +682,57 @@ def _prepare_pod_for_required_kueue(
             {'name': k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE})
 
 
+def _preflight_required_kueue_local_queue(namespace: str, context: str | None,
+                                          expected_queue: str) -> None:
+    """Requires the selected LocalQueue to exist and be ready for admission."""
+    queue_ref = f'{namespace}/{expected_queue}'
+    try:
+        local_queue = kubernetes.custom_objects_api(
+            context).get_namespaced_custom_object(
+                group=k8s_constants.KUEUE_API_GROUP,
+                version=k8s_constants.KUEUE_API_VERSION,
+                namespace=namespace,
+                plural=k8s_constants.KUEUE_LOCAL_QUEUE_PLURAL,
+                name=expected_queue,
+                _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        if e.status == 404:
+            raise config_lib.KubernetesError(
+                f'Required Kueue LocalQueue {queue_ref!r} does not exist. '
+                'Create it and wait for its Active condition to become True '
+                'before launching this workload.') from None
+        raise config_lib.KubernetesError(
+            f'Failed to verify required Kueue LocalQueue {queue_ref!r}: '
+            f'{common_utils.format_exception(e)}. SkyPilot refused to create '
+            'Pods because it cannot prove that the queue is usable.') from None
+
+    if not isinstance(local_queue, Mapping):
+        raise config_lib.KubernetesError(
+            f'Kubernetes returned an invalid response for required Kueue '
+            f'LocalQueue {queue_ref!r}. SkyPilot refused to create Pods.')
+    status = local_queue.get('status')
+    conditions = status.get('conditions') if isinstance(status, Mapping) else []
+    active_condition = None
+    if isinstance(conditions, list):
+        active_condition = next(
+            (condition for condition in conditions
+             if isinstance(condition, Mapping) and
+             condition.get('type') == k8s_constants.KUEUE_ACTIVE_CONDITION),
+            None)
+    if active_condition is None:
+        raise config_lib.KubernetesError(
+            f'Required Kueue LocalQueue {queue_ref!r} has not reported '
+            'Active=True. Wait for Kueue to reconcile the queue before '
+            'launching this workload.')
+    if active_condition.get('status') != 'True':
+        reason = active_condition.get('reason')
+        message = active_condition.get('message')
+        raise config_lib.KubernetesError(
+            f'Required Kueue LocalQueue {queue_ref!r} is not active '
+            f'(reason={reason!r}, message={message!r}). Wait for its Active '
+            'condition to become True before launching this workload.')
+
+
 def _attest_required_kueue_pod(pod: Any, namespace: str, context: str | None,
                                expected_queue: str) -> None:
     """Verifies Kueue admission mutation, deleting a Pod that bypassed it."""
@@ -933,6 +984,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             raise config_lib.KubernetesError(
                 'Required Kueue management currently supports direct Pods, '
                 'not high-availability Deployment-owned Pods.')
+        _preflight_required_kueue_local_queue(namespace, context,
+                                              kueue_local_queue_name)
 
     tags = ray_tag_filter(cluster_name_on_cloud)
 

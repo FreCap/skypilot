@@ -1,7 +1,7 @@
 # Fail-closed Kueue management for Kubernetes pods
 
-- Status: Incident root cause proven; Phase 1 automatic enforcement implemented; cluster rollout pending
-- Last updated: 2026-08-08
+- Status: Incident root cause proven; Phase 1 automatic enforcement and LocalQueue preflight implemented; cluster rollout pending
+- Last updated: 2026-08-09
 - Owners: SkyPilot Kubernetes and Serve
 
 ## Context
@@ -73,6 +73,8 @@ References:
   configured, without requiring a second opt-in flag.
 - Fail closed when the Kueue webhook or plain-Pod integration is missing or
   mis-scoped: an unverified Pod must not reach a GPU.
+- Fail immediately, before any Pod operation, when the selected LocalQueue is
+  missing, inactive, unreconciled, or cannot be verified.
 - Make the effective queue a server-owned placement decision in required mode.
 - Map SkyPilot's named resource `priority_class` to Kueue's
   WorkloadPriorityClass in required mode.
@@ -121,7 +123,13 @@ an operator configures a queue but forgets the assertion flag.
 When an effective queue is present, or `require_managed` is `true`:
 
 1. A non-empty effective LocalQueue name is mandatory.  Resource rendering
-   fails before Pod creation if it is absent.
+   fails before Pod creation if it is absent.  At the final provisioning
+   boundary, SkyPilot also reads that namespace-local object and requires its
+   `Active` condition to be `True` before it lists, adopts, deletes, or creates
+   any Pod.  A missing object, inactive or unreconciled condition, malformed
+   response, RBAC denial, or Kubernetes API error fails provisioning
+   immediately rather than leaving a gated Pod pending until
+   `provision_timeout`.
 2. `require_managed` and an API-server-configured effective queue are taken
    from API-server config, not a remote client's request override.  Workspace
    config is already wholly server-owned; global and context `require_managed`
@@ -162,6 +170,12 @@ effective queue or explicit strict assertion
 render queue + derived strict mode + workload priority
         |
         v
+preflight namespace-local LocalQueue
+  - object exists
+  - Active=True
+  - read is authorized
+        |
+        v
 final Pod spec after custom pod_config
   - overwrite queue/group/priority metadata
   - remove forged managed label
@@ -179,6 +193,8 @@ The following invariants hold whenever an effective queue exists or
 `require_managed` is true:
 
 - No newly created, unattested SkyPilot Pod can be scheduled.
+- No Pod reconciliation or mutation begins unless the selected LocalQueue has
+  been read successfully and reports `Active=True`.
 - A configured queue cannot silently remain best effort because
   `require_managed` was omitted or set to false.
 - A request cannot redirect a strict placement to another LocalQueue through
@@ -211,13 +227,16 @@ shared inference placement is enabled, the cluster must provide:
 2. The configured LocalQueue in that namespace.  A LocalQueue named `default`
    is recommended as defense in depth for older or non-SkyPilot clients that
    omit the queue label.
-3. A low WorkloadPriorityClass for inference and a higher class for research.
-4. One verified preemption domain:
+3. Permission for the Kubernetes identity used by SkyPilot provisioning to
+   `get` `localqueues.kueue.x-k8s.io` in that namespace.  Inability to perform
+   this read is intentionally a fail-closed launch error.
+4. A low WorkloadPriorityClass for inference and a higher class for research.
+5. One verified preemption domain:
    - preferably the same ClusterQueue with `withinClusterQueue: LowerPriority`;
      or
    - ClusterQueues in the same Cohort with reclaim/borrow preemption configured
      and tested.
-5. An admission policy rejecting GPU Pods in the inference namespace when they
+6. An admission policy rejecting GPU Pods in the inference namespace when they
    omit the required Kueue queue metadata.  This protects the cluster from
    clients that predate SkyPilot's required mode.
 
@@ -242,6 +261,8 @@ the Kueue preemption smoke test passes.
   merging request config with server config.
 - Persist the resolved queue, strict flag, and WorkloadPriorityClass in the
   Kubernetes provider config.
+- Preflight the selected LocalQueue and require `Active=True` before any Pod
+  query, cleanup, adoption, or creation.
 - Gate, normalize, attest, and clean up direct Pods in the provisioner.
 - Reject the Deployment path in required mode.
 - Extend config, request-sanitization, template, and provisioning unit tests.
@@ -269,7 +290,8 @@ the Kueue preemption smoke test passes.
 SkyPilot code can deploy before cluster activation because placements without
 an effective queue remain unchanged.  Cluster resources and server-owned queue
 config are deployed next, while the shared inference placement remains
-disabled.
+disabled.  The cluster rollout must grant the SkyPilot provisioning identity
+read access to LocalQueues before adding the queue to server-owned config.
 
 Activation is per workspace/context.  Adding a queue (or enabling the explicit
 assertion) on a context with existing ordinary Pods intentionally makes those
@@ -289,6 +311,20 @@ enabled.  Strict mode would safely stop new Pods, but the service would be
 unavailable and continuously attempt recovery.
 
 ## Verification evidence and test plan
+
+The LocalQueue preflight follow-up was verified on 2026-08-09:
+
+- The focused required-Kueue regression selection and the complete
+  `tests/unit_tests/kubernetes/test_provision.py` suite both exited
+  successfully.
+- Tests cover an active queue, a missing object, absent and false `Active`
+  conditions, authorization and malformed-response failures, and ordering
+  before the first Pod query.
+- `format.sh` completed YAPF and isort, and mypy reported no issues across 887
+  source files.  Pylint rated the changed production modules 10.00/10; its
+  separate pass over the legacy provisioner test module reports that file's
+  existing warnings.
+- `git diff --check` passed.
 
 Phase 1 automated verification completed on 2026-08-08:
 
@@ -362,6 +398,8 @@ Automated tests must prove:
   workspace, context, and request-provided configurations;
 - explicit false cannot downgrade a queued placement, while explicit true
   without a queue fails before Pod creation;
+- missing, inactive, unreconciled, malformed, or unreadable LocalQueues fail
+  before the first Pod query or mutation, while `Active=True` passes;
 - precedence and absence-of-queue rejection;
 - remote clients cannot override `require_managed`;
 - remote clients cannot redirect queues on a server containing a configured
@@ -435,6 +473,16 @@ Rejected as the primary boundary.  It adds a controller race and leaves a
 window in which an ungated Pod can schedule.  Create-response attestation plus
 a pre-added scheduling gate is synchronous and fail closed.  Workload checks
 remain valuable operational verification.
+
+### Let Kueue retain a gated Pod when the LocalQueue is missing
+
+Rejected.  Kueue safely marks the generated Workload `Inadmissible`, but
+SkyPilot would otherwise wait until `provision_timeout` (or forever for a
+negative timeout) and obscure a deterministic configuration error.  A
+read-only LocalQueue preflight preserves fail-closed behavior and returns the
+actionable error before creating any object.  SkyPilot still does not create
+the queue because its ClusterQueue, quota, cohort, and preemption policy are
+operator-owned decisions.
 
 ### Require cluster-wide `manageJobsWithoutQueueName`
 

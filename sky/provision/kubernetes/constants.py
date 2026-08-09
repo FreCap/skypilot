@@ -36,6 +36,10 @@ KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION = (
     'kueue.x-k8s.io/pod-group-total-count')
 KUEUE_RETRIABLE_IN_GROUP_ANNOTATION = 'kueue.x-k8s.io/retriable-in-group'
 KUEUE_ADMISSION_SCHEDULING_GATE = 'kueue.x-k8s.io/admission'
+KUEUE_API_GROUP = 'kueue.x-k8s.io'
+KUEUE_API_VERSION = 'v1beta1'
+KUEUE_LOCAL_QUEUE_PLURAL = 'localqueues'
+KUEUE_ACTIVE_CONDITION = 'Active'
 
 # Pod phases that are not holding PVCs
 PVC_NOT_HOLD_POD_PHASES = ['Succeeded', 'Failed']
