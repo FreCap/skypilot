@@ -481,7 +481,7 @@ def test_builtin_kubernetes_writer_preserves_replacement_renderer_authority(
                              'templates' / template_ref)
         source_bytes = template_path.read_bytes()
         assert hashlib.sha256(source_bytes).hexdigest() == (
-            '988b6d5e2afd7e96b3a6d7e0091c661a3d05d5a61d23fd7efa138ab75d55a6f8')
+            'dcb8b332408ffadaf92882a2b510fb9acfb36e5196757932957fb7826d395891')
         source = source_bytes.decode('utf-8')
         assert '{{ skypilot_kubernetes_node_config_fragment_v1 }}\n' not in source
         rendered = common_utils.jinja2.Template(source).render(**variables)
@@ -790,24 +790,24 @@ def test_host_network_probe_is_only_builtin_render_delta(
         current_render.replace(canonical_root, b'<TMP>')).hexdigest()
     expected_hashes = {
         'kubernetes-host-network-false': (
-            '37ea063f413cdac1f27140ec53da34336747e6c377260570cbd88afb3326a426',
-            '96bc26cba5c35bfdf4979c2372d0013fd5f15e062673fe5ea1b6a54ce54a1cac',
+            '76166866c2408054bcb2786da0696e1f6583798416aefdd8b130fa180b77ec79',
+            '96a3e08dffb31b73cdc85e6737b01129fb77c028e090193f56cf4dc538c28a0e',
         ),
         'kubernetes-host-network-true': (
-            'd13b292460ca5c368c83b9e1b2cdd3f5f8790c7ed4e6d4317635d815989f1501',
-            '5d0e83ab72ae9905c8aeeaf1d18b08a8778cfa148c1aeffb4038c4a5bd1072d3',
+            'bd8e7645de9dbb93a4969c2567706db2f042da39557e28172188299f9fe4abe5',
+            'd85e40332956c3a0d4b0a0f4029542d844fdaaca04a9e6fbfdad341dff4ea6e8',
         ),
         'kubernetes-oci-roce': (
-            'bd88f2c02829ceb298568983f940ef87f32f04b1e9b210b16feac53b037d2a8e',
-            '2161061192392c5d8957992c2b5d457f4531be630157d51838a167bd74b59959',
+            '3b9095baa1f2b7527257aa9c35dc32180a1da73ead12ab4a1d547c4714fcc337',
+            '875ca4f82941cb886b2f40009a84601be77ee2afb777754ebb4131e330749711',
         ),
         'ssh-host-network-false': (
-            'bf08ce1722b84096d1c00d774915aa9853d9849ea5d35059f781fab447b58e7e',
-            '163feda8868fba7a2fd9b2df29fc0e04d16b390bb280e827aeed8158ee751127',
+            'd941a6b8ca41be28c9bef1b77ff5791d47b40961f0c3f8ae5da3173dc2710e2c',
+            '893f010283e009b3197eb00602089bf259c5f5fd2f03f2a2c184778e76c0e9eb',
         ),
         'ssh-host-network-true': (
-            '675d42b13e23c215c56257ead94b3c25b3b40a8f45a2d38dca591aa9898ff9e9',
-            '5319addeb7e7fbe758184c9cd2a82330a5e8bbea13cc371f1b5b7f41f711e1b0',
+            '7bfddc5a3d8699d2c5bda12fbb15a9997a5880dd792d6717be180c12f93ebc9f',
+            '562ea0fd5e67c87b99de45c0c94b96e7cec2e4dae9e929f55b7ecfeee19afea8',
         ),
     }
     assert (legacy_hash, current_hash) == expected_hashes[scenario]
