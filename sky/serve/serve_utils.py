@@ -4707,7 +4707,8 @@ def terminate_services(service_names: list[str] | None, purge: bool,
         service_status = _get_service_status(service_name,
                                              pool=pool,
                                              with_replica_info=False,
-                                             with_yaml=False)
+                                             with_yaml=False,
+                                             status_snapshot_only=True)
         if service_status is None:
             # `_get_service_status` returns None for two distinct cases: a
             # healthy service of the *other* mode (its `pool` flag != the

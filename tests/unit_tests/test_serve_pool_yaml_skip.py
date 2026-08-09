@@ -1,8 +1,14 @@
 """Tests for skipping pool YAML on liveness-only status paths."""
 
+# Fixture imports are referenced indirectly by pytest, and the helper imports
+# keep these call-site tests on the real DB-backed read paths they cover.
+# pylint: disable=unused-import
 from unittest import mock
 
 import pytest
+from test_serve_state import _add_minimal_service
+from test_serve_state import _count_sql_statements
+from test_serve_state import _mock_serve_db
 
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -73,8 +79,6 @@ def test_terminate_services_skips_display_yaml(pool, noun):
     record = {
         'name': 'target-a',
         'pool': pool,
-        'version': 1,
-        'yaml_content': None,
         'status': serve_state.ServiceStatus.SHUTTING_DOWN,
         'hash': 'incarnation-a',
         'resource_scope': 'scope-a',
@@ -83,8 +87,13 @@ def test_terminate_services_skips_display_yaml(pool, noun):
                            'get_glob_service_names',
                            return_value=['target-a']), \
          mock.patch.object(serve_state,
-                           'get_service_from_name',
+                           'get_service_status_snapshot',
                            return_value=record), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           side_effect=AssertionError(
+                               'termination must not read the full '
+                               'service row')), \
          mock.patch.object(serve_utils,
                            'get_yaml_content',
                            side_effect=AssertionError(
@@ -96,6 +105,34 @@ def test_terminate_services_skips_display_yaml(pool, noun):
 
     get_yaml.assert_not_called()
     assert message == f'No {noun} to terminate.'
+
+
+def test_terminate_services_uses_status_snapshot_without_loading_spec(
+        _mock_serve_db, monkeypatch):
+    assert _add_minimal_service('svc-shutdown',
+                                service_hash='incarnation-a') is True
+    serve_state.set_service_status_and_active_versions(
+        'svc-shutdown',
+        serve_state.ServiceStatus.SHUTTING_DOWN,
+        active_versions=[],
+    )
+
+    def fail_if_spec_loaded(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError('termination must not deserialize the latest spec')
+
+    monkeypatch.setattr(serve_state.pickle, 'loads', fail_if_spec_loaded)
+
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc-shutdown']), \
+         _count_sql_statements(_mock_serve_db) as counts:
+        message = serve_utils.terminate_services(['svc-shutdown'],
+                                                 purge=False,
+                                                 pool=False)
+
+    assert counts['n'] == 1, counts
+    assert message == 'No service to terminate.'
 
 
 @pytest.mark.parametrize(
