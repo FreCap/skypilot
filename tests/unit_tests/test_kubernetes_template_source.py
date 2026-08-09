@@ -21,17 +21,17 @@ _NODE_CONFIG_PATH = (_TEMPLATE_DIR / 'kubernetes-ray-node-config.yml.j2')
 
 _SOURCE_MARKER_LINE = ('{{ skypilot_kubernetes_node_config_fragment_v1 }}\n')
 
-_MONOLITH_SIZE = 83790
+_MONOLITH_SIZE = 84457
 _MONOLITH_SHA256 = (
-    '988b6d5e2afd7e96b3a6d7e0091c661a3d05d5a61d23fd7efa138ab75d55a6f8')
-_OUTER_SIZE = 16028
+    'dcb8b332408ffadaf92882a2b510fb9acfb36e5196757932957fb7826d395891')
+_OUTER_SIZE = 16400
 _OUTER_SHA256 = (
-    '3f9343f8ff289711d931af2915391338ac628d30d96fb10e66b4808578eadcd1')
-_NODE_CONFIG_SIZE = 67812
+    'b49f33288ccaf0356b212b1863819e1126aa4d17c5501961dcfc66d87f118707')
+_NODE_CONFIG_SIZE = 68107
 _NODE_CONFIG_SHA256 = (
-    '09ea5d743a09286649c56f26c5b737764b81730b90fefae2bd561e0707a72e04')
+    '546110919b7e73e245f6287d502d6382c4e8e257d6296806b80a73f17ee095b1')
 _BINDING_NAMES_SHA256 = (
-    '458bb234308e1ac0afc20945c24c10e524d29dc813253347943a9af8184819fe')
+    '597244323599bf43d24902fe0ad0465b2353e80448311137949857287702f106')
 
 _MARKER_ERROR = ('Built-in Kubernetes template outer marker count mismatch.')
 _OUTER_ERROR = ('Built-in Kubernetes template outer source identity mismatch.')
@@ -117,7 +117,7 @@ def test_fragment_binding_names_are_closed() -> None:
         meta.find_undeclared_variables(syntax_tree) - set(environment.globals))
     canonical_names = ('\n'.join(binding_names) + '\n').encode('utf-8')
 
-    assert len(binding_names) == 71
+    assert len(binding_names) == 72
     assert _sha256_bytes(canonical_names) == _BINDING_NAMES_SHA256
 
 

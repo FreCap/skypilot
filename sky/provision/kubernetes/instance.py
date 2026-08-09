@@ -639,9 +639,94 @@ def _force_remove_terminating_pod(pod_name: str, namespace: str,
                 f'Force delete of terminating pod {pod_name} failed: {e}')
 
 
+def _prepare_pod_for_required_kueue(
+        pod_spec: dict, expected_queue: str, pod_group_name: str,
+        pod_group_total_count: int,
+        workload_priority_class_name: str | None) -> None:
+    """Reasserts the server-owned Kueue contract on a final Pod spec."""
+    metadata = pod_spec.setdefault('metadata', {})
+    labels = metadata.setdefault('labels', {})
+    labels[k8s_constants.KUEUE_QUEUE_LABEL] = expected_queue
+    labels[k8s_constants.KUEUE_POD_GROUP_LABEL] = pod_group_name
+    # The managed label is admission attestation.  It must never arrive in the
+    # request, otherwise a custom pod_config could forge a successful check.
+    labels.pop(k8s_constants.KUEUE_MANAGED_KEY, None)
+    if workload_priority_class_name is None:
+        labels.pop(k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL, None)
+    else:
+        labels[k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL] = (
+            workload_priority_class_name)
+
+    annotations = metadata.setdefault('annotations', {})
+    annotations[k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION] = 'false'
+    annotations[k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION] = str(
+        pod_group_total_count)
+
+    # A client-supplied Kueue finalizer can leak a Pod if admission never runs.
+    finalizers = metadata.get('finalizers')
+    if finalizers is not None:
+        metadata['finalizers'] = [
+            finalizer for finalizer in finalizers
+            if finalizer != k8s_constants.KUEUE_MANAGED_FINALIZER
+        ]
+
+    # Kueue adds this gate itself, but adding it before admission reverses the
+    # failure mode: if the webhook is missing or excludes this namespace, the
+    # unverified Pod cannot reach the default scheduler or consume a GPU.
+    scheduling_gates = pod_spec.setdefault('spec', {}).setdefault(
+        'schedulingGates', [])
+    if not any(
+            gate.get('name') == k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
+            for gate in scheduling_gates):
+        scheduling_gates.append(
+            {'name': k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE})
+
+
+def _attest_required_kueue_pod(pod: Any, namespace: str, context: str | None,
+                               expected_queue: str) -> None:
+    """Verifies Kueue admission mutation, deleting a Pod that bypassed it."""
+    labels = pod.metadata.labels or {}
+    managed_value = labels.get(k8s_constants.KUEUE_MANAGED_KEY)
+    actual_queue = labels.get(k8s_constants.KUEUE_QUEUE_LABEL)
+    if (managed_value == k8s_constants.KUEUE_MANAGED_VALUE and
+            actual_queue == expected_queue):
+        return
+
+    pod_name = pod.metadata.name
+    reasons = []
+    if managed_value != k8s_constants.KUEUE_MANAGED_VALUE:
+        reasons.append(f'{k8s_constants.KUEUE_MANAGED_KEY}={managed_value!r}')
+    if actual_queue != expected_queue:
+        reasons.append(f'{k8s_constants.KUEUE_QUEUE_LABEL}={actual_queue!r} '
+                       f'(expected {expected_queue!r})')
+    cleanup_error = None
+    try:
+        kubernetes.core_api(context).delete_namespaced_pod(
+            pod_name,
+            namespace,
+            grace_period_seconds=0,
+            _request_timeout=config_lib.DELETION_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        if e.status != 404:
+            cleanup_error = common_utils.format_exception(e)
+            logger.error(f'Failed to delete unattested Kueue Pod {pod_name}: '
+                         f'{cleanup_error}')
+
+    detail = ', '.join(reasons)
+    cleanup_detail = ('' if cleanup_error is None else
+                      f' Cleanup also failed: {cleanup_error}')
+    raise config_lib.KubernetesError(
+        f'Pod {namespace}/{pod_name} was not admitted through the required '
+        f'Kueue LocalQueue {expected_queue!r}: {detail}. The Pod was rejected '
+        f'to prevent it from bypassing Kueue.{cleanup_detail}')
+
+
 @timeline.event
-def _create_namespaced_pod_with_retries(namespace: str, pod_spec: dict,
-                                        context: str | None) -> Any:
+def _create_namespaced_pod_with_retries(
+        namespace: str,
+        pod_spec: dict,
+        context: str | None,
+        expected_kueue_queue: str | None = None) -> Any:
     """Attempts to create a Kubernetes Pod and handle any errors.
 
     Currently, we handle errors due to the AppArmor annotation and retry if
@@ -650,11 +735,18 @@ def _create_namespaced_pod_with_retries(namespace: str, pod_spec: dict,
 
     Returns: The created Pod object.
     """
+
+    def attest_if_required(pod: Any) -> Any:
+        if expected_kueue_queue is not None:
+            _attest_required_kueue_pod(pod, namespace, context,
+                                       expected_kueue_queue)
+        return pod
+
     try:
         # Attempt to create the Pod with the AppArmor annotation
         pod = kubernetes.core_api(context).create_namespaced_pod(
             namespace, pod_spec)
-        return pod
+        return attest_if_required(pod)
     except kubernetes.api_exception() as e:
         try:
             error_body = json.loads(e.body)
@@ -694,7 +786,7 @@ def _create_namespaced_pod_with_retries(namespace: str, pod_spec: dict,
                     namespace, pod_spec)
                 logger.info(f'Pod {pod.metadata.name} created successfully '
                             'without AppArmor annotation.')
-                return pod
+                return attest_if_required(pod)
             except kubernetes.api_exception() as retry_exception:
                 logger.info('Failed to create Pod without AppArmor annotation: '
                             f'{retry_exception}')
@@ -735,7 +827,7 @@ def _create_namespaced_pod_with_retries(namespace: str, pod_spec: dict,
                     namespace, pod_spec)
                 logger.info(f'Pod {pod.metadata.name} created successfully '
                             'after force-removing the terminating pod.')
-                return pod
+                return attest_if_required(pod)
             except kubernetes.api_exception() as retry_exception:
                 logger.warning(f'Failed to create pod {pod_name} on retry: '
                                f'{retry_exception}')
@@ -822,6 +914,25 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     if to_create_deployment:
         deployment_spec = pod_spec.pop('deployment_spec')
         pvc_spec = pod_spec.pop('pvc_spec')
+
+    kueue_local_queue_name = provider_config.get('kueue_local_queue_name')
+    # Provider configs are persisted and may outlive the renderer that created
+    # them.  Derive strict mode from the queue again at the final provisioning
+    # boundary so a missing or false flag can never downgrade a queued Pod.
+    kueue_require_managed = bool(
+        provider_config.get('kueue_require_managed', False) or
+        kueue_local_queue_name)
+    kueue_workload_priority_class_name = provider_config.get(
+        'kueue_workload_priority_class_name')
+    if kueue_require_managed:
+        if not kueue_local_queue_name:
+            raise config_lib.KubernetesError(
+                'Required Kueue management is enabled, but the rendered '
+                'provider config has no LocalQueue name.')
+        if to_create_deployment:
+            raise config_lib.KubernetesError(
+                'Required Kueue management currently supports direct Pods, '
+                'not high-availability Deployment-owned Pods.')
 
     tags = ray_tag_filter(cluster_name_on_cloud)
 
@@ -935,6 +1046,11 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                                                 ['Pending', 'Running'])
     _validate_cluster_name_annotations(running_pods, cluster_name,
                                        cluster_name_on_cloud)
+    if kueue_require_managed:
+        assert kueue_local_queue_name is not None
+        for existing_pod in running_pods.values():
+            _attest_required_kueue_pod(existing_pod, namespace, context,
+                                       kueue_local_queue_name)
     head_pod_name = _get_head_pod_name(running_pods)
     running_pod_statuses = [{
         pod.metadata.name: pod.status.phase
@@ -1038,6 +1154,17 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             deployment_name=deployment_name,
         )
 
+        if kueue_require_managed:
+            assert kueue_local_queue_name is not None
+            _prepare_pod_for_required_kueue(
+                pod_spec_copy,
+                expected_queue=kueue_local_queue_name,
+                pod_group_name=cluster_name_on_cloud,
+                pod_group_total_count=config.count,
+                workload_priority_class_name=(
+                    kueue_workload_priority_class_name),
+            )
+
         if to_create_deployment:
             assert deployment_spec is not None
             assert pvc_spec is not None
@@ -1063,6 +1190,13 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         # is used by any pod in the namespace.
         volume.check_pvc_usage_for_pod(context, namespace, pod_spec_copy)
 
+        if kueue_require_managed:
+            assert kueue_local_queue_name is not None
+            return _create_namespaced_pod_with_retries(
+                namespace,
+                pod_spec_copy,
+                context,
+                expected_kueue_queue=kueue_local_queue_name)
         return _create_namespaced_pod_with_retries(namespace, pod_spec_copy,
                                                    context)
 

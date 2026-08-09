@@ -1260,6 +1260,9 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
             'local_queue_name': {
                 'type': 'string',
             },
+            'require_managed': {
+                'type': 'boolean',
+            },
         },
     },
     # Alias of `kueue.local_queue_name`; `quota.queue` takes precedence
@@ -2650,6 +2653,9 @@ def get_config_schema():
                                 'local_queue_name': {
                                     'type': 'string',
                                 },
+                                'require_managed': {
+                                    'type': 'boolean',
+                                },
                             },
                         },
                         'quota': {
@@ -2692,6 +2698,9 @@ def get_config_schema():
                                         'properties': {
                                             'local_queue_name': {
                                                 'type': 'string',
+                                            },
+                                            'require_managed': {
+                                                'type': 'boolean',
                                             },
                                         },
                                     },

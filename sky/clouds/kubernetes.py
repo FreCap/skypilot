@@ -861,12 +861,31 @@ class Kubernetes(clouds.Cloud):
                 keys=('high_availability', 'storage_class_name'),
                 default_value=None))
 
-        k8s_kueue_local_queue_name = (
-            skypilot_config.get_effective_queue_name(
+        # An API-server-configured queue is an operator-owned admission
+        # boundary, so request overrides cannot redirect it.  A legacy
+        # request-provided queue on an otherwise queue-less server is still
+        # accepted, but it also activates strict management below.
+        k8s_kueue_require_managed = (
+            skypilot_config.get_effective_kueue_require_managed(
                 # TODO(kyuds): Support SSH node pools as well.
                 cloud='kubernetes',
-                region=context,
-                override_configs=resources.cluster_config_overrides))
+                region=context))
+        queue_override_configs = (None if k8s_kueue_require_managed else
+                                  resources.cluster_config_overrides)
+        k8s_kueue_local_queue_name = (skypilot_config.get_effective_queue_name(
+            cloud='kubernetes',
+            region=context,
+            override_configs=queue_override_configs))
+        # Defense in depth for request-provided queues and older config
+        # resolvers: no effective queue is ever allowed to remain best effort.
+        k8s_kueue_require_managed = (k8s_kueue_require_managed or
+                                     bool(k8s_kueue_local_queue_name))
+        if (k8s_kueue_require_managed and not k8s_kueue_local_queue_name):
+            raise ValueError(
+                'kubernetes.kueue.require_managed is true for context '
+                f'{context!r}, but no Kueue LocalQueue is configured. Set '
+                'kubernetes.kueue.local_queue_name (or '
+                'kubernetes.quota.queue) in the API server config.')
 
         # Check DWS configuration for GKE.
         (enable_flex_start, enable_flex_start_queued_provisioning,
@@ -960,6 +979,10 @@ class Kubernetes(clouds.Cloud):
             'k8s_automount_sa_token': 'true',
             'k8s_fuse_device_required': fuse_device_required,
             'k8s_kueue_local_queue_name': k8s_kueue_local_queue_name,
+            'k8s_kueue_require_managed': k8s_kueue_require_managed,
+            'k8s_kueue_workload_priority_class_name':
+                (resources.priority_class if k8s_kueue_require_managed else None
+                ),
             # Namespace to run the fusermount-server daemonset in
             'k8s_skypilot_system_namespace': _SKYPILOT_SYSTEM_NAMESPACE,
             'k8s_fusermount_shared_dir': kubernetes_fuse.FUSERMOUNT_SHARED_DIR,

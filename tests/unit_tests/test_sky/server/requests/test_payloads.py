@@ -138,25 +138,34 @@ def test_request_body_projection_placeholder_is_inert(monkeypatch):
     assert body.client_api_version is None
 
 
-def test_persisted_payload_strips_server_owned_kubernetes_autoscaler():
-    body = payloads.ServeUpBody(task='name: task',
-                                service_name='service',
-                                override_skypilot_config={
-                                    'active_workspace': 'workspace',
-                                    'kubernetes': {
-                                        'autoscaler': 'generic',
-                                        'ports': 'podip',
-                                        'context_configs': {
-                                            'research': {
-                                                'autoscaler': 'generic',
-                                                'provision_timeout': 15,
-                                            },
-                                            'other': {
-                                                'provision_timeout': 30,
-                                            },
-                                        },
-                                    },
-                                })
+def test_persisted_payload_strips_server_owned_kubernetes_fields():
+    body = payloads.ServeUpBody(
+        task='name: task',
+        service_name='service',
+        override_skypilot_config={
+            'active_workspace': 'workspace',
+            'kubernetes': {
+                'autoscaler': 'generic',
+                'ports': 'podip',
+                'kueue': {
+                    'local_queue_name': 'client-queue',
+                    'require_managed': True,
+                },
+                'context_configs': {
+                    'research': {
+                        'autoscaler': 'generic',
+                        'provision_timeout': 15,
+                        'kueue': {
+                            'local_queue_name': 'research-queue',
+                            'require_managed': False,
+                        },
+                    },
+                    'other': {
+                        'provision_timeout': 30,
+                    },
+                },
+            },
+        })
 
     payloads.validate_task_request_body_for_persistence(body)
 
@@ -164,9 +173,15 @@ def test_persisted_payload_strips_server_owned_kubernetes_autoscaler():
         'active_workspace': 'workspace',
         'kubernetes': {
             'ports': 'podip',
+            'kueue': {
+                'local_queue_name': 'client-queue',
+            },
             'context_configs': {
                 'research': {
                     'provision_timeout': 15,
+                    'kueue': {
+                        'local_queue_name': 'research-queue',
+                    },
                 },
                 'other': {
                     'provision_timeout': 30,

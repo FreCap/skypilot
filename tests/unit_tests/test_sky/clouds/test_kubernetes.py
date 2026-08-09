@@ -745,7 +745,6 @@ class TestKubernetesSecurityContextMerging(unittest.TestCase):
         mock_get_accelerator_label_keys.return_value = []
         mock_get_workspace_cloud.return_value.get.return_value = None
         mock_is_exec_auth.return_value = (False, None)
-
         # Mock GPU-related functions
         mock_get_accelerator_label_key_values.return_value = ('accelerator',
                                                               ['H100'
@@ -1012,6 +1011,10 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         self.region = mock.MagicMock()
         self.region.name = "my-k8s-cluster"
 
+    @patch('sky.skypilot_config.get_effective_kueue_require_managed',
+           return_value=False)
+    @patch('sky.skypilot_config.get_effective_queue_name',
+           return_value='server-queue')
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
     @patch(
         'sky.provision.kubernetes.utils.get_current_kube_config_context_name')
@@ -1027,7 +1030,8 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
             self, mock_detect_network_type, mock_get_image, mock_get_port_mode,
             mock_get_workspace_cloud, mock_get_cloud_config_value,
             mock_is_exec_auth, mock_get_accelerator_label_keys,
-            mock_get_namespace, mock_get_current_context, mock_get_k8s_nodes):
+            mock_get_namespace, mock_get_current_context, mock_get_k8s_nodes,
+            mock_get_queue_name, mock_require_managed):
         """Test that Kubernetes cloud uses 'kubernetes' config (not 'ssh') for provision_timeout."""
 
         # Setup mocks
@@ -1041,6 +1045,7 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         mock_get_accelerator_label_keys.return_value = []
         mock_get_workspace_cloud.return_value.get.return_value = None
         mock_is_exec_auth.return_value = (False, None)
+        self.resources.priority_class = 'inference-low'
 
         # Track calls to get_effective_region_config
         config_calls = []
@@ -1106,6 +1111,18 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
         # Verify the timeout value is set in deploy vars
         self.assertIn('timeout', deploy_vars)
         self.assertEqual(deploy_vars['timeout'], '3600')
+        # Even if the explicit/server resolver reports false, the effective
+        # queue automatically activates strict management.
+        self.assertTrue(deploy_vars['k8s_kueue_require_managed'])
+        self.assertEqual(deploy_vars['k8s_kueue_local_queue_name'],
+                         'server-queue')
+        self.assertEqual(deploy_vars['k8s_kueue_workload_priority_class_name'],
+                         'inference-low')
+        mock_require_managed.assert_called_once_with(cloud='kubernetes',
+                                                     region='my-k8s-cluster')
+        mock_get_queue_name.assert_called_once_with(cloud='kubernetes',
+                                                    region='my-k8s-cluster',
+                                                    override_configs={})
 
     @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
     @patch(

@@ -107,6 +107,7 @@ Below is the configuration syntax and some example values. See detailed explanat
     :ref:`enable_docker <config-yaml-kubernetes-enable-docker>`: true  # or ALL / BUILD
     :ref:`kueue <config-yaml-kubernetes-kueue>`:
       :ref:`local_queue_name <config-yaml-kubernetes-kueue-local-queue-name>`: skypilot-local-queue
+      :ref:`require_managed <config-yaml-kubernetes-kueue-require-managed>`: true  # optional assertion
     :ref:`dws <config-yaml-kubernetes-dws>`:
       enabled: true
       max_run_duration: 10m
@@ -2047,6 +2048,30 @@ Kueue configuration (optional).
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Name of the `local queue <https://kueue.sigs.k8s.io/docs/concepts/local_queue/>`_ to use for SkyPilot jobs.
+Setting an effective queue automatically enables fail-closed Kueue management;
+no second opt-in flag is required.
+
+.. _config-yaml-kubernetes-kueue-require-managed:
+
+``kubernetes.kueue.require_managed``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Optional assertion that SkyPilot must use Kueue for this placement.  When set
+to ``true``, ``local_queue_name`` (or ``kubernetes.quota.queue``) is required.
+An effective queue already enables this behavior automatically: SkyPilot adds
+Kueue's admission scheduling gate before Pod creation and rejects an unmutated
+Pod, so a missing or mis-scoped Kueue webhook cannot silently bypass queue
+admission.  Setting this field to ``false`` does not downgrade a queued
+placement; remove the queue to disable Kueue for that placement.
+
+This is an API-server-owned setting for remote clients.  Configure it globally,
+per workspace, or per Kubernetes context on the API server.  Required mode does
+not currently support high-availability Deployment-owned Pods.
+
+When required mode is enabled explicitly or by a queue, a resource-level
+``priority_class`` is used as the Kueue WorkloadPriorityClass name.
+
+Default: ``false``.
 
 .. _config-yaml-kubernetes-dws:
 
