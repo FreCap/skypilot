@@ -782,7 +782,7 @@ def stream_logs_by_id(job_id: int,
             # Wait a bit longer than the controller, so as to make sure the
             # managed job state is updated.
             _sleep_log_follow_wait(3 * JOB_STATUS_CHECK_GAP_SECONDS)
-            managed_job_status = managed_job_state.get_status(job_id)
+            managed_job_status = get_follow_status()
             assert managed_job_status is not None, (job_id, managed_job_status)
 
     # Preserve the latest-task verdict already observed by the follow loop.
