@@ -885,6 +885,90 @@ class TestStreamLogsByIdLifecycle:
         assert backend.status_calls == 1
         sleep.assert_called_once_with(1)
 
+    def test_filtered_task_retry_refresh_uses_task_status_scope(
+            self, monkeypatch):
+        backend = _FakeBackend()
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        lookup_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, running, None, 'filtered-cluster', None, 'eval'),
+                local_log_file=None,
+                logs_cleaned_at=None,
+                num_tasks=2,
+            ))
+        filtered_snapshot_read = mock.Mock(side_effect=[
+            managed_job_state.JobLogStreamSnapshot(
+                1, running, None, 'filtered-cluster', None, 'eval'),
+            managed_job_state.JobLogStreamSnapshot(
+                1, succeeded, None, 'filtered-cluster', None, 'eval'),
+        ])
+        sleep = mock.Mock()
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        handle_lookup = mock.Mock(return_value=_FakeHandle())
+        generate_cluster_name = mock.Mock(return_value='filtered-cluster')
+        backend.tail_logs = mock.Mock(return_value=255)
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(
+            managed_job_state, 'get_all_task_ids_names_statuses_logs',
+            mock.Mock(side_effect=AssertionError('whole-task scan used')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError(
+                'count query used on found task-id filter')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_status',
+            mock.Mock(side_effect=AssertionError('whole-job status poll used')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_latest_task_id_status',
+            mock.Mock(side_effect=AssertionError('scalar latest-task poll '
+                                                 'used')))
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
+                            filtered_snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils, 'generate_managed_job_cluster_name',
+                            generate_cluster_name)
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
+                            _FakeHandle)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42,
+                                                          follow=True,
+                                                          task=1)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        lookup_read.assert_called_once_with(42, 1)
+        assert filtered_snapshot_read.call_args_list == [
+            mock.call(42, 1),
+            mock.call(42, 1),
+        ]
+        generate_cluster_name.assert_called_once_with('eval', 42)
+        handle_lookup.assert_called_once_with('filtered-cluster')
+        backend.tail_logs.assert_called_once()
+        assert backend.status_calls == 0
+        sleep.assert_called_once_with(3 *
+                                      jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS)
+
     def test_unfiltered_final_wait_keeps_whole_job_status_poll(
             self, monkeypatch):
         backend = _FakeBackend()
