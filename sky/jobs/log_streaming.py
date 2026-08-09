@@ -455,11 +455,12 @@ def stream_logs_by_id(job_id: int,
     # Resolve task filter to a specific task_id if provided
     # This is used for running jobs to stream logs from the correct task
     filtered_task_id: int | None = None
+    prefetched_snapshot: managed_job_state.JobLogStreamSnapshot | None = None
     if task is not None:
         if isinstance(task, int):
-            task_row = managed_job_state.get_task_id_name_status_log(
+            prefetched_snapshot = managed_job_state.get_task_log_stream_snapshot(
                 job_id, task)
-            if task_row is None:
+            if prefetched_snapshot.task_id is None:
                 num_tasks = managed_job_state.get_num_tasks(job_id)
                 return _task_filter_not_found(job_id, task, num_tasks)
             filtered_task_id = task
@@ -474,6 +475,11 @@ def stream_logs_by_id(job_id: int,
                 return _task_filter_not_found(job_id, task, num_tasks)
 
     def get_stream_target_snapshot() -> managed_job_state.JobLogStreamSnapshot:
+        nonlocal prefetched_snapshot
+        if prefetched_snapshot is not None:
+            snapshot = prefetched_snapshot
+            prefetched_snapshot = None
+            return snapshot
         if filtered_task_id is None:
             return managed_job_state.get_latest_log_stream_snapshot(job_id)
         return managed_job_state.get_task_log_stream_snapshot(

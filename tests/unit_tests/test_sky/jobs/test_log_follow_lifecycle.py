@@ -806,7 +806,6 @@ class TestStreamLogsByIdLifecycle:
             managed_job_state.JobLogStreamSnapshot(
                 1, succeeded, None, 'filtered-cluster', None, 'eval'),
         ])
-        task_row_read = mock.Mock(return_value=(1, 'eval', running, None, None))
         sleep = mock.Mock()
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
@@ -825,8 +824,9 @@ class TestStreamLogsByIdLifecycle:
             managed_job_state, 'get_num_tasks',
             mock.Mock(side_effect=AssertionError(
                 'count query used on found task-id filter')))
-        monkeypatch.setattr(managed_job_state, 'get_task_id_name_status_log',
-                            task_row_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
         monkeypatch.setattr(
             managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('whole-job status poll used')))
@@ -861,7 +861,6 @@ class TestStreamLogsByIdLifecycle:
             mock.call(42, 1),
             mock.call(42, 1),
         ]
-        task_row_read.assert_called_once_with(42, 1)
         generate_cluster_name.assert_called_once_with('eval', 42)
         handle_lookup.assert_called_once_with('filtered-cluster')
         assert backend.tail_calls == 1
@@ -1026,18 +1025,14 @@ class TestStreamLogsByIdLifecycle:
 
         assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
-        assert task_row_read.call_args_list == [
-            mock.call(42, 1), mock.call(42, 1)
-        ]
+        task_row_read.assert_called_once_with(42, 1)
         snapshot_read.assert_called_once_with(42, 1)
         sleep.assert_not_called()
 
     def test_terminal_task_id_filter_preserves_missing_job(self, monkeypatch):
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
-        task_row = (1, 'eval', managed_job_state.ManagedJobStatus.RUNNING, '',
-                    None)
-        task_row_read = mock.Mock(side_effect=[task_row, None])
+        task_row_read = mock.Mock(return_value=None)
         count_read = mock.Mock(return_value=0)
         snapshot_read = mock.Mock(
             return_value=managed_job_state.JobLogStreamSnapshot(
@@ -1072,9 +1067,7 @@ class TestStreamLogsByIdLifecycle:
 
         assert message == 'Job 42 not found.'
         assert exit_code == exceptions.JobExitCode.NOT_FOUND
-        assert task_row_read.call_args_list == [
-            mock.call(42, 1), mock.call(42, 1)
-        ]
+        task_row_read.assert_called_once_with(42, 1)
         count_read.assert_called_once_with(42)
         snapshot_read.assert_called_once_with(42, 1)
         sleep.assert_not_called()
