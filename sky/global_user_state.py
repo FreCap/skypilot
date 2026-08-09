@@ -2220,6 +2220,9 @@ def get_cluster_from_name(
         cluster_table.c.workspace,
         cluster_table.c.is_managed,
     ]
+    joined_user_name_label = 'joined_user_name'
+    if include_user_info:
+        query_fields.append(user_table.c.name.label(joined_user_name_label))
     if not summary_response:
         query_fields.extend([
             cluster_table.c.last_creation_yaml,
@@ -2227,15 +2230,21 @@ def get_cluster_from_name(
         ])
     with orm.Session(engine) as session:
         query = session.query(*query_fields)
-        row = query.filter_by(name=cluster_name).first()
-    if row is None:
-        return None
-    user_hash = None
-    user_name = None
-    if include_user_info:
-        user_hash = _get_user_hash_or_current_user(row.user_hash)
-        user = get_user(user_hash)
-        user_name = user.name if user is not None else None
+        if include_user_info:
+            query = query.outerjoin(
+                user_table, cluster_table.c.user_hash == user_table.c.id)
+        row = query.filter(cluster_table.c.name == cluster_name).first()
+        if row is None:
+            return None
+        user_hash = None
+        user_name = None
+        if include_user_info:
+            user_hash = _get_user_hash_or_current_user(row.user_hash)
+            if row.user_hash is None:
+                user = get_user(user_hash, session=session)
+                user_name = user.name if user is not None else None
+            else:
+                user_name = getattr(row, joined_user_name_label)
     last_event = None
     if not summary_response:
         last_event = get_terminal_or_last_status_change_event(row.cluster_hash)
