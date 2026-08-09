@@ -6,6 +6,7 @@ from collections.abc import Callable
 from collections.abc import Collection
 import json
 import time
+import typing
 from typing import Any, Optional
 
 import sqlalchemy
@@ -60,6 +61,14 @@ _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 
 class ControllerLeadershipLostError(RuntimeError):
     """Raised when a split-role managed-job write has lost its outer fence."""
+
+
+class TaskLogStreamLookup(typing.NamedTuple):
+    """One task-filtered log snapshot plus exact task-count context."""
+    snapshot: JobLogStreamSnapshot
+    local_log_file: str | None
+    logs_cleaned_at: float | None
+    num_tasks: int
 
 
 def get_current_controller_owner() -> tuple[str, int] | None:
@@ -1612,15 +1621,25 @@ def get_log_stream_context(
 
 
 @db_retries.retry
-def get_task_log_stream_snapshot(job_id: int,
-                                 task_id: int) -> JobLogStreamSnapshot:
-    """Return one task-specific status and routing snapshot for log following.
+def get_task_log_stream_lookup(job_id: int,
+                               task_id: int) -> TaskLogStreamLookup:
+    """Return one task-filtered lookup plus exact task-count context.
 
     When callers follow a specific task in a JobGroup, the task status and its
     routing context must come from the same database snapshot. Otherwise a
     later task can advance the job-level latest-task status between the two
-    reads and make the follower wait on the wrong lifecycle.
+    reads and make the follower wait on the wrong lifecycle. The same lookup
+    also returns the exact task count for this job snapshot so a missing task
+    can be classified as either "job missing" or "task ID invalid" without a
+    second point query.
     """
+    task_count = sqlalchemy.select(
+        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
+    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
+    job_scope = sqlalchemy.select(
+        sqlalchemy.literal(job_id).label('spot_job_id'),
+        task_count.label('num_tasks'),
+    ).subquery()
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
@@ -1631,24 +1650,40 @@ def get_task_log_stream_snapshot(job_id: int,
                 job_info_table.c.current_cluster_name,
                 job_info_table.c.job_id_on_pool_cluster,
                 spot_table.c.task_name,
+                spot_table.c.local_log_file,
+                spot_table.c.logs_cleaned_at,
+                job_scope.c.num_tasks,
             ).select_from(
-                spot_table.outerjoin(
-                    job_info_table, job_info_table.c.spot_job_id ==
-                    spot_table.c.spot_job_id)).where(
-                        sqlalchemy.and_(
-                            spot_table.c.spot_job_id == job_id,
-                            spot_table.c.task_id == task_id,
-                        ))).fetchone()
-    if row is None:
-        return JobLogStreamSnapshot(None, None, None, None, None, None)
-    return JobLogStreamSnapshot(
+                job_scope.outerjoin(
+                    spot_table,
+                    sqlalchemy.and_(
+                        spot_table.c.spot_job_id == job_scope.c.spot_job_id,
+                        spot_table.c.task_id == task_id,
+                    )).outerjoin(
+                        job_info_table, job_info_table.c.spot_job_id ==
+                        spot_table.c.spot_job_id))).fetchone()
+    assert row is not None, (job_id, task_id)
+    snapshot = JobLogStreamSnapshot(
         row.task_id,
-        ManagedJobStatus(row.status),
+        (None if row.status is None else ManagedJobStatus(row.status)),
         row.pool,
         row.current_cluster_name,
         row.job_id_on_pool_cluster,
         row.task_name,
     )
+    return TaskLogStreamLookup(
+        snapshot=snapshot,
+        local_log_file=row.local_log_file,
+        logs_cleaned_at=row.logs_cleaned_at,
+        num_tasks=int(row.num_tasks or 0),
+    )
+
+
+@db_retries.retry
+def get_task_log_stream_snapshot(job_id: int,
+                                 task_id: int) -> JobLogStreamSnapshot:
+    """Return one task-specific status and routing snapshot for log following."""
+    return get_task_log_stream_lookup(job_id, task_id).snapshot
 
 
 @db_retries.retry
