@@ -332,6 +332,29 @@ describe('useSingleManagedJob refresh ownership', () => {
     expect(result.current.jobData.jobs[0].status).toBe('RUNNING');
   });
 
+  it('keeps the visible job snapshot when a refresh fails', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const { result } = renderHook(() => useSingleManagedJob(jobId));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.jobData.jobs[0].id).toBe(Number(jobId));
+
+    dashboardCache.get.mockRejectedValueOnce(new Error('refresh failed'));
+
+    await act(async () => {
+      await result.current.refreshJobData();
+    });
+
+    expect(result.current.loading).toBe(false);
+    expect(result.current.jobData.jobs[0].id).toBe(Number(jobId));
+    expect(dashboardCache.get).toHaveBeenCalledTimes(2);
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Error fetching single managed job data:',
+      expect.objectContaining({ message: 'refresh failed' })
+    );
+    errorSpy.mockRestore();
+  });
+
   it('coalesces concurrent forced refreshes for the same job', async () => {
     const refreshedRequest = deferred();
     const { result } = renderHook(() => useSingleManagedJob(jobId));

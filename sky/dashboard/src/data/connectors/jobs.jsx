@@ -564,8 +564,9 @@ export function useSingleManagedJob(jobId) {
     } = {}) => {
       if (!jobId) return;
       const inFlight = refreshInFlightRef.current;
+      const visibleCurrentJobData = visibleJobDataRef.current;
       const hasVisibleCurrentJobData = Boolean(
-        visibleJobDataRef.current?.jobs?.some(
+        visibleCurrentJobData?.jobs?.some(
           (job) => String(job.id) === String(jobId)
         )
       );
@@ -620,7 +621,9 @@ export function useSingleManagedJob(jobId) {
           return;
         }
         console.error('Error fetching single managed job data:', error);
-        setJobData({ jobs: [], controllerStopped: false });
+        if (!hasVisibleCurrentJobData) {
+          setJobData({ jobs: [], controllerStopped: false });
+        }
       } finally {
         if (isCurrentRequest()) {
           setLoadingJobData(false);
