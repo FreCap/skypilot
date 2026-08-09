@@ -324,7 +324,27 @@ For the SkyPilot API server to submit jobs to a kueue, the following config shou
       kueue:
         local_queue_name: skypilot-local-queue
 
-The config above allows the API server to submit jobs using the local queue.
+The queue automatically requires the API server to submit jobs through Kueue;
+there is no second flag to remember. SkyPilot rejects and deletes a Pod if
+Kueue's admission webhook does not mark it as managed. It also adds Kueue's
+admission scheduling gate before the Pod is created, so a webhook configuration
+error leaves the Pod unable to schedule instead of letting it bypass the queue.
+You may additionally set ``require_managed: true`` as an assertion that makes a
+missing queue a configuration error.
+
+For priority and preemption, create a Kueue ``WorkloadPriorityClass`` and set
+its name on the SkyPilot resource:
+
+.. code-block:: yaml
+
+    resources:
+      accelerators: A100:8
+      priority_class: inference-low
+
+With required management enabled, SkyPilot writes ``inference-low`` to Kueue's
+``kueue.x-k8s.io/priority-class`` label. The ClusterQueue must also have a
+preemption policy (for example, ``withinClusterQueue: LowerPriority``) if a
+higher-priority workload should reclaim occupied quota.
 
 .. image:: ../../../images/examples/k8s-with-kueue/final-architecture.svg
    :alt: Final Architecture

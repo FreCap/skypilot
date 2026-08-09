@@ -1084,6 +1084,22 @@ def override_skypilot_config(
 
     skipped_keys = config_utils.expand_nested_key_patterns(
         override_configs, constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    if _config_requires_managed_kueue(original_config):
+        # Request config is merged into the loaded config below.  Ignoring only
+        # Resources.cluster_config_overrides at placement time is insufficient:
+        # a client queue would already be present in that merged config.  Once
+        # an API server has any strict Kueue placement, keep all queue routing
+        # server-owned so a request cannot redirect a strict workload.
+        queue_override_patterns = []
+        for queue_key in _QUEUE_NAME_KEYS:
+            queue_override_patterns.extend([
+                ('kubernetes',) + queue_key,
+                ('kubernetes', 'context_configs', '*') + queue_key,
+            ])
+        for key in config_utils.expand_nested_key_patterns(
+                override_configs, queue_override_patterns):
+            if key not in skipped_keys:
+                skipped_keys.append(key)
     disallowed_diff_keys = []
     for key in skipped_keys:
         if key == ('db',):
@@ -1209,7 +1225,57 @@ _QUEUE_NAME_KEYS: list[tuple[str, ...]] = [
     ('kueue', 'local_queue_name'),
 ]
 
+_KUEUE_REQUIRE_MANAGED_KEYS: list[tuple[str, ...]] = [
+    ('kueue', 'require_managed'),
+]
+
 _NAMESPACE_KEYS: list[tuple[str, ...]] = [('namespace',)]
+
+
+def _config_requires_managed_kueue(config: config_utils.Config) -> bool:
+    """Whether any API-server Kubernetes scope enables strict Kueue."""
+
+    def get_mapping_value(mapping: Mapping[str, Any],
+                          keys: tuple[str, ...]) -> Any | None:
+        value: Any = mapping
+        for key in keys:
+            if not isinstance(value, Mapping):
+                return None
+            value = value.get(key)
+        return value
+
+    def kubernetes_scope_requires(kubernetes_config: Any) -> bool:
+        if not isinstance(kubernetes_config, Mapping):
+            return False
+        kueue_config = kubernetes_config.get('kueue', {})
+        if (isinstance(kueue_config, Mapping) and
+                kueue_config.get('require_managed') is True):
+            return True
+        # Queue selection itself opts into Kueue.  Treat it as strict even if
+        # require_managed was omitted or explicitly false, otherwise forgetting
+        # a second flag recreates a fail-open path.
+        if any(
+                bool(get_mapping_value(kubernetes_config, queue_key))
+                for queue_key in _QUEUE_NAME_KEYS):
+            return True
+        context_configs = kubernetes_config.get('context_configs', {})
+        if not isinstance(context_configs, Mapping):
+            return False
+        return any(
+            kubernetes_scope_requires(context_config)
+            for context_config in context_configs.values())
+
+    if kubernetes_scope_requires(
+            config.get_nested(('kubernetes',), default_value={})):
+        return True
+    workspaces = config.get_nested(('workspaces',), default_value={})
+    if not isinstance(workspaces, Mapping):
+        return False
+    return any(
+        isinstance(workspace_config, Mapping) and
+        kubernetes_scope_requires(workspace_config.get('kubernetes', {}))
+        for workspace_config in workspaces.values())
+
 
 # Hooks invoked at the end of `update_api_server_config_no_lock`, after the
 # new config has been persisted and reloaded in-process. Plugins use this to
@@ -1236,7 +1302,7 @@ def _get_effective_k8s_config_value(
         property_keys: list[tuple[str, ...]],
         region: str | None = None,
         workspace: str | None = None,
-        override_configs: dict[str, Any] | None = None) -> str | None:
+        override_configs: dict[str, Any] | None = None) -> Any | None:
     """Generic Kubernetes config-value resolver.
 
     Resolution precedence (most specific first):
@@ -1309,6 +1375,32 @@ def get_effective_queue_name(
                                            override_configs=override_configs)
 
 
+def get_effective_kueue_require_managed(
+        cloud: str,
+        region: str | None = None,
+        workspace: str | None = None,
+        override_configs: dict[str, Any] | None = None) -> bool:
+    """Whether Pods at this placement must be managed by Kueue.
+
+    The caller controls whether request-scoped overrides are eligible.  The
+    Kubernetes cloud intentionally omits them so this safety boundary remains
+    server-owned.  Any effective queue implies required management; the
+    explicit setting is an optional assertion, not a way to downgrade a queued
+    placement.
+    """
+    value = _get_effective_k8s_config_value(
+        cloud=cloud,
+        property_keys=_KUEUE_REQUIRE_MANAGED_KEYS,
+        region=region,
+        workspace=workspace,
+        override_configs=override_configs)
+    queue_name = get_effective_queue_name(cloud=cloud,
+                                          region=region,
+                                          workspace=workspace,
+                                          override_configs=override_configs)
+    return bool(value) or bool(queue_name)
+
+
 def get_effective_namespace(
         cloud: str,
         region: str | None = None,
@@ -1343,7 +1435,7 @@ def register_queue_name_key(key: tuple[str, ...]) -> None:
 
 @contextlib.contextmanager
 def remove_queue_name_from_config() -> Iterator[None]:
-    """Removes the local_queue_name from the config."""
+    """Disables Kueue queueing for SkyPilot system-controller launches."""
     config = to_dict()
 
     def update_to_none_if_set(keys: tuple[str, ...]) -> None:
@@ -1352,6 +1444,11 @@ def remove_queue_name_from_config() -> Iterator[None]:
                 logger.debug(f'removing local queue name: setting '
                              f'{keys + queue_key} to None')
                 config.set_nested(keys + queue_key, None)
+        for require_key in _KUEUE_REQUIRE_MANAGED_KEYS:
+            if config.get_nested(keys + require_key, None) is not None:
+                logger.debug(f'disabling required Kueue management: setting '
+                             f'{keys + require_key} to False')
+                config.set_nested(keys + require_key, False)
 
     def remove_from_context_configs(keys: tuple[str, ...]) -> None:
         for context_name, _ in config.get_nested((*keys, 'context_configs'),
@@ -1367,7 +1464,7 @@ def remove_queue_name_from_config() -> Iterator[None]:
         remove_from_context_configs(
             ('workspaces', workspace_name, 'kubernetes'))
     safe_config = _redact_container_image_config_for_logging(config)
-    logger.debug('config without local queue: '
+    logger.debug('config without Kueue queueing: '
                  f'{yaml_utils.dump_yaml_str(safe_config)}')
     with replace_skypilot_config(config):
         yield

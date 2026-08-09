@@ -1631,6 +1631,159 @@ def test_get_effective_queue_name_workspace_override(monkeypatch,
         override_configs=cloud_level_override) == 'override-queue'
 
 
+def test_get_effective_kueue_require_managed(monkeypatch, tmp_path) -> None:
+    """Required management follows workspace/context precedence."""
+    with open(tmp_path / 'required_kueue.yaml', 'w', encoding='utf-8') as f:
+        f.write("""\
+        kubernetes:
+            kueue:
+                require_managed: false
+            context_configs:
+                contextA:
+                    kueue:
+                        require_managed: true
+                contextB:
+                    kueue:
+                        local_queue_name: context-b-queue
+                        require_managed: false
+                contextC:
+                    kueue:
+                        local_queue_name: context-c-queue
+        workspaces:
+            workspaceA:
+                kubernetes:
+                    kueue:
+                        require_managed: true
+                    context_configs:
+                        contextA:
+                            kueue:
+                                require_managed: false
+        """)
+    monkeypatch.setattr(skypilot_config, '_GLOBAL_CONFIG_PATH',
+                        tmp_path / 'required_kueue.yaml')
+    skypilot_config.reload_config()
+
+    assert not skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes', workspace='default')
+    assert skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes', region='contextA', workspace='default')
+    # A queue cannot be downgraded by an omitted or false assertion flag.
+    assert skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes', region='contextB', workspace='default')
+    assert skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes', region='contextC', workspace='default')
+    assert skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes', workspace='workspaceA')
+    assert not skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes', region='contextA', workspace='workspaceA')
+    # The resolver supports overrides for non-placement callers.  The
+    # Kubernetes cloud deliberately does not pass request overrides here.
+    assert skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes',
+        workspace='default',
+        override_configs={'kubernetes': {
+            'kueue': {
+                'require_managed': True
+            }
+        }})
+
+
+def test_strict_kueue_server_strips_client_queue_overrides() -> None:
+    """A merged request cannot redirect a queue-only strict server."""
+    server_config = _make_config({
+        'kubernetes': {
+            'kueue': {
+                'local_queue_name': 'server-queue',
+            },
+            'context_configs': {
+                'research': {
+                    'quota': {
+                        'queue': 'server-research-queue',
+                    },
+                },
+            },
+        },
+    })
+    client_override = {
+        'kubernetes': {
+            'quota': {
+                'queue': 'client-queue',
+            },
+            'context_configs': {
+                'research': {
+                    'kueue': {
+                        'local_queue_name': 'client-research-queue',
+                    },
+                },
+            },
+        },
+    }
+
+    with skypilot_config.replace_skypilot_config_in_memory(server_config):
+        with skypilot_config.override_skypilot_config(client_override):
+            assert skypilot_config.get_effective_queue_name(
+                cloud='kubernetes') == 'server-queue'
+            assert skypilot_config.get_effective_queue_name(
+                cloud='kubernetes',
+                region='research') == 'server-research-queue'
+
+
+def test_workspace_context_strict_kueue_makes_server_queues_authoritative(
+) -> None:
+    """Strict policy in any server scope closes request queue overrides."""
+    server_config = _make_config({
+        'kubernetes': {
+            'kueue': {
+                'local_queue_name': 'server-default-queue',
+            },
+        },
+        'workspaces': {
+            'guarded': {
+                'kubernetes': {
+                    'context_configs': {
+                        'research': {
+                            'kueue': {
+                                'local_queue_name': 'server-research-queue',
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    })
+    client_override = {
+        'kubernetes': {
+            'quota': {
+                'queue': 'client-default-queue',
+            },
+        },
+    }
+
+    with skypilot_config.replace_skypilot_config_in_memory(server_config):
+        with skypilot_config.override_skypilot_config(client_override):
+            assert skypilot_config.get_effective_queue_name(
+                cloud='kubernetes') == 'server-default-queue'
+
+
+def test_queue_less_server_preserves_client_queue_override() -> None:
+    """A queue-less server preserves a legacy request-provided queue."""
+    server_config = _make_config({})
+    client_override = {
+        'kubernetes': {
+            'quota': {
+                'queue': 'client-queue',
+            },
+        },
+    }
+
+    with skypilot_config.replace_skypilot_config_in_memory(server_config):
+        with skypilot_config.override_skypilot_config(client_override):
+            assert skypilot_config.get_effective_queue_name(
+                cloud='kubernetes') == 'client-queue'
+            assert skypilot_config.get_effective_kueue_require_managed(
+                cloud='kubernetes', override_configs=client_override)
+
+
 def test_get_effective_namespace(monkeypatch, tmp_path) -> None:
     """Full precedence matrix across all four resolver layers."""
     with open(tmp_path / 'namespace.yaml', 'w', encoding='utf-8') as f:
@@ -1954,7 +2107,8 @@ class TestRemoveQueueNameFromConfig:
         cfg = _make_config({
             'kubernetes': {
                 'kueue': {
-                    'local_queue_name': 'root-q'
+                    'local_queue_name': 'root-q',
+                    'require_managed': True,
                 },
                 'quota': {
                     'queue': 'root-quota-q'
@@ -1962,7 +2116,8 @@ class TestRemoveQueueNameFromConfig:
                 'context_configs': {
                     'ctx1': {
                         'kueue': {
-                            'local_queue_name': 'ctx1-q'
+                            'local_queue_name': 'ctx1-q',
+                            'require_managed': True,
                         },
                         'quota': {
                             'queue': 'ctx1-quota-q'
@@ -1974,7 +2129,8 @@ class TestRemoveQueueNameFromConfig:
                 'ws1': {
                     'kubernetes': {
                         'kueue': {
-                            'local_queue_name': 'ws1-q'
+                            'local_queue_name': 'ws1-q',
+                            'require_managed': True,
                         },
                         'quota': {
                             'queue': 'ws1-quota-q'
@@ -1982,7 +2138,8 @@ class TestRemoveQueueNameFromConfig:
                         'context_configs': {
                             'ctx2': {
                                 'kueue': {
-                                    'local_queue_name': 'ws1-ctx2-q'
+                                    'local_queue_name': 'ws1-ctx2-q',
+                                    'require_managed': True,
                                 },
                                 'quota': {
                                     'queue': 'ws1-ctx2-quota-q'
@@ -2012,6 +2169,17 @@ class TestRemoveQueueNameFromConfig:
                 ]:
                     assert current.get_nested(
                         keys, 'NOT_SET') is None, (f'Expected None at {keys}')
+                for keys in [
+                    ('kubernetes', 'kueue', 'require_managed'),
+                    ('kubernetes', 'context_configs', 'ctx1', 'kueue',
+                     'require_managed'),
+                    ('workspaces', 'ws1', 'kubernetes', 'kueue',
+                     'require_managed'),
+                    ('workspaces', 'ws1', 'kubernetes', 'context_configs',
+                     'ctx2', 'kueue', 'require_managed'),
+                ]:
+                    assert current.get_nested(
+                        keys, 'NOT_SET') is False, (f'Expected False at {keys}')
 
     def test_noop_when_no_queue_name_set(self):
         """No error when queue name keys are absent."""

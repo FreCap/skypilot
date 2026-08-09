@@ -627,6 +627,11 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     # labels that do not exist on the server's Kubernetes infrastructure.
     ('kubernetes', 'autoscaler'),
     ('kubernetes', 'context_configs', '*', 'autoscaler'),
+    # Required Kueue management is an operator-owned admission boundary.  A
+    # remote client may request ordinary best-effort queueing, but it cannot
+    # enable or disable this fail-closed server policy.
+    ('kubernetes', 'kueue', 'require_managed'),
+    ('kubernetes', 'context_configs', '*', 'kueue', 'require_managed'),
     # TODO(kevin,tian): Override the whole controller config once our test
     # infrastructure supports setting dynamic server side configs.
     # Tests that are affected:
