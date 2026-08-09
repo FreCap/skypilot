@@ -635,6 +635,7 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
                 task['task_name'], job_id)
             if cluster_name is not None:
                 cluster_names.append(cluster_name)
+        cluster_names = list(dict.fromkeys(cluster_names))
 
         def _terminate_one(cluster_name: str) -> str | None:
             try:

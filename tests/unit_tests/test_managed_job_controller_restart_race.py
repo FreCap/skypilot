@@ -211,6 +211,49 @@ def test_terminal_decision_precedes_provider_cleanup_and_done(monkeypatch):
     assert order == ['terminalize', 'terminate:job-1', 'done']
 
 
+def test_cleanup_dedupes_duplicate_task_cluster_teardowns(monkeypatch):
+    """Duplicate snapshot rows must not fan out duplicate teardowns."""
+    set_failed_calls, job_done_calls = [], []
+    _wire_dead_controller(monkeypatch, set_failed_calls, job_done_calls)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+    info = _make_status_check_info()
+    info[1]['tasks'] = [{
+        'task_id': 0,
+        'status': managed_job_state.ManagedJobStatus.RUNNING,
+        'task_name': 'dup-task',
+        'submitted_at': 100.0,
+        'start_at': 110.0,
+        'last_recovered_at': 110.0,
+    }, {
+        'task_id': 0,
+        'status': managed_job_state.ManagedJobStatus.RUNNING,
+        'task_name': 'dup-task',
+        'submitted_at': 100.0,
+        'start_at': 110.0,
+        'last_recovered_at': 110.0,
+    }, {
+        'task_id': 1,
+        'status': managed_job_state.ManagedJobStatus.RUNNING,
+        'task_name': 'other-task',
+        'submitted_at': 101.0,
+        'start_at': 111.0,
+        'last_recovered_at': 111.0,
+    }]
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: info)
+    monkeypatch.setattr(utils, 'generate_managed_job_cluster_name',
+                        lambda task_name, job_id: f'{task_name}-{job_id}')
+    terminated_clusters = []
+    monkeypatch.setattr(utils, 'terminate_cluster', terminated_clusters.append)
+
+    utils.update_managed_jobs_statuses(job_ids=[1])
+
+    assert terminated_clusters == ['dup-task-1', 'other-task-1']
+    assert len(set_failed_calls) == 1
+    assert len(job_done_calls) == 1
+
+
 def test_cleanup_reports_every_failed_cluster_termination(monkeypatch, caplog):
     """All termination failures are attempted and reported after terminalizing.
 
