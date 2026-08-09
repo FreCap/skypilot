@@ -240,14 +240,20 @@ def _render_stopped_snapshot_logs(
                    f'{managed_job_state.get_failure_reason(job_id)}')
     log_file_ever_existed = False
     if filtered_task_id is not None:
-        terminal_task_row = managed_job_state.get_task_id_name_status_log(
+        lookup = managed_job_state.get_task_log_stream_lookup(
             job_id, filtered_task_id)
-        if terminal_task_row is None:
+        if lookup.snapshot.task_id is None:
             if num_tasks is None:
-                num_tasks = managed_job_state.get_num_tasks(job_id)
+                num_tasks = lookup.num_tasks
             assert task_filter is not None, filtered_task_id
             return _task_filter_not_found(job_id, task_filter, num_tasks)
-        terminal_task_info = [terminal_task_row]
+        terminal_task_info = [(
+            lookup.snapshot.task_id,
+            lookup.snapshot.task_name,
+            lookup.snapshot.status,
+            lookup.local_log_file,
+            lookup.logs_cleaned_at,
+        )]
     else:
         terminal_task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
             job_id)
@@ -458,10 +464,10 @@ def stream_logs_by_id(job_id: int,
     prefetched_snapshot: managed_job_state.JobLogStreamSnapshot | None = None
     if task is not None:
         if isinstance(task, int):
-            prefetched_snapshot = managed_job_state.get_task_log_stream_snapshot(
-                job_id, task)
+            lookup = managed_job_state.get_task_log_stream_lookup(job_id, task)
+            prefetched_snapshot = lookup.snapshot
+            num_tasks = lookup.num_tasks
             if prefetched_snapshot.task_id is None:
-                num_tasks = managed_job_state.get_num_tasks(job_id)
                 return _task_filter_not_found(job_id, task, num_tasks)
             filtered_task_id = task
         else:

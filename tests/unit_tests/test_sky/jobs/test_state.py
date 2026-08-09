@@ -995,6 +995,75 @@ def test_get_task_log_stream_snapshot_missing_task_is_one_query(
     assert counts['n'] == 1, counts
 
 
+def test_get_task_log_stream_lookup_reads_one_task_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine,
+                 job_id,
+                 2,
+                 status=ManagedJobStatus.RUNNING,
+                 local_log_file='/tmp/task-2.log',
+                 logs_cleaned_at=123.0)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.job_info_table).where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    pool='pool-a',
+                    current_cluster_name='replica-a',
+                    job_id_on_pool_cluster=41,
+                ))
+        session.commit()
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_task_log_stream_lookup(job_id, 2)
+
+    assert lookup == state.TaskLogStreamLookup(
+        snapshot=state.JobLogStreamSnapshot(2, ManagedJobStatus.RUNNING,
+                                            'pool-a', 'replica-a', 41,
+                                            'task-2'),
+        local_log_file='/tmp/task-2.log',
+        logs_cleaned_at=123.0,
+        num_tasks=1,
+    )
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_log_stream_lookup_missing_task_counts_existing_job(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 0, status=ManagedJobStatus.RUNNING)
+    _insert_task(engine, job_id, 1, status=ManagedJobStatus.SUCCEEDED)
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_task_log_stream_lookup(job_id, 999)
+
+    assert lookup == state.TaskLogStreamLookup(
+        snapshot=state.JobLogStreamSnapshot(None, None, None, None, None, None),
+        local_log_file=None,
+        logs_cleaned_at=None,
+        num_tasks=2,
+    )
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_log_stream_lookup_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_task_log_stream_lookup(999999, 1)
+
+    assert lookup == state.TaskLogStreamLookup(
+        snapshot=state.JobLogStreamSnapshot(None, None, None, None, None, None),
+        local_log_file=None,
+        logs_cleaned_at=None,
+        num_tasks=0,
+    )
+    assert counts['n'] == 1, counts
+
+
 def test_get_task_id_name_status_log_reads_one_task_row(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

@@ -638,9 +638,14 @@ class TestStreamLogsByIdLifecycle:
         succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
-        filtered_snapshot_read = mock.Mock(
-            return_value=managed_job_state.JobLogStreamSnapshot(
-                0, succeeded, None, None, None, 'first'))
+        lookup = managed_job_state.TaskLogStreamLookup(
+            snapshot=managed_job_state.JobLogStreamSnapshot(
+                0, succeeded, None, None, None, 'first'),
+            local_log_file=None,
+            logs_cleaned_at=None,
+            num_tasks=2,
+        )
+        lookup_read = mock.Mock(side_effect=[lookup, lookup])
 
         monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
         monkeypatch.setattr(jobs_utils.select, 'select',
@@ -655,13 +660,16 @@ class TestStreamLogsByIdLifecycle:
             ]))
         monkeypatch.setattr(
             managed_job_state, 'get_task_id_name_status_log',
-            mock.Mock(return_value=(0, 'first', succeeded, None, None)))
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
         monkeypatch.setattr(
             managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('scalar latest-task poll '
                                                  'used')))
-        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
-                            filtered_snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot poll used')))
         monkeypatch.setattr(
             managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('whole-job status poll used')))
@@ -681,7 +689,9 @@ class TestStreamLogsByIdLifecycle:
 
         assert 'terminal state SUCCEEDED' in message
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
-        filtered_snapshot_read.assert_called_once_with(42, 0)
+        assert lookup_read.call_args_list == [
+            mock.call(42, 0), mock.call(42, 0)
+        ]
         assert backend.tail_calls == 0
         assert backend.status_calls == 0
 
@@ -798,9 +808,15 @@ class TestStreamLogsByIdLifecycle:
         backend = _FakeBackend()
         running = managed_job_state.ManagedJobStatus.RUNNING
         succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        lookup_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, running, None, 'filtered-cluster', None, 'eval'),
+                local_log_file=None,
+                logs_cleaned_at=None,
+                num_tasks=2,
+            ))
         filtered_snapshot_read = mock.Mock(side_effect=[
-            managed_job_state.JobLogStreamSnapshot(
-                1, running, None, 'filtered-cluster', None, 'eval'),
             managed_job_state.JobLogStreamSnapshot(
                 1, running, None, 'filtered-cluster', None, 'eval'),
             managed_job_state.JobLogStreamSnapshot(
@@ -834,6 +850,8 @@ class TestStreamLogsByIdLifecycle:
             managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('scalar latest-task poll '
                                                  'used')))
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
                             filtered_snapshot_read)
         monkeypatch.setattr(managed_job_state, 'is_batch_job',
@@ -856,8 +874,8 @@ class TestStreamLogsByIdLifecycle:
 
         assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        lookup_read.assert_called_once_with(42, 1)
         assert filtered_snapshot_read.call_args_list == [
-            mock.call(42, 1),
             mock.call(42, 1),
             mock.call(42, 1),
         ]
@@ -934,14 +952,19 @@ class TestStreamLogsByIdLifecycle:
         log_path.write_text('waiting\n')
         initial_rows = [(1, 'eval', managed_job_state.ManagedJobStatus.RUNNING,
                          '', None)]
-        terminal_rows = [(1, 'eval',
-                          managed_job_state.ManagedJobStatus.SUCCEEDED,
-                          str(log_path), None)]
         status_read = mock.Mock(
             side_effect=AssertionError('scalar status poll used'))
         get_num_tasks = mock.Mock(return_value=1)
         task_info_read = mock.Mock(return_value=initial_rows)
-        task_row_read = mock.Mock(return_value=terminal_rows[0])
+        lookup_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
+                    None, 'eval'),
+                local_log_file=str(log_path),
+                logs_cleaned_at=None,
+                num_tasks=1,
+            ))
         sleep = mock.Mock()
         snapshot_read = mock.Mock(
             return_value=managed_job_state.JobLogStreamSnapshot(
@@ -957,12 +980,15 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(managed_job_state,
                             'get_all_task_ids_names_statuses_logs',
                             task_info_read)
-        monkeypatch.setattr(managed_job_state, 'get_task_id_name_status_log',
-                            task_row_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
         monkeypatch.setattr(managed_job_state, 'get_status', status_read)
         monkeypatch.setattr(
             managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('whole-job status poll used')))
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
                             snapshot_read)
         monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
@@ -977,7 +1003,7 @@ class TestStreamLogsByIdLifecycle:
         status_read.assert_not_called()
         snapshot_read.assert_called_once_with(42, 1)
         task_info_read.assert_called_once_with(42)
-        task_row_read.assert_called_once_with(42, 1)
+        lookup_read.assert_called_once_with(42, 1)
         sleep.assert_not_called()
 
     def test_terminal_task_id_filter_skips_whole_task_scan(
@@ -986,13 +1012,15 @@ class TestStreamLogsByIdLifecycle:
         status_display.__enter__.return_value = status_display
         log_path = tmp_path / 'task.log'
         log_path.write_text('waiting\n')
-        task_row = (1, 'eval', managed_job_state.ManagedJobStatus.SUCCEEDED,
-                    str(log_path), None)
-        task_row_read = mock.Mock(return_value=task_row)
-        snapshot_read = mock.Mock(
-            return_value=managed_job_state.JobLogStreamSnapshot(
+        lookup = managed_job_state.TaskLogStreamLookup(
+            snapshot=managed_job_state.JobLogStreamSnapshot(
                 1, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
-                None, 'eval'))
+                None, 'eval'),
+            local_log_file=str(log_path),
+            logs_cleaned_at=None,
+            num_tasks=1,
+        )
+        lookup_read = mock.Mock(side_effect=[lookup, lookup])
         sleep = mock.Mock()
 
         monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
@@ -1007,16 +1035,20 @@ class TestStreamLogsByIdLifecycle:
             managed_job_state, 'get_num_tasks',
             mock.Mock(side_effect=AssertionError(
                 'count query used on found task-id filter')))
-        monkeypatch.setattr(managed_job_state, 'get_task_id_name_status_log',
-                            task_row_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
         monkeypatch.setattr(
             managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('scalar status poll used')))
         monkeypatch.setattr(
             managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('whole-job status poll used')))
-        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
-                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot poll used')))
         monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
@@ -1025,19 +1057,32 @@ class TestStreamLogsByIdLifecycle:
 
         assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
-        task_row_read.assert_called_once_with(42, 1)
-        snapshot_read.assert_called_once_with(42, 1)
+        assert lookup_read.call_args_list == [
+            mock.call(42, 1), mock.call(42, 1)
+        ]
         sleep.assert_not_called()
 
     def test_terminal_task_id_filter_preserves_missing_job(self, monkeypatch):
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
-        task_row_read = mock.Mock(return_value=None)
         count_read = mock.Mock(return_value=0)
-        snapshot_read = mock.Mock(
-            return_value=managed_job_state.JobLogStreamSnapshot(
-                1, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
-                None, 'eval'))
+        lookup_read = mock.Mock(side_effect=[
+            managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
+                    None, 'eval'),
+                local_log_file=None,
+                logs_cleaned_at=None,
+                num_tasks=1,
+            ),
+            managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    None, None, None, None, None, None),
+                local_log_file=None,
+                logs_cleaned_at=None,
+                num_tasks=0,
+            ),
+        ])
         sleep = mock.Mock()
 
         monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
@@ -1049,27 +1094,32 @@ class TestStreamLogsByIdLifecycle:
             managed_job_state, 'get_all_task_ids_names_statuses_logs',
             mock.Mock(side_effect=AssertionError('whole-task scan used')))
         monkeypatch.setattr(managed_job_state, 'get_num_tasks', count_read)
-        monkeypatch.setattr(managed_job_state, 'get_task_id_name_status_log',
-                            task_row_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
         monkeypatch.setattr(
             managed_job_state, 'get_status',
             mock.Mock(side_effect=AssertionError('scalar status poll used')))
         monkeypatch.setattr(
             managed_job_state, 'get_latest_task_id_status',
             mock.Mock(side_effect=AssertionError('whole-job status poll used')))
-        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
-                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot poll used')))
         monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
                                                           follow=False,
                                                           task=1)
 
-        assert message == 'Job 42 not found.'
+        assert message == 'No task found matching 1 in job 42. Valid task IDs are 0.'
         assert exit_code == exceptions.JobExitCode.NOT_FOUND
-        task_row_read.assert_called_once_with(42, 1)
-        count_read.assert_called_once_with(42)
-        snapshot_read.assert_called_once_with(42, 1)
+        assert lookup_read.call_args_list == [
+            mock.call(42, 1), mock.call(42, 1)
+        ]
+        count_read.assert_not_called()
         sleep.assert_not_called()
 
     def test_terminal_task_filter_refreshes_snapshot_after_wait(
@@ -1080,14 +1130,19 @@ class TestStreamLogsByIdLifecycle:
         log_path.write_text('waiting\n')
         initial_rows = [(1, 'eval', managed_job_state.ManagedJobStatus.RUNNING,
                          '', None)]
-        terminal_rows = [(1, 'eval',
-                          managed_job_state.ManagedJobStatus.SUCCEEDED,
-                          str(log_path), None)]
         status_read = mock.Mock(
             side_effect=AssertionError('scalar status poll used'))
         get_num_tasks = mock.Mock(return_value=1)
         task_info_read = mock.Mock(return_value=initial_rows)
-        task_row_read = mock.Mock(return_value=terminal_rows[0])
+        lookup_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
+                    None, 'eval'),
+                local_log_file=str(log_path),
+                logs_cleaned_at=None,
+                num_tasks=1,
+            ))
         sleep = mock.Mock()
 
         monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
@@ -1099,8 +1154,9 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(managed_job_state,
                             'get_all_task_ids_names_statuses_logs',
                             task_info_read)
-        monkeypatch.setattr(managed_job_state, 'get_task_id_name_status_log',
-                            task_row_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_id_name_status_log',
+            mock.Mock(side_effect=AssertionError('task row lookup used')))
         monkeypatch.setattr(managed_job_state, 'get_status', status_read)
         monkeypatch.setattr(
             managed_job_state, 'get_latest_task_id_status',
@@ -1114,6 +1170,8 @@ class TestStreamLogsByIdLifecycle:
         ])
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
                             snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_read)
         monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
 
         message, exit_code = jobs_utils.stream_logs_by_id(42,
@@ -1125,7 +1183,7 @@ class TestStreamLogsByIdLifecycle:
         get_num_tasks.assert_not_called()
         status_read.assert_not_called()
         task_info_read.assert_called_once_with(42)
-        task_row_read.assert_called_once_with(42, 1)
+        lookup_read.assert_called_once_with(42, 1)
         assert snapshot_read.call_args_list == [
             mock.call(42, 1), mock.call(42, 1)
         ]
