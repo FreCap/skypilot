@@ -562,6 +562,36 @@ def test_get_clusters_cluster_name_filter_chunks_large_input(
         for _, parameters in cluster_selects) == 2
 
 
+def test_get_clusters_cluster_name_filter_dedupes_cross_chunk_duplicates(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
+    for launched_at, name in enumerate(['c-0', 'c-1', 'c-2'], start=10):
+        _add_cluster(name, ready=True)
+        _set_cluster_launched_at(name, launched_at)
+
+    engine = global_user_state._db_manager.get_engine()
+    cluster_selects = []
+
+    @event.listens_for(engine, 'before_cursor_execute')
+    def _count_cluster_selects(_conn, _cursor, statement, parameters, *_args):
+        if ('FROM clusters LEFT OUTER JOIN users' in statement and
+                statement.lstrip().upper().startswith('SELECT')):
+            cluster_selects.append((statement, parameters))
+
+    try:
+        records = global_user_state.get_clusters(
+            cluster_names=['c-0', 'c-1', 'c-0', 'c-2'], summary_response=True)
+    finally:
+        event.remove(engine, 'before_cursor_execute', _count_cluster_selects)
+
+    assert [record['name'] for record in records] == ['c-2', 'c-1', 'c-0']
+    assert len(cluster_selects) == 2
+    assert max(
+        len(parameters) if isinstance(parameters, tuple) else len(parameters[0])
+        for _, parameters in cluster_selects) == 2
+
+
 def test_get_clusters_cluster_name_filter_small_input_uses_one_select(
         tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
