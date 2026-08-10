@@ -177,7 +177,7 @@ class TestGetJobsToCheckStatusInfo:
                                                  monkeypatch):
         pipeline_id = _seed_multi_task_job['pipeline_job_id']
         monkeypatch.setattr(
-            state, '_get_all_task_ids_statuses', lambda _job_id:
+            state, 'get_all_task_ids_statuses', lambda _job_id:
             (_ for _ in ()).throw(
                 AssertionError('status rows materialized for task count')))
         select_count = 0
