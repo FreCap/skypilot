@@ -1187,8 +1187,7 @@ class TestStreamLogsByIdTaskFiltering:
         # Should NOT return NOT_FOUND since task_id=1 exists
         assert exit_code != exceptions.JobExitCode.NOT_FOUND
         assert 'No task found matching' not in msg
-        lookup_read.assert_has_calls(
-            [mock.call(job_id, 1), mock.call(job_id, 1)])
+        lookup_read.assert_called_once_with(job_id, 1)
 
     def test_task_filter_by_str_matches_task_name(self, monkeypatch):
         """Test that str task filter matches against task_name."""
@@ -1241,7 +1240,7 @@ class TestStreamLogsByIdTaskFiltering:
         assert 'No task found matching' not in msg
         snapshot_read.assert_not_called()
         lookup_read.assert_called_once_with(job_id, 'eval')
-        terminal_lookup_read.assert_called_once_with(job_id, 1)
+        terminal_lookup_read.assert_not_called()
 
     def test_task_filter_int_not_found(self, monkeypatch):
         """Test that int task filter returns NOT_FOUND when task_id doesn't exist."""
