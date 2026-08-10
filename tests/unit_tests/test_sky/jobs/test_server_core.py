@@ -30,6 +30,12 @@ def cancellation_gateway():
             mock.patch.object(jobs_core.backend_utils,
                               'is_controller_accessible',
                               return_value=handle))
+        get_backend = stack.enter_context(
+            mock.patch.object(
+                jobs_core.backend_utils,
+                'get_backend_from_handle',
+                side_effect=AssertionError(
+                    'cancel transport must not look up a backend')))
         invoke = stack.enter_context(
             mock.patch.object(jobs_core.backend_utils,
                               'invoke_skylet_with_retries',
@@ -51,6 +57,7 @@ def cancellation_gateway():
             channel=channel,
             client=client,
             accessible=accessible,
+            get_backend=get_backend,
             invoke=invoke,
             skylet_client=skylet_client,
         )
