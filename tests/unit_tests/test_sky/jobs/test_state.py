@@ -413,7 +413,7 @@ def test_get_latest_task_id_status_uses_one_latest_row(
     _insert_task(engine, 2, 1, status=ManagedJobStatus.FAILED)
 
     monkeypatch.setattr(
-        state, '_get_all_task_ids_statuses', lambda *_args, **_kwargs:
+        state, 'get_all_task_ids_statuses', lambda *_args, **_kwargs:
         (_ for _ in
          ()).throw(AssertionError('full task snapshot must not run')))
 
@@ -1189,6 +1189,23 @@ def test_get_task_id_name_status_log_missing_task_is_one_query(
         row = state.get_task_id_name_status_log(job_id, 999)
 
     assert row is None
+    assert counts['n'] == 1, counts
+
+
+def test_get_all_task_ids_statuses_reads_one_ordered_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 2, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, job_id, 0, status=ManagedJobStatus.RUNNING)
+
+    with _count_sql_statements(engine) as counts:
+        rows = state.get_all_task_ids_statuses(job_id)
+
+    assert rows == [
+        (0, ManagedJobStatus.RUNNING),
+        (2, ManagedJobStatus.SUCCEEDED),
+    ]
     assert counts['n'] == 1, counts
 
 

@@ -1524,25 +1524,33 @@ def wait(name: str | None,
                 time.monotonic() >= deadline):
             break
 
-        records, _, _, _ = queue_v2_api(refresh=False, job_ids=[job_id])
-        if not records:
-            with ux_utils.print_exception_no_traceback():
-                raise ValueError(f'Managed job {job_id} not found.')
-
-        # Filter to the requested task if specified.
-        if task is not None:
-            if isinstance(task, int):
-                filtered = [r for r in records if r.task_id == task]
-            else:
-                filtered = [r for r in records if r.task_name == task]
-            if not filtered:
+        if task is None:
+            task_statuses = managed_job_state.get_all_task_ids_statuses(job_id)
+            if not task_statuses:
                 with ux_utils.print_exception_no_traceback():
+                    raise ValueError(f'Managed job {job_id} not found.')
+            statuses = [status for _, status in task_statuses]
+        elif isinstance(task, int):
+            lookup = managed_job_state.get_task_log_stream_lookup(job_id, task)
+            if lookup.snapshot.task_id is None:
+                with ux_utils.print_exception_no_traceback():
+                    if lookup.num_tasks == 0:
+                        raise ValueError(f'Managed job {job_id} not found.')
                     raise ValueError(
                         f'No task matching {task!r} in job {job_id}.')
-            records = filtered
+            statuses = [lookup.snapshot.status]
+        else:
+            lookup = managed_job_state.get_task_log_stream_lookup_by_name(
+                job_id, task)
+            if lookup.snapshot.task_id is None:
+                with ux_utils.print_exception_no_traceback():
+                    if lookup.num_tasks == 0:
+                        raise ValueError(f'Managed job {job_id} not found.')
+                    raise ValueError(
+                        f'No task matching {task!r} in job {job_id}.')
+            statuses = [lookup.snapshot.status]
 
         # Check if all relevant tasks are terminal.
-        statuses = [r.status for r in records]
         if all(s is not None and s.is_terminal() for s in statuses):
             # Return the worst exit code across tasks: any failure dominates.
             worst = exceptions.JobExitCode.SUCCEEDED

@@ -698,8 +698,10 @@ def get_jobs_to_check_status(job_ids: list[int] | None = None) -> list[int]:
         return [row[0] for row in rows if row[0] is not None]
 
 
-def _get_all_task_ids_statuses(
+@db_retries.retry
+def get_all_task_ids_statuses(
         job_id: int) -> list[tuple[int, ManagedJobStatus]]:
+    """Return all task statuses for one job in task_id order."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         id_statuses = session.execute(
