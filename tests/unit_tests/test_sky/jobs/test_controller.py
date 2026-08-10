@@ -3075,6 +3075,80 @@ class TestCancelSignalScan:
         assert 7 not in manager._cancel_info
 
     @pytest.mark.asyncio
+    async def test_signal_read_failure_keeps_file_for_retry(self, signal_dir):
+        manager = self._make_manager()
+        task = MagicMock()
+        manager.job_tasks[7] = task
+        (signal_dir / '7').write_text('', encoding='utf-8')
+
+        async def fail_read(*_args, **_kwargs):
+            raise OSError('transient read failure')
+
+        with patch.object(controller_lib.anyio.Path,
+                          'read_text',
+                          side_effect=fail_read):
+            await manager._process_cancel_signals()
+
+        task.cancel.assert_not_called()
+        assert (signal_dir / '7').exists()
+        assert 7 not in manager._cancel_info
+
+    @pytest.mark.asyncio
+    async def test_signal_read_failure_retries_on_next_scan(self, signal_dir):
+        manager = self._make_manager()
+        task = MagicMock()
+        manager.job_tasks[7] = task
+        (signal_dir / '7').write_text('', encoding='utf-8')
+
+        read_attempts = 0
+
+        async def flaky_read(*_args, **_kwargs):
+            nonlocal read_attempts
+            read_attempts += 1
+            if read_attempts == 1:
+                raise OSError('transient read failure')
+            return ''
+
+        with patch.object(controller_lib.anyio.Path,
+                          'read_text',
+                          side_effect=flaky_read):
+            await manager._process_cancel_signals()
+            task.cancel.assert_not_called()
+            assert (signal_dir / '7').exists()
+
+            await manager._process_cancel_signals()
+
+        assert read_attempts == 2
+        task.cancel.assert_called_once_with()
+        assert not (signal_dir / '7').exists()
+        assert manager._cancel_info[7] == (False, None)
+
+    @pytest.mark.asyncio
+    async def test_successful_signal_consume_uses_one_read_and_one_unlink(
+            self, signal_dir):
+        (signal_dir / '7').write_text('', encoding='utf-8')
+        call_counts = {'read': 0, 'unlink': 0}
+        original_read = controller_lib.anyio.Path.read_text
+        original_unlink = controller_lib.anyio.Path.unlink
+
+        async def count_read(path_obj, *args, **kwargs):
+            call_counts['read'] += 1
+            return await original_read(path_obj, *args, **kwargs)
+
+        async def count_unlink(path_obj, *args, **kwargs):
+            call_counts['unlink'] += 1
+            return await original_unlink(path_obj, *args, **kwargs)
+
+        with patch.object(controller_lib.anyio.Path, 'read_text',
+                          count_read), patch.object(controller_lib.anyio.Path,
+                                                    'unlink', count_unlink):
+            content = await ControllerManager._consume_signal_file(7)
+
+        assert content == ''
+        assert call_counts == {'read': 1, 'unlink': 1}
+        assert not (signal_dir / '7').exists()
+
+    @pytest.mark.asyncio
     async def test_cancel_loop_survives_scan_failure(self):
         """One failed scan must not unwind the cancel loop.
 

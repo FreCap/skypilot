@@ -2914,17 +2914,18 @@ class ControllerManager:
                                    str(job_id))
         async with filelock.AsyncFileLock(f'{signal_path}.lock'):
             try:
-                return (await anyio.Path(signal_path).read_text(encoding='utf-8'
-                                                               )).strip()
+                content = (await
+                           anyio.Path(signal_path).read_text(encoding='utf-8'
+                                                            )).strip()
             except FileNotFoundError:
                 return None
             except Exception as e:  # pylint: disable=broad-except
                 logger.debug('Problem occurred when reading '
                              f'{signal_path}: '
                              f'{common_utils.format_exception(e)}')
-                return ''
-            finally:
-                await anyio.Path(signal_path).unlink(missing_ok=True)
+                return None
+            await anyio.Path(signal_path).unlink(missing_ok=True)
+            return content
 
     @staticmethod
     @asyncio_utils.shield
