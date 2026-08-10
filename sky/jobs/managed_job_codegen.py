@@ -4,7 +4,6 @@ import shlex
 import textwrap
 import typing
 
-from sky import skypilot_config
 from sky.backends import backend_utils
 from sky.dag import DEFAULT_EXECUTION
 from sky.skylet import constants
@@ -149,80 +148,6 @@ class ManagedJobCodeGen:
                                 submitted_before={submitted_before!r})
         print(job_table, flush=True)
         """)
-        return cls._build(code)
-
-    @classmethod
-    def cancel_managed_jobs(
-        cls,
-        *,
-        name: str | None = None,
-        job_ids: list[int] | None = None,
-        pool: str | None = None,
-        all: bool = False,  # pylint: disable=redefined-builtin
-        all_users: bool = False,
-        graceful: bool = False,
-        graceful_timeout: int | None = None,
-    ) -> str:
-        """Unified cancel codegen.
-
-        Legacy codegen remains available for selector-only cancellation. Any
-        graceful cancellation request is intentionally modern-only: the legacy
-        path raises instead of silently dropping graceful fields on older
-        controllers.
-        """
-        active_workspace = skypilot_config.get_active_workspace()
-
-        if graceful or graceful_timeout is not None:
-            legacy_block = textwrap.indent(
-                textwrap.dedent("""\
-                raise RuntimeError(
-                    'Graceful managed job cancellation requires a jobs '
-                    'controller with the gRPC `cancel_managed_jobs` endpoint. '
-                    'Please upgrade the jobs controller and retry.')
-            """).rstrip(), '    ')
-        elif all_users or all or job_ids:
-            legacy_call_lines = [
-                'if managed_job_version < 2:',
-                f'    msg = utils.cancel_jobs_by_id({job_ids!r})',
-                'elif managed_job_version < 4:',
-                f'    msg = utils.cancel_jobs_by_id({job_ids!r}, '
-                f'all_users={all_users!r})',
-                'else:',
-                f'    msg = utils.cancel_jobs_by_id({job_ids!r}, '
-                f'all_users={all_users!r}, '
-                f'current_workspace={active_workspace!r})',
-            ]
-            legacy_block = '\n'.join(
-                f'    {line}' for line in legacy_call_lines)
-        elif name is not None:
-            legacy_call_lines = [
-                'if managed_job_version < 4:',
-                f'    msg = utils.cancel_job_by_name({name!r})',
-                'else:',
-                f'    msg = utils.cancel_job_by_name({name!r}, '
-                f'{active_workspace!r})',
-            ]
-            legacy_block = '\n'.join(
-                f'    {line}' for line in legacy_call_lines)
-        else:
-            assert pool is not None, (job_ids, name, pool, all)
-            legacy_block = (f'    msg = utils.cancel_jobs_by_pool({pool!r}, '
-                            f'{active_workspace!r})')
-
-        code = (f'if managed_job_version < 19:\n'
-                f'{legacy_block}\n'
-                f'else:\n'
-                f'    msg = utils.cancel_managed_jobs(\n'
-                f'        name={name!r},\n'
-                f'        job_ids={job_ids!r},\n'
-                f'        pool={pool!r},\n'
-                f'        all={all!r},\n'
-                f'        all_users={all_users!r},\n'
-                f'        graceful={graceful!r},\n'
-                f'        graceful_timeout={graceful_timeout!r},\n'
-                f'        current_workspace={active_workspace!r},\n'
-                f'    )\n'
-                f'print(msg, end="", flush=True)\n')
         return cls._build(code)
 
     @classmethod

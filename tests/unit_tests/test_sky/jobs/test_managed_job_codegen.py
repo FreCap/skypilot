@@ -63,20 +63,6 @@ _CODEGEN_CASES = [
         'submitted_after': 1.25,
         'submitted_before': 9.5,
     }, '9c9a68ee14ab4fff5259b607951684e6cf1ef3f1b305e5e96ed66baaf97c8861'),
-    ('cancel_managed_jobs', (), {
-        'job_ids': [1, 2],
-        'all_users': True,
-        'graceful': True,
-        'graceful_timeout': 30,
-    }, '8cfb362c5db217363fbd71e9a1f211d99bf1d7ca4ad21f427f0cee3bf68d2afc'),
-    ('cancel_managed_jobs', (), {
-        'name': 'job name',
-        'graceful': True,
-        'graceful_timeout': 12,
-    }, 'da6f0d0b3d25cd407448dc9ec0cfd5050bee084cbfffe141b9e8a2c44b8d2743'),
-    ('cancel_managed_jobs', (), {
-        'pool': 'pool A',
-    }, 'ec34494a27b122a5b7b25e41afa9d804792eebc50b2ab22348f98c15b46d2cce'),
     ('get_version_and_job_table', (), {},
      '5bd3151698eb24547aaa0f106609fd00fe5361d8919b179a31138df79ab508a5'),
     ('get_version', (), {},
@@ -129,15 +115,19 @@ def test_set_pending_codegen_output_is_stable() -> None:
     compile(_extract_generated_python(command), '<managed-job-code>', 'exec')
 
 
-def test_cancel_codegen_legacy_graceful_guard_is_embedded() -> None:
-    command = managed_job_utils.ManagedJobCodeGen.cancel_managed_jobs(
-        name='job name', graceful=True, graceful_timeout=12)
-    code = _extract_generated_python(command)
+def test_cancel_has_no_codegen_transport() -> None:
+    """Cancellation is gRPC-only; no codegen may resurrect a second path.
 
-    assert 'if managed_job_version < 19:' in code
-    assert 'raise RuntimeError(' in code
-    assert '`cancel_managed_jobs` endpoint.' in code
-    assert 'Please upgrade the jobs controller and retry.' in code
+    ``sky.jobs.server.cancellation`` speaks the skylet ``CancelJobs`` RPC
+    directly, so the selector dispatch lives only in the servicer. A codegen
+    entry point here would reintroduce a second dispatch that can drift.
+    """
+    assert not hasattr(managed_job_utils.ManagedJobCodeGen,
+                       'cancel_managed_jobs')
+    assert not hasattr(managed_job_codegen.ManagedJobCodeGen,
+                       'cancel_managed_jobs')
+    # The on-controller dispatcher existed only to be named by that codegen.
+    assert not hasattr(managed_job_utils, 'cancel_managed_jobs')
 
 
 def test_managed_job_codegen_facade_contract() -> None:

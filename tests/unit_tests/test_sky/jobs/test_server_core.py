@@ -9,6 +9,7 @@ import pytest
 
 from sky import backends
 from sky import exceptions
+from sky.jobs import runner as managed_job_runner
 from sky.jobs.server import cancellation as jobs_cancellation
 from sky.jobs.server import core as jobs_core
 from sky.usage import usage_lib
@@ -61,6 +62,20 @@ def cancellation_gateway():
             invoke=invoke,
             skylet_client=skylet_client,
         )
+
+
+def test_cancel_is_not_a_runner_operation():
+    """Cancel bypasses the runner strategy, so neither may advertise it.
+
+    A ``cancel_managed_jobs`` hook on either the protocol or the default
+    runner would be dead weight that a plugin could implement and silently
+    never have called.
+    """
+    assert not hasattr(managed_job_runner.ManagedJobRunner,
+                       'cancel_managed_jobs')
+    assert not hasattr(
+        jobs_core._DefaultManagedJobRunner,  # pylint: disable=protected-access
+        'cancel_managed_jobs')
 
 
 def test_cancel_grpc_projects_job_ids_and_graceful_fields(cancellation_gateway):
