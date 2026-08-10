@@ -428,7 +428,7 @@ def test_get_cluster_from_name_with_user_info_uses_joined_user_projection(
 def test_get_cluster_from_name_current_user_fallback_uses_bounded_queries(
         tmp_path, monkeypatch):
     """Legacy NULL user_hash rows must still map to the current user without
-    reintroducing unbounded extra lookups."""
+    reintroducing an extra fallback SELECT."""
     _fresh_db(tmp_path, monkeypatch)
     global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
     _add_cluster('legacy-null-user', ready=True)
@@ -455,7 +455,7 @@ def test_get_cluster_from_name_current_user_fallback_uses_bounded_queries(
     assert record is not None
     assert record['user_hash'] == 'user-a'
     assert record['user_name'] == 'Alice'
-    assert len(select_statements) == 2
+    assert len(select_statements) == 1
 
 
 def test_get_clusters_from_names_batches_user_info_once_per_cluster_snapshot(
@@ -527,7 +527,7 @@ def test_get_clusters_current_user_filter_includes_legacy_null_user_hash(
         record for record in records if record['name'] == 'legacy-null-user')
     assert legacy_record['user_hash'] == 'user-a'
     assert legacy_record['user_name'] == 'Alice'
-    assert len(select_statements) == 2
+    assert len(select_statements) == 1
 
 
 def test_get_clusters_cluster_name_filter_chunks_large_input(
@@ -559,7 +559,7 @@ def test_get_clusters_cluster_name_filter_chunks_large_input(
     assert len(cluster_selects) == 3
     assert max(
         len(parameters) if isinstance(parameters, tuple) else len(parameters[0])
-        for _, parameters in cluster_selects) == 2
+        for _, parameters in cluster_selects) == 3
 
 
 def test_get_clusters_cluster_name_filter_dedupes_cross_chunk_duplicates(
@@ -589,7 +589,7 @@ def test_get_clusters_cluster_name_filter_dedupes_cross_chunk_duplicates(
     assert len(cluster_selects) == 2
     assert max(
         len(parameters) if isinstance(parameters, tuple) else len(parameters[0])
-        for _, parameters in cluster_selects) == 2
+        for _, parameters in cluster_selects) == 3
 
 
 def test_get_clusters_cluster_name_filter_small_input_uses_one_select(

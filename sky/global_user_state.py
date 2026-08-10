@@ -2193,6 +2193,12 @@ def _load_storage_mounts_metadata(
     return pickle.loads(record_storage_mounts_metadata)
 
 
+def _cluster_user_join_key(current_user_hash: str) -> sqlalchemy.ColumnElement:
+    """Resolve legacy NULL user rows to the current user inside the join."""
+    return sqlalchemy.func.coalesce(cluster_table.c.user_hash,
+                                    sqlalchemy.literal(current_user_hash))
+
+
 @db_retries.retry
 @metrics_lib.time_me
 @context_utils.cancellation_guard
@@ -2221,7 +2227,9 @@ def get_cluster_from_name(
         cluster_table.c.is_managed,
     ]
     joined_user_name_label = 'joined_user_name'
+    current_user_hash = ''
     if include_user_info:
+        current_user_hash = common_utils.get_user_hash()
         query_fields.append(user_table.c.name.label(joined_user_name_label))
     if not summary_response:
         query_fields.extend([
@@ -2232,19 +2240,17 @@ def get_cluster_from_name(
         query = session.query(*query_fields)
         if include_user_info:
             query = query.outerjoin(
-                user_table, cluster_table.c.user_hash == user_table.c.id)
+                user_table,
+                _cluster_user_join_key(current_user_hash) == user_table.c.id)
         row = query.filter(cluster_table.c.name == cluster_name).first()
         if row is None:
             return None
         user_hash = None
         user_name = None
         if include_user_info:
-            user_hash = _get_user_hash_or_current_user(row.user_hash)
-            if row.user_hash is None:
-                user = get_user(user_hash, session=session)
-                user_name = user.name if user is not None else None
-            else:
-                user_name = getattr(row, joined_user_name_label)
+            user_hash = (row.user_hash
+                         if row.user_hash is not None else current_user_hash)
+            user_name = getattr(row, joined_user_name_label)
     last_event = None
     if not summary_response:
         last_event = get_terminal_or_last_status_change_event(row.cluster_hash)
@@ -2647,7 +2653,8 @@ def get_clusters(
         query_fields.append(cluster_table.c.is_managed)
     with orm.Session(engine) as session:
         query = session.query(*query_fields).outerjoin(
-            user_table, cluster_table.c.user_hash == user_table.c.id)
+            user_table,
+            _cluster_user_join_key(current_user_hash) == user_table.c.id)
         if exclude_managed_clusters:
             query = query.filter(cluster_table.c.is_managed == int(False))
         if workspaces_filter is not None:
@@ -2679,15 +2686,6 @@ def get_clusters(
                 rows.extend(query.filter(cluster_table.c.name.in_(batch)).all())
             rows.sort(key=lambda row: row.launched_at, reverse=True)
     records = []
-
-    # Check if we need to fetch the current user's name,
-    # for backwards compatibility, if user_hash is None.
-    current_user_name = None
-    needs_current_user = any(row.user_hash is None for row in rows)
-    if needs_current_user:
-        current_user = get_user(current_user_hash)
-        current_user_name = (current_user.name
-                             if current_user is not None else None)
 
     # Hoisted: needed by both the new launch-progress fill (any response)
     # and the existing last_event fill (summary_response=False only).
@@ -2735,8 +2733,7 @@ def get_clusters(
             'cluster_ever_up': bool(row.cluster_ever_up),
             'user_hash': (row.user_hash
                           if row.user_hash is not None else current_user_hash),
-            'user_name': (row.user_name
-                          if row.user_name is not None else current_user_name),
+            'user_name': row.user_name,
             'workspace': row.workspace,
             'is_managed': False
                           if exclude_managed_clusters else bool(row.is_managed),
