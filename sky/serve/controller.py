@@ -583,6 +583,16 @@ class SkyServeController:
                 'as controller-applied under the current ownership fence.')
         self._acknowledge_pending_placement_normalization(service_spec, version)
 
+    def _ensure_lb_role_snapshot_read_executor(
+            self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the reusable role-snapshot read pool, creating it lazily."""
+        executor = getattr(self, '_lb_role_snapshot_read_executor', None)
+        if executor is None:
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix='skyserve-ha-role-snapshot')
+            self._lb_role_snapshot_read_executor = executor
+        return executor
+
     @contextlib.asynccontextmanager
     async def lifespan(self, _: fastapi.FastAPI):
         uvicorn_access_logger = logging.getLogger('uvicorn.access')
@@ -593,8 +603,10 @@ class SkyServeController:
             yield
         finally:
             self._lb_role_executor.shutdown(wait=False, cancel_futures=True)
-            self._lb_role_snapshot_read_executor.shutdown(wait=False,
-                                                          cancel_futures=True)
+            snapshot_executor = getattr(self, '_lb_role_snapshot_read_executor',
+                                        None)
+            if snapshot_executor is not None:
+                snapshot_executor.shutdown(wait=False, cancel_futures=True)
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
@@ -2100,9 +2112,11 @@ class SkyServeController:
                     timings['kubernetes_role_snapshot_executor_queue'] = max(
                         0.0,
                         time.monotonic() - submitted_at)
-                    return lb_k8s.get_lb_role_snapshot(
-                        self._service_name, fence, state, owner, timings,
-                        self._lb_role_snapshot_read_executor)
+                    read_executor = (
+                        self._ensure_lb_role_snapshot_read_executor())
+                    return lb_k8s.get_lb_role_snapshot(self._service_name,
+                                                       fence, state, owner,
+                                                       timings, read_executor)
 
                 try:
                     snapshot = await asyncio.wait_for(
@@ -2311,11 +2325,13 @@ class SkyServeController:
             else:
                 snapshot_timings: dict[str, float] = {}
                 try:
+                    read_executor = (
+                        self._ensure_lb_role_snapshot_read_executor())
                     snapshot = await trace.run_in_executor(
                         loop, 'kubernetes_role_snapshot',
                         lb_k8s.get_lb_role_snapshot, self._service_name, fence,
                         state, database_snapshot.owner, snapshot_timings,
-                        self._lb_role_snapshot_read_executor)
+                        read_executor)
                 except lb_k8s.LbRoleSnapshotStateMismatchError:
                     trace.add_phases(snapshot_timings)
                     return role_response(
