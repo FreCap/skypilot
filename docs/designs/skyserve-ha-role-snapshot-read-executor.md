@@ -56,7 +56,7 @@ independently through the optional fallback.
 | Path | Invariant | Coverage |
 | --- | --- | --- |
 | `sky/serve/controller.py` | one pool across stable/transition reads; shutdown owns both pools | focused controller transition and HA lifespan/reuse tests |
-| `sky/serve/lb_k8s.py` | supplied pool avoids construction; fallback and error order remain intact | provided-executor, deterministic-error, and direct snapshot tests |
+| `sky/serve/lb_k8s.py` | supplied pool avoids construction and joins both reads; fallback and error order remain intact | provided-executor, failed-read join, deterministic-error, and direct snapshot tests |
 | `tests/unit_tests/test_serve_controller.py` | synthetic controllers mirror production ownership | complete controller test file |
 | `tests/unit_tests/test_serve_lb_ha.py` | lifecycle, concurrency, fencing, and exact submission count | focused HA matrix and complete HA test file |
 

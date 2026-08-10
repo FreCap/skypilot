@@ -2956,6 +2956,7 @@ def get_lb_role_snapshot(
             pods_future = executor.submit(parent_context.copy().run, list_pods)
             service_future = executor.submit(parent_context.copy().run,
                                              read_service)
+            concurrent.futures.wait((pods_future, service_future))
             pods = pods_future.result()
             try:
                 service = service_future.result()

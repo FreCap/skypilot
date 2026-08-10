@@ -991,6 +991,50 @@ def test_get_lb_role_snapshot_uses_provided_read_executor():
     assert len(read_executor.submissions) == 2
 
 
+def test_provided_snapshot_executor_joins_reads_after_pod_failure():
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    owner = _role_owner_record(fence, stable)
+    service_started = threading.Event()
+    release_service = threading.Event()
+    core_api = mock.Mock()
+    core_api.list_namespaced_pod.side_effect = RuntimeError('pod read failed')
+
+    def read_service(*unused_args, **unused_kwargs):
+        service_started.set()
+        assert release_service.wait(timeout=2)
+        return mock.Mock()
+
+    core_api.read_namespaced_service.side_effect = read_service
+    with mock.patch.object(
+            lb_k8s, '_lb_mode_active', return_value=True), mock.patch.object(
+                lb_k8s.kubernetes,
+                'in_cluster_context_name',
+                return_value='ctx'), mock.patch.object(
+                    lb_k8s, 'get_lb_namespace',
+                    return_value='ns'), mock.patch.object(
+                        lb_k8s.kubernetes, 'core_api', return_value=core_api
+                    ), concurrent.futures.ThreadPoolExecutor(
+                        max_workers=2
+                    ) as read_executor, concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1) as caller_executor:
+        snapshot_future = caller_executor.submit(_REAL_GET_LB_ROLE_SNAPSHOT,
+                                                 'service',
+                                                 fence,
+                                                 stable,
+                                                 owner,
+                                                 read_executor=read_executor)
+        assert service_started.wait(timeout=2)
+        try:
+            assert not snapshot_future.done()
+        finally:
+            release_service.set()
+        assert snapshot_future.result(timeout=2) is None
+
+    core_api.list_namespaced_pod.assert_called_once()
+    core_api.read_namespaced_service.assert_called_once()
+
+
 def test_role_heartbeat_uses_one_shared_authority_snapshot():
     ctrl = _role_controller()
     ctrl._controller_owner = (123, '10.0.0.1')
