@@ -1049,21 +1049,24 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
     """Decode slim status-check rows into the per-job refresh snapshot."""
     for row in rows:
         mapping = row._mapping  # pylint: disable=protected-access
+        schedule_state = mapping['schedule_state']
+        workspace = mapping['workspace']
+        if schedule_state is None or workspace is None:
+            continue
         job_id = mapping['spot_job_id']
         info = result.get(job_id)
         # WARNING: Keep this decode (enum conversion + job_name fallback)
         # in sync with get_managed_job_tasks.
         if info is None:
             info = {
-                'schedule_state': ManagedJobScheduleState(
-                    mapping['schedule_state']),
+                'schedule_state': ManagedJobScheduleState(schedule_state),
                 'controller_pid': mapping['controller_pid'],
                 'controller_pid_started_at':
                     mapping['controller_pid_started_at'],
                 'controller_instance_id': mapping['controller_instance_id'],
                 'controller_generation': mapping['controller_generation'],
                 'pool': mapping['pool'],
-                'workspace': mapping['workspace'],
+                'workspace': workspace,
                 'tasks': [],
             }
             result[job_id] = info

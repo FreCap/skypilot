@@ -1440,6 +1440,24 @@ class TestGetJobsStatusCheckInfo:
         assert (state.get_job_cancellation_states_from_status_check_info(info)
                 == state.get_job_cancellation_states(job_ids))
 
+    def test_legacy_job_is_excluded_instead_of_crashing(
+            self, _mock_managed_jobs_db_conn):
+        with _mock_managed_jobs_db_conn.begin() as connection:
+            result = connection.execute(state.job_info_table.insert().values(
+                name='legacy-job',
+                workspace='default',
+                schedule_state=None,
+            ))
+            job_id = result.lastrowid
+            connection.execute(state.spot_table.insert().values(
+                spot_job_id=job_id,
+                task_id=0,
+                task_name='task-0',
+                status=state.ManagedJobStatus.RUNNING.value,
+            ))
+
+        assert not state.get_jobs_status_check_info([job_id])
+
     def test_job_name_is_public_name_not_task_name(self, _seed_test_jobs):
         # The seed sets job_info.name='test-job-a' but task_name='task0'.
         # job_name MUST resolve to the public job_info.name (the value cleanup
