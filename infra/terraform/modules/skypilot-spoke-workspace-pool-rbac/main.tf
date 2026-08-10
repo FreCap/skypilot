@@ -66,6 +66,41 @@ resource "kubernetes_cluster_role_v1" "pool" {
     verbs          = ["get"]
   }
 
+  # Required-Kueue preflight follows LocalQueue -> ClusterQueue and evaluates
+  # the latter's selector against this Namespace on every launch. Both reads
+  # remain exact-name and cluster-scoped; no list or mutation is needed.
+  dynamic "rule" {
+    for_each = var.kueue == null ? [] : [var.kueue.cluster_queue_name]
+    content {
+      api_groups     = ["kueue.x-k8s.io"]
+      resources      = ["clusterqueues"]
+      resource_names = [rule.value]
+      verbs          = ["get"]
+    }
+  }
+
+  dynamic "rule" {
+    for_each = var.kueue == null ? [] : [var.namespace]
+    content {
+      api_groups     = [""]
+      resources      = ["namespaces"]
+      resource_names = [rule.value]
+      verbs          = ["get"]
+    }
+  }
+
+  # API discovery selects v1beta2 with a v1beta1 compatibility fallback. The
+  # generated Python client currently calls /apis/; grant both exact spellings
+  # to remain compatible without exposing discovery subpaths. Most clusters
+  # already grant these through system:discovery, but hardened clusters may not.
+  dynamic "rule" {
+    for_each = var.kueue == null ? [] : [1]
+    content {
+      non_resource_urls = ["/apis", "/apis/"]
+      verbs             = ["get"]
+    }
+  }
+
   # runtimeclasses: SkyPilot lists these on launch to detect the GPU RuntimeClass.
   # Source review marked this "optional/warn", but on the deployed chart version its
   # denial fails the launch (verified live) — so it's REQUIRED here. `list` only.
@@ -138,6 +173,18 @@ resource "kubernetes_role_v1" "pool" {
     api_groups = [""]
     resources  = ["events"]
     verbs      = ["list"]
+  }
+
+  # SkyPilot checks this exact queue before Pod creation. It does not need to
+  # enumerate or mutate queues, and workload Pods must not receive this grant.
+  dynamic "rule" {
+    for_each = var.kueue == null ? [] : [var.kueue.local_queue_name]
+    content {
+      api_groups     = ["kueue.x-k8s.io"]
+      resources      = ["localqueues"]
+      resource_names = [rule.value]
+      verbs          = ["get"]
+    }
   }
 
   # PVC reads for tiers that mount pre-existing claims (FSx): SkyPilot GETs each

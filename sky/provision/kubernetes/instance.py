@@ -682,55 +682,280 @@ def _prepare_pod_for_required_kueue(
             {'name': k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE})
 
 
-def _preflight_required_kueue_local_queue(namespace: str, context: str | None,
-                                          expected_queue: str) -> None:
-    """Requires the selected LocalQueue to exist and be ready for admission."""
-    queue_ref = f'{namespace}/{expected_queue}'
+def _kueue_api_field(obj: Any, field: str) -> Any:
+    if isinstance(obj, Mapping):
+        return obj.get(field)
+    return getattr(obj, field, None)
+
+
+def _get_required_kueue_api_version(context: str | None) -> str:
+    """Discovers the first supported Kueue API version served by the cluster."""
     try:
-        local_queue = kubernetes.custom_objects_api(
-            context).get_namespaced_custom_object(
+        api_groups = kubernetes.apis_api(context).get_api_versions(
+            _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        raise config_lib.KubernetesError(
+            'Failed to discover Kueue API versions: '
+            f'{common_utils.format_exception(e)}. SkyPilot refused to create '
+            'Pods because it cannot prove that Kueue is available.') from None
+
+    groups = _kueue_api_field(api_groups, 'groups')
+    if not isinstance(groups, list):
+        raise config_lib.KubernetesError(
+            'Kubernetes returned an invalid API discovery response. SkyPilot '
+            'refused to create Pods because it cannot prove that Kueue is '
+            'available.')
+    group = next(
+        (candidate for candidate in groups
+         if _kueue_api_field(candidate, 'name') == k8s_constants.KUEUE_API_GROUP
+        ), None)
+    versions = _kueue_api_field(group, 'versions')
+    if not isinstance(versions, list):
+        versions = []
+    served_versions = {
+        version for item in versions
+        if isinstance((version := _kueue_api_field(item, 'version')), str)
+    }
+    for version in k8s_constants.KUEUE_API_VERSIONS:
+        if version in served_versions:
+            return version
+    raise config_lib.KubernetesError(
+        f'Kubernetes does not serve a supported Kueue API version '
+        f'({", ".join(k8s_constants.KUEUE_API_VERSIONS)}). SkyPilot refused '
+        'to create Pods.')
+
+
+def _get_required_kueue_object(*,
+                               context: str | None,
+                               api_version: str,
+                               kind: str,
+                               plural: str,
+                               name: str,
+                               namespace: str | None = None) -> Mapping:
+    """Gets a required Kueue object from the discovered API version."""
+    api = kubernetes.custom_objects_api(context)
+    object_ref = f'{namespace}/{name}' if namespace is not None else name
+    try:
+        if namespace is None:
+            obj = api.get_cluster_custom_object(
                 group=k8s_constants.KUEUE_API_GROUP,
-                version=k8s_constants.KUEUE_API_VERSION,
+                version=api_version,
+                plural=plural,
+                name=name,
+                _request_timeout=kubernetes.API_TIMEOUT)
+        else:
+            obj = api.get_namespaced_custom_object(
+                group=k8s_constants.KUEUE_API_GROUP,
+                version=api_version,
                 namespace=namespace,
-                plural=k8s_constants.KUEUE_LOCAL_QUEUE_PLURAL,
-                name=expected_queue,
+                plural=plural,
+                name=name,
                 _request_timeout=kubernetes.API_TIMEOUT)
     except kubernetes.api_exception() as e:
         if e.status == 404:
             raise config_lib.KubernetesError(
-                f'Required Kueue LocalQueue {queue_ref!r} does not exist. '
-                'Create it and wait for its Active condition to become True '
-                'before launching this workload.') from None
+                f'Required Kueue {kind} {object_ref!r} does not exist in '
+                f'{api_version}. Create it and wait for its current-generation '
+                'Active condition to become True before launching this '
+                'workload.') from None
         raise config_lib.KubernetesError(
-            f'Failed to verify required Kueue LocalQueue {queue_ref!r}: '
+            f'Failed to verify required Kueue {kind} {object_ref!r}: '
             f'{common_utils.format_exception(e)}. SkyPilot refused to create '
             'Pods because it cannot prove that the queue is usable.') from None
 
-    if not isinstance(local_queue, Mapping):
+    if not isinstance(obj, Mapping):
         raise config_lib.KubernetesError(
             f'Kubernetes returned an invalid response for required Kueue '
-            f'LocalQueue {queue_ref!r}. SkyPilot refused to create Pods.')
-    status = local_queue.get('status')
-    conditions = status.get('conditions') if isinstance(status, Mapping) else []
-    active_condition = None
-    if isinstance(conditions, list):
-        active_condition = next(
-            (condition for condition in conditions
-             if isinstance(condition, Mapping) and
-             condition.get('type') == k8s_constants.KUEUE_ACTIVE_CONDITION),
-            None)
-    if active_condition is None:
+            f'{kind} {object_ref!r}. SkyPilot refused to create Pods.')
+    metadata = obj.get('metadata')
+    if (not isinstance(metadata, Mapping) or metadata.get('name') != name or
+        (namespace is not None and metadata.get('namespace') != namespace)):
         raise config_lib.KubernetesError(
-            f'Required Kueue LocalQueue {queue_ref!r} has not reported '
-            'Active=True. Wait for Kueue to reconcile the queue before '
-            'launching this workload.')
+            f'Kubernetes returned the wrong object for required Kueue '
+            f'{kind} {object_ref!r}. SkyPilot refused to create Pods.')
+    return obj
+
+
+def _require_current_kueue_active(obj: Mapping, *, kind: str,
+                                  object_ref: str) -> None:
+    """Requires a reconciled, non-deleting Kueue queue object."""
+    metadata = obj.get('metadata')
+    if not isinstance(metadata, Mapping):
+        raise config_lib.KubernetesError(
+            f'Required Kueue {kind} {object_ref!r} has invalid metadata. '
+            'SkyPilot refused to create Pods.')
+    if metadata.get('deletionTimestamp') is not None:
+        raise config_lib.KubernetesError(
+            f'Required Kueue {kind} {object_ref!r} is being deleted. '
+            'SkyPilot refused to create Pods.')
+
+    status = obj.get('status')
+    conditions = status.get('conditions') if isinstance(status, Mapping) else []
+    active_conditions = []
+    if isinstance(conditions, list):
+        active_conditions = [
+            condition for condition in conditions
+            if isinstance(condition, Mapping) and
+            condition.get('type') == k8s_constants.KUEUE_ACTIVE_CONDITION
+        ]
+    if not active_conditions:
+        raise config_lib.KubernetesError(
+            f'Required Kueue {kind} {object_ref!r} has not reported '
+            'Active=True. Wait for Kueue to reconcile it before launching '
+            'this workload.')
+    if len(active_conditions) != 1:
+        raise config_lib.KubernetesError(
+            f'Required Kueue {kind} {object_ref!r} reported multiple Active '
+            'conditions. SkyPilot refused to create Pods.')
+    active_condition = active_conditions[0]
     if active_condition.get('status') != 'True':
         reason = active_condition.get('reason')
         message = active_condition.get('message')
         raise config_lib.KubernetesError(
-            f'Required Kueue LocalQueue {queue_ref!r} is not active '
+            f'Required Kueue {kind} {object_ref!r} is not active '
             f'(reason={reason!r}, message={message!r}). Wait for its Active '
             'condition to become True before launching this workload.')
+
+    generation = metadata.get('generation')
+    observed_generation = active_condition.get('observedGeneration')
+    if generation is None or observed_generation != generation:
+        raise config_lib.KubernetesError(
+            f'Required Kueue {kind} {object_ref!r} has stale Active status '
+            f'(generation={generation!r}, '
+            f'observedGeneration={observed_generation!r}). Wait for Kueue to '
+            'reconcile the current generation before launching this workload.')
+
+
+def _namespace_matches_kueue_selector(selector: Any,
+                                      labels: Mapping[str, str]) -> bool:
+    """Evaluates a Kubernetes metav1.LabelSelector against Namespace labels."""
+    # Kueue defines a nil ClusterQueue selector as matching no namespaces. An
+    # explicit empty object is the match-all selector.
+    if not isinstance(selector, Mapping):
+        return False
+    if not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in labels.items()):
+        return False
+    if set(selector) - {'matchLabels', 'matchExpressions'}:
+        return False
+
+    match_labels = selector.get('matchLabels', {})
+    if match_labels is None:
+        match_labels = {}
+    if not isinstance(match_labels, Mapping):
+        return False
+    for key, value in match_labels.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return False
+        if labels.get(key) != value:
+            return False
+
+    match_expressions = selector.get('matchExpressions', [])
+    if match_expressions is None:
+        match_expressions = []
+    if not isinstance(match_expressions, list):
+        return False
+    for expression in match_expressions:
+        if not isinstance(expression, Mapping):
+            return False
+        if set(expression) - {'key', 'operator', 'values'}:
+            return False
+        key = expression.get('key')
+        operator = expression.get('operator')
+        values = expression.get('values', [])
+        if not isinstance(key, str) or not isinstance(operator, str):
+            return False
+        if values is None:
+            values = []
+        if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values):
+            return False
+
+        if operator == 'In':
+            if not values or key not in labels or labels[key] not in values:
+                return False
+        elif operator == 'NotIn':
+            if not values or (key in labels and labels[key] in values):
+                return False
+        elif operator == 'Exists':
+            if values or key not in labels:
+                return False
+        elif operator == 'DoesNotExist':
+            if values or key in labels:
+                return False
+        else:
+            return False
+    return True
+
+
+def _get_required_namespace_labels(namespace: str,
+                                   context: str | None) -> Mapping[str, str]:
+    """Reads the exact Namespace whose labels Kueue evaluates."""
+    try:
+        namespace_obj = kubernetes.core_api(context).read_namespace(
+            namespace, _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        raise config_lib.KubernetesError(
+            f'Failed to verify Namespace {namespace!r} for required Kueue '
+            f'admission: {common_utils.format_exception(e)}. SkyPilot refused '
+            'to create Pods because it cannot prove that the queue is '
+            'usable.') from None
+    metadata = getattr(namespace_obj, 'metadata', None)
+    labels = getattr(metadata, 'labels', None)
+    if labels is None:
+        labels = {}
+    if getattr(metadata, 'name',
+               None) != namespace or not isinstance(labels, Mapping):
+        raise config_lib.KubernetesError(
+            f'Kubernetes returned an invalid response for Namespace '
+            f'{namespace!r}. SkyPilot refused to create Pods.')
+    return labels
+
+
+def _preflight_required_kueue_local_queue(namespace: str, context: str | None,
+                                          expected_queue: str) -> None:
+    """Requires an active LocalQueue whose current policy admits Namespace."""
+    api_version = _get_required_kueue_api_version(context)
+    queue_ref = f'{namespace}/{expected_queue}'
+    local_queue = _get_required_kueue_object(
+        context=context,
+        api_version=api_version,
+        kind='LocalQueue',
+        plural=k8s_constants.KUEUE_LOCAL_QUEUE_PLURAL,
+        name=expected_queue,
+        namespace=namespace)
+    _require_current_kueue_active(local_queue,
+                                  kind='LocalQueue',
+                                  object_ref=queue_ref)
+
+    local_queue_spec = local_queue.get('spec')
+    cluster_queue_name = (local_queue_spec.get('clusterQueue') if isinstance(
+        local_queue_spec, Mapping) else None)
+    if not isinstance(cluster_queue_name,
+                      str) or not cluster_queue_name.strip():
+        raise config_lib.KubernetesError(
+            f'Required Kueue LocalQueue {queue_ref!r} has no valid '
+            'spec.clusterQueue. SkyPilot refused to create Pods.')
+
+    cluster_queue = _get_required_kueue_object(
+        context=context,
+        api_version=api_version,
+        kind='ClusterQueue',
+        plural=k8s_constants.KUEUE_CLUSTER_QUEUE_PLURAL,
+        name=cluster_queue_name)
+    _require_current_kueue_active(cluster_queue,
+                                  kind='ClusterQueue',
+                                  object_ref=cluster_queue_name)
+    cluster_queue_spec = cluster_queue.get('spec')
+    selector = (cluster_queue_spec.get('namespaceSelector') if isinstance(
+        cluster_queue_spec, Mapping) else None)
+    namespace_labels = _get_required_namespace_labels(namespace, context)
+    if not _namespace_matches_kueue_selector(selector, namespace_labels):
+        raise config_lib.KubernetesError(
+            f'Required Kueue ClusterQueue {cluster_queue_name!r} does not '
+            f'admit Namespace {namespace!r} under its current '
+            'spec.namespaceSelector. SkyPilot refused to create Pods.')
 
 
 def _attest_required_kueue_pod(pod: Any, namespace: str, context: str | None,

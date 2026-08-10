@@ -116,3 +116,46 @@ variable "allow_pvc_read" {
   type        = bool
   default     = false
 }
+
+variable "kueue" {
+  description = <<-EOT
+    Optional Kueue objects that the SkyPilot control-plane subjects must
+    preflight before launching a Pod. When set, grant only exact-name `get` on
+    the namespaced LocalQueue, cluster-scoped ClusterQueue, and this Namespace,
+    plus exact `GET /apis` and `GET /apis/` for served-version discovery. The
+    workload ServiceAccount receives no Kueue permission.
+  EOT
+  type = object({
+    local_queue_name   = string
+    cluster_queue_name = string
+  })
+  default = null
+
+  validation {
+    condition = var.kueue == null ? true : (
+      length(var.kueue.local_queue_name) >= 1 &&
+      length(var.kueue.local_queue_name) <= 253 &&
+      alltrue([
+        for label in split(".", var.kueue.local_queue_name) :
+        length(label) >= 1 &&
+        length(label) <= 63 &&
+        can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+      ])
+    )
+    error_message = "kueue.local_queue_name must be a Kubernetes DNS-1123 subdomain of at most 253 characters."
+  }
+
+  validation {
+    condition = var.kueue == null ? true : (
+      length(var.kueue.cluster_queue_name) >= 1 &&
+      length(var.kueue.cluster_queue_name) <= 253 &&
+      alltrue([
+        for label in split(".", var.kueue.cluster_queue_name) :
+        length(label) >= 1 &&
+        length(label) <= 63 &&
+        can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+      ])
+    )
+    error_message = "kueue.cluster_queue_name must be a Kubernetes DNS-1123 subdomain of at most 253 characters."
+  }
+}

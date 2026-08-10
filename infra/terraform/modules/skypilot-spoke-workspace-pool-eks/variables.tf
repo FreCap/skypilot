@@ -43,16 +43,17 @@ variable "partitions" {
   description = <<-EOT
     Workload partitions to register. Each item creates namespaced RBAC and can
     optionally create a Pod Identity association, an exact-priority admission
-    policy, and static FSx PV/PVC pairs.
+    policy, a Kueue LocalQueue, and static FSx PV/PVC pairs.
 
     A partition is a workload credential and storage partition, not an
     independent tenant boundary. The same controller principal receives every
     configured group. Pin each SkyPilot workspace to its intended namespace and
     audit pre-existing service-account associations and namespaced resources.
 
-    Durable identity keys are namespace, group, priority-class name, FSx claim
-    name, and the derived RBAC resource names. Change them only with a reviewed
-    Terraform state and workload migration.
+    Durable identity keys are namespace, group, priority-class name, Kueue
+    LocalQueue and ClusterQueue names, FSx claim name, and the derived RBAC
+    resource names. Change them only with a reviewed Terraform state and
+    workload migration.
   EOT
   type = list(object({
     namespace                    = string
@@ -61,10 +62,14 @@ variable "partitions" {
     pod_identity_role_arn        = optional(string, "")
     pod_identity_service_account = optional(string, "skypilot-pool-sa")
 
-
     priority_class = optional(object({
       value = number
       name  = optional(string)
+    }))
+
+    kueue = optional(object({
+      local_queue_name   = optional(string, "default")
+      cluster_queue_name = string
     }))
 
     fsx_volumes = optional(list(object({
@@ -129,6 +134,40 @@ variable "partitions" {
       )) && length(partition.pod_identity_service_account) <= 253
     ])
     error_message = "Each pod_identity_service_account must be a valid Kubernetes DNS subdomain of at most 253 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      for partition in var.partitions :
+      partition.kueue == null ? true : (
+        length(partition.kueue.local_queue_name) >= 1 &&
+        length(partition.kueue.local_queue_name) <= 253 &&
+        alltrue([
+          for label in split(".", partition.kueue.local_queue_name) :
+          length(label) >= 1 &&
+          length(label) <= 63 &&
+          can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+        ])
+      )
+    ])
+    error_message = "Each kueue.local_queue_name must be a Kubernetes DNS-1123 subdomain of at most 253 characters."
+  }
+
+  validation {
+    condition = alltrue([
+      for partition in var.partitions :
+      partition.kueue == null ? true : (
+        length(partition.kueue.cluster_queue_name) >= 1 &&
+        length(partition.kueue.cluster_queue_name) <= 253 &&
+        alltrue([
+          for label in split(".", partition.kueue.cluster_queue_name) :
+          length(label) >= 1 &&
+          length(label) <= 63 &&
+          can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+        ])
+      )
+    ])
+    error_message = "Each kueue.cluster_queue_name must be a Kubernetes DNS-1123 subdomain of at most 253 characters."
   }
 
   validation {

@@ -24,6 +24,31 @@ mock_provider "aws" {
 
 mock_provider "kubernetes" {
   override_during = plan
+
+  mock_data "kubernetes_resource" {
+    defaults = {
+      object = {
+        metadata = {
+          generation = 4
+          name       = "inference-borrower"
+        }
+        spec = {
+          namespaceSelector = {
+            matchLabels = {
+              "kubernetes.io/metadata.name" = "inference"
+            }
+          }
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 4
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
 }
 
 variables {
@@ -55,6 +80,9 @@ variables {
     {
       namespace        = "inference"
       manage_namespace = false
+      kueue = {
+        cluster_queue_name = "inference-borrower"
+      }
       fsx_volumes = [{
         claim_name    = "models"
         volume_handle = "fs-0fedcba9876543210"
@@ -133,6 +161,68 @@ run "commercial_pool_preserves_partition_identity_shapes" {
       training  = "training"
     }
     error_message = "The partition output must expose the effective RBAC groups."
+  }
+
+  assert {
+    condition     = toset(keys(kubernetes_manifest.partition_local_queue)) == toset(["inference"])
+    error_message = "Only partitions that configure Kueue may create a LocalQueue."
+  }
+
+  assert {
+    condition = (
+      kubernetes_manifest.partition_local_queue["inference"].manifest["apiVersion"] == "kueue.x-k8s.io/v1beta2" &&
+      kubernetes_manifest.partition_local_queue["inference"].manifest["kind"] == "LocalQueue" &&
+      kubernetes_manifest.partition_local_queue["inference"].manifest["metadata"]["name"] == "default" &&
+      kubernetes_manifest.partition_local_queue["inference"].manifest["metadata"]["namespace"] == "inference" &&
+      kubernetes_manifest.partition_local_queue["inference"].manifest["spec"]["clusterQueue"] == "inference-borrower"
+    )
+    error_message = "The LocalQueue must preserve the exact configured namespace, name, API, and ClusterQueue."
+  }
+
+  assert {
+    condition = (
+      length(kubernetes_manifest.partition_local_queue["inference"].wait) == 1 &&
+      length(kubernetes_manifest.partition_local_queue["inference"].wait[0].condition) == 1 &&
+      kubernetes_manifest.partition_local_queue["inference"].wait[0].condition[0].type == "Active" &&
+      kubernetes_manifest.partition_local_queue["inference"].wait[0].condition[0].status == "True"
+    )
+    error_message = "Terraform must not finish the partition apply until the LocalQueue reports Active=True."
+  }
+
+  assert {
+    condition = (
+      toset(keys(kubernetes_manifest.partition_kueue_policy)) == toset(["inference"]) &&
+      toset(keys(kubernetes_manifest.partition_kueue_binding)) == toset(["inference"]) &&
+      strcontains(
+        kubernetes_manifest.partition_kueue_policy["inference"].manifest["spec"]["validations"][0]["expression"],
+        "object.metadata.labels['kueue.x-k8s.io/queue-name'] == 'default'",
+      ) &&
+      strcontains(
+        kubernetes_manifest.partition_kueue_policy["inference"].manifest["spec"]["validations"][0]["expression"],
+        "object.metadata.labels['kueue.x-k8s.io/managed'] == 'true'",
+      )
+    )
+    error_message = "A configured Kueue partition must reject Pods that omit/misname its exact queue or bypass Kueue mutation."
+  }
+
+  assert {
+    condition = output.kueue_local_queues == {
+      inference = {
+        api_version        = "kueue.x-k8s.io/v1beta2"
+        cluster_queue_name = "inference-borrower"
+        local_queue_name   = "default"
+      }
+    }
+    error_message = "The Kueue output must expose only the verified namespace-to-queue contract."
+  }
+
+  assert {
+    condition = (
+      module.rbac["inference"].kueue.local_queue_name == "default" &&
+      module.rbac["inference"].kueue.cluster_queue_name == "inference-borrower" &&
+      module.rbac["training"].kueue == null
+    )
+    error_message = "Only the configured partition may receive LocalQueue preflight RBAC."
   }
 }
 

@@ -123,12 +123,117 @@ run "default_permissions_match_the_skypilot_pool_contract" {
 
   assert {
     condition = (
+      length([
+        for rule in kubernetes_role_v1.pool.rule : rule
+        if contains(rule.resources, "localqueues")
+      ]) == 0 &&
+      output.kueue == null
+    )
+    error_message = "LocalQueue reads must remain disabled when no queue is configured."
+  }
+
+  assert {
+    condition = (
       output.namespace == "skypilot-gpu" &&
       output.service_account_name == "skypilot-pool-sa" &&
       output.cluster_role_name == "skypilot-gpu-pool" &&
       output.role_name == "skypilot-gpu-pool"
     )
     error_message = "The module must expose the managed workload and RBAC identities."
+  }
+}
+
+run "local_queue_preflight_is_exact_name_get_for_control_plane_only" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "inference-borrower"
+    }
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool.rule : rule
+      if toset(rule.api_groups) == toset(["kueue.x-k8s.io"]) &&
+      toset(rule.resources) == toset(["localqueues"]) &&
+      toset(rule.resource_names) == toset(["default"]) &&
+      toset(rule.verbs) == toset(["get"])
+    ]) == 1
+    error_message = "The control-plane Role must receive exact-name get on only the configured LocalQueue."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_cluster_role_v1.pool.rule : rule
+      if toset(rule.api_groups) == toset(["kueue.x-k8s.io"]) &&
+      toset(rule.resources) == toset(["clusterqueues"]) &&
+      toset(rule.resource_names) == toset(["inference-borrower"]) &&
+      toset(rule.verbs) == toset(["get"])
+    ]) == 1
+    error_message = "Runtime preflight must receive exact-name get on the configured ClusterQueue."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_cluster_role_v1.pool.rule : rule
+      if toset(rule.api_groups) == toset([""]) &&
+      toset(rule.resources) == toset(["namespaces"]) &&
+      toset(rule.resource_names) == toset([var.namespace]) &&
+      toset(rule.verbs) == toset(["get"])
+    ]) == 1
+    error_message = "Runtime preflight must receive exact-name get on only the partition Namespace."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_cluster_role_v1.pool.rule : rule
+      if toset(rule.non_resource_urls) == toset(["/apis", "/apis/"]) &&
+      toset(rule.verbs) == toset(["get"])
+    ]) == 1
+    error_message = "Runtime preflight must grant both exact API-discovery root spellings used by supported clients."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_cluster_role_v1.pool.rule : rule
+      if(
+        try(contains(rule.resources, "clusterqueues"), false) ||
+        try(contains(rule.resource_names, var.namespace), false)
+        ) && (
+        length(setsubtract(toset(rule.verbs), toset(["get"]))) > 0 ||
+        try(length(rule.resource_names) != 1, true)
+      )
+    ]) == 0
+    error_message = "Kueue drift preflight must not receive list, mutation, or unscoped cluster reads."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool.rule : rule
+      if try(contains(rule.resources, "localqueues"), false) && (
+        length(setsubtract(toset(rule.verbs), toset(["get"]))) > 0 ||
+        try(length(rule.resource_names) != 1, true)
+      )
+    ]) == 0
+    error_message = "LocalQueue RBAC must not grant enumeration, mutation, or an unscoped get."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool_sa_self_teardown.rule : rule
+      if contains(rule.resources, "localqueues")
+    ]) == 0
+    error_message = "The workload ServiceAccount must receive no Kueue API permission."
+  }
+
+  assert {
+    condition = output.kueue == {
+      cluster_queue_name = "inference-borrower"
+      local_queue_name   = "default"
+    }
+    error_message = "The RBAC output must expose the exact granted queue names."
   }
 }
 

@@ -25,3 +25,8 @@ output "self_teardown_role_name" {
   EOT
   value       = kubernetes_role_v1.pool_sa_self_teardown.metadata[0].name
 }
+
+output "kueue" {
+  description = "Exact Kueue LocalQueue and ClusterQueue names readable by the control-plane subjects, or null."
+  value       = var.kueue
+}
