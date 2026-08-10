@@ -1401,6 +1401,93 @@ class TestStatusExprSeam:
         assert seq_d == sorted(seq_d, reverse=True), seq_d
 
 
+def _insert_null_workspace_job(engine,
+                               *,
+                               schedule_state,
+                               status,
+                               workspace=None,
+                               controller_pid=4242):
+    """Insert one job_info/spot pair, defaulting to a NULL legacy workspace."""
+    with engine.begin() as connection:
+        result = connection.execute(state.job_info_table.insert().values(
+            name='legacy-job',
+            workspace=workspace,
+            schedule_state=schedule_state,
+            controller_pid=controller_pid,
+            controller_pid_started_at=1.0,
+        ))
+        job_id = result.lastrowid
+        connection.execute(state.spot_table.insert().values(
+            spot_job_id=job_id,
+            task_id=0,
+            task_name='task-0',
+            status=status,
+            submitted_at=1.0,
+            start_at=2.0,
+        ))
+    return job_id
+
+
+class TestJobsToCheckStatusInfoLegacyRows:
+    """The dead-controller sweep must not silently shrink.
+
+    get_jobs_to_check_status_info() shares its row decode with
+    get_jobs_status_check_info(), which cancellation narrowed to rows carrying
+    a workspace. The sweep has no such requirement: a live job that drops out
+    of it is never converted to FAILED_CONTROLLER when its controller dies, so
+    it stays non-terminal forever and its task clusters are never torn down.
+    """
+
+    def test_null_workspace_job_stays_in_global_sweep(
+            self, _mock_managed_jobs_db_conn):
+        job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value)
+
+        assert job_id in state.get_jobs_to_check_status_info(None)
+
+    def test_null_workspace_job_stays_in_explicit_sweep(
+            self, _mock_managed_jobs_db_conn):
+        job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value)
+
+        assert job_id in state.get_jobs_to_check_status_info([job_id])
+
+    def test_selector_and_snapshot_agree(self, _mock_managed_jobs_db_conn):
+        # get_jobs_to_check_status() is the id-only selector the slim snapshot
+        # was built to replace. "Which jobs need checking?" must not depend on
+        # which of the two helpers is asked.
+        _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value)
+        _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value,
+            workspace='default')
+
+        assert set(state.get_jobs_to_check_status()) == set(
+            state.get_jobs_to_check_status_info(None))
+
+    def test_null_schedule_state_stays_fenced_out(self,
+                                                  _mock_managed_jobs_db_conn):
+        # The other half of the shared skip must survive: a NULL
+        # schedule_state cannot be decoded into the enum and is fenced out of
+        # both the selector and the snapshot.
+        job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=None,
+            status=state.ManagedJobStatus.RUNNING.value,
+            workspace='default')
+
+        assert job_id not in state.get_jobs_to_check_status_info(None)
+        assert job_id not in state.get_jobs_to_check_status()
+
+
 class TestGetJobsStatusCheckInfo:
     """Tests for the slim batched get_jobs_status_check_info helper.
 
@@ -1457,6 +1544,50 @@ class TestGetJobsStatusCheckInfo:
             ))
 
         assert not state.get_jobs_status_check_info([job_id])
+
+    def test_null_workspace_job_is_still_snapshotted(
+            self, _mock_managed_jobs_db_conn):
+        # A NULL workspace is a legacy-row marker, not a reason to drop the
+        # row from the shared decode. get_jobs_status_check_info feeds the
+        # DONE cluster-leak repair, which exists specifically to reclaim
+        # clusters left behind by older controllers -- the same population
+        # that carries a NULL workspace. Dropping them makes that repair
+        # unable to see the rows it was written for.
+        job_id = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.DONE.value,
+            status=state.ManagedJobStatus.SUCCEEDED.value)
+
+        info = state.get_jobs_status_check_info([job_id])
+        assert job_id in info
+        assert info[job_id]['workspace'] is None
+
+    def test_cancellation_snapshot_parity_for_legacy_rows(
+            self, _mock_managed_jobs_db_conn):
+        # Cancellation routing does require a workspace. That narrowing must
+        # live in the cancellation derivation, not in the shared decode, and
+        # it must still match the point-query implementation exactly.
+        null_workspace = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value)
+        null_schedule_state = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=None,
+            status=state.ManagedJobStatus.RUNNING.value,
+            workspace='default')
+        modern = _insert_null_workspace_job(
+            _mock_managed_jobs_db_conn,
+            schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+            status=state.ManagedJobStatus.RUNNING.value,
+            workspace='default')
+
+        job_ids = [null_workspace, null_schedule_state, modern]
+        derived = state.get_job_cancellation_states_from_status_check_info(
+            state.get_jobs_status_check_info(job_ids))
+
+        assert derived == state.get_job_cancellation_states(job_ids)
+        assert set(derived) == {modern}
 
     def test_job_name_is_public_name_not_task_name(self, _seed_test_jobs):
         # The seed sets job_info.name='test-job-a' but task_name='task0'.
