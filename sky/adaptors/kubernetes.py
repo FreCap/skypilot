@@ -2870,6 +2870,13 @@ def core_api(context: str | None = None):
 @_api_logging_decorator('urllib3', logging.ERROR)
 @annotations.lru_cache(scope='request')
 @_retryable_kubernetes_client
+def apis_api(context: str | None = None):
+    return kubernetes.client.ApisApi(api_client=_get_api_client(context))
+
+
+@_api_logging_decorator('urllib3', logging.ERROR)
+@annotations.lru_cache(scope='request')
+@_retryable_kubernetes_client
 def storage_api(context: str | None = None):
     return kubernetes.client.StorageV1Api(api_client=_get_api_client(context))
 

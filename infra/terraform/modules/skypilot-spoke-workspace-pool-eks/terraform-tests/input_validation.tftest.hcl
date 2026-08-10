@@ -24,6 +24,27 @@ mock_provider "aws" {
 
 mock_provider "kubernetes" {
   override_during = plan
+
+  mock_data "kubernetes_resource" {
+    defaults = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "training-all"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
 }
 
 variables {
@@ -49,6 +70,312 @@ run "accepts_an_existing_namespace" {
     condition     = output.partitions == { training = "training" }
     error_message = "Disabling namespace ownership must retain the partition identity."
   }
+}
+
+run "kueue_is_a_backward_compatible_noop_by_default" {
+  command = plan
+
+  assert {
+    condition = (
+      length(data.kubernetes_resource.partition_cluster_queue) == 0 &&
+      length(kubernetes_manifest.partition_local_queue) == 0 &&
+      length(kubernetes_manifest.partition_kueue_policy) == 0 &&
+      length(kubernetes_manifest.partition_kueue_binding) == 0 &&
+      output.kueue_local_queues == {} &&
+      module.rbac["training"].kueue == null
+    )
+    error_message = "Omitting partition.kueue must create no Kueue reads, resources, admission policy, or RBAC."
+  }
+}
+
+run "rejects_an_invalid_local_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "Invalid_Queue"
+        cluster_queue_name = "training"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_a_blank_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = ""
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_a_cluster_queue_that_cannot_prove_namespace_eligibility" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "research-only"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "research-only"
+        }
+        spec = {
+          namespaceSelector = {
+            matchLabels = {
+              "kubernetes.io/metadata.name" = "research"
+            }
+          }
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  expect_failures = [kubernetes_manifest.partition_local_queue["training"]]
+}
+
+run "accepts_an_explicit_match_all_cluster_queue_selector" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-all"
+      }
+    }]
+  }
+
+  assert {
+    condition     = kubernetes_manifest.partition_local_queue["training"].manifest["spec"]["clusterQueue"] == "training-all"
+    error_message = "An explicit empty namespaceSelector legitimately admits every namespace."
+  }
+}
+
+run "rejects_an_omitted_cluster_queue_selector" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-none"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "training-none"
+        }
+        spec = {}
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  expect_failures = [kubernetes_manifest.partition_local_queue["training"]]
+}
+
+run "rejects_a_stale_cluster_queue_active_condition" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-all"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 2
+          name       = "training-all"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  expect_failures = [kubernetes_manifest.partition_local_queue["training"]]
+}
+
+run "rejects_duplicate_cluster_queue_active_conditions" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-all"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "training-all"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [
+            {
+              observedGeneration = 1
+              status             = "True"
+              type               = "Active"
+            },
+            {
+              observedGeneration = 1
+              status             = "False"
+              type               = "Active"
+            },
+          ]
+        }
+      }
+    }
+  }
+
+  expect_failures = [kubernetes_manifest.partition_local_queue["training"]]
+}
+
+run "rejects_a_deleting_cluster_queue" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-all"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          deletionTimestamp = "2026-08-10T00:00:00Z"
+          generation        = 1
+          name              = "training-all"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  expect_failures = [kubernetes_manifest.partition_local_queue["training"]]
+}
+
+run "rejects_an_inactive_cluster_queue" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-all"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "training-all"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            reason             = "FlavorNotFound"
+            status             = "False"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  expect_failures = [kubernetes_manifest.partition_local_queue["training"]]
 }
 
 run "rejects_an_empty_partition_set" {

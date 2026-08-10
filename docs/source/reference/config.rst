@@ -2051,10 +2051,15 @@ Name of the `local queue <https://kueue.sigs.k8s.io/docs/concepts/local_queue/>`
 Setting an effective queue automatically enables fail-closed Kueue management;
 no second opt-in flag is required. Before performing any Pod operation,
 SkyPilot verifies that this LocalQueue exists in the workload namespace and
-reports ``Active=True``. Missing, inactive, unreconciled, or unreadable queues
-fail the launch immediately. The Kubernetes identity used for provisioning
-must therefore have permission to ``get localqueues.kueue.x-k8s.io`` in the
-namespace.
+reports current-generation ``Active=True``. It follows the LocalQueue's
+reference to its ClusterQueue, requires that queue to report current-generation
+``Active=True``, and evaluates the ClusterQueue's namespace selector against
+the current Namespace labels. Missing, inactive, unreconciled, ineligible, or
+unreadable objects fail the launch immediately. SkyPilot discovers Kueue
+``v1beta2`` with a ``v1beta1`` compatibility fallback. The Kubernetes identity
+used for provisioning therefore needs ``GET /apis/`` (and ``GET /apis`` for
+client compatibility) plus exact-name ``get`` on the LocalQueue, referenced
+ClusterQueue, and workload Namespace.
 
 .. _config-yaml-kubernetes-kueue-require-managed:
 

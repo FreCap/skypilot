@@ -365,6 +365,34 @@ def test_required_kueue_preflights_before_pod_queries(monkeypatch):
     filter_pods.assert_not_called()
 
 
+def test_required_kueue_preflight_repeats_for_reattach(monkeypatch):
+    """A successful preflight is not cached across provisioning attempts."""
+    cluster_on_cloud = 'test-cluster-kueue-reattach'
+    head_name = f'{cluster_on_cloud}-head'
+    existing_pod = _fake_pod(head_name)
+    existing_pod.metadata.labels = {
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+    }
+    _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
+                                    head_name)
+    preflight = mock.MagicMock()
+    monkeypatch.setattr(instance, '_preflight_required_kueue_local_queue',
+                        preflight)
+
+    config = _make_provision_config(count=1)
+    config.provider_config['kueue_local_queue_name'] = 'inference'
+    for _ in range(2):
+        record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
+                                       config)
+        assert record.head_instance_id == head_name
+
+    assert preflight.call_args_list == [
+        mock.call('ns', 'ctx', 'inference'),
+        mock.call('ns', 'ctx', 'inference'),
+    ]
+
+
 def test_out_of_cpus(monkeypatch):
     """Test to check if the error message is correct when there is only CPU resource shortage."""
 
@@ -4260,32 +4288,138 @@ class TestConfigureRuntimeClass:
 class TestRequiredKueueAdmission:
     """Fail-closed preparation and create-response attestation."""
 
-    def test_preflight_accepts_active_local_queue(self, monkeypatch):
-        custom_api = mock.MagicMock()
-        custom_api.get_namespaced_custom_object.return_value = {
+    @staticmethod
+    def _queue_object(name,
+                      *,
+                      namespace=None,
+                      generation=1,
+                      observed_generation=None,
+                      active_status='True',
+                      deletion_timestamp=None,
+                      spec=None):
+        metadata = {
+            'name': name,
+            'generation': generation,
+        }
+        if namespace is not None:
+            metadata['namespace'] = namespace
+        if deletion_timestamp is not None:
+            metadata['deletionTimestamp'] = deletion_timestamp
+        if observed_generation is None:
+            observed_generation = generation
+        return {
+            'metadata': metadata,
+            'spec': spec or {},
             'status': {
                 'conditions': [{
                     'type': 'Active',
-                    'status': 'True',
+                    'status': active_status,
+                    'observedGeneration': observed_generation,
                     'reason': 'Ready',
                 }]
-            }
+            },
         }
+
+    @staticmethod
+    def _patch_kueue_discovery(monkeypatch, versions=('v1beta2', 'v1beta1')):
+        apis_api = mock.MagicMock()
+        apis_api.get_api_versions.return_value = types.SimpleNamespace(groups=[
+            types.SimpleNamespace(name='kueue.x-k8s.io',
+                                  versions=[
+                                      types.SimpleNamespace(version=version)
+                                      for version in versions
+                                  ])
+        ])
+        monkeypatch.setattr(kubernetes, 'apis_api', lambda _context: apis_api)
+        return apis_api
+
+    def _patch_ready_kueue(self,
+                           monkeypatch,
+                           *,
+                           local_queue=None,
+                           cluster_queue=None,
+                           namespace_labels=None):
+        self._patch_kueue_discovery(monkeypatch)
+        if local_queue is None:
+            local_queue = self._queue_object(
+                'default',
+                namespace='inference-ns',
+                spec={'clusterQueue': 'inference-borrower'})
+        if cluster_queue is None:
+            cluster_queue = self._queue_object(
+                'inference-borrower',
+                spec={
+                    'namespaceSelector': {
+                        'matchLabels': {
+                            'kubernetes.io/metadata.name': 'inference-ns'
+                        }
+                    }
+                })
+        if namespace_labels is None:
+            namespace_labels = {'kubernetes.io/metadata.name': 'inference-ns'}
+
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.return_value = local_queue
+        custom_api.get_cluster_custom_object.return_value = cluster_queue
+        core_api = mock.MagicMock()
+        core_api.read_namespace.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(name='inference-ns',
+                                           labels=namespace_labels))
         monkeypatch.setattr(kubernetes, 'custom_objects_api',
                             lambda _context: custom_api)
+        monkeypatch.setattr(kubernetes, 'core_api', lambda _context: core_api)
+        return custom_api, core_api
+
+    def test_preflight_accepts_active_eligible_queue(self, monkeypatch):
+        custom_api, core_api = self._patch_ready_kueue(monkeypatch)
 
         instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
-            'inference-ns', 'research', 'inference')
+            'inference-ns', 'research', 'default')
 
         custom_api.get_namespaced_custom_object.assert_called_once_with(
             group='kueue.x-k8s.io',
-            version='v1beta1',
+            version='v1beta2',
             namespace='inference-ns',
             plural='localqueues',
-            name='inference',
+            name='default',
             _request_timeout=kubernetes.API_TIMEOUT)
+        custom_api.get_cluster_custom_object.assert_called_once_with(
+            group='kueue.x-k8s.io',
+            version='v1beta2',
+            plural='clusterqueues',
+            name='inference-borrower',
+            _request_timeout=kubernetes.API_TIMEOUT)
+        core_api.read_namespace.assert_called_once_with(
+            'inference-ns', _request_timeout=kubernetes.API_TIMEOUT)
+
+    def test_preflight_falls_back_to_v1beta1(self, monkeypatch):
+        local_queue = self._queue_object(
+            'default',
+            namespace='inference-ns',
+            spec={'clusterQueue': 'inference-borrower'})
+        cluster_queue = self._queue_object('inference-borrower',
+                                           spec={'namespaceSelector': {}})
+        self._patch_kueue_discovery(monkeypatch, versions=('v1beta1',))
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.return_value = local_queue
+        custom_api.get_cluster_custom_object.return_value = cluster_queue
+        core_api = mock.MagicMock()
+        core_api.read_namespace.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(name='inference-ns', labels={}))
+        monkeypatch.setattr(kubernetes, 'custom_objects_api',
+                            lambda _context: custom_api)
+        monkeypatch.setattr(kubernetes, 'core_api', lambda _context: core_api)
+
+        instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+            'inference-ns', 'research', 'default')
+
+        assert custom_api.get_namespaced_custom_object.call_args.kwargs[
+            'version'] == 'v1beta1'
+        assert custom_api.get_cluster_custom_object.call_args.kwargs[
+            'version'] == 'v1beta1'
 
     def test_preflight_rejects_missing_local_queue(self, monkeypatch):
+        self._patch_kueue_discovery(monkeypatch)
         custom_api = mock.MagicMock()
         custom_api.get_namespaced_custom_object.side_effect = (
             _make_api_exception(404, 'Not Found'))
@@ -4295,36 +4429,61 @@ class TestRequiredKueueAdmission:
                             lambda: FakeApiException)
 
         with pytest.raises(config_lib.KubernetesError,
-                           match="LocalQueue 'inference-ns/inference' does not "
+                           match="LocalQueue 'inference-ns/default' does not "
                            'exist'):
             instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
-                'inference-ns', 'research', 'inference')
+                'inference-ns', 'research', 'default')
+        custom_api.get_namespaced_custom_object.assert_called_once()
 
-    @pytest.mark.parametrize(('conditions', 'error_match'), [
-        ([], 'has not reported Active=True'),
-        ([{
-            'type': 'Active',
-            'status': 'False',
-            'reason': 'ClusterQueueDoesNotExist',
-            'message': 'ClusterQueue is inactive',
-        }], 'is not active'),
+    @pytest.mark.parametrize(('local_queue_update', 'error_match'), [
+        ({
+            'status': {
+                'conditions': []
+            }
+        }, 'has not reported Active=True'),
+        ({
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'False',
+                    'observedGeneration': 1,
+                    'reason': 'ClusterQueueDoesNotExist',
+                    'message': 'ClusterQueue is inactive',
+                }]
+            }
+        }, 'is not active'),
+        ({
+            'metadata': {
+                'name': 'default',
+                'namespace': 'inference-ns',
+                'generation': 2,
+            }
+        }, 'has stale Active status'),
+        ({
+            'metadata': {
+                'name': 'default',
+                'namespace': 'inference-ns',
+                'generation': 1,
+                'deletionTimestamp': '2026-08-10T00:00:00Z',
+            }
+        }, 'is being deleted'),
     ])
     def test_preflight_rejects_unready_local_queue(self, monkeypatch,
-                                                   conditions, error_match):
-        custom_api = mock.MagicMock()
-        custom_api.get_namespaced_custom_object.return_value = {
-            'status': {
-                'conditions': conditions
-            }
-        }
-        monkeypatch.setattr(kubernetes, 'custom_objects_api',
-                            lambda _context: custom_api)
+                                                   local_queue_update,
+                                                   error_match):
+        local_queue = self._queue_object(
+            'default',
+            namespace='inference-ns',
+            spec={'clusterQueue': 'inference-borrower'})
+        local_queue.update(local_queue_update)
+        self._patch_ready_kueue(monkeypatch, local_queue=local_queue)
 
         with pytest.raises(config_lib.KubernetesError, match=error_match):
             instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
-                'inference-ns', 'research', 'inference')
+                'inference-ns', 'research', 'default')
 
     def test_preflight_rejects_unverifiable_local_queue(self, monkeypatch):
+        self._patch_kueue_discovery(monkeypatch)
         custom_api = mock.MagicMock()
         custom_api.get_namespaced_custom_object.side_effect = (
             _make_api_exception(403, 'Forbidden'))
@@ -4336,9 +4495,10 @@ class TestRequiredKueueAdmission:
         with pytest.raises(config_lib.KubernetesError,
                            match='cannot prove that the queue is usable'):
             instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
-                'inference-ns', 'research', 'inference')
+                'inference-ns', 'research', 'default')
 
     def test_preflight_rejects_invalid_local_queue_response(self, monkeypatch):
+        self._patch_kueue_discovery(monkeypatch)
         custom_api = mock.MagicMock()
         custom_api.get_namespaced_custom_object.return_value = None
         monkeypatch.setattr(kubernetes, 'custom_objects_api',
@@ -4347,7 +4507,236 @@ class TestRequiredKueueAdmission:
         with pytest.raises(config_lib.KubernetesError,
                            match='returned an invalid response'):
             instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
-                'inference-ns', 'research', 'inference')
+                'inference-ns', 'research', 'default')
+
+    @pytest.mark.parametrize(('discovery_response', 'error_match'), [
+        (types.SimpleNamespace(groups=[]), 'does not serve a supported'),
+        (types.SimpleNamespace(groups=None), 'invalid API discovery response'),
+        (types.SimpleNamespace(groups=[
+            types.SimpleNamespace(
+                name='kueue.x-k8s.io',
+                versions=[types.SimpleNamespace(version='v1alpha1')])
+        ]), 'does not serve a supported'),
+    ])
+    def test_preflight_rejects_unsupported_or_malformed_discovery(
+            self, monkeypatch, discovery_response, error_match):
+        apis_api = mock.MagicMock()
+        apis_api.get_api_versions.return_value = discovery_response
+        monkeypatch.setattr(kubernetes, 'apis_api', lambda _context: apis_api)
+
+        with pytest.raises(config_lib.KubernetesError, match=error_match):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'default')
+
+    def test_preflight_rejects_unreadable_discovery(self, monkeypatch):
+        apis_api = mock.MagicMock()
+        apis_api.get_api_versions.side_effect = _make_api_exception(
+            403, 'Forbidden')
+        monkeypatch.setattr(kubernetes, 'apis_api', lambda _context: apis_api)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Failed to discover Kueue API versions'):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'default')
+
+    @pytest.mark.parametrize(('cluster_queue', 'error_match'), [
+        ({
+            'metadata': {
+                'name': 'inference-borrower',
+                'generation': 1,
+                'deletionTimestamp': '2026-08-10T00:00:00Z',
+            },
+            'spec': {
+                'namespaceSelector': {}
+            },
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'True',
+                    'observedGeneration': 1,
+                }]
+            },
+        }, 'is being deleted'),
+        ({
+            'metadata': {
+                'name': 'inference-borrower',
+                'generation': 1,
+            },
+            'spec': {
+                'namespaceSelector': {}
+            },
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'False',
+                    'observedGeneration': 1,
+                    'reason': 'FlavorNotFound',
+                }]
+            },
+        }, 'is not active'),
+        ({
+            'metadata': {
+                'name': 'inference-borrower',
+                'generation': 2,
+            },
+            'spec': {
+                'namespaceSelector': {}
+            },
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'True',
+                    'observedGeneration': 1,
+                }]
+            },
+        }, 'has stale Active status'),
+        ({
+            'metadata': {
+                'name': 'inference-borrower',
+                'generation': 1,
+            },
+            'spec': {
+                'namespaceSelector': {
+                    'matchLabels': {
+                        'kubernetes.io/metadata.name': 'research'
+                    }
+                }
+            },
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'True',
+                    'observedGeneration': 1,
+                }]
+            },
+        }, 'does not admit Namespace'),
+        ({
+            'metadata': {
+                'name': 'inference-borrower',
+                'generation': 1,
+            },
+            'spec': {},
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'True',
+                    'observedGeneration': 1,
+                }]
+            },
+        }, 'does not admit Namespace'),
+    ])
+    def test_preflight_rejects_unusable_cluster_queue(self, monkeypatch,
+                                                      cluster_queue,
+                                                      error_match):
+        self._patch_ready_kueue(monkeypatch, cluster_queue=cluster_queue)
+
+        with pytest.raises(config_lib.KubernetesError, match=error_match):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'default')
+
+    def test_preflight_rejects_unreadable_namespace(self, monkeypatch):
+        _, core_api = self._patch_ready_kueue(monkeypatch)
+        core_api.read_namespace.side_effect = _make_api_exception(
+            403, 'Forbidden')
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Failed to verify Namespace'):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'default')
+
+    @pytest.mark.parametrize(('selector', 'labels', 'expected'), [
+        ({}, {}, True),
+        (None, {}, False),
+        ({
+            'matchLabels': {
+                'team': 'inference'
+            }
+        }, {
+            'team': 'inference'
+        }, True),
+        ({
+            'matchLabels': {
+                'team': 'inference'
+            }
+        }, {
+            'team': 'research'
+        }, False),
+        ({
+            'matchExpressions': [{
+                'key': 'zone',
+                'operator': 'In',
+                'values': ['east', 'west'],
+            }]
+        }, {
+            'zone': 'west'
+        }, True),
+        ({
+            'matchExpressions': [{
+                'key': 'zone',
+                'operator': 'In',
+                'values': ['east'],
+            }]
+        }, {}, False),
+        ({
+            'matchExpressions': [{
+                'key': 'dedicated',
+                'operator': 'NotIn',
+                'values': ['research'],
+            }]
+        }, {}, True),
+        ({
+            'matchExpressions': [{
+                'key': 'dedicated',
+                'operator': 'NotIn',
+                'values': ['research'],
+            }]
+        }, {
+            'dedicated': 'research'
+        }, False),
+        ({
+            'matchExpressions': [{
+                'key': 'kueue-managed',
+                'operator': 'Exists',
+            }]
+        }, {
+            'kueue-managed': ''
+        }, True),
+        ({
+            'matchExpressions': [{
+                'key': 'kueue-managed',
+                'operator': 'Exists',
+            }]
+        }, {}, False),
+        ({
+            'matchExpressions': [{
+                'key': 'blocked',
+                'operator': 'DoesNotExist',
+            }]
+        }, {}, True),
+        ({
+            'matchExpressions': [{
+                'key': 'blocked',
+                'operator': 'DoesNotExist',
+            }]
+        }, {
+            'blocked': 'true'
+        }, False),
+        ({
+            'matchExpressions': [{
+                'key': 'team',
+                'operator': 'Unknown',
+            }]
+        }, {
+            'team': 'inference'
+        }, False),
+    ])
+    def test_namespace_selector_semantics(self, selector, labels, expected):
+        assert instance._namespace_matches_kueue_selector(  # pylint: disable=protected-access
+            selector, labels) is expected
 
     def test_prepare_reasserts_server_owned_contract(self):
         pod_spec = {

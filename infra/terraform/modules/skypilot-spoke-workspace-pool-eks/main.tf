@@ -26,6 +26,10 @@ locals {
     for partition in local.partitions : partition.namespace => partition
     if trimspace(partition.pod_identity_role_arn) != ""
   }
+  kueue_partitions = {
+    for partition in local.partitions : partition.namespace => partition.kueue
+    if partition.kueue != null
+  }
 }
 
 # EKS access entries support cross-account principals within the active AWS
@@ -63,6 +67,7 @@ module "rbac" {
   manage_namespace     = each.value.manage_namespace
   service_account_name = each.value.pod_identity_service_account
   allow_pvc_read       = length(each.value.fsx_volumes) > 0
+  kueue                = each.value.kueue
 
   subjects = [{
     kind = "Group"

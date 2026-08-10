@@ -16,6 +16,9 @@ The module grants:
   protocol-v2 reserved fill deduplicate context aliases and fence retargeting;
 - namespaced pod lifecycle, exec, and port-forward permissions;
 - namespaced service lifecycle and event-list permissions;
+- optional exact-name `get` on one Kueue LocalQueue, ClusterQueue, and
+  partition Namespace, plus exact `GET /apis` and `GET /apis/`, for
+  control-plane preflight;
 - optional read-only access to persistent volume claims; and
 - a separate teardown-only role bound to the pool ServiceAccount, so a node can
   delete itself when its idle timer fires.
@@ -45,6 +48,10 @@ module "skypilot_spoke_workspace_pool_rbac" {
   namespace            = "skypilot-gpu"
   service_account_name = "skypilot-pool-sa"
   allow_pvc_read       = true
+  kueue = {
+    local_queue_name   = "default"
+    cluster_queue_name = "inference-borrower"
+  }
 
   subjects = [{
     kind = "Group"
@@ -75,6 +82,16 @@ or read of another Namespace is allowed.
 `subjects` accepts `User` and `Group` subjects. Service-account subjects are not
 accepted because Kubernetes role-binding service-account subjects also require
 an explicit namespace, which is not part of this module's public subject type.
+
+When `kueue` is non-null, the namespaced control-plane Role receives only `get`
+on the exact `localqueues.kueue.x-k8s.io` object. The ClusterRole receives only
+exact-name `get` on the referenced ClusterQueue and partition Namespace, which
+lets runtime preflight evaluate current queue policy without any list or
+mutation permission. It also receives non-resource `GET /apis` and
+`GET /apis/` so version discovery remains explicit across supported Kubernetes
+clients on clusters that do not grant the usual discovery role. The workload
+ServiceAccount's self-teardown Role receives no Kueue permission. Omitting the
+input creates no Kueue RBAC and is backward compatible.
 
 ### Node self-teardown
 
@@ -123,15 +140,15 @@ live namespace.
 ## Requirements
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.5.0 |
 | <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | >= 2.20 |
 
 ## Providers
 
 | Name | Version |
-|------|---------|
-| <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | >= 2.20 |
+| ---- | ------- |
+| <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | 3.2.1 |
 
 ## Modules
 
@@ -140,7 +157,7 @@ No modules.
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [kubernetes_cluster_role_binding_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_binding_v1) | resource |
 | [kubernetes_cluster_role_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_v1) | resource |
 | [kubernetes_namespace_v1.pool](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace_v1) | resource |
@@ -153,8 +170,9 @@ No modules.
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_allow_pvc_read"></a> [allow\_pvc\_read](#input\_allow\_pvc\_read) | Grant read (get/list) on persistentvolumeclaims in the namespace. Required when<br/>a tier mounts pre-existing PVCs (e.g. FSx): before creating the pod SkyPilot GETs<br/>each referenced claim to check its phase. Read-only — the PVCs are Terraform-<br/>provisioned, so SkyPilot never creates/deletes them. Leave false for tiers with<br/>no volumes (nothing to read). | `bool` | `false` | no |
+| <a name="input_kueue"></a> [kueue](#input\_kueue) | Optional Kueue objects that the SkyPilot control-plane subjects must<br/>preflight before launching a Pod. When set, grant only exact-name `get` on<br/>the namespaced LocalQueue, cluster-scoped ClusterQueue, and this Namespace,<br/>plus exact `GET /apis` and `GET /apis/` for served-version discovery. The<br/>workload ServiceAccount receives no Kueue permission. | <pre>object({<br/>    local_queue_name   = string<br/>    cluster_queue_name = string<br/>  })</pre> | `null` | no |
 | <a name="input_labels"></a> [labels](#input\_labels) | Extra labels applied to the RBAC objects. | `map(string)` | `{}` | no |
 | <a name="input_manage_namespace"></a> [manage\_namespace](#input\_manage\_namespace) | Create the namespace. Set false if it is provisioned elsewhere. | `bool` | `true` | no |
 | <a name="input_name"></a> [name](#input\_name) | Name for the RBAC objects (ClusterRole/Role/bindings). | `string` | `"skypilot-pool"` | no |
@@ -165,8 +183,9 @@ No modules.
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | <a name="output_cluster_role_name"></a> [cluster\_role\_name](#output\_cluster\_role\_name) | Name shared by the cluster role and its binding. |
+| <a name="output_kueue"></a> [kueue](#output\_kueue) | Exact Kueue LocalQueue and ClusterQueue names readable by the control-plane subjects, or null. |
 | <a name="output_namespace"></a> [namespace](#output\_namespace) | Namespace SkyPilot launches pool workloads into. |
 | <a name="output_role_name"></a> [role\_name](#output\_role\_name) | Name shared by the namespaced role and its binding. |
 | <a name="output_self_teardown_role_name"></a> [self\_teardown\_role\_name](#output\_self\_teardown\_role\_name) | Name shared by the pod ServiceAccount's self-teardown role and its binding<br/>-- the grant that lets a node honour `sky launch -i N --down`. |

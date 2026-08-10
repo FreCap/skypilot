@@ -1,7 +1,7 @@
 # Fail-closed Kueue management for Kubernetes pods
 
-- Status: Incident root cause proven; Phase 1 automatic enforcement and LocalQueue preflight implemented; cluster rollout pending
-- Last updated: 2026-08-09
+- Status: Incident root cause proven; Phase 1 merged; reusable LocalQueue and runtime drift defenses implemented and locally verified; cluster policy rollout pending
+- Last updated: 2026-08-10
 - Owners: SkyPilot Kubernetes and Serve
 
 ## Context
@@ -21,7 +21,8 @@ this gap: Kueue cannot reclaim quota from a workload it never managed.
 The 2026-08-08 Phoenix incident is now attributed to this gap from retained EKS
 audit records, Kueue Events, live cluster state, and an isolated reproduction:
 
-- Four 32-GPU research PyTorchJobs were created between 06:08 and 06:21 UTC.
+- Four 32-GPU research PyTorchJobs were created between 01:08 and 01:21 EST
+  (06:08--06:21 UTC).
   Kueue created their Workloads but created no Pods.  Repeated Workload Events
   said the `hyperpod` topology could not fit the pod sets because
   `nvidia.com/gpu` excluded 59--63 of 64 nodes.
@@ -34,12 +35,12 @@ audit records, Kueue Events, live cluster state, and an isolated reproduction:
   GPU bin-pack scheduler.  That had allowed scheduler-level preemption in older
   flows, but it could not help here: the higher-priority research Pods did not
   exist until Kueue admission, while Kueue could not evict Pods it did not own.
-- Simone's administrator identity deleted the 128 inference Pods from 10:13:39
-  through 10:14:22 UTC (06:13--06:14 Eastern daylight time).  Kueue reserved
-  quota and admitted all four research Workloads at 10:23:14 UTC, and their Pods
-  were created immediately.  This matches the 06:23 Slack update that the jobs
-  were running; it precedes the later 06:44 announcement that inference was
-  temporarily disabled.
+- Simone's administrator identity deleted the 128 inference Pods from 05:13:39
+  through 05:14:22 EST (10:13:39--10:14:22 UTC).  Kueue reserved quota and
+  admitted all four research Workloads at 05:23:14 EST (10:23:14 UTC), and
+  their Pods were created immediately.  This precedes the 06:23 EST Slack
+  update that the jobs were running and the later 06:44 EST announcement that
+  inference was temporarily disabled.
 - The reported 26 "fully GPU-free" nodes were a monitoring blind spot.  The
   list included the 16 nodes occupied by those 128 SkyPilot Pods.  It counted
   managed-job GPU requests but omitted the direct inference Pods.
@@ -62,7 +63,7 @@ Kueue's plain-Pod protocol gives us a strong admission boundary:
 
 References:
 
-- [Kueue plain Pods](https://kueue.sigs.k8s.io/v0.19/docs/tasks/run/plain_pods/)
+- [Kueue plain Pods](https://kueue.sigs.k8s.io/v0.18/docs/tasks/run/plain_pods/)
 - [Kueue WorkloadPriorityClass](https://kueue.sigs.k8s.io/docs/concepts/workload_priority_class/)
 - [Kueue preemption](https://kueue.sigs.k8s.io/docs/concepts/preemption/)
 - [Default LocalQueue](https://kueue.sigs.k8s.io/docs/tasks/manage/enforce_job_management/setup_default_local_queue/)
@@ -73,8 +74,9 @@ References:
   configured, without requiring a second opt-in flag.
 - Fail closed when the Kueue webhook or plain-Pod integration is missing or
   mis-scoped: an unverified Pod must not reach a GPU.
-- Fail immediately, before any Pod operation, when the selected LocalQueue is
-  missing, inactive, unreconciled, or cannot be verified.
+- Fail immediately, before any Pod operation, when the selected LocalQueue or
+  its ClusterQueue is missing, inactive, unreconciled, namespace-ineligible,
+  or cannot be verified.
 - Make the effective queue a server-owned placement decision in required mode.
 - Map SkyPilot's named resource `priority_class` to Kueue's
   WorkloadPriorityClass in required mode.
@@ -84,8 +86,10 @@ References:
 
 ## Non-goals
 
-- Installing Kueue, creating LocalQueues, or choosing ClusterQueue quotas from
-  SkyPilot.
+- Installing Kueue or choosing ClusterQueue quota, cohort, namespace-selection,
+  or preemption policy from SkyPilot.  The reusable infrastructure module may
+  create a namespaced LocalQueue only when the operator explicitly names both
+  that LocalQueue and its already-designed ClusterQueue.
 - Defining a cluster's preemption or cohort policy.  SkyPilot can attest that a
   workload is governed; the cluster operator still owns who may preempt whom.
 - Converting the SkyServe controller, managed-jobs controller, or other SkyPilot
@@ -106,7 +110,7 @@ kubernetes:
     research-phx:
       namespace: rescluster-k8s-prod-east1-preemptible-inference
       kueue:
-        local_queue_name: inference
+        local_queue_name: default
 ```
 
 `kubernetes.quota.queue` remains an equivalent queue-name spelling.  Resolution
@@ -161,6 +165,64 @@ SkyPilot's high-availability Deployment path.  SkyPilot system controllers are
 unaffected because their launch context removes both the queue and the explicit
 strict assertion.
 
+The reusable EKS spoke-workspace module exposes the corresponding cluster-side
+contract as an optional object on each partition:
+
+```hcl
+partitions = [{
+  namespace = "inference"
+  kueue = {
+    cluster_queue_name = "inference-borrower"
+  }
+}]
+```
+
+`local_queue_name` is optional and defaults to the literal `default`.  Kueue
+0.18's GA LocalQueue defaulting then injects the queue label for otherwise
+unlabelled integrated Pods before validation, while the admission policy
+requires both that exact label and the `managed=true` value normally added by
+Kueue.  An ordinary client that omitted Kueue metadata is therefore auto-fixed,
+or denied if the webhook/defaulting path is unavailable.  These writable labels
+are not cryptographic admission provenance against a namespace writer that
+deliberately forges both values; strict SkyPilot closes that threat by stripping
+the managed label, adding the scheduling gate, and attesting the create
+response.  A non-default name is supported as an explicit loss of the
+queue-label auto-fix behavior, without weakening strict SkyPilot.
+
+Supplying the object creates only the namespace-local LocalQueue, grants the
+SkyPilot control-plane subject `get` on that exact LocalQueue, and installs a
+fail-closed Pod admission rule requiring that exact queue label and managed
+value.  Before creation, the module reads the named ClusterQueue
+and accepts only a selector that is explicitly empty (all namespaces) or
+consists solely of
+`kubernetes.io/metadata.name=<partition namespace>`.  This deliberately
+conservative subset is mechanically provable without guessing external
+namespace labels.  It then waits for the LocalQueue's `Active=True` condition.
+
+The selector check is necessary because Kueue 0.18 defines LocalQueue
+`Active=True` only in terms of the referenced ClusterQueue's active condition;
+the scheduler checks the ClusterQueue namespace selector later.  A queue can
+therefore look active while every Workload from its namespace remains
+inadmissible.  `Active=True` alone is not the module readiness contract.
+
+The module does not install Kueue, create or mutate a ClusterQueue, infer a
+queue from cluster discovery, or grant this read to the workload Pod
+ServiceAccount.  An absent object creates no Kueue resources, admission rules,
+or RBAC, preserving existing callers.  A missing CRD or ClusterQueue,
+inaccessible cluster, selector mismatch, inactive queue, or ownership conflict
+fails the Terraform plan/apply rather than publishing a usable-looking
+partition.
+
+The resulting queue name remains explicit in server-owned workspace
+configuration.  The control-plane and spoke stacks cannot safely auto-wire
+that output: the control-plane identity is a prerequisite for creating each
+spoke, so a reverse dependency would form a deployment cycle.  The Boltz
+rollout will use the deterministic `default` name in both research contexts and
+repeat it in the two inference workspaces; CI must check that equality.  If the
+server setting is accidentally omitted, LocalQueue defaulting plus the managed
+Pod admission policy still prevents an unmanaged Pod, but SkyPilot's gang
+metadata and synchronous attestation require the explicit setting.
+
 ## Architecture and invariants
 
 ```text
@@ -172,7 +234,9 @@ render queue + derived strict mode + workload priority
         v
 preflight namespace-local LocalQueue
   - object exists
-  - Active=True
+  - current-generation Active=True
+  - target ClusterQueue exists and is current-generation Active=True
+  - target ClusterQueue selector matches the current Namespace
   - read is authorized
         |
         v
@@ -194,7 +258,8 @@ The following invariants hold whenever an effective queue exists or
 
 - No newly created, unattested SkyPilot Pod can be scheduled.
 - No Pod reconciliation or mutation begins unless the selected LocalQueue has
-  been read successfully and reports `Active=True`.
+  been read successfully, both queue conditions are current and active, and the
+  current Namespace still matches the target ClusterQueue selector.
 - A configured queue cannot silently remain best effort because
   `require_managed` was omitted or set to false.
 - A request cannot redirect a strict placement to another LocalQueue through
@@ -224,21 +289,36 @@ Strict SkyPilot support is only one half of the production guarantee.  Before a
 shared inference placement is enabled, the cluster must provide:
 
 1. Kueue plain-Pod integration for the inference namespace.
-2. The configured LocalQueue in that namespace.  A LocalQueue named `default`
-   is recommended as defense in depth for older or non-SkyPilot clients that
-   omit the queue label.
+2. The configured LocalQueue in that namespace.  The reusable module defaults
+   its name to `default`, activating Kueue's GA queue-label defaulting as defense
+   in depth for older or non-SkyPilot clients that omit the label.
 3. Permission for the Kubernetes identity used by SkyPilot provisioning to
-   `get` `localqueues.kueue.x-k8s.io` in that namespace.  Inability to perform
-   this read is intentionally a fail-closed launch error.
-4. A low WorkloadPriorityClass for inference and a higher class for research.
-5. One verified preemption domain:
+   `get` `localqueues.kueue.x-k8s.io` in that namespace and exact `GET /apis`
+   plus `GET /apis/` for served-version discovery.  Inability to perform these
+   reads is intentionally a fail-closed launch error.
+4. Exact-name `get` permission on the referenced ClusterQueue and current
+   Namespace, so runtime preflight can catch queue-policy drift after Terraform
+   apply without granting enumeration or mutation.
+5. A fail-closed namespaced admission rule requiring the configured queue label
+   and `managed=true` value on every direct Pod.  This protects older SkyPilot
+   clients and ordinary direct Pod submitters that do not implement synchronous
+   create-response attestation, including accidental webhook omission or
+   mis-scoping.  Because Kubernetes labels are user-writable, strict SkyPilot's
+   strip/gate/create-response attestation remains the boundary against a
+   deliberate forgery.  The reusable module owns the Pod-specific rule
+   automatically.
+6. A lower Kueue workload priority for inference than research.  Kueue uses an
+   explicit WorkloadPriorityClass label when supplied; otherwise it derives the
+   Workload priority from the Pod's Kubernetes PriorityClass.  The Boltz
+   inference partition already creates and admission-enforces a `-1000`
+   Kubernetes PriorityClass, so the initial rollout deliberately uses that
+   verified fallback and does not require a service-YAML change or a redundant
+   same-name WorkloadPriorityClass.
+7. One verified preemption domain:
    - preferably the same ClusterQueue with `withinClusterQueue: LowerPriority`;
      or
    - ClusterQueues in the same Cohort with reclaim/borrow preemption configured
      and tested.
-6. An admission policy rejecting GPU Pods in the inference namespace when they
-   omit the required Kueue queue metadata.  This protects the cluster from
-   clients that predate SkyPilot's required mode.
 
 The HyperPod task-governance add-on owns its generated Kueue objects.  Rollout
 must use supported add-on inputs or separately owned objects that the add-on
@@ -263,6 +343,10 @@ the Kueue preemption smoke test passes.
   Kubernetes provider config.
 - Preflight the selected LocalQueue and require `Active=True` before any Pod
   query, cleanup, adoption, or creation.
+- Discover Kueue API v1beta2 with a v1beta1 fallback, then follow the LocalQueue
+  reference to the ClusterQueue and validate current-generation activity plus
+  the full Kubernetes Namespace selector on every launch.  This catches policy
+  drift that occurs after the infrastructure apply.
 - Gate, normalize, attest, and clean up direct Pods in the provisioner.
 - Reject the Deployment path in required mode.
 - Extend config, request-sanitization, template, and provisioning unit tests.
@@ -270,9 +354,21 @@ the Kueue preemption smoke test passes.
 
 ### Phase 2: cluster policy rollout
 
-- Provision the inference LocalQueue and WorkloadPriorityClass.
+- Add the optional per-partition Kueue contract to the reusable EKS spoke
+  module.  It validates the existing ClusterQueue's namespace selector,
+  provisions the LocalQueue, waits for `Active=True`, adds exact-name read RBAC
+  and exact-queue/managed Pod admission, adds the runtime preflight's exact-name
+  ClusterQueue/Namespace reads and both exact API-discovery-root spellings, and
+  outputs the queue mapping.  The LocalQueue name defaults to `default` for
+  Kueue webhook auto-fix behavior.
+- Provision an operator-owned inference admission domain.  The referenced
+  ClusterQueue must already select the inference namespace and implement the
+  reviewed quota/cohort/preemption policy; the module must not infer it.
+- Retain the existing admission-enforced `-1000` Kubernetes PriorityClass as
+  both Pod and Kueue Workload priority for the initial Boltz rollout.
 - Connect inference and research to a tested preemption domain.
-- Add namespace-level defaulting/admission enforcement.
+- Expand queue-label admission to non-Pod workload kinds where each cluster's
+  Kueue installation supports them.
 - Configure the SkyPilot workspace/context with the inference LocalQueue;
   `require_managed: true` may be retained as an explicit assertion.
 - Keep the shared research placement disabled until the rollout gates pass.
@@ -290,8 +386,29 @@ the Kueue preemption smoke test passes.
 SkyPilot code can deploy before cluster activation because placements without
 an effective queue remain unchanged.  Cluster resources and server-owned queue
 config are deployed next, while the shared inference placement remains
-disabled.  The cluster rollout must grant the SkyPilot provisioning identity
-read access to LocalQueues before adding the queue to server-owned config.
+disabled.  The expanded-runtime release and module RBAC must be deployed before
+adding the queue to server-owned config; older module RBAC lacks the exact
+ClusterQueue, Namespace, and API-discovery reads and will correctly fail closed.
+
+For module-managed partitions, apply ordering is:
+
+1. Provision or update the operator-owned ClusterQueue/preemption domain.
+2. Disable new unmanaged inference placement and drain/down existing inference
+   Pods.  The module's admission policy covers both creates and updates, so it
+   must not be activated while legacy unlabeled Pods still need mutation.
+3. Apply the spoke partition's `kueue` object.  Terraform creates the
+   LocalQueue only after validating the ClusterQueue selector, waits for
+   `Active=True`, and installs exact-name read RBAC plus exact-queue Pod
+   admission.  Import an existing LocalQueue only if it already references the
+   intended ClusterQueue; drain and replace rather than retarget it in place.
+4. Verify the module output and a direct authorization check.
+5. Add the identical queue name to the server-owned inference workspace.
+6. Run the canary and only then re-enable shared placement.
+
+An unused LocalQueue does not affect existing Pods, but the exact-queue
+admission binding deliberately does.  The drain in step 2 is therefore a hard
+gate, not optional cleanup.  Reversing steps 3 and 5 is safe but unavailable,
+because the runtime preflight fails closed until the queue becomes active.
 
 Activation is per workspace/context.  Adding a queue (or enabling the explicit
 assertion) on a context with existing ordinary Pods intentionally makes those
@@ -304,13 +421,37 @@ Rollback order is the reverse:
 2. Remove the queue from the server-owned placement if SkyPilot must
    temporarily return to unqueued behavior.  Setting `require_managed: false`
    alone does not bypass management for a queued placement.
-3. Only then remove separately owned Kueue policy objects.
+3. Remove the partition's `kueue` object and apply the spoke stack while the
+   referenced ClusterQueue and Kueue CRDs still exist.  This destroys the
+   module-owned binding, policy, LocalQueue, and extra RBAC cleanly.
+4. Only then remove the separately owned ClusterQueue or uninstall Kueue.
 
 Do not remove Kueue policy while strict mode and the shared placement remain
 enabled.  Strict mode would safely stop new Pods, but the service would be
 unavailable and continuously attempt recovery.
 
 ## Verification evidence and test plan
+
+The reusable module and expanded runtime drift contract were verified on
+2026-08-10:
+
+- The EKS spoke module's native Terraform test suite passed 37/37 tests.  It
+  covers no-op compatibility, default LocalQueue creation and readiness,
+  ClusterQueue activity and selector rejection, exact managed-Pod admission,
+  outputs, and partition validation.
+- The shared Kubernetes RBAC module's native Terraform test suite passed 15/15
+  tests.  It proves exact-name LocalQueue, ClusterQueue, and Namespace reads,
+  exact `/apis` and `/apis/` discovery roots, no broad Kueue verbs, and no Kueue
+  permission on the workload ServiceAccount.
+- The focused Kueue runtime selection passed 39 tests, and the complete
+  `tests/unit_tests/kubernetes/test_provision.py` file passed 197 tests.  The
+  added cases cover API-version fallback, LocalQueue and ClusterQueue deletion,
+  stale or inactive status, unreadable Namespace state, nil/mismatching/full
+  selector semantics, and fail-before-Pod ordering.
+- YAPF and isort completed, mypy reported no issues across 887 source files,
+  and `git diff --check` passed.  The repository formatter's Pylint pass over
+  the legacy provisioner test file continues to report that file's existing
+  warnings; changed production modules have no new Pylint finding.
 
 The LocalQueue preflight follow-up was verified on 2026-08-09:
 
@@ -360,7 +501,7 @@ Three candidate causes were tested independently:
    `QuotaReserved=False, reason=Inadmissible` and message `ClusterQueue ... is
    inactive`.  Restoring `stopPolicy: None` admitted it.  Production did not
    have this signature: the controller recorded 8,227 successful leader-lease
-   updates from 05:50 through 10:25 UTC, with no gap above four seconds, and no
+   updates from 00:50 through 05:25 EST, with no gap above four seconds, and no
    controller restart or queue-spec write released the jobs.
 2. **Nominal Kueue quota exhaustion.**  Two 10-millicore Pods behind a
    10-millicore test ClusterQueue produced `insufficient unused quota for cpu
@@ -437,12 +578,28 @@ inference Pods, Workloads, or stuck Kueue finalizers remain.
 
 ## Open gates
 
-- The live HyperPod-owned research ClusterQueue and its preemption policy have
-  been confirmed.  The supported add-on customization surface for adding the
-  inference queue/priority class without later reconciliation overwriting it
-  must still be confirmed before Phase 2.
-- The cluster-side LocalQueue, WorkloadPriorityClass, and admission policy need
-  platform design approval before implementation.
+- East1 live inspection on 2026-08-10 confirmed TAS disabled, plain-Pod
+  integration enabled, an active research LocalQueue/ClusterQueue, no
+  LocalQueue in the inference namespace, and no LocalQueue read permission for
+  the SkyPilot provisioning subject.  The research ClusterQueue's namespace
+  selector excludes the inference namespace, so pointing a new LocalQueue at
+  it could report `Active=True` while all inference Workloads remain
+  inadmissible; it is not an activation path.
+- Current platform main reverted the attempted Phoenix TAS disable and keeps
+  TAS enabled: disabling only the primary feature gate left dependent Kueue
+  0.18 beta gates enabled and made the controller configuration invalid.  The
+  checked-in and live research ClusterQueue still selects only
+  `hyperpod-ns-research`.  AWS EKS metadata reports the managed task-governance
+  add-on, so a standalone inference queue must use a separately owned name and
+  must not overwrite an add-on-generated object.
+- Each cluster needs an operator-owned inference ClusterQueue or other durable,
+  supported preemption-domain change that admits the inference namespace.  Do
+  not patch the HyperPod add-on's generated east1 ClusterQueue in place.
+- The reusable module's direct-Pod admission rule covers SkyPilot pool Pods.
+  Cluster-wide policy for other workload kinds remains owned by the Kueue
+  installation; Phoenix already ships such a policy behind its own namespace
+  label, while east1 needs an independently owned equivalent if non-Pod clients
+  are admitted there.
 - The research-over-inference preemption smoke test must pass before Phoenix is
   re-enabled for SkyServe.
 

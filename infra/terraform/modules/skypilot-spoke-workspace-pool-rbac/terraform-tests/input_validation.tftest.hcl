@@ -94,3 +94,42 @@ run "rejects_the_wrong_rbac_api_group" {
 
   expect_failures = [var.subjects]
 }
+
+run "rejects_a_blank_local_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = ""
+      cluster_queue_name = "inference"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}
+
+run "rejects_an_invalid_local_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "Invalid_Queue"
+      cluster_queue_name = "inference"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}
+
+run "rejects_an_invalid_cluster_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "Invalid_Queue"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}

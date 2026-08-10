@@ -31,3 +31,14 @@ output "priority_classes" {
   description = "Partition namespace to enforced PriorityClass name mapping."
   value       = { for namespace, priority in local.priority_partitions : namespace => priority.name }
 }
+
+output "kueue_local_queues" {
+  description = "Active Kueue LocalQueues created for configured partitions."
+  value = {
+    for namespace, queue in local.kueue_partitions : namespace => {
+      local_queue_name   = queue.local_queue_name
+      cluster_queue_name = queue.cluster_queue_name
+      api_version        = "kueue.x-k8s.io/v1beta2"
+    }
+  }
+}
