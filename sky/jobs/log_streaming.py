@@ -229,24 +229,34 @@ def _render_stopped_snapshot_logs(
     *,
     task_filter: str | int | None,
     filtered_task_id: int | None,
+    filtered_lookup: managed_job_state.TaskLogStreamLookup | None = None,
     num_tasks: int | None,
     tail: int | None,
     tail_offset: int | None,
 ) -> tuple[str, int]:
     """Render cached logs for a snapshot that should stop active following."""
+    terminal_task_info: typing.Sequence[tuple[
+        int,
+        str | None,
+        managed_job_state.ManagedJobStatus,
+        str | None,
+        float | None,
+    ]]
     job_msg = ''
     if managed_job_status.is_failed():
         job_msg = ('\nFailure reason: '
                    f'{managed_job_state.get_failure_reason(job_id)}')
     log_file_ever_existed = False
     if filtered_task_id is not None:
-        lookup = managed_job_state.get_task_log_stream_lookup(
-            job_id, filtered_task_id)
+        lookup = (filtered_lookup if filtered_lookup is not None else
+                  managed_job_state.get_task_log_stream_lookup(
+                      job_id, filtered_task_id))
         if lookup.snapshot.task_id is None:
             if num_tasks is None:
                 num_tasks = lookup.num_tasks
             assert task_filter is not None, filtered_task_id
             return _task_filter_not_found(job_id, task_filter, num_tasks)
+        assert lookup.snapshot.status is not None, (job_id, filtered_task_id)
         terminal_task_info = [(
             lookup.snapshot.task_id,
             lookup.snapshot.task_name,
@@ -452,9 +462,11 @@ def stream_logs_by_id(job_id: int,
     # This is used for running jobs to stream logs from the correct task
     filtered_task_id: int | None = None
     prefetched_snapshot: managed_job_state.JobLogStreamSnapshot | None = None
+    prefetched_lookup: managed_job_state.TaskLogStreamLookup | None = None
     if task is not None:
         if isinstance(task, int):
             lookup = managed_job_state.get_task_log_stream_lookup(job_id, task)
+            prefetched_lookup = lookup
             prefetched_snapshot = lookup.snapshot
             num_tasks = lookup.num_tasks
             if prefetched_snapshot.task_id is None:
@@ -466,6 +478,7 @@ def stream_logs_by_id(job_id: int,
         else:
             lookup = managed_job_state.get_task_log_stream_lookup_by_name(
                 job_id, task)
+            prefetched_lookup = lookup
             prefetched_snapshot = lookup.snapshot
             num_tasks = lookup.num_tasks
             if prefetched_snapshot.task_id is None:
@@ -545,14 +558,20 @@ def stream_logs_by_id(job_id: int,
                       f'{colorama.Style.RESET_ALL}')
 
         if not _should_keep_logging(managed_job_status):
+            initial_filtered_lookup = None
+            if (prefetched_lookup is not None and
+                    prefetched_lookup.snapshot == initial_snapshot):
+                initial_filtered_lookup = prefetched_lookup
             return _render_stopped_snapshot_logs(
                 job_id,
                 managed_job_status,
                 task_filter=task,
                 filtered_task_id=filtered_task_id,
+                filtered_lookup=initial_filtered_lookup,
                 num_tasks=num_tasks,
                 tail=tail,
                 tail_offset=tail_offset)
+        prefetched_lookup = None
         backend = backends.CloudVmRayBackend()
 
         while True:
@@ -592,9 +611,16 @@ def stream_logs_by_id(job_id: int,
             if (handle is None or managed_job_status
                     != managed_job_state.ManagedJobStatus.RUNNING):
                 if not follow:
+                    refreshed_lookup = None
                     if (handle is None and managed_job_status
                             == managed_job_state.ManagedJobStatus.RUNNING):
-                        refreshed_snapshot = get_stream_target_snapshot()
+                        if filtered_task_id is None:
+                            refreshed_snapshot = get_stream_target_snapshot()
+                        else:
+                            refreshed_lookup = (
+                                managed_job_state.get_task_log_stream_lookup(
+                                    job_id, filtered_task_id))
+                            refreshed_snapshot = refreshed_lookup.snapshot
                         refreshed_status = refreshed_snapshot.status
                         assert refreshed_status is not None, (
                             job_id, refreshed_snapshot)
@@ -604,6 +630,7 @@ def stream_logs_by_id(job_id: int,
                                 refreshed_status,
                                 task_filter=task,
                                 filtered_task_id=filtered_task_id,
+                                filtered_lookup=refreshed_lookup,
                                 num_tasks=num_tasks,
                                 tail=tail,
                                 tail_offset=tail_offset)

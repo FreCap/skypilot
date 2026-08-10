@@ -689,9 +689,7 @@ class TestStreamLogsByIdLifecycle:
 
         assert 'terminal state SUCCEEDED' in message
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
-        assert lookup_read.call_args_list == [
-            mock.call(42, 0), mock.call(42, 0)
-        ]
+        lookup_read.assert_called_once_with(42, 0)
         assert backend.tail_calls == 0
         assert backend.status_calls == 0
 
@@ -1090,7 +1088,7 @@ class TestStreamLogsByIdLifecycle:
         status_read.assert_not_called()
         snapshot_read.assert_not_called()
         lookup_by_name_read.assert_called_once_with(42, 'eval')
-        lookup_by_id_read.assert_called_once_with(42, 1)
+        lookup_by_id_read.assert_not_called()
         sleep.assert_not_called()
 
     def test_terminal_task_id_filter_skips_whole_task_scan(
@@ -1144,31 +1142,25 @@ class TestStreamLogsByIdLifecycle:
 
         assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
-        assert lookup_read.call_args_list == [
-            mock.call(42, 1), mock.call(42, 1)
-        ]
+        lookup_read.assert_called_once_with(42, 1)
         sleep.assert_not_called()
 
-    def test_terminal_task_id_filter_preserves_missing_job(self, monkeypatch):
+    def test_terminal_task_id_filter_keeps_initial_lookup_across_cleanup_race(
+            self, monkeypatch, tmp_path):
         status_display = mock.MagicMock()
         status_display.__enter__.return_value = status_display
-        count_read = mock.Mock(return_value=0)
+        log_path = tmp_path / 'task.log'
+        log_path.write_text('finished\n', encoding='utf-8')
         lookup_read = mock.Mock(side_effect=[
             managed_job_state.TaskLogStreamLookup(
                 snapshot=managed_job_state.JobLogStreamSnapshot(
                     1, managed_job_state.ManagedJobStatus.SUCCEEDED, None, None,
                     None, 'eval'),
-                local_log_file=None,
+                local_log_file=str(log_path),
                 logs_cleaned_at=None,
                 num_tasks=1,
             ),
-            managed_job_state.TaskLogStreamLookup(
-                snapshot=managed_job_state.JobLogStreamSnapshot(
-                    None, None, None, None, None, None),
-                local_log_file=None,
-                logs_cleaned_at=None,
-                num_tasks=0,
-            ),
+            AssertionError('re-read filtered lookup after terminal snapshot'),
         ])
         sleep = mock.Mock()
 
@@ -1180,7 +1172,10 @@ class TestStreamLogsByIdLifecycle:
         monkeypatch.setattr(
             managed_job_state, 'get_all_task_ids_names_statuses_logs',
             mock.Mock(side_effect=AssertionError('whole-task scan used')))
-        monkeypatch.setattr(managed_job_state, 'get_num_tasks', count_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError(
+                'count query used on found task-id filter')))
         monkeypatch.setattr(
             managed_job_state, 'get_task_id_name_status_log',
             mock.Mock(side_effect=AssertionError('task row lookup used')))
@@ -1201,12 +1196,9 @@ class TestStreamLogsByIdLifecycle:
                                                           follow=False,
                                                           task=1)
 
-        assert message == 'No task found matching 1 in job 42. Valid task IDs are 0.'
-        assert exit_code == exceptions.JobExitCode.NOT_FOUND
-        assert lookup_read.call_args_list == [
-            mock.call(42, 1), mock.call(42, 1)
-        ]
-        count_read.assert_not_called()
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        lookup_read.assert_called_once_with(42, 1)
         sleep.assert_not_called()
 
     def test_terminal_task_filter_refreshes_snapshot_after_wait(
@@ -1271,6 +1263,84 @@ class TestStreamLogsByIdLifecycle:
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
         status_read.assert_not_called()
         lookup_by_name_read.assert_called_once_with(42, 'eval')
-        lookup_by_id_read.assert_called_once_with(42, 1)
+        lookup_by_id_read.assert_not_called()
         snapshot_read.assert_not_called()
         sleep.assert_not_called()
+
+    def test_no_follow_filtered_missing_handle_refresh_uses_one_lookup(
+            self, monkeypatch, tmp_path, capsys):
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        log_path = tmp_path / 'task.log'
+        log_path.write_text('finished\n', encoding='utf-8')
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        lookup_by_name_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, running, None, 'missing-cluster', None, 'eval'),
+                local_log_file=str(log_path),
+                logs_cleaned_at=None,
+                num_tasks=1,
+            ))
+        lookup_by_id_read = mock.Mock(
+            return_value=managed_job_state.TaskLogStreamLookup(
+                snapshot=managed_job_state.JobLogStreamSnapshot(
+                    1, succeeded, None, None, None, 'eval'),
+                local_log_file=str(log_path),
+                logs_cleaned_at=None,
+                num_tasks=1,
+            ))
+        backend = _FakeBackend()
+        handle_lookup = mock.Mock(return_value=None)
+        generate_cluster_name = mock.Mock(return_value='generated-cluster')
+        snapshot_read = mock.Mock(
+            side_effect=AssertionError('task snapshot poll used'))
+        sleep = mock.Mock(side_effect=AssertionError('snapshot mode waited'))
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(
+            managed_job_state, 'get_num_tasks',
+            mock.Mock(side_effect=AssertionError('whole-job count used')))
+        monkeypatch.setattr(
+            managed_job_state, 'get_status',
+            mock.Mock(side_effect=AssertionError('scalar status poll used')))
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_all_task_ids_names_statuses_logs',
+            mock.Mock(side_effect=AssertionError('whole-task scan used')))
+        monkeypatch.setattr(managed_job_state,
+                            'get_task_log_stream_lookup_by_name',
+                            lookup_by_name_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
+                            lookup_by_id_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils, 'generate_managed_job_cluster_name',
+                            generate_cluster_name)
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
+                            _FakeHandle)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', sleep)
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42,
+                                                          follow=False,
+                                                          task='eval')
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        lookup_by_name_read.assert_called_once_with(42, 'eval')
+        lookup_by_id_read.assert_called_once_with(42, 1)
+        generate_cluster_name.assert_called_once_with('eval', 42)
+        handle_lookup.assert_called_once_with('generated-cluster')
+        snapshot_read.assert_not_called()
+        sleep.assert_not_called()
+        assert 'Job finished (status: SUCCEEDED).' in capsys.readouterr().out
