@@ -131,7 +131,8 @@ def test_global_sweep_ignores_unproven_legacy_cluster_name(monkeypatch):
 def _wire_dead_controller(monkeypatch,
                           set_failed_calls,
                           job_done_calls,
-                          fresh_state=None):
+                          fresh_state=None,
+                          set_failed_return=True):
     _forbid_split_snapshot_helpers(monkeypatch)
     monkeypatch.setattr(managed_job_state,
                         'get_jobs_to_check_status_info',
@@ -143,9 +144,16 @@ def _wire_dead_controller(monkeypatch,
                         lambda job_id: fresh_state)
     monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
     monkeypatch.setattr(utils, 'terminate_cluster', lambda name: None)
+
+    def _set_failed(*args, **kwargs):
+        set_failed_calls.append((args, kwargs))
+        if callable(set_failed_return):
+            return set_failed_return(*args, **kwargs)
+        return set_failed_return
+
     monkeypatch.setattr(managed_job_state,
                         'set_failed_controller_if_current_snapshot',
-                        lambda *a, **k: set_failed_calls.append((a, k)) or True)
+                        _set_failed)
     monkeypatch.setattr(managed_job_state,
                         'finish_controller_cleanup_if_current_snapshot',
                         lambda *a, **k: job_done_calls.append((a, k)) or True)
@@ -180,6 +188,33 @@ def test_marks_failed_controller_when_no_restart(monkeypatch):
 
     assert len(set_failed_calls) == 1, (
         'a genuinely dead controller (no restart) must still fail the job')
+    assert len(job_done_calls) == 1
+
+
+def test_dead_controller_common_path_skips_fresh_status_reread(monkeypatch):
+    """The common dead-controller path should not pay for a fallback reread."""
+    set_failed_calls, job_done_calls = [], []
+    _forbid_split_snapshot_helpers(monkeypatch)
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: _make_status_check_info())
+    monkeypatch.setattr(
+        managed_job_state, 'get_job_status_check_state', lambda job_id:
+        (_ for _ in ()).throw(
+            AssertionError('successful CAS must not reread point status')))
+    monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
+    monkeypatch.setattr(utils, 'terminate_cluster', lambda name: None)
+    monkeypatch.setattr(managed_job_state,
+                        'set_failed_controller_if_current_snapshot',
+                        lambda *a, **k: set_failed_calls.append((a, k)) or True)
+    monkeypatch.setattr(managed_job_state,
+                        'finish_controller_cleanup_if_current_snapshot',
+                        lambda *a, **k: job_done_calls.append((a, k)) or True)
+    monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
+
+    utils.update_managed_jobs_statuses(job_ids=[1])
+
+    assert len(set_failed_calls) == 1
     assert len(job_done_calls) == 1
 
 
@@ -387,7 +422,8 @@ def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
                           job_done_calls,
                           fresh_state=_make_job_status_check_state(
                               managed_job_state.ManagedJobScheduleState.ALIVE,
-                              all_tasks_terminal=True))
+                              all_tasks_terminal=True),
+                          set_failed_return=False)
     monkeypatch.setattr(
         managed_job_state, 'get_managed_job_tasks', lambda job_id:
         (_ for _ in
@@ -412,8 +448,9 @@ def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
 
     assert cleanup_reads == [('job', 1)]
     assert terminated_clusters == ['job-1']
-    assert not set_failed_calls, (
-        'terminal task outcomes must survive controller death during cleanup')
+    assert len(set_failed_calls) == 1, (
+        'the refresh loop may attempt the atomic CAS once before the fallback '
+        'terminal snapshot proves the job already finished')
     assert len(job_done_calls) == 1
 
 
@@ -456,7 +493,8 @@ def test_defers_when_job_reset_for_recovery_midcycle(monkeypatch):
                           job_done_calls,
                           fresh_state=_make_job_status_check_state(
                               managed_job_state.ManagedJobScheduleState.WAITING,
-                              pid=None))
+                              pid=None),
+                          set_failed_return=False)
     cleanup_reads = []
     monkeypatch.setattr(
         utils, 'generate_managed_job_cluster_name',
@@ -468,7 +506,9 @@ def test_defers_when_job_reset_for_recovery_midcycle(monkeypatch):
 
     assert not cleanup_reads, (
         'cluster cleanup must not start for a job reset for recovery')
-    assert not set_failed_calls
+    assert len(set_failed_calls) == 1, (
+        'the refresh loop may attempt the atomic CAS once before the fallback '
+        'snapshot proves the job was reset for recovery')
     assert not job_done_calls
 
 
