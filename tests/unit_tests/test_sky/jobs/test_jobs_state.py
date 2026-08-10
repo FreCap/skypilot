@@ -1425,12 +1425,20 @@ class TestGetJobsStatusCheckInfo:
             assert entry['controller_pid_started_at'] == tasks[0].get(
                 'controller_pid_started_at')
             assert entry['pool'] == tasks[0].get('pool')
+            assert entry['workspace'] == tasks[0].get('workspace')
             # Per-task fields, same order.
             assert len(entry['tasks']) == len(tasks)
             for slim, full in zip(entry['tasks'], tasks):
                 assert slim['task_id'] == full['task_id']
                 assert slim['status'] == full['status']
                 assert slim['job_name'] == full['job_name']
+
+    def test_cancellation_snapshot_parity(self, _seed_test_jobs):
+        job_ids = list(_seed_test_jobs.values())
+        info = state.get_jobs_status_check_info(job_ids)
+
+        assert (state.get_job_cancellation_states_from_status_check_info(info)
+                == state.get_job_cancellation_states(job_ids))
 
     def test_job_name_is_public_name_not_task_name(self, _seed_test_jobs):
         # The seed sets job_info.name='test-job-a' but task_name='task0'.
