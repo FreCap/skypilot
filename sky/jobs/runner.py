@@ -1,10 +1,14 @@
 """Managed job runner: abstraction + registry.
 
 A ``ManagedJobRunner`` is the strategy object that the server's managed-job
-entry points (queue, cancel, tail_logs) delegate to. The registered runner decides
+entry points (queue, tail_logs) delegate to. The registered runner decides
 *how* the operation executes — the default runner generates Python code and
 runs it on the controller via subprocess, while a plugin-provided runner
 might call the managed jobs DB directly when the controller is in-process.
+
+Cancellation is deliberately not a runner operation: it speaks the skylet
+``CancelJobs`` gRPC endpoint directly (see ``sky.jobs.server.cancellation``),
+so there is a single cancel dispatch rather than one per transport.
 
 At most one runner is registered at a time. If nothing has registered,
 ``current()`` lazily constructs ``_DefaultManagedJobRunner`` from
@@ -56,21 +60,6 @@ class ManagedJobRunner(Protocol):
     ) -> tuple[list[dict[str, Any]], int,
                'managed_job_utils.ManagedJobQueueResultType', int, dict[str,
                                                                         int]]:
-        ...
-
-    def cancel_managed_jobs(
-        self,
-        *,
-        handle: 'backends.CloudVmRayResourceHandle',
-        backend: 'backends.CloudVmRayBackend',
-        all_users: bool,
-        all: bool,  # pylint: disable=redefined-builtin
-        job_ids: list[int] | None,
-        name: str | None,
-        pool: str | None,
-        graceful: bool,
-        graceful_timeout: int | None,
-    ) -> str:
         ...
 
     def tail_managed_job_logs(

@@ -1287,56 +1287,6 @@ def cancel_jobs_by_pool(pool_name: str,
     return cancel_jobs_by_id(job_ids, current_workspace=current_workspace)
 
 
-def cancel_managed_jobs(
-    *,
-    name: str | None = None,
-    job_ids: list[int] | None = None,
-    pool: str | None = None,
-    all: bool = False,  # pylint: disable=redefined-builtin
-    all_users: bool = False,
-    graceful: bool = False,
-    graceful_timeout: int | None = None,
-    current_workspace: str | None = None,
-    user_hash: str | None = None,
-) -> str:
-    """Dispatch to the correct cancel variant based on selector args.
-
-    One of ``job_ids``/``name``/``pool``/``all``/``all_users`` should be set.
-    Precedence:
-
-      - ``all_users`` or ``all`` or ``job_ids`` -> ``cancel_jobs_by_id``
-      - ``name`` -> ``cancel_job_by_name``
-      - ``pool`` -> ``cancel_jobs_by_pool``
-
-    Single source of truth for the dispatch precedence. Direct callers
-    (including plugins registering a custom ``ManagedJobRunner``) invoke
-    this function; the codegen path
-    (``ManagedJobCodeGen.cancel_managed_jobs``) also references it by
-    name on controllers running ``MANAGED_JOBS_VERSION >= 19``.
-    """
-    if all_users or all or job_ids:
-        return cancel_jobs_by_id(
-            job_ids,
-            all_users=all_users,
-            current_workspace=current_workspace,
-            user_hash=user_hash,
-            graceful=graceful,
-            graceful_timeout=graceful_timeout,
-        )
-    if name is not None:
-        return cancel_job_by_name(
-            name,
-            current_workspace=current_workspace,
-            graceful=graceful,
-            graceful_timeout=graceful_timeout,
-        )
-    assert pool is not None, (job_ids, name, pool, all)
-    return cancel_jobs_by_pool(
-        pool,
-        current_workspace=current_workspace,
-    )
-
-
 def _sync_log_streaming_facade() -> None:
     """Keep historical replaceable bindings effective after extraction."""
     managed_job_log_streaming.sync_facade(

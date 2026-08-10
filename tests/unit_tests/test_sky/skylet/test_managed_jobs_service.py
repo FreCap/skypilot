@@ -747,6 +747,80 @@ class TestCancelJobs:
         assert response.message.lower() == "no job to cancel."
         context_mock.abort.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ('criteria', 'cancel_fn'),
+        [
+            ('job_ids', 'cancel_jobs_by_id'),
+            ('job_name', 'cancel_job_by_name'),
+            ('all_users', 'cancel_jobs_by_id'),
+        ],
+    )
+    @pytest.mark.parametrize(('graceful', 'graceful_timeout'), [
+        (None, None),
+        (True, 45),
+        (False, None),
+    ])
+    def test_cancel_jobs_forwards_graceful_fields(self, criteria, cancel_fn,
+                                                  graceful, graceful_timeout):
+        """The servicer is the only cancel dispatch, so it must not drop
+        the graceful fields on any selector.
+
+        Unset proto fields must arrive as ``graceful=False`` /
+        ``graceful_timeout=None``, not as proto zero-values.
+        """
+        kwargs = {'current_workspace': 'ws1'}
+        if criteria == 'job_ids':
+            kwargs['job_ids'] = managed_jobsv1_pb2.JobIds(
+                ids=[self.job_ids['job_id1']])
+        elif criteria == 'job_name':
+            kwargs['job_name'] = 'test_job_1'
+        else:
+            kwargs['all_users'] = True
+        if graceful is not None:
+            kwargs['graceful'] = graceful
+        if graceful_timeout is not None:
+            kwargs['graceful_timeout'] = graceful_timeout
+
+        request = managed_jobsv1_pb2.CancelJobsRequest(**kwargs)
+        context_mock = mock.Mock()
+
+        with mock.patch.object(services.managed_job_utils,
+                               cancel_fn,
+                               return_value='cancelled') as cancel_mock:
+            response = self.service.CancelJobs(request, context_mock)
+
+        context_mock.abort.assert_not_called()
+        assert response.message == 'cancelled'
+        cancel_mock.assert_called_once()
+        forwarded = cancel_mock.call_args.kwargs
+        assert forwarded['graceful'] is bool(graceful)
+        assert forwarded['graceful_timeout'] == graceful_timeout
+
+    def test_cancel_jobs_by_pool_ignores_graceful_fields(self):
+        """Pool cancellation has no graceful variant.
+
+        ``cancel_jobs_by_pool`` takes no graceful arguments, so the servicer
+        must drop them rather than forward and raise ``TypeError``.
+        """
+        request = managed_jobsv1_pb2.CancelJobsRequest(
+            pool_name='test_pool',
+            current_workspace='ws1',
+            graceful=True,
+            graceful_timeout=45,
+        )
+        context_mock = mock.Mock()
+
+        with mock.patch.object(services.managed_job_utils,
+                               'cancel_jobs_by_pool',
+                               return_value='cancelled') as cancel_mock:
+            response = self.service.CancelJobs(request, context_mock)
+
+        context_mock.abort.assert_not_called()
+        assert response.message == 'cancelled'
+        forwarded = cancel_mock.call_args.kwargs
+        assert 'graceful' not in forwarded
+        assert 'graceful_timeout' not in forwarded
+
     def test_cancel_jobs_all_users_validation_error(self):
         """Test validation error when all_users=True but user_hash is provided (removed overly strict validation)."""
         # This test is now obsolete since we allow user_hash with all_users=True
