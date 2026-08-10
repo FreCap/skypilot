@@ -570,8 +570,9 @@ def test_postgres_controller_failure_decision_uses_live_generation(
     try:
         with _live_controller_generation(postgres_engine, instance_id,
                                          generation):
-            assert state.set_failed_controller_if_current_snapshot(
-                job_id, **snapshot, failure_reason='controller process died')
+            assert (state.set_failed_controller_if_current_snapshot(
+                job_id, **snapshot, failure_reason='controller process died') ==
+                    state.ControllerFailureDecision.TERMINALIZED)
             assert state.get_status(job_id) == (
                 state.ManagedJobStatus.FAILED_CONTROLLER)
             assert state.get_job_schedule_state(job_id) == (

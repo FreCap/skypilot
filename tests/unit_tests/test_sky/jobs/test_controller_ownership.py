@@ -291,8 +291,9 @@ class TestManagedJobControllerOwnership:
             'controller_generation': owner[1],
         }
 
-        assert state.set_failed_controller_if_current_snapshot(
-            job_id, **snapshot, failure_reason='controller died')
+        assert (state.set_failed_controller_if_current_snapshot(
+            job_id, **snapshot, failure_reason='controller died') ==
+                state.ControllerFailureDecision.TERMINALIZED)
         with state.orm.Session(_mock_managed_jobs_db_conn) as session:
             job_row = session.execute(
                 sqlalchemy.select(state.job_info_table.c.schedule_state).where(
@@ -364,8 +365,9 @@ class TestManagedJobControllerOwnership:
             'controller_generation': owner[1],
         }
 
-        assert state.set_failed_controller_if_current_snapshot(
-            job_id, **snapshot, failure_reason='controller died')
+        assert (state.set_failed_controller_if_current_snapshot(
+            job_id, **snapshot, failure_reason='controller died') ==
+                state.ControllerFailureDecision.TERMINALIZED)
         with state.orm.Session(_mock_managed_jobs_db_conn) as session:
             row = session.execute(
                 sqlalchemy.select(
@@ -376,6 +378,49 @@ class TestManagedJobControllerOwnership:
         assert row.status == state.ManagedJobStatus.FAILED_CONTROLLER.value
         assert row.failure_reason == (
             'controller died. Previously: older failure')
+
+    def test_failure_recheck_reports_already_terminal_without_rewrite(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        job_id = self._seed_waiting_job()
+        owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_pid=111,
+                    controller_pid_started_at=1.0,
+                    controller_instance_id=owner[0],
+                    controller_generation=owner[1]))
+            session.execute(state.spot_table.update().where(
+                state.spot_table.c.spot_job_id == job_id).values(
+                    status=state.ManagedJobStatus.SUCCEEDED.value,
+                    failure_reason=None,
+                    end_at=10.0))
+            session.commit()
+
+        monkeypatch.setattr(state, 'get_current_controller_owner',
+                            lambda: owner)
+        monkeypatch.setattr(state, '_lock_current_controller_owner',
+                            lambda _session, _owner: None)
+        snapshot = {
+            'schedule_state': state.ManagedJobScheduleState.ALIVE,
+            'controller_pid': 111,
+            'controller_pid_started_at': 1.0,
+            'controller_instance_id': owner[0],
+            'controller_generation': owner[1],
+        }
+
+        assert (state.set_failed_controller_if_current_snapshot(
+            job_id, **snapshot, failure_reason='controller died') ==
+                state.ControllerFailureDecision.ALREADY_TERMINAL)
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            row = session.execute(
+                sqlalchemy.select(
+                    state.spot_table.c.status,
+                    state.spot_table.c.failure_reason).where(
+                        state.spot_table.c.spot_job_id == job_id)).one()
+        assert row.status == state.ManagedJobStatus.SUCCEEDED.value
+        assert row.failure_reason is None
 
     def test_replacement_finishes_terminal_cleanup_from_stale_owner(
             self, _mock_managed_jobs_db_conn, monkeypatch):

@@ -4,6 +4,7 @@
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Collection
+import enum
 import json
 import time
 import typing
@@ -76,6 +77,13 @@ class TaskWaitStatusLookup(typing.NamedTuple):
     task_id: int | None
     status: ManagedJobStatus | None
     num_tasks: int
+
+
+class ControllerFailureDecision(enum.Enum):
+    """Exact dead-controller terminalization outcome for one snapshot."""
+    TERMINALIZED = 'terminalized'
+    ALREADY_TERMINAL = 'already_terminal'
+    STALE = 'stale'
 
 
 def get_current_controller_owner() -> tuple[str, int] | None:
@@ -1296,7 +1304,7 @@ def set_failed_controller_if_current_snapshot(
     controller_instance_id: str | None,
     controller_generation: int | None,
     failure_reason: str,
-) -> bool:
+) -> ControllerFailureDecision:
     """Terminalize an exact dead-controller snapshot before provider cleanup.
 
     The job's schedule state intentionally remains non-DONE. If this process
@@ -1307,7 +1315,7 @@ def set_failed_controller_if_current_snapshot(
     owner = get_current_controller_owner()
     recorded_owner = (controller_instance_id, controller_generation)
     if owner is not None and recorded_owner != owner:
-        return False
+        return ControllerFailureDecision.STALE
 
     terminal_status_values = [
         status.value for status in ManagedJobStatus.terminal_statuses()
@@ -1326,20 +1334,23 @@ def set_failed_controller_if_current_snapshot(
                 sqlalchemy.and_(*conditions)).with_for_update()).first()
         if job_row is None:
             session.rollback()
-            return False
+            return ControllerFailureDecision.STALE
 
         task_count, nonterminal_task_count, existing_reason = (
             _locked_task_recheck_summary(session, job_id,
                                          terminal_status_values))
-        if task_count == 0 or nonterminal_task_count == 0:
+        if task_count == 0:
             session.rollback()
-            return False
+            return ControllerFailureDecision.STALE
+        if nonterminal_task_count == 0:
+            session.rollback()
+            return ControllerFailureDecision.ALREADY_TERMINAL
 
         persisted_reason = failure_reason
         if existing_reason:
             persisted_reason += f'. Previously: {existing_reason}'
         end_time = time.time()
-        result = session.execute(
+        session.execute(
             sqlalchemy.update(spot_table).where(
                 spot_table.c.spot_job_id == job_id).values({
                     spot_table.c.status:
@@ -1353,7 +1364,7 @@ def set_failed_controller_if_current_snapshot(
                         spot_table.c.end_at, end_time),
                 }))
         session.commit()
-        return result.rowcount > 0
+        return ControllerFailureDecision.TERMINALIZED
 
 
 def finish_controller_cleanup_if_current_snapshot(
