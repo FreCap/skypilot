@@ -903,17 +903,25 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
         failure_message = (
             f'Controller process has exited abnormally ({failure_reason}). '
             f'For more details, run: sky jobs logs --controller {job_id}')
-        terminalized = (
+        failure_decision = (
             managed_job_state.set_failed_controller_if_current_snapshot(
                 job_id,
                 **_snapshot_kwargs(info),
                 failure_reason=failure_message))
-        if terminalized:
+        if (failure_decision ==
+                managed_job_state.ControllerFailureDecision.TERMINALIZED):
             # Terminal task state is the durable no-recovery decision. Provider
             # cleanup follows it so a handoff can retry teardown but cannot
             # relaunch the workload underneath an old generation's destructive
             # request.
             logger.info(failure_message)
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], info)
+            continue
+        if (failure_decision ==
+                managed_job_state.ControllerFailureDecision.ALREADY_TERMINAL):
+            logger.info(f'Job {job_id} already reached terminal task status; '
+                        'finalizing schedule state without rewriting the job '
+                        'to FAILED_CONTROLLER.')
             _finish_terminal_cleanup(job_id, tasks, info['pool'], info)
             continue
 
@@ -938,13 +946,6 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
         # cluster teardown. Preserve the terminal task outcome and only
         # finalize scheduler state; rewriting the job to FAILED_CONTROLLER here
         # would clobber a real SUCCEEDED/FAILED result with a cleanup crash.
-        if fresh_info['all_tasks_terminal']:
-            logger.info(f'Job {job_id} already reached terminal task status; '
-                        'finalizing schedule state without rewriting the job '
-                        'to FAILED_CONTROLLER.')
-            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
-            continue
-
         logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could '
                     'be committed; deferring cleanup.')
 

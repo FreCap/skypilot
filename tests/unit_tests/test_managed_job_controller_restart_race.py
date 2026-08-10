@@ -132,7 +132,8 @@ def _wire_dead_controller(monkeypatch,
                           set_failed_calls,
                           job_done_calls,
                           fresh_state=None,
-                          set_failed_return=True):
+                          set_failed_return=managed_job_state.
+                          ControllerFailureDecision.TERMINALIZED):
     _forbid_split_snapshot_helpers(monkeypatch)
     monkeypatch.setattr(managed_job_state,
                         'get_jobs_to_check_status_info',
@@ -149,6 +150,10 @@ def _wire_dead_controller(monkeypatch,
         set_failed_calls.append((args, kwargs))
         if callable(set_failed_return):
             return set_failed_return(*args, **kwargs)
+        if set_failed_return is True:
+            return managed_job_state.ControllerFailureDecision.TERMINALIZED
+        if set_failed_return is False:
+            return managed_job_state.ControllerFailureDecision.STALE
         return set_failed_return
 
     monkeypatch.setattr(managed_job_state,
@@ -204,9 +209,10 @@ def test_dead_controller_common_path_skips_fresh_status_reread(monkeypatch):
             AssertionError('successful CAS must not reread point status')))
     monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
     monkeypatch.setattr(utils, 'terminate_cluster', lambda name: None)
-    monkeypatch.setattr(managed_job_state,
-                        'set_failed_controller_if_current_snapshot',
-                        lambda *a, **k: set_failed_calls.append((a, k)) or True)
+    monkeypatch.setattr(
+        managed_job_state, 'set_failed_controller_if_current_snapshot',
+        lambda *a, **k: set_failed_calls.append(
+            (a, k)) or managed_job_state.ControllerFailureDecision.TERMINALIZED)
     monkeypatch.setattr(managed_job_state,
                         'finish_controller_cleanup_if_current_snapshot',
                         lambda *a, **k: job_done_calls.append((a, k)) or True)
@@ -231,9 +237,10 @@ def test_terminal_decision_precedes_provider_cleanup_and_done(monkeypatch):
             managed_job_state.ManagedJobScheduleState.ALIVE))
     monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
-    monkeypatch.setattr(managed_job_state,
-                        'set_failed_controller_if_current_snapshot',
-                        lambda *a, **k: order.append('terminalize') or True)
+    monkeypatch.setattr(
+        managed_job_state, 'set_failed_controller_if_current_snapshot',
+        lambda *a, **k: order.append('terminalize') or managed_job_state.
+        ControllerFailureDecision.TERMINALIZED)
     monkeypatch.setattr(
         utils, 'terminate_cluster',
         lambda cluster_name: order.append(f'terminate:{cluster_name}'))
@@ -417,17 +424,23 @@ def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
     only finalize the scheduler state.
     """
     set_failed_calls, job_done_calls = [], []
-    _wire_dead_controller(monkeypatch,
-                          set_failed_calls,
-                          job_done_calls,
-                          fresh_state=_make_job_status_check_state(
-                              managed_job_state.ManagedJobScheduleState.ALIVE,
-                              all_tasks_terminal=True),
-                          set_failed_return=False)
+    _forbid_split_snapshot_helpers(monkeypatch)
+    monkeypatch.setattr(managed_job_state,
+                        'get_jobs_to_check_status_info',
+                        lambda job_id=None: _make_status_check_info())
     monkeypatch.setattr(
-        managed_job_state, 'get_managed_job_tasks', lambda job_id:
-        (_ for _ in
-         ()).throw(AssertionError('must stay on the slim recheck path')))
+        managed_job_state, 'get_job_status_check_state', lambda job_id:
+        (_ for _ in ()).throw(
+            AssertionError('already-terminal decision must not reread point '
+                           'status')))
+    monkeypatch.setattr(utils, 'controller_process_alive', lambda record: False)
+    monkeypatch.setattr(
+        managed_job_state, 'set_failed_controller_if_current_snapshot',
+        lambda *a, **k: set_failed_calls.append((a, k)) or managed_job_state.
+        ControllerFailureDecision.ALREADY_TERMINAL)
+    monkeypatch.setattr(managed_job_state,
+                        'finish_controller_cleanup_if_current_snapshot',
+                        lambda *a, **k: job_done_calls.append((a, k)) or True)
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
     cleanup_reads = []
 
@@ -449,8 +462,8 @@ def test_terminal_job_preserves_status_when_controller_dies_during_cleanup(
     assert cleanup_reads == [('job', 1)]
     assert terminated_clusters == ['job-1']
     assert len(set_failed_calls) == 1, (
-        'the refresh loop may attempt the atomic CAS once before the fallback '
-        'terminal snapshot proves the job already finished')
+        'the refresh loop should use the exact terminal decision from the '
+        'atomic state recheck once')
     assert len(job_done_calls) == 1
 
 
@@ -538,9 +551,10 @@ def test_stale_outer_generation_is_recovered_not_failed(monkeypatch):
     monkeypatch.setattr(
         utils, 'terminate_cluster', lambda name: (_ for _ in ()).throw(
             AssertionError('stale ownership must not tear down the workload')))
-    monkeypatch.setattr(managed_job_state,
-                        'set_failed_controller_if_current_snapshot',
-                        lambda *a, **k: set_failed_calls.append((a, k)) or True)
+    monkeypatch.setattr(
+        managed_job_state, 'set_failed_controller_if_current_snapshot',
+        lambda *a, **k: set_failed_calls.append(
+            (a, k)) or managed_job_state.ControllerFailureDecision.TERMINALIZED)
     monkeypatch.setattr(managed_job_state,
                         'finish_controller_cleanup_if_current_snapshot',
                         lambda *a, **k: job_done_calls.append((a, k)) or True)
@@ -642,9 +656,10 @@ def test_pending_job_skips_controller_status_read(monkeypatch, schedule_state):
         'get_jobs_to_check_status_info',
         lambda job_id=None: _make_pending_status_check_info(schedule_state))
     monkeypatch.setattr(job_lib, 'get_status', _record_get_status)
-    monkeypatch.setattr(managed_job_state,
-                        'set_failed_controller_if_current_snapshot',
-                        lambda *a, **k: set_failed_calls.append((a, k)) or True)
+    monkeypatch.setattr(
+        managed_job_state, 'set_failed_controller_if_current_snapshot',
+        lambda *a, **k: set_failed_calls.append(
+            (a, k)) or managed_job_state.ControllerFailureDecision.TERMINALIZED)
     monkeypatch.setattr(utils, '_controller_is_restarting', lambda: False)
 
     utils.update_managed_jobs_statuses(job_ids=[1])
@@ -707,9 +722,10 @@ def test_cleanup_uses_task_name_identity_for_multi_task_jobs(monkeypatch):
         utils, 'generate_managed_job_cluster_name', lambda task_name, job_id:
         seen_task_names.append(task_name) or f'{task_name}-{job_id}')
     monkeypatch.setattr(utils, 'terminate_cluster', lambda cluster_name: None)
-    monkeypatch.setattr(managed_job_state,
-                        'set_failed_controller_if_current_snapshot',
-                        lambda *a, **k: set_failed_calls.append((a, k)) or True)
+    monkeypatch.setattr(
+        managed_job_state, 'set_failed_controller_if_current_snapshot',
+        lambda *a, **k: set_failed_calls.append(
+            (a, k)) or managed_job_state.ControllerFailureDecision.TERMINALIZED)
     monkeypatch.setattr(managed_job_state,
                         'finish_controller_cleanup_if_current_snapshot',
                         lambda *a, **k: job_done_calls.append((a, k)) or True)
