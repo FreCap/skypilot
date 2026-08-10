@@ -578,7 +578,14 @@ def stream_logs_by_id(job_id: int,
             assert managed_job_status is not None, job_id
             if not _should_keep_logging(managed_job_status):
                 break
-            assert snapshot is not None, job_id
+            if snapshot is None:
+                # The startup wait seeds the first iteration, and the
+                # not-ready and next-task waits seed their own. The remaining
+                # re-entries - a broken/preempted tail falling through the
+                # bottom of the loop, and a failed task waiting on its
+                # restart - clear the snapshot without replacing it, so they
+                # must re-read the routing target here.
+                snapshot = get_stream_target_snapshot()
             task_id = snapshot.task_id
             managed_job_status = snapshot.status
             pool = snapshot.pool
