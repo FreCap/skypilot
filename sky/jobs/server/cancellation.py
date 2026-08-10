@@ -1,14 +1,12 @@
 """Managed jobs cancellation transport gateway."""
 import typing
 
-from sky import backends
 from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
-from sky.jobs import runner as managed_job_runner
 from sky.usage import usage_lib
 from sky.utils import common_utils
 from sky.utils import controller_utils
@@ -26,14 +24,9 @@ else:
 logger = sky_logging.init_logger('sky.jobs.server.core')
 
 _CANCEL_TRANSPORT_UPGRADE_HINT = (
-    'Graceful managed job cancellation requires a jobs controller with the gRPC '
+    'Managed job cancellation requires a jobs controller with the gRPC '
     '`cancel_managed_jobs` endpoint. Please upgrade the jobs controller and '
     'retry.')
-
-
-def _requires_modern_cancel_transport(graceful: bool,
-                                      graceful_timeout: int | None) -> bool:
-    return graceful or graceful_timeout is not None
 
 
 def _build_cancel_request(
@@ -108,48 +101,25 @@ def cancel(name: str | None = None,
 
         job_ids = None if (all_users or all) else job_ids
 
-        requires_modern_transport = _requires_modern_cancel_transport(
-            graceful, graceful_timeout)
-        if requires_modern_transport and not handle.is_grpc_enabled_with_flag:
+        if not handle.is_grpc_enabled_with_flag:
             raise exceptions.NotSupportedError(_CANCEL_TRANSPORT_UPGRADE_HINT)
-
-        backend = backend_utils.get_backend_from_handle(handle)
-        assert isinstance(backend, backends.CloudVmRayBackend)
-        use_legacy = not handle.is_grpc_enabled_with_flag
-        stdout = None
-        if not use_legacy:
-            request = _build_cancel_request(
-                current_workspace=skypilot_config.get_active_workspace(),
-                all_users=all_users,
-                all=all,
-                job_ids=job_ids,
-                name=name,
-                pool=pool,
-                graceful=graceful,
-                graceful_timeout=graceful_timeout)
-            try:
-                response = backend_utils.invoke_skylet_with_retries(
-                    lambda: cloud_vm_ray_backend.SkyletClient(
-                        handle.get_grpc_channel()).cancel_managed_jobs(request))
-                stdout = response.message
-            except exceptions.SkyletMethodNotImplementedError as e:
-                if requires_modern_transport:
-                    raise exceptions.NotSupportedError(
-                        _CANCEL_TRANSPORT_UPGRADE_HINT) from e
-                use_legacy = True
-
-        if use_legacy:
-            stdout = managed_job_runner.current().cancel_managed_jobs(
-                handle=handle,
-                backend=backend,
-                all_users=all_users,
-                all=all,
-                job_ids=job_ids,
-                name=name,
-                pool=pool,
-                graceful=graceful,
-                graceful_timeout=graceful_timeout,
-            )
+        request = _build_cancel_request(
+            current_workspace=skypilot_config.get_active_workspace(),
+            all_users=all_users,
+            all=all,
+            job_ids=job_ids,
+            name=name,
+            pool=pool,
+            graceful=graceful,
+            graceful_timeout=graceful_timeout)
+        try:
+            response = backend_utils.invoke_skylet_with_retries(
+                lambda: cloud_vm_ray_backend.SkyletClient(
+                    handle.get_grpc_channel()).cancel_managed_jobs(request))
+        except exceptions.SkyletMethodNotImplementedError as e:
+            raise exceptions.NotSupportedError(
+                _CANCEL_TRANSPORT_UPGRADE_HINT) from e
+        stdout = response.message
 
         if stdout is None:
             raise RuntimeError('Managed job cancellation produced no output.')

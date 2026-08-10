@@ -9,7 +9,6 @@ import pytest
 
 from sky import backends
 from sky import exceptions
-from sky.jobs import runner as managed_job_runner
 from sky.jobs.server import cancellation as jobs_cancellation
 from sky.jobs.server import core as jobs_core
 from sky.usage import usage_lib
@@ -22,8 +21,6 @@ def cancellation_gateway():
     handle.is_grpc_enabled_with_flag = True
     channel = object()
     handle.get_grpc_channel.return_value = channel
-    backend = mock.MagicMock(spec=backends.CloudVmRayBackend)
-    runner = mock.MagicMock()
     client = mock.MagicMock()
     client.cancel_managed_jobs.return_value = SimpleNamespace(
         message='Cancellation requested.')
@@ -34,9 +31,11 @@ def cancellation_gateway():
                               'is_controller_accessible',
                               return_value=handle))
         get_backend = stack.enter_context(
-            mock.patch.object(jobs_core.backend_utils,
-                              'get_backend_from_handle',
-                              return_value=backend))
+            mock.patch.object(
+                jobs_core.backend_utils,
+                'get_backend_from_handle',
+                side_effect=AssertionError(
+                    'cancel transport must not look up a backend')))
         invoke = stack.enter_context(
             mock.patch.object(jobs_core.backend_utils,
                               'invoke_skylet_with_retries',
@@ -45,10 +44,6 @@ def cancellation_gateway():
             mock.patch.object(jobs_core.cloud_vm_ray_backend,
                               'SkyletClient',
                               return_value=client))
-        current_runner = stack.enter_context(
-            mock.patch.object(managed_job_runner,
-                              'current',
-                              return_value=runner))
         stack.enter_context(
             mock.patch.object(jobs_core.skypilot_config,
                               'get_active_workspace',
@@ -60,14 +55,11 @@ def cancellation_gateway():
         yield SimpleNamespace(
             handle=handle,
             channel=channel,
-            backend=backend,
-            runner=runner,
             client=client,
             accessible=accessible,
             get_backend=get_backend,
             invoke=invoke,
             skylet_client=skylet_client,
-            current_runner=current_runner,
         )
 
 
@@ -79,7 +71,6 @@ def test_cancel_grpc_projects_job_ids_and_graceful_fields(cancellation_gateway):
     gateway.accessible.assert_called_once_with(
         controller=controller_utils.Controllers.JOBS_CONTROLLER,
         stopped_message='All managed jobs should have finished.')
-    gateway.get_backend.assert_called_once_with(gateway.handle)
     gateway.skylet_client.assert_called_once_with(gateway.channel)
     gateway.invoke.assert_called_once()
     gateway.client.cancel_managed_jobs.assert_called_once()
@@ -88,7 +79,6 @@ def test_cancel_grpc_projects_job_ids_and_graceful_fields(cancellation_gateway):
     assert list(request.job_ids.ids) == [7, 9]
     assert request.graceful is True
     assert request.graceful_timeout == 23
-    gateway.current_runner.assert_not_called()
 
 
 @pytest.mark.parametrize(('kwargs', 'field', 'expected'), [
@@ -126,52 +116,48 @@ def test_cancel_rejects_stale_controller_graceful_without_legacy_runner(
         jobs_core.cancel(name='train', graceful=True, graceful_timeout=17)
 
     gateway.client.cancel_managed_jobs.assert_called_once()
-    gateway.current_runner.assert_not_called()
+    gateway.skylet_client.assert_called_once_with(gateway.channel)
 
 
 def test_cancel_rejects_missing_selector(cancellation_gateway):
     with pytest.raises(ValueError, match='Can only specify one'):
         jobs_core.cancel()
 
-    cancellation_gateway.get_backend.assert_not_called()
     cancellation_gateway.invoke.assert_not_called()
 
 
-def test_cancel_non_graceful_falls_back_to_legacy_runner_when_grpc_missing(
+def test_cancel_rejects_stale_controller_non_graceful_without_legacy_runner(
         cancellation_gateway):
     gateway = cancellation_gateway
     gateway.client.cancel_managed_jobs.side_effect = (
         exceptions.SkyletMethodNotImplementedError())
-    gateway.runner.cancel_managed_jobs.return_value = 'Legacy cancelled.'
 
-    jobs_core.cancel(name='train')
+    with pytest.raises(exceptions.NotSupportedError,
+                       match='Please upgrade the jobs controller'):
+        jobs_core.cancel(name='train')
 
     gateway.client.cancel_managed_jobs.assert_called_once()
-    gateway.runner.cancel_managed_jobs.assert_called_once_with(
-        handle=gateway.handle,
-        backend=gateway.backend,
-        all_users=False,
-        all=False,
-        job_ids=[],
-        name='train',
-        pool=None,
-        graceful=False,
-        graceful_timeout=None,
-    )
+    gateway.skylet_client.assert_called_once_with(gateway.channel)
 
 
-def test_cancel_rejects_non_grpc_graceful_before_backend_lookup(
-        cancellation_gateway):
+@pytest.mark.parametrize(('graceful', 'graceful_timeout'), [
+    (False, None),
+    (True, 17),
+])
+def test_cancel_rejects_non_grpc_before_transport_setup(cancellation_gateway,
+                                                        graceful,
+                                                        graceful_timeout):
     gateway = cancellation_gateway
     gateway.handle.is_grpc_enabled_with_flag = False
 
     with pytest.raises(exceptions.NotSupportedError,
                        match='Please upgrade the jobs controller'):
-        jobs_core.cancel(name='train', graceful=True, graceful_timeout=17)
+        jobs_core.cancel(name='train',
+                         graceful=graceful,
+                         graceful_timeout=graceful_timeout)
 
-    gateway.get_backend.assert_not_called()
     gateway.invoke.assert_not_called()
-    gateway.current_runner.assert_not_called()
+    gateway.skylet_client.assert_not_called()
 
 
 def test_cancel_rejects_missing_grpc_output(cancellation_gateway):
@@ -183,15 +169,14 @@ def test_cancel_rejects_missing_grpc_output(cancellation_gateway):
         jobs_core.cancel(name='train')
 
 
-@pytest.mark.parametrize(('output', 'message'), [
-    (None, 'produced no output'),
+@pytest.mark.parametrize(('message_output', 'message'), [
     ('Multiple jobs found with name train', 'specify the job ID'),
 ])
-def test_cancel_rejects_invalid_legacy_output(cancellation_gateway, output,
-                                              message):
+def test_cancel_rejects_invalid_grpc_output(cancellation_gateway,
+                                            message_output, message):
     gateway = cancellation_gateway
-    gateway.handle.is_grpc_enabled_with_flag = False
-    gateway.runner.cancel_managed_jobs.return_value = output
+    gateway.client.cancel_managed_jobs.return_value = SimpleNamespace(
+        message=message_output)
 
     with pytest.raises(RuntimeError, match=message):
         jobs_core.cancel(name='train')
@@ -214,7 +199,7 @@ def test_cancel_preserves_usage_entrypoint_attribution(cancellation_gateway):
             jobs_core.cancel()
 
     update.assert_called_once_with('sky.jobs.server.core.cancel')
-    cancellation_gateway.get_backend.assert_not_called()
+    cancellation_gateway.invoke.assert_not_called()
 
 
 def _forwarded_tail(tail):
