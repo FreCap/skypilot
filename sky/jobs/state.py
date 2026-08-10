@@ -1059,7 +1059,20 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
         mapping = row._mapping  # pylint: disable=protected-access
         schedule_state = mapping['schedule_state']
         workspace = mapping['workspace']
-        if schedule_state is None or workspace is None:
+        # Legacy single-job controllers have a NULL schedule_state. Fence them
+        # out here instead of raising while decoding a NULL enum; the same
+        # rows are already fenced out of get_jobs_to_check_status_info by
+        # _get_jobs_to_check_status_condition.
+        #
+        # A NULL workspace is deliberately NOT fenced here. This decode is
+        # shared by the dead-controller sweep and the DONE cluster-leak
+        # repair, and both must keep seeing legacy rows: a swept job that
+        # disappears is never terminalized when its controller dies, and a
+        # repair that cannot see legacy rows leaks the cluster it exists to
+        # reclaim. Cancellation routing does require a workspace, and
+        # get_job_cancellation_states_from_status_check_info applies that
+        # narrowing itself.
+        if schedule_state is None:
             continue
         job_id = mapping['spot_job_id']
         info = result.get(job_id)
