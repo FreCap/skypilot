@@ -589,7 +589,9 @@ def _task_has_launch_attempt(task: dict[str, Any]) -> bool:
         for field in ('submitted_at', 'start_at', 'last_recovered_at'))
 
 
-def update_managed_jobs_statuses(job_ids: list[int] | None = None):
+def update_managed_jobs_statuses(job_ids: list[int] | None = None,
+                                 jobs_info: dict[int, dict[str, Any]] |
+                                 None = None):
     """Update managed job status if the controller process failed abnormally.
 
     Check the status of the controller process. If it is not running, it must
@@ -600,6 +602,9 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
 
     Note: we expect that job_ids, if provided, refer to nonterminal jobs or
     jobs that have not completed their cleanup (schedule state not DONE).
+    Callers that already fetched ``get_jobs_status_check_info()`` for the same
+    explicit ``job_ids`` may pass that snapshot via ``jobs_info`` to reuse the
+    first lifecycle read instead of re-querying before refresh.
     """
     # The signal file suggests that the controller is recovering from a
     # failure. See sky/templates/kubernetes-ray.yml.j2 for more details.
@@ -755,7 +760,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
-    jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
+    if jobs_info is None:
+        jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
     if job_ids is None:
         # The periodic global sweep also repairs rows orphaned by older
         # controllers that finalized the scheduler despite cleanup failure.
@@ -1151,7 +1157,10 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
     cancelled_job_ids: list[int] = []
     wrong_workspace_job_ids: list[int] = []
     jobs_to_refresh: list[int] = []
-    initial_states = managed_job_state.get_job_cancellation_states(job_ids)
+    initial_info = managed_job_state.get_jobs_status_check_info(job_ids)
+    initial_states = (
+        managed_job_state.get_job_cancellation_states_from_status_check_info(
+            initial_info))
     for job_id in job_ids:
         snapshot = initial_states.get(job_id)
         if snapshot is None:
@@ -1176,8 +1185,15 @@ def cancel_jobs_by_id(job_ids: list[int] | None,
     if jobs_to_refresh:
         # One batched refresh sweep for every job that needs it, instead of a
         # sweep per job: all jobs are judged against a single status snapshot,
-        # and a cancel of N live jobs issues one refresh query instead of N.
-        update_managed_jobs_statuses(jobs_to_refresh)
+        # and a cancel of N live jobs reuses the same initial lifecycle read
+        # instead of issuing a second pre-refresh snapshot query.
+        refresh_jobs_info = {
+            job_id: initial_info[job_id]
+            for job_id in jobs_to_refresh
+            if job_id in initial_info
+        }
+        update_managed_jobs_statuses(jobs_to_refresh,
+                                     jobs_info=refresh_jobs_info)
     fresh_states = managed_job_state.get_job_cancellation_states(
         jobs_to_refresh)
     for job_id in jobs_to_refresh:

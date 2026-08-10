@@ -1012,6 +1012,7 @@ def _status_check_select(from_clause) -> 'sqlalchemy.Select':
         job_info_table.c.controller_instance_id,
         job_info_table.c.controller_generation,
         job_info_table.c.pool,
+        job_info_table.c.workspace,
     ).select_from(from_clause)
 
 
@@ -1048,20 +1049,24 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
     """Decode slim status-check rows into the per-job refresh snapshot."""
     for row in rows:
         mapping = row._mapping  # pylint: disable=protected-access
+        schedule_state = mapping['schedule_state']
+        workspace = mapping['workspace']
+        if schedule_state is None or workspace is None:
+            continue
         job_id = mapping['spot_job_id']
         info = result.get(job_id)
         # WARNING: Keep this decode (enum conversion + job_name fallback)
         # in sync with get_managed_job_tasks.
         if info is None:
             info = {
-                'schedule_state': ManagedJobScheduleState(
-                    mapping['schedule_state']),
+                'schedule_state': ManagedJobScheduleState(schedule_state),
                 'controller_pid': mapping['controller_pid'],
                 'controller_pid_started_at':
                     mapping['controller_pid_started_at'],
                 'controller_instance_id': mapping['controller_instance_id'],
                 'controller_generation': mapping['controller_generation'],
                 'pool': mapping['pool'],
+                'workspace': workspace,
                 'tasks': [],
             }
             result[job_id] = info
@@ -1077,6 +1082,31 @@ def _merge_jobs_status_check_rows(result: dict[int, dict[str, Any]],
             'start_at': mapping['start_at'],
             'last_recovered_at': mapping['last_recovered_at'],
         })
+
+
+def get_job_cancellation_states_from_status_check_info(
+        jobs_info: dict[int, dict[str,
+                                  Any]]) -> dict[int, JobCancellationState]:
+    """Derive cancellation states from a shared status-check snapshot.
+
+    Callers that already fetched ``get_jobs_status_check_info()`` can reuse the
+    same latest-task / workspace snapshot for cancellation routing instead of
+    paying an extra lifecycle read before refresh.
+    """
+    snapshots: dict[int, JobCancellationState] = {}
+    for job_id, info in jobs_info.items():
+        workspace = info.get('workspace')
+        schedule_state = info.get('schedule_state')
+        if workspace is None or schedule_state is None:
+            continue
+        _, status = get_latest_task_id_from_statuses([
+            (task['task_id'], task['status']) for task in info['tasks']
+        ])
+        if status is None:
+            continue
+        snapshots[job_id] = JobCancellationState(status=status,
+                                                 workspace=workspace)
+    return snapshots
 
 
 def get_jobs_to_check_status_info(
