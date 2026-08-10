@@ -522,6 +522,112 @@ class TestStreamLogsByIdLifecycle:
         assert backend.status_calls == 1
         assert sleep.call_count == jobs_utils.JOB_STATUS_CHECK_GAP_SECONDS
 
+    def test_broken_tail_refetches_routing_snapshot(self, monkeypatch):
+        """A preempted tail re-enters the loop with no snapshot in hand."""
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        recovering = managed_job_state.ManagedJobStatus.RECOVERING
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        snapshot_read = mock.Mock(side_effect=[
+            managed_job_state.JobLogStreamSnapshot(0, running, 'pool-a',
+                                                   'pool-cluster', 73, 'first'),
+            managed_job_state.JobLogStreamSnapshot(0, succeeded, 'pool-a',
+                                                   'pool-cluster', 73, 'first'),
+        ])
+        # Both post-tail lifecycle reads still observe the controller
+        # recovering, so the follow loop must keep going.
+        status_read = mock.Mock(return_value=recovering)
+        backend = _FakeBackend()
+        # 137 is not a JobExitCode: the remote tail died with its cluster.
+        backend.tail_logs = mock.Mock(return_value=137)
+        backend.get_job_status = mock.Mock(
+            side_effect=AssertionError('job status polled after a broken '
+                                       'tail'))
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        handle_lookup = mock.Mock(return_value=_FakeHandle())
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks',
+                            mock.Mock(return_value=1))
+        monkeypatch.setattr(managed_job_state, 'get_status', status_read)
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
+                            _FakeHandle)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', mock.Mock())
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        # The startup snapshot is consumed once; recovery must read a fresh
+        # routing target rather than reuse or assert on the cleared one.
+        assert snapshot_read.call_count == 2
+        assert backend.tail_logs.call_count == 1
+
+    def test_failed_task_restart_refetches_routing_snapshot(self, monkeypatch):
+        """A retried task re-enters the loop with no snapshot in hand."""
+        running = managed_job_state.ManagedJobStatus.RUNNING
+        recovering = managed_job_state.ManagedJobStatus.RECOVERING
+        succeeded = managed_job_state.ManagedJobStatus.SUCCEEDED
+        snapshot_read = mock.Mock(side_effect=[
+            managed_job_state.JobLogStreamSnapshot(0, running, 'pool-a',
+                                                   'pool-cluster', 73, 'first'),
+            managed_job_state.JobLogStreamSnapshot(0, succeeded, 'pool-a',
+                                                   'pool-cluster', 73, 'first'),
+        ])
+        status_read = mock.Mock(return_value=recovering)
+        backend = _FakeBackend()
+        backend.get_job_status = mock.Mock(
+            return_value={1: jobs_utils.job_lib.JobStatus.FAILED})
+        status_display = mock.MagicMock()
+        status_display.__enter__.return_value = status_display
+        handle_lookup = mock.Mock(return_value=_FakeHandle())
+
+        monkeypatch.setattr(jobs_utils.threading, 'Thread', mock.Mock())
+        monkeypatch.setattr(jobs_utils.select, 'select',
+                            mock.Mock(return_value=([], [], [])))
+        monkeypatch.setattr(jobs_utils.rich_utils, 'safe_status',
+                            mock.Mock(return_value=status_display))
+        monkeypatch.setattr(managed_job_state, 'get_num_tasks',
+                            mock.Mock(return_value=1))
+        monkeypatch.setattr(managed_job_state, 'get_status', status_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_specs',
+            mock.Mock(return_value={'max_restarts_on_errors': 3}))
+        monkeypatch.setattr(managed_job_state, 'get_latest_log_stream_snapshot',
+                            snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'is_batch_job',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils.global_user_state,
+                            'get_handle_from_cluster_name', handle_lookup)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayResourceHandle',
+                            _FakeHandle)
+        monkeypatch.setattr(jobs_utils.backends, 'CloudVmRayBackend',
+                            mock.Mock(return_value=backend))
+        monkeypatch.setattr(jobs_utils.managed_job_runtime, 'is_registered',
+                            mock.Mock(return_value=False))
+        monkeypatch.setattr(jobs_utils, '_sleep_log_follow_wait', mock.Mock())
+
+        message, exit_code = jobs_utils.stream_logs_by_id(42, follow=True)
+
+        assert message == ''
+        assert exit_code == exceptions.JobExitCode.SUCCEEDED
+        assert snapshot_read.call_count == 2
+        assert backend.tail_calls == 1
+
     def test_initial_running_snapshot_skips_scalar_status_poll(
             self, monkeypatch):
         backend = _FakeBackend()

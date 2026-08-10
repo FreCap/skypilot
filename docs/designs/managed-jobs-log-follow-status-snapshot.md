@@ -2,13 +2,21 @@
 
 ## Behavior contract
 
-`stream_logs_by_id()` uses `get_latest_task_id_status()` to wait for the first
-initialized lifecycle status. Once active log following starts, the unfiltered
-path uses `get_latest_log_stream_snapshot()` as the single source for the
-latest task, lifecycle status, and routing fields. Those values must not be
-read in separate sessions because the reads can observe different recovery
-epochs. The remote-log loop retains its existing scalar status refreshes after
-tail attempts.
+`stream_logs_by_id()` waits for the first initialized lifecycle status on the
+same log-target snapshot it will follow, so startup performs no separate scalar
+latest-task read. Once active log following starts, the unfiltered path uses
+`get_latest_log_stream_snapshot()` as the single source for the latest task,
+lifecycle status, and routing fields. Those values must not be read in separate
+sessions because the reads can observe different recovery epochs. The
+remote-log loop retains its existing scalar status refreshes after tail
+attempts.
+
+Snapshot carrying is an optimization, never a precondition. Each loop iteration
+consumes and clears the snapshot it selected a target from. An iteration that
+begins with no carried snapshot must read a fresh one before target selection.
+Two re-entries reach the loop top without a replacement: a broken or preempted
+remote tail falling through the bottom of the loop, and a failed task waiting
+on its configured restart. Following must resume on both.
 
 When the target log is unavailable, the follower waits for the existing poll
 interval and reads one new combined snapshot. That post-wait snapshot is
@@ -44,7 +52,10 @@ existing `_should_keep_logging()` policy. A terminal status observed by the
 post-wait snapshot stops before handle lookup or remote tailing. A recovered
 runnable target observed by that snapshot is used directly on the next
 iteration. The remote-log loop continues to refresh scalar status after each
-tail attempt. Active JobGroup transitions use the existing managed-job polling
+tail attempt. When such a refresh keeps the job non-terminal - the cluster was
+preempted, the tail died, or the task is restarting - the follower re-reads the
+log target and keeps following the new incarnation. It must not treat a cleared
+snapshot as an invariant violation. Active JobGroup transitions use the existing managed-job polling
 interval, and cancellation or terminal snapshots stop without an additional
 routing read.
 
@@ -59,9 +70,12 @@ For an unfiltered active job, one combined query selects latest-task status and
 routing fields from one recovery snapshot. When the log target remains
 unavailable across a poll interval, the post-wait snapshot serves the next
 target-selection iteration, so each poll cycle performs one combined database
-read instead of two back-to-back reads. Initial status discovery, task counts,
-polling cadence, and scalar status refreshes after remote tail attempts are
-unchanged. Integer task-ID validation changes from an O(tasks) inventory read
+read instead of two back-to-back reads. Task counts, polling cadence, and
+scalar status refreshes after remote tail attempts are unchanged. Startup
+discovery drops its separate scalar latest-task read and reuses the first
+snapshot it waited on. The re-read after a broken tail or a task restart costs
+one combined query per recovery, on a path that already sleeps at least one
+managed-job poll interval. Integer task-ID validation changes from an O(tasks) inventory read
 to one O(1) point lookup. Only a missing task-ID adds one O(1) aggregate count;
 it does not materialize task status rows.
 
@@ -95,7 +109,8 @@ persisted-state change. Rollback is a code rollback.
 status polling, no scalar status reads, active follow task selection, immediate
 terminal transitions, terminal transitions after a `None` status, stale
 initial task inventories, filtered task validation, exact query-call counts,
-post-wait snapshot reuse for recovered targets, and remote log-call counts.
+post-wait snapshot reuse for recovered targets, remote log-call counts, and
+resumed following after a broken tail or a failed-task restart.
 
 `tests/unit_tests/test_sky/jobs/test_utils.py` covers integer and name filters,
 missing tasks, missing jobs, and exact read counts.
@@ -111,6 +126,6 @@ cover the changed Python paths.
 
 | Changed path | Invariants | Concrete tests and commands |
 | --- | --- | --- |
-| `sky/jobs/log_streaming.py` | Exact integer task filters avoid whole-task scans; missing jobs and missing tasks remain distinct; terminal and cancelling snapshots stop without handle lookup; same-task snapshots keep the existing polling cadence. | `tests/unit_tests/test_sky/jobs/test_utils.py` task-filter cases and `tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py` filtered lifecycle cases; run both focused files, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
+| `sky/jobs/log_streaming.py` | Exact integer task filters avoid whole-task scans; missing jobs and missing tasks remain distinct; terminal and cancelling snapshots stop without handle lookup; same-task snapshots keep the existing polling cadence; an iteration entered without a carried snapshot re-reads the target instead of failing. | `tests/unit_tests/test_sky/jobs/test_utils.py` task-filter cases and `tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py` filtered lifecycle cases plus `test_broken_tail_refetches_routing_snapshot` and `test_failed_task_restart_refetches_routing_snapshot`; run both focused files, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
 | `sky/jobs/state.py` | Task counting is one aggregate query and does not materialize status rows. | `tests/unit_tests/test_sky/jobs/test_status_refresh_snapshot.py::TestGetJobsToCheckStatusInfo::test_get_num_tasks_uses_one_count_select`. |
 | `docs/designs/managed-jobs-log-follow-status-snapshot.md` | The lifecycle, failure, concurrency, and performance contracts remain synchronized with the implementation. | The focused task-filter and lifecycle tests above plus the one-SQL count assertion. |
