@@ -2857,11 +2857,13 @@ def _parse_lb_service_transition_routing(
 
 
 def get_lb_role_snapshot(
-        service_name: str,
-        expected_fence: tuple[str, tuple[int | None, str | None], int],
-        expected_state: lb_ha.LbCutoverState,
-        owner: Mapping[str, Any],
-        timings: dict[str, float] | None = None) -> LbRoleSnapshot | None:
+    service_name: str,
+    expected_fence: tuple[str, tuple[int | None, str | None], int],
+    expected_state: lb_ha.LbCutoverState,
+    owner: Mapping[str, Any],
+    timings: dict[str, float] | None = None,
+    read_executor: concurrent.futures.Executor | None = None
+) -> LbRoleSnapshot | None:
     """Read one fail-closed Pod and Service authority snapshot for a role.
 
     The caller supplies the owner and complete cutover state from one database
@@ -2946,7 +2948,11 @@ def get_lb_role_snapshot(
         # window.  Resolve futures in the historical fail-closed order so a
         # concurrent multi-failure retains deterministic outcome mapping.
         parent_context = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        owns_executor = read_executor is None
+        executor = (concurrent.futures.ThreadPoolExecutor(
+            max_workers=2) if owns_executor else read_executor)
+        assert executor is not None
+        try:
             pods_future = executor.submit(parent_context.copy().run, list_pods)
             service_future = executor.submit(parent_context.copy().run,
                                              read_service)
@@ -2955,6 +2961,9 @@ def get_lb_role_snapshot(
                 service = service_future.result()
             except Exception as e:  # pylint: disable=broad-except
                 raise LbRoleSnapshotRoutingError(str(e)) from e
+        finally:
+            if owns_executor:
+                executor.shutdown(wait=True, cancel_futures=True)
         try:
             resource_version = timed(
                 'snapshot_ownership_validation',
