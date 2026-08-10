@@ -1078,27 +1078,32 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
 def test_serve040_runtime_authority_rejects_duplicate_revision_identity(
         serve040) -> None:
     function = placement_normalization_authority.AUTHORITY_FUNCTION
-    with serve040.begin() as connection:
-        connection.exec_driver_sql('CREATE SCHEMA duplicate_040')
-        for relation in (placement_normalization_authority.VERSION_RELATION,
-                         placement_normalization_authority.AUTHORITY_GATE,
-                         placement_normalization_authority.RUNS_RELATION,
-                         placement_normalization_authority.ROWS_RELATION):
+    try:
+        with serve040.begin() as connection:
+            connection.exec_driver_sql('CREATE SCHEMA duplicate_040')
+            for relation in (placement_normalization_authority.VERSION_RELATION,
+                             placement_normalization_authority.AUTHORITY_GATE,
+                             placement_normalization_authority.RUNS_RELATION,
+                             placement_normalization_authority.ROWS_RELATION):
+                connection.exec_driver_sql(
+                    f'CREATE TABLE duplicate_040.{relation} (value text)')
             connection.exec_driver_sql(
-                f'CREATE TABLE duplicate_040.{relation} (value text)')
-        connection.exec_driver_sql(
-            'INSERT INTO duplicate_040.'
-            f'{placement_normalization_authority.VERSION_RELATION} '
-            "VALUES ('040')")
-        connection.exec_driver_sql(
-            f'CREATE FUNCTION duplicate_040.{function}() RETURNS boolean '
-            'LANGUAGE plpgsql AS $$BEGIN RETURN TRUE; END;$$')
-    with serve040.connect() as connection:
-        with pytest.raises(placement_normalization_authority.
-                           PlacementNormalizationAuthorityError,
-                           match='exactly one persistent'):
-            (placement_normalization_authority.assert_reader_database_authority(
-                connection))
+                'INSERT INTO duplicate_040.'
+                f'{placement_normalization_authority.VERSION_RELATION} '
+                "VALUES ('040')")
+            connection.exec_driver_sql(
+                f'CREATE FUNCTION duplicate_040.{function}() RETURNS boolean '
+                'LANGUAGE plpgsql AS $$BEGIN RETURN TRUE; END;$$')
+        with serve040.connect() as connection:
+            with pytest.raises(placement_normalization_authority.
+                               PlacementNormalizationAuthorityError,
+                               match='exactly one persistent'):
+                (placement_normalization_authority.
+                 assert_reader_database_authority(connection))
+    finally:
+        with serve040.begin() as connection:
+            connection.exec_driver_sql(
+                'DROP SCHEMA IF EXISTS duplicate_040 CASCADE')
 
 
 def test_writer_session_lock_proof_is_exact(serve040) -> None:
