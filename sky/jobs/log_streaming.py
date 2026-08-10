@@ -493,7 +493,15 @@ def stream_logs_by_id(job_id: int,
     def get_follow_status() -> managed_job_state.ManagedJobStatus | None:
         if filtered_task_id is None:
             return managed_job_state.get_status(job_id)
-        return get_stream_target_snapshot().status
+        # Task-filtered follow already resolved the exact task identity and
+        # routing snapshot. Later lifecycle polls only need the current task
+        # status, so keep them on the slim wait lookup instead of re-reading
+        # log-routing metadata on every retry/final-wait iteration.
+        lookup = managed_job_state.get_task_wait_status_lookup(
+            job_id, filtered_task_id)
+        if lookup.task_id is None:
+            return None
+        return lookup.status
 
     # Follow the jobs controller log during provisioning so the user sees the
     # same spinner messages that `sky launch` shows. The controller relays the

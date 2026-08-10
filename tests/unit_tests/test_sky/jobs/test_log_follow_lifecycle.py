@@ -816,11 +816,9 @@ class TestStreamLogsByIdLifecycle:
                 logs_cleaned_at=None,
                 num_tasks=2,
             ))
-        filtered_snapshot_read = mock.Mock(side_effect=[
-            managed_job_state.JobLogStreamSnapshot(
-                1, running, None, 'filtered-cluster', None, 'eval'),
-            managed_job_state.JobLogStreamSnapshot(
-                1, succeeded, None, 'filtered-cluster', None, 'eval'),
+        wait_lookup_read = mock.Mock(side_effect=[
+            managed_job_state.TaskWaitStatusLookup(1, running, 2),
+            managed_job_state.TaskWaitStatusLookup(1, succeeded, 2),
         ])
         sleep = mock.Mock()
         status_display = mock.MagicMock()
@@ -852,8 +850,11 @@ class TestStreamLogsByIdLifecycle:
                                                  'used')))
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
                             lookup_read)
-        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
-                            filtered_snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_wait_status_lookup',
+                            wait_lookup_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot poll used')))
         monkeypatch.setattr(managed_job_state, 'is_batch_job',
                             mock.Mock(return_value=False))
         monkeypatch.setattr(jobs_utils, 'generate_managed_job_cluster_name',
@@ -875,7 +876,7 @@ class TestStreamLogsByIdLifecycle:
         assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
         lookup_read.assert_called_once_with(42, 1)
-        assert filtered_snapshot_read.call_args_list == [
+        assert wait_lookup_read.call_args_list == [
             mock.call(42, 1),
             mock.call(42, 1),
         ]
@@ -898,11 +899,9 @@ class TestStreamLogsByIdLifecycle:
                 logs_cleaned_at=None,
                 num_tasks=2,
             ))
-        filtered_snapshot_read = mock.Mock(side_effect=[
-            managed_job_state.JobLogStreamSnapshot(
-                1, running, None, 'filtered-cluster', None, 'eval'),
-            managed_job_state.JobLogStreamSnapshot(
-                1, succeeded, None, 'filtered-cluster', None, 'eval'),
+        wait_lookup_read = mock.Mock(side_effect=[
+            managed_job_state.TaskWaitStatusLookup(1, running, 2),
+            managed_job_state.TaskWaitStatusLookup(1, succeeded, 2),
         ])
         sleep = mock.Mock()
         status_display = mock.MagicMock()
@@ -935,8 +934,11 @@ class TestStreamLogsByIdLifecycle:
                                                  'used')))
         monkeypatch.setattr(managed_job_state, 'get_task_log_stream_lookup',
                             lookup_read)
-        monkeypatch.setattr(managed_job_state, 'get_task_log_stream_snapshot',
-                            filtered_snapshot_read)
+        monkeypatch.setattr(managed_job_state, 'get_task_wait_status_lookup',
+                            wait_lookup_read)
+        monkeypatch.setattr(
+            managed_job_state, 'get_task_log_stream_snapshot',
+            mock.Mock(side_effect=AssertionError('task snapshot poll used')))
         monkeypatch.setattr(managed_job_state, 'is_batch_job',
                             mock.Mock(return_value=False))
         monkeypatch.setattr(jobs_utils, 'generate_managed_job_cluster_name',
@@ -958,7 +960,7 @@ class TestStreamLogsByIdLifecycle:
         assert message == ''
         assert exit_code == exceptions.JobExitCode.SUCCEEDED
         lookup_read.assert_called_once_with(42, 1)
-        assert filtered_snapshot_read.call_args_list == [
+        assert wait_lookup_read.call_args_list == [
             mock.call(42, 1),
             mock.call(42, 1),
         ]
