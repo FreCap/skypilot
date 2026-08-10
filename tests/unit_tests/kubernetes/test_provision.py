@@ -103,6 +103,8 @@ def _patch_create_pods_k8s_boundary(monkeypatch, existing_pods, head_name):
     monkeypatch.setattr(instance, '_wait_for_pods_to_run', lambda *a, **k: None)
     monkeypatch.setattr(instance, 'is_high_availability_cluster_by_kubectl',
                         lambda *a, **k: False)
+    monkeypatch.setattr(instance, '_preflight_required_kueue_local_queue',
+                        lambda *a, **k: None)
 
 
 def test_create_pods_is_idempotent_when_all_pods_exist(monkeypatch):
@@ -339,6 +341,28 @@ def test_required_kueue_rejects_missing_local_queue(monkeypatch):
     with pytest.raises(config_lib.KubernetesError,
                        match='has no LocalQueue name'):
         instance._create_pods('us', 'cluster', 'cluster', config)
+
+
+def test_required_kueue_preflights_before_pod_queries(monkeypatch):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *a, **k: 'inference-ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *a, **k: 'research')
+    preflight = mock.MagicMock(
+        side_effect=config_lib.KubernetesError('queue is unavailable'))
+    filter_pods = mock.MagicMock()
+    monkeypatch.setattr(instance, '_preflight_required_kueue_local_queue',
+                        preflight)
+    monkeypatch.setattr(kubernetes_utils, 'filter_pods', filter_pods)
+    config = _make_provision_config(count=1)
+    config.provider_config['kueue_local_queue_name'] = 'inference'
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='queue is unavailable'):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+    preflight.assert_called_once_with('inference-ns', 'research', 'inference')
+    filter_pods.assert_not_called()
 
 
 def test_out_of_cpus(monkeypatch):
@@ -4235,6 +4259,95 @@ class TestConfigureRuntimeClass:
 
 class TestRequiredKueueAdmission:
     """Fail-closed preparation and create-response attestation."""
+
+    def test_preflight_accepts_active_local_queue(self, monkeypatch):
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.return_value = {
+            'status': {
+                'conditions': [{
+                    'type': 'Active',
+                    'status': 'True',
+                    'reason': 'Ready',
+                }]
+            }
+        }
+        monkeypatch.setattr(kubernetes, 'custom_objects_api',
+                            lambda _context: custom_api)
+
+        instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+            'inference-ns', 'research', 'inference')
+
+        custom_api.get_namespaced_custom_object.assert_called_once_with(
+            group='kueue.x-k8s.io',
+            version='v1beta1',
+            namespace='inference-ns',
+            plural='localqueues',
+            name='inference',
+            _request_timeout=kubernetes.API_TIMEOUT)
+
+    def test_preflight_rejects_missing_local_queue(self, monkeypatch):
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.side_effect = (
+            _make_api_exception(404, 'Not Found'))
+        monkeypatch.setattr(kubernetes, 'custom_objects_api',
+                            lambda _context: custom_api)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match="LocalQueue 'inference-ns/inference' does not "
+                           'exist'):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'inference')
+
+    @pytest.mark.parametrize(('conditions', 'error_match'), [
+        ([], 'has not reported Active=True'),
+        ([{
+            'type': 'Active',
+            'status': 'False',
+            'reason': 'ClusterQueueDoesNotExist',
+            'message': 'ClusterQueue is inactive',
+        }], 'is not active'),
+    ])
+    def test_preflight_rejects_unready_local_queue(self, monkeypatch,
+                                                   conditions, error_match):
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.return_value = {
+            'status': {
+                'conditions': conditions
+            }
+        }
+        monkeypatch.setattr(kubernetes, 'custom_objects_api',
+                            lambda _context: custom_api)
+
+        with pytest.raises(config_lib.KubernetesError, match=error_match):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'inference')
+
+    def test_preflight_rejects_unverifiable_local_queue(self, monkeypatch):
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.side_effect = (
+            _make_api_exception(403, 'Forbidden'))
+        monkeypatch.setattr(kubernetes, 'custom_objects_api',
+                            lambda _context: custom_api)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='cannot prove that the queue is usable'):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'inference')
+
+    def test_preflight_rejects_invalid_local_queue_response(self, monkeypatch):
+        custom_api = mock.MagicMock()
+        custom_api.get_namespaced_custom_object.return_value = None
+        monkeypatch.setattr(kubernetes, 'custom_objects_api',
+                            lambda _context: custom_api)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='returned an invalid response'):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'inference')
 
     def test_prepare_reasserts_server_owned_contract(self):
         pod_spec = {

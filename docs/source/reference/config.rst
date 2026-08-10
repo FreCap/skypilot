@@ -2049,7 +2049,12 @@ Kueue configuration (optional).
 
 Name of the `local queue <https://kueue.sigs.k8s.io/docs/concepts/local_queue/>`_ to use for SkyPilot jobs.
 Setting an effective queue automatically enables fail-closed Kueue management;
-no second opt-in flag is required.
+no second opt-in flag is required. Before performing any Pod operation,
+SkyPilot verifies that this LocalQueue exists in the workload namespace and
+reports ``Active=True``. Missing, inactive, unreconciled, or unreadable queues
+fail the launch immediately. The Kubernetes identity used for provisioning
+must therefore have permission to ``get localqueues.kueue.x-k8s.io`` in the
+namespace.
 
 .. _config-yaml-kubernetes-kueue-require-managed:
 

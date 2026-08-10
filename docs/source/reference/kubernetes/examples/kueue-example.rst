@@ -332,6 +332,18 @@ error leaves the Pod unable to schedule instead of letting it bypass the queue.
 You may additionally set ``require_managed: true`` as an assertion that makes a
 missing queue a configuration error.
 
+Before any Pod operation, SkyPilot also verifies that
+``LocalQueue/skypilot-local-queue`` exists in the workload namespace and has an
+``Active=True`` condition. A missing, inactive, unreconciled, or unreadable
+queue fails immediately instead of waiting for the Pod provisioning timeout.
+The Kubernetes identity used by SkyPilot must be allowed to read it; verify the
+rollout identity and namespace with:
+
+.. code-block:: console
+
+    kubectl auth can-i get localqueues.kueue.x-k8s.io -n <workload-namespace>
+    kubectl get localqueue skypilot-local-queue -n <workload-namespace> -o yaml
+
 For priority and preemption, create a Kueue ``WorkloadPriorityClass`` and set
 its name on the SkyPilot resource:
 
