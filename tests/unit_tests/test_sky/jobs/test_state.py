@@ -1161,6 +1161,97 @@ def test_get_task_log_stream_lookup_by_name_missing_job_is_one_query(
     assert counts['n'] == 1, counts
 
 
+def test_get_task_wait_status_lookup_reads_one_slim_task_snapshot(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine,
+                 job_id,
+                 2,
+                 status=ManagedJobStatus.RUNNING,
+                 local_log_file='/tmp/task-2.log',
+                 logs_cleaned_at=123.0)
+    statements = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        del conn, cursor, parameters, context, executemany
+        statements.append(statement.lower())
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        lookup = state.get_task_wait_status_lookup(job_id, 2)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert lookup == state.TaskWaitStatusLookup(2, ManagedJobStatus.RUNNING, 1)
+    assert len(statements) == 1, statements
+    sql = statements[0]
+    assert 'job_info' not in sql
+    assert 'local_log_file' not in sql
+    assert 'logs_cleaned_at' not in sql
+    assert 'current_cluster_name' not in sql
+    assert 'job_id_on_pool_cluster' not in sql
+
+
+def test_get_task_wait_status_lookup_missing_task_counts_existing_job(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 0, status=ManagedJobStatus.RUNNING)
+    _insert_task(engine, job_id, 1, status=ManagedJobStatus.SUCCEEDED)
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_task_wait_status_lookup(job_id, 999)
+
+    assert lookup == state.TaskWaitStatusLookup(None, None, 2)
+    assert counts['n'] == 1, counts
+
+
+def test_get_task_wait_status_lookup_by_name_preserves_first_task_id_order(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine)
+    _insert_task(engine, job_id, 5, status=ManagedJobStatus.SUCCEEDED)
+    _insert_task(engine, job_id, 1, status=ManagedJobStatus.RUNNING)
+    with orm.Session(engine) as session:
+        session.execute(
+            sqlalchemy.update(state.spot_table).where(
+                sqlalchemy.and_(
+                    state.spot_table.c.spot_job_id == job_id,
+                    state.spot_table.c.task_id.in_([1, 5]),
+                )).values(task_name='eval'))
+        session.commit()
+    statements = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        del conn, cursor, parameters, context, executemany
+        statements.append(statement.lower())
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _capture)
+    try:
+        lookup = state.get_task_wait_status_lookup_by_name(job_id, 'eval')
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute', _capture)
+
+    assert lookup == state.TaskWaitStatusLookup(1, ManagedJobStatus.RUNNING, 2)
+    assert len(statements) == 1, statements
+    sql = statements[0]
+    assert 'job_info' not in sql
+    assert 'local_log_file' not in sql
+    assert 'logs_cleaned_at' not in sql
+
+
+def test_get_task_wait_status_lookup_by_name_missing_job_is_one_query(
+        _mock_managed_jobs_db_conn):
+    engine = _mock_managed_jobs_db_conn
+
+    with _count_sql_statements(engine) as counts:
+        lookup = state.get_task_wait_status_lookup_by_name(999999, 'missing')
+
+    assert lookup == state.TaskWaitStatusLookup(None, None, 0)
+    assert counts['n'] == 1, counts
+
+
 def test_get_task_id_name_status_log_reads_one_task_row(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

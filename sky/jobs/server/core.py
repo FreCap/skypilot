@@ -1530,25 +1530,20 @@ def wait(name: str | None,
                 with ux_utils.print_exception_no_traceback():
                     raise ValueError(f'Managed job {job_id} not found.')
             statuses = [status for _, status in task_statuses]
-        elif isinstance(task, int):
-            lookup = managed_job_state.get_task_log_stream_lookup(job_id, task)
-            if lookup.snapshot.task_id is None:
-                with ux_utils.print_exception_no_traceback():
-                    if lookup.num_tasks == 0:
-                        raise ValueError(f'Managed job {job_id} not found.')
-                    raise ValueError(
-                        f'No task matching {task!r} in job {job_id}.')
-            statuses = [lookup.snapshot.status]
         else:
-            lookup = managed_job_state.get_task_log_stream_lookup_by_name(
-                job_id, task)
-            if lookup.snapshot.task_id is None:
+            if isinstance(task, int):
+                lookup = managed_job_state.get_task_wait_status_lookup(
+                    job_id, task)
+            else:
+                lookup = managed_job_state.get_task_wait_status_lookup_by_name(
+                    job_id, task)
+            if lookup.task_id is None:
                 with ux_utils.print_exception_no_traceback():
                     if lookup.num_tasks == 0:
                         raise ValueError(f'Managed job {job_id} not found.')
                     raise ValueError(
                         f'No task matching {task!r} in job {job_id}.')
-            statuses = [lookup.snapshot.status]
+            statuses = [lookup.status]
 
         # Check if all relevant tasks are terminal.
         if all(s is not None and s.is_terminal() for s in statuses):

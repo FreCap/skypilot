@@ -71,6 +71,13 @@ class TaskLogStreamLookup(typing.NamedTuple):
     num_tasks: int
 
 
+class TaskWaitStatusLookup(typing.NamedTuple):
+    """One task-filtered wait snapshot plus exact task-count context."""
+    task_id: int | None
+    status: ManagedJobStatus | None
+    num_tasks: int
+
+
 def get_current_controller_owner() -> tuple[str, int] | None:
     """Return the active outer controller instance and generation, if any."""
     return request_postgres.controller_owner_from_environment()
@@ -1620,6 +1627,92 @@ def get_log_stream_context(
     if context is None:
         return None, None, None, None
     return context[0], context[1], context[2], context[3]
+
+
+def _task_wait_job_scope(job_id: int) -> Any:
+    task_count = sqlalchemy.select(
+        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
+    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
+    return sqlalchemy.select(
+        sqlalchemy.literal(job_id).label('spot_job_id'),
+        task_count.label('num_tasks'),
+    ).subquery()
+
+
+def _task_wait_lookup(row: Any) -> TaskWaitStatusLookup:
+    return TaskWaitStatusLookup(
+        task_id=row.task_id,
+        status=None if row.status is None else ManagedJobStatus(row.status),
+        num_tasks=int(row.num_tasks or 0),
+    )
+
+
+@db_retries.retry
+def get_task_wait_status_lookup(job_id: int,
+                                task_id: int) -> TaskWaitStatusLookup:
+    """Return one task-filtered status lookup for the wait polling path.
+
+    ``wait()`` only needs the matched task id, its current status, and the
+    exact task count for missing-task classification. Keep that contract on one
+    database snapshot without paying for log-routing or log-file metadata.
+    """
+    job_scope = _task_wait_job_scope(job_id)
+    matching_task = sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+    ).where(
+        sqlalchemy.and_(
+            spot_table.c.spot_job_id == job_id,
+            spot_table.c.task_id == task_id,
+        )).subquery()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                matching_task.c.task_id,
+                matching_task.c.status,
+                job_scope.c.num_tasks,
+            ).select_from(
+                job_scope.outerjoin(
+                    matching_task, matching_task.c.spot_job_id ==
+                    job_scope.c.spot_job_id))).fetchone()
+    assert row is not None, (job_id, task_id)
+    return _task_wait_lookup(row)
+
+
+@db_retries.retry
+def get_task_wait_status_lookup_by_name(job_id: int,
+                                        task_name: str) -> TaskWaitStatusLookup:
+    """Return one name-filtered status lookup for the wait polling path.
+
+    String task filters historically matched the first task with that name in
+    task_id order. Preserve that contract while keeping the wait path on one
+    slim database snapshot.
+    """
+    job_scope = _task_wait_job_scope(job_id)
+    matching_task = sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+    ).where(
+        sqlalchemy.and_(
+            spot_table.c.spot_job_id == job_id,
+            spot_table.c.task_name == task_name,
+        )).order_by(spot_table.c.task_id.asc()).limit(1).subquery()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                matching_task.c.task_id,
+                matching_task.c.status,
+                job_scope.c.num_tasks,
+            ).select_from(
+                job_scope.outerjoin(
+                    matching_task, matching_task.c.spot_job_id ==
+                    job_scope.c.spot_job_id))).fetchone()
+    assert row is not None, (job_id, task_name)
+    return _task_wait_lookup(row)
 
 
 @db_retries.retry

@@ -29,20 +29,13 @@ def _make_record(
     )
 
 
-def _make_task_lookup(
+def _make_wait_lookup(
     status: Optional[ManagedJobStatus],
     *,
     task_id: Optional[int] = 0,
-    task_name: Optional[str] = 'train',
     num_tasks: int = 1,
-) -> managed_job_state.TaskLogStreamLookup:
-    return managed_job_state.TaskLogStreamLookup(
-        snapshot=managed_job_state.JobLogStreamSnapshot(task_id, status, None,
-                                                        None, None, task_name),
-        local_log_file=None,
-        logs_cleaned_at=None,
-        num_tasks=num_tasks,
-    )
+) -> managed_job_state.TaskWaitStatusLookup:
+    return managed_job_state.TaskWaitStatusLookup(task_id, status, num_tasks)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -432,14 +425,13 @@ class TestWaitJobGroup:
         assert result == exceptions.JobExitCode.FAILED
 
     @mock.patch.object(jobs_core.managed_job_state,
-                       'get_task_log_stream_lookup')
+                       'get_task_wait_status_lookup')
     @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
     def test_task_filter_by_int(self, mock_sleep, mock_queue, mock_lookup):
         """With task=1, only wait for task_id=1, ignore task_id=0."""
-        mock_lookup.return_value = _make_task_lookup(ManagedJobStatus.SUCCEEDED,
+        mock_lookup.return_value = _make_wait_lookup(ManagedJobStatus.SUCCEEDED,
                                                      task_id=1,
-                                                     task_name='train',
                                                      num_tasks=2)
 
         result = jobs_core.wait(name=None,
@@ -454,13 +446,12 @@ class TestWaitJobGroup:
         mock_queue.assert_not_called()
 
     @mock.patch.object(jobs_core.managed_job_state,
-                       'get_task_log_stream_lookup_by_name')
+                       'get_task_wait_status_lookup_by_name')
     @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
     def test_task_filter_by_str(self, mock_sleep, mock_queue, mock_lookup):
-        mock_lookup.return_value = _make_task_lookup(ManagedJobStatus.SUCCEEDED,
+        mock_lookup.return_value = _make_wait_lookup(ManagedJobStatus.SUCCEEDED,
                                                      task_id=1,
-                                                     task_name='train',
                                                      num_tasks=2)
 
         result = jobs_core.wait(name=None,
@@ -475,13 +466,12 @@ class TestWaitJobGroup:
         mock_queue.assert_not_called()
 
     @mock.patch.object(jobs_core.managed_job_state,
-                       'get_task_log_stream_lookup')
+                       'get_task_wait_status_lookup')
     @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
     def test_task_filter_not_found(self, mock_sleep, mock_queue, mock_lookup):
-        mock_lookup.return_value = _make_task_lookup(None,
+        mock_lookup.return_value = _make_wait_lookup(None,
                                                      task_id=None,
-                                                     task_name=None,
                                                      num_tasks=1)
 
         with pytest.raises(ValueError, match='No task matching'):
@@ -493,14 +483,13 @@ class TestWaitJobGroup:
         mock_queue.assert_not_called()
 
     @mock.patch.object(jobs_core.managed_job_state,
-                       'get_task_log_stream_lookup')
+                       'get_task_wait_status_lookup')
     @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
     def test_task_filter_missing_job_raises_job_not_found(
             self, mock_sleep, mock_queue, mock_lookup):
-        mock_lookup.return_value = _make_task_lookup(None,
+        mock_lookup.return_value = _make_wait_lookup(None,
                                                      task_id=None,
-                                                     task_name=None,
                                                      num_tasks=0)
 
         with pytest.raises(ValueError, match='Managed job 1 not found'):
@@ -512,21 +501,15 @@ class TestWaitJobGroup:
         mock_queue.assert_not_called()
 
     @mock.patch.object(jobs_core.managed_job_state,
-                       'get_task_log_stream_lookup')
+                       'get_task_wait_status_lookup')
     @mock.patch.object(jobs_core, 'queue_v2_api')
     @mock.patch('time.sleep')
     def test_task_filter_waits_for_specific_task(self, mock_sleep, mock_queue,
                                                  mock_lookup):
         """task=0 is still RUNNING while task=1 is done; keeps polling."""
         mock_lookup.side_effect = [
-            _make_task_lookup(ManagedJobStatus.RUNNING,
-                              task_id=0,
-                              task_name='task-0',
-                              num_tasks=2),
-            _make_task_lookup(ManagedJobStatus.FAILED,
-                              task_id=0,
-                              task_name='task-0',
-                              num_tasks=2),
+            _make_wait_lookup(ManagedJobStatus.RUNNING, task_id=0, num_tasks=2),
+            _make_wait_lookup(ManagedJobStatus.FAILED, task_id=0, num_tasks=2),
         ]
 
         result = jobs_core.wait(name=None,
