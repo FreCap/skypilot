@@ -875,40 +875,6 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
 
         # At this point, either pid is None or process is dead.
 
-        # The judgment above was made from the batched snapshot taken before
-        # the loop, which can be minutes stale by now (each earlier iteration
-        # that reaches the destructive path synchronously terminates a
-        # cluster). In that window the job may have been reset for recovery
-        # (schedule_state=WAITING, pid cleared; see reset_jobs_for_recovery)
-        # or re-claimed by a new controller process. Only act if a fresh read
-        # confirms the exact values the judgment was based on; otherwise defer
-        # to the next status-update cycle, which will re-judge the job from
-        # fresh state.
-        fresh_info = managed_job_state.get_job_status_check_state(job_id)
-        if (fresh_info is not None and fresh_info['schedule_state']
-                == managed_job_state.ManagedJobScheduleState.DONE):
-            # The controller marked the job done and exited between the batched
-            # snapshot and the destructive path. This is fine.
-            continue
-        if not _snapshot_is_unchanged(info, fresh_info):
-            logger.info(f'Job {job_id} schedule state or controller pid '
-                        'changed since the status snapshot was taken; '
-                        'deferring to the next status update cycle.')
-            continue
-        assert fresh_info is not None
-
-        # The controller can also die AFTER all tasks are already terminal but
-        # BEFORE it flips schedule_state to DONE, e.g. during log streaming or
-        # cluster teardown. Preserve the terminal task outcome and only
-        # finalize scheduler state; rewriting the job to FAILED_CONTROLLER here
-        # would clobber a real SUCCEEDED/FAILED result with a cleanup crash.
-        if fresh_info['all_tasks_terminal']:
-            logger.info(f'Job {job_id} already reached terminal task status; '
-                        'finalizing schedule state without rewriting the job '
-                        'to FAILED_CONTROLLER.')
-            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
-            continue
-
         # The controller process for this managed job is not running: it must
         # have exited abnormally, and we should set the job status to
         # FAILED_CONTROLLER.
@@ -934,18 +900,47 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None):
         terminalized = (
             managed_job_state.set_failed_controller_if_current_snapshot(
                 job_id,
-                **_snapshot_kwargs(fresh_info),
+                **_snapshot_kwargs(info),
                 failure_reason=failure_message))
-        if not terminalized:
-            logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could '
-                        'be committed; deferring cleanup.')
+        if terminalized:
+            # Terminal task state is the durable no-recovery decision. Provider
+            # cleanup follows it so a handoff can retry teardown but cannot
+            # relaunch the workload underneath an old generation's destructive
+            # request.
+            logger.info(failure_message)
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], info)
             continue
 
-        # Terminal task state is the durable no-recovery decision. Provider
-        # cleanup follows it so a handoff can retry teardown but cannot relaunch
-        # the workload underneath an old generation's destructive request.
-        logger.info(failure_message)
-        _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
+        # The atomic FAILED_CONTROLLER write already locked and rechecked the
+        # exact snapshot. Only the declined-CAS path pays for a fresh point
+        # read so the common dead-controller case stays on one exact DB write.
+        fresh_info = managed_job_state.get_job_status_check_state(job_id)
+        if (fresh_info is not None and fresh_info['schedule_state']
+                == managed_job_state.ManagedJobScheduleState.DONE):
+            # The controller marked the job done and exited between the batched
+            # snapshot and the destructive path. This is fine.
+            continue
+        if not _snapshot_is_unchanged(info, fresh_info):
+            logger.info(f'Job {job_id} schedule state or controller pid '
+                        'changed since the status snapshot was taken; '
+                        'deferring to the next status update cycle.')
+            continue
+        assert fresh_info is not None
+
+        # The controller can also die AFTER all tasks are already terminal but
+        # BEFORE it flips schedule_state to DONE, e.g. during log streaming or
+        # cluster teardown. Preserve the terminal task outcome and only
+        # finalize scheduler state; rewriting the job to FAILED_CONTROLLER here
+        # would clobber a real SUCCEEDED/FAILED result with a cleanup crash.
+        if fresh_info['all_tasks_terminal']:
+            logger.info(f'Job {job_id} already reached terminal task status; '
+                        'finalizing schedule state without rewriting the job '
+                        'to FAILED_CONTROLLER.')
+            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
+            continue
+
+        logger.info(f'Job {job_id} changed before FAILED_CONTROLLER could '
+                    'be committed; deferring cleanup.')
 
 
 def get_job_timestamp(backend: 'backends.CloudVmRayBackend',
