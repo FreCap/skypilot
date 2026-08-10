@@ -1680,6 +1680,70 @@ def get_task_log_stream_lookup(job_id: int,
 
 
 @db_retries.retry
+def get_task_log_stream_lookup_by_name(job_id: int,
+                                       task_name: str) -> TaskLogStreamLookup:
+    """Return one name-filtered lookup plus exact task-count context.
+
+    String task filters historically matched the first task with that name in
+    task_id order. Preserve that contract while resolving the match, task
+    status, and the exact task count from one database snapshot.
+    """
+    task_count = sqlalchemy.select(
+        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
+    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
+    job_scope = sqlalchemy.select(
+        sqlalchemy.literal(job_id).label('spot_job_id'),
+        task_count.label('num_tasks'),
+    ).subquery()
+    matching_task = sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+        spot_table.c.task_name,
+        spot_table.c.local_log_file,
+        spot_table.c.logs_cleaned_at,
+    ).where(
+        sqlalchemy.and_(
+            spot_table.c.spot_job_id == job_id,
+            spot_table.c.task_name == task_name,
+        )).order_by(spot_table.c.task_id.asc()).limit(1).subquery()
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                matching_task.c.task_id,
+                matching_task.c.status,
+                job_info_table.c.pool,
+                job_info_table.c.current_cluster_name,
+                job_info_table.c.job_id_on_pool_cluster,
+                matching_task.c.task_name,
+                matching_task.c.local_log_file,
+                matching_task.c.logs_cleaned_at,
+                job_scope.c.num_tasks,
+            ).select_from(
+                job_scope.outerjoin(
+                    matching_task, matching_task.c.spot_job_id ==
+                    job_scope.c.spot_job_id).outerjoin(
+                        job_info_table, job_info_table.c.spot_job_id ==
+                        matching_task.c.spot_job_id))).fetchone()
+    assert row is not None, (job_id, task_name)
+    snapshot = JobLogStreamSnapshot(
+        row.task_id,
+        (None if row.status is None else ManagedJobStatus(row.status)),
+        row.pool,
+        row.current_cluster_name,
+        row.job_id_on_pool_cluster,
+        row.task_name,
+    )
+    return TaskLogStreamLookup(
+        snapshot=snapshot,
+        local_log_file=row.local_log_file,
+        logs_cleaned_at=row.logs_cleaned_at,
+        num_tasks=int(row.num_tasks or 0),
+    )
+
+
+@db_retries.retry
 def get_task_log_stream_snapshot(job_id: int,
                                  task_id: int) -> JobLogStreamSnapshot:
     """Return one task-specific status and routing snapshot for log following."""

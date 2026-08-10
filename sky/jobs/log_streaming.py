@@ -444,19 +444,9 @@ def stream_logs_by_id(job_id: int,
                                              provision_str='',
                                              job_id=job_id)
     status_display = rich_utils.safe_status(msg)
-    task_info: list[tuple[int, str, managed_job_state.ManagedJobStatus, str,
-                          float | None]] | None = None
     num_tasks: int | None = None
-    if isinstance(task, str):
-        task_info = managed_job_state.get_all_task_ids_names_statuses_logs(
-            job_id)
-        num_tasks = len(task_info)
-    elif task is None:
+    if task is None:
         num_tasks = managed_job_state.get_num_tasks(job_id)
-
-    # Check if job exists - if num_tasks is 0, the job doesn't exist
-    if num_tasks == 0:
-        return (f'Job {job_id} not found.', exceptions.JobExitCode.NOT_FOUND)
 
     # Resolve task filter to a specific task_id if provided
     # This is used for running jobs to stream logs from the correct task
@@ -468,17 +458,26 @@ def stream_logs_by_id(job_id: int,
             prefetched_snapshot = lookup.snapshot
             num_tasks = lookup.num_tasks
             if prefetched_snapshot.task_id is None:
+                if num_tasks == 0:
+                    return (f'Job {job_id} not found.',
+                            exceptions.JobExitCode.NOT_FOUND)
                 return _task_filter_not_found(job_id, task, num_tasks)
             filtered_task_id = task
         else:
-            assert task_info is not None, task
-            for t_id, t_name, _, _, _ in task_info:
-                if t_name == task:
-                    filtered_task_id = t_id
-                    break
-            if filtered_task_id is None:
-                assert num_tasks is not None, task
+            lookup = managed_job_state.get_task_log_stream_lookup_by_name(
+                job_id, task)
+            prefetched_snapshot = lookup.snapshot
+            num_tasks = lookup.num_tasks
+            if prefetched_snapshot.task_id is None:
+                if num_tasks == 0:
+                    return (f'Job {job_id} not found.',
+                            exceptions.JobExitCode.NOT_FOUND)
                 return _task_filter_not_found(job_id, task, num_tasks)
+            filtered_task_id = prefetched_snapshot.task_id
+
+    # Check if job exists - if num_tasks is 0, the job doesn't exist
+    if num_tasks == 0:
+        return (f'Job {job_id} not found.', exceptions.JobExitCode.NOT_FOUND)
 
     def get_stream_target_snapshot() -> managed_job_state.JobLogStreamSnapshot:
         nonlocal prefetched_snapshot
