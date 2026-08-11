@@ -1798,6 +1798,13 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
             if decision.target is not None
         ]
         self.assertEqual(len(fill_ups), 4)
+        self.assertEqual([decision.target[_POOL_KEY] for decision in fill_ups],
+                         [
+                             self.east_pool,
+                             self.phx_pool,
+                             self.east_pool,
+                             self.phx_pool,
+                         ])
         by_pool = {self.east_pool: 0, self.phx_pool: 0}
         for decision in fill_ups:
             override = decision.target
