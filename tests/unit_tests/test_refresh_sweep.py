@@ -8,6 +8,7 @@ override for its thread count.
 """
 # pylint: disable=protected-access
 import threading
+import types
 from unittest import mock
 
 from sky.backends import backend_utils
@@ -164,6 +165,67 @@ class TestRefreshFaultIsolation:
         backend_utils.refresh_cluster_records()
 
         assert attempted == ['user-cluster']
+
+    def test_ownerless_managed_service_without_yaml_is_retained(
+            self, monkeypatch):
+        removed = []
+
+        monkeypatch.setattr(
+            backend_utils.global_user_state,
+            'get_cluster_status_fields',
+            lambda names=None, *, exclude_managed_clusters=False: {})
+        monkeypatch.setattr(
+            backend_utils.serve_utils,
+            'get_orphaned_service_cluster_status_fields', lambda:
+            {'ownerless-service': (status_lib.ClusterStatus.UP.value, 1)})
+        monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
+                            lambda: 1)
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'add_cluster_event', lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            backend_utils.global_user_state, 'remove_cluster',
+            lambda cluster_name, terminate: removed.append(
+                (cluster_name, terminate)))
+
+        def _refresh_record(cluster_name, **kwargs):
+            del kwargs
+            record = {
+                'handle': types.SimpleNamespace(cluster_yaml=None),
+                'status': status_lib.ClusterStatus.UP,
+                'is_managed': True,
+            }
+            return backend_utils._update_cluster_status(cluster_name,
+                                                        record,
+                                                        retry_if_missing=True)
+
+        monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
+                            _refresh_record)
+
+        backend_utils.refresh_cluster_records()
+
+        assert not removed
+
+    def test_unmanaged_cluster_without_yaml_keeps_legacy_cleanup(
+            self, monkeypatch):
+        removed = []
+        monkeypatch.setattr(backend_utils.global_user_state,
+                            'add_cluster_event', lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            backend_utils.global_user_state, 'remove_cluster',
+            lambda cluster_name, terminate: removed.append(
+                (cluster_name, terminate)))
+        record = {
+            'handle': types.SimpleNamespace(cluster_yaml=None),
+            'status': status_lib.ClusterStatus.UP,
+            'is_managed': False,
+        }
+
+        result = backend_utils._update_cluster_status('user-cluster',
+                                                      record,
+                                                      retry_if_missing=True)
+
+        assert result is None
+        assert removed == [('user-cluster', True)]
 
     def test_sweep_covers_all_clusters_when_snapshot_fails(self, monkeypatch):
         """A status-snapshot failure falls back to the names-only sweep."""

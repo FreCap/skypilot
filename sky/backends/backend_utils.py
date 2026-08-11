@@ -2896,6 +2896,15 @@ def _update_cluster_status(
     handle = record['handle']
     status = record['status']
     if handle.cluster_yaml is None:
+        if record.get('is_managed', False):
+            # Ownerless managed service rows are nominated specifically for a
+            # provider-authoritative refresh. Without the YAML, the provider
+            # cannot be queried, so deleting the row would turn "unknown" into
+            # false absence and could hide a live resource.
+            logger.debug(f'Managed cluster {cluster_name!r} has no YAML file; '
+                         'retaining its cache row because provider absence '
+                         'cannot be verified.')
+            return record
         # Remove cluster from db since this cluster does not have a config file
         # or any other ongoing requests
         global_user_state.add_cluster_event(

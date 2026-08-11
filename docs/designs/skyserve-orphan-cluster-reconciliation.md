@@ -36,6 +36,9 @@ path. It has these outcomes:
   status. Do not terminate it.
 - Credentials, provider status, or locking are unavailable: retain the row and
   retry on a later sweep.
+- The persisted handle has no cluster YAML, so the provider cannot be queried:
+  retain the managed row and its open usage interval for investigation. The
+  existing unmanaged-cluster cleanup behavior remains unchanged.
 
 Non-consolidated SkyServe is unchanged. Its replica database lives on the
 remote controller, so the API server cannot safely infer exact ownership.
@@ -66,6 +69,12 @@ replica row. The set difference therefore identifies broken or legacy
 inventory, while the provider query remains the final authority for deletion.
 The existing cluster and resource-operation locks protect races with a launch
 or teardown that is already in progress.
+
+A missing cluster YAML is not provider-absence evidence. Although the ordinary
+unmanaged sweep historically removes such incomplete cache rows, applying that
+shortcut to an ownerless managed candidate could discard the only tracking row
+for a live resource and close its usage interval. Managed candidates therefore
+fail closed when their persisted handle cannot identify a cluster YAML.
 
 ## Integration
 
@@ -143,7 +152,9 @@ Automated tests must prove:
 - the ordinary sweep includes candidates but still excludes other managed
   clusters;
 - candidate-discovery failure does not abort ordinary refresh;
-- one candidate refresh failure does not abort other candidates.
+- one candidate refresh failure does not abort other candidates;
+- an ownerless managed candidate without a cluster YAML is retained, while the
+  legacy unmanaged no-YAML cleanup still removes its cache row.
 
 Run the focused unit tests, formatter and linters for changed Python files, and
 the relevant broader backend and Serve unit-test slices.
