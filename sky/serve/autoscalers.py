@@ -2036,6 +2036,26 @@ class Autoscaler:
                                 live.free_slots_by_accelerator.get(card, 0) -
                                 card_emitted)
                 self._refresh_legacy_fill_projection_locked()
+
+            # Reserved fill is computed after ordinary decisions so the
+            # conservative exact-card debits above can account for every
+            # demand launch. Execution order need not match computation
+            # order, though. A LogicalScaleTarget is a blocking manager call
+            # that may reconcile a large paid launch budget before the next
+            # decision is handled. If it precedes protocol-v2 fill, the
+            # broker epoch can expire without any zero-cost launch reaching
+            # admission. Put this tick's already-debited fill decisions before
+            # the first ordinary scale-up while retaining any leading
+            # scale-down decisions and their existing ordering contract.
+            num_fill_decisions = sum(emitted_by_pool.values())
+            ordinary = result[:-num_fill_decisions]
+            fill = result[-num_fill_decisions:]
+            first_ordinary_up = next(
+                (index for index, decision in enumerate(ordinary)
+                 if decision.operator == AutoscalerDecisionOperator.SCALE_UP),
+                len(ordinary))
+            result = (ordinary[:first_ordinary_up] + fill +
+                      ordinary[first_ordinary_up:])
         return result
 
     def _apply_reserved_capacity_fill(
