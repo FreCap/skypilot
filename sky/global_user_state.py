@@ -26,6 +26,7 @@ from sqlalchemy.dialects import sqlite
 from sqlalchemy.ext import asyncio as sql_async
 
 from sky import global_user_state_cloud_checks
+from sky import global_user_state_cluster_control_plane_reads
 from sky import global_user_state_cluster_events
 from sky import global_user_state_cluster_history
 from sky import global_user_state_cluster_listing
@@ -2081,80 +2082,18 @@ def get_cluster_from_name(
         *,
         include_user_info: bool = True,
         summary_response: bool = False) -> dict[str, Any] | None:
-    engine = _db_manager.get_engine()
-    query_fields = [
-        cluster_table.c.name,
-        cluster_table.c.launched_at,
-        cluster_table.c.handle,
-        cluster_table.c.last_use,
-        cluster_table.c.status,
-        cluster_table.c.autostop,
-        cluster_table.c.to_down,
-        cluster_table.c.owner,
-        cluster_table.c.metadata,
-        cluster_table.c.cluster_hash,
-        cluster_table.c.cluster_ever_up,
-        cluster_table.c.status_updated_at,
-        cluster_table.c.user_hash,
-        cluster_table.c.config_hash,
-        cluster_table.c.workspace,
-        cluster_table.c.is_managed,
-    ]
-    joined_user_name_label = 'joined_user_name'
-    current_user_hash = ''
-    if include_user_info:
-        current_user_hash = common_utils.get_user_hash()
-        query_fields.append(user_table.c.name.label(joined_user_name_label))
-    if not summary_response:
-        query_fields.extend([
-            cluster_table.c.last_creation_yaml,
-            cluster_table.c.last_creation_command,
-        ])
-    with orm.Session(engine) as session:
-        query = session.query(*query_fields)
-        if include_user_info:
-            query = query.outerjoin(
-                user_table,
-                _cluster_user_join_key(current_user_hash) == user_table.c.id)
-        row = query.filter(cluster_table.c.name == cluster_name).first()
-        if row is None:
-            return None
-        user_hash = None
-        user_name = None
-        if include_user_info:
-            user_hash = (row.user_hash
-                         if row.user_hash is not None else current_user_hash)
-            user_name = getattr(row, joined_user_name_label)
-    last_event = None
-    if not summary_response:
-        last_event = get_terminal_or_last_status_change_event(row.cluster_hash)
-    # TODO: use namedtuple instead of dict
-    record = {
-        'name': row.name,
-        'launched_at': row.launched_at,
-        'handle': pickle.loads(row.handle),
-        'last_use': row.last_use,
-        'status': status_lib.ClusterStatus[row.status],
-        'autostop': row.autostop,
-        'to_down': bool(row.to_down),
-        'owner': _load_owner(row.owner),
-        'metadata': json.loads(row.metadata),
-        'cluster_hash': row.cluster_hash,
-        'cluster_ever_up': bool(row.cluster_ever_up),
-        'status_updated_at': row.status_updated_at,
-        'workspace': row.workspace,
-        'is_managed': bool(row.is_managed),
-        'config_hash': row.config_hash,
-    }
-    if not summary_response:
-        record['last_creation_yaml'] = row.last_creation_yaml
-        record['last_creation_command'] = row.last_creation_command
-        record['last_event'] = last_event
-    if include_user_info:
-        record['user_hash'] = user_hash
-        record['user_name'] = user_name
-
-    return record
+    return global_user_state_cluster_control_plane_reads.get_cluster_from_name(
+        _db_manager.get_engine,
+        orm.Session,
+        cluster_table,
+        user_table,
+        common_utils.get_user_hash,
+        _cluster_user_join_key,
+        _load_owner,
+        get_terminal_or_last_status_change_event,
+        cluster_name,
+        include_user_info=include_user_info,
+        summary_response=summary_response)
 
 
 # Bound the IN list per query so we stay under SQLite's
@@ -2191,74 +2130,16 @@ def get_clusters_from_names(
         Dict mapping ``cluster_name`` to its record, or to ``None`` for
         names that don't exist in the cluster table.
     """
-    result: dict[str, dict[str, Any] | None] = {
-        name: None for name in cluster_names
-    }
-    if not cluster_names:
-        return result
-    engine = _db_manager.get_engine()
-    query_fields = [
-        cluster_table.c.name,
-        cluster_table.c.launched_at,
-        cluster_table.c.handle,
-        cluster_table.c.last_use,
-        cluster_table.c.status,
-        cluster_table.c.autostop,
-        cluster_table.c.to_down,
-        cluster_table.c.owner,
-        cluster_table.c.metadata,
-        cluster_table.c.cluster_hash,
-        cluster_table.c.cluster_ever_up,
-        cluster_table.c.status_updated_at,
-        cluster_table.c.user_hash,
-        cluster_table.c.config_hash,
-        cluster_table.c.workspace,
-        cluster_table.c.is_managed,
-    ]
-    with orm.Session(engine) as session:
-        row_snapshots: list[tuple[Any, str | None]] = []
-        effective_user_hashes: set[str] = set()
-        for offset in range(0, len(cluster_names),
-                            _CLUSTER_IN_QUERY_CHUNK_SIZE):
-            batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
-            rows = session.query(*query_fields).filter(
-                cluster_table.c.name.in_(batch)).all()
-            for row in rows:
-                effective_user_hash = None
-                if include_user_info:
-                    effective_user_hash = _get_user_hash_or_current_user(
-                        row.user_hash)
-                    effective_user_hashes.add(effective_user_hash)
-                row_snapshots.append((row, effective_user_hash))
-        users_by_hash = {}
-        if include_user_info:
-            users_by_hash = _get_users_in_session(session,
-                                                  effective_user_hashes)
-        for row, effective_user_hash in row_snapshots:
-            record: dict[str, Any] = {
-                'name': row.name,
-                'launched_at': row.launched_at,
-                'handle': pickle.loads(row.handle),
-                'last_use': row.last_use,
-                'status': status_lib.ClusterStatus[row.status],
-                'autostop': row.autostop,
-                'to_down': bool(row.to_down),
-                'owner': _load_owner(row.owner),
-                'metadata': json.loads(row.metadata),
-                'cluster_hash': row.cluster_hash,
-                'cluster_ever_up': bool(row.cluster_ever_up),
-                'status_updated_at': row.status_updated_at,
-                'workspace': row.workspace,
-                'is_managed': bool(row.is_managed),
-                'config_hash': row.config_hash,
-            }
-            if include_user_info:
-                assert effective_user_hash is not None, row.name
-                user = users_by_hash.get(effective_user_hash)
-                record['user_hash'] = effective_user_hash
-                record['user_name'] = (user.name if user is not None else None)
-            result[row.name] = record
-    return result
+    return global_user_state_cluster_control_plane_reads.get_clusters_from_names(
+        _db_manager.get_engine,
+        orm.Session,
+        cluster_table,
+        _CLUSTER_IN_QUERY_CHUNK_SIZE,
+        _get_user_hash_or_current_user,
+        _get_users_in_session,
+        _load_owner,
+        cluster_names,
+        include_user_info=include_user_info)
 
 
 @metrics_lib.time_me
