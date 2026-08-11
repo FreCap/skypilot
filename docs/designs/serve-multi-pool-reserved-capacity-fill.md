@@ -17,10 +17,14 @@ double-debit a row already included by the broker.  The corrective contract is
 therefore strict epoch fencing; durable stale-decision reauthorization remains
 an open design gate.  The post-merge audit of PR #1424 also found that its
 numeric actionable-list cursor advanced on empty waves and changed meaning as
-pool eligibility changed.  Follow-up PR #1433 implements the stable-identity
-emitted-wave contract below in code-bearing commit
-`19aa7d6e86e49537b780f8b2dcb18ab32c991de9`; merge, artifact publication,
-deployment, and live verification remain pending.
+pool eligibility changed.  Follow-up PR #1433 merged the stable-identity
+emitted-wave correction as merge `96a56fe069c621df18ec13e8dfadaa305f9da6ea`
+(head `7c8c71f1348ab2cb4276aa237ecee950d74e7e58`).  Its detached-wave premise was
+still partially false: a same-order generation/UID/epoch successor could let
+stale fill or globally coupled shelter suppression escape and could leave the
+aggregate target projection stale.  The sequential audit correction in this
+change adds the all-or-nothing authority commit seam below.  Its merge,
+artifact publication, deployment, and live verification remain pending.
 Sustained live verification and compatibility-cleanup merge gates remain open.
 
 Last updated: 2026-08-11
@@ -304,19 +308,26 @@ at most one emitted wave per pool in the validated map, without adding provider
 or database calls; ordering remains linear in the number of pools.  A detached
 decision wave also captures the ordered-map revision.  If pool membership or
 ordering changes, or a lifecycle reset removes and then re-adds the same pool
-identity, the stale wave may neither debit the replacement feed nor recreate
-the cleared rotation anchor.  The controller's production poller, service
-update, decision, and synchronous actuation paths already share the actuation
-epoch lock, so this ordered-map revision is a defense-in-depth fence for
-direct or reentrant publication rather than a substitute for that
-serialization.  Decisions that remain valid across such a publication may
-still be returned: every accepted protocol-v2 launch is durably persisted
-before synchronous batch actuation returns, and its persisted nonterminal row
-(initially PENDING) debits the next tick's exact pool occupancy; only failed or
-otherwise unpersisted peers are retried.  Dynamic-state loading builds an
-unpublished replacement autoscaler under the routing and actuation locks.
-Concurrent mutation of the same autoscaler during `load_dynamic_states` is
-outside the supported lifecycle contract.
+identity, the stale wave is discarded before the replica manager and may
+neither suppress ordinary work, mutate the replacement feed, nor recreate the
+cleared rotation anchor; the caller's ordinary decisions remain unchanged.  If
+any live pool's generation, physical UID, or broker epoch differs without a
+map-order change, the complete detached overlay is likewise discarded and the
+caller's exact ordinary decisions are restored.  Target/headroom partitioning
+and demand/shelter coverage couple every pool, so no unchanged peer's detached
+subset is independently committable.  Rollback aligns the aggregate target
+projection with the replacement live per-pool targets but does not debit feed
+or advance the rotation anchor; a fresh tick retries the complete map within
+one decision interval.  A same-authority timestamp or damping refresh remains
+committable.  Only after every authority tuple matches does the first emitted
+fill decision's pool advance the rotation anchor.  This is an in-method commit
+seam for shelter suppression, fill decisions, feed, targets, and rotation
+state; production serialization through the controller's actuation-epoch lock
+and the manager's durable broker fences remains authoritative across method
+return and actuation.  Dynamic-state loading builds an unpublished replacement
+autoscaler under the routing and actuation locks. Concurrent mutation of the
+same autoscaler during `load_dynamic_states` is outside the supported lifecycle
+contract.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that
@@ -1670,11 +1681,25 @@ all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
 xfailed, 197 warnings, and 103 subtests passed. Phase-scope hotfix #1280 is now
 merged and deployed; those counts are historical evidence, not a current
-release identity. Follow-up #1433 must pass every relevant GitHub check on its
-exact final head, including the PostgreSQL Serve suite. Its local focused/broad
-test counts, formatter/type/lint results, and exact-head adversarial review must
-be recorded in the PR before merge and in the audit state after the gate
-completes.
+release identity. Follow-up #1433 merged at the weakened head above after its
+31 reported relevant checks passed, but before the audit's final adversarial
+gate; those checks did not cover epoch-blackout, remove/re-add, or globally
+coupled shelter races. The sequential correction containing this design must
+pass every relevant GitHub check on its exact final head, including the
+PostgreSQL Serve suite. Its local focused/broad test counts,
+formatter/type/lint results, and exact-head adversarial review must be recorded
+in the PR before merge and in audit state after the gate completes.
+
+Sequential-correction pre-PR validation on 2026-08-11 passed 227 reserved-fill
+tests (80 subtests), 49 refresh-row contract tests, 113 autoscaler contract
+tests (7 subtests), 459 replica-manager tests, 261 broker/persist/activation/
+spec tests, and 488 concurrency/controller tests (15 subtests).  The checked-in
+formatter completed with mypy clean across 895 source files, production pylint
+at 10.00/10, and dashboard lint/format clean; the production dashboard build
+also completed.  Three alternating 21-sample end-to-end runs at 100 and 1,000
+pools showed unchanged call counts and median-of-medians deltas of +0.007 ms
+and -0.057 ms versus merged #1433, respectively.  No provider, broker,
+database, catalog, or network call was added.
 
 Phase-scope acceptance requires both active convoy exercises from deployment
 step 6 and the sustained no-timeout/progress window. Feature acceptance
@@ -1692,8 +1717,10 @@ larger than the configured `max_replicas`.
   `fd909e0c534045ca21381e9f6ce79da141f145f7`, but the audit environment
   lacked the production Kubernetes context needed to verify the Helm revision,
   chart, image tag, and digest. Fetch those values from the live release before
-  any rollout or rollback. Follow-up #1433 still requires exact-head CI, merge,
-  artifact publication, deployment, and behavior-specific verification.
+  any rollout or rollback. Follow-up #1433 is merged but is not an acceptable
+  rollout identity until the sequential detached-authority correction passes
+  exact-head CI and review, merges, and receives artifact publication,
+  deployment, and behavior-specific verification.
 - Historical live version 51 acceptance retained serving health and
   demonstrated exact-card committed observation/refill behavior, but revision
   336 transiently entered controller failure under the phase convoy described
