@@ -10,8 +10,8 @@ from typing import Any
 
 import sqlalchemy
 from sqlalchemy import orm
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.dialects import sqlite
+from sqlalchemy.dialects import postgresql  # pylint: disable=unused-import
+from sqlalchemy.dialects import sqlite  # pylint: disable=unused-import
 from sqlalchemy.ext import asyncio as sql_async
 
 from sky import exceptions
@@ -21,6 +21,7 @@ from sky.jobs import batch_state
 from sky.jobs import state_api_access_tokens
 from sky.jobs import state_events
 from sky.jobs import state_file_mount_blobs
+from sky.jobs import state_job_registration
 from sky.jobs import state_log_cleanup
 from sky.jobs import state_pool_execution
 from sky.jobs import state_pool_queries
@@ -42,6 +43,10 @@ from sky.utils import common_utils
 from sky.utils.db import db_utils
 from sky.utils.db import retries as db_retries
 from sky.utils.plugin_extensions import ExternalClusterFailure
+
+# Preserve the historical dialect helper exports used by state tests and
+# external debugging code. Registration implementations live in
+# state_job_registration.
 
 # Separate callback types for sync and async contexts
 SyncCallbackType = Callable[[str], None]
@@ -352,54 +357,9 @@ _get_jobs_dict = state_queries._get_jobs_dict
 
 # pylint: enable=protected-access
 
-
 # === Status transition functions ===
-def set_job_info_without_job_id(name: str,
-                                workspace: str,
-                                entrypoint: str,
-                                pool: str | None,
-                                pool_hash: str | None,
-                                user_hash: str | None,
-                                execution: str | None = None,
-                                is_batch: bool = False,
-                                file_mounts_blob_id: str | None = None) -> int:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmt = insert_func(job_info_table).values(
-            name=name,
-            schedule_state=ManagedJobScheduleState.INACTIVE.value,
-            workspace=workspace,
-            entrypoint=entrypoint,
-            pool=pool,
-            pool_hash=pool_hash,
-            user_hash=user_hash,
-            execution=execution,
-            is_batch=is_batch,
-            file_mounts_blob_id=file_mounts_blob_id,
-        )
-
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            result = session.execute(insert_stmt)
-            ret = result.lastrowid
-            session.commit()
-            return ret
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            result = session.execute(
-                insert_stmt.returning(job_info_table.c.spot_job_id))
-            ret = result.scalar()
-            session.commit()
-            return ret
-        else:
-            raise ValueError('Unsupported database dialect')
+set_job_info_without_job_id = (
+    state_job_registration.set_job_info_without_job_id)
 
 
 def set_pending(
@@ -2726,39 +2686,7 @@ async def scheduler_set_done_async(job_id: int,
 # ==== needed for codegen ====
 # functions have no use outside of codegen, remove at your own peril
 
-
-def set_job_info(job_id: int,
-                 name: str,
-                 workspace: str,
-                 entrypoint: str,
-                 pool: str | None,
-                 pool_hash: str | None,
-                 user_hash: str | None = None,
-                 execution: str | None = None,
-                 is_batch: bool = False):
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmt = insert_func(job_info_table).values(
-            spot_job_id=job_id,
-            name=name,
-            schedule_state=ManagedJobScheduleState.INACTIVE.value,
-            workspace=workspace,
-            entrypoint=entrypoint,
-            pool=pool,
-            pool_hash=pool_hash,
-            user_hash=user_hash,
-            execution=execution,
-            is_batch=is_batch,
-        )
-        session.execute(insert_stmt)
-        session.commit()
+set_job_info = state_job_registration.set_job_info
 
 
 def reset_jobs_for_recovery() -> None:
