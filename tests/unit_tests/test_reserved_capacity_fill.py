@@ -1959,6 +1959,40 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         _replenish()
         self.assertEqual(_fill_pool_order(), [self.east_pool, self.phx_pool])
 
+    def test_stale_generation_wave_cannot_replace_rotation_anchor(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        generation_one = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        autoscaler.collect_reserved_capacity_pools(generation_one)
+        autoscaler.collect_reserved_capacity_pools(generation_one)
+        original_generate = autoscalers._generate_scale_up_decisions
+        advanced = False
+
+        def _advance_generation(num, target):
+            nonlocal advanced
+            if not advanced:
+                advanced = True
+                generation_two = self._snapshots(generation=2,
+                                                 east_feed=0,
+                                                 phx_feed=0)
+                autoscaler.collect_reserved_capacity_pools(generation_two)
+            return original_generate(num, target)
+
+        # Advance the complete live map after computation detached generation
+        # one but before it tries to debit and record the wave under the lock.
+        with mock.patch.object(autoscalers,
+                               '_generate_scale_up_decisions',
+                               side_effect=_advance_generation):
+            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+
+        self.assertTrue(_ups(decisions))
+        self.assertTrue(advanced)
+        self.assertEqual(
+            {
+                state.service_generation
+                for state in autoscaler._fill_pool_states.values()
+            }, {2})
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
     def test_rotation_anchor_survives_valid_dynamic_restore(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=4)
         snapshots = self._snapshots()
