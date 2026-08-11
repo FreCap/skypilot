@@ -4739,12 +4739,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                         fill_exact_accelerator_shape = (raw_card.casefold(),
                                                         raw_count)
                 # Broker epoch fence: a fill decision computed from a
-                # superseded allocation round must never launch DIRECTLY
-                # against capacity that may have been re-granted to a peer.
-                # Protocol v2 may re-authorize that decision from the latest
-                # same-generation/same-UID feed after debiting rows newer than
-                # its provider snapshot; legacy decisions remain strictly
-                # fenced. A lease-dead gap always fails the refresh closed.
+                # superseded allocation round must never launch against
+                # capacity that may have been re-granted to a peer. Provider
+                # snapshot and replica creation timestamps do not establish
+                # which row commits the round's debit scan included, so even a
+                # same-generation/same-UID v2 allocation cannot safely
+                # re-authorize a stale decision.
                 # Compared against the POOL's round epoch (stamped
                 # alongside the carried epoch): rounds are per-pool, so a
                 # grant change on an unrelated pool must not fence this
@@ -4769,32 +4769,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                         fill_pool_key)
                     if (broker_epoch is not None and
                             broker_epoch != fill_grant_epoch):
-                        refreshed_epoch = None
-                        if fill_protocol_version == 2:
-                            assert fill_service_generation is not None
-                            assert fill_physical_cluster_uid is not None
-                            refreshed_epoch = (
-                                self._refresh_protocol_v2_fill_epoch(
-                                    pool_key=fill_pool_key,
-                                    carried_epoch=fill_grant_epoch,
-                                    current_epoch=broker_epoch,
-                                    service_generation=(
-                                        fill_service_generation),
-                                    physical_cluster_uid=(
-                                        fill_physical_cluster_uid),
-                                    exact_accelerator_shape=(
-                                        fill_exact_accelerator_shape),
-                                    existing_replica_infos=(
-                                        existing_replica_infos)))
-                        if refreshed_epoch is None:
-                            self._log_fill_skip(
-                                f'grant epoch {fill_grant_epoch} superseded '
-                                f'(current {broker_epoch})')
-                            return None
-                        logger.debug('Refreshed reserved-fill launch epoch for '
-                                     f'{fill_pool_key}: {fill_grant_epoch} -> '
-                                     f'{refreshed_epoch}.')
-                        fill_grant_epoch = refreshed_epoch
+                        self._log_fill_skip(
+                            f'grant epoch {fill_grant_epoch} superseded '
+                            f'(current {broker_epoch})')
+                        return None
                 # The no-spill guarantee: a fill launch either lands on a
                 # zero-cost ACTIVE location or does not happen at all --
                 # checked BEFORE any replica row is persisted, so an
@@ -5853,109 +5831,6 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info(f'Reserved-capacity fill launch skipped: {reason}.')
         else:
             logger.debug(f'Reserved-capacity fill launch skipped: {reason}.')
-
-    def _refresh_protocol_v2_fill_epoch(
-        self,
-        *,
-        pool_key: str,
-        carried_epoch: int,
-        current_epoch: int,
-        service_generation: int,
-        physical_cluster_uid: str,
-        exact_accelerator_shape: tuple[str, int] | None,
-        existing_replica_infos: list['ReplicaInfo'] | None,
-    ) -> int | None:
-        """Refresh a stale v2 epoch only from unconsumed current authority.
-
-        Exact-card observations can legitimately move a shared pool's epoch
-        between autoscaler decision time and manager admission.  Rejecting
-        every such decision forever is unnecessary when the latest round
-        still grants this service an equivalent slot.  A refresh is safe only
-        within the same service generation and physical pool, and only while
-        the latest feed has capacity left after durable rows that may have
-        raced its provider snapshot are debited.
-
-        Final row persistence still compares this returned epoch atomically
-        under the broker lock.  A round published after this read therefore
-        rejects the launch instead of consuming newly reallocated capacity.
-        """
-        try:
-            allocation = reserved_capacity_broker.get_my_allocation(
-                self._service_name, pool_key)
-        except Exception as error:  # pylint: disable=broad-except
-            logger.warning('Reserved-fill epoch refresh could not read current '
-                           f'allocation for {pool_key}: '
-                           f'{common_utils.format_exception(error)}')
-            return None
-        if (allocation is None or allocation.protocol_version
-                != reserved_capacity_broker.PROTOCOL_V2 or
-                allocation.pool_key != pool_key or
-                allocation.service_generation != service_generation or
-                allocation.physical_cluster_uid != physical_cluster_uid or
-                allocation.epoch != current_epoch or
-                allocation.epoch <= carried_epoch):
-            return None
-        max_age = (reserved_capacity.poll_interval_seconds() *
-                   serve_constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
-        if time.time() - allocation.snapshot_time > max_age:
-            return None
-
-        feed_by_accelerator = allocation.feed_by_accelerator
-        if exact_accelerator_shape is None:
-            authorized = allocation.feed
-        else:
-            card, _ = exact_accelerator_shape
-            authorized = (allocation.feed if feed_by_accelerator is None else
-                          feed_by_accelerator.get(card, 0))
-        if authorized <= 0:
-            return None
-
-        try:
-            infos = (existing_replica_infos
-                     if existing_replica_infos is not None else
-                     serve_state.get_replica_infos(self._service_name))
-        except Exception as error:  # pylint: disable=broad-except
-            logger.warning(
-                'Reserved-fill epoch refresh could not debit current replica '
-                f'rows for {pool_key}: '
-                f'{common_utils.format_exception(error)}')
-            return None
-
-        consumed = 0
-        for info in infos:
-            if (info.is_terminal or info.reserved_fill is not True or
-                    info.reserved_fill_pool_key != pool_key or
-                    info.reserved_fill_service_generation != service_generation
-                    or info.reserved_fill_physical_cluster_uid
-                    != physical_cluster_uid):
-                continue
-            created_at = info.created_at
-            if (isinstance(created_at, (int, float)) and
-                    not isinstance(created_at, bool) and
-                    created_at <= allocation.snapshot_time):
-                continue
-            if (exact_accelerator_shape is not None and
-                    feed_by_accelerator is not None):
-                location = info.location
-                accelerators = (location.get('accelerators') if isinstance(
-                    location, dict) else None)
-                if not isinstance(accelerators, dict) or len(accelerators) != 1:
-                    # A post-snapshot row with unprovable shape consumes the
-                    # candidate card conservatively.
-                    consumed += 1
-                    continue
-                row_card, row_count = next(iter(accelerators.items()))
-                expected_card, expected_count = exact_accelerator_shape
-                if (not isinstance(row_card, str) or
-                        row_card.casefold() != expected_card or
-                        isinstance(row_count, bool) or
-                        not isinstance(row_count, (int, float)) or
-                        row_count != expected_count):
-                    continue
-            consumed += 1
-        if consumed >= authorized:
-            return None
-        return allocation.epoch
 
     def _scale_up_one_locked(
         self,

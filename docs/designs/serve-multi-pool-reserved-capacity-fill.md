@@ -11,9 +11,14 @@ connectivity. A later live refill cycle exposed two corrective invariants now
 implemented here: an identity-stable pool retains non-launching shelter across
 a forward service-generation transition, and a downscale-held actuator may
 reuse materialized compatible supply only for the fresh owned source subset.
+The post-merge audit of PR #1422 found that its timestamp-based stale-epoch
+reauthorization could both reuse capacity consumed by an ordinary replica and
+double-debit a row already included by the broker.  The corrective contract is
+therefore strict epoch fencing; durable stale-decision reauthorization remains
+an open design gate.
 Sustained live verification and compatibility-cleanup merge gates remain open.
 
-Last updated: 2026-08-07
+Last updated: 2026-08-11
 
 Canonical owner: this file. The implementation, rollout evidence, and the
 stacked compatibility-removal change must stay synchronized with this
@@ -794,7 +799,22 @@ positive authority retains the existing epoch fence.
 
 A failed, stale, benched, or phantom pool feeds zero only for that pool. It
 does not erase another healthy edge of the same service. A pool epoch change
-fences only launches stamped for that pool.
+fences only launches stamped for that pool.  Every decision stamped with a
+superseded epoch fails closed before location selection and row persistence,
+even when a newer round currently has positive feed for the same service,
+generation, physical UID, or accelerator card.  The final row persist retains
+its atomic epoch/generation/UID/owner checks for a round that changes after the
+early check.
+
+Provider `snapshot_time` and replica `created_at` are wall-clock observations,
+not a durable admission order.  They cannot prove whether the broker's later
+row scan included a replica, and clocks on different controllers may disagree.
+Consequently no launch may adopt a newer epoch by subtracting rows ordered by
+those timestamps.  A future live reauthorization protocol requires a
+PostgreSQL-backed, round-scoped admission ledger or equivalent monotonic commit
+boundary consumed transactionally by every fill and ordinary zero-cost
+admission, including mixed-version rollout fencing.  That protocol is outside
+this corrective change.
 
 After the existing consecutive-observation threshold confirms a protocol-v2
 phantom, the broker publishes explicit zero grant/feed authority for that pool
@@ -1471,6 +1491,12 @@ Automated coverage must include:
   unchanged, plus delayed same-PID delivery cannot cancel the next invocation
   and a broken pool cannot create a masking execution generation;
 - no row/thread on malformed, removed, benched, or superseded pool launches;
+- a stale protocol-v2 epoch fails closed before placement and persistence even
+  when the current same-generation/same-UID aggregate or exact-card feed is
+  positive; ordinary and cross-service post-snapshot rows, broker debit
+  overlap, malformed/NaN/future timestamps, and aggregate/exact authority
+  transitions cannot reauthorize it; the unchanged final persist fence still
+  rejects a round or ownership change after the early check;
 - workspace allowed-context validation covers inherited finite-list equality
   materialization and supersets, explicit finite-list supersets, list-to-`all`,
   empty-block normalization, and combined user-access checks; removals,
@@ -1658,3 +1684,8 @@ larger than the configured `max_replicas`.
   H200 model endpoint check, and east regression check remain open.
 - Draft compatibility cleanup PR #1263 is authored in stack #1264 and must
   remain blocked until the rollout gates above pass.
+- PR #1422's stale-epoch liveness premise remains unresolved after restoring
+  strict safety fencing.  Any replacement must first add and roll out the
+  durable admission-order contract described above, prove mixed-version
+  fail-closed behavior, and include cross-service race, restart, large-fleet
+  call-count, and timing evidence.
