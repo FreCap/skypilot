@@ -30,6 +30,7 @@ from sky import global_user_state_cluster_control_plane_reads
 from sky import global_user_state_cluster_events
 from sky import global_user_state_cluster_history
 from sky import global_user_state_cluster_listing
+from sky import global_user_state_cluster_raw_snapshots
 from sky import global_user_state_cluster_record_identity
 from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
@@ -2177,27 +2178,13 @@ def get_cluster_status_fields(
     ``cluster_names`` is None, all matching clusters are returned. Names not
     present in the cluster table are omitted from the result.
     """
-    result: dict[str, tuple[str | None, int | None]] = {}
-    if cluster_names == []:
-        return result
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        query = session.query(cluster_table.c.name, cluster_table.c.status,
-                              cluster_table.c.status_updated_at)
-        if exclude_managed_clusters:
-            query = query.filter(cluster_table.c.is_managed == int(False))
-        if cluster_names is None:
-            rows = query.all()
-            return {
-                row.name: (row.status, row.status_updated_at) for row in rows
-            }
-        for offset in range(0, len(cluster_names),
-                            _CLUSTER_IN_QUERY_CHUNK_SIZE):
-            batch = cluster_names[offset:offset + _CLUSTER_IN_QUERY_CHUNK_SIZE]
-            rows = query.filter(cluster_table.c.name.in_(batch)).all()
-            for row in rows:
-                result[row.name] = (row.status, row.status_updated_at)
-    return result
+    return global_user_state_cluster_raw_snapshots.get_cluster_status_fields(
+        _db_manager.get_engine,
+        orm.Session,
+        cluster_table,
+        _CLUSTER_IN_QUERY_CHUNK_SIZE,
+        cluster_names,
+        exclude_managed_clusters=exclude_managed_clusters)
 
 
 @metrics_lib.time_me
@@ -2212,24 +2199,12 @@ def get_cluster_status_fields_by_prefix(
     facts about one reserved prefix never load unrelated cluster rows.  The
     extra selected row makes overflow fail closed without an unbounded query.
     """
-    if (not isinstance(cluster_name_prefix, str) or not cluster_name_prefix or
-            type(row_limit) is not int or row_limit < 1):
-        raise ValueError('A nonempty cluster prefix and positive integer row '
-                         'limit are required.')
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(
-            cluster_table.c.name,
-            cluster_table.c.status,
-            cluster_table.c.status_updated_at,
-        ).filter(
-            cluster_table.c.name.startswith(
-                cluster_name_prefix, autoescape=True)).order_by(
-                    cluster_table.c.name).limit(row_limit + 1).all()
-    if len(rows) > row_limit:
-        raise ValueError('Cluster prefix inventory exceeds its explicit row '
-                         'limit.')
-    return {row.name: (row.status, row.status_updated_at) for row in rows}
+    return (global_user_state_cluster_raw_snapshots.
+            get_cluster_status_fields_by_prefix(_db_manager.get_engine,
+                                                orm.Session,
+                                                cluster_table,
+                                                cluster_name_prefix,
+                                                row_limit=row_limit))
 
 
 @metrics_lib.time_me
@@ -2243,23 +2218,11 @@ def get_managed_cluster_status_fields(
     which it no longer has an exact child record. Rows without a non-empty
     cluster hash cannot be safely fenced and are omitted.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(
-            cluster_table.c.name,
-            cluster_table.c.status,
-            cluster_table.c.status_updated_at,
-            cluster_table.c.cluster_hash,
-        ).filter(
-            cluster_table.c.is_managed == int(True),
-            cluster_table.c.workload_type == workload_type,
-            cluster_table.c.cluster_hash.is_not(None),
-            cluster_table.c.cluster_hash != '',
-        ).all()
-    return {
-        row.name: ManagedClusterStatusFields(row.status, row.status_updated_at,
-                                             row.cluster_hash) for row in rows
-    }
+    return (global_user_state_cluster_raw_snapshots.
+            get_managed_cluster_status_fields(_db_manager.get_engine,
+                                              orm.Session, cluster_table,
+                                              ManagedClusterStatusFields,
+                                              workload_type))
 
 
 @metrics_lib.time_me
@@ -2272,19 +2235,10 @@ def get_managed_job_cluster_cleanup_candidates() -> dict[str, str | None]:
     name before attempting cleanup. Rows attributed to another workload type
     are excluded here.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        rows = session.query(
-            cluster_table.c.name,
-            cluster_table.c.workload_id,
-        ).filter(
-            cluster_table.c.is_managed == int(True),
-            sqlalchemy.or_(
-                cluster_table.c.workload_type == 'managed_job',
-                cluster_table.c.workload_type.is_(None),
-            ),
-        ).all()
-    return {row.name: row.workload_id for row in rows}
+    return (global_user_state_cluster_raw_snapshots.
+            get_managed_job_cluster_cleanup_candidates(_db_manager.get_engine,
+                                                       orm.Session,
+                                                       cluster_table))
 
 
 @metrics_lib.time_me
@@ -2354,22 +2308,9 @@ def get_cluster_refresh_fields(
     still fencing concurrent autostop updates and row replacement, neither of
     which necessarily bumps ``status_updated_at``.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.query(
-            cluster_table.c.status,
-            cluster_table.c.status_updated_at,
-            cluster_table.c.autostop,
-            cluster_table.c.to_down,
-            cluster_table.c.cluster_hash,
-            cluster_table.c.is_managed,
-            cluster_table.c.workload_type,
-        ).filter_by(name=cluster_name).first()
-    if row is None:
-        return None
-    return ClusterRefreshFields(row.status, row.status_updated_at, row.autostop,
-                                bool(row.to_down), row.cluster_hash,
-                                bool(row.is_managed), row.workload_type)
+    return global_user_state_cluster_raw_snapshots.get_cluster_refresh_fields(
+        _db_manager.get_engine, orm.Session, cluster_table,
+        ClusterRefreshFields, cluster_name)
 
 
 @metrics_lib.time_me
