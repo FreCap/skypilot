@@ -15,6 +15,8 @@ from sky.serve import lb_ha
 from sky.serve import lb_k8s
 from sky.serve import serve_utils
 
+_REAL_GET_LB_ROLE_SNAPSHOT = lb_k8s.get_lb_role_snapshot
+
 
 def _state(phase: lb_ha.LbCutoverPhase,
            active: lb_ha.LbSlot = lb_ha.LbSlot.A,
@@ -615,6 +617,8 @@ def _role_controller() -> controller.SkyServeController:
     ctrl._lb_ha_enabled = True
     ctrl._lb_role_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=2, thread_name_prefix='test-skyserve-ha-role')
+    ctrl._lb_role_snapshot_read_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=4, thread_name_prefix='test-skyserve-ha-role-snapshot')
     ctrl._lb_role_lock = None
     ctrl._lb_role_snapshot_task = None
     ctrl._lb_role_snapshot_key = None
@@ -658,7 +662,8 @@ def _adapt_existing_role_handler_mocks(monkeypatch):
                       unused_fence,
                       state,
                       unused_owner,
-                      unused_timings=None):
+                      unused_timings=None,
+                      unused_executor=None):
         authority = lb_k8s.get_lb_pod_authority(service_name)
         if authority is None:
             return None
@@ -857,19 +862,237 @@ def test_role_heartbeat_bypasses_saturated_default_executor():
     assert phases['kubernetes_role_snapshot_executor_queue'] >= 0
 
 
-def test_controller_lifespan_shuts_down_role_executor():
+def test_controller_lifespan_shuts_down_role_executors():
     ctrl = _role_controller()
     role_executor = mock.Mock(spec=concurrent.futures.ThreadPoolExecutor)
+    snapshot_executor = mock.Mock(spec=concurrent.futures.ThreadPoolExecutor)
     ctrl._lb_role_executor = role_executor
+    ctrl._lb_role_snapshot_read_executor = snapshot_executor
 
     async def drive():
         async with ctrl.lifespan(None):
             role_executor.shutdown.assert_not_called()
+            snapshot_executor.shutdown.assert_not_called()
 
     asyncio.run(drive())
 
     role_executor.shutdown.assert_called_once_with(wait=False,
                                                    cancel_futures=True)
+    snapshot_executor.shutdown.assert_called_once_with(wait=False,
+                                                       cancel_futures=True)
+
+
+def test_role_heartbeat_reuses_snapshot_read_executor():
+    ctrl = _role_controller()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    snapshot = lb_k8s.LbRoleSnapshot(
+        _authority(), lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1'))
+    observed_executors = []
+
+    def read_snapshot(service_name,
+                      fence,
+                      state,
+                      owner,
+                      timings,
+                      read_executor=None):
+        assert service_name == 'service'
+        assert fence == ('incarnation', (123, '10.0.0.1'), 7)
+        assert state == stable
+        assert owner == _role_owner_record(fence, stable)
+        assert timings is not None
+        observed_executors.append(read_executor)
+        return snapshot
+
+    with mock.patch.object(controller.lb_k8s,
+                           'get_lb_role_snapshot',
+                           side_effect=read_snapshot), mock.patch.object(
+                               controller.serve_state,
+                               'get_lb_cutover_state',
+                               return_value=stable):
+        first = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+        second = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _role_request('active', lb_ha.LbSlot.A)))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert observed_executors == [
+        ctrl._lb_role_snapshot_read_executor,
+        ctrl._lb_role_snapshot_read_executor,
+    ]
+    assert len({id(executor) for executor in observed_executors}) == 1
+
+
+def test_get_lb_role_snapshot_uses_provided_read_executor():
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    owner = _role_owner_record(fence, stable)
+    authority = _authority()
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1')
+    service = {
+        'metadata': {
+            'resourceVersion': 'rv-1',
+        },
+        'spec': {},
+    }
+    pods = mock.Mock()
+    pods.items = []
+
+    class RecordingExecutor:
+        """Records submitted snapshot reads while executing them inline."""
+
+        def __init__(self):
+            self.submissions = []
+
+        def submit(self, function, *args, **kwargs):
+            self.submissions.append((function, args, kwargs))
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(function(*args, **kwargs))
+            except Exception as e:  # pylint: disable=broad-except
+                future.set_exception(e)
+            return future
+
+    read_executor = RecordingExecutor()
+    core_api = mock.Mock()
+    core_api.list_namespaced_pod.return_value = pods
+    core_api.read_namespaced_service.return_value = service
+    with mock.patch.object(
+            lb_k8s, '_lb_mode_active', return_value=True), mock.patch.object(
+                lb_k8s.kubernetes,
+                'in_cluster_context_name',
+                return_value='ctx'), mock.patch.object(
+                    lb_k8s, 'get_lb_namespace',
+                    return_value='ns'), mock.patch.object(
+                        lb_k8s.kubernetes, 'core_api', return_value=core_api
+                    ), mock.patch.object(
+                        lb_k8s,
+                        '_require_existing_lb_object_live_ownership',
+                        return_value='rv-1'), mock.patch.object(
+                            lb_k8s,
+                            '_parse_lb_service_routing',
+                            return_value=routing), mock.patch.object(
+                                lb_k8s,
+                                '_parse_lb_role_pod_authority',
+                                return_value=authority), mock.patch.object(
+                                    lb_k8s.concurrent.futures,
+                                    'ThreadPoolExecutor',
+                                    side_effect=AssertionError(
+                                        'provided executor must be reused')):
+        snapshot = _REAL_GET_LB_ROLE_SNAPSHOT('service',
+                                              fence,
+                                              stable,
+                                              owner,
+                                              read_executor=read_executor)
+
+    assert snapshot == lb_k8s.LbRoleSnapshot(authority, routing)
+    assert len(read_executor.submissions) == 2
+
+
+def test_provided_snapshot_executor_joins_reads_after_pod_failure():
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    owner = _role_owner_record(fence, stable)
+    service_started = threading.Event()
+    release_service = threading.Event()
+    core_api = mock.Mock()
+    core_api.list_namespaced_pod.side_effect = RuntimeError('pod read failed')
+
+    def read_service(*unused_args, **unused_kwargs):
+        service_started.set()
+        assert release_service.wait(timeout=2)
+        return mock.Mock()
+
+    core_api.read_namespaced_service.side_effect = read_service
+    with mock.patch.object(
+            lb_k8s, '_lb_mode_active', return_value=True), mock.patch.object(
+                lb_k8s.kubernetes,
+                'in_cluster_context_name',
+                return_value='ctx'), mock.patch.object(
+                    lb_k8s, 'get_lb_namespace',
+                    return_value='ns'), mock.patch.object(
+                        lb_k8s.kubernetes, 'core_api', return_value=core_api
+                    ), concurrent.futures.ThreadPoolExecutor(
+                        max_workers=2
+                    ) as read_executor, concurrent.futures.ThreadPoolExecutor(
+                        max_workers=1) as caller_executor:
+        snapshot_future = caller_executor.submit(_REAL_GET_LB_ROLE_SNAPSHOT,
+                                                 'service',
+                                                 fence,
+                                                 stable,
+                                                 owner,
+                                                 read_executor=read_executor)
+        assert service_started.wait(timeout=2)
+        try:
+            assert not snapshot_future.done()
+        finally:
+            release_service.set()
+        assert snapshot_future.result(timeout=2) is None
+
+    core_api.list_namespaced_pod.assert_called_once()
+    core_api.read_namespaced_service.assert_called_once()
+
+
+def test_provided_snapshot_executor_joins_read_after_second_submit_failure():
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    owner = _role_owner_record(fence, stable)
+    pod_started = threading.Event()
+    release_pod = threading.Event()
+    core_api = mock.Mock()
+
+    def list_pods(*unused_args, **unused_kwargs):
+        pod_started.set()
+        assert release_pod.wait(timeout=2)
+        return mock.Mock()
+
+    core_api.list_namespaced_pod.side_effect = list_pods
+
+    class RejectSecondSubmitExecutor:
+        """Starts one read, then models shutdown rejecting its peer."""
+
+        def __init__(self, backing_executor):
+            self._backing_executor = backing_executor
+            self.submission_count = 0
+
+        def submit(self, function, *args, **kwargs):
+            self.submission_count += 1
+            if self.submission_count == 2:
+                raise RuntimeError('cannot schedule new futures after shutdown')
+            return self._backing_executor.submit(function, *args, **kwargs)
+
+    with mock.patch.object(
+            lb_k8s, '_lb_mode_active', return_value=True), mock.patch.object(
+                lb_k8s.kubernetes,
+                'in_cluster_context_name',
+                return_value='ctx'), mock.patch.object(
+                    lb_k8s, 'get_lb_namespace', return_value='ns'
+                ), mock.patch.object(
+                    lb_k8s.kubernetes, 'core_api', return_value=core_api
+                ), concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1
+                ) as backing_executor, concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1) as caller_executor:
+        read_executor = RejectSecondSubmitExecutor(backing_executor)
+        snapshot_future = caller_executor.submit(_REAL_GET_LB_ROLE_SNAPSHOT,
+                                                 'service',
+                                                 fence,
+                                                 stable,
+                                                 owner,
+                                                 read_executor=read_executor)
+        assert pod_started.wait(timeout=2)
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                snapshot_future.result(timeout=0.2)
+        finally:
+            release_pod.set()
+        assert snapshot_future.result(timeout=2) is None
+
+    assert read_executor.submission_count == 2
+    core_api.list_namespaced_pod.assert_called_once()
+    core_api.read_namespaced_service.assert_not_called()
 
 
 def test_role_heartbeat_uses_one_shared_authority_snapshot():
@@ -879,7 +1102,12 @@ def test_role_heartbeat_uses_one_shared_authority_snapshot():
     routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1', 'runtime-new')
     snapshot = lb_k8s.LbRoleSnapshot(_authority(), routing)
 
-    def read_snapshot(service_name, fence, state, owner, timings):
+    def read_snapshot(service_name,
+                      fence,
+                      state,
+                      owner,
+                      timings,
+                      unused_executor=None):
         assert service_name == 'service'
         assert fence == ('incarnation', (123, '10.0.0.1'), 7)
         assert state == stable
@@ -969,7 +1197,12 @@ def test_concurrent_slot_heartbeats_keep_shared_snapshot_fencing():
                            {url: 1 for url in backend_urls},
                            {url: 0.0 for url in backend_urls})
 
-    def read_snapshot(unused_name, fence, state, unused_owner, unused_timings):
+    def read_snapshot(unused_name,
+                      fence,
+                      state,
+                      unused_owner,
+                      unused_timings,
+                      unused_executor=None):
         observed_fences.append((fence, state))
         snapshot_started.set()
         assert release_snapshot.wait(timeout=2)
@@ -1347,7 +1580,7 @@ def test_stable_role_prefetch_fails_closed_if_authority_changes(
     assert response.status_code == 503
     assert json.loads(response.body)['outcome'] == 'cutover_state_unavailable'
     snapshot_read.assert_called_once_with('service', fence, stable, mock.ANY,
-                                          mock.ANY)
+                                          mock.ANY, mock.ANY)
     ctrl._lb_session_ledger.update.assert_not_called()
 
 

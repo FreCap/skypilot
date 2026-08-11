@@ -315,6 +315,9 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._lb_role_executor = concurrent.futures.ThreadPoolExecutor(  # pylint: disable=protected-access
         max_workers=2,
         thread_name_prefix='test-skyserve-ha-role')
+    ctrl._lb_role_snapshot_read_executor = (  # pylint: disable=protected-access
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix='test-skyserve-ha-role-snapshot'))
     ctrl._lb_demand_lock = None  # pylint: disable=protected-access
     ctrl._lb_ha_enabled = False  # pylint: disable=protected-access
     ctrl._lb_session_ledger = None  # pylint: disable=protected-access
@@ -1754,6 +1757,8 @@ class TestServiceUpdateReconciler:
             'lifecycle_epoch': 7,
         }
         role_executor = ctrl._lb_role_executor  # pylint: disable=protected-access
+        snapshot_read_executor = (  # pylint: disable=protected-access
+            ctrl._lb_role_snapshot_read_executor)
         try:
             with mock.patch.object(controller.serve_state,
                                    'get_lb_cutover_state',
@@ -1780,6 +1785,8 @@ class TestServiceUpdateReconciler:
 
             assert ctrl._lb_ha_enabled is True  # pylint: disable=protected-access
             assert ctrl._lb_role_executor is role_executor  # pylint: disable=protected-access
+            assert (  # pylint: disable=protected-access
+                ctrl._lb_role_snapshot_read_executor is snapshot_read_executor)
 
             release_default = threading.Event()
             default_started = threading.Event()
@@ -1821,6 +1828,7 @@ class TestServiceUpdateReconciler:
             assert snapshot.snapshot.startswith('test-skyserve-ha-role')
         finally:
             role_executor.shutdown(wait=True, cancel_futures=True)
+            snapshot_read_executor.shutdown(wait=True, cancel_futures=True)
 
     def test_lb_mode_retry_resumes_interrupted_migration(self):
         ctrl = _make_update_controller()
