@@ -1909,6 +1909,22 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         self.assertEqual([item.target[_POOL_KEY] for item in second],
                          [self.phx_pool, west_pool])
 
+        # The manager stops the remainder of a wave at the first busy item.
+        # Exercise that component boundary deterministically: PHX, not the
+        # newly actionable west pool, must receive this wave's first attempt.
+        manager = _make_manager(None)
+        manager.lock = threading.RLock()
+        manager._batch_needs_placement_snapshot = mock.Mock(return_value=False)
+        manager._scale_up_one_locked = mock.Mock(
+            side_effect=exceptions.ProviderPhaseBusyError('phase busy'))
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_ids',
+                               return_value=set()):
+            manager.scale_up_batch([item.target for item in second])
+        manager._scale_up_one_locked.assert_called_once()
+        attempted = manager._scale_up_one_locked.call_args.args[0]
+        self.assertEqual(attempted[_POOL_KEY], self.phx_pool)
+
     def test_rotation_anchor_survives_valid_dynamic_restore(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=4)
         snapshots = self._snapshots()
@@ -2682,12 +2698,17 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
 
     def test_disabling_fill_clears_shelter_before_reenable(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
-        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertTrue(_ups(_decisions(autoscaler, [])))
+        self.assertIsNotNone(autoscaler._fill_pool_last_started_key)
 
         autoscaler.update_version(
             2, _spec(min_replicas=0, max_replicas=5, fill=False),
             serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler._fill_pool_states, {})
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
         autoscaler.update_version(
             3, _spec(min_replicas=0, max_replicas=5, fill=True),
             serve_utils.DEFAULT_UPDATE_MODE)
@@ -2827,10 +2848,13 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         autoscaler.collect_reserved_capacity_pools(snapshots)
         autoscaler.collect_reserved_capacity_pools(snapshots)
         self.assertIn('fill_by_pool', autoscaler.info())
+        self.assertTrue(_ups(_decisions(autoscaler, [])))
+        self.assertIsNotNone(autoscaler._fill_pool_last_started_key)
 
         autoscaler.collect_reserved_capacity(0, [_K8S_KEY],
                                              time.time(),
                                              protocol_version=1)
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
         autoscaler.collect_reserved_capacity(2, [_K8S_KEY],
                                              time.time(),
                                              protocol_version=1)

@@ -15,7 +15,10 @@ The post-merge audit of PR #1422 found that its timestamp-based stale-epoch
 reauthorization could both reuse capacity consumed by an ordinary replica and
 double-debit a row already included by the broker.  The corrective contract is
 therefore strict epoch fencing; durable stale-decision reauthorization remains
-an open design gate.
+an open design gate.  The post-merge audit of PR #1424 also found that its
+numeric actionable-list cursor advanced on empty waves and changed meaning as
+pool eligibility changed.  Emitted-wave fairness is now anchored to stable pool
+identity as specified below.
 Sustained live verification and compatibility-cleanup merge gates remain open.
 
 Last updated: 2026-08-11
@@ -284,6 +287,19 @@ capacity-reservation evidence and is not recorded as physical-identity
 uncertainty; unchanged work is retried next round. A busy batch item stops the
 entire remaining wave so the manager lock is released to the newly admitted
 opposite root instead of churning later decisions beneath that root.
+
+The autoscaler interleaves protocol-v2 fill decisions in stable configured
+pool order.  It remembers the stable identity of the pool that actually
+emitted the prior wave's first decision; the next wave starts after that pool
+in the complete ordered pool map and only then filters pools with no spendable
+feed.  A tick that emits no fill decision does not consume a fairness turn.
+The identity is carried across an in-process autoscaler state transfer only
+when it is a string naming a pool in the validated restored map.  Pool removal,
+protocol demotion, fill disablement, malformed state, and a full controller
+restart reset the anchor.  Thus a continuously running controller gives every
+continuously actionable pool a first-admission opportunity within at most one
+emitted wave per pool in the validated map, without adding provider or database
+calls; ordering remains linear in the number of pools.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that
