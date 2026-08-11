@@ -2260,6 +2260,10 @@ The persistence-ingestion entry point is exactly the `from_json()` signature
 above, where `serialized` is `str` or strict UTF-8 `bytes`; `bytearray` and
 every other type are rejected. It uses `object_pairs_hook` to reject a duplicate
 key before dictionary materialization and rejects JSON constants and floats.
+Decoder recursion exhaustion is normalized to `ValueError`. The materialized
+envelope is then validated field by field: each fixed-shape object rejects
+unknown keys before inspecting their descendants, so malformed unknown values
+cannot force an unbounded recursive prewalk ahead of the V1 shape checks.
 `from_envelope()` accepts an already-materialized in-process dictionary only;
 it cannot prove that upstream text had no duplicate keys and is not a
 persistence-ingestion API. The `bulk_provision()` validation path calls
@@ -13139,7 +13143,8 @@ Every declared facet generates conformance tests for:
   typed, disallowed-string, and empty fields at every depth;
 - JSON text rejects duplicates before materialization, floats, constants,
   lone surrogates, explicit C0/C1 controls, invalid fixed `NFC_V1`, and unknown
-  envelope keys;
+  envelope keys; deeply nested unknown values and decoder recursion exhaustion
+  are rejected as `ValueError` rather than escaping the parser contract;
 - the locked secret-key deny and allow corpus matches exactly;
 - scalar, per-container, combined-tree, 4 KiB payload, and 16 KiB envelope
   boundaries test the accepted value and the first rejected value;
