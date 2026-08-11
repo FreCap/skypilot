@@ -27,6 +27,7 @@ from sqlalchemy.ext import asyncio as sql_async
 
 from sky import global_user_state_cloud_checks
 from sky import global_user_state_cluster_events
+from sky import global_user_state_cluster_listing
 from sky import global_user_state_cluster_record_identity
 from sky import global_user_state_cluster_yaml
 from sky import global_user_state_notifications
@@ -2489,150 +2490,22 @@ def get_clusters(
         cluster_names: If specified, only include clusters
             that has name field set to one of the values.
     """
-    # is a cluster has a null user_hash,
-    # we treat it as belonging to the current user.
-    current_user_hash = common_utils.get_user_hash()
-    engine = _db_manager.get_engine()
-    deduped_cluster_names = None
-    if cluster_names is not None:
-        deduped_cluster_names = list(dict.fromkeys(cluster_names))
-    query_fields = [
-        cluster_table.c.name,
-        cluster_table.c.launched_at,
-        cluster_table.c.handle,
-        cluster_table.c.status,
-        cluster_table.c.autostop,
-        cluster_table.c.to_down,
-        cluster_table.c.cluster_hash,
-        cluster_table.c.cluster_ever_up,
-        cluster_table.c.user_hash,
-        cluster_table.c.workspace,
-        cluster_table.c.node_names,
-        user_table.c.name.label('user_name'),
-    ]
-    if not summary_response:
-        query_fields.extend([
-            cluster_table.c.last_creation_yaml,
-            cluster_table.c.last_creation_command,
-            cluster_table.c.config_hash,
-            cluster_table.c.owner,
-            cluster_table.c.metadata,
-            cluster_table.c.last_use,
-            cluster_table.c.status_updated_at,
-            cluster_table.c.links,
-        ])
-    if not exclude_managed_clusters:
-        query_fields.append(cluster_table.c.is_managed)
-    with orm.Session(engine) as session:
-        query = session.query(*query_fields).outerjoin(
-            user_table,
-            _cluster_user_join_key(current_user_hash) == user_table.c.id)
-        if exclude_managed_clusters:
-            query = query.filter(cluster_table.c.is_managed == int(False))
-        if workspaces_filter is not None:
-            query = query.filter(
-                cluster_table.c.workspace.in_(workspaces_filter))
-        if user_hashes_filter is not None:
-            if current_user_hash in user_hashes_filter:
-                # backwards compatibility for old clusters.
-                # If current_user_hash is in user_hashes_filter, we include
-                # clusters that have a null user_hash.
-                query = query.filter(
-                    cluster_table.c.user_hash.in_(user_hashes_filter) |
-                    cluster_table.c.user_hash.is_(None))
-            else:
-                query = query.filter(
-                    cluster_table.c.user_hash.in_(user_hashes_filter))
-        query = query.order_by(sqlalchemy.desc(cluster_table.c.launched_at))
-        if deduped_cluster_names is None:
-            rows = query.all()
-        elif len(deduped_cluster_names) <= _CLUSTER_IN_QUERY_CHUNK_SIZE:
-            rows = query.filter(
-                cluster_table.c.name.in_(deduped_cluster_names)).all()
-        else:
-            rows = []
-            for offset in range(0, len(deduped_cluster_names),
-                                _CLUSTER_IN_QUERY_CHUNK_SIZE):
-                batch = deduped_cluster_names[offset:offset +
-                                              _CLUSTER_IN_QUERY_CHUNK_SIZE]
-                rows.extend(query.filter(cluster_table.c.name.in_(batch)).all())
-            rows.sort(key=lambda row: row.launched_at, reverse=True)
-    records = []
-
-    # Hoisted: needed by both the new launch-progress fill (any response)
-    # and the existing last_event fill (summary_response=False only).
-    cluster_hashes = {row.cluster_hash for row in rows}
-
-    # Only fetch launch-progress events for clusters actually in INIT.
-    # Keeps the zero-overhead promise for non-INIT callers (e.g. SSH
-    # WebSocket validation uses summary_response=True specifically to
-    # avoid cluster-event queries on the hot path; see comment near
-    # `_get_cluster_and_validate` in server.py). The helper
-    # short-circuits on an empty set, so this is a no-op when no INIT
-    # clusters are in the result.
-    init_cluster_hashes = {
-        row.cluster_hash
-        for row in rows
-        if status_lib.ClusterStatus[row.status] is status_lib.ClusterStatus.INIT
-    }
-    launch_progress_dict = get_last_cluster_event_of_type_multiple(
-        init_cluster_hashes, ClusterEventType.LAUNCH_PROGRESS)
-
-    # get last cluster event for each row
-    last_cluster_event_dict = {}
-    if not summary_response:
-        last_cluster_event_dict = _get_last_or_terminal_cluster_event_multiple(
-            cluster_hashes)
-
-    for row in rows:
-        handle = pickle.loads(row.handle)
-        priority = (handle.launched_resources.priority
-                    if handle.launched_resources is not None else None)
-        priority_class = (handle.launched_resources.priority_class
-                          if handle.launched_resources is not None else None)
-        # TODO: use namedtuple instead of dict
-        record = {
-            'name': row.name,
-            'launched_at': row.launched_at,
-            'handle': handle,
-            'status': status_lib.ClusterStatus[row.status],
-            'priority': priority
-                        if priority is not None else constants.DEFAULT_PRIORITY,
-            'priority_class': priority_class,
-            'autostop': row.autostop,
-            'to_down': bool(row.to_down),
-            'cluster_hash': row.cluster_hash,
-            'cluster_ever_up': bool(row.cluster_ever_up),
-            'user_hash': (row.user_hash
-                          if row.user_hash is not None else current_user_hash),
-            'user_name': row.user_name,
-            'workspace': row.workspace,
-            'is_managed': False
-                          if exclude_managed_clusters else bool(row.is_managed),
-            'node_names': common_utils.get_display_node_names(row.node_names),
-        }
-        # launch_status_reason is populated outside the summary_response
-        # gate so both the list page (summary_response=True) and detail
-        # page (summary_response=False) get the badge tooltip data.
-        if record['status'] is status_lib.ClusterStatus.INIT:
-            record['launch_status_reason'] = launch_progress_dict.get(
-                row.cluster_hash)
-        else:
-            record['launch_status_reason'] = None
-        if not summary_response:
-            record['last_creation_yaml'] = row.last_creation_yaml
-            record['last_creation_command'] = row.last_creation_command
-            record['last_event'] = last_cluster_event_dict.get(
-                row.cluster_hash, None)
-            record['config_hash'] = row.config_hash
-            record['links'] = row.links if isinstance(row.links, dict) else {}
-            record['owner'] = _load_owner(row.owner)
-            record['metadata'] = json.loads(row.metadata)
-            record['last_use'] = row.last_use
-            record['status_updated_at'] = row.status_updated_at
-
-        records.append(record)
-    return records
+    return global_user_state_cluster_listing.get_clusters(
+        _db_manager.get_engine,
+        orm.Session,
+        cluster_table,
+        user_table,
+        _CLUSTER_IN_QUERY_CHUNK_SIZE,
+        get_last_cluster_event_of_type_multiple,
+        _get_last_or_terminal_cluster_event_multiple,
+        ClusterEventType.LAUNCH_PROGRESS,
+        _cluster_user_join_key,
+        _load_owner,
+        exclude_managed_clusters=exclude_managed_clusters,
+        workspaces_filter=workspaces_filter,
+        user_hashes_filter=user_hashes_filter,
+        cluster_names=cluster_names,
+        summary_response=summary_response)
 
 
 @metrics_lib.time_me
