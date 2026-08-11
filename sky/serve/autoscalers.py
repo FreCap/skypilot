@@ -1842,14 +1842,6 @@ class Autoscaler:
             targets[key] = min(targets[key], remaining_target_budget)
             remaining_target_budget -= targets[key]
 
-        total_target = sum(targets.values())
-        self._fill_target = total_target
-        with self._fill_pool_state_lock:
-            for key, target in targets.items():
-                live = self._fill_pool_states.get(key)
-                if (live is not None and live.service_generation
-                        == states[key].service_generation):
-                    live.fill_target = target
         result = list(decisions)
 
         # Partition the exact v1 shelter equation over pools. When complete
@@ -2044,17 +2036,40 @@ class Autoscaler:
             if not made_progress:
                 break
 
+        fill: list[AutoscalerDecision] = []
         if first_emitted_key is not None:
-            with self._fill_pool_state_lock:
-                if self._fill_pool_order_revision == pool_order_revision:
+            num_fill_decisions = sum(emitted_by_pool.values())
+            fill = result[-num_fill_decisions:]
+
+        pool_authority_is_current = False
+        with self._fill_pool_state_lock:
+            pool_order_is_current = (
+                self._fill_pool_order_revision == pool_order_revision)
+            if pool_order_is_current:
+                pool_authority_is_current = True
+                for key, source in states.items():
+                    live = self._fill_pool_states.get(key)
+                    if (live is None or live.service_generation
+                            != source.service_generation or
+                            live.physical_cluster_uid
+                            != source.physical_cluster_uid or
+                            live.grant_epoch != source.grant_epoch):
+                        pool_authority_is_current = False
+                        break
+            if pool_order_is_current and pool_authority_is_current:
+                # Target/headroom and shelter are partitioned across the full
+                # ordered map. Commit only if every pool still has the exact
+                # authority used by that coupled calculation.
+                for key, target in targets.items():
+                    self._fill_pool_states[key].fill_target = target
+                self._fill_target = sum(
+                    state.fill_target
+                    for state in self._fill_pool_states.values())
+                if first_emitted_key is not None:
                     for key, emitted in emitted_by_pool.items():
                         if emitted <= 0:
                             continue
-                        live = self._fill_pool_states.get(key)
-                        source = states[key]
-                        if (live is None or live.service_generation
-                                != source.service_generation):
-                            continue
+                        live = self._fill_pool_states[key]
                         live.free_slots = max(0, live.free_slots - emitted)
                         if live.last_raw_free_slots is not None:
                             live.last_raw_free_slots = max(
@@ -2066,15 +2081,29 @@ class Autoscaler:
                                     0,
                                     live.free_slots_by_accelerator.get(card, 0)
                                     - card_emitted)
-                    first_live = self._fill_pool_states.get(first_emitted_key)
-                    first_source = states[first_emitted_key]
-                    if (first_live is not None and first_live.service_generation
-                            == first_source.service_generation and
-                            first_live.physical_cluster_uid
-                            == first_source.physical_cluster_uid):
-                        self._fill_pool_last_started_key = first_emitted_key
+                    self._fill_pool_last_started_key = first_emitted_key
                     self._refresh_legacy_fill_projection_locked()
+            else:
+                # Publication installs replacement live states with their own
+                # per-pool targets (normally zero). Keep the aggregate status
+                # projection aligned even though this detached overlay rolls
+                # back without mutating feed or rotation state.
+                self._fill_target = sum(
+                    state.fill_target
+                    for state in self._fill_pool_states.values())
 
+        if not pool_order_is_current or not pool_authority_is_current:
+            # A lifecycle or authority boundary superseded part of this
+            # globally coupled calculation. Preserve the caller's exact
+            # ordinary work; a fresh tick retries the complete live map.
+            return decisions
+
+        ordinary = [
+            decision for index, decision in enumerate(decisions)
+            if index not in suppressed
+        ]
+        result = ordinary
+        if first_emitted_key is not None:
             # Reserved fill is computed after ordinary decisions so the
             # conservative exact-card debits above can account for every
             # demand launch. Execution order need not match computation
@@ -2085,9 +2114,6 @@ class Autoscaler:
             # admission. Put this tick's already-debited fill decisions before
             # the first ordinary scale-up while retaining any leading
             # scale-down decisions and their existing ordering contract.
-            num_fill_decisions = sum(emitted_by_pool.values())
-            ordinary = result[:-num_fill_decisions]
-            fill = result[-num_fill_decisions:]
             first_ordinary_up = next(
                 (index for index, decision in enumerate(ordinary)
                  if decision.operator == AutoscalerDecisionOperator.SCALE_UP),
