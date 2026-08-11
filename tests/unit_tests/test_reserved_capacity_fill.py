@@ -1925,6 +1925,40 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         attempted = manager._scale_up_one_locked.call_args.args[0]
         self.assertEqual(attempted[_POOL_KEY], self.phx_pool)
 
+    def test_rotation_anchors_to_first_pool_that_actually_emits(self):
+        autoscaler = self._exact_card_autoscaler({'L4': 1, 'H200': 1})
+        snapshots = self._snapshots(east_feed=1, phx_feed=1)
+        for snapshot in snapshots.values():
+            snapshot.pop('free_slots_by_accelerator')
+
+        def _replenish() -> None:
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        def _fill_pool_order() -> list[str]:
+            return [
+                decision.target[_POOL_KEY]
+                for decision in _ups(
+                    autoscaler._apply_reserved_capacity_fill([], []))
+                if isinstance(decision.target, dict) and
+                decision.target.get(_FILL_KEY)
+            ]
+
+        # Legacy v2 snapshots share the autoscaler's exact-card authority.
+        # EAST is planned first but cannot emit from an H200-only budget.
+        autoscaler.set_free_reserved_slots_by_accelerator({'H200': 1})
+        _replenish()
+        self.assertEqual(_fill_pool_order(), [self.phx_pool])
+
+        # Rotation must start after the first pool that really emitted (PHX),
+        # rather than after the planned-but-unemittable EAST pool.
+        autoscaler.set_free_reserved_slots_by_accelerator({
+            'L4': 1,
+            'H200': 1,
+        })
+        _replenish()
+        self.assertEqual(_fill_pool_order(), [self.east_pool, self.phx_pool])
+
     def test_rotation_anchor_survives_valid_dynamic_restore(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=4)
         snapshots = self._snapshots()
