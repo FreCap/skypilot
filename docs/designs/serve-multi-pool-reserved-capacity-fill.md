@@ -17,8 +17,10 @@ double-debit a row already included by the broker.  The corrective contract is
 therefore strict epoch fencing; durable stale-decision reauthorization remains
 an open design gate.  The post-merge audit of PR #1424 also found that its
 numeric actionable-list cursor advanced on empty waves and changed meaning as
-pool eligibility changed.  Emitted-wave fairness is now anchored to stable pool
-identity as specified below.
+pool eligibility changed.  Follow-up PR #1433 implements the stable-identity
+emitted-wave contract below in code-bearing commit
+`19aa7d6e86e49537b780f8b2dcb18ab32c991de9`; merge, artifact publication,
+deployment, and live verification remain pending.
 Sustained live verification and compatibility-cleanup merge gates remain open.
 
 Last updated: 2026-08-11
@@ -1651,10 +1653,13 @@ checks on the final PR head remain the merge gate.
 Required feature CI on the preceding code-bearing head `1357dec79` completed
 all 32 checks successfully. The mandatory unit job ran with
 `SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
-xfailed, 197 warnings, and 103 subtests passed. The phase-scope hotfix must pass
-every required GitHub check on its exact merge head, including the PostgreSQL
-Serve suite. Its local focused/broad test counts, formatter/type/lint results,
-and exact-head adversarial review must be recorded here before merge.
+xfailed, 197 warnings, and 103 subtests passed. Phase-scope hotfix #1280 is now
+merged and deployed; those counts are historical evidence, not a current
+release identity. Follow-up #1433 must pass every relevant GitHub check on its
+exact final head, including the PostgreSQL Serve suite. Its local focused/broad
+test counts, formatter/type/lint results, and exact-head adversarial review must
+be recorded in the PR before merge and in the audit state after the gate
+completes.
 
 Phase-scope acceptance requires both active convoy exercises from deployment
 step 6 and the sustained no-timeout/progress window. Feature acceptance
@@ -1665,21 +1670,23 @@ larger than the configured `max_replicas`.
 
 ## Open gates
 
-- Required feature and durable provider-fence CI passed. Helm revision 336
-  currently runs release `1.1.1099` from `57a0283ff`, with merged PRs #1269,
-  #1271, #1272, #1274, and #1275.
-  The production request store completed its one-way PostgreSQL cutover, Serve
-  is at schema head 035, token-bound protocol v2 is active, and the exact
-  `kube-system` Namespace read is present on east and PHX. The phase-scope
-  hotfix, required CI, artifact publication, Helm redeployment, and sustained
-  no-timeout observation are still open.
-- Live version 51 acceptance retained serving health and demonstrated exact-
-  card committed observation/refill behavior, but revision 336 transiently
-  entered controller failure under the phase convoy described above. The
-  hotfix must merge/deploy, actively pass both convoy exercises in deployment
-  step 6, and then complete at least three broker intervals with progressing
-  broker/LB/job-status work and no provider-phase timeout, 503 route sync, or
-  controller-failed transition.
+- Required feature and durable provider-fence CI passed. Helm revision 336 and
+  release `1.1.1099` from `57a0283ff` are historical rollout evidence; they do
+  not identify the current live release. A 2026-08-11 read-only endpoint check
+  reported server `1.1.1227` at
+  `fd909e0c534045ca21381e9f6ce79da141f145f7`, but the audit environment
+  lacked the production Kubernetes context needed to verify the Helm revision,
+  chart, image tag, and digest. Fetch those values from the live release before
+  any rollout or rollback. Follow-up #1433 still requires exact-head CI, merge,
+  artifact publication, deployment, and behavior-specific verification.
+- Historical live version 51 acceptance retained serving health and
+  demonstrated exact-card committed observation/refill behavior, but revision
+  336 transiently entered controller failure under the phase convoy described
+  above. Hotfix #1280 is merged and deployed. Sustained acceptance evidence for
+  the current release remains open: actively pass both convoy exercises in
+  deployment step 6, then complete at least three broker intervals with
+  progressing broker/LB/job-status work and no provider-phase timeout, 503
+  route sync, or controller-failed transition.
 - The no-platform-PR production bridge is a separately named ClusterRole and
   ClusterRoleBinding, `skypilot-physical-cluster-identity-reader`, on east and
   PHX, bound to EKS group
@@ -1687,11 +1694,11 @@ larger than the configured `max_replicas`.
   drift item until both platform pool roots consume the fixed module. At that
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
-- The Helm release is declaratively owned by boltz-platform Terragrunt, whose
-  `skypilot-pin.json` remains at `1.1.1084`. Revisions 331 through 336 and this
-  requested phase-scope Helm rollout are intentional direct-deploy drift; a
-  later Terragrunt apply will revert them unless the pin is reconciled. This
-  rollout deliberately creates no boltz-platform PR, per operator direction.
+- The live SkyPilot Helm release is the deployment authority.  The
+  boltz-platform pin is independent configuration and is not a rollback source
+  for a direct SkyPilot rollout; changing it requires separate explicit scope.
+  Verify the live chart version, image tag, and image digest after each rollout
+  and do not infer deployment state from the platform repository.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
   Isolated exact-context and two-pool canaries passed, including an H200 replica
   and HTTP 200 from Rainier, but versions 51--53 retained east-only placement
