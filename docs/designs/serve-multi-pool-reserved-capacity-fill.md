@@ -305,7 +305,18 @@ or database calls; ordering remains linear in the number of pools.  A detached
 decision wave also captures the ordered-map revision.  If pool membership or
 ordering changes, or a lifecycle reset removes and then re-adds the same pool
 identity, the stale wave may neither debit the replacement feed nor recreate
-the cleared rotation anchor.
+the cleared rotation anchor.  The controller's production poller, service
+update, decision, and synchronous actuation paths already share the actuation
+epoch lock, so this ordered-map revision is a defense-in-depth fence for
+direct or reentrant publication rather than a substitute for that
+serialization.  Decisions that remain valid across such a publication may
+still be returned: every accepted protocol-v2 launch is durably persisted
+before synchronous batch actuation returns, and its persisted nonterminal row
+(initially PENDING) debits the next tick's exact pool occupancy; only failed or
+otherwise unpersisted peers are retried.  Dynamic-state loading builds an
+unpublished replacement autoscaler under the routing and actuation locks.
+Concurrent mutation of the same autoscaler during `load_dynamic_states` is
+outside the supported lifecycle contract.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that
@@ -1698,11 +1709,11 @@ larger than the configured `max_replicas`.
   drift item until both platform pool roots consume the fixed module. At that
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
-- Deployment authority between the live Helm release and the boltz-platform
-  pin was not verified in this audit. Before any rollout or rollback, inspect
-  the live revision, chart version, image tag and digest, and the current
-  declarative pin; do not assume either source is authoritative or current.
-  Changing platform configuration is outside follow-up #1433.
+- The existing SkyPilot Helm release is the control-plane deployment and
+  rollback authority. The boltz-platform pin is independent infrastructure: do
+  not require, modify, wait for, or apply it for a SkyPilot application rollout.
+  This audit did not verify the live Helm revision, chart version, image tag, or
+  image digest; inspect those exact release values before and after any rollout.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
   Isolated exact-context and two-pool canaries passed, including an H200 replica
   and HTTP 200 from Rainier, but versions 51--53 retained east-only placement

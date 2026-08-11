@@ -1984,7 +1984,8 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                                side_effect=_advance_generation):
             decisions = autoscaler._apply_reserved_capacity_fill([], [])
 
-        self.assertTrue(_ups(decisions))
+        self.assertEqual([item.target[_POOL_KEY] for item in _ups(decisions)],
+                         [self.east_pool, self.phx_pool])
         self.assertTrue(advanced)
         self.assertEqual(
             {
@@ -2019,7 +2020,8 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                                side_effect=_remove_and_readd):
             decisions = autoscaler._apply_reserved_capacity_fill([], [])
 
-        self.assertTrue(_ups(decisions))
+        self.assertEqual([item.target[_POOL_KEY] for item in _ups(decisions)],
+                         [self.east_pool, self.phx_pool])
         self.assertTrue(readded)
         self.assertEqual(set(autoscaler._fill_pool_states), set(snapshots))
         self.assertEqual(
@@ -2031,6 +2033,55 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 self.phx_pool: 1,
             })
         self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+        # Batch actuation persists each accepted protocol-v2 reservation
+        # before returning. Model EAST as accepted while PHX was not reached:
+        # the next tick must debit EAST's PENDING occupancy and retry only
+        # the unpersisted PHX decision, despite the replacement map retaining
+        # its original feed values.
+        accepted = _replica(1,
+                            self.east.to_pickleable(),
+                            status=serve_state.ReplicaStatus.PENDING,
+                            created_at=snapshots[self.east_pool]['timestamp'] +
+                            1)
+        accepted.reserved_fill_pool_key = self.east_pool
+        accepted.reserved_fill_service_generation = 1
+        accepted.reserved_fill_physical_cluster_uid = 'east-uid'
+        retry = _ups(autoscaler._apply_reserved_capacity_fill([accepted], []))
+        self.assertEqual([item.target[_POOL_KEY] for item in retry],
+                         [self.phx_pool])
+
+    def test_pool_order_revision_tracks_membership_and_order_boundaries(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        initial_revision = autoscaler._fill_pool_order_revision
+
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        first_publication_revision = autoscaler._fill_pool_order_revision
+        self.assertEqual(first_publication_revision, initial_revision + 1)
+
+        # A same-order feed refresh changes values but is not a lifecycle or
+        # fairness boundary, so it must not invalidate an in-flight wave.
+        refreshed = {
+            key: dict(value, timestamp=value['timestamp'] + 1)
+            for key, value in snapshots.items()
+        }
+        autoscaler.collect_reserved_capacity_pools(refreshed)
+        self.assertEqual(autoscaler._fill_pool_order_revision,
+                         first_publication_revision)
+
+        reversed_snapshots = dict(reversed(list(refreshed.items())))
+        autoscaler.collect_reserved_capacity_pools(reversed_snapshots)
+        reorder_revision = autoscaler._fill_pool_order_revision
+        self.assertEqual(reorder_revision, first_publication_revision + 1)
+        autoscaler.collect_reserved_capacity_pools(reversed_snapshots)
+        self.assertEqual(autoscaler._fill_pool_order_revision, reorder_revision)
+
+        autoscaler.collect_reserved_capacity_pools({
+            self.phx_pool: reversed_snapshots[self.phx_pool],
+        })
+        self.assertEqual(autoscaler._fill_pool_order_revision,
+                         reorder_revision + 1)
 
     def test_rotation_anchor_survives_valid_dynamic_restore(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=4)
