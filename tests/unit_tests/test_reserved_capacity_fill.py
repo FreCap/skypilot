@@ -3332,6 +3332,159 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(
             persist.call_args.kwargs['expected_service_generation'], 7)
 
+    def test_v2_stale_epoch_refreshes_from_equivalent_current_feed(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        snapshot_time = time.time() - 1
+        allocation = reserved_capacity_broker.Allocation(
+            grant=4,
+            feed=2,
+            round_id=9,
+            epoch=5,
+            snapshot_time=snapshot_time,
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            service_generation=7,
+            physical_cluster_uid='physical-uid',
+            edge_cap=4,
+            pool_key=self._v2_override(location)[_POOL_KEY],
+            feed_by_accelerator={'h200': 2})
+        override = self._v2_override(location, epoch=3, exact_shape={'H200': 1})
+        existing = []
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=5), \
+             mock.patch.object(reserved_capacity_broker,
+                               'get_my_allocation',
+                               return_value=allocation) as get_allocation, \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica',
+                               return_value=True) as persist:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+                launched = manager._launch_replica(
+                    7,
+                    override,
+                    existing_replica_infos=existing,
+                    provider_phase_admission=admission)
+
+        self.assertTrue(launched)
+        get_allocation.assert_called_once_with('svc', override[_POOL_KEY])
+        self.assertEqual(persist.call_args.kwargs['expected_epoch'], 5)
+        self.assertEqual([info.replica_id for info in existing], [7])
+
+    def test_v2_stale_epoch_cannot_reuse_consumed_current_feed(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        manager = _make_manager(placer)
+        override = self._v2_override(location, epoch=3, exact_shape={'H200': 1})
+        snapshot_time = time.time() - 1
+        allocation = reserved_capacity_broker.Allocation(
+            grant=1,
+            feed=1,
+            round_id=9,
+            epoch=5,
+            snapshot_time=snapshot_time,
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            service_generation=7,
+            physical_cluster_uid='physical-uid',
+            edge_cap=1,
+            pool_key=override[_POOL_KEY],
+            feed_by_accelerator={'h200': 1})
+        occupying = mock.Mock()
+        occupying.is_terminal = False
+        occupying.reserved_fill = True
+        occupying.reserved_fill_pool_key = override[_POOL_KEY]
+        occupying.reserved_fill_service_generation = 7
+        occupying.reserved_fill_physical_cluster_uid = 'physical-uid'
+        occupying.created_at = snapshot_time + 0.5
+        occupying.location = location.to_pickleable()
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=5), \
+             mock.patch.object(reserved_capacity_broker,
+                               'get_my_allocation',
+                               return_value=allocation), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist:
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+                launched = manager._launch_replica(
+                    7,
+                    override,
+                    existing_replica_infos=[occupying],
+                    provider_phase_admission=admission)
+
+        self.assertFalse(launched)
+        persist.assert_not_called()
+        placer.select_next_zero_cost_location.assert_not_called()
+
+    def test_v2_epoch_refresh_rejects_changed_or_stale_authority(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        manager = _make_manager(mock.Mock())
+        pool_key = self._v2_override(location)[_POOL_KEY]
+        allocation = reserved_capacity_broker.Allocation(
+            grant=4,
+            feed=2,
+            round_id=9,
+            epoch=5,
+            snapshot_time=time.time(),
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            service_generation=7,
+            physical_cluster_uid='physical-uid',
+            edge_cap=4,
+            pool_key=pool_key,
+            feed_by_accelerator={'h200': 2})
+        cases = {
+            'service generation changed': dataclasses.replace(
+                allocation, service_generation=8),
+            'physical cluster changed': dataclasses.replace(
+                allocation, physical_cluster_uid='replacement-uid'),
+            'exact card authority moved': dataclasses.replace(
+                allocation, feed_by_accelerator={'a100': 2}),
+            'allocation is stale': dataclasses.replace(
+                allocation, snapshot_time=time.time() - 10_000),
+        }
+        for label, candidate in cases.items():
+            with self.subTest(label=label), mock.patch.object(
+                    reserved_capacity_broker,
+                    'get_my_allocation',
+                    return_value=candidate):
+                self.assertIsNone(
+                    manager._refresh_protocol_v2_fill_epoch(
+                        pool_key=pool_key,
+                        carried_epoch=3,
+                        current_epoch=5,
+                        service_generation=7,
+                        physical_cluster_uid='physical-uid',
+                        exact_accelerator_shape=('h200', 1),
+                        existing_replica_infos=[]))
+
     def test_v2_launch_capture_and_queued_static_pin_guard(self):
         location = make_location('phx-context',
                                  accelerators={'H200': 1.0},
