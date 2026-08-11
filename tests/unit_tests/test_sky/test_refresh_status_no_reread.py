@@ -87,8 +87,9 @@ def test_cluster_refresh_fields_track_autostop_without_status_bump(
     assert before is not None
     assert after is not None
     assert before[:2] == after[:2]
-    assert before[2:] == (-1, False)
-    assert after[2:] == (10, True)
+    assert (before.autostop, before.to_down) == (-1, False)
+    assert (after.autostop, after.to_down) == (10, True)
+    assert before.cluster_hash == after.cluster_hash
 
 
 def _make_handle():
@@ -461,10 +462,126 @@ def _make_refreshable_record(handle):
     return record
 
 
+def _refresh_fields(record, *, workload_type=None):
+    return global_user_state.ClusterRefreshFields(
+        record['status'].name, record['status_updated_at'], record['autostop'],
+        record['to_down'], record.get('cluster_hash'),
+        record.get('is_managed', False), workload_type)
+
+
+def _managed_candidate(record):
+    return global_user_state.ManagedClusterStatusFields(
+        record['status'].name, record['status_updated_at'],
+        record['cluster_hash'])
+
+
+def test_nominated_service_no_yaml_is_retained_under_refresh_locks():
+    handle = _make_handle()
+    handle.cluster_yaml = None
+    record = _make_refreshable_record(handle)
+    record['is_managed'] = True
+    status_lock = mock.MagicMock()
+    status_lock.acquire.return_value.__enter__.return_value = None
+    resource_lock = mock.MagicMock()
+    resource_lock.acquire.return_value.__enter__.return_value = None
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=record) as full_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=_refresh_fields(
+                               record, workload_type='service')) as cheap_read, \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record') as owner, \
+         mock.patch.object(backend_utils.locks,
+                           'get_lock',
+                           side_effect=[status_lock,
+                                        resource_lock]) as get_lock, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'remove_cluster') as remove:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster',
+            force_refresh_statuses=set(status_lib.ClusterStatus),
+            include_user_info=False,
+            summary_response=True,
+            _managed_no_yaml_candidate=_managed_candidate(record))
+
+    assert result is record
+    full_read.assert_called_once()
+    cheap_read.assert_called_once_with('test-cluster')
+    assert get_lock.call_count == 2
+    owner.assert_called_once_with('test-cluster', record)
+    add_event.assert_not_called()
+    remove.assert_not_called()
+
+
+@pytest.mark.parametrize(('is_managed', 'workload_type', 'cluster_hash'), [
+    (True, 'managed_job', 'fake-hash'),
+    (True, 'pool', 'fake-hash'),
+    (True, 'service', 'successor-hash'),
+    (False, None, 'fake-hash'),
+])
+def test_stale_service_nomination_cannot_act_on_same_name_successor(
+        is_managed, workload_type, cluster_hash):
+    handle = _make_handle()
+    handle.cluster_yaml = None
+    predecessor = _make_refreshable_record(handle)
+    predecessor['is_managed'] = True
+    successor = dict(predecessor,
+                     is_managed=is_managed,
+                     cluster_hash=cluster_hash)
+    candidate = _managed_candidate(predecessor)
+    status_lock = mock.MagicMock()
+    status_lock.acquire.return_value.__enter__.return_value = None
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           side_effect=[predecessor,
+                                        successor]) as full_read, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=_refresh_fields(
+                               successor, workload_type=workload_type)), \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record') as owner, \
+         mock.patch.object(backend_utils.locks,
+                           'get_lock',
+                           return_value=status_lock) as get_lock, \
+         mock.patch.object(
+             backend_utils,
+             '_update_cluster_status_with_resource_lock') as update, \
+         mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api') as provider, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'remove_cluster') as remove:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster',
+            force_refresh_statuses=set(status_lib.ClusterStatus),
+            include_user_info=False,
+            summary_response=True,
+            _managed_no_yaml_candidate=candidate)
+
+    assert result in (predecessor, successor)
+    assert full_read.call_count == (
+        2 if predecessor['cluster_hash'] != successor['cluster_hash'] or
+        predecessor['is_managed'] != successor['is_managed'] else 1)
+    get_lock.assert_called_once_with(
+        backend_utils.cluster_status_lock_id('test-cluster'))
+    owner.assert_called_once_with('test-cluster', predecessor)
+    update.assert_not_called()
+    provider.assert_not_called()
+    add_event.assert_not_called()
+    remove.assert_not_called()
+
+
 def test_reload_skips_full_read_when_status_unchanged():
     record = _make_refreshable_record(_make_handle())
-    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
-                      record['to_down'])
+    refresh_fields = _refresh_fields(record)
     with mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_refresh_fields',
                            return_value=refresh_fields) as cheap_read, \
@@ -472,9 +589,10 @@ def test_reload_skips_full_read_when_status_unchanged():
              backend_utils.global_user_state, 'get_cluster_from_name',
              side_effect=AssertionError(
                  'must not re-read the full record when status is unchanged')):
-        result = backend_utils._reload_record_if_refresh_fields_changed(
+        result, fields = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is record
+    assert fields is refresh_fields
     cheap_read.assert_called_once_with('test-cluster')
 
 
@@ -483,17 +601,17 @@ def test_reload_fetches_full_record_when_status_changed():
     fresh_record = dict(record,
                         status=status_lib.ClusterStatus.STOPPED,
                         status_updated_at=int(time.time()))
-    refresh_fields = ('STOPPED', fresh_record['status_updated_at'],
-                      fresh_record['autostop'], fresh_record['to_down'])
+    refresh_fields = _refresh_fields(fresh_record)
     with mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_refresh_fields',
                            return_value=refresh_fields), \
          mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_from_name',
                            return_value=fresh_record) as full_read:
-        result = backend_utils._reload_record_if_refresh_fields_changed(
+        result, fields = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is fresh_record
+    assert fields is refresh_fields
     full_read.assert_called_once_with('test-cluster',
                                       include_user_info=True,
                                       summary_response=False)
@@ -508,9 +626,10 @@ def test_reload_returns_none_when_cluster_deleted():
              backend_utils.global_user_state, 'get_cluster_from_name',
              side_effect=AssertionError(
                  'must not re-read the full record for a deleted cluster')):
-        result = backend_utils._reload_record_if_refresh_fields_changed(
+        result, fields = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is None
+    assert fields is None
 
 
 def test_refresh_lock_path_reads_full_record_once():
@@ -520,8 +639,7 @@ def test_refresh_lock_path_reads_full_record_once():
     record = _make_refreshable_record(handle)
     # Spot cluster with stale status_updated_at -> must refresh.
     handle.launched_resources.use_spot = True
-    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
-                      record['to_down'])
+    refresh_fields = _refresh_fields(record)
 
     lock = mock.MagicMock()
     lock.acquire.return_value.__enter__.return_value = None
@@ -544,7 +662,8 @@ def test_refresh_lock_path_reads_full_record_once():
     assert result is updated
     full_read.assert_called_once()
     cheap_read.assert_called_once_with('test-cluster')
-    update.assert_called_once_with('test-cluster', record, True, True, False)
+    update.assert_called_once_with('test-cluster', record, True, True, False,
+                                   None)
 
 
 def test_refresh_reloads_record_when_autostop_changes_before_lock():
@@ -566,7 +685,7 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
     status_fields = {
         'test-cluster': ('UP', record['status_updated_at']),
     }
-    refresh_fields = ('UP', record['status_updated_at'], 10, True)
+    refresh_fields = _refresh_fields(fresh_record)
 
     with mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_from_name',
@@ -603,7 +722,7 @@ def test_refresh_reloads_record_when_autostop_changes_before_lock():
     ]
     sleep.assert_called_once_with(lock.poll_interval)
     update.assert_called_once_with('test-cluster', fresh_record, True, True,
-                                   False)
+                                   False, None)
 
 
 def test_refresh_lock_wait_clamps_final_sleep_to_deadline():
@@ -611,8 +730,7 @@ def test_refresh_lock_wait_clamps_final_sleep_to_deadline():
     handle = _make_handle()
     handle.launched_resources.use_spot = True
     record = _make_refreshable_record(handle)
-    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
-                      record['to_down'])
+    refresh_fields = _refresh_fields(record)
 
     blocked = mock.MagicMock()
     blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
@@ -656,8 +774,7 @@ def test_refresh_lock_wait_returns_concurrent_update_at_deadline():
     fresh_record = dict(record,
                         status=status_lib.ClusterStatus.STOPPED,
                         status_updated_at=int(time.time()))
-    refresh_fields = ('STOPPED', fresh_record['status_updated_at'],
-                      fresh_record['autostop'], fresh_record['to_down'])
+    refresh_fields = _refresh_fields(fresh_record)
 
     blocked = mock.MagicMock()
     blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
@@ -696,8 +813,7 @@ def test_refresh_lock_wait_cancellation_stops_before_next_poll():
     handle = _make_handle()
     handle.launched_resources.use_spot = True
     record = _make_refreshable_record(handle)
-    refresh_fields = ('UP', record['status_updated_at'], record['autostop'],
-                      record['to_down'])
+    refresh_fields = _refresh_fields(record)
 
     blocked = mock.MagicMock()
     blocked.__enter__.side_effect = backend_utils.locks.LockTimeout
