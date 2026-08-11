@@ -3,6 +3,7 @@
 
 import asyncio
 import contextlib
+import inspect
 import pickle
 import time
 
@@ -14,6 +15,7 @@ from sqlalchemy import orm
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import state_log_cleanup
 from sky.jobs import state_task_lookups
 from sky.jobs.state import ManagedJobStatus
 
@@ -65,6 +67,28 @@ def test_task_lookup_public_identity_and_facade_patch(monkeypatch):
 
     assert state.get_task_log_stream_snapshot(7, 2) is snapshot
     assert calls == [(7, 2)]
+
+
+def test_log_cleanup_metadata_public_contract():
+    expected_signatures = {
+        'get_task_logs_to_clean':
+            '(retention_seconds: int, batch_size: int, '
+            'exclude_tasks: collections.abc.Collection[tuple[int, int]] | '
+            'None = None) -> list[dict[str, typing.Any]]',
+        'get_controller_logs_to_clean':
+            '(retention_seconds: int, batch_size: int, '
+            'exclude_job_ids: collections.abc.Collection[int] | None = None) '
+            '-> list[dict[str, typing.Any]]',
+        'set_task_logs_cleaned': '(tasks: list[tuple[int, int]], logs_cleaned_at: float)',
+        'set_controller_logs_cleaned': '(job_ids: list[int], logs_cleaned_at: float)',
+    }
+    for name, expected_signature in expected_signatures.items():
+        function = getattr(state, name)
+        assert function is getattr(state_log_cleanup, name)
+        assert function.__name__ == name
+        assert function.__module__ == 'sky.jobs.state'
+        assert str(inspect.signature(function)) == expected_signature
+        assert pickle.loads(pickle.dumps(function)) is function
 
 
 @pytest.fixture
@@ -1858,6 +1882,69 @@ def test_set_controller_logs_cleaned(_mock_managed_jobs_db_conn):
                     state.job_info_table.c.spot_job_id == job_id)).fetchone()
         assert row is not None
         assert row[0] == now
+
+
+def test_log_cleanup_empty_marker_batches_do_not_open_database(monkeypatch):
+
+    def _unexpected_engine_lookup():
+        raise AssertionError('empty cleanup markers must not obtain an engine')
+
+    monkeypatch.setattr(state._db_manager, 'get_engine',
+                        _unexpected_engine_lookup)
+
+    assert state.set_task_logs_cleaned([], 123.0) is None
+    assert state.set_controller_logs_cleaned([], 123.0) is None
+
+
+def test_log_cleanup_metadata_statement_budgets_and_deduplication(
+        _mock_managed_jobs_db_conn):
+    now = time.time()
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine, controller_logs_cleaned_at=None)
+    _insert_task(
+        engine,
+        job_id,
+        0,
+        status=ManagedJobStatus.SUCCEEDED,
+        end_at=now - 120,
+        local_log_file='/tmp/cleanup-budget.log',
+        logs_cleaned_at=None,
+    )
+    state.scheduler_set_done(job_id)
+
+    with _count_sql_statements(engine) as task_read_counts:
+        task_rows = state.get_task_logs_to_clean(60, batch_size=10)
+    assert task_rows == [{
+        'job_id': job_id,
+        'task_id': 0,
+        'local_log_file': '/tmp/cleanup-budget.log',
+    }]
+    assert task_read_counts['n'] == 1
+
+    with _count_sql_statements(engine) as controller_read_counts:
+        controller_rows = state.get_controller_logs_to_clean(60, batch_size=10)
+    assert controller_rows == [{'job_id': job_id}]
+    assert controller_read_counts['n'] == 1
+
+    with _count_sql_statements(engine) as task_write_counts:
+        state.set_task_logs_cleaned([(job_id, 0), (job_id, 0)], now)
+    assert task_write_counts['n'] == 1
+
+    with _count_sql_statements(engine) as controller_write_counts:
+        state.set_controller_logs_cleaned([job_id, job_id], now)
+    assert controller_write_counts['n'] == 1
+
+    with orm.Session(engine) as session:
+        task_cleaned_at = session.execute(
+            sqlalchemy.select(state.spot_table.c.logs_cleaned_at).where(
+                sqlalchemy.and_(state.spot_table.c.spot_job_id == job_id,
+                                state.spot_table.c.task_id == 0))).scalar_one()
+        controller_cleaned_at = session.execute(
+            sqlalchemy.select(
+                state.job_info_table.c.controller_logs_cleaned_at).where(
+                    state.job_info_table.c.spot_job_id == job_id)).scalar_one()
+    assert task_cleaned_at == now
+    assert controller_cleaned_at == now
 
 
 def test_get_active_file_mounts_blob_ids(_mock_managed_jobs_db_conn):
