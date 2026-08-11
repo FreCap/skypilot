@@ -14,6 +14,8 @@ though the read shape and maximum outer concurrency are fixed.
 - Stable role heartbeats and legacy-to-HA transitions use that same executor.
 - The two Kubernetes reads remain concurrent and retain their deterministic,
   fail-closed error ordering.
+- Every accepted read is joined before return, including when controller
+  shutdown rejects the peer submission.
 - Direct helper callers that do not supply an executor retain a self-owned
   fallback with the existing synchronous lifetime.
 - Controller shutdown stops accepting queued role work and snapshot reads
@@ -30,10 +32,12 @@ controller snapshot call sites pass the read executor to
 
 The inner helper accepts an optional `concurrent.futures.Executor`. When one is
 provided, it submits the Pod and Service reads without assuming ownership of
-the executor. When omitted, it creates and shuts down the historical local
-two-worker pool. A four-worker shared pool matches the maximum two concurrent
-outer role requests times two independent reads, so this removes executor
-churn without adding queueing at the supported concurrency bound.
+the executor. If shutdown lands between the two submissions, the helper joins
+the accepted read before propagating the submission failure. When omitted, it
+creates and shuts down the historical local two-worker pool. A four-worker
+shared pool matches the maximum two concurrent outer role requests times two
+independent reads, so this removes executor churn without adding queueing at
+the supported concurrency bound.
 
 ## Alternatives
 
@@ -56,7 +60,7 @@ independently through the optional fallback.
 | Path | Invariant | Coverage |
 | --- | --- | --- |
 | `sky/serve/controller.py` | one pool across stable/transition reads; shutdown owns both pools | focused controller transition and HA lifespan/reuse tests |
-| `sky/serve/lb_k8s.py` | supplied pool avoids construction and joins both reads; fallback and error order remain intact | provided-executor, failed-read join, deterministic-error, and direct snapshot tests |
+| `sky/serve/lb_k8s.py` | supplied pool avoids construction and joins every accepted read, including partial submission; fallback and error order remain intact | provided-executor, failed-read join, rejected-peer-submission join, deterministic-error, and direct snapshot tests |
 | `tests/unit_tests/test_serve_controller.py` | synthetic controllers mirror production ownership | complete controller test file |
 | `tests/unit_tests/test_serve_lb_ha.py` | lifecycle, concurrency, fencing, and exact submission count | focused HA matrix and complete HA test file |
 
@@ -65,4 +69,6 @@ independently through the optional fallback.
 Tests assert that repeated heartbeats observe the same executor identity, that
 a supplied executor performs exactly two submissions while local executor
 construction is forbidden, and that backend call counts do not increase. The
-worker bound follows directly from two outer workers times two inner reads.
+partial-submission test proves the failure path joins accepted work without
+issuing the rejected Service call. The worker bound follows directly from two
+outer workers times two inner reads.

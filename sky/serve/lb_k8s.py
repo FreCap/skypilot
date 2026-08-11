@@ -2954,8 +2954,17 @@ def get_lb_role_snapshot(
         assert executor is not None
         try:
             pods_future = executor.submit(parent_context.copy().run, list_pods)
-            service_future = executor.submit(parent_context.copy().run,
-                                             read_service)
+            service_future: concurrent.futures.Future[Any] | None = None
+            try:
+                service_future = executor.submit(parent_context.copy().run,
+                                                 read_service)
+            except BaseException:
+                # Controller shutdown can reject the peer submission after
+                # accepting this read.  Preserve the synchronous snapshot
+                # lifetime instead of leaving that accepted work detached.
+                concurrent.futures.wait((pods_future,))
+                raise
+            assert service_future is not None
             concurrent.futures.wait((pods_future, service_future))
             pods = pods_future.result()
             try:

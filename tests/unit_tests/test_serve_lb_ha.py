@@ -1035,6 +1035,66 @@ def test_provided_snapshot_executor_joins_reads_after_pod_failure():
     core_api.read_namespaced_service.assert_called_once()
 
 
+def test_provided_snapshot_executor_joins_read_after_second_submit_failure():
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    fence = ('incarnation', (123, '10.0.0.1'), 7)
+    owner = _role_owner_record(fence, stable)
+    pod_started = threading.Event()
+    release_pod = threading.Event()
+    core_api = mock.Mock()
+
+    def list_pods(*unused_args, **unused_kwargs):
+        pod_started.set()
+        assert release_pod.wait(timeout=2)
+        return mock.Mock()
+
+    core_api.list_namespaced_pod.side_effect = list_pods
+
+    class RejectSecondSubmitExecutor:
+        """Starts one read, then models shutdown rejecting its peer."""
+
+        def __init__(self, backing_executor):
+            self._backing_executor = backing_executor
+            self.submission_count = 0
+
+        def submit(self, function, *args, **kwargs):
+            self.submission_count += 1
+            if self.submission_count == 2:
+                raise RuntimeError('cannot schedule new futures after shutdown')
+            return self._backing_executor.submit(function, *args, **kwargs)
+
+    with mock.patch.object(
+            lb_k8s, '_lb_mode_active', return_value=True), mock.patch.object(
+                lb_k8s.kubernetes,
+                'in_cluster_context_name',
+                return_value='ctx'), mock.patch.object(
+                    lb_k8s, 'get_lb_namespace', return_value='ns'
+                ), mock.patch.object(
+                    lb_k8s.kubernetes, 'core_api', return_value=core_api
+                ), concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1
+                ) as backing_executor, concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1) as caller_executor:
+        read_executor = RejectSecondSubmitExecutor(backing_executor)
+        snapshot_future = caller_executor.submit(_REAL_GET_LB_ROLE_SNAPSHOT,
+                                                 'service',
+                                                 fence,
+                                                 stable,
+                                                 owner,
+                                                 read_executor=read_executor)
+        assert pod_started.wait(timeout=2)
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                snapshot_future.result(timeout=0.2)
+        finally:
+            release_pod.set()
+        assert snapshot_future.result(timeout=2) is None
+
+    assert read_executor.submission_count == 2
+    core_api.list_namespaced_pod.assert_called_once()
+    core_api.read_namespaced_service.assert_not_called()
+
+
 def test_role_heartbeat_uses_one_shared_authority_snapshot():
     ctrl = _role_controller()
     ctrl._controller_owner = (123, '10.0.0.1')
