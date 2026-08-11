@@ -750,6 +750,42 @@ def _exit_on_ownership_loss(
     _orphan_exit(controller_process)
 
 
+def _promote_fresh_ordinary_launch_binding(
+    authority: ordinary_launch_binding.ControllerBindingAuthority | None,
+    *,
+    is_recovery: bool,
+    is_pool: bool,
+) -> ordinary_launch_binding.ControllerBindingAuthority | None:
+    """Promote an eligible fresh service before its controller can spawn.
+
+    Recovery preserves the persisted binding mode, pools have no inference
+    endpoint, and stores without Serve042 PostgreSQL support return no durable
+    authority.  Every other fresh service must complete the transactional
+    participant/drain barriers and then prove the exact committed authority.
+    """
+    if is_recovery or is_pool or authority is None:
+        return authority
+    if authority.capable is not True:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh ordinary-launch binding requires capable authority.')
+
+    promoted_epoch = request_postgres.promote_ordinary_launch_binding_service(
+        authority)
+    expected_epoch = authority.binding_epoch + 1
+    if promoted_epoch != expected_epoch:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fresh ordinary-launch binding promotion returned an unexpected '
+            'epoch.')
+    with ordinary_launch_binding.refresh_controller_authority(
+            authority) as refreshed:
+        if (refreshed.binding_mode != ordinary_launch_binding.BindingMode.BOUND
+                or refreshed.binding_epoch != promoted_epoch):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Fresh ordinary-launch binding promotion could not be '
+                'verified under the exact controller authority.')
+        return refreshed
+
+
 def _bail_on_boot_failure(service_name: str,
                           controller_process: multiprocessing.Process | None,
                           timeout_seconds: int,
@@ -2328,6 +2364,11 @@ def _start(service_name: str,
                 _exit_on_ownership_loss(False, service_name,
                                         'claiming fresh controller startup',
                                         None)
+
+        controller_binding_authority = (_promote_fresh_ordinary_launch_binding(
+            controller_binding_authority,
+            is_recovery=is_recovery,
+            is_pool=service_spec.pool))
 
         def _get_controller_host():
             """Get the controller host address.

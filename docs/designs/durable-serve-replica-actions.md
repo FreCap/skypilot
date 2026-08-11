@@ -62,6 +62,16 @@ kernel. A bounded fix may proceed only under the contract and evidence gates
 in this document. Issue #1352 owns that telemetry-first follow-up; it is not an
 R0 authority-retirement blocker.
 
+The localized follow-up is now authored as a stack through R3. R1 adds only
+diagnostic evidence, R2 adds the bounded binding/adoption machinery while
+leaving all services in `legacy`, and this R3 change makes that machinery
+mandatory before the first controller child is spawned for a fresh eligible
+central-PostgreSQL non-pool service. R3 does not change schema defaults,
+migrate an existing service, promote a recovery, or change pool/local/pre-042
+behavior. R4, the already-planned legacy-fallback removal, remains blocked on
+the rollout and migration gates below. None of R1--R3 is treated as deployed
+merely because its stacked source is authored.
+
 ## Decision record
 
 The original 2026-07-30 request was an evaluation of whether a unified
@@ -107,9 +117,10 @@ eligible production volume. It does not reverse the capacity-scanner no-go,
 revive the universal kernel or retired authority topology, waive the R1-first
 sequence, or authorize a capacity-creating canary.
 
-The stack therefore starts with the diagnostic-only R1 change below. R2 may be
-implemented in the next stacked change, but binding activation and legacy-path
-removal remain subject to their compatibility, crash-matrix, and rollout gates.
+The stack therefore starts with the diagnostic-only R1 change below, followed
+by R2's bounded machinery and R3's mandatory fresh-service adoption. Binding
+activation in production and R4 legacy-path removal remain subject to their
+compatibility, crash-matrix, migration, and rollout gates.
 
 ## Goals
 
@@ -347,11 +358,17 @@ The service row has a non-null controller-incarnation UUID, monotonic
 `ordinary_launch_binding_mode` (`legacy` or `bound`), and monotonic binding
 epoch. Every controller subprocess startup supplies a fresh incarnation UUID;
 the owner CAS changes it and increments the epoch even when PID/IP are reused.
-Existing services default to `legacy`.
-Promotion to `bound` is an explicit transaction requiring a non-pool service,
-the full participant/quiescence barrier, and zero legacy nonterminal ordinary
-requests or PENDING/PROVISIONING replica rows. A fenced rollback demotion to
-`legacy` is permitted only after every bound association is terminal,
+Serve042 migration rows and existing services default to `legacy`. Fresh R3
+services also insert as `legacy`; after claiming a fresh capable controller
+incarnation, but before spawning its child, an eligible central-PostgreSQL
+non-pool service must complete the existing explicit promotion transaction and
+refresh the exact committed authority. That transaction requires the full
+participant/quiescence barrier and zero legacy nonterminal ordinary requests or
+PENDING/PROVISIONING replica rows. Any promotion or exact mode/epoch refresh
+failure aborts startup before child creation. Recovery preserves the persisted
+mode, and pools plus stores without a capable Serve042 authority remain outside
+automatic promotion. A fenced rollback demotion to `legacy` is permitted only
+after every bound association is terminal,
 quiescent, copied, projected and unpinned and no launch generation is active;
 it increments the binding epoch. An incapable controller can never claim a
 service while its mode is `bound`.
@@ -717,18 +734,39 @@ started bound worker `RUNNING` only through a locked compare-and-update that
 requires the exact active association and still-`SCHEDULED` row; a faster child
 projection always wins.
 
-### R3: rollout and removal
+### R3: mandatory fresh-service adoption
 
-Deploy dark/read-only validation first, then one eligible non-pool service.
-Remove the old resubmission inference only after the exact merged artifact has
-completed the monitoring gate. The already-authored removal change makes the
-bound endpoint mandatory for eligible ordinary launches, removes the branch in
-`_recover_legacy_replica_operations()` that resubmits without first resolving
-an exact association, removes the capability-controlled unbound submission
-fallback, and deletes transition-only compatibility probes. It retains the
-process map and legacy recovery for pools, system-OOM recovery, reserved-fill,
-and other excluded profiles; global deletion of those contracts is outside
-this design.
+Keep `add_service()` and the Serve042 migration default at `legacy`; directly
+creating a bound row would bypass both the request-side participant/drain
+barriers and the exact capable controller authority required by promotion.
+For a fresh service only, `_start()` first claims a capable controller
+incarnation. If the service is non-pool and the claim returned a Serve042
+central-PostgreSQL authority, it then transactionally promotes that exact
+authority, refreshes it, and requires mode `bound` at exactly the returned
+adjacent binding epoch before calling the child-spawn boundary. Promotion,
+barrier, epoch, or refresh failure propagates and therefore fails closed before
+any child can admit a launch.
+
+Recovery, including recovery of an existing `legacy` row, never automatically
+promotes. Pools and an absent authority (the local, SQLite, and pre-042
+compatibility result) also preserve their prior behavior. This phase performs
+no bulk migration and exposes no new public switch. The explicit R2 transition
+and fenced demotion surfaces remain available for controlled migration and
+rollback of existing services.
+
+### R4: rollout-gated legacy fallback removal
+
+Deploy R1 and R2 dark/read-only validation first, then R3 and one newly created
+eligible non-pool service. Remove the old resubmission inference only after the
+exact merged artifact has completed the monitoring gate and every existing
+eligible legacy service has been explicitly promoted or retired. The stacked
+removal change makes the bound endpoint mandatory for eligible ordinary
+launches, removes the branch in `_recover_legacy_replica_operations()` that
+resubmits without first resolving an exact association, removes the
+capability-controlled unbound submission fallback, and deletes
+transition-only compatibility probes. It retains the process map and legacy
+recovery for pools, system-OOM recovery, reserved-fill, and other excluded
+profiles; global deletion of those contracts is outside this design.
 
 ## Deployment and rollback
 
@@ -836,7 +874,12 @@ open, and requires rollback if investigation connects it to the new artifact.
 R2 ships with every service in durable `legacy` mode, so schema and capability
 writes are dark. Promotion changes one approved non-pool service to `bound`
 only after its controller capability, the full participant barrier, and the
-legacy-drain transaction pass. The participant barrier includes every API,
+legacy-drain transaction pass. R3 retains that same transition as the safe
+bootstrap for a fresh eligible service: the row is inserted in `legacy`, its
+fresh capable incarnation is claimed, promotion commits, and the exact bound
+epoch is refreshed before child spawn. A failed barrier or refresh leaves no
+controller child running. Existing services and recovery are not implicitly
+migrated. The participant barrier includes every API,
 queue-executor, and service-controller role that must preserve and revalidate
 the closed excluded-profile discriminator; a queued special request may cross
 promotion only because all of those roles understand its exact persisted
@@ -847,10 +890,12 @@ projected, and unpinned. The fenced demotion transaction then proves no active
 generation, sets the service back to `legacy`, and increments its binding epoch
 before any incapable image may own it. A rollback must not clear associations
 or tombstones, release pins early, change replica record IDs, or race a
-predecessor with a successor. R3 makes `bound` the creation/steady-state mode
-for non-pool services after all such services are promoted; excluded profiles
-retain their existing contracts through the closed discriminator rather than
-entering the ordinary association path.
+predecessor with a successor. R3 makes `bound` mandatory before the first child
+spawn for each newly created eligible non-pool service. After all existing
+eligible services are explicitly promoted or retired and rollout evidence
+passes, R4 removes the ordinary legacy fallback; excluded profiles retain their
+existing contracts through the closed discriminator rather than entering the
+ordinary association path.
 
 Eligibility is deliberately narrower than "not a pool": reserved-fill,
 zero-cost/reservation, system-OOM recovery, unknown-capacity replacement, and
@@ -1775,8 +1820,11 @@ service to `bound`. Rollback drains and projects its rows with capable binaries,
 then performs the fenced demotion before any old image can become ready. The
 additive PostgreSQL schemas are not downgraded. An old API cannot serve the
 private endpoint; an old executor does not advertise the distinct handler and
-leaves its queue row unclaimed. The R3 removal remains draft until this mixed-
-version and rollback sequence,
+leaves its queue row unclaimed. R3 may then be deployed to require the same
+transactional promotion for newly created eligible services. Verify one fresh
+service becomes exactly bound before its controller child starts, and verify a
+forced participant-barrier failure creates no child. The R4 removal remains
+draft until this mixed-version and rollback sequence,
 the exact crash matrix, and the monitoring window below have passed.
 
 The operational promotion/demotion request is intentionally absent from the
@@ -1894,12 +1942,22 @@ approved canary:
 - [ ] Merge and deploy the revision-041 R1 telemetry change, then verify its
   closed event kinds, database-clock timestamps, 60-day retention, diagnostic
   failure isolation, and summary counters before enabling any R2 write.
-- [ ] Keep every service in durable `legacy` mode until atomic bind-and-
-  enqueue, stable retry, adoption, owner-epoch/provider/service-job fences,
-  retention pin, local-handler claim, mixed-version/demotion, teardown-order,
-  and crash-matrix tests pass.
-- [ ] Keep the stacked legacy-fallback removal blocked until the promoted R2
-  artifact passes its exact canary and monitoring gates.
+- [x] Author R2's atomic bind-and-enqueue, stable retry, adoption,
+  owner-epoch/provider/service-job fences, retention pin, local-handler claim,
+  mixed-version/demotion, teardown-order, and crash-matrix implementation in
+  the stack. It remains operationally dark until the preceding R1 gate passes.
+- [x] Author R3's fresh-service adoption: claim first; transactionally promote
+  only a fresh capable central-PostgreSQL non-pool authority; verify the exact
+  adjacent bound epoch; and fail before spawn on any transition error. Preserve
+  recovery, existing rows, pools, and absent-authority stores.
+- [ ] Merge and deploy R1, R2, and R3 in stack order. On the exact R3 artifact,
+  verify successful promotion precedes first child spawn and an injected
+  participant/drain-barrier failure produces no child or launch request.
+- [ ] Inventory every existing eligible `legacy` service and explicitly
+  promote or retire it; R3 intentionally does not perform that migration.
+- [ ] Keep the stacked R4 legacy-fallback removal blocked until the promoted
+  R2/R3 artifact passes its exact canary and monitoring gates, rollback through
+  fenced demotion is proved, and no existing eligible legacy row remains.
 - [x] Record the final production rollout's exact zero-incremental-capacity
   bound; the worst-case API plus 16-LB surge fits either existing non-API node.
 - [ ] R2 only: obtain named capacity approval before any positive launch/down
@@ -1909,4 +1967,4 @@ Until the bounded shared-snapshot deadline artifact passes its production
 monitor and this stacked canonical follow-up merges, the dedicated
 authority-stack retirement is not production-complete. The bounded
 request-binding follow-up remains independently incomplete until issue #1352
-satisfies the R1/R2 evidence above.
+satisfies the R1--R4 evidence above.

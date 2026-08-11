@@ -62,6 +62,27 @@ def _free_port():
     return port
 
 
+def _binding_authority(
+    mode=service.ordinary_launch_binding.BindingMode.LEGACY,
+    binding_epoch=0,
+    *,
+    capable=True,
+):
+    return service.ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='svc',
+        service_hash='incarnation-a',
+        service_workspace='default',
+        service_lifecycle_epoch=11,
+        controller_pid=123,
+        controller_ip='10.0.0.2',
+        controller_incarnation=uuid.UUID(
+            '00000000-0000-4000-8000-000000000123'),
+        controller_owner_epoch=7,
+        capable=capable,
+        binding_mode=mode,
+        binding_epoch=binding_epoch)
+
+
 def _listen_on_transferred_socket(controller_socket, ready):
     controller_socket.listen(1)
     ready.set()
@@ -113,6 +134,268 @@ def test_controller_hold_preserves_fresh_pool_from_yaml(monkeypatch, tmp_path):
 
     with pytest.raises(PoolBootReached, match='pool boot'):
         service._start('pool-a', str(task_yaml), 1, 'pool apply')
+
+
+class TestPromoteFreshOrdinaryLaunchBinding:
+
+    @staticmethod
+    def _fresh_non_pool_task():
+        spec = mock.MagicMock()
+        spec.pool = False
+        spec.placement_contract = placement_policy.resolve_fresh_contract(
+            None, pool=False)
+        spec.uses_logical_replicas = False
+        spec.lb_high_availability = False
+        spec.autoscaling_policy_str.return_value = 'policy'
+        spec.load_balancing_policy = 'round_robin'
+        spec.tls_credential = None
+        return mock.MagicMock(service=spec, num_nodes=1)
+
+    @staticmethod
+    def _fresh_start_patches(task):
+        return [
+            mock.patch.object(service.auth_utils, 'get_or_generate_keys'),
+            mock.patch.object(service.serve_state,
+                              'get_service_from_name',
+                              return_value=None),
+            mock.patch.object(service.replica_managers,
+                              'load_task_with_service_spec',
+                              return_value=task),
+            mock.patch.object(service.serve_utils,
+                              'generate_remote_service_dir_name',
+                              return_value='/tmp/scoped-service'),
+            mock.patch.object(service.controller_utils,
+                              'get_resources_lock_path',
+                              return_value='/tmp/resources.lock'),
+            mock.patch.object(service.controller_utils,
+                              'can_start_new_process',
+                              return_value=True),
+            mock.patch.object(service.serve_utils,
+                              'validate_external_lb_service_spec'),
+            mock.patch.object(service.backend_utils,
+                              'get_task_resources_str',
+                              return_value='resources'),
+            mock.patch.object(service.serve_state,
+                              'add_service',
+                              return_value=True),
+            mock.patch.object(service.os, 'makedirs'),
+            mock.patch.object(service.filelock, 'FileLock'),
+            mock.patch.object(service, '_run_cleanup_and_finalize'),
+        ]
+
+    def test_promotes_and_refreshes_exact_bound_authority(self):
+        claimed = _binding_authority(binding_epoch=3)
+        refreshed = _binding_authority(
+            mode=service.ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=4)
+        with mock.patch.object(
+                service.request_postgres,
+                'promote_ordinary_launch_binding_service',
+                return_value=4) as promote, \
+             mock.patch.object(
+                 service.ordinary_launch_binding,
+                 'refresh_controller_authority',
+                 return_value=contextlib.nullcontext(refreshed)) as refresh:
+            result = service._promote_fresh_ordinary_launch_binding(
+                claimed, is_recovery=False, is_pool=False)
+
+        assert result is refreshed
+        promote.assert_called_once_with(claimed)
+        refresh.assert_called_once_with(claimed)
+
+    @pytest.mark.parametrize('is_recovery,is_pool', [(True, False),
+                                                     (False, True)])
+    def test_preserves_recovery_and_pool_binding_mode(self, is_recovery,
+                                                      is_pool):
+        claimed = _binding_authority()
+        with mock.patch.object(
+                service.request_postgres,
+                'promote_ordinary_launch_binding_service') as promote, \
+             mock.patch.object(
+                 service.ordinary_launch_binding,
+                 'refresh_controller_authority') as refresh:
+            result = service._promote_fresh_ordinary_launch_binding(
+                claimed, is_recovery=is_recovery, is_pool=is_pool)
+
+        assert result is claimed
+        promote.assert_not_called()
+        refresh.assert_not_called()
+
+    def test_preserves_store_without_durable_authority(self):
+        with mock.patch.object(
+                service.request_postgres,
+                'promote_ordinary_launch_binding_service') as promote, \
+             mock.patch.object(
+                 service.ordinary_launch_binding,
+                 'refresh_controller_authority') as refresh:
+            result = service._promote_fresh_ordinary_launch_binding(
+                None, is_recovery=False, is_pool=False)
+
+        assert result is None
+        promote.assert_not_called()
+        refresh.assert_not_called()
+
+    def test_promotion_failure_propagates_before_refresh(self):
+        claimed = _binding_authority()
+        error = service.ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'participant barrier is not ready')
+        with mock.patch.object(
+                service.request_postgres,
+                'promote_ordinary_launch_binding_service',
+                side_effect=error), \
+             mock.patch.object(
+                 service.ordinary_launch_binding,
+                 'refresh_controller_authority') as refresh:
+            with pytest.raises(service.ordinary_launch_binding.
+                               OrdinaryLaunchBindingUnavailable,
+                               match='participant barrier is not ready'):
+                service._promote_fresh_ordinary_launch_binding(
+                    claimed, is_recovery=False, is_pool=False)
+
+        refresh.assert_not_called()
+
+    def test_rejects_unexpected_promotion_epoch_before_refresh(self):
+        claimed = _binding_authority(binding_epoch=3)
+        with mock.patch.object(
+                service.request_postgres,
+                'promote_ordinary_launch_binding_service',
+                return_value=5), \
+             mock.patch.object(
+                 service.ordinary_launch_binding,
+                 'refresh_controller_authority') as refresh:
+            with pytest.raises(service.ordinary_launch_binding.
+                               OrdinaryLaunchBindingConflict,
+                               match='unexpected epoch'):
+                service._promote_fresh_ordinary_launch_binding(
+                    claimed, is_recovery=False, is_pool=False)
+
+        refresh.assert_not_called()
+
+    @pytest.mark.parametrize(
+        'mode,binding_epoch',
+        [(service.ordinary_launch_binding.BindingMode.LEGACY, 4),
+         (service.ordinary_launch_binding.BindingMode.BOUND, 5)],
+    )
+    def test_rejects_refreshed_authority_that_does_not_match_promotion(
+            self, mode, binding_epoch):
+        claimed = _binding_authority(binding_epoch=3)
+        refreshed = _binding_authority(mode=mode, binding_epoch=binding_epoch)
+        with mock.patch.object(
+                service.request_postgres,
+                'promote_ordinary_launch_binding_service',
+                return_value=4), \
+             mock.patch.object(
+                 service.ordinary_launch_binding,
+                 'refresh_controller_authority',
+                 return_value=contextlib.nullcontext(refreshed)):
+            with pytest.raises(service.ordinary_launch_binding.
+                               OrdinaryLaunchBindingConflict,
+                               match='could not be verified'):
+                service._promote_fresh_ordinary_launch_binding(
+                    claimed, is_recovery=False, is_pool=False)
+
+    def test_fresh_start_promotes_after_claim_and_before_spawn(self, tmp_path):
+
+        class SpawnReached(RuntimeError):
+            pass
+
+        task_yaml = tmp_path / 'service.yaml'
+        task_yaml.write_text('service: {}\n', encoding='utf-8')
+        task = self._fresh_non_pool_task()
+        claimed = _binding_authority(binding_epoch=0)
+        bound = _binding_authority(
+            mode=service.ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=1)
+        events = []
+
+        def _claim(*unused_args, **unused_kwargs):
+            events.append('claim')
+            return claimed
+
+        def _promote(authority):
+            assert authority is claimed
+            events.append('promote')
+            return 1
+
+        def _refresh(authority):
+            assert authority is claimed
+            events.append('refresh')
+            return contextlib.nullcontext(bound)
+
+        def _spawn(*unused_args, **unused_kwargs):
+            events.append('spawn')
+            raise SpawnReached('spawn reached')
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._fresh_start_patches(task):
+                stack.enter_context(patcher)
+            stack.enter_context(_mock_external_lb_recovery())
+            stack.enter_context(
+                mock.patch.object(service.ordinary_launch_binding,
+                                  'claim_controller_incarnation',
+                                  side_effect=_claim))
+            stack.enter_context(
+                mock.patch.object(service.request_postgres,
+                                  'promote_ordinary_launch_binding_service',
+                                  side_effect=_promote))
+            stack.enter_context(
+                mock.patch.object(service.ordinary_launch_binding,
+                                  'refresh_controller_authority',
+                                  side_effect=_refresh))
+            stack.enter_context(
+                mock.patch.object(service,
+                                  '_spawn_controller_on_reserved_port',
+                                  side_effect=_spawn))
+            with pytest.raises(SpawnReached, match='spawn reached'):
+                service._start('svc',
+                               str(task_yaml),
+                               7,
+                               'sky serve up',
+                               requested_incarnation='incarnation-a',
+                               workspace='default')
+
+        assert events == ['claim', 'promote', 'refresh', 'spawn']
+
+    def test_fresh_start_promotion_failure_prevents_spawn(self, tmp_path):
+        task_yaml = tmp_path / 'service.yaml'
+        task_yaml.write_text('service: {}\n', encoding='utf-8')
+        task = self._fresh_non_pool_task()
+        claimed = _binding_authority(binding_epoch=0)
+        spawn = mock.Mock()
+
+        with contextlib.ExitStack() as stack:
+            for patcher in self._fresh_start_patches(task):
+                stack.enter_context(patcher)
+            stack.enter_context(_mock_external_lb_recovery())
+            stack.enter_context(
+                mock.patch.object(service.ordinary_launch_binding,
+                                  'claim_controller_incarnation',
+                                  return_value=claimed))
+            stack.enter_context(
+                mock.patch.object(
+                    service.request_postgres,
+                    'promote_ordinary_launch_binding_service',
+                    side_effect=(service.ordinary_launch_binding.
+                                 OrdinaryLaunchBindingUnavailable(
+                                     'fleet barrier is not ready'))))
+            refresh = stack.enter_context(
+                mock.patch.object(service.ordinary_launch_binding,
+                                  'refresh_controller_authority'))
+            stack.enter_context(
+                mock.patch.object(service, '_spawn_controller_on_reserved_port',
+                                  spawn))
+            with pytest.raises(service.ordinary_launch_binding.
+                               OrdinaryLaunchBindingUnavailable,
+                               match='fleet barrier is not ready'):
+                service._start('svc',
+                               str(task_yaml),
+                               7,
+                               'sky serve up',
+                               requested_incarnation='incarnation-a',
+                               workspace='default')
+
+        refresh.assert_not_called()
+        spawn.assert_not_called()
 
 
 class TestWaitForControllerReady:
