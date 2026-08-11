@@ -505,15 +505,28 @@ cancel, authorize, retry, or project a launch.
 
 The R1 implementation advances only the central PostgreSQL Serve schema to
 revision 041. Its closed event writer uses a bounded process-local queue and a
-daemon writer so launch callers never wait for telemetry. Event timestamps use
-the database clock, payloads and credentials are never stored, updates and
-truncation are rejected, and retention deletes only rows older than 60 days.
-The summary query reports each counter above plus explicitly process-local
-queue depths, queue drops, writer failures, and terminal-lookup failures since
-module import, so a lossy diagnostic process cannot present unexplained zeros
-as fleet-wide completeness. Initial instrumentation covers ordinary request
-publication, controller-start observation and restart redrive, owner-loss
-cancellation, observed API terminal result with a closed
+daemon writer so launch callers never wait for telemetry. For ordinary
+controller launches, versioned diagnostic identity travels inside the existing
+launch context; the API process publishes `REQUEST_PUBLISHED` only after
+request scheduling returns, so a lost HTTP acknowledgement does not hide the
+accepted request merely because `sdk.launch()` never returned to the
+controller. This API-side publication remains asynchronous and fail-open.
+Event timestamps use the database clock, payloads and credentials are never
+stored, and updates and truncation are rejected. A writer-owned five-minute
+cadence deletes at most 1,000 rows per pass, and only rows strictly older than
+60 days; event insertion never performs retention work.
+
+The summary query labels all event evidence as a lower bound, reports redrives
+whose predecessor publication was not observed, and includes explicitly
+process-local queue depths, queue drops, writer failures, backend-unavailable
+events, retention-prune failures, and terminal-lookup failures since module
+import. A low-cardinality multiprocess Prometheus counter exports enqueue,
+persist, drop, unavailable, lookup, and prune outcomes across scraped fleet
+processes. These surfaces prevent a lossy diagnostic process from presenting
+unexplained zeros as fleet-wide completeness; they do not make asynchronous
+telemetry an authority or a complete audit log. Initial instrumentation covers
+ordinary request publication, controller-start observation and restart
+redrive, owner-loss cancellation, observed API terminal result with a closed
 `SUCCEEDED`/`FAILED`/`CANCELLED` status, service-job observation, and Serve
 result projection. Terminal lookup runs on a separate bounded daemon, ignores
 missing/nonterminal/inexact results, and cannot delay launch. The closed

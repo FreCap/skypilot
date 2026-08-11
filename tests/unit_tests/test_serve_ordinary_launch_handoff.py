@@ -58,6 +58,10 @@ def test_closed_event_kinds_and_table_contract():
     )
     assert table.c.observed_at.server_default is not None
     assert ordinary_launch_handoff.RETENTION_DAYS == 60
+    assert ordinary_launch_handoff.RETENTION_PRUNE_INTERVAL_SECONDS == 300
+    assert ordinary_launch_handoff.RETENTION_PRUNE_BATCH_SIZE == 1000
+    assert ordinary_launch_handoff.DELIVERY_METRIC_NAME == (
+        'sky_serve_ordinary_launch_handoff_delivery_total')
 
 
 def test_redacted_digest_is_deterministic_and_order_independent():
@@ -159,6 +163,11 @@ def test_non_postgres_write_and_summary_are_explicitly_unavailable(monkeypatch):
     assert ordinary_launch_handoff.get_summary() == {
         'available': False,
         'retention_days': 60,
+        'evidence_is_lower_bound': True,
+        'fleet_delivery_metric':
+            ('sky_serve_ordinary_launch_handoff_delivery_total'),
+        'fleet_delivery_outcomes': list(
+            ordinary_launch_handoff.DELIVERY_OUTCOMES),
         'process_local_delivery': {
             'scope': 'current_process_since_module_import',
             'queue_drops':
@@ -172,6 +181,10 @@ def test_non_postgres_write_and_summary_are_explicitly_unavailable(monkeypatch):
             'writer_failures': ordinary_launch_handoff._write_failure_count,
             'terminal_lookup_failures':
                 (ordinary_launch_handoff._terminal_lookup_failure_count),
+            'backend_unavailable':
+                ordinary_launch_handoff._backend_unavailable_count,
+            'retention_prune_failures':
+                ordinary_launch_handoff._retention_prune_failure_count,
             'pending_events': ordinary_launch_handoff._pending_events.qsize(),
             'pending_terminal_observations':
                 ordinary_launch_handoff._pending_terminal_observations.qsize(),
@@ -190,6 +203,10 @@ def test_process_local_delivery_failures_are_counted_and_scoped(monkeypatch):
     monkeypatch.setattr(ordinary_launch_handoff, '_write_failure_count', 0)
     monkeypatch.setattr(ordinary_launch_handoff,
                         '_terminal_lookup_failure_count', 0)
+    monkeypatch.setattr(ordinary_launch_handoff, '_backend_unavailable_count',
+                        0)
+    monkeypatch.setattr(ordinary_launch_handoff,
+                        '_retention_prune_failure_count', 0)
     monkeypatch.setattr(ordinary_launch_handoff, '_ensure_writer', lambda: None)
     sqlite = sqlalchemy.create_engine('sqlite://')
     monkeypatch.setattr(ordinary_launch_handoff.serve_state,
@@ -209,6 +226,8 @@ def test_process_local_delivery_failures_are_counted_and_scoped(monkeypatch):
         'terminal_observation_queue_drops': 0,
         'writer_failures': 1,
         'terminal_lookup_failures': 1,
+        'backend_unavailable': 0,
+        'retention_prune_failures': 0,
         'pending_events': 1,
         'pending_terminal_observations':
             ordinary_launch_handoff._pending_terminal_observations.qsize(),
@@ -235,6 +254,54 @@ def test_terminal_observation_queue_drop_is_counted(monkeypatch):
     assert delivery['queue_drops'] == 1
     assert delivery['event_queue_drops'] == 0
     assert delivery['terminal_observation_queue_drops'] == 1
+
+
+def test_retention_pruning_is_cadenced_and_fail_open(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ordinary_launch_handoff, '_prune_expired_events',
+                        lambda: calls.append('pruned'))
+
+    assert ordinary_launch_handoff._maybe_prune_expired_events(20.0,
+                                                               now=19.0) == 20.0
+    assert not calls
+    assert ordinary_launch_handoff._maybe_prune_expired_events(
+        20.0, now=20.0) == 320.0
+    assert calls == ['pruned']
+
+    outcomes = []
+    monkeypatch.setattr(ordinary_launch_handoff,
+                        '_retention_prune_failure_count', 0)
+    monkeypatch.setattr(ordinary_launch_handoff, '_record_delivery_outcome',
+                        outcomes.append)
+
+    def _fail_prune():
+        raise RuntimeError('maintenance unavailable')
+
+    monkeypatch.setattr(ordinary_launch_handoff, '_prune_expired_events',
+                        _fail_prune)
+    assert ordinary_launch_handoff._maybe_prune_expired_events(
+        320.0, now=320.0) == 620.0
+    assert ordinary_launch_handoff._retention_prune_failure_count == 1
+    assert outcomes == ['retention_prune_failed']
+
+
+def test_delivery_metric_outcomes_cover_success_and_loss(monkeypatch):
+    outcomes = []
+    monkeypatch.setattr(ordinary_launch_handoff, '_record_delivery_outcome',
+                        outcomes.append)
+    pending_events = queue.Queue(maxsize=1)
+    monkeypatch.setattr(ordinary_launch_handoff, '_pending_events',
+                        pending_events)
+    monkeypatch.setattr(ordinary_launch_handoff, '_ensure_writer', lambda: None)
+    monkeypatch.setattr(ordinary_launch_handoff, '_event_queue_drop_count', 0)
+    monkeypatch.setattr(ordinary_launch_handoff,
+                        '_terminal_observation_queue_drop_count', 0)
+
+    event = ordinary_launch_handoff._event(**_event_kwargs())
+    assert ordinary_launch_handoff._enqueue_event(event)
+    assert not ordinary_launch_handoff._enqueue_event(event)
+
+    assert outcomes == ['event_enqueued', 'event_queue_dropped']
 
 
 @pytest.mark.parametrize('status', [None, 'PENDING', 'WAITING', 'RUNNING'])

@@ -2964,6 +2964,48 @@ class TestLaunchClusterRetry:
              'request-id', 17, None),
         ]
 
+    def test_ordinary_handoff_context_is_carried_with_launch_fence(
+            self, tmp_path):
+        fence = {
+            'sky_serve_service_name': 'svc',
+            'sky_serve_service_hash': 'incarnation-a',
+        }
+        handoff = {
+            'context_version': 1,
+            'service_name': 'svc',
+            'service_version': 2,
+            'replica_id': 7,
+            'replica_record_id': '11111111-1111-4111-8111-111111111111',
+            'controller_route_epoch': ('22222222-2222-4222-8222-222222222222'),
+            'input_digest': 'a' * 64,
+        }
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            launch_fence=fence,
+            ordinary_launch_handoff_context=handoff)
+
+        assert raised is None
+        launch_context = mock_sdk.launch.call_args.kwargs[
+            '_extra_launch_context']
+        assert launch_context['sky_serve_service_hash'] == 'incarnation-a'
+        assert launch_context[replica_managers.serve_constants.
+                              ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY] == handoff
+        # Context assembly must not mutate the durable fence or caller-owned
+        # diagnostic dictionary.
+        assert (
+            replica_managers.serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY
+            not in fence)
+        assert handoff == {
+            'context_version': 1,
+            'service_name': 'svc',
+            'service_version': 2,
+            'replica_id': 7,
+            'replica_record_id': '11111111-1111-4111-8111-111111111111',
+            'controller_route_epoch': ('22222222-2222-4222-8222-222222222222'),
+            'input_digest': 'a' * 64,
+        }
+
     @pytest.mark.parametrize('status', ['SUCCEEDED', 'FAILED', 'CANCELLED'])
     def test_stream_error_records_only_observed_terminal_status(
             self, tmp_path, status):
@@ -3631,6 +3673,15 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         assert callable(call.kwargs['kwargs']['pre_launch_guard'])
         assert callable(call.kwargs['kwargs']['continue_guard'])
         assert callable(call.kwargs['kwargs']['cleanup_continue_guard'])
+        handoff = call.kwargs['kwargs']['ordinary_launch_handoff_context']
+        assert handoff['context_version'] == 1
+        assert handoff['service_name'] == 'svc'
+        assert handoff['service_version'] == 1
+        assert handoff['replica_id'] == 1
+        assert handoff['replica_record_id'] == (
+            '00000000-0000-4000-8000-000000000001')
+        assert handoff['controller_route_epoch']
+        assert len(handoff['input_digest']) == 64
         # retry_until_up must be False: failover is owned by the placer.
         assert call.kwargs['args'][-1] is False
 

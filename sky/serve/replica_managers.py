@@ -579,6 +579,7 @@ def launch_cluster(
     None = None,
     persist_system_recovery_job_id: Callable[[str, int], bool] | None = None,
     demote_system_recovery_candidate: Callable[[], bool] | None = None,
+    ordinary_launch_handoff_context: dict[str, Any] | None = None,
     ordinary_launch_event: Callable[[
         ordinary_launch_handoff.EventKind, str | None, int |
         None, ordinary_launch_handoff.TerminalStatus | None
@@ -935,6 +936,14 @@ def launch_cluster(
             launch_kwargs: dict[str, Any] = {}
             launch_context = (system_recovery_launch_context
                               if recovery_context_available else launch_fence)
+            if ordinary_launch_handoff_context is not None:
+                # Reuse the existing internal launch context transport.  This
+                # metadata is diagnostic only and remains separate from every
+                # provider-authority fence inside one nested versioned value.
+                launch_context = dict(launch_context or {})
+                launch_context[
+                    serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY] = (
+                        dict(ordinary_launch_handoff_context))
             if launch_context is not None:
                 launch_kwargs['_extra_launch_context'] = launch_context
             workspace_ctx: contextlib.AbstractContextManager = (
@@ -5323,9 +5332,22 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'frozen_controller_config_path': frozen_controller_config_path,
                 **recovery_launch_kwargs,
             }
-            if not recovery_launch_kwargs and not self._is_pool:
+            if (not recovery_launch_kwargs and not self._is_pool and
+                    not zero_cost_only):
                 input_digest = (ordinary_launch_handoff.redacted_input_digest(
                     launch_yaml_content, resources_override))
+                launch_thread_kwargs['ordinary_launch_handoff_context'] = {
+                    'context_version':
+                        (serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION
+                        ),
+                    'service_name': self._service_name,
+                    'service_version': launch_version,
+                    'replica_id': replica_id,
+                    'replica_record_id': info.replica_record_id,
+                    'controller_route_epoch':
+                        (self._ordinary_launch_handoff_route_epoch),
+                    'input_digest': input_digest,
+                }
                 launch_thread_kwargs['ordinary_launch_event'] = (
                     functools.partial(self._emit_ordinary_launch_handoff_event,
                                       info,

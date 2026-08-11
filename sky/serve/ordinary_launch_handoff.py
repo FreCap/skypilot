@@ -14,9 +14,11 @@ import json
 import queue
 import re
 import threading
+import time
 from typing import Any
 import uuid
 
+import prometheus_client as prom
 import sqlalchemy
 
 from sky import sky_logging
@@ -28,6 +30,25 @@ MAX_QUERY_DAYS = RETENTION_DAYS
 POSTGRES_STATEMENT_TIMEOUT_MS = 1000
 MAX_PENDING_EVENTS = 4096
 MAX_PENDING_TERMINAL_OBSERVATIONS = 1024
+RETENTION_PRUNE_INTERVAL_SECONDS = 5 * 60
+RETENTION_PRUNE_BATCH_SIZE = 1000
+
+DELIVERY_METRIC_NAME = 'sky_serve_ordinary_launch_handoff_delivery_total'
+DELIVERY_OUTCOMES = (
+    'event_enqueued',
+    'event_queue_dropped',
+    'event_persisted',
+    'event_backend_unavailable',
+    'event_write_failed',
+    'terminal_observation_enqueued',
+    'terminal_observation_queue_dropped',
+    'terminal_lookup_failed',
+    'retention_prune_failed',
+)
+ORDINARY_LAUNCH_HANDOFF_DELIVERY = prom.Counter(
+    DELIVERY_METRIC_NAME,
+    'Fail-open ordinary-launch handoff telemetry delivery outcomes.',
+    ('outcome',))
 
 
 class EventKind(str, enum.Enum):
@@ -154,6 +175,8 @@ _event_queue_drop_count = 0
 _terminal_observation_queue_drop_count = 0
 _write_failure_count = 0
 _terminal_lookup_failure_count = 0
+_backend_unavailable_count = 0
+_retention_prune_failure_count = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,21 +291,57 @@ def _event(
 
 
 def _write_event(event: _Event) -> bool:
-    """Insert one event and prune expired history on PostgreSQL only."""
+    """Insert one event on PostgreSQL without coupling retention work."""
     engine = _postgres_engine()
     if engine is None:
         return False
-    table = serve_ordinary_launch_handoff_events_table
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.text('SET LOCAL statement_timeout = '
                             f'{POSTGRES_STATEMENT_TIMEOUT_MS}'))
-        connection.execute(table.insert().values(**event.insert_values()))
         connection.execute(
-            sqlalchemy.delete(table).where(table.c.observed_at < sqlalchemy.
-                                           text('CURRENT_TIMESTAMP - INTERVAL '
-                                                f"'{RETENTION_DAYS} days'")))
+            serve_ordinary_launch_handoff_events_table.insert().values(
+                **event.insert_values()))
     return True
+
+
+_PRUNE_EXPIRED_SQL = sqlalchemy.text(f"""
+DELETE FROM serve_ordinary_launch_handoff_events
+WHERE event_id IN (
+    SELECT event_id
+    FROM serve_ordinary_launch_handoff_events
+    WHERE observed_at < CURRENT_TIMESTAMP - INTERVAL '{RETENTION_DAYS} days'
+    ORDER BY observed_at, event_id
+    LIMIT :batch_size
+)
+""")
+
+
+def _prune_expired_events() -> int:
+    """Delete at most one bounded batch of expired PostgreSQL history."""
+    engine = _postgres_engine()
+    if engine is None:
+        return 0
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text('SET LOCAL statement_timeout = '
+                            f'{POSTGRES_STATEMENT_TIMEOUT_MS}'))
+        result = connection.execute(_PRUNE_EXPIRED_SQL,
+                                    {'batch_size': RETENTION_PRUNE_BATCH_SIZE})
+    return max(result.rowcount, 0)
+
+
+def _record_delivery_outcome(outcome: str) -> None:
+    """Record a fleet-visible outcome without affecting launch behavior."""
+    if outcome not in DELIVERY_OUTCOMES:
+        return
+    try:
+        ORDINARY_LAUNCH_HANDOFF_DELIVERY.labels(outcome=outcome).inc()
+    except Exception:  # pylint: disable=broad-except
+        # Prometheus is evidence about this fail-open diagnostic path.  A bad
+        # registry or multiprocess directory cannot become a launch failure.
+        logger.debug('Failed to record ordinary-launch delivery metric.',
+                     exc_info=True)
 
 
 def _log_write_failure(error: Exception) -> None:
@@ -290,6 +349,7 @@ def _log_write_failure(error: Exception) -> None:
     with _writer_lock:
         _write_failure_count += 1
         failure_count = _write_failure_count
+    _record_delivery_outcome('event_write_failed')
     if failure_count == 1 or failure_count % 100 == 0:
         logger.warning(
             'Ordinary-launch handoff telemetry write failed; launch behavior '
@@ -301,21 +361,70 @@ def _log_terminal_lookup_failure(error: Exception) -> None:
     with _writer_lock:
         _terminal_lookup_failure_count += 1
         failure_count = _terminal_lookup_failure_count
+    _record_delivery_outcome('terminal_lookup_failed')
     if failure_count == 1 or failure_count % 100 == 0:
         logger.warning(
             'Ordinary-launch terminal status lookup failed; launch behavior '
             'is unchanged (failure %s): %s', failure_count, error)
 
 
+def _record_backend_unavailable() -> None:
+    global _backend_unavailable_count
+    with _writer_lock:
+        _backend_unavailable_count += 1
+        unavailable_count = _backend_unavailable_count
+    _record_delivery_outcome('event_backend_unavailable')
+    if unavailable_count == 1 or unavailable_count % 100 == 0:
+        logger.warning(
+            'Ordinary-launch handoff telemetry requires PostgreSQL; dropping '
+            'one diagnostic event without changing launch behavior '
+            '(unavailable %s).', unavailable_count)
+
+
+def _log_retention_prune_failure(error: Exception) -> None:
+    global _retention_prune_failure_count
+    with _writer_lock:
+        _retention_prune_failure_count += 1
+        failure_count = _retention_prune_failure_count
+    _record_delivery_outcome('retention_prune_failed')
+    if failure_count == 1 or failure_count % 100 == 0:
+        logger.warning(
+            'Ordinary-launch handoff retention pruning failed; event writes '
+            'and launch behavior are unchanged (failure %s): %s', failure_count,
+            error)
+
+
+def _maybe_prune_expired_events(next_prune_at: float, *, now: float) -> float:
+    """Run one fail-open maintenance batch when the cadence is due."""
+    if now < next_prune_at:
+        return next_prune_at
+    try:
+        _prune_expired_events()
+    except Exception as error:  # pylint: disable=broad-except
+        _log_retention_prune_failure(error)
+    return now + RETENTION_PRUNE_INTERVAL_SECONDS
+
+
 def _writer_loop() -> None:
+    next_prune_at = time.monotonic() + RETENTION_PRUNE_INTERVAL_SECONDS
     while True:
-        event = _pending_events.get()
+        timeout = max(0.0, next_prune_at - time.monotonic())
         try:
-            _write_event(event)
-        except Exception as error:  # pylint: disable=broad-except
-            _log_write_failure(error)
-        finally:
-            _pending_events.task_done()
+            event = _pending_events.get(timeout=timeout)
+        except queue.Empty:
+            event = None
+        if event is not None:
+            try:
+                if _write_event(event):
+                    _record_delivery_outcome('event_persisted')
+                else:
+                    _record_backend_unavailable()
+            except Exception as error:  # pylint: disable=broad-except
+                _log_write_failure(error)
+            finally:
+                _pending_events.task_done()
+        now = time.monotonic()
+        next_prune_at = _maybe_prune_expired_events(next_prune_at, now=now)
 
 
 def _process_terminal_observation(observation: _TerminalObservation) -> None:
@@ -380,6 +489,8 @@ def _record_queue_drop(*, terminal_observation: bool) -> None:
         drop_count = (_event_queue_drop_count +
                       _terminal_observation_queue_drop_count)
     queue_name = ('terminal-observation' if terminal_observation else 'event')
+    _record_delivery_outcome('terminal_observation_queue_dropped'
+                             if terminal_observation else 'event_queue_dropped')
     if drop_count == 1 or drop_count % 100 == 0:
         logger.warning(
             'Ordinary-launch handoff telemetry %s queue is full; dropping '
@@ -397,6 +508,7 @@ def _enqueue_event(event: _Event) -> bool:
     except Exception as error:  # pylint: disable=broad-except
         _log_write_failure(error)
         return False
+    _record_delivery_outcome('event_enqueued')
     return True
 
 
@@ -426,6 +538,7 @@ def observe_terminal_nonblocking(
     except Exception as error:  # pylint: disable=broad-except
         _log_terminal_lookup_failure(error)
         return False
+    _record_delivery_outcome('terminal_observation_enqueued')
     return True
 
 
@@ -536,6 +649,7 @@ duplicate_service_jobs AS (
     HAVING COUNT(DISTINCT service_job_id) > 1
 )
 SELECT
+    (SELECT COUNT(*) FROM window_events) AS observed_events,
     (SELECT COUNT(DISTINCT replica_record_id) FROM window_events
      WHERE event_kind = 'request_published') AS eligible_ordinary_launches,
     (SELECT COUNT(*) FROM window_events
@@ -549,6 +663,9 @@ SELECT
     (SELECT COUNT(*) FROM redrive_classes
      WHERE predecessor_terminal AND NOT predecessor_projected) AS
         restart_redrives_with_terminal_unprojected_predecessor,
+    (SELECT COUNT(*) FROM redrive_classes
+     WHERE NOT has_predecessor) AS
+        restart_redrives_without_observed_predecessor,
     (SELECT COUNT(*) FROM duplicate_service_jobs) AS
         replica_records_with_duplicate_service_jobs,
     (SELECT COUNT(*) FROM window_events
@@ -567,6 +684,8 @@ def _process_local_delivery_summary() -> dict[str, Any]:
             _terminal_observation_queue_drop_count)
         writer_failures = _write_failure_count
         terminal_lookup_failures = _terminal_lookup_failure_count
+        backend_unavailable = _backend_unavailable_count
+        retention_prune_failures = _retention_prune_failure_count
     return {
         'scope': 'current_process_since_module_import',
         'queue_drops': (event_queue_drops + terminal_observation_queue_drops),
@@ -574,6 +693,8 @@ def _process_local_delivery_summary() -> dict[str, Any]:
         'terminal_observation_queue_drops': (terminal_observation_queue_drops),
         'writer_failures': writer_failures,
         'terminal_lookup_failures': terminal_lookup_failures,
+        'backend_unavailable': backend_unavailable,
+        'retention_prune_failures': retention_prune_failures,
         'pending_events': _pending_events.qsize(),
         'pending_terminal_observations':
             (_pending_terminal_observations.qsize()),
@@ -581,7 +702,7 @@ def _process_local_delivery_summary() -> dict[str, Any]:
 
 
 def get_summary(*, days: int = RETENTION_DAYS) -> dict[str, Any]:
-    """Return the evidence-gate counters for the retained history window."""
+    """Return lower-bound evidence counters for the retained history window."""
     if (isinstance(days, bool) or not isinstance(days, int) or days < 1 or
             days > MAX_QUERY_DAYS):
         raise ValueError(f'days must be an integer from 1 to {MAX_QUERY_DAYS}.')
@@ -590,6 +711,9 @@ def get_summary(*, days: int = RETENTION_DAYS) -> dict[str, Any]:
         return {
             'available': False,
             'retention_days': RETENTION_DAYS,
+            'evidence_is_lower_bound': True,
+            'fleet_delivery_metric': DELIVERY_METRIC_NAME,
+            'fleet_delivery_outcomes': list(DELIVERY_OUTCOMES),
             'process_local_delivery': _process_local_delivery_summary(),
         }
     with engine.connect() as connection:
@@ -600,6 +724,9 @@ def get_summary(*, days: int = RETENTION_DAYS) -> dict[str, Any]:
     return {
         'available': True,
         'retention_days': RETENTION_DAYS,
+        'evidence_is_lower_bound': True,
+        'fleet_delivery_metric': DELIVERY_METRIC_NAME,
+        'fleet_delivery_outcomes': list(DELIVERY_OUTCOMES),
         'window_start': (clock - datetime.timedelta(days=days)).timestamp(),
         'window_end': clock.timestamp(),
         'process_local_delivery': _process_local_delivery_summary(),

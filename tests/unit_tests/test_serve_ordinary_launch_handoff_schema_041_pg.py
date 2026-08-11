@@ -20,6 +20,7 @@ pytestmark = pytest.mark.xdist_group(
 _TABLE = ordinary_launch_handoff.serve_ordinary_launch_handoff_events_table
 _RECORD_A = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _RECORD_B = uuid.UUID('22222222-2222-4222-8222-222222222222')
+_RECORD_C = uuid.UUID('33333333-3333-4333-8333-333333333333')
 _ROUTE_A = uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
 _ROUTE_B = uuid.UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')
 
@@ -146,7 +147,7 @@ def test_serve041_terminal_status_is_closed_and_kind_scoped(serve041) -> None:
                 connection.execute(_TABLE.insert().values(**row))
 
 
-def test_writer_uses_database_clock_and_prunes_after_60_days(
+def test_writer_uses_database_clock_and_retention_pruning_is_bounded(
         serve041, monkeypatch) -> None:
     monkeypatch.setattr(ordinary_launch_handoff.serve_state,
                         'get_database_engine', lambda: serve041)
@@ -163,10 +164,11 @@ def test_writer_uses_database_clock_and_prunes_after_60_days(
     with serve041.begin() as connection:
         before = connection.execute(
             sqlalchemy.text('SELECT clock_timestamp()')).scalar_one()
-        connection.execute(_TABLE.insert().values(
-            **_event(ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
-                     observed_at=before - datetime.timedelta(days=61),
-                     request_id='request-expired')))
+        connection.execute(_TABLE.insert(), [
+            _event(ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                   observed_at=before - datetime.timedelta(days=61),
+                   request_id=f'request-expired-{index}') for index in range(3)
+        ])
 
     assert ordinary_launch_handoff._write_event(event)
 
@@ -176,10 +178,24 @@ def test_writer_uses_database_clock_and_prunes_after_60_days(
         rows = connection.execute(
             sqlalchemy.select(_TABLE.c.event_id, _TABLE.c.observed_at,
                               _TABLE.c.ordinary_request_id)).all()
-    assert len(rows) == 1
-    assert rows[0].event_id == event.event_id
-    assert rows[0].ordinary_request_id == 'request-current'
-    assert before <= rows[0].observed_at <= after
+    assert len(rows) == 4
+    current = next(
+        row for row in rows if row.ordinary_request_id == 'request-current')
+    assert current.event_id == event.event_id
+    assert before <= current.observed_at <= after
+
+    monkeypatch.setattr(ordinary_launch_handoff, 'RETENTION_PRUNE_BATCH_SIZE',
+                        2)
+    assert ordinary_launch_handoff._prune_expired_events() == 2
+    with serve041.connect() as connection:
+        remaining = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(  # pylint: disable=not-callable
+                _TABLE).where(
+                    _TABLE.c.ordinary_request_id.like(
+                        'request-expired-%'))).scalar_one()
+    assert remaining == 1
+    assert ordinary_launch_handoff._prune_expired_events() == 1
+    assert ordinary_launch_handoff._prune_expired_events() == 0
 
 
 def test_summary_reports_restart_and_duplicate_evidence(serve041,
@@ -240,6 +256,10 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
                    record_id=_RECORD_B,
                    route_epoch=_ROUTE_B,
                    observed_at=now - minute),
+            _event(ordinary_launch_handoff.EventKind.RESTART_REDRIVE,
+                   record_id=_RECORD_C,
+                   route_epoch=_ROUTE_B,
+                   observed_at=now - minute),
         ]
         connection.execute(_TABLE.insert(), rows)
 
@@ -247,6 +267,8 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
 
     assert summary['available'] is True
     assert summary['retention_days'] == 60
+    assert summary['evidence_is_lower_bound'] is True
+    assert summary['observed_events'] == 13
     assert summary['eligible_ordinary_launches'] == 2
     assert summary['controller_starts_during_nonterminal_launches'] == 2
     assert summary[
@@ -254,6 +276,7 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
     assert summary['restart_redrives_with_active_predecessor'] == 1
     assert summary[
         'restart_redrives_with_terminal_unprojected_predecessor'] == 1
+    assert summary['restart_redrives_without_observed_predecessor'] == 1
     assert summary['replica_records_with_duplicate_service_jobs'] == 1
     assert summary['owner_loss_cancellations'] == 1
     assert summary['cleanup_retries_after_route_epoch_change'] == 1
