@@ -460,13 +460,17 @@ class Autoscaler:
         # protocol-v1 implementation and compatibility/status projection.
         self._fill_pool_state_lock = threading.RLock()
         self._fill_pool_states: dict[str, _PoolFillState] = {}
-        # Rotate which actionable pool starts each emitted wave. The replica
-        # manager deliberately stops a v2 batch when provider admission is
-        # busy so it can release its lock to the queued phase owner. Without
-        # cross-wave rotation, one persistently busy first pool can therefore
-        # prevent every later pool from reaching admission despite the
-        # within-wave round robin below.
-        self._fill_pool_round_robin_cursor = 0
+        # Stable identity of the pool that actually emitted the prior wave's
+        # first decision. The replica manager deliberately stops a v2 batch
+        # when provider admission is busy, so the next wave starts after this
+        # pool in configured order. Identity (rather than an actionable-list
+        # index) keeps rotation stable as other pools become actionable.
+        self._fill_pool_last_started_key: str | None = None
+        # Fences a detached decision wave from debiting replacement feed or
+        # restoring a rotation anchor after membership, ordering, or an
+        # explicit lifecycle reset. Same-order feed refreshes deliberately
+        # retain the revision.
+        self._fill_pool_order_revision = 0
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
         self.cost_rebalance: bool = bool(spec.cost_rebalance)
@@ -632,6 +636,7 @@ class Autoscaler:
                 # leave a process-local shelter that a later re-enable could
                 # relay across a failed first round for a newly created claim.
                 self._fill_pool_states = {}
+                self._fill_pool_last_started_key = None
             else:
                 # A service update may add/remove/reorder pool edges and
                 # therefore advance the authoritative service generation.
@@ -650,6 +655,7 @@ class Autoscaler:
                                                    pool_state.edge_cap)
                     pool_state.grant = 0
                     pool_state.grant_epoch = None
+            self._fill_pool_order_revision += 1
             self._refresh_legacy_fill_projection_locked()
         self.cost_rebalance = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction = float(
@@ -778,6 +784,8 @@ class Autoscaler:
             # subsequent v1 heartbeat forever.
             with self._fill_pool_state_lock:
                 self._fill_pool_states = {}
+                self._fill_pool_last_started_key = None
+                self._fill_pool_order_revision += 1
         free_slots = max(0, int(free_slots))
         prev_raw = self._fill_last_raw_free_slots
         self._fill_last_raw_free_slots = free_slots
@@ -1043,7 +1051,11 @@ class Autoscaler:
                           previous_raw > state.free_slots):
                         state.free_slots = min(previous_raw, raw_free)
                 state.free_slots = min(state.free_slots, state.edge_cap)
+            if tuple(previous) != tuple(parsed):
+                self._fill_pool_order_revision += 1
             self._fill_pool_states = parsed
+            if self._fill_pool_last_started_key not in parsed:
+                self._fill_pool_last_started_key = None
             self._refresh_legacy_fill_projection_locked()
 
     def seed_zero_cost_pools(
@@ -1091,11 +1103,16 @@ class Autoscaler:
         self._fill_grant_pool_key = None
 
     def _pool_fill_states_snapshot(self) -> dict[str, _PoolFillState]:
+        states, _ = self._pool_fill_states_snapshot_with_order_revision()
+        return states
+
+    def _pool_fill_states_snapshot_with_order_revision(
+            self) -> tuple[dict[str, _PoolFillState], int]:
         with self._fill_pool_state_lock:
-            return {
+            return ({
                 key: state.detached_copy()
                 for key, state in self._fill_pool_states.items()
-            }
+            }, self._fill_pool_order_revision)
 
     def get_reserved_capacity_pool_shelter_grant(self, pool_key: str, *,
                                                  service_generation: int,
@@ -1685,6 +1702,7 @@ class Autoscaler:
         replica_infos: list['replica_managers.ReplicaInfo'],
         decisions: list[AutoscalerDecision],
         states: dict[str, _PoolFillState],
+        pool_order_revision: int,
     ) -> list[AutoscalerDecision]:
         """Apply independently fenced pool feeds under one service ceiling."""
         if not states:
@@ -1970,13 +1988,16 @@ class Autoscaler:
         # intentionally stops a batch, so a fixed first pool would still be
         # able to starve every later pool before the within-wave round robin
         # gets its first turn.
+        with self._fill_pool_state_lock:
+            last_started_key = self._fill_pool_last_started_key
+        rotated_keys = ordered_keys
+        if last_started_key in ordered_keys:
+            start = ordered_keys.index(last_started_key) + 1
+            rotated_keys = ordered_keys[start:] + ordered_keys[:start]
         launch_order = [
-            key for key in ordered_keys if launch_remaining.get(key, 0) > 0
+            key for key in rotated_keys if launch_remaining.get(key, 0) > 0
         ]
-        if launch_order:
-            start = self._fill_pool_round_robin_cursor % len(launch_order)
-            launch_order = launch_order[start:] + launch_order[:start]
-            self._fill_pool_round_robin_cursor += 1
+        first_emitted_key: str | None = None
         while hard_headroom > 0:
             made_progress = False
             for key in launch_order:
@@ -1992,6 +2013,8 @@ class Autoscaler:
                     # path. This is the compatibility behavior for an old v2
                     # round.
                     result.extend(_generate_scale_up_decisions(1, override))
+                    if first_emitted_key is None:
+                        first_emitted_key = key
                     emitted_by_pool[key] += 1
                     launch_remaining[key] = remaining - 1
                     hard_headroom -= 1
@@ -2008,6 +2031,8 @@ class Autoscaler:
                     shaped_override['accelerators'] = {display_card: gpu_count}
                     result.extend(
                         _generate_scale_up_decisions(1, shaped_override))
+                    if first_emitted_key is None:
+                        first_emitted_key = key
                     exact_slots[card] = available - 1
                     emitted_by_pool_card[key][card] = (
                         emitted_by_pool_card[key].get(card, 0) + 1)
@@ -2019,28 +2044,36 @@ class Autoscaler:
             if not made_progress:
                 break
 
-        if any(emitted_by_pool.values()):
+        if first_emitted_key is not None:
             with self._fill_pool_state_lock:
-                for key, emitted in emitted_by_pool.items():
-                    if emitted <= 0:
-                        continue
-                    live = self._fill_pool_states.get(key)
-                    source = states[key]
-                    if (live is None or live.service_generation
-                            != source.service_generation):
-                        continue
-                    live.free_slots = max(0, live.free_slots - emitted)
-                    if live.last_raw_free_slots is not None:
-                        live.last_raw_free_slots = max(
-                            0, live.last_raw_free_slots - emitted)
-                    if live.free_slots_by_accelerator is not None:
-                        for card, card_emitted in emitted_by_pool_card[
-                                key].items():
-                            live.free_slots_by_accelerator[card] = max(
-                                0,
-                                live.free_slots_by_accelerator.get(card, 0) -
-                                card_emitted)
-                self._refresh_legacy_fill_projection_locked()
+                if self._fill_pool_order_revision == pool_order_revision:
+                    for key, emitted in emitted_by_pool.items():
+                        if emitted <= 0:
+                            continue
+                        live = self._fill_pool_states.get(key)
+                        source = states[key]
+                        if (live is None or live.service_generation
+                                != source.service_generation):
+                            continue
+                        live.free_slots = max(0, live.free_slots - emitted)
+                        if live.last_raw_free_slots is not None:
+                            live.last_raw_free_slots = max(
+                                0, live.last_raw_free_slots - emitted)
+                        if live.free_slots_by_accelerator is not None:
+                            for card, card_emitted in emitted_by_pool_card[
+                                    key].items():
+                                live.free_slots_by_accelerator[card] = max(
+                                    0,
+                                    live.free_slots_by_accelerator.get(card, 0)
+                                    - card_emitted)
+                    first_live = self._fill_pool_states.get(first_emitted_key)
+                    first_source = states[first_emitted_key]
+                    if (first_live is not None and first_live.service_generation
+                            == first_source.service_generation and
+                            first_live.physical_cluster_uid
+                            == first_source.physical_cluster_uid):
+                        self._fill_pool_last_started_key = first_emitted_key
+                    self._refresh_legacy_fill_projection_locked()
 
             # Reserved fill is computed after ordinary decisions so the
             # conservative exact-card debits above can account for every
@@ -2098,10 +2131,11 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
-        pool_states = self._pool_fill_states_snapshot()
+        (pool_states, pool_order_revision) = (
+            self._pool_fill_states_snapshot_with_order_revision())
         if pool_states:
             return self._apply_reserved_capacity_fill_v2(
-                replica_infos, decisions, pool_states)
+                replica_infos, decisions, pool_states, pool_order_revision)
         # Zero-cost accounting is version-asymmetric by design; the
         # four roles use different version scopes:
         # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
@@ -3010,6 +3044,9 @@ class Autoscaler:
         # subclass _load_dynamic_states leftover-logging never sees it.
         with self._fill_pool_state_lock:
             fill_state_version = 2 if self._fill_pool_states else 1
+            fill_pool_last_started_key = self._fill_pool_last_started_key
+            if fill_pool_last_started_key not in self._fill_pool_states:
+                fill_pool_last_started_key = None
             # Capture the version discriminator and complete v2 pool map from
             # one critical section. A poller map swap between two independent
             # reads must not produce a v1 discriminator with v2 contents (or
@@ -3046,6 +3083,7 @@ class Autoscaler:
                 for location in self._fill_zero_cost_locations
             ],
             'fill_snapshot_time': self._fill_snapshot_time,
+            'fill_pool_last_started_key': fill_pool_last_started_key,
             # Grants/epochs remain DB-authoritative and are deliberately not
             # restored. Locations and identity are enough to protect existing
             # replicas during an in-process autoscaler swap; feed resumes only
@@ -3064,6 +3102,9 @@ class Autoscaler:
         # is also a lifecycle boundary: do not restore authority that a later
         # re-enable could mistake for its newly created claim.
         fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
+        with self._fill_pool_state_lock:
+            self._fill_pool_last_started_key = None
+            self._fill_pool_order_revision += 1
         if fill_state is not None and self.reserved_capacity_fill:
             broker_authority = bool(fill_state.get('broker_authority', True))
             self._fill_free_slots = (0 if broker_authority else max(
@@ -3177,8 +3218,16 @@ class Autoscaler:
                         continue
                 if len(restored_generations) > 1:
                     restored = {}
+                raw_last_started_key = fill_state.get(
+                    'fill_pool_last_started_key')
+                restored_last_started_key = (
+                    raw_last_started_key
+                    if isinstance(raw_last_started_key, str) and
+                    raw_last_started_key in restored else None)
                 with self._fill_pool_state_lock:
                     self._fill_pool_states = restored
+                    self._fill_pool_last_started_key = (
+                        restored_last_started_key)
                     self._refresh_legacy_fill_projection_locked()
         self._load_dynamic_states(dynamic_states)
 

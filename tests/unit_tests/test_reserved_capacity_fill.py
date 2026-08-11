@@ -1842,6 +1842,311 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 self.east_pool,
             ])
 
+    def test_non_emitting_tick_does_not_advance_pool_rotation(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        first = _ups(_decisions(autoscaler, []))
+        self.assertEqual(first[0].target[_POOL_KEY], self.east_pool)
+
+        # Replenish authority, but let demand consume all hard headroom. The
+        # actionable set is nonempty even though this tick emits no fill.
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        unrelated = [
+            _replica(index, location_key=None, reserved_fill=False)
+            for index in range(1, 5)
+        ]
+        self.assertEqual(_fill_ups(_decisions(autoscaler, unrelated)), [])
+
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        resumed = _ups(_decisions(autoscaler, []))
+        self.assertEqual(resumed[0].target[_POOL_KEY], self.phx_pool)
+
+    def test_rotation_uses_stable_identity_before_actionable_filter(self):
+        west = make_location('west-context',
+                             accelerators={'A100': 1},
+                             cloud_name='Kubernetes',
+                             use_spot=False)
+        west_pool = reserved_capacity_broker.make_pool_key(
+            'west-context',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='west-uid')
+        timestamp = time.time()
+        first_snapshots = self._snapshots(east_feed=1, phx_feed=1)
+        first_snapshots[west_pool] = {
+            'protocol_version': 2,
+            'pool_key': west_pool,
+            'physical_cluster_uid': 'west-uid',
+            'service_generation': 1,
+            'edge_cap': 1,
+            'zero_cost_location_keys': [west.to_pickleable()],
+            'free_slots': 0,
+            'free_slots_by_accelerator': {},
+            'grant': 1,
+            'grant_epoch': 23,
+            'timestamp': timestamp,
+        }
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=2)
+        autoscaler.collect_reserved_capacity_pools(first_snapshots)
+        autoscaler.collect_reserved_capacity_pools(first_snapshots)
+        first = _ups(_decisions(autoscaler, []))
+        self.assertEqual([item.target[_POOL_KEY] for item in first],
+                         [self.east_pool, self.phx_pool])
+
+        second_snapshots = self._snapshots(east_feed=0, phx_feed=1)
+        second_snapshots[west_pool] = dict(
+            first_snapshots[west_pool],
+            free_slots=1,
+            free_slots_by_accelerator={'a100': 1},
+            timestamp=time.time())
+        autoscaler.collect_reserved_capacity_pools(second_snapshots)
+        autoscaler.collect_reserved_capacity_pools(second_snapshots)
+        second = _ups(_decisions(autoscaler, []))
+        self.assertEqual([item.target[_POOL_KEY] for item in second],
+                         [self.phx_pool, west_pool])
+
+        # The manager stops the remainder of a wave at the first busy item.
+        # Exercise that component boundary deterministically: PHX, not the
+        # newly actionable west pool, must receive this wave's first attempt.
+        manager = _make_manager(None)
+        manager.lock = threading.RLock()
+        manager._batch_needs_placement_snapshot = mock.Mock(return_value=False)
+        manager._scale_up_one_locked = mock.Mock(
+            side_effect=exceptions.ProviderPhaseBusyError('phase busy'))
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_ids',
+                               return_value=set()):
+            manager.scale_up_batch([item.target for item in second])
+        manager._scale_up_one_locked.assert_called_once()
+        attempted = manager._scale_up_one_locked.call_args.args[0]
+        self.assertEqual(attempted[_POOL_KEY], self.phx_pool)
+
+    def test_rotation_anchors_to_first_pool_that_actually_emits(self):
+        autoscaler = self._exact_card_autoscaler({'L4': 1, 'H200': 1})
+        snapshots = self._snapshots(east_feed=1, phx_feed=1)
+        for snapshot in snapshots.values():
+            snapshot.pop('free_slots_by_accelerator')
+
+        def _replenish() -> None:
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        def _fill_pool_order() -> list[str]:
+            return [
+                decision.target[_POOL_KEY]
+                for decision in _ups(
+                    autoscaler._apply_reserved_capacity_fill([], []))
+                if isinstance(decision.target, dict) and
+                decision.target.get(_FILL_KEY)
+            ]
+
+        # Legacy v2 snapshots share the autoscaler's exact-card authority.
+        # EAST is planned first but cannot emit from an H200-only budget.
+        autoscaler.set_free_reserved_slots_by_accelerator({'H200': 1})
+        _replenish()
+        self.assertEqual(_fill_pool_order(), [self.phx_pool])
+
+        # Rotation must start after the first pool that really emitted (PHX),
+        # rather than after the planned-but-unemittable EAST pool.
+        autoscaler.set_free_reserved_slots_by_accelerator({
+            'L4': 1,
+            'H200': 1,
+        })
+        _replenish()
+        self.assertEqual(_fill_pool_order(), [self.east_pool, self.phx_pool])
+
+    def test_stale_generation_wave_cannot_replace_rotation_anchor(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        generation_one = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        autoscaler.collect_reserved_capacity_pools(generation_one)
+        autoscaler.collect_reserved_capacity_pools(generation_one)
+        original_generate = autoscalers._generate_scale_up_decisions
+        advanced = False
+
+        def _advance_generation(num, target):
+            nonlocal advanced
+            if not advanced:
+                advanced = True
+                generation_two = self._snapshots(generation=2,
+                                                 east_feed=0,
+                                                 phx_feed=0)
+                autoscaler.collect_reserved_capacity_pools(generation_two)
+            return original_generate(num, target)
+
+        # Advance the complete live map after computation detached generation
+        # one but before it tries to debit and record the wave under the lock.
+        with mock.patch.object(autoscalers,
+                               '_generate_scale_up_decisions',
+                               side_effect=_advance_generation):
+            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+
+        self.assertEqual([item.target[_POOL_KEY] for item in _ups(decisions)],
+                         [self.east_pool, self.phx_pool])
+        self.assertTrue(advanced)
+        self.assertEqual(
+            {
+                state.service_generation
+                for state in autoscaler._fill_pool_states.values()
+            }, {2})
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+    def test_same_identity_readd_cannot_restore_rotation_anchor(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        original_generate = autoscalers._generate_scale_up_decisions
+        readded = False
+
+        def _remove_and_readd(num, target):
+            nonlocal readded
+            if not readded:
+                readded = True
+                autoscaler.collect_reserved_capacity_pools({})
+                autoscaler.collect_reserved_capacity_pools(snapshots)
+                autoscaler.collect_reserved_capacity_pools(snapshots)
+                self.assertIsNone(autoscaler._fill_pool_last_started_key)
+            return original_generate(num, target)
+
+        # A transient empty publication is a hard rotation boundary even when
+        # the next heartbeat restores the same pool keys, generation, and UIDs.
+        # The detached pre-removal wave may retain valid decisions but must not
+        # recreate the cleared anchor. The caller's ordinary decision remains
+        # untouched.
+        ordinary = autoscalers.AutoscalerDecision(_SCALE_DOWN, 999)
+        with mock.patch.object(autoscalers,
+                               '_generate_scale_up_decisions',
+                               side_effect=_remove_and_readd):
+            decisions = autoscaler._apply_reserved_capacity_fill([], [ordinary])
+
+        self.assertEqual(decisions[0], ordinary)
+        self.assertEqual([item.target[_POOL_KEY] for item in _ups(decisions)],
+                         [self.east_pool, self.phx_pool])
+        self.assertTrue(readded)
+        self.assertEqual(set(autoscaler._fill_pool_states), set(snapshots))
+        self.assertEqual(
+            {
+                key: state.free_slots
+                for key, state in autoscaler._fill_pool_states.items()
+            }, {
+                self.east_pool: 1,
+                self.phx_pool: 1,
+            })
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+        # Batch actuation persists each accepted protocol-v2 reservation
+        # before returning. Model EAST as accepted while PHX was not reached:
+        # the next tick must debit EAST's PENDING occupancy and retry only
+        # the unpersisted PHX decision, despite the replacement map retaining
+        # its original feed values.
+        accepted = _replica(1,
+                            self.east.to_pickleable(),
+                            status=serve_state.ReplicaStatus.PENDING,
+                            created_at=snapshots[self.east_pool]['timestamp'] +
+                            1)
+        accepted.reserved_fill_pool_key = self.east_pool
+        accepted.reserved_fill_service_generation = 1
+        accepted.reserved_fill_physical_cluster_uid = 'east-uid'
+        retry = _ups(autoscaler._apply_reserved_capacity_fill([accepted], []))
+        self.assertEqual([item.target[_POOL_KEY] for item in retry],
+                         [self.phx_pool])
+
+    def test_pool_order_revision_tracks_membership_and_order_boundaries(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        initial_revision = autoscaler._fill_pool_order_revision
+
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        first_publication_revision = autoscaler._fill_pool_order_revision
+        self.assertEqual(first_publication_revision, initial_revision + 1)
+
+        # A same-order feed refresh changes values but is not a lifecycle or
+        # fairness boundary, so it must not invalidate an in-flight wave.
+        refreshed = {
+            key: dict(value, timestamp=value['timestamp'] + 1)
+            for key, value in snapshots.items()
+        }
+        autoscaler.collect_reserved_capacity_pools(refreshed)
+        self.assertEqual(autoscaler._fill_pool_order_revision,
+                         first_publication_revision)
+
+        reversed_snapshots = dict(reversed(list(refreshed.items())))
+        autoscaler.collect_reserved_capacity_pools(reversed_snapshots)
+        reorder_revision = autoscaler._fill_pool_order_revision
+        self.assertEqual(reorder_revision, first_publication_revision + 1)
+        autoscaler.collect_reserved_capacity_pools(reversed_snapshots)
+        self.assertEqual(autoscaler._fill_pool_order_revision, reorder_revision)
+
+        autoscaler.collect_reserved_capacity_pools({
+            self.phx_pool: reversed_snapshots[self.phx_pool],
+        })
+        self.assertEqual(autoscaler._fill_pool_order_revision,
+                         reorder_revision + 1)
+
+    def test_rotation_anchor_survives_valid_dynamic_restore(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        first = _ups(_decisions(old, []))
+        self.assertEqual(first[0].target[_POOL_KEY], self.east_pool)
+
+        dumped = old.dump_dynamic_states()
+        self.assertEqual(
+            dumped['reserved_capacity_fill_state']
+            ['fill_pool_last_started_key'], self.east_pool)
+        restored = _make_autoscaler(min_replicas=0, max_replicas=4)
+        restored.load_dynamic_states(dumped)
+        restored.collect_reserved_capacity_pools(snapshots)
+        restored.collect_reserved_capacity_pools(snapshots)
+        resumed = _ups(_decisions(restored, []))
+        self.assertEqual(resumed[0].target[_POOL_KEY], self.phx_pool)
+
+    def test_rotation_anchor_rejects_removed_or_malformed_identity(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        self.assertTrue(_ups(_decisions(old, [])))
+
+        cases = ('missing', 'retired-pool', True, 7)
+        for anchor in cases:
+            with self.subTest(anchor=anchor):
+                dumped = old.dump_dynamic_states()
+                if anchor == 'missing':
+                    dumped['reserved_capacity_fill_state'].pop(
+                        'fill_pool_last_started_key')
+                else:
+                    dumped['reserved_capacity_fill_state'][
+                        'fill_pool_last_started_key'] = anchor
+                restored = _make_autoscaler(min_replicas=0, max_replicas=4)
+                restored.load_dynamic_states(dumped)
+                restored.collect_reserved_capacity_pools(snapshots)
+                restored.collect_reserved_capacity_pools(snapshots)
+                resumed = _ups(_decisions(restored, []))
+                self.assertEqual(resumed[0].target[_POOL_KEY], self.east_pool)
+
+    def test_live_pool_removal_then_readd_resets_rotation_anchor(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        first = _ups(_decisions(autoscaler, []))
+        self.assertEqual(first[0].target[_POOL_KEY], self.east_pool)
+
+        phx_only = {self.phx_pool: self._snapshots()[self.phx_pool]}
+        autoscaler.collect_reserved_capacity_pools(phx_only)
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        resumed = _ups(_decisions(autoscaler, []))
+        self.assertEqual(resumed[0].target[_POOL_KEY], self.east_pool)
+
     def test_fill_precedes_blocking_ordinary_scale_up(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
         snapshots = self._snapshots()
@@ -2555,12 +2860,17 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
 
     def test_disabling_fill_clears_shelter_before_reenable(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
-        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertTrue(_ups(_decisions(autoscaler, [])))
+        self.assertIsNotNone(autoscaler._fill_pool_last_started_key)
 
         autoscaler.update_version(
             2, _spec(min_replicas=0, max_replicas=5, fill=False),
             serve_utils.DEFAULT_UPDATE_MODE)
         self.assertEqual(autoscaler._fill_pool_states, {})
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
         autoscaler.update_version(
             3, _spec(min_replicas=0, max_replicas=5, fill=True),
             serve_utils.DEFAULT_UPDATE_MODE)
@@ -2700,10 +3010,13 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         autoscaler.collect_reserved_capacity_pools(snapshots)
         autoscaler.collect_reserved_capacity_pools(snapshots)
         self.assertIn('fill_by_pool', autoscaler.info())
+        self.assertTrue(_ups(_decisions(autoscaler, [])))
+        self.assertIsNotNone(autoscaler._fill_pool_last_started_key)
 
         autoscaler.collect_reserved_capacity(0, [_K8S_KEY],
                                              time.time(),
                                              protocol_version=1)
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
         autoscaler.collect_reserved_capacity(2, [_K8S_KEY],
                                              time.time(),
                                              protocol_version=1)
