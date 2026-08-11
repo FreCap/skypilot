@@ -1868,6 +1868,77 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 isinstance(decision.target, dict) and
                 decision.target.get(_FILL_KEY) for decision in decisions[1:-1]))
 
+    def test_interleaving_respects_stable_pool_target_budget(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=2)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        fill_ups = [
+            decision for decision in _ups(_decisions(autoscaler, []))
+            if decision.target is not None
+        ]
+        self.assertEqual(len(fill_ups), 2)
+        # The stable target partition gives the first pool both globally
+        # available slots. Interleaving must not launch into a pool whose
+        # durable target is zero, or the next tick immediately tears it down.
+        targets = {
+            key: value['fill_target']
+            for key, value in autoscaler.info()['fill_by_pool'].items()
+        }
+        self.assertEqual(targets, {
+            self.east_pool: 2,
+            self.phx_pool: 0,
+        })
+        emitted = {self.east_pool: 0, self.phx_pool: 0}
+        for decision in fill_ups:
+            override = decision.target
+            pool_key = override[_POOL_KEY]
+            emitted[pool_key] += 1
+            self.assertEqual(override[_PROTOCOL_KEY], 2)
+            self.assertEqual(override[_GENERATION_KEY], 1)
+            expected_uid = ('east-uid'
+                            if pool_key == self.east_pool else 'phx-uid')
+            self.assertEqual(
+                override[
+                    constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY],
+                expected_uid)
+        self.assertTrue(
+            all(count <= targets[key] for key, count in emitted.items()),
+            (emitted, targets))
+        self.assertEqual(emitted, {
+            self.east_pool: 2,
+            self.phx_pool: 0,
+        })
+
+        rows = []
+        locations = {
+            self.east_pool: self.east,
+            self.phx_pool: self.phx,
+        }
+        uids = {
+            self.east_pool: 'east-uid',
+            self.phx_pool: 'phx-uid',
+        }
+        launched_at = snapshots[self.east_pool]['timestamp'] + 1
+        for replica_id, decision in enumerate(fill_ups, start=1):
+            pool_key = decision.target[_POOL_KEY]
+            row = _replica(replica_id,
+                           locations[pool_key].to_pickleable(),
+                           created_at=launched_at)
+            row.reserved_fill_pool_key = pool_key
+            row.reserved_fill_service_generation = 1
+            row.reserved_fill_physical_cluster_uid = uids[pool_key]
+            rows.append(row)
+
+        refreshed = self._snapshots(east_feed=2 - emitted[self.east_pool],
+                                    phx_feed=2 - emitted[self.phx_pool])
+        for snapshot in refreshed.values():
+            snapshot['timestamp'] = launched_at + 1
+        autoscaler.collect_reserved_capacity_pools(refreshed)
+        next_decisions = _decisions(autoscaler, rows)
+        self.assertEqual(_downs(next_decisions), [])
+
     def test_exact_measurement_selects_available_card_in_mixed_pool(self):
         mixed_l4 = make_location('phx-context',
                                  accelerators={'L4': 1},

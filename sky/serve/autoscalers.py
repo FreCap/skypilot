@@ -1924,7 +1924,12 @@ class Autoscaler:
         launch_exact_slots: dict[str, dict[str, int] | None] = {}
         for key in ordered_keys:
             entry = data[key]
-            desired = max(0, launch_targets[key] - int(entry['latest']))
+            # The stable target partition is also the durable scale-down
+            # authority for each pool. Never interleave a launch beyond that
+            # pool's partition: the next tick would immediately select the
+            # out-of-target replica as a victim and churn provider capacity.
+            pool_launch_target = min(launch_targets[key], targets[key])
+            desired = max(0, pool_launch_target - int(entry['latest']))
             if desired <= 0:
                 continue
             state = states[key]
