@@ -192,6 +192,8 @@ class _ZeroCostDemandBudget:
 
     remaining_by_pool: dict[tuple[str, str], int]
     measured_by_pool: dict[tuple[str, str], int | None]
+    selected_launches_by_pool: dict[tuple[str, str], int] = dataclasses.field(
+        default_factory=dict)
 
 
 class _ReplicaLaunchFunding(enum.Enum):
@@ -1525,6 +1527,20 @@ def _should_use_spot(
     return len(spot_use_resources) > 0
 
 
+def _placer_has_only_non_spot_kubernetes_gpu_locations(
+        placer: spot_placer.SpotPlacer | None) -> bool:
+    """Whether every placer location is a budgetable non-spot K8s GPU."""
+    if placer is None:
+        return False
+    location_statuses = getattr(placer, 'location2status', None)
+    if not isinstance(location_statuses, dict) or not location_statuses:
+        return False
+    return all(
+        not location.use_spot and str(location.cloud).lower() == 'kubernetes'
+        and _whole_gpu_capacity(location.accelerators) is not None
+        for location in location_statuses)
+
+
 def _whole_gpu_capacity(
         accelerators: Mapping[str, int | float] | None) -> int | None:
     """Return the v1 logical slot width for one exact GPU shape."""
@@ -1535,6 +1551,17 @@ def _whole_gpu_capacity(
             count < 1 or not float(count).is_integer()):
         return None
     return int(count)
+
+
+def _kubernetes_context_has_configured_autoscaler(
+        kubernetes_context: str) -> bool:
+    """Whether a Kubernetes context is configured to scale from zero."""
+    autoscaler = skypilot_config.get_effective_region_config(
+        cloud='kubernetes',
+        region=kubernetes_context,
+        keys=('autoscaler',),
+        default_value=None)
+    return isinstance(autoscaler, str) and bool(autoscaler.strip())
 
 
 def _is_protocol_v2_fill_override(
@@ -4500,6 +4527,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                     launch_spec)
         retry_until_up = True
         location = None
+        placer_owns_kubernetes_fallback = (
+            _placer_has_only_non_spot_kubernetes_gpu_locations(
+                self._spot_placer))
         debit_paid_location_launch_budget = False
         recovered_location = None
         if recovering_existing_replica and self._spot_placer is not None:
@@ -4584,8 +4614,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             use_spot = location.use_spot
             retry_until_up = False
         elif (self._spot_placer is not None and
-              (use_spot or zero_cost_only or not paid_launch_allowed) and
-              recovered_location is None):
+              (use_spot or zero_cost_only or not paid_launch_allowed or
+               placer_owns_kubernetes_fallback) and recovered_location is None):
             # For spot placer, we don't retry until up so any launch failed
             # due to availability issue will be handled by the placer.
             retry_until_up = False
@@ -5578,10 +5608,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         budget: _ZeroCostDemandBudget,
         allowed_locations: set[spot_placer.Location] | None = None,
     ) -> spot_placer.Location | None:
-        """Reserve and select one location from a measured batch budget."""
+        """Reserve one location while balancing a multi-pool launch wave.
+
+        Selection uses remaining backend attempts, rather than raw GPU count,
+        as the balance unit. This keeps different replica widths comparable
+        and ensures equal unknown-capacity probe budgets alternate across
+        contexts instead of letting one indefinitely pending Kubernetes pool
+        consume the whole provider-launch admission window.
+        """
         if self._spot_placer is None:
             return None
-        allowed = set()
+        available_pool_keys: dict[spot_placer.Location, tuple[str, str]] = {}
         for location in self._spot_placer.zero_cost_locations():
             if (allowed_locations is not None and
                     location not in allowed_locations):
@@ -5598,9 +5635,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             # measurement blackout, the fallback is deliberately expressed
             # in bounded speculative backend attempts instead.
             if measured is None or width <= remaining:
-                allowed.add(location)
-        if not allowed:
+                available_pool_keys[location] = pool_key
+        if not available_pool_keys:
             return None
+        fewest_selected = min(
+            budget.selected_launches_by_pool.get(pool_key, 0)
+            for pool_key in available_pool_keys.values())
+        allowed = {
+            location for location, pool_key in available_pool_keys.items() if
+            budget.selected_launches_by_pool.get(pool_key, 0) == fewest_selected
+        }
         location = self._spot_placer.select_next_zero_cost_location(
             allowed_locations=allowed)
         if location is None:
@@ -5615,6 +5659,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                  if budget.measured_by_pool.get(pool_key) is not None else 1)
         assert remaining >= debit, (location, budget)
         budget.remaining_by_pool[pool_key] = remaining - debit
+        budget.selected_launches_by_pool[pool_key] = (
+            budget.selected_launches_by_pool.get(pool_key, 0) + 1)
         return location
 
     def _locations_for_accelerator_override(
@@ -5667,7 +5713,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         count. Rows across every service that may not be represented in that
         snapshot are debited under the cross-process reservation lock before
         this budget is returned. A missing/failed observation falls back to a
-        bounded number of backend probes; a successful zero is authoritative.
+        bounded number of backend probes. A successful zero is authoritative
+        for fixed pools in mixed fallback, while all-Kubernetes placement and
+        configured autoscalers receive bounded probes so a pod can trigger
+        scheduler preemption or scale-up from zero.
         """
         if self._spot_placer is None:
             return None
@@ -5685,10 +5734,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not zero_cost:
             return None
         observations = reserved_capacity.get_cached_free_gpus_by_pool(zero_cost)
+        kubernetes_only_placement = (
+            _placer_has_only_non_spot_kubernetes_gpu_locations(
+                self._spot_placer))
         measured = {
             key: observation.free_gpus
             for key, observation in observations.items()
         }
+        for measured_pool_key, free_gpus in measured.items():
+            if (free_gpus == 0 and
+                (kubernetes_only_placement or
+                 _kubernetes_context_has_configured_autoscaler(
+                     measured_pool_key[0]))):
+                measured[measured_pool_key] = None
         active_count_by_pool: dict[tuple[str, str], int] = {}
         for location in zero_cost:
             pool_key = _zero_cost_pool_key(location)
@@ -6552,6 +6610,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Whether any launch in a batch will ask the placer for a location."""
         if self._spot_placer is None or not resources_overrides:
             return False
+        if _placer_has_only_non_spot_kubernetes_gpu_locations(
+                self._spot_placer):
+            return True
         uses_task_default = False
         for resources_override in resources_overrides:
             if (resources_override is not None and

@@ -1033,7 +1033,16 @@ class SpotPlacer:
                 timeout = float(timeout)
             except (TypeError, ValueError):
                 continue
-            if timeout >= ttl:
+            if timeout < 0:
+                logger.warning(
+                    f'Kubernetes context {context!r} has '
+                    'provision_timeout=-1 and keeps each admitted unscheduled '
+                    'pod indefinitely. SkyServe will balance bounded '
+                    'zero/unknown-capacity scheduler probes across an '
+                    'all-Kubernetes catalog, but each admitted probe continues '
+                    'to occupy a provider-launch slot until it schedules or '
+                    'is cancelled.')
+            elif timeout >= ttl:
                 logger.warning(
                     f'Kubernetes context {context!r} has '
                     f'provision_timeout={timeout:.0f}s >= the spot placer '
