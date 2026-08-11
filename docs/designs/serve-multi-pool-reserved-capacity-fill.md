@@ -1694,11 +1694,11 @@ larger than the configured `max_replicas`.
   drift item until both platform pool roots consume the fixed module. At that
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
-- The live SkyPilot Helm release is the deployment authority.  The
-  boltz-platform pin is independent configuration and is not a rollback source
-  for a direct SkyPilot rollout; changing it requires separate explicit scope.
-  Verify the live chart version, image tag, and image digest after each rollout
-  and do not infer deployment state from the platform repository.
+- Deployment authority between the live Helm release and the boltz-platform
+  pin was not verified in this audit. Before any rollout or rollback, inspect
+  the live revision, chart version, image tag and digest, and the current
+  declarative pin; do not assume either source is authoritative or current.
+  Changing platform configuration is outside follow-up #1433.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
   Isolated exact-context and two-pool canaries passed, including an H200 replica
   and HTTP 200 from Rainier, but versions 51--53 retained east-only placement
