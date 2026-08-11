@@ -480,6 +480,7 @@ def test_nominated_service_no_yaml_is_retained_under_refresh_locks():
     handle.cluster_yaml = None
     record = _make_refreshable_record(handle)
     record['is_managed'] = True
+    record['workload_type'] = 'service'
     status_lock = mock.MagicMock()
     status_lock.acquire.return_value.__enter__.return_value = None
     resource_lock = mock.MagicMock()
@@ -518,6 +519,7 @@ def test_nominated_service_no_yaml_is_retained_under_refresh_locks():
     remove.assert_not_called()
 
 
+@pytest.mark.parametrize('cluster_yaml', [None, '/fake/path/cluster.yaml'])
 @pytest.mark.parametrize(('is_managed', 'workload_type', 'cluster_hash'), [
     (True, 'managed_job', 'fake-hash'),
     (True, 'pool', 'fake-hash'),
@@ -525,14 +527,16 @@ def test_nominated_service_no_yaml_is_retained_under_refresh_locks():
     (False, None, 'fake-hash'),
 ])
 def test_stale_service_nomination_cannot_act_on_same_name_successor(
-        is_managed, workload_type, cluster_hash):
+        is_managed, workload_type, cluster_hash, cluster_yaml):
     handle = _make_handle()
-    handle.cluster_yaml = None
+    handle.cluster_yaml = cluster_yaml
     predecessor = _make_refreshable_record(handle)
     predecessor['is_managed'] = True
+    predecessor['workload_type'] = 'service'
     successor = dict(predecessor,
                      is_managed=is_managed,
-                     cluster_hash=cluster_hash)
+                     cluster_hash=cluster_hash,
+                     workload_type=workload_type)
     candidate = _managed_candidate(predecessor)
     status_lock = mock.MagicMock()
     status_lock.acquire.return_value.__enter__.return_value = None
@@ -566,14 +570,106 @@ def test_stale_service_nomination_cannot_act_on_same_name_successor(
             summary_response=True,
             _managed_no_yaml_candidate=candidate)
 
-    assert result in (predecessor, successor)
-    assert full_read.call_count == (
-        2 if predecessor['cluster_hash'] != successor['cluster_hash'] or
-        predecessor['is_managed'] != successor['is_managed'] else 1)
+    assert result is successor
+    assert full_read.call_count == 2
     get_lock.assert_called_once_with(
         backend_utils.cluster_status_lock_id('test-cluster'))
-    owner.assert_called_once_with('test-cluster', predecessor)
+    owner.assert_not_called()
     update.assert_not_called()
+    provider.assert_not_called()
+    add_event.assert_not_called()
+    remove.assert_not_called()
+
+
+@pytest.mark.parametrize('workload_type', ['managed_job', 'pool'])
+def test_initial_reclassified_candidate_exits_before_identity_or_lock(
+        workload_type):
+    record = _make_refreshable_record(_make_handle())
+    record.update(is_managed=True, workload_type=workload_type)
+    candidate = _managed_candidate(record)
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=record), \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record') as owner, \
+         mock.patch.object(backend_utils.locks, 'get_lock') as get_lock:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster',
+            force_refresh_statuses=set(status_lib.ClusterStatus),
+            _managed_no_yaml_candidate=candidate)
+
+    assert result is record
+    owner.assert_not_called()
+    get_lock.assert_not_called()
+
+
+@pytest.mark.parametrize(('workload_type', 'admitted'), [
+    ('service', True),
+    ('managed_job', False),
+    ('pool', False),
+])
+def test_candidate_with_status_lock_already_held_is_revalidated(
+        workload_type, admitted):
+    record = _make_refreshable_record(_make_handle())
+    record.update(is_managed=True, workload_type=workload_type)
+    candidate = _managed_candidate(record)
+    refresh_fields = _refresh_fields(record, workload_type=workload_type)
+
+    with mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_from_name',
+                           return_value=record), \
+         mock.patch.object(backend_utils.global_user_state,
+                           'get_cluster_refresh_fields',
+                           return_value=refresh_fields) as cheap_read, \
+         mock.patch.object(backend_utils,
+                           '_check_owner_identity_with_record') as owner, \
+         mock.patch.object(
+             backend_utils,
+             '_update_cluster_status_with_resource_lock',
+             return_value=record) as update:
+        result = backend_utils.refresh_cluster_record(
+            'test-cluster',
+            force_refresh_statuses=set(status_lib.ClusterStatus),
+            cluster_lock_already_held=True,
+            cluster_resource_lock_already_held=True,
+            _managed_no_yaml_candidate=candidate)
+
+    assert result is record
+    if admitted:
+        cheap_read.assert_called_once_with('test-cluster')
+        owner.assert_called_once_with('test-cluster', record)
+        update.assert_called_once_with('test-cluster', record, True, True,
+                                       False, True, candidate)
+    else:
+        cheap_read.assert_not_called()
+        owner.assert_not_called()
+        update.assert_not_called()
+
+
+@pytest.mark.parametrize('cluster_yaml', [None, '/fake/path/cluster.yaml'])
+@pytest.mark.parametrize('workload_type', ['managed_job', 'pool'])
+def test_update_rejects_reclassified_candidate_before_provider_or_cleanup(
+        workload_type, cluster_yaml):
+    handle = _make_handle()
+    handle.cluster_yaml = cluster_yaml
+    record = _make_refreshable_record(handle)
+    record.update(is_managed=True, workload_type=workload_type)
+    candidate = _managed_candidate(record)
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api') as provider, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'add_cluster_event') as add_event, \
+         mock.patch.object(backend_utils.global_user_state,
+                           'remove_cluster') as remove:
+        result = backend_utils._update_cluster_status(
+            'test-cluster',
+            record,
+            retry_if_missing=True,
+            managed_no_yaml_candidate=candidate)
+
+    assert result is record
     provider.assert_not_called()
     add_event.assert_not_called()
     remove.assert_not_called()
@@ -611,7 +707,8 @@ def test_reload_fetches_full_record_when_status_changed():
         result, fields = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is fresh_record
-    assert fields is refresh_fields
+    assert fields == _refresh_fields(fresh_record)
+    assert fields is not refresh_fields
     full_read.assert_called_once_with('test-cluster',
                                       include_user_info=True,
                                       summary_response=False)

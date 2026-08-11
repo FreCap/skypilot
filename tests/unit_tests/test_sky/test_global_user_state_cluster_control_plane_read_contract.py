@@ -33,12 +33,16 @@ def _fresh_db(tmp_path, monkeypatch):
     return manager
 
 
-def _add_cluster(name: str, *, ready: bool = True) -> None:
+def _add_cluster(name: str,
+                 *,
+                 ready: bool = True,
+                 workload_type: str | None = None) -> None:
     global_user_state.add_or_update_cluster(
         cluster_name=name,
         cluster_handle=_MinimalHandle(),
         requested_resources=set(),
         ready=ready,
+        workload_type=workload_type,
     )
 
 
@@ -103,7 +107,7 @@ def test_exact_read_preserves_summary_verbose_projection_and_decode_budget(
         tmp_path, monkeypatch) -> None:
     manager = _fresh_db(tmp_path, monkeypatch)
     global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
-    _add_cluster('exact')
+    _add_cluster('exact', workload_type='service')
     _set_cluster_user_hash('exact', 'user-a')
     engine = manager.get_engine()
     statements = []
@@ -134,6 +138,7 @@ def test_exact_read_preserves_summary_verbose_projection_and_decode_budget(
 
     assert summary is not None and verbose is not None
     assert summary['status'] is status_lib.ClusterStatus.UP
+    assert summary['workload_type'] == 'service'
     assert summary['user_hash'] == 'user-a'
     assert summary['user_name'] == 'Alice'
     assert set(verbose) == set(summary) | {
@@ -154,7 +159,7 @@ def test_batched_read_preserves_cardinality_user_snapshot_and_decode_budget(
     manager = _fresh_db(tmp_path, monkeypatch)
     monkeypatch.setattr(global_user_state, '_CLUSTER_IN_QUERY_CHUNK_SIZE', 2)
     global_user_state.add_or_update_user(models.User(id='user-a', name='Alice'))
-    _add_cluster('explicit')
+    _add_cluster('explicit', workload_type='managed_job')
     _set_cluster_user_hash('explicit', 'user-a')
     _add_cluster('legacy')
     _set_cluster_user_hash('legacy', None)
@@ -187,8 +192,10 @@ def test_batched_read_preserves_cardinality_user_snapshot_and_decode_budget(
     assert records['legacy'] is not None
     assert records['explicit']['user_hash'] == 'user-a'
     assert records['explicit']['user_name'] == 'Alice'
+    assert records['explicit']['workload_type'] == 'managed_job'
     assert records['legacy']['user_hash'] == 'user-a'
     assert records['legacy']['user_name'] == 'Alice'
+    assert records['legacy']['workload_type'] is None
     assert len(statements) == 3
     assert sum('FROM users' in statement for statement in statements) == 1
     assert pickle_loads.call_count == 2

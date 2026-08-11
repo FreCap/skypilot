@@ -1,6 +1,7 @@
 # SkyServe orphan cluster reconciliation
 
-Status: Implemented; production repair remains gated by the v1 rollout
+Status: Implemented; production repair remains gated by the candidate fence
+follow-up and v1 rollout
 Last updated: 2026-08-11
 
 ## Problem
@@ -99,6 +100,11 @@ fail closed for operator investigation.
 fields into its existing unmanaged snapshot and passes the generation-bound
 nomination only for that candidate's refresh. Direct refresh, relaunch,
 managed-job, pool, and owned-service callers never receive this authority.
+The exact and batched cluster projections include workload type. Before any
+owner-identity, provider, event, or cleanup work, the refresh path requires the
+full record being acted on to remain the nominated hash, managed, and a service.
+If a cheap snapshot causes a full-record reload, admission fields are derived
+from that later full record rather than the superseded snapshot.
 Candidate-discovery failure is fault-isolated: it logs and preserves the
 existing unmanaged sweep. Per-cluster refresh failure already returns an
 `UNKNOWN` sentinel without aborting other clusters.
@@ -170,20 +176,23 @@ Automated tests must prove:
 - a nominated ownerless managed service generation without a cluster YAML is
   retained; non-nominated managed jobs, pools, owned services, and ordinary
   user clusters keep the legacy no-YAML cleanup behavior; and a stale
-  nomination cannot perform provider, event, or cleanup work on a same-name
-  successor generation.
+  nomination cannot perform owner-identity, provider, event, or cleanup work on
+  a same-name successor generation, with or without a cluster YAML.
 
 Run the focused unit tests, formatter and linters for changed Python files, and
 the relevant broader backend and Serve unit-test slices.
 
 ## Verification evidence
 
-The post-merge audit reproduced the pre-correction failure through the managed
-job relaunch path: a managed no-YAML row was retained and reused. The corrected
-path removes non-nominated managed-job rows before relaunch. Deterministic tests
-also replace a nominated row after the initial full read with a same-hash job,
+The first post-merge audit reproduced the pre-correction failure through the
+managed-job relaunch path: a managed no-YAML row was retained and reused. A
+second adversarial review found that a same-hash row reclassified after
+nomination could still inherit a superseded service snapshot. The corrective
+follow-up fences the full row before every side-effecting path. Deterministic
+tests replace a nominated row after the initial full read with a same-hash job,
 same-hash pool, different-hash service generation, and unmanaged successor;
-none can reach provider, event, or cleanup work through the stale nomination.
+none can reach owner identity, provider, event, or cleanup work through the
+stale nomination, whether the successor has a YAML or not.
 
 Local component verification passed 670 tests. Candidate discovery remains one
 SELECT at 10,000 rows, and each locked refresh remains one full read plus the

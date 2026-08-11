@@ -2861,6 +2861,17 @@ def check_can_clone_disk_and_override_task(
     return task, handle
 
 
+def _record_matches_managed_service_candidate(
+    record: dict[str, Any],
+    candidate: global_user_state.ManagedClusterStatusFields,
+) -> bool:
+    """Whether a full record is the nominated managed service generation."""
+    return (bool(candidate.cluster_hash) and
+            record.get('cluster_hash') == candidate.cluster_hash and
+            record.get('is_managed', False) and
+            record.get('workload_type') == 'service')
+
+
 def _update_cluster_status(
     cluster_name: str,
     record: dict[str, Any],
@@ -2896,21 +2907,20 @@ def _update_cluster_status(
           fetched from the cloud provider or there are leaked nodes causing
           the node number larger than expected.
     """
+    if (managed_no_yaml_candidate is not None and
+            not _record_matches_managed_service_candidate(
+                record, managed_no_yaml_candidate)):
+        # A sweep nomination is admission authority for one exact managed
+        # service generation, never provider or cleanup authority for a
+        # same-name successor. Fence every path before inspecting its handle.
+        logger.debug(f'Ignoring stale ownerless-service nomination for cluster '
+                     f'{cluster_name!r}.')
+        return record
+
     handle = record['handle']
     status = record['status']
     if handle.cluster_yaml is None:
         if managed_no_yaml_candidate is not None:
-            # A sweep nomination is admission authority for one exact managed
-            # service generation, never deletion authority for a same-name
-            # successor. The caller validates workload type under the cluster
-            # lock; repeat the identity check here as defense in depth.
-            if (not managed_no_yaml_candidate.cluster_hash or
-                    not record.get('is_managed', False) or
-                    record.get('cluster_hash')
-                    != managed_no_yaml_candidate.cluster_hash):
-                logger.debug(f'Ignoring stale ownerless-service nomination for '
-                             f'cluster {cluster_name!r}.')
-                return record
             # Without the YAML, the provider cannot be queried, so deleting
             # the row would turn "unknown" into false absence and could hide a
             # live resource.
@@ -3740,13 +3750,21 @@ def _reload_record_if_refresh_fields_changed(
             record['autostop'] == refresh_fields.autostop and
             record['to_down'] == refresh_fields.to_down and
             record.get('cluster_hash') == refresh_fields.cluster_hash and
-            record.get('is_managed', False) == refresh_fields.is_managed):
+            record.get('is_managed', False) == refresh_fields.is_managed and
+            record.get('workload_type') == refresh_fields.workload_type):
         return record, refresh_fields
     record = global_user_state.get_cluster_from_name(
         cluster_name,
         include_user_info=include_user_info,
         summary_response=summary_response)
-    return record, refresh_fields
+    if record is None:
+        return None, None
+    # The plain snapshot can itself be superseded before this full read. Derive
+    # the admission fields from the full record that will actually be acted on.
+    return record, global_user_state.ClusterRefreshFields(
+        record['status'].name, record['status_updated_at'], record['autostop'],
+        record['to_down'], record.get('cluster_hash'),
+        record.get('is_managed', False), record.get('workload_type'))
 
 
 def _is_current_managed_no_yaml_candidate(
@@ -3878,16 +3896,15 @@ def refresh_cluster_record(
     with skypilot_config.local_active_workspace_ctx(workspace):
         if _managed_no_yaml_candidate is not None:
             # Reject an already-stale nomination before any cloud identity or
-            # lock work. Workload type is re-proved from the plain DB snapshot
-            # after the lock is acquired.
-            if (not _managed_no_yaml_candidate.cluster_hash or
-                    not record.get('is_managed', False) or
-                    record.get('cluster_hash')
-                    != _managed_no_yaml_candidate.cluster_hash):
+            # lock work. Re-prove the full identity after acquiring the lock.
+            if not _record_matches_managed_service_candidate(
+                    record, _managed_no_yaml_candidate):
                 return record
-        # check_owner_identity returns if the record handle is
-        # not a CloudVmRayResourceHandle
-        _check_owner_identity_with_record(cluster_name, record)
+        else:
+            # check_owner_identity returns if the record handle is
+            # not a CloudVmRayResourceHandle. Candidate refreshes defer this
+            # lookup until their generation is revalidated under the lock.
+            _check_owner_identity_with_record(cluster_name, record)
 
         # The loop logic allows us to notice if the status was updated in the
         # global_user_state by another process and stop trying to get the lock.
@@ -3913,6 +3930,7 @@ def refresh_cluster_record(
                     if not _is_current_managed_no_yaml_candidate(
                             refresh_fields, _managed_no_yaml_candidate):
                         return record
+                    _check_owner_identity_with_record(cluster_name, record)
                 return _update_cluster_status_with_resource_lock(
                     cluster_name, record, retry_if_missing, include_user_info,
                     summary_response, cluster_resource_lock_already_held,
@@ -3937,6 +3955,8 @@ def refresh_cluster_record(
                     if not _must_refresh_cluster_status(record,
                                                         force_refresh_statuses):
                         return record
+                    if _managed_no_yaml_candidate is not None:
+                        _check_owner_identity_with_record(cluster_name, record)
                     # Update and return the cluster status.
                     return _update_cluster_status_with_resource_lock(
                         cluster_name,
