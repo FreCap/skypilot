@@ -125,6 +125,26 @@ discovered independently for each model.
 Non-spot entries and cluster-backed clouds such as Kubernetes remain at their
 explicitly configured count. SkyPilot does not inspect those live cluster APIs
 to discover additional shapes.
+A fleet may contain only non-spot Kubernetes entries when each entry has one
+positive whole-number accelerator shape; in that case the placer uses those
+shapes as its complete zero-cost catalog. CPU-only, fractional, and compound
+accelerator entries remain unsupported in an all-nonspot catalog. Fresh
+free-capacity observations provide the measured admission budget, and
+unknown-capacity probes are balanced across the configured locations. In an
+all-Kubernetes catalog, a measured zero also receives only the bounded probe
+allowance: this lets a pod wait for a slot to return or lets a configured
+autoscaler grow from zero. It does not change Kubernetes priority or preemption
+policy. A mixed paid-fallback catalog continues to treat zero in a fixed pool
+as authoritative. No special 30-second timeout is required. Leave
+``kubernetes.provision_timeout`` unset to retain the ordinary single-pod
+10-second fallback-oriented baseline, or use ``provision_timeout: -1`` for
+reserved pools where each admitted, unscheduled pod should wait for an occupied
+slot to become free. The timeout does not limit startup after a pod is bound.
+Balancing is across a multi-backend demand wave, not a hedge for one replica;
+demand for at least two backends is required to initialize two contexts
+concurrently. If a large fleet starts with every GPU occupied but reclaimable,
+it grows in bounded reconciliation waves rather than admitting the full target
+at once.
 
 .. note::
 

@@ -1193,6 +1193,111 @@ class TestMixedValidation:
             serve_utils.validate_service_task(sky.Task.from_yaml_str(yaml_str),
                                               pool=False)
 
+    def _kubernetes_only_task(self,
+                              provision_timeout=None,
+                              first_shape='accelerators: A100-80GB:1',
+                              second_shape='accelerators: H200:1',
+                              placer='dynamic_fallback_per_gpu'):
+        import textwrap
+
+        import sky
+
+        def _shape_block(shape):
+            if shape is None:
+                return ''
+            return '\n' + textwrap.indent(shape, ' ' * 18)
+
+        first_shape_block = _shape_block(first_shape)
+        second_shape_block = _shape_block(second_shape)
+        timeout_override = ''
+        if provision_timeout is not None:
+            timeout_override = f"""
+                  _cluster_config_overrides:
+                    kubernetes:
+                      provision_timeout: {provision_timeout}"""
+        yaml_str = textwrap.dedent(f"""
+            resources:
+              ports: 8080
+              any_of:
+                - infra: k8s/prod_research_cluster_eks
+                  {first_shape_block}
+                  use_spot: false{timeout_override}
+                - infra: k8s/prod_research_cluster_eks
+                  {second_shape_block}
+                  use_spot: false{timeout_override}
+            service:
+              readiness_probe: /health
+              graceful_drain_async_occupancy: true
+              replica_policy:
+                min_replicas: 0
+                max_replicas: 2
+                target_concurrency_per_replica: 1
+                spot_placer: {placer}
+            run: echo hi
+            """)
+        return sky.Task.from_yaml_str(yaml_str)
+
+    def test_kubernetes_only_non_spot_placer_accepted(self):
+        from sky.serve import serve_utils
+
+        serve_utils.validate_service_task(self._kubernetes_only_task(),
+                                          pool=False)
+
+    def test_kubernetes_only_placer_accepts_finite_provisioning(self):
+        from sky.serve import serve_utils
+
+        serve_utils.validate_service_task(
+            self._kubernetes_only_task(provision_timeout=30), pool=False)
+
+    def test_kubernetes_only_placer_accepts_indefinite_provisioning(self):
+        from sky.serve import serve_utils
+
+        serve_utils.validate_service_task(
+            self._kubernetes_only_task(provision_timeout=-1), pool=False)
+
+    @pytest.mark.parametrize('invalid_shape', [None, 'accelerators: A100:0.5'])
+    def test_kubernetes_only_placer_rejects_unbudgetable_shape(
+            self, invalid_shape):
+        from sky.serve import serve_utils
+
+        task = self._kubernetes_only_task(first_shape=invalid_shape,
+                                          placer='dynamic_fallback')
+        with pytest.raises(ValueError,
+                           match='positive whole-number accelerator'):
+            serve_utils.validate_service_task(task, pool=False)
+
+    def test_kubernetes_only_placer_rejects_compound_accelerators_in_schema(
+            self):
+        from sky import exceptions
+
+        with pytest.raises(exceptions.InvalidSkyPilotConfigError,
+                           match='too many properties'):
+            self._kubernetes_only_task(
+                first_shape='accelerators:\n  A100: 1\n  H200: 1',
+                placer='dynamic_fallback')
+
+    def test_kubernetes_only_non_spot_pool_remains_unsupported(self):
+        import sky
+        from sky.serve import serve_utils
+
+        task = sky.Task.from_yaml_str("""
+            resources:
+              any_of:
+                - infra: k8s/prod_research_cluster_eks
+                  accelerators: A100-80GB:1
+                  use_spot: false
+                - infra: k8s/phx_research_cluster_eks
+                  accelerators: H200:1
+                  use_spot: false
+            pool:
+              workers: 2
+              spot_placer: dynamic_fallback
+            run: echo hi
+            """)
+
+        with pytest.raises(ValueError, match='requires at least one spot'):
+            serve_utils.validate_service_task(task, pool=True)
+
 
 class TestReservedFillPoolValidation:
     """validate_service_task groups accelerators per k8s context.

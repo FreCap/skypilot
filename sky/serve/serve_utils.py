@@ -1609,8 +1609,28 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
     # immutable service version is committed.
     spot_placer.SpotPlacer.validate_task(task.service, task)
 
+    requested_resources_list = list(task.resources)
+
+    def _is_non_spot_kubernetes_gpu_shape(resource: 'sky.Resources') -> bool:
+        accelerators = resource.accelerators or {}
+        if (resource.use_spot or str(resource.cloud).lower() != 'kubernetes' or
+                len(accelerators) != 1):
+            return False
+        count = next(iter(accelerators.values()))
+        return (not isinstance(count, bool) and isinstance(count,
+                                                           (int, float)) and
+                math.isfinite(float(count)) and float(count).is_integer() and
+                float(count) >= 1)
+
+    kubernetes_only_placement = (not pool and
+                                 task.service.placement_contract.enabled and
+                                 not spot_resources and
+                                 bool(requested_resources_list) and all(
+                                     _is_non_spot_kubernetes_gpu_shape(resource)
+                                     for resource in requested_resources_list))
+
     replica_ingress_port = resolve_replica_ingress_port(task, pool)
-    for requested_resources in task.resources:
+    for requested_resources in requested_resources_list:
         if (task.service.use_ondemand_fallback and
                 not requested_resources.use_spot):
             with ux_utils.print_exception_no_traceback():
@@ -1619,14 +1639,18 @@ def validate_service_task(task: 'sky.Task', pool: bool) -> None:
                     'for spot resources. Please explicitly specify '
                     '`use_spot: true` in resources for on-demand fallback.')
         if (task.service.placement_contract.enabled and
-                not requested_resources.use_spot and not spot_resources):
+                not requested_resources.use_spot and not spot_resources and
+                not kubernetes_only_placement):
             # Non-spot entries are fine under a placer as the reserved
-            # zero-cost tier of a mixed set — but a placer over a set with
-            # NO spot entry at all is a misconfiguration.
+            # zero-cost tier of a mixed set.  A Kubernetes-only set is also a
+            # valid zero-cost placement catalog.  Other all-on-demand sets do
+            # not have a capacity-fallback contract and remain invalid.
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(
                     '`spot_placer` requires at least one spot resource. '
-                    'Please specify `use_spot: true` on the cloud entries.')
+                    'Please specify `use_spot: true` on the cloud entries, or '
+                    'use only non-spot Kubernetes entries with one positive '
+                    'whole-number accelerator shape each.')
     if not pool and task.service.ports is None:
         task.service.set_ports(replica_ingress_port)
 
