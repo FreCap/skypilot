@@ -18,7 +18,7 @@ _PRESERVED_DOCKER_TEST_PATH = Path('tests/smoke_tests/docker')
 def _extract_process_source_run(dockerfile: Path) -> str:
     contents = dockerfile.read_text(encoding='utf-8')
     start_marker = 'RUN cd /skypilot && \\\n'
-    end_marker = '\n\n\n# Stage 3: Main image'
+    end_marker = '# Stage 3: Main image'
     start = contents.index(start_marker)
     end = contents.index(end_marker, start)
     instruction = contents[start + len('RUN '):end]
