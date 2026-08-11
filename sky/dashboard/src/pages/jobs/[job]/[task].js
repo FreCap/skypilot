@@ -199,11 +199,15 @@ function TaskDetails() {
             {/* Logs Section */}
             <div id="logs-section" className="mt-6">
               <Card>
-                <button
-                  onClick={() => setIsLogsExpanded(!currentIsLogsExpanded)}
-                  className="flex items-center justify-between w-full px-4 py-4 text-left focus:outline-none"
-                >
-                  <div className="flex items-center">
+                <div className="flex items-center justify-between w-full">
+                  <button
+                    type="button"
+                    aria-expanded={currentIsLogsExpanded}
+                    aria-controls="task-logs-content"
+                    aria-label={`Toggle task ${taskIndex} logs`}
+                    onClick={() => setIsLogsExpanded(!currentIsLogsExpanded)}
+                    className="flex min-w-0 flex-1 items-center px-4 py-4 text-left focus:outline-none"
+                  >
                     {currentIsLogsExpanded ? (
                       <ChevronDownIcon className="w-5 h-5 mr-2 text-gray-500" />
                     ) : (
@@ -213,14 +217,16 @@ function TaskDetails() {
                     <span className="ml-2 text-xs text-gray-500">
                       (Task {taskIndex} logs)
                     </span>
-                  </div>
+                  </button>
                   {currentIsLogsExpanded && (
-                    <div className="flex items-center space-x-3">
+                    <div className="flex items-center space-x-3 pr-4">
                       <Tooltip
                         content="Download task logs"
                         className="text-muted-foreground"
                       >
                         <button
+                          type="button"
+                          aria-label="Download task logs"
                           onClick={(e) => {
                             e.stopPropagation();
                             trackJobAction('download_logs', {
@@ -241,6 +247,8 @@ function TaskDetails() {
                         className="text-muted-foreground"
                       >
                         <button
+                          type="button"
+                          aria-label="Refresh task logs"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleLogsRefresh();
@@ -255,9 +263,9 @@ function TaskDetails() {
                       </Tooltip>
                     </div>
                   )}
-                </button>
+                </div>
                 {currentIsLogsExpanded && (
-                  <div className="p-4">
+                  <div id="task-logs-content" className="p-4">
                     <TaskLogsContent
                       key={routeKey}
                       taskData={taskData}
