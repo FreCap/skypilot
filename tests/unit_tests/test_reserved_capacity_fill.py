@@ -1842,6 +1842,32 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 self.east_pool,
             ])
 
+    def test_fill_precedes_blocking_ordinary_scale_up(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        leading_down = autoscalers.AutoscalerDecision(_SCALE_DOWN, 999)
+        logical_up = autoscalers.AutoscalerDecision(
+            _SCALE_UP,
+            autoscalers.LogicalScaleTarget(version=1,
+                                           reconcile_generation=1,
+                                           target_capacity=50,
+                                           launch_budget=50))
+
+        decisions = autoscaler._apply_reserved_capacity_fill(
+            [], [leading_down, logical_up])
+
+        # Preserve a leading retirement, but admit the already debit-aware
+        # zero-cost batch before a potentially long logical reconciliation.
+        self.assertEqual(decisions[0], leading_down)
+        self.assertEqual(decisions[-1], logical_up)
+        self.assertEqual(len(decisions[1:-1]), 4)
+        self.assertTrue(
+            all(
+                isinstance(decision.target, dict) and
+                decision.target.get(_FILL_KEY) for decision in decisions[1:-1]))
+
     def test_exact_measurement_selects_available_card_in_mixed_pool(self):
         mixed_l4 = make_location('phx-context',
                                  accelerators={'L4': 1},
