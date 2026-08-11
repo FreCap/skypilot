@@ -129,21 +129,32 @@ def _new_pool_job(engine, *, pool: str, status: ManagedJobStatus,
 def test_pool_query_facade_identity_signatures_and_pickle_lookup():
     """The historical state facade remains the public function owner."""
     expected_signatures = {
-        'get_pending_jobs_count_by_pool': '(pool: str) -> int',
-        'get_nonterminal_job_ids_by_pool': "(pool: str, cluster_name: str | None = None) -> list[int]",
-        'get_nonterminal_job_counts_by_pool': '(pool: str) -> dict[str, int]',
-        'get_nonterminal_job_status_counts_by_pool': '(pool: str) -> dict[str, int]',
-        'get_nonterminal_job_ids_by_pool_grouped': '(pool: str) -> dict[str | None, list[int]]',
-        'get_pool_worker_used_resources':
+        'get_pending_jobs_count_by_pool': ('(pool: str) -> int',),
+        'get_nonterminal_job_ids_by_pool':
+            ("(pool: str, cluster_name: str | None = None) -> list[int]",),
+        'get_nonterminal_job_counts_by_pool': ('(pool: str) -> dict[str, int]',
+                                              ),
+        'get_nonterminal_job_status_counts_by_pool':
+            ('(pool: str) -> dict[str, int]',),
+        'get_nonterminal_job_ids_by_pool_grouped':
+            ('(pool: str) -> dict[str | None, list[int]]',),
+        # Python 3.14 renders typing.Optional as a PEP 604 union. Both strings
+        # describe the same annotation and preserve the public contract.
+        'get_pool_worker_used_resources': (
             "(job_ids: set[int]) -> "
             "Optional[ForwardRef('resources_lib.Resources')]",
-        'get_pool_worker_used_resources_by_cluster': "(pool: str) -> dict[str | None, 'resources_lib.Resources'] | None",
+            "(job_ids: set[int]) -> "
+            "ForwardRef('resources_lib.Resources') | None",
+        ),
+        'get_pool_worker_used_resources_by_cluster':
+            ("(pool: str) -> dict[str | None, "
+             "'resources_lib.Resources'] | None",),
     }
 
     for function in _POOL_QUERY_PUBLIC_FUNCTIONS:
         assert function.__module__ == 'sky.jobs.state'
         assert function is getattr(state_pool_queries, function.__name__)
-        assert str(inspect.signature(function)) == expected_signatures[
+        assert str(inspect.signature(function)) in expected_signatures[
             function.__name__]
         assert pickle.loads(pickle.dumps(function)) is function
 
