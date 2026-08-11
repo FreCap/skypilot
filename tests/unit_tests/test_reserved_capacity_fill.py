@@ -2014,12 +2014,16 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
 
         # A transient empty publication is a hard rotation boundary even when
         # the next heartbeat restores the same pool keys, generation, and UIDs.
-        # The detached pre-removal wave must not recreate the cleared anchor.
+        # The detached pre-removal wave may retain valid decisions but must not
+        # recreate the cleared anchor. The caller's ordinary decision remains
+        # untouched.
+        ordinary = autoscalers.AutoscalerDecision(_SCALE_DOWN, 999)
         with mock.patch.object(autoscalers,
                                '_generate_scale_up_decisions',
                                side_effect=_remove_and_readd):
-            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+            decisions = autoscaler._apply_reserved_capacity_fill([], [ordinary])
 
+        self.assertEqual(decisions[0], ordinary)
         self.assertEqual([item.target[_POOL_KEY] for item in _ups(decisions)],
                          [self.east_pool, self.phx_pool])
         self.assertTrue(readded)
