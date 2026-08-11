@@ -407,6 +407,39 @@ class TestBackgroundDutyOwnershipLifecycle:
 
         mgr._probe_all_replicas.assert_not_called()
 
+    def test_ownership_loss_after_probe_skips_interval_spec_read(self):
+        mgr = self._stopped_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = threading.Event()
+        mgr._update_recovery_required = False
+        mgr._status_epoch_lock = threading.Lock()
+        mgr._status_epoch_generation = 0
+        mgr._tick_version_spec_cache = {}
+        mgr._service_name = 'svc'
+        mgr._update_mode = None
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+
+        def _finish_probe_after_ownership_loss():
+            mgr._ownership_lost.set()
+            return []
+
+        mgr._probe_all_replicas = mock.Mock(
+            side_effect=_finish_probe_after_ownership_loss)
+        interval_lookup = mock.Mock(
+            side_effect=AssertionError('stale prober read interval spec'))
+        mgr._get_endpoint_probe_interval_seconds = interval_lookup
+
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica'
+        ) as status_write:
+            mgr._replica_prober()
+
+        mgr._probe_all_replicas.assert_called_once_with()
+        status_write.assert_not_called()
+        interval_lookup.assert_not_called()
+        assert mgr._manager_daemon_stop.is_set()
+
     def test_delayed_job_result_cannot_mutate_after_update_recovery_fence(self):
         mgr = _make_manager()
         mgr._ownership_lost = threading.Event()

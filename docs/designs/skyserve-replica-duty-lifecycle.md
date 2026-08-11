@@ -22,6 +22,7 @@ In-flight work is left to its existing database and launch fences. Interrupting 
 | `sky/serve/replica_managers.py::_thread_pool_refresher` | no pool refresh starts after loss and its wait is interruptible | same focused file and command |
 | `sky/serve/replica_managers.py::_job_status_fetcher` | no status or SSH sweep starts after loss | same focused file and command |
 | `sky/serve/replica_managers.py::_replica_prober` | no probe or service-status write starts after loss | same focused file and command |
+| `sky/serve/replica_managers.py::_replica_prober` after an in-flight probe | terminal loss skips status reduction and the interval-spec database read | same focused file and command |
 | all three duties | active-owner call count and asymptotic cost stay unchanged; stale-owner work becomes zero | focused call-count assertions plus the SkyServe unit suite |
 | existing probe-round batching | an active owner still performs one fleet read and feeds that snapshot to the status update before its interruptible wait | `tests/unit_tests/test_probe_round_batching.py`; `pytest -q tests/unit_tests/test_probe_round_batching.py` |
 
