@@ -34,6 +34,7 @@ from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.provision import common as provision_common
+from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
 from sky.serve import placement_policy
 from sky.serve import replica_managers
@@ -2844,6 +2845,7 @@ class TestLaunchClusterRetry:
         launch_side_effect = kwargs.pop('launch_side_effect', None)
         terminate_side_effect = kwargs.pop('terminate_side_effect', None)
         cancel_side_effect = kwargs.pop('cancel_side_effect', None)
+        api_status_results = kwargs.pop('api_status_results', [])
         raised = None
         task = mock.MagicMock()
         resource = mock.MagicMock()
@@ -2856,14 +2858,30 @@ class TestLaunchClusterRetry:
              mock.patch('sky.serve.replica_managers.sdk') as mock_sdk, \
              mock.patch('sky.serve.replica_managers.terminate_cluster'
                        ) as mock_terminate, \
+             mock.patch.object(
+                 ordinary_launch_handoff,
+                 'observe_terminal_nonblocking') as mock_observe_terminal, \
              mock.patch('sky.serve.replica_managers.common_utils.Backoff'
                        ) as mock_backoff:
+
+            def _observe_terminal(request_id, *, lookup, emit):
+                status = lookup(request_id)
+                try:
+                    terminal_status = ordinary_launch_handoff.TerminalStatus(
+                        status)
+                except (TypeError, ValueError):
+                    return True
+                emit(terminal_status)
+                return True
+
+            mock_observe_terminal.side_effect = _observe_terminal
             mock_backoff.return_value.current_backoff.return_value = (
                 backoff_seconds)
             if terminate_side_effect is not None:
                 mock_terminate.side_effect = terminate_side_effect
             if cancel_side_effect is not None:
                 mock_sdk.api_cancel.side_effect = cancel_side_effect
+            mock_sdk.api_status.return_value = api_status_results
             if launch_side_effect is not None:
                 mock_sdk.launch.side_effect = launch_side_effect
             elif observed_workspaces is None:
@@ -2917,6 +2935,78 @@ class TestLaunchClusterRetry:
         assert mock_sdk.launch.call_count == 2
         assert sleeps == pytest.approx([0.1, 0.05])
         assert now == pytest.approx(0.15)
+
+    def test_ordinary_launch_events_follow_exact_request_result(self, tmp_path):
+        events = []
+        result_handle = object()
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [(17, result_handle)],
+            api_status_results=[
+                types.SimpleNamespace(request_id='request-id',
+                                      status='SUCCEEDED')
+            ],
+            ordinary_launch_event=lambda kind, request_id, job_id, status:
+            events.append((kind, request_id, job_id, status)))
+
+        assert raised is None
+        mock_sdk.api_status.assert_called_once_with(
+            request_ids=['request-id'],
+            fields=['request_id', 'status'],
+            _exact_request_ids=True,
+            _use_body=True)
+        assert events == [
+            (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, 'request-id',
+             None, None),
+            (ordinary_launch_handoff.EventKind.API_TERMINAL, 'request-id', None,
+             ordinary_launch_handoff.TerminalStatus.SUCCEEDED),
+            (ordinary_launch_handoff.EventKind.SERVICE_JOB_OBSERVED,
+             'request-id', 17, None),
+        ]
+
+    @pytest.mark.parametrize('status', ['SUCCEEDED', 'FAILED', 'CANCELLED'])
+    def test_stream_error_records_only_observed_terminal_status(
+            self, tmp_path, status):
+        events = []
+
+        _, _, raised = self._run_launch_cluster(
+            tmp_path, [RuntimeError('transport lost')],
+            max_retry=1,
+            api_status_results=[
+                types.SimpleNamespace(request_id='request-id', status=status)
+            ],
+            ordinary_launch_event=lambda kind, request_id, job_id,
+            terminal_status: events.append(
+                (kind, request_id, job_id, terminal_status)))
+
+        assert isinstance(raised, RuntimeError)
+        assert events == [
+            (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, 'request-id',
+             None, None),
+            (ordinary_launch_handoff.EventKind.API_TERMINAL, 'request-id', None,
+             ordinary_launch_handoff.TerminalStatus(status)),
+        ]
+
+    @pytest.mark.parametrize('api_status_results', [
+        [types.SimpleNamespace(request_id='request-id', status='RUNNING')],
+        [types.SimpleNamespace(request_id='different', status='FAILED')],
+        [],
+    ])
+    def test_transport_error_does_not_misclassify_nonterminal_or_inexact_status(
+            self, tmp_path, api_status_results):
+        events = []
+
+        _, _, raised = self._run_launch_cluster(
+            tmp_path, [RuntimeError('transport lost')],
+            max_retry=1,
+            api_status_results=api_status_results,
+            ordinary_launch_event=lambda kind, request_id, job_id,
+            terminal_status: events.append(
+                (kind, request_id, job_id, terminal_status)))
+
+        assert isinstance(raised, RuntimeError)
+        assert events == [(ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                           'request-id', None, None)]
 
     def test_retry_backoff_stops_on_cancellation(self, tmp_path):
         now = 0.0
