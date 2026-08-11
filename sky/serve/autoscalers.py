@@ -1005,16 +1005,28 @@ class Autoscaler:
             for pool_key, state in parsed.items():
                 raw_free = state.last_raw_free_slots or 0
                 prior = previous.get(pool_key)
-                if (prior is None or
-                        prior.service_generation != state.service_generation or
-                        prior.physical_cluster_uid
-                        != state.physical_cluster_uid):
-                    # A newly authorized generation gets no feed on its first
-                    # sample. The next exact-generation sample confirms the
+                same_pool_lineage = (
+                    prior is not None and
+                    prior.physical_cluster_uid == state.physical_cluster_uid and
+                    prior.service_generation <= state.service_generation)
+                if not same_pool_lineage:
+                    # A newly discovered/replaced pool gets no feed on its
+                    # first sample. The next observation confirms the
                     # increase, mirroring protocol-v1 two-poll damping.
                     state.free_slots = 0
                     state.last_raw_free_slots = raw_free
                 else:
+                    assert prior is not None
+                    # Service generations fence launch authority, not the
+                    # physical capacity observation. Demand/headroom changes
+                    # can advance the generation every poll; restarting the
+                    # two-poll damping on each advance would therefore keep a
+                    # continuously free pool at zero forever. Carry only the
+                    # pool-local damping memory across a forward generation.
+                    # The new state still carries the new generation, grant,
+                    # epoch, cap, and allowed locations, so no old launch
+                    # authority is reused. A removed edge has no `prior` on
+                    # re-add, and a replacement UID starts from zero above.
                     state.free_slots = prior.free_slots
                     previous_raw = prior.last_raw_free_slots
                     state.last_raw_free_slots = raw_free

@@ -1624,7 +1624,7 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
         self.assertIsNone(east_state.grant_epoch)
         self.assertEqual(phx_state.shelter_grant, 1)
         self.assertEqual(phx_state.grant, 1)
-        self.assertEqual(phx_state.free_slots, 0 if advance_generation else 1)
+        self.assertEqual(phx_state.free_slots, 1)
         self.assertEqual(phx_state.grant_epoch, 6)
 
         east_row = _replica(1, east.to_pickleable())
@@ -1641,9 +1641,10 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
             decision.target[_POOL_KEY] for decision in _ups(decisions) if
             isinstance(decision.target, dict) and decision.target.get(_FILL_KEY)
         ]
-        # A generation change restarts increase damping, so even the healthy
-        # pool needs a second matching observation before it may launch.
-        self.assertEqual(fill_pools, [] if advance_generation else [phx_pool])
+        # The healthy pool has two matching physical observations. A forward
+        # service-generation change replaces its launch authority but does not
+        # discard the pool-local observation used for increase damping.
+        self.assertEqual(fill_pools, [phx_pool])
 
     def test_failed_round_preserves_only_pool_local_shelter(self):
         self._assert_one_pool_round_failure_isolated(lock_timeout=False)
@@ -1973,24 +1974,58 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         # matter which context placement eventually selects.
         self.assertEqual(fill_by_pool, {east_h200_pool: 1, self.phx_pool: 1})
 
-    def test_generation_change_invalidates_old_feed_and_restarts_damping(self):
+    def test_generation_change_keeps_pool_observation_damping(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
+        snapshots = self._snapshots(generation=1)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertEqual([
+            decision for decision in _ups(_decisions(autoscaler, []))
+            if decision.target is not None
+        ], [])
+
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=2))
+        info = autoscaler.info()
+        self.assertEqual(
+            sum(pool['free_slots'] for pool in info['fill_by_pool'].values()),
+            4)
+        fill_ups = [
+            decision for decision in _ups(_decisions(autoscaler, []))
+            if decision.target is not None
+        ]
+        self.assertEqual(len(fill_ups), 4)
+        self.assertTrue(
+            all(decision.target[_GENERATION_KEY] == 2 for decision in fill_ups))
+
+    def test_generation_regression_restarts_pool_observation_damping(self):
+        autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
+        snapshots = self._snapshots(generation=2)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertEqual(
+            sum(pool['free_slots']
+                for pool in autoscaler.info()['fill_by_pool'].values()), 4)
+
+        autoscaler.collect_reserved_capacity_pools(
+            self._snapshots(generation=1))
+        self.assertEqual(
+            sum(pool['free_slots']
+                for pool in autoscaler.info()['fill_by_pool'].values()), 0)
+
+    def test_generation_advance_applies_capacity_decrease_immediately(self):
         autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
         snapshots = self._snapshots(generation=1)
         autoscaler.collect_reserved_capacity_pools(snapshots)
         autoscaler.collect_reserved_capacity_pools(snapshots)
         self.assertEqual(
-            len([
-                decision for decision in _ups(_decisions(autoscaler, []))
-                if decision.target is not None
-            ]), 4)
+            sum(pool['free_slots']
+                for pool in autoscaler.info()['fill_by_pool'].values()), 4)
 
         autoscaler.collect_reserved_capacity_pools(
-            self._snapshots(generation=2))
-        self.assertEqual([
-            decision for decision in _ups(_decisions(autoscaler, []))
-            if decision.target is not None
-        ], [])
-        self.assertEqual(autoscaler.info()['fill_free_slots'], 0)
+            self._snapshots(generation=2, east_feed=0, phx_feed=1))
+        self.assertEqual(
+            sum(pool['free_slots']
+                for pool in autoscaler.info()['fill_by_pool'].values()), 1)
 
     def test_live_snapshot_rejects_malformed_pool_authority(self):
         v1_pool = reserved_capacity_broker.make_pool_key('east-context', 'l4')
