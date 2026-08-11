@@ -5,6 +5,7 @@ events without waiting for PostgreSQL; neither a dropped event nor a writer
 failure can authorize, delay, cancel, retry, or project a replica launch.
 """
 
+from collections.abc import Callable
 import dataclasses
 import datetime
 import enum
@@ -13,7 +14,7 @@ import json
 import queue
 import re
 import threading
-from typing import Any, Callable
+from typing import Any
 import uuid
 
 import sqlalchemy

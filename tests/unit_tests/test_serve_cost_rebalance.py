@@ -745,6 +745,7 @@ class TestPinnedReplacementLaunch:
             'service_spec',
             'service_name',
             'workspace',
+            'ordinary_launch_event',
             'frozen_controller_config',
             'frozen_controller_config_path',
         }
