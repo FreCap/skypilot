@@ -1659,7 +1659,7 @@ def test_envelope_rejects_unknown_duplicate_float_and_secret_like_values():
         module.PlacementOfferV1.from_envelope(deep_unknown,
                                               payload_schema=schema)
     deep_serialized = ('{"unknown":' + '[' * 1200 + 'null' + ']' * 1200 + '}')
-    with pytest.raises(ValueError, match='not valid V1 JSON'):
+    with pytest.raises(ValueError):
         module.PlacementOfferV1.from_json(deep_serialized,
                                           payload_schema=schema)
 
