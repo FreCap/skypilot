@@ -452,6 +452,13 @@ class SkyServeController:
         self._lb_role_executor: concurrent.futures.ThreadPoolExecutor = (
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix='skyserve-ha-role'))
+        # Reuse one nested read pool for the Pod-list + Service-read fan-out
+        # inside get_lb_role_snapshot() instead of constructing two fresh
+        # worker threads for every heartbeat.
+        self._lb_role_snapshot_read_executor: (
+            concurrent.futures.ThreadPoolExecutor
+        ) = concurrent.futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix='skyserve-ha-role-snapshot')
         self._lb_session_ledger = (lb_ha.LbSessionLedger(
             serve_constants.LB_ROLE_REPORT_MAX_AGE_SECONDS,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
@@ -586,6 +593,8 @@ class SkyServeController:
             yield
         finally:
             self._lb_role_executor.shutdown(wait=False, cancel_futures=True)
+            self._lb_role_snapshot_read_executor.shutdown(wait=False,
+                                                          cancel_futures=True)
 
     def _seed_fill_zero_cost_locations(
             self, autoscaler: autoscalers.Autoscaler) -> None:
@@ -2091,9 +2100,9 @@ class SkyServeController:
                     timings['kubernetes_role_snapshot_executor_queue'] = max(
                         0.0,
                         time.monotonic() - submitted_at)
-                    return lb_k8s.get_lb_role_snapshot(self._service_name,
-                                                       fence, state, owner,
-                                                       timings)
+                    return lb_k8s.get_lb_role_snapshot(
+                        self._service_name, fence, state, owner, timings,
+                        self._lb_role_snapshot_read_executor)
 
                 try:
                     snapshot = await asyncio.wait_for(
@@ -2305,7 +2314,8 @@ class SkyServeController:
                     snapshot = await trace.run_in_executor(
                         loop, 'kubernetes_role_snapshot',
                         lb_k8s.get_lb_role_snapshot, self._service_name, fence,
-                        state, database_snapshot.owner, snapshot_timings)
+                        state, database_snapshot.owner, snapshot_timings,
+                        self._lb_role_snapshot_read_executor)
                 except lb_k8s.LbRoleSnapshotStateMismatchError:
                     trace.add_phases(snapshot_timings)
                     return role_response(
