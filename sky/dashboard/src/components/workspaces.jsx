@@ -301,8 +301,11 @@ export function Workspaces() {
 
   // Fetch clusters independently and update state progressively
   const fetchClustersData = useCallback(
-    async (workspaceNames, isCurrentRequest) => {
+    async (workspaceNames, isCurrentRequest, forceFresh = false) => {
       try {
+        if (forceFresh) {
+          dashboardCache.invalidate(getClusters);
+        }
         const allClusters = await dashboardCache.get(getClusters);
         if (!isCurrentRequest()) return;
 
@@ -364,11 +367,13 @@ export function Workspaces() {
 
   // Fetch jobs independently and update state progressively
   const fetchJobsData = useCallback(
-    async (workspaceNames, isCurrentRequest) => {
+    async (workspaceNames, isCurrentRequest, forceFresh = false) => {
       try {
-        const allJobsData = await dashboardCache.get(getManagedJobs, [
-          { allUsers: true, skipFinished: true },
-        ]);
+        const jobsArgs = [{ allUsers: true, skipFinished: true }];
+        if (forceFresh) {
+          dashboardCache.invalidate(getManagedJobs, jobsArgs);
+        }
+        const allJobsData = await dashboardCache.get(getManagedJobs, jobsArgs);
         if (!isCurrentRequest()) return;
         const jobs = allJobsData?.jobs || [];
 
@@ -420,7 +425,11 @@ export function Workspaces() {
 
   const fetchData = useCallback(
     async (options = {}) => {
-      const { showLoadingIndicators = true, supersede = false } = options;
+      const {
+        showLoadingIndicators = true,
+        supersede = false,
+        forceFresh = false,
+      } = options;
       if (!supersede && activeRequestRef.current) {
         return activeRequestRef.current;
       }
@@ -439,6 +448,9 @@ export function Workspaces() {
 
         try {
           // First, get the list of workspaces the user has access to
+          if (forceFresh) {
+            dashboardCache.invalidate(getWorkspaces);
+          }
           const fetchedWorkspacesConfig =
             await dashboardCache.get(getWorkspaces);
           if (!isCurrentRequest()) return false;
@@ -448,9 +460,17 @@ export function Workspaces() {
           // Fetch enabledClouds for all workspaces in a single batch request
           let enabledCloudsMap = {};
           try {
-            enabledCloudsMap = await dashboardCache.get(getEnabledCloudsBatch, [
-              configuredWorkspaceNames,
-            ]);
+            const enabledCloudsArgs = [configuredWorkspaceNames];
+            if (forceFresh) {
+              dashboardCache.invalidate(
+                getEnabledCloudsBatch,
+                enabledCloudsArgs
+              );
+            }
+            enabledCloudsMap = await dashboardCache.get(
+              getEnabledCloudsBatch,
+              enabledCloudsArgs
+            );
           } catch (error) {
             if (isCurrentRequest()) {
               console.error('Error fetching enabled clouds batch:', error);
@@ -483,11 +503,13 @@ export function Workspaces() {
           // Launch clusters and jobs fetches in parallel.
           const clustersPromise = fetchClustersData(
             configuredWorkspaceNames,
-            isCurrentRequest
+            isCurrentRequest,
+            forceFresh
           );
           const jobsPromise = fetchJobsData(
             configuredWorkspaceNames,
-            isCurrentRequest
+            isCurrentRequest,
+            forceFresh
           );
 
           // Wait for both to complete (errors are handled inside each function).
@@ -557,6 +579,7 @@ export function Workspaces() {
       void fetchData({
         showLoadingIndicators: false,
         supersede: refreshSource === 'visibilitychange',
+        forceFresh: refreshSource === 'visibilitychange',
       });
     },
     [fetchData]
