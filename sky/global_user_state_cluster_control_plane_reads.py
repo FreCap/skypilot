@@ -29,6 +29,7 @@ def _query_fields(cluster_table: sqlalchemy.Table) -> list[Any]:
         cluster_table.c.config_hash,
         cluster_table.c.workspace,
         cluster_table.c.is_managed,
+        cluster_table.c.workload_type,
     ]
 
 
@@ -52,6 +53,7 @@ def _project_summary_record(
         'status_updated_at': row.status_updated_at,
         'workspace': row.workspace,
         'is_managed': bool(row.is_managed),
+        'workload_type': row.workload_type,
         'config_hash': row.config_hash,
     }
 
