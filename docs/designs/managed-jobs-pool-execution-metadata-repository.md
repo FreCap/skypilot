@@ -139,3 +139,40 @@ relevant checks must pass on the exact final head.
 This is an internal structural extraction with a stable facade and no data
 migration.  Rollback is a normal revert that moves the functions back into
 `sky.jobs.state`.
+
+## Validation evidence
+
+The three characterization tests passed before and after movement.  They cover
+all nine public functions, direct facade identity, signatures, pickle lookup,
+wrapped retry identity, missing rows, no-op writes, locked node-lineage merge,
+selected resource storage, sync and async parity, and exact SQL statement
+budgets.  All nine moved function ASTs are identical to
+`origin/improvements`.
+
+The changed-path matrix collected and passed 332 tests across managed-job
+state, sync and async parity, scheduler, controller, recovery strategy, job
+utilities, debug dump, SkyServe pool scheduling, and pool resource accounting.
+One additional PostgreSQL pool-resource test could not create its local
+container because the Docker API returned HTTP 500; its body did not run and
+the unfiltered cloud Unit Tests job remains mandatory.  Fifty-seven managed-job
+smoke cases collected successfully for remote integration coverage.
+
+The repository formatter passed with full mypy over 897 files, Pylint 10.00,
+dashboard lint, and dashboard format.  Ruff, import-linter, compilation, both
+module import orders, pickle probes, and diff checks pass.  BasedPyright 1.39.9
+reports zero diagnostics for the extracted module and characterization file.
+The exact Python 3.14 baseline remains mapped to cloud CI because the local
+Python 3.11 dependency environment produces unrelated baseline drift.  A clean
+Python 3.14 environment built all 220 documentation sources and validated the
+generated `llms.txt`.
+
+The GitHub Python and static-analysis workflows target `improvements` without
+path filters.  Unit Tests cover the new characterization and PostgreSQL case;
+Jobs and API Tests cover async versus sync parity; format, mypy, Pylint, Ruff,
+BasedPyright, import-linter, and documentation jobs cover the remaining paths.
+
+Twelve alternating cold-import samples changed the median from 744.651 ms to
+750.205 ms, a 0.746 percent increase.  Seven alternating SQLite submit-context
+samples changed the median from 55.438 us to 56.395 us, a 1.728 percent
+increase.  Both are within local timing noise; function ASTs and one-query
+budgets are unchanged, and direct aliases add no runtime frame.

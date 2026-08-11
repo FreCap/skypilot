@@ -1,4 +1,5 @@
 """Characterization tests for managed-job pool execution metadata."""
+# pylint: disable=protected-access,redefined-outer-name
 
 import asyncio
 import contextlib
@@ -16,6 +17,7 @@ from sqlalchemy import orm
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import state_pool_execution
 from sky.jobs.status_types import ManagedJobStatus
 
 
@@ -25,7 +27,7 @@ def managed_jobs_db(tmp_path, monkeypatch):
     db_path = tmp_path / 'managed_jobs.db'
     engine = create_engine(f'sqlite:///{db_path}')
     async_engine = create_async_engine(f'sqlite+aiosqlite:///{db_path}',
-                                        connect_args={'timeout': 30})
+                                       connect_args={'timeout': 30})
 
     @contextlib.contextmanager
     def _tmp_db_lock(_section: str):
@@ -89,27 +91,21 @@ def _new_pool_job(engine,
 def test_pool_execution_metadata_public_contract():
     expected_signatures = {
         'get_pool_from_job_id': '(job_id: int) -> str | None',
-        'get_pool_and_current_cluster_name':
-            '(job_id: int) -> tuple[str | None, str | None]',
-        'get_pool_and_execution_from_job_id_async':
-            '(job_id: int) -> tuple[str | None, str | None]',
-        'set_current_cluster_name':
-            '(job_id: int, current_cluster_name: str) -> None',
+        'get_pool_and_current_cluster_name': '(job_id: int) -> tuple[str | None, str | None]',
+        'get_pool_and_execution_from_job_id_async': '(job_id: int) -> tuple[str | None, str | None]',
+        'set_current_cluster_name': '(job_id: int, current_cluster_name: str) -> None',
         'set_job_infra':
             '(job_id: int, cloud: str | None = None, region: str | None = '
             'None, zone: str | None = None, current_node_names: list[str] | '
             'None = None) -> None',
-        'update_job_full_resources':
-            '(job_id: int, full_resources_json: dict[str, typing.Any]) -> None',
-        'set_job_id_on_pool_cluster_async':
-            '(job_id: int, job_id_on_pool_cluster: int) -> None',
-        'get_pool_submit_info':
-            '(job_id: int) -> tuple[str | None, int | None]',
-        'get_pool_submit_info_async':
-            '(job_id: int) -> tuple[str | None, int | None]',
+        'update_job_full_resources': '(job_id: int, full_resources_json: dict[str, typing.Any]) -> None',
+        'set_job_id_on_pool_cluster_async': '(job_id: int, job_id_on_pool_cluster: int) -> None',
+        'get_pool_submit_info': '(job_id: int) -> tuple[str | None, int | None]',
+        'get_pool_submit_info_async': '(job_id: int) -> tuple[str | None, int | None]',
     }
     for name, expected_signature in expected_signatures.items():
         function = getattr(state, name)
+        assert function is getattr(state_pool_execution, name)
         assert function.__name__ == name
         assert function.__module__ == 'sky.jobs.state'
         assert str(inspect.signature(function)) == expected_signature
@@ -140,12 +136,12 @@ async def test_pool_execution_metadata_round_trip_and_query_budgets(
 
     with _count_sql_statements(engine) as counts:
         assert state.get_pool_and_current_cluster_name(job_id) == ('pool-a',
-                                                                  None)
+                                                                   None)
     assert counts['n'] == 1
 
     with _count_sql_statements(async_engine.sync_engine) as counts:
-        assert await state.get_pool_and_execution_from_job_id_async(
-            job_id) == ('pool-a', 'parallel')
+        assert await state.get_pool_and_execution_from_job_id_async(job_id) == (
+            'pool-a', 'parallel')
     assert counts['n'] == 1
 
     with _count_sql_statements(engine) as counts:
@@ -161,8 +157,7 @@ async def test_pool_execution_metadata_round_trip_and_query_budgets(
     assert counts['n'] == 2
 
     with _count_sql_statements(engine) as counts:
-        state.set_job_infra(job_id,
-                            current_node_names=['head-b', 'worker-a'])
+        state.set_job_infra(job_id, current_node_names=['head-b', 'worker-a'])
     assert counts['n'] == 2
 
     resources: dict[str, Any] = {'cloud': 'aws', 'accelerators': {'A10G': 1}}
@@ -198,7 +193,7 @@ async def test_pool_execution_metadata_round_trip_and_query_budgets(
 
     assert job_row[:3] == ('AWS', 'us-east-1', 'us-east-1a')
     assert json.loads(job_row.node_names) == [['head-a', 'head-b'],
-                                             ['worker-a']]
+                                              ['worker-a']]
     assert full_resources == resources
 
 
@@ -214,12 +209,12 @@ async def test_pool_execution_metadata_missing_rows_and_noop_update(
 
     assert state.get_pool_from_job_id(missing_job_id) is None
     assert state.get_pool_and_current_cluster_name(missing_job_id) == (None,
-                                                                      None)
-    assert await state.get_pool_and_execution_from_job_id_async(
-        missing_job_id) == (None, None)
+                                                                       None)
+    assert await state.get_pool_and_execution_from_job_id_async(missing_job_id
+                                                               ) == (None, None)
     assert state.get_pool_submit_info(missing_job_id) == (None, None)
 
     with _count_sql_statements(async_engine.sync_engine) as counts:
         assert await state.get_pool_submit_info_async(missing_job_id) == (None,
-                                                                         None)
+                                                                          None)
     assert counts['n'] == 1
