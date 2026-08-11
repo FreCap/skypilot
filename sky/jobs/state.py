@@ -20,6 +20,7 @@ from sky.adaptors import common as adaptors_common
 from sky.jobs import batch_state
 from sky.jobs import state_api_access_tokens
 from sky.jobs import state_events
+from sky.jobs import state_file_mount_blobs
 from sky.jobs import state_log_cleanup
 from sky.jobs import state_pool_execution
 from sky.jobs import state_pool_queries
@@ -1600,34 +1601,8 @@ _map_response_field_to_db_column = (
 # pylint: enable=protected-access
 get_managed_jobs_total = state_queries.get_managed_jobs_total
 
-
-def get_active_file_mounts_blob_ids() -> set[str]:
-    """Return blob ids referenced by jobs still in a non-terminal state.
-
-    Used by the API server's blob GC so that a blob is not reclaimed while
-    any managed job (including queued / recovering / winding-down jobs) still
-    needs its contents.
-    """
-    engine = _db_manager.get_engine()
-    terminal_status_values = [
-        s.value for s in ManagedJobStatus.terminal_statuses()
-    ]
-    non_terminal_job_ids_subquery = (sqlalchemy.select(
-        spot_table.c.spot_job_id).where(
-            sqlalchemy.or_(
-                spot_table.c.status.is_(None),
-                sqlalchemy.not_(
-                    spot_table.c.status.in_(terminal_status_values)),
-            )).distinct())
-    query = sqlalchemy.select(
-        job_info_table.c.file_mounts_blob_id).distinct().where(
-            sqlalchemy.and_(
-                job_info_table.c.file_mounts_blob_id.is_not(None),
-                job_info_table.c.spot_job_id.in_(non_terminal_job_ids_subquery),
-            ))
-    with orm.Session(engine) as session:
-        rows = session.execute(query).fetchall()
-    return {row[0] for row in rows if row[0] is not None}
+get_active_file_mounts_blob_ids = (
+    state_file_mount_blobs.get_active_file_mounts_blob_ids)
 
 
 def get_managed_jobs_highest_priority() -> int:
@@ -2181,17 +2156,8 @@ def get_workspace(job_id: int) -> str:
         return job_workspace
 
 
-@db_retries.retry_async
-async def get_file_mounts_blob_id_async(job_id: int) -> str | None:
-    """Return the file_mounts_blob_id persisted for a job, if any."""
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        row = (await session.execute(
-            sqlalchemy.select(job_info_table.c.file_mounts_blob_id).where(
-                job_info_table.c.spot_job_id == job_id))).fetchone()
-        if row is None:
-            return None
-        return row[0]
+get_file_mounts_blob_id_async = (
+    state_file_mount_blobs.get_file_mounts_blob_id_async)
 
 
 @db_retries.retry_async
