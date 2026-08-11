@@ -466,6 +466,10 @@ class Autoscaler:
         # pool in configured order. Identity (rather than an actionable-list
         # index) keeps rotation stable as other pools become actionable.
         self._fill_pool_last_started_key: str | None = None
+        # Fences a detached decision wave from mutating a replacement ordered
+        # pool map after membership, ordering, or an explicit lifecycle reset.
+        # Same-order feed refreshes deliberately retain the revision.
+        self._fill_pool_order_revision = 0
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
         self.cost_rebalance: bool = bool(spec.cost_rebalance)
@@ -650,6 +654,7 @@ class Autoscaler:
                                                    pool_state.edge_cap)
                     pool_state.grant = 0
                     pool_state.grant_epoch = None
+            self._fill_pool_order_revision += 1
             self._refresh_legacy_fill_projection_locked()
         self.cost_rebalance = bool(spec.cost_rebalance)
         self.cost_rebalance_min_savings_fraction = float(
@@ -779,6 +784,7 @@ class Autoscaler:
             with self._fill_pool_state_lock:
                 self._fill_pool_states = {}
                 self._fill_pool_last_started_key = None
+                self._fill_pool_order_revision += 1
         free_slots = max(0, int(free_slots))
         prev_raw = self._fill_last_raw_free_slots
         self._fill_last_raw_free_slots = free_slots
@@ -1044,6 +1050,8 @@ class Autoscaler:
                           previous_raw > state.free_slots):
                         state.free_slots = min(previous_raw, raw_free)
                 state.free_slots = min(state.free_slots, state.edge_cap)
+            if tuple(previous) != tuple(parsed):
+                self._fill_pool_order_revision += 1
             self._fill_pool_states = parsed
             if self._fill_pool_last_started_key not in parsed:
                 self._fill_pool_last_started_key = None
@@ -1094,11 +1102,16 @@ class Autoscaler:
         self._fill_grant_pool_key = None
 
     def _pool_fill_states_snapshot(self) -> dict[str, _PoolFillState]:
+        states, _ = self._pool_fill_states_snapshot_with_order_revision()
+        return states
+
+    def _pool_fill_states_snapshot_with_order_revision(
+            self) -> tuple[dict[str, _PoolFillState], int]:
         with self._fill_pool_state_lock:
-            return {
+            return ({
                 key: state.detached_copy()
                 for key, state in self._fill_pool_states.items()
-            }
+            }, self._fill_pool_order_revision)
 
     def get_reserved_capacity_pool_shelter_grant(self, pool_key: str, *,
                                                  service_generation: int,
@@ -1688,6 +1701,7 @@ class Autoscaler:
         replica_infos: list['replica_managers.ReplicaInfo'],
         decisions: list[AutoscalerDecision],
         states: dict[str, _PoolFillState],
+        pool_order_revision: int,
     ) -> list[AutoscalerDecision]:
         """Apply independently fenced pool feeds under one service ceiling."""
         if not states:
@@ -2031,33 +2045,34 @@ class Autoscaler:
 
         if first_emitted_key is not None:
             with self._fill_pool_state_lock:
-                for key, emitted in emitted_by_pool.items():
-                    if emitted <= 0:
-                        continue
-                    live = self._fill_pool_states.get(key)
-                    source = states[key]
-                    if (live is None or live.service_generation
-                            != source.service_generation):
-                        continue
-                    live.free_slots = max(0, live.free_slots - emitted)
-                    if live.last_raw_free_slots is not None:
-                        live.last_raw_free_slots = max(
-                            0, live.last_raw_free_slots - emitted)
-                    if live.free_slots_by_accelerator is not None:
-                        for card, card_emitted in emitted_by_pool_card[
-                                key].items():
-                            live.free_slots_by_accelerator[card] = max(
-                                0,
-                                live.free_slots_by_accelerator.get(card, 0) -
-                                card_emitted)
-                first_live = self._fill_pool_states.get(first_emitted_key)
-                first_source = states[first_emitted_key]
-                if (first_live is not None and first_live.service_generation
-                        == first_source.service_generation and
-                        first_live.physical_cluster_uid
-                        == first_source.physical_cluster_uid):
-                    self._fill_pool_last_started_key = first_emitted_key
-                self._refresh_legacy_fill_projection_locked()
+                if self._fill_pool_order_revision == pool_order_revision:
+                    for key, emitted in emitted_by_pool.items():
+                        if emitted <= 0:
+                            continue
+                        live = self._fill_pool_states.get(key)
+                        source = states[key]
+                        if (live is None or live.service_generation
+                                != source.service_generation):
+                            continue
+                        live.free_slots = max(0, live.free_slots - emitted)
+                        if live.last_raw_free_slots is not None:
+                            live.last_raw_free_slots = max(
+                                0, live.last_raw_free_slots - emitted)
+                        if live.free_slots_by_accelerator is not None:
+                            for card, card_emitted in emitted_by_pool_card[
+                                    key].items():
+                                live.free_slots_by_accelerator[card] = max(
+                                    0,
+                                    live.free_slots_by_accelerator.get(card, 0)
+                                    - card_emitted)
+                    first_live = self._fill_pool_states.get(first_emitted_key)
+                    first_source = states[first_emitted_key]
+                    if (first_live is not None and first_live.service_generation
+                            == first_source.service_generation and
+                            first_live.physical_cluster_uid
+                            == first_source.physical_cluster_uid):
+                        self._fill_pool_last_started_key = first_emitted_key
+                    self._refresh_legacy_fill_projection_locked()
 
             # Reserved fill is computed after ordinary decisions so the
             # conservative exact-card debits above can account for every
@@ -2115,10 +2130,11 @@ class Autoscaler:
         """
         if not self.reserved_capacity_fill:
             return decisions
-        pool_states = self._pool_fill_states_snapshot()
+        (pool_states, pool_order_revision) = (
+            self._pool_fill_states_snapshot_with_order_revision())
         if pool_states:
             return self._apply_reserved_capacity_fill_v2(
-                replica_infos, decisions, pool_states)
+                replica_infos, decisions, pool_states, pool_order_revision)
         # Zero-cost accounting is version-asymmetric by design; the
         # four roles use different version scopes:
         # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
@@ -3087,6 +3103,7 @@ class Autoscaler:
         fill_state = dynamic_states.pop('reserved_capacity_fill_state', None)
         with self._fill_pool_state_lock:
             self._fill_pool_last_started_key = None
+            self._fill_pool_order_revision += 1
         if fill_state is not None and self.reserved_capacity_fill:
             broker_authority = bool(fill_state.get('broker_authority', True))
             self._fill_free_slots = (0 if broker_authority else max(

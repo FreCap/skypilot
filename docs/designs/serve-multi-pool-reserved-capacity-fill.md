@@ -301,7 +301,11 @@ removal, protocol demotion, fill disablement, a malformed or unknown anchor,
 and a full controller restart reset it.  Thus a continuously running controller
 gives every continuously actionable pool a first-admission opportunity within
 at most one emitted wave per pool in the validated map, without adding provider
-or database calls; ordering remains linear in the number of pools.
+or database calls; ordering remains linear in the number of pools.  A detached
+decision wave also captures the ordered-map revision.  If pool membership or
+ordering changes, or a lifecycle reset removes and then re-adds the same pool
+identity, the stale wave may neither debit the replacement feed nor recreate
+the cleared rotation anchor.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that

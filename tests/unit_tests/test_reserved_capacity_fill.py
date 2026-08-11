@@ -1993,6 +1993,45 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
             }, {2})
         self.assertIsNone(autoscaler._fill_pool_last_started_key)
 
+    def test_same_identity_readd_cannot_restore_rotation_anchor(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        original_generate = autoscalers._generate_scale_up_decisions
+        readded = False
+
+        def _remove_and_readd(num, target):
+            nonlocal readded
+            if not readded:
+                readded = True
+                autoscaler.collect_reserved_capacity_pools({})
+                autoscaler.collect_reserved_capacity_pools(snapshots)
+                autoscaler.collect_reserved_capacity_pools(snapshots)
+                self.assertIsNone(autoscaler._fill_pool_last_started_key)
+            return original_generate(num, target)
+
+        # A transient empty publication is a hard rotation boundary even when
+        # the next heartbeat restores the same pool keys, generation, and UIDs.
+        # The detached pre-removal wave must not recreate the cleared anchor.
+        with mock.patch.object(autoscalers,
+                               '_generate_scale_up_decisions',
+                               side_effect=_remove_and_readd):
+            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+
+        self.assertTrue(_ups(decisions))
+        self.assertTrue(readded)
+        self.assertEqual(set(autoscaler._fill_pool_states), set(snapshots))
+        self.assertEqual(
+            {
+                key: state.free_slots
+                for key, state in autoscaler._fill_pool_states.items()
+            }, {
+                self.east_pool: 1,
+                self.phx_pool: 1,
+            })
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
     def test_rotation_anchor_survives_valid_dynamic_restore(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=4)
         snapshots = self._snapshots()
