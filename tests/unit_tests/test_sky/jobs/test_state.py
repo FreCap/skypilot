@@ -6,6 +6,7 @@ import contextlib
 import inspect
 import pickle
 import time
+import types
 
 import filelock
 import pytest
@@ -15,6 +16,7 @@ from sqlalchemy import orm
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import state_api_access_tokens
 from sky.jobs import state_log_cleanup
 from sky.jobs import state_task_lookups
 from sky.jobs.state import ManagedJobStatus
@@ -89,6 +91,24 @@ def test_log_cleanup_metadata_public_contract():
         assert function.__module__ == 'sky.jobs.state'
         assert str(inspect.signature(function)) == expected_signature
         assert pickle.loads(pickle.dumps(function)) is function
+
+
+def test_api_access_token_repository_public_contract():
+    expected_signatures = {
+        'set_api_access_token_ids': '(job_ids: list[int], token_id: str) -> None',
+        'get_releasable_api_access_token_id': '(job_id: int) -> str | None',
+    }
+    for name, expected_signature in expected_signatures.items():
+        function = getattr(state, name)
+        assert function is getattr(state_api_access_tokens, name)
+        assert function.__name__ == name
+        assert function.__module__ == 'sky.jobs.state'
+        assert str(inspect.signature(function)) == expected_signature
+        assert pickle.loads(pickle.dumps(function)) is function
+
+    releasable = state.get_releasable_api_access_token_id
+    assert releasable.__wrapped__.__name__ == releasable.__name__
+    assert releasable.__wrapped__.__module__ == 'sky.jobs.state'
 
 
 @pytest.fixture
@@ -629,6 +649,42 @@ def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
         (2, 'shared-token'),
         (3, 'replacement-token'),
     ]
+
+
+def test_set_api_access_token_ids_compiles_postgresql_upsert(monkeypatch):
+    engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+        name='postgresql'))
+    statements = []
+    commits = []
+
+    class _Session:
+        """Capture PostgreSQL statements without opening a connection."""
+
+        def __init__(self, session_engine):
+            assert session_engine is engine
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del exc_type, exc_value, traceback
+
+        def execute(self, statement):
+            statements.append(statement)
+
+        def commit(self):
+            commits.append(True)
+
+    monkeypatch.setattr(state_api_access_tokens._db_manager, 'get_engine',
+                        lambda: engine)
+    monkeypatch.setattr(state_api_access_tokens.orm, 'Session', _Session)
+
+    state.set_api_access_token_ids([2, 1, 2], 'shared-token')
+
+    assert len(statements) == 1
+    sql = str(statements[0].compile(dialect=state.postgresql.dialect()))
+    assert 'ON CONFLICT (job_id) DO UPDATE' in sql
+    assert commits == [True]
 
 
 def test_set_api_access_token_ids_empty_input_uses_no_query(
