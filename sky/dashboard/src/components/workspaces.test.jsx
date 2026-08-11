@@ -608,6 +608,7 @@ describe('Workspaces request lifecycle', () => {
         await Promise.resolve();
       });
       await waitFor(() => expect(callsFor(getWorkspaces)).toHaveLength(3));
+      expect(dashboardCache.invalidate).toHaveBeenCalledWith(getWorkspaces);
 
       await act(async () => {
         staleRefresh.resolve({ beta: {} });
@@ -622,6 +623,29 @@ describe('Workspaces request lifecycle', () => {
       });
       await screen.findByText('gamma');
       expect(screen.queryByText('beta')).not.toBeInTheDocument();
+      expect(dashboardCache.invalidate).toHaveBeenCalledTimes(4);
+      expect(dashboardCache.invalidate).toHaveBeenCalledWith(getClusters);
+      expect(dashboardCache.invalidate).toHaveBeenCalledWith(
+        getEnabledCloudsBatch,
+        [['gamma']]
+      );
+      expect(dashboardCache.invalidate).toHaveBeenCalledWith(getManagedJobs, [
+        { allUsers: true, skipFinished: true },
+      ]);
+      expect(dashboardCache.invalidateFunction).not.toHaveBeenCalled();
+      const lastGetOrderFor = (fetcher) =>
+        Math.max(
+          ...dashboardCache.get.mock.calls.flatMap(([candidate], index) =>
+            candidate === fetcher
+              ? [dashboardCache.get.mock.invocationCallOrder[index]]
+              : []
+          )
+        );
+      dashboardCache.invalidate.mock.calls.forEach(([fetcher], index) => {
+        expect(
+          dashboardCache.invalidate.mock.invocationCallOrder[index]
+        ).toBeLessThan(lastGetOrderFor(fetcher));
+      });
     } finally {
       if (mounted) {
         unmount();
