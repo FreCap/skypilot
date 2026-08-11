@@ -24,6 +24,7 @@ from sky import optimizer
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.container_images import consumers as container_image_consumers
@@ -57,6 +58,9 @@ if typing.TYPE_CHECKING:
     from sky import resources as resources_lib
 
 logger = sky_logging.init_logger(__name__)
+
+ordinary_launch_request = adaptors_common.LazyImport(
+    'sky.server.requests.ordinary_launch')
 
 # Keep the historical sky.execution callable identities while the launch-time
 # policy implementation lives in its own module.
@@ -335,9 +339,26 @@ def _execute(
         _extra_launch_context,
         is_launched_by_sky_serve_controller=_is_launched_by_sky_serve_controller
     )
+    has_bound_ordinary_launch_context = (
+        ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
+            _extra_launch_context))
+    if has_bound_ordinary_launch_context:
+        if (not _is_launched_by_sky_serve_controller or
+                reserved_fill_launch_fence is not None):
+            raise exceptions.RequestCancelled(
+                'Bound ordinary launch authority is restricted to a '
+                'non-reserved SkyServe request.')
+        # Bound requests deliberately replace mutable PID/IP routing metadata
+        # with fail-closed sentinels.  Parse their complete immutable context
+        # here, then let the request-claim/association fence authorize the
+        # provider tail; the legacy PID/IP validator cannot represent an
+        # owner-epoch takeover and would reject every valid bound request.
+        ordinary_launch_request._validate_bound_entrypoint_context(  # pylint: disable=protected-access
+            _extra_launch_context)
     has_launch_fence = any(key in _extra_launch_context
                            for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS)
-    if (_is_launched_by_sky_serve_controller and
+    if (not has_bound_ordinary_launch_context and
+            _is_launched_by_sky_serve_controller and
         (has_launch_fence or reserved_fill_launch_fence is not None or
          serve_utils.is_external_load_balancer_mode())):
         _validate_service_replica_launch_fence(_extra_launch_context)
@@ -368,11 +389,12 @@ def _execute(
                 not _is_launched_by_sky_serve_controller):
             # Only process pre-mount operations on API server.
             dag.pre_mount_volumes()
-        for task in dag.tasks:
-            if task.storage_mounts is not None:
-                for storage in task.storage_mounts.values():
-                    # Ensure the storage is constructed.
-                    storage.construct()
+        if not has_bound_ordinary_launch_context:
+            for task in dag.tasks:
+                if task.storage_mounts is not None:
+                    for storage in task.storage_mounts.values():
+                        # Legacy launches construct storage before execution.
+                        storage.construct()
         _resolve_managed_secrets(dag)
         return _execute_dag(
             dag,
@@ -689,6 +711,17 @@ def _execute_dag_under_provider_fence(
     # the physical-identity read and rely on the later actuation-boundary
     # check to reject a drifted result.
 
+    # A bound ordinary Serve launch takes the shared, cross-pod service
+    # authority guard and advances its durable effect phase at the last common
+    # boundary before any provider-bearing work.  Policy evaluation and
+    # optimization above remain pre-effect: rejecting there can still prove
+    # that no provider call began.  The ExitStack holds this guard through
+    # provisioning, setup, and service-job submission, so controller takeover
+    # cannot overlap opaque provider work.
+    _provider_fence_stack.enter_context(
+        ordinary_launch_request._provider_effect_guard(  # pylint: disable=protected-access
+            _extra_launch_context))
+
     phase_mode = (provider_phase.ProviderPhaseMode.AMBIENT_LEGACY
                   if reserved_fill_launch_fence is None else
                   provider_phase.ProviderPhaseMode.V2_FENCED)
@@ -697,6 +730,17 @@ def _execute_dag_under_provider_fence(
     # capture so ambient requests can never overlap that immutable authority.
     _provider_fence_stack.enter_context(
         provider_phase.provider_phase(phase_mode))
+
+    if ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
+            _extra_launch_context):
+        # Storage construction may create/check buckets and synchronize local
+        # sources.  It is therefore provider-bearing work, not validation.
+        # Keep it after the association advances to PROVIDER_IO and while
+        # both the exact request claim and service authority guards are held.
+        # A crash here must be reduced as an effectful/ambiguous attempt; it
+        # must never be replayed as a provably NOT_STARTED successor.
+        for storage in (task.storage_mounts or {}).values():
+            storage.construct()
 
     if reserved_fill_launch_fence is not None:
         # Optimization is allowed to rewrite best_resources. Reject any drift
@@ -848,7 +892,11 @@ def _execute_dag_under_provider_fence(
         if Stage.EXEC in stages:
             try:
                 global_user_state.update_last_use(handle.get_cluster_name())
+                ordinary_launch_request._begin_service_job_io(  # pylint: disable=protected-access
+                    _extra_launch_context)
                 job_id = backend.execute(handle, task, dryrun=dryrun)
+                ordinary_launch_request._record_service_job(  # pylint: disable=protected-access
+                    _extra_launch_context, job_id)
             finally:
                 # Enables post_execute() to be run after KeyboardInterrupt.
                 backend.post_execute(handle, down)

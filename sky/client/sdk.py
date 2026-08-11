@@ -1154,6 +1154,50 @@ def submit_prepared_launch_request(
     return server_common.get_request_id(response)
 
 
+def submit_prepared_ordinary_launch_request(
+    prepared_request: PreparedLaunchRequest,
+    submission_uuid: str | uuid.UUID,
+) -> server_common.RequestId[tuple[int | None,
+                                   Optional['backends.ResourceHandle']]]:
+    """Submit one frozen launch through the private durable binding seam.
+
+    The caller must reuse ``submission_uuid`` for every transport retry.  An
+    old API target has no such route and returns 404 without scheduling through
+    the unsafe public launch fallback.
+    """
+    try:
+        parsed_submission_uuid = uuid.UUID(str(submission_uuid))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError('submission_uuid must be a UUID.') from error
+    canonical_submission_uuid = str(parsed_submission_uuid)
+    if (isinstance(submission_uuid, str) and
+            submission_uuid != canonical_submission_uuid):
+        raise ValueError('submission_uuid must be a canonical UUID string.')
+    response = server_common.make_authenticated_request(
+        'POST',
+        server_constants.ORDINARY_LAUNCH_BINDING_PATH,
+        json={
+            'submission_uuid': canonical_submission_uuid,
+            'launch': json.loads(prepared_request.submitted_bytes),
+        },
+        timeout=5)
+    server_common.handle_request_error(response)
+    try:
+        binding = responses.OrdinaryLaunchBindingResponse.model_validate(
+            response.json())
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            'Ordinary Serve launch binding returned a malformed response.') \
+            from error
+    if str(binding.submission_uuid) != canonical_submission_uuid:
+        raise RuntimeError(
+            'Ordinary Serve launch binding returned a different submission '
+            'UUID.')
+    return server_common.RequestId[tuple[int | None,
+                                         Optional['backends.ResourceHandle']]](
+                                             str(binding.request_id))
+
+
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api

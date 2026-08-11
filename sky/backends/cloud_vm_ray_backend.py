@@ -76,6 +76,7 @@ from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve import system_oom_recovery_observability
 from sky.server import common as server_common
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import storage as request_storage
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -108,6 +109,8 @@ from sky.utils import yaml_utils
 from sky.utils.plugin_extensions import ExternalFailureSource
 
 metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
 serve_placement_history = adaptors_common.LazyImport(
     'sky.serve.placement_history')
 
@@ -814,11 +817,43 @@ class RetryingVmProvisioner:
                 'Reserved-fill retry candidate changed its fenced '
                 'Kubernetes context or accelerator shape.') from error
 
+    def _validate_binding_excluded_request_identity(self) -> None:
+        """Bind a system-recovery exclusion to this exact executor claim."""
+        try:
+            excluded = serve_state.normalize_binding_excluded_launch_context(
+                self._extra_launch_context)
+        except (TypeError, ValueError) as error:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'SkyServe binding-excluded launch context is malformed.'
+            ) from error
+        if (excluded is None or excluded.get(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY)
+                != serve_constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE):
+            return
+        claim = request_storage.active_execution_claim()
+        if (claim is None or claim.request_id != excluded.get(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY)
+           ):
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'System-recovery excluded authority does not belong to the '
+                'active request execution claim.')
+
     def _validate_service_replica_launch_fence(self) -> None:
         """Fail closed if this Serve request lost durable launch authority."""
         if self._workload_type not in ('service', 'pool'):
             return
         launch_context = self._extra_launch_context
+        if ordinary_launch_binding.has_bound_launch_context(launch_context):
+            try:
+                ordinary_launch_binding.require_active_provider_effect_authorization(
+                    launch_context)
+            except Exception as error:
+                raise exceptions.ServeReplicaLaunchFenceError(
+                    'Bound SkyServe execution has no exact active '
+                    'association authority.') from error
+            return
+        self._validate_binding_excluded_request_identity()
         if not any(key in launch_context
                    for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
             # Preserve compatibility for pre-fence persisted requests.  Once a
@@ -851,6 +886,35 @@ class RetryingVmProvisioner:
             yield
             return
         launch_context = self._extra_launch_context
+        if ordinary_launch_binding.has_bound_launch_context(launch_context):
+            # execution._execute_dag() owns one association guard across the
+            # entire provider-bearing tail.  Re-entering the legacy PID/IP
+            # guard would reject every valid bound request because its queued
+            # body intentionally carries impossible PID/IP sentinels.  A
+            # strict contextvar check prevents a forged or directly invoked
+            # bound context from using this bypass.
+            try:
+                ordinary_launch_binding.require_active_provider_effect_authorization(
+                    launch_context)
+            except Exception as error:
+                raise exceptions.ServeReplicaLaunchFenceError(
+                    'Bound SkyServe provider I/O has no exact active '
+                    'association authority.') from error
+            provider_completed = False
+            try:
+                yield
+                provider_completed = True
+            finally:
+                if provider_completed:
+                    try:
+                        ordinary_launch_binding.require_active_provider_effect_authorization(
+                            launch_context)
+                    except Exception as error:
+                        raise exceptions.ServeReplicaLaunchFenceError(
+                            'Bound SkyServe association authority became '
+                            'indeterminate during provider I/O.') from error
+            return
+        self._validate_binding_excluded_request_identity()
         if not any(key in launch_context
                    for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
             yield

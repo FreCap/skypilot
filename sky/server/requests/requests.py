@@ -413,8 +413,8 @@ class Request:
     # events. It is intentionally absent from the client RequestPayload and
     # legacy SQLite row shape.
     event_context: dict[str, Any] | None = None
-    # In-memory cause required when a generic update context performs a
-    # terminal transition. Never persisted or exposed to clients.
+    # Closed cause persisted by the PostgreSQL backend in the same transaction
+    # as a terminal transition.  It remains absent from the client payload.
     terminal_cause: str | None = None
     # Queue intent is set only while creating a newly scheduled request.
     # Durable backends consume it in the same transaction as request creation;
@@ -490,6 +490,7 @@ class Request:
             'payload_json': payload_json,
             'execution_class': registration.execution_class.value,
             'status': self.status.value,
+            'terminal_cause': self.terminal_cause,
             'return_value': self.return_value,
             'error': self.error,
             'pid': self.pid,
@@ -544,6 +545,7 @@ class Request:
             entrypoint=registration.func,
             request_body=request_body,
             status=RequestStatus(values['status']),
+            terminal_cause=values.get('terminal_cause'),
             created_at=float(values['created_at']),
             user_id=values[COL_USER_ID],
             return_value=values.get('return_value'),
@@ -1654,9 +1656,10 @@ class RequestTaskFilter:
         finished_after: if provided, only include requests finished at or after
             this timestamp. Requests still in progress (finished_at IS NULL)
             are always included.
-        retention_safe: internal GC guard that excludes correlated requests
-            until their exact resource-action attempt is settled. PostgreSQL
-            enforces this; SQLite has no central resource-action correlation.
+        retention_safe: internal GC guard that excludes requests until their
+            exact resource-action attempt, execution-quiescence evidence, and
+            every generic active retention pin are settled. PostgreSQL
+            enforces this; SQLite has no central retention protocol.
         execution_quiescence_candidates_only: include active rows plus
             terminal rows governed by the API008 execution-quiescence
             contract. Used with ``cluster_names`` for bounded cancellation
@@ -2248,6 +2251,15 @@ async def requests_gc_daemon():
                 if retention_seconds >= 0:
                     await clean_finished_requests_with_retention(
                         retention_seconds)
+                # Cross-domain tombstones have their own retention and must
+                # continue to drain even when ordinary request retention is
+                # disabled. The backend owns the request/pin predicates; local
+                # and plugin backends use the source-compatible no-op.
+                collected = await request_storage.get_request_backend(
+                ).gc_request_owned_tombstones()
+                if collected:
+                    logger.info('Collected %s request-owned tombstones.',
+                                collected)
             except asyncio.CancelledError:
                 logger.info('Requests GC daemon cancelled')
                 raise

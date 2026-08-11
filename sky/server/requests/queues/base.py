@@ -24,6 +24,7 @@ class QueueItem:
     retryable: bool
     execution_generation: int = 0
     claim_token: str | None = None
+    worker_instance_id: str | None = None
 
 
 QueueItemLike = QueueItem | tuple[str, bool, bool]

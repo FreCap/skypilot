@@ -55,6 +55,32 @@ REPLICA_LAUNCH_FENCE_KEYS = (
 ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY = 'sky_serve_ordinary_launch_handoff'
 ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION = 1
 
+# Closed discriminator for launch profiles that deliberately retain their
+# existing request contract after ordinary launches move to durable binding.
+# The API queue persists this exact tuple and both queue admission and the
+# provider boundary revalidate it against the named ReplicaInfo row.
+ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX = 'sky_serve_binding_excluded_'
+ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY = (
+    f'{ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX}profile')
+ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY = (
+    f'{ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX}replica_id')
+ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY = (
+    f'{ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX}replica_record_id')
+ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY = (
+    f'{ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX}request_id')
+ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY = (
+    f'{ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX}generation')
+ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE = 'persisted-special.v1'
+ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE = (
+    'system-recovery.v1')
+ORDINARY_LAUNCH_BINDING_EXCLUDED_KEYS = (
+    ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY,
+    ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY,
+    ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY,
+    ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY,
+    ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY,
+)
+
 # Protocol-v2 reserved-fill authority carried in the durable API launch row.
 # Unlike the underscore-prefixed resources_override fields below, these values
 # survive the controller-to-API queue boundary and are revalidated by the
@@ -479,6 +505,8 @@ CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH = (
     '/controller/update_service_with_config')
 CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH = (
     '/controller/cleanup_staged_update_config')
+CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH = (
+    '/controller/internal/ordinary_launch_binding')
 SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION = 1
 VERSIONED_HA_CONFIG_RECOVERY_MARKER = (
     '# SKY_SERVE_VERSIONED_CONFIG_RECOVERY_V1')

@@ -28,6 +28,16 @@ _SERVE038_BOOTSTRAP_FACTORIES = {
         resource_action_m4_state_schema.version_spec_identity_columns,
     'replicas': resource_action_m4_state_schema.replica_spec_identity_columns,
 }
+_SERVE042_POSTGRES_ONLY_COLUMNS = {
+    'services': frozenset({
+        'controller_incarnation',
+        'controller_owner_epoch',
+        'ordinary_launch_binding_capable',
+        'ordinary_launch_binding_mode',
+        'ordinary_launch_binding_epoch',
+    }),
+    'replicas': frozenset({'ordinary_launch_association_id'}),
+}
 
 
 def _initial_metadata(bind: sa.engine.Connection) -> sa.MetaData:
@@ -46,6 +56,12 @@ def _initial_metadata(bind: sa.engine.Connection) -> sa.MetaData:
                 # index, or FK.  Removing them from this private clone leaves
                 # runtime Base metadata complete without leaking 038 into a
                 # fresh non-PostgreSQL historical schema.
+                table._columns.remove(column)
+    for table_name, column_names in _SERVE042_POSTGRES_ONLY_COLUMNS.items():
+        table = metadata.tables[table_name]
+        for column_name in column_names:
+            column = table.c.get(column_name)
+            if column is not None:
                 table._columns.remove(column)
     return metadata
 

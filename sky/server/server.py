@@ -24,6 +24,7 @@ import fastapi
 from fastapi import exception_handlers as fastapi_exception_handlers
 from fastapi import exceptions as fastapi_exceptions
 from fastapi.middleware import cors
+import pydantic
 import starlette.background
 
 import sky
@@ -34,8 +35,10 @@ from sky import estimated_spend as estimated_spend_lib
 from sky import exceptions
 from sky import execution
 from sky import global_user_state
+from sky import models
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.container_images import server as container_images_rest
 from sky.data import storage_utils
 from sky.jobs.server import server as jobs_rest
@@ -47,6 +50,7 @@ from sky.recipes import server as recipes_rest
 from sky.schemas.api import responses
 from sky.serve import constants as serve_constants
 from sky.serve import lb_rbac_preflight
+from sky.serve import ordinary_launch_binding
 from sky.serve import ordinary_launch_handoff
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -81,6 +85,7 @@ from sky.server.requests import access as request_access
 from sky.server.requests import executor
 from sky.server.requests import launch_identity
 from sky.server.requests import log_provider
+from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
 from sky.server.requests import request_names
@@ -109,6 +114,72 @@ from sky.workspaces import server as workspaces_rest
 P = ParamSpec('P')
 
 logger = sky_logging.init_logger(__name__)
+_ordinary_launch_request_postgres = adaptors_common.LazyImport(
+    'sky.server.requests.postgres')
+
+
+class _OrdinaryServeLaunchSubmission(pydantic.BaseModel):
+    """Closed wire envelope for one idempotent ordinary Serve admission."""
+
+    model_config = pydantic.ConfigDict(extra='forbid')
+
+    submission_uuid: str
+    launch: payloads.LaunchBody
+
+
+def _parse_ordinary_launch_submission_uuid(value: str) -> uuid.UUID:
+    if not isinstance(value, str):
+        raise ValueError('submission_uuid must be a canonical UUID string.')
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            'submission_uuid must be a canonical UUID string.') from error
+    if str(parsed) != value:
+        raise ValueError('submission_uuid must be a canonical UUID string.')
+    return parsed
+
+
+def _derive_ordinary_launch_binding_ids(submission_uuid: uuid.UUID,
+                                        tenant_id: str,
+                                        workspace: str) -> tuple[str, str]:
+    """Derive durable IDs without using the transport request identity."""
+    association_id, request_id = ordinary_launch_binding.derive_binding_ids(
+        tenant_id, workspace, submission_uuid)
+    return str(association_id), request_id
+
+
+def _resolve_ordinary_launch_tenant_id(launch_body: payloads.LaunchBody,
+                                       auth_user: models.User | None) -> str:
+    """Resolve the same trusted request owner used by request construction."""
+    submitted_user_hash = launch_body.env_vars.get(constants.USER_ID_ENV_VAR,
+                                                   '')
+    submitted_original_user = launch_body.env_vars.get(constants.USER_ENV_VAR,
+                                                       submitted_user_hash)
+    if not isinstance(submitted_user_hash, str):
+        raise ValueError('Submitted user ID must be text.')
+    if not isinstance(submitted_original_user, str):
+        raise ValueError('Submitted user name must be text.')
+    _, tenant_id = common.resolve_effective_request_identity(
+        auth_user, submitted_original_user, submitted_user_hash)
+    if not tenant_id:
+        raise ValueError('Ordinary launch tenant scope must be non-empty.')
+    return tenant_id
+
+
+def _bind_and_enqueue_ordinary_launch(
+    request_task: requests_lib.Request,
+    identity: ordinary_launch_binding.BindingIdentity,
+) -> ordinary_launch_binding.BindingAdmission:
+    """Call the built-in PostgreSQL cross-lineage admission transaction."""
+    bind = getattr(_ordinary_launch_request_postgres,
+                   'bind_and_enqueue_ordinary_launch', None)
+    if not callable(bind):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'The atomic ordinary launch request binding integration is not '
+            'installed on this API server.')
+    return bind(request_task, identity)
+
 
 # Portable deployment provenance for the code instance serving this process.
 # Capturing this at module initialization avoids adding Helm/Kubernetes calls
@@ -901,9 +972,25 @@ async def launch(launch_body: payloads.LaunchBody,
     request_id = request.state.request_id
     logger.info(f'Launching request: {request_id}')
     launch_context = launch_body.extra_launch_context
+    if ordinary_launch_binding.has_bound_launch_context(launch_context):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Ordinary bound Serve launches require the dedicated '
+            'internal binding endpoint.')
     has_system_recovery_context = (
         serve_system_oom_recovery.has_v3_system_oom_recovery_context(
             launch_context))
+    if (has_system_recovery_context and any(
+            isinstance(key, str) and key.startswith(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX)
+            for key in launch_context)):
+        # The excluded system profile is created only after this endpoint
+        # consumes the exact recovery nonce.  Reject caller-authored marker
+        # fields before that irreversible bind transaction.
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='System-recovery excluded-profile authority is '
+            'server-derived only.')
     try:
         reserved_fill_launch_fence = (
             reserved_capacity.parse_protocol_v2_launch_fence(launch_context))
@@ -945,6 +1032,36 @@ async def launch(launch_body: payloads.LaunchBody,
         # execution sees the server-known request association and no nonce.
         launch_body.extra_launch_context = bound_context
         launch_context = bound_context
+    try:
+        binding_excluded_launch_context = (
+            serve_state.normalize_binding_excluded_launch_context(
+                launch_context))
+    except (TypeError, ValueError) as error:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='SkyServe binding-excluded launches require a complete, '
+            'valid excluded-profile discriminator.') from error
+    if (binding_excluded_launch_context is not None and
+            not launch_body.is_launched_by_sky_serve_controller):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Binding-excluded launch profiles are restricted to '
+            'SkyServe controller requests.')
+    if (binding_excluded_launch_context is not None and
+            binding_excluded_launch_context.get(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY)
+            == serve_constants.
+            ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE and
+        (not has_system_recovery_context or binding_excluded_launch_context.get(
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY)
+         != request_id)):
+        # The system form is server-derived only after the nonce-consuming
+        # bind transaction.  Accepting a caller-authored form would let an
+        # unrelated request borrow another recovery request's persisted row.
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='System-recovery excluded-profile authority must be '
+            'derived from this exact bound launch request.')
     launch_precondition = None
     has_launch_fence = False
     service_name = None
@@ -964,6 +1081,7 @@ async def launch(launch_body: payloads.LaunchBody,
         controller_ip = launch_context.get(
             serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY)
         if ((has_launch_fence or reserved_fill_launch_fence is not None or
+             binding_excluded_launch_context is not None or
              serve_utils.is_external_load_balancer_mode()) and
             (not isinstance(service_name, str) or not service_name or
              not isinstance(service_hash, str) or not service_hash or
@@ -981,7 +1099,8 @@ async def launch(launch_body: payloads.LaunchBody,
             launch_precondition = (
                 preconditions.ServiceReplicaLaunchPrecondition(
                     request_id, service_name, service_hash, controller_pid,
-                    controller_ip, service_version))
+                    controller_ip, service_version,
+                    binding_excluded_launch_context))
     await executor.schedule_request_async(
         request_id,
         request_name=request_names.RequestName.CLUSTER_LAUNCH,
@@ -1043,6 +1162,129 @@ async def launch(launch_body: payloads.LaunchBody,
                 logger.debug(
                     'Ordinary-launch request publication telemetry '
                     'failed after scheduling: %s', error)
+
+
+@app.post(server_constants.ORDINARY_LAUNCH_BINDING_PATH)
+async def ordinary_serve_launch(
+    submission: _OrdinaryServeLaunchSubmission,
+    request: fastapi.Request,
+) -> responses.OrdinaryLaunchBindingResponse:
+    """Atomically bind and enqueue one ordinary non-pool Serve launch."""
+    launch_body = submission.launch.model_copy(deep=True)
+    launch_context = launch_body.extra_launch_context
+    if (not launch_body.is_launched_by_sky_serve_controller or
+            launch_body.is_launched_by_jobs_controller or launch_body.dryrun or
+            launch_body.clone_disk_from is not None or
+            serve_system_oom_recovery.has_v3_system_oom_recovery_context(
+                launch_context)):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Bound ordinary launches require a non-special SkyServe '
+            'controller request.')
+    try:
+        if any(
+                isinstance(key, str) and key.startswith(
+                    serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX)
+                for key in launch_context):
+            raise ValueError(
+                'Binding-excluded launch context is not ordinary and must '
+                'be derived by its retained special-profile path.')
+        if reserved_capacity.parse_protocol_v2_launch_fence(
+                launch_context) is not None:
+            raise ValueError('reserved-fill context is not ordinary')
+        server_owned_context_keys = (
+            ordinary_launch_binding.SUBMISSION_ID_KEY,
+            ordinary_launch_binding.ASSOCIATION_ID_KEY,
+            ordinary_launch_binding.LAUNCH_GENERATION_KEY,
+            ordinary_launch_binding.BOUND_REQUEST_ID_KEY,
+            ordinary_launch_binding.INPUT_DIGEST_KEY,
+            ordinary_launch_binding.OWNER_REVISION_KEY,
+        )
+        if any(key in launch_context for key in server_owned_context_keys):
+            raise ValueError(
+                'Ordinary launch binding identity must be server-generated.')
+
+        submission_uuid = _parse_ordinary_launch_submission_uuid(
+            submission.submission_uuid)
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        if not isinstance(service_name, str) or not service_name:
+            raise ValueError('Ordinary launch service name must be non-empty.')
+        if not isinstance(service_hash, str) or not service_hash:
+            raise ValueError('Ordinary launch service hash must be non-empty.')
+        recovery_identity = await asyncio.to_thread(
+            serve_state.get_service_config_recovery_identity, service_name)
+        if (recovery_identity is None or recovery_identity[0] != service_hash):
+            raise ValueError(
+                'Ordinary launch service incarnation is not current.')
+        workspace = recovery_identity[1]
+        tenant_id = _resolve_ordinary_launch_tenant_id(launch_body,
+                                                       request.state.auth_user)
+        association_id, request_id = _derive_ordinary_launch_binding_ids(
+            submission_uuid, tenant_id, workspace)
+
+        intent = ordinary_launch_binding.parse_unbound_launch_context(
+            launch_context)
+        # Hash the exact frozen client representation before request building
+        # normalizes authenticated identity fields and stamps API metadata.
+        input_digest = ordinary_launch_binding.canonical_launch_digest(
+            submission.launch)
+        identity = ordinary_launch_binding.build_binding_identity(
+            intent,
+            submission_id=submission_uuid,
+            tenant_scope=tenant_id,
+            service_workspace=workspace,
+            cluster_name=launch_body.cluster_name,
+            input_digest=input_digest)
+        if (str(identity.association_id) != association_id or
+                identity.request_id != request_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Server-derived ordinary launch identity is inconsistent.')
+        binding_precondition = (preconditions.OrdinaryLaunchBindingPrecondition(
+            request_id, str(identity.association_id)))
+        request_task = await executor.build_request_async(
+            request_id=request_id,
+            request_name=request_names.RequestName.CLUSTER_LAUNCH,
+            request_body=launch_body,
+            func=ordinary_launch_request.launch,
+            request_cluster_name=launch_body.cluster_name,
+            schedule_type=requests_lib.ScheduleType.LONG,
+            # execution.launch owns retry_until_up within this one guarded
+            # claim.  Generic worker retry could authorize another effect
+            # generation after claim loss.
+            retryable=False,
+            should_enqueue=True,
+            precondition=binding_precondition,
+            auth_user=request.state.auth_user,
+        )
+        reservation = await asyncio.to_thread(_bind_and_enqueue_ordinary_launch,
+                                              request_task, identity)
+        if (reservation.association_id != association_id or
+                reservation.request_id != request_id or
+                type(reservation.launch_generation) is not int or
+                reservation.launch_generation < 1 or
+                type(reservation.created) is not bool):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Transactional binding returned an inconsistent identity.')
+    except ordinary_launch_binding.OrdinaryLaunchBindingUnavailable as error:
+        raise fastapi.HTTPException(status_code=503,
+                                    detail=str(error)) from error
+    except (ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+            ValueError) as error:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Ordinary Serve launch binding was rejected: '
+            f'{common_utils.format_exception(error)}') from error
+    if reservation.created:
+        request_task.log_path.touch()
+    return responses.OrdinaryLaunchBindingResponse(
+        submission_uuid=submission_uuid,
+        association_id=reservation.association_id,
+        request_id=reservation.request_id,
+        launch_generation=reservation.launch_generation,
+        created=reservation.created)
 
 
 @app.post('/exec')
@@ -2311,6 +2553,18 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
             release_metadata['commit_timestamp'] = sky.__commit_timestamp__
         release_metadata['deployment_timestamp'] = _SERVER_STARTED_AT
 
+    ordinary_launch_binding_capable = False
+    if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+        try:
+            # Runtime import preserves the local/SQLite API import path.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests import postgres as request_postgres
+            ordinary_launch_binding_capable = await asyncio.to_thread(
+                request_postgres.ordinary_launch_binding_fleet_capable)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.debug('Ordinary launch binding capability is unavailable: '
+                         f'{common_utils.format_exception(error)}')
+
     return responses.APIHealthResponse(
         status=server_status,
         # Kept for backward compatibility, clients before 0.11.0 will read this
@@ -2342,6 +2596,7 @@ async def health(request: fastapi.Request) -> responses.APIHealthResponse:
         latest_version=latest_version,
         # Whether telemetry/usage collection is enabled
         telemetry_enabled=not env_options.Options.DISABLE_LOGGING.get(),
+        ordinary_launch_binding_capable=ordinary_launch_binding_capable,
     )
 
 

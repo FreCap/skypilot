@@ -135,6 +135,36 @@ async def update(
     )
 
 
+@router.post('/_internal/{service_name}/ordinary-launch-binding',
+             include_in_schema=False)
+async def set_ordinary_launch_binding_mode(
+        request: fastapi.Request,
+        service_name: str,
+        mode: str = fastapi.Body(...),
+        expected_service_hash: str = fastapi.Body(..., min_length=1),
+        expected_binding_epoch: int = fastapi.Body(..., ge=0),
+) -> dict:
+    """Run an explicit admin-only legacy/bound transition on one service."""
+    _require_admin(request)
+    if mode not in ('legacy', 'bound'):
+        raise fastapi.HTTPException(status_code=422,
+                                    detail='mode must be legacy or bound.')
+    try:
+        return await asyncio.to_thread(
+            serve_utils.set_ordinary_launch_binding_mode_encoded,
+            service_name,
+            mode,
+            expected_service_hash,
+            expected_binding_epoch,
+        )
+    except ValueError as error:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail=str(error)) from error
+    except RuntimeError as error:
+        raise fastapi.HTTPException(status_code=409,
+                                    detail=str(error)) from error
+
+
 @router.get('/{service_name}/versions')
 def version_history(request: fastapi.Request, service_name: str) -> dict:
     """Return immutable version history to an administrator."""

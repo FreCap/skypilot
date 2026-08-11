@@ -1,6 +1,7 @@
 """Real-PostgreSQL tests for durable API request delivery."""
-# pylint: disable=protected-access,redefined-outer-name
+# pylint: disable=protected-access,redefined-outer-name,unexpected-keyword-arg
 
+import ast
 import asyncio
 import concurrent.futures
 import dataclasses
@@ -21,10 +22,16 @@ import sqlalchemy
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky import core
+from sky import exceptions
 from sky import execution
 from sky import global_user_state
 from sky.events import api_models as event_api_models
 from sky.jobs.server import core as managed_jobs_core
+from sky.serve import constants as serve_constants
+from sky.serve import ordinary_launch_binding
+from sky.serve import replica_managers
+from sky.serve import serve_state
+from sky.serve import serve_state_schema
 from sky.serve.server import core as serve_core
 from sky.server import daemons
 from sky.server.events import cursors as event_cursors
@@ -33,6 +40,7 @@ from sky.server.events import schema as event_schema
 from sky.server.events import store as event_store
 from sky.server.requests import cutover
 from sky.server.requests import executor
+from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import preconditions
@@ -41,6 +49,7 @@ from sky.server.requests import requests
 from sky.server.requests import storage
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
+from sky.utils import common_utils
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 from sky.volumes.server import core as volume_core
@@ -55,6 +64,22 @@ pytestmark = pytest.mark.skipif(
     _POSTGRES_URL is None and shutil.which('docker') is None,
     reason='docker unavailable; skipping durable request PostgreSQL tests')
 
+_GC_REPLICA_RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
+_GC_CONTROLLER_ID = uuid.UUID('33333333-3333-4333-8333-333333333333')
+
+
+def _gc_replica_state() -> dict[str, object]:
+    info = replica_managers.ReplicaInfo(replica_id=3,
+                                        cluster_name='gc-service-3',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=2,
+                                        resources_override=None)
+    info.replica_record_id = str(_GC_REPLICA_RECORD_ID)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.RUNNING
+    return info.to_storage_dict()
+
 
 @pytest.fixture(scope='module')
 def postgres_engine():
@@ -63,8 +88,8 @@ def postgres_engine():
     temporary_database = None
     if _POSTGRES_URL is None:
         assert testcontainers_postgres is not None
-        container = testcontainers_postgres.PostgresContainer('postgres:16')
         try:
+            container = testcontainers_postgres.PostgresContainer('postgres:16')
             container.start()
         except Exception as e:  # pylint: disable=broad-except
             pytest.skip(f'could not start postgres container: {e}')
@@ -126,6 +151,55 @@ def request_database(postgres_engine, monkeypatch):
     asyncio.run(async_engine.dispose())
 
 
+@pytest.fixture
+def bound_request_database(request_database, monkeypatch):
+    """Request and Serve binding schemas on one central PostgreSQL database."""
+    engine, backend = request_database
+    config = migration_utils.get_alembic_config(engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '042')
+    monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name='gc-service', epoch=4))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.services_table).values(
+                name='gc-service',
+                workspace='workspace-a',
+                status='READY',
+                hash='gc-service-hash',
+                current_version=2,
+                active_versions='[2]',
+                pool=0,
+                controller_pid=123,
+                controller_ip='10.0.0.2',
+                lifecycle_epoch=4,
+                controller_incarnation=_GC_CONTROLLER_ID,
+                controller_owner_epoch=6,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode='bound',
+                ordinary_launch_binding_epoch=5))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.version_specs_table).values(
+                service_name='gc-service',
+                version=2,
+                yaml_content='service:\n  min_replicas: 0\n',
+                controller_applied_at=1.0))
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                service_name='gc-service',
+                replica_id=3,
+                replica_state_version=1,
+                status='PROVISIONING',
+                version=2,
+                cluster_name='gc-service-3',
+                is_spot=False,
+                replica_state=_gc_replica_state()))
+    return engine, backend
+
+
 def _request(request_id: str,
              *,
              should_enqueue: bool = True,
@@ -142,6 +216,108 @@ def _request(request_id: str,
         schedule_type=schedule_type,
         should_enqueue=should_enqueue,
     )
+
+
+def _bound_request(request_id: str) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='sky.launch',
+        entrypoint=ordinary_launch_request.launch,
+        request_body=payloads.LaunchBody(
+            task='name: ordinary-serve-launch\nrun: echo bound\n',
+            cluster_name='svc-1',
+            is_launched_by_sky_serve_controller=True,
+            extra_launch_context={}),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='user',
+        cluster_name='svc-1',
+        schedule_type=requests.ScheduleType.SHORT,
+        retryable=False,
+        should_enqueue=True,
+    )
+
+
+def _legacy_serve_launch_request(request_id: str) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='sky.launch',
+        entrypoint=execution.launch,
+        request_body=payloads.LaunchBody(
+            task='name: legacy-ordinary-serve-launch\nrun: echo legacy\n',
+            cluster_name='gc-service-3',
+            is_launched_by_sky_serve_controller=True,
+            extra_launch_context={
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'gc-service',
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'gc-service-hash',
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 2,
+                serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+                serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.2',
+            }),
+        status=requests.RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='user',
+        cluster_name='gc-service-3',
+        schedule_type=requests.ScheduleType.SHORT,
+        retryable=False,
+        should_enqueue=True,
+    )
+
+
+def _gc_binding_identity(
+    submission_id: uuid.UUID | None = None
+) -> ordinary_launch_binding.BindingIdentity:
+    if submission_id is None:
+        submission_id = uuid.UUID('11111111-1111-4111-8111-111111111111')
+    intent = ordinary_launch_binding.BindingIntent(
+        service_name='gc-service',
+        service_hash='gc-service-hash',
+        service_version=2,
+        replica_id=3,
+        replica_record_id=_GC_REPLICA_RECORD_ID,
+        lifecycle_epoch=4,
+        binding_epoch=5,
+        controller_incarnation=_GC_CONTROLLER_ID,
+        controller_owner_epoch=6,
+        controller_pid=123,
+        controller_ip='10.0.0.2')
+    return ordinary_launch_binding.build_binding_identity(
+        intent,
+        submission_id=submission_id,
+        tenant_scope='tenant-a',
+        service_workspace='workspace-a',
+        cluster_name='gc-service-3',
+        input_digest='a' * 64)
+
+
+def _gc_binding_context(
+    identity: ordinary_launch_binding.BindingIdentity,
+    launch_generation: int,
+) -> ordinary_launch_binding.BoundLaunchContext:
+    return ordinary_launch_binding.BoundLaunchContext(
+        association_id=identity.association_id,
+        request_id=identity.request_id,
+        service_name=identity.service_name,
+        replica_id=identity.replica_id,
+        replica_record_id=identity.replica_record_id,
+        launch_generation=launch_generation,
+        input_digest=identity.input_digest)
+
+
+def _gc_binding_authority(
+) -> ordinary_launch_binding.ControllerBindingAuthority:
+    return ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='gc-service',
+        service_hash='gc-service-hash',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=4,
+        controller_pid=123,
+        controller_ip='10.0.0.2',
+        controller_incarnation=_GC_CONTROLLER_ID,
+        controller_owner_epoch=6,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=5)
 
 
 def _controller_request(
@@ -430,7 +606,7 @@ def test_api007_upgrade_preserves_instances_and_widens_only_role_check(
     assert role_check.count("'") == 10
 
 
-def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
+def test_api009_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
@@ -463,7 +639,7 @@ def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
 
     migration_utils.safe_alembic_upgrade(postgres_engine,
                                          migration_utils.API_REQUESTS_DB_NAME,
-                                         '008',
+                                         '009',
                                          mode='upgrade')
 
     with postgres_engine.connect() as connection:
@@ -478,9 +654,11 @@ def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
     assert row['execution_quiescence_required'] is False
     assert row['execution_quiesced_generation'] is None
     assert row['execution_quiesced_at'] is None
+    assert row['ordinary_launch_association_id'] is None
     assert legacy_instance['request_storage_backend'] == 'unknown'
     assert legacy_instance['request_queue_backend'] == 'unknown'
     assert legacy_instance['execution_quiescence_capable'] is False
+    assert legacy_instance['ordinary_launch_binding_capable'] is False
     indexes = {
         index['name']: index for index in sqlalchemy.inspect(
             postgres_engine).get_indexes('api_requests')
@@ -491,6 +669,107 @@ def test_api008_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
         'execution_quiescence_requiredAND'
         'execution_quiesced_generationISDISTINCTFROMexecution_generationOR'
         'execution_quiesced_atISNULL')
+
+
+def test_api009_migration_is_runtime_module_independent():
+    migration_path = (pathlib.Path(__file__).parents[2] / 'sky' / 'schemas' /
+                      'db' / 'api_requests' / '009_ordinary_launch_binding.py')
+    tree = ast.parse(migration_path.read_text(encoding='utf-8'))
+    imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.append(node.module)
+    assert all(
+        name != 'sky' and not name.startswith('sky.') for name in imports)
+
+
+def test_api009_upgrades_without_serve_schema_or_migration_order(
+        postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '008',
+                                         mode='upgrade')
+    inspector = sqlalchemy.inspect(postgres_engine)
+    assert 'serve_ordinary_launch_associations' not in inspector.get_table_names(
+    )
+    assert 'api_request_retention_pins' not in inspector.get_table_names()
+
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '009',
+                                         mode='upgrade')
+
+    assert migration_utils.get_current_alembic_revision(
+        postgres_engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
+    tables = sqlalchemy.inspect(postgres_engine).get_table_names()
+    assert 'api_request_retention_pins' in tables
+    assert 'serve_ordinary_launch_associations' not in tables
+
+
+def test_api009_binding_catalog_matches_literal_contract(postgres_engine):
+    inspector = sqlalchemy.inspect(postgres_engine)
+    assert [
+        column['name']
+        for column in inspector.get_columns('api_request_retention_pins')
+    ] == ['pin_kind', 'pin_id', 'request_id', 'created_at']
+    primary_key = inspector.get_pk_constraint('api_request_retention_pins')
+    assert primary_key['constrained_columns'] == ['pin_kind', 'pin_id']
+    assert primary_key['name'] == 'pk_api_request_retention_pins'
+    foreign_keys = inspector.get_foreign_keys('api_request_retention_pins')
+    assert len(foreign_keys) == 1
+    foreign_key = foreign_keys[0]
+    assert foreign_key['name'] == 'fk_api_request_retention_pins_request'
+    assert foreign_key['constrained_columns'] == ['request_id']
+    assert foreign_key['referred_table'] == 'api_requests'
+    assert foreign_key['referred_columns'] == ['request_id']
+    assert foreign_key['options'].get('ondelete') == 'RESTRICT'
+    pin_checks = {
+        check['name']:
+            ''.join(check['sqltext'].split()).replace('(', '').replace(')', '')
+        for check in inspector.get_check_constraints(
+            'api_request_retention_pins')
+    }
+    pin_kind_check = pin_checks['ck_api_request_retention_pins_kind']
+    assert pin_kind_check in (
+        'char_lengthpin_kindBETWEEN1AND128',
+        'char_lengthpin_kind>=1ANDchar_lengthpin_kind<=128',
+    )
+    pin_indexes = {
+        index['name']: index
+        for index in inspector.get_indexes('api_request_retention_pins')
+    }
+    assert pin_indexes['ix_api_request_retention_pins_request'][
+        'column_names'] == ['request_id']
+
+    request_checks = {
+        check['name']: ''.join(check['sqltext'].replace(
+            '::text', '').split()).replace('(', '').replace(
+                ')',
+                '') for check in inspector.get_check_constraints('api_requests')
+    }
+    assert request_checks['ck_api_requests_ordinary_launch_handler'] == (
+        "ordinary_launch_association_idISNULL=handler_name<>"
+        "'sky.server.requests.ordinary_launch:launch'")
+    binding_index = {
+        index['name']: index for index in inspector.get_indexes('api_requests')
+    }['uq_api_requests_ordinary_launch_association']
+    assert binding_index['unique']
+    assert binding_index['column_names'] == ['ordinary_launch_association_id']
+    assert _normalized_index_predicate(binding_index) == (
+        'ordinary_launch_association_idISNOTNULL')
+
+    assert list(request_postgres.REQUEST_RETENTION_PINS.c.keys()) == [
+        'pin_kind', 'pin_id', 'request_id', 'created_at'
+    ]
+    runtime_foreign_key = next(
+        iter(request_postgres.REQUEST_RETENTION_PINS.foreign_keys))
+    assert runtime_foreign_key.target_fullname == 'api_requests.request_id'
+    assert runtime_foreign_key.ondelete == 'RESTRICT'
 
 
 def test_api006_upgrade_serializes_with_uncommitted_api005_insert(
@@ -658,17 +937,588 @@ def test_retention_allows_pre_api008_unrequired_terminal_row(request_database):
                                  request_id)).scalar_one() == 0
 
 
+def test_bound_request_handler_correlation_and_pin_constraints(
+        request_database):
+    engine, _ = request_database
+    association_id = uuid.uuid4()
+    bound = _bound_request('bound-catalog')
+    with engine.begin() as connection:
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection, bound, ordinary_launch_association_id=association_id)
+    with engine.connect() as connection:
+        stored = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.handler_name,
+                request_postgres.REQUESTS.c.ordinary_launch_association_id).
+            where(request_postgres.REQUESTS.c.request_id ==
+                  bound.request_id)).one()
+        pin = connection.execute(
+            sqlalchemy.select(request_postgres.REQUEST_RETENTION_PINS).where(
+                request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                bound.request_id)).mappings().one()
+    assert stored.handler_name == (
+        ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME)
+    assert stored.ordinary_launch_association_id == association_id
+    assert pin['pin_kind'] == (
+        request_postgres.ORDINARY_LAUNCH_RETENTION_PIN_KIND)
+    assert pin['pin_id'] == association_id
+
+    legacy_values = request_postgres._request_values_for_db(
+        _request('legacy-with-correlation', should_enqueue=False))
+    legacy_values['ordinary_launch_association_id'] = uuid.uuid4()
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    request_postgres.REQUESTS).values(**legacy_values))
+
+    uncorrelated_bound_values = request_postgres._request_values_for_db(
+        _bound_request('bound-without-correlation'))
+    uncorrelated_bound_values['ordinary_launch_association_id'] = None
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(request_postgres.REQUESTS).values(
+                    **uncorrelated_bound_values))
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.delete(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id == bound.request_id))
+
+
+def test_generic_kill_requests_skips_correlated_bound_launch(request_database):
+    engine, backend = request_database
+    request_id = 'bound-generic-cancel-must-skip'
+    association_id = uuid.uuid4()
+    with engine.begin() as connection:
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection,
+            _bound_request(request_id),
+            ordinary_launch_association_id=association_id)
+
+    assert backend.kill_requests([request_id]) == []
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+        queue_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.QUEUE).where(
+                                 request_postgres.QUEUE.c.request_id ==
+                                 request_id)).scalar_one()
+    assert row['status'] == requests.RequestStatus.PENDING.value
+    assert row['cancel_requested_at'] is None
+    assert row['ordinary_launch_association_id'] == association_id
+    assert queue_count == 1
+
+
+def test_bound_tombstone_gc_rechecks_request_absence_at_delete(
+        bound_request_database):
+    engine, _ = bound_request_database
+    association_id = uuid.UUID('44444444-4444-4444-8444-444444444444')
+    request_id = 'gc-bound-request'
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            values(
+                association_id=association_id,
+                submission_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+                tenant_scope='tenant-a',
+                service_name='gc-service',
+                service_hash='gc-service-hash',
+                service_workspace='workspace-a',
+                service_lifecycle_epoch=4,
+                service_binding_epoch=5,
+                service_version=2,
+                replica_id=3,
+                replica_record_id=uuid.UUID(
+                    '22222222-2222-4222-8222-222222222222'),
+                launch_generation=1,
+                cluster_name='gc-service-3',
+                request_id=request_id,
+                input_digest='a' * 64,
+                owner_controller_incarnation=uuid.UUID(
+                    '33333333-3333-4333-8333-333333333333'),
+                owner_controller_epoch=6,
+                effect_phase='NOT_STARTED',
+                resolution='PRE_EFFECT_TERMINAL',
+                terminal_status='CANCELLED',
+                terminal_cause='dispatcher_submit_failed',
+                terminal_execution_generation=0,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=0,
+                execution_quiesced_at=now,
+                result_recorded_at=now,
+                projected_at=now,
+                pin_released_at=now,
+                tombstone_not_before=now - datetime.timedelta(seconds=1)))
+
+    request_values = request_postgres._request_values_for_db(
+        _bound_request(request_id))
+    request_values.update({
+        'ordinary_launch_association_id': association_id,
+        'status': requests.RequestStatus.SUCCEEDED.value,
+        'finished_at': now,
+        'terminal_cause': event_api_models.EventCause.HANDLER_SUCCEEDED.value,
+    })
+    inserted_during_delete = False
+
+    def _restore_request_before_delete(_connection, _cursor, statement,
+                                       _parameters, _context, _executemany):
+        nonlocal inserted_during_delete
+        if (inserted_during_delete or not statement.lstrip().startswith(
+                'DELETE FROM serve_ordinary_launch_associations')):
+            return
+        inserted_during_delete = True
+        with engine.begin() as contender:
+            contender.execute(
+                sqlalchemy.insert(
+                    request_postgres.REQUESTS).values(**request_values))
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _restore_request_before_delete)
+    try:
+        with engine.begin() as connection:
+            assert request_postgres.gc_bound_ordinary_launch_tombstones_in_transaction(
+                connection) == 0
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _restore_request_before_delete)
+    assert inserted_during_delete
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == association_id)).scalar_one() == 1
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id))
+    with engine.begin() as connection:
+        assert request_postgres.gc_bound_ordinary_launch_tombstones_in_transaction(
+            connection) == 1
+
+
+def test_bound_handler_is_filtered_by_local_inventory_and_claim_carries_owner(
+        request_database):
+    engine, backend = request_database
+    request_id = 'bound-local-handler-filter'
+    association_id = uuid.uuid4()
+    with engine.begin() as connection:
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection,
+            _bound_request(request_id),
+            ordinary_launch_association_id=association_id)
+
+    legacy_handler = registry.registration_for_handler(core.enabled_clouds).name
+    legacy_queue = request_postgres.PostgresQueueBackend(
+        'short', supported_handler_names=frozenset({legacy_handler}))
+    assert legacy_queue.qsize() == 0
+    assert legacy_queue.get() is None
+    with engine.connect() as connection:
+        delivery = connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                request_id)).mappings().one()
+    assert delivery['delivery_state'] == 'queued'
+
+    capable_queue = request_postgres.PostgresQueueBackend(
+        'short',
+        supported_handler_names=frozenset(
+            {ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME}))
+    item = capable_queue.get()
+    assert item is not None
+    assert item.request_id == request_id
+    assert item.worker_instance_id == capable_queue._instance_id
+    assert item.claim_token is not None
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token)
+
+
+def test_bound_effect_claim_requires_exact_request_queue_pin_and_owner(
+        request_database):
+    engine, backend = request_database
+    request_id = 'bound-effect-claim'
+    association_id = uuid.uuid4()
+    with engine.begin() as connection:
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection,
+            _bound_request(request_id),
+            ordinary_launch_association_id=association_id)
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    assert item.worker_instance_id is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    with engine.begin() as connection:
+        assert (request_postgres.
+                validate_bound_ordinary_launch_claim_in_transaction(
+                    connection, association_id, claim))
+
+    invalid_claims = (
+        dataclasses.replace(claim,
+                            execution_generation=claim.execution_generation +
+                            1),
+        dataclasses.replace(claim, claim_token=str(uuid.uuid4())),
+        dataclasses.replace(claim, worker_instance_id=str(uuid.uuid4())),
+        dataclasses.replace(claim, request_id='different-request'),
+    )
+    for invalid_claim in invalid_claims:
+        with engine.begin() as connection:
+            assert not (request_postgres.
+                        validate_bound_ordinary_launch_claim_in_transaction(
+                            connection, association_id, invalid_claim))
+
+    with engine.begin() as connection:
+        assert request_postgres.delete_request_retention_pin_in_transaction(
+            connection, request_id,
+            request_postgres.ORDINARY_LAUNCH_RETENTION_PIN_KIND, association_id)
+    with engine.begin() as connection:
+        assert not (request_postgres.
+                    validate_bound_ordinary_launch_claim_in_transaction(
+                        connection, association_id, claim))
+
+
+def _claim_gc_bound_request(engine, _backend):
+    """Admit one canonical association and stop in the claim handoff."""
+    identity = _gc_binding_identity()
+    request = _bound_request(identity.request_id)
+    with engine.begin() as connection:
+        admission = ordinary_launch_binding.insert_or_get_locked(
+            connection, identity)
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection,
+            request,
+            ordinary_launch_association_id=identity.association_id)
+    context = _gc_binding_context(identity, admission.launch_generation)
+    queue = request_postgres.PostgresQueueBackend('short')
+    item = queue.get()
+    assert item is not None
+    assert item.request_id == identity.request_id
+    assert item.claim_token is not None
+    assert item.worker_instance_id is not None
+    return identity, context, queue, item
+
+
+def _expire_claim(engine, request_id):
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    lease_expires_at=sqlalchemy.func.clock_timestamp() -
+                    datetime.timedelta(seconds=1)))
+
+
+def _keep_replica_projection(_connection, _projection):
+    return True
+
+
+def test_generic_reaper_leaves_expired_bound_claim_for_canonical_reducer(
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, queue, item = _claim_gc_bound_request(engine, backend)
+    _expire_claim(engine, identity.request_id)
+
+    # Exercise the losing scheduler order explicitly: the generic reaper gets
+    # the first transaction, but it cannot erase association-aware evidence.
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+    with engine.connect() as connection:
+        request_row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id)).mappings().one()
+        queue_row = connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                identity.request_id)).mappings().one()
+    assert request_row['status'] == requests.RequestStatus.PENDING.value
+    assert request_row['claim_token'] == uuid.UUID(item.claim_token)
+    assert request_row['worker_instance_id'] == uuid.UUID(
+        item.worker_instance_id)
+    assert queue_row['delivery_state'] == 'claimed'
+    assert queue_row['claim_generation'] == item.execution_generation
+
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+    assert reduction.request.quiescent
+    assert reduction.request.execution_quiesced_generation == (
+        item.execution_generation)
+
+
+def test_terminal_expired_bound_claim_settles_only_before_provider_io(
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    facts = request_postgres.request_bound_ordinary_launch_cancel(
+        context, _gc_binding_authority(), 'replica-teardown')
+    assert facts.status is requests.RequestStatus.CANCELLED
+    assert not facts.queue_exists
+    assert facts.claim_token == uuid.UUID(item.claim_token)
+    assert not facts.quiescent
+    _expire_claim(engine, identity.request_id)
+
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+    assert reduction.request.terminal_cause is (
+        event_api_models.EventCause.EXPLICIT_CANCEL)
+    assert reduction.request.quiescent
+    assert reduction.request.execution_quiesced_generation == (
+        item.execution_generation)
+    # Synthesized proof keeps the exact owner identity, so a late genuine ACK
+    # is an idempotent success instead of losing its generation.
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    assert backend.acknowledge_execution_quiescence(claim)
+
+
+def test_active_expired_bound_claim_preserves_prior_exact_quiescence(
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    # The handler's finally block can win after its terminal status CAS loses
+    # the lease race. Preserve this genuine receipt when expiry settles the
+    # still-active NOT_STARTED request.
+    assert backend.acknowledge_execution_quiescence(claim)
+    with engine.connect() as connection:
+        prior_quiesced_at = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.execution_quiesced_at).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    identity.request_id)).scalar_one()
+    _expire_claim(engine, identity.request_id)
+
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+    assert reduction.request.quiescent
+    assert reduction.request.execution_quiesced_at == prior_quiesced_at
+    assert reduction.request.terminal_cause is (
+        event_api_models.EventCause.EXECUTION_LEASE_EXPIRED)
+
+
+@pytest.mark.parametrize('terminal_before_expiry', [False, True])
+def test_expired_bound_claim_after_provider_io_is_ambiguous(
+        bound_request_database, terminal_before_expiry):
+    engine, backend = bound_request_database
+    identity, context, queue, item = _claim_gc_bound_request(engine, backend)
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token)
+    body = _bound_request(identity.request_id).request_body
+    ordinary_launch_binding.install_bound_context(body, identity,
+                                                  context.launch_generation)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    with ordinary_launch_binding.provider_effect_guard(
+            body.extra_launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_ordinary_launch_claim_in_transaction)):
+        pass
+    if terminal_before_expiry:
+        facts = request_postgres.request_bound_ordinary_launch_cancel(
+            context, _gc_binding_authority(), 'replica-teardown')
+        assert facts.status is requests.RequestStatus.CANCELLED
+        assert not facts.queue_exists
+    _expire_claim(engine, identity.request_id)
+    # When the queue still exists, generic request expiry must remain a no-op.
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
+    with engine.connect() as connection:
+        resolution = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                resolution).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == identity.association_id)).scalar_one()
+    assert resolution == ordinary_launch_binding.Resolution.AMBIGUOUS.value
+
+
+def test_malformed_success_result_is_durably_ambiguous(bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == identity.association_id).values(
+                      effect_phase=(ordinary_launch_binding.EffectPhase.
+                                    SERVICE_JOB_RECORDED.value),
+                      service_job_id=17,
+                      owner_revision=(
+                          ordinary_launch_binding.
+                          ordinary_launch_associations_table.c.owner_revision +
+                          1)))
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    active_claim = storage.activate_execution_claim(claim.request_id,
+                                                    claim.execution_generation,
+                                                    claim.claim_token)
+    try:
+        # A generic list is serializable, but it is not the exact
+        # ``(service_job_id, CloudVmRayResourceHandle)`` success contract.
+        assert backend.set_request_finished(identity.request_id,
+                                            requests.RequestStatus.SUCCEEDED,
+                                            result=[])
+    finally:
+        storage.deactivate_execution_claim(active_claim)
+    assert backend.acknowledge_execution_quiescence(claim)
+
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
+    with engine.connect() as connection:
+        ambiguity_code = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                ambiguity_code).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == identity.association_id)).scalar_one()
+    assert ambiguity_code == 'service-job-result-malformed-or-mismatched'
+
+
+def test_malformed_request_error_is_durably_ambiguous(bound_request_database):
+    engine, backend = bound_request_database
+    identity, context, _, _ = _claim_gc_bound_request(engine, backend)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id).values(
+                    error={
+                        'object': 'not-valid-encoded-exception',
+                        'type': 'ResourcesUnavailableError',
+                        'message': 'corrupt durable error',
+                    }))
+
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
+    with engine.connect() as connection:
+        ambiguity_code = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                ambiguity_code).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id == identity.association_id)).scalar_one()
+    assert ambiguity_code == 'request-error-malformed'
+
+
+def test_generic_retention_pin_blocks_candidates_and_final_delete(
+        request_database):
+    engine, backend = request_database
+    request_id = 'generically-pinned'
+    request = _request(request_id, should_enqueue=False)
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    assert backend.set_request_finished(request_id,
+                                        requests.RequestStatus.SUCCEEDED,
+                                        result=[])
+    pin_id = uuid.uuid4()
+    with engine.begin() as connection:
+        request_postgres.insert_request_retention_pin_in_transaction(
+            connection, request_id, 'test-owner.v1', pin_id)
+
+    candidates = backend.query_requests(
+        requests.RequestTaskFilter(request_ids=[request_id],
+                                   retention_safe=True))
+    assert candidates == []
+    asyncio.run(backend.delete_requests([request_id]))
+    assert backend.get_request(request_id) is not None
+
+    with engine.begin() as connection:
+        assert request_postgres.delete_request_retention_pin_in_transaction(
+            connection, request_id, 'test-owner.v1', pin_id)
+    assert [
+        request.request_id for request in backend.query_requests(
+            requests.RequestTaskFilter(request_ids=[request_id],
+                                       retention_safe=True))
+    ] == [request_id]
+    asyncio.run(backend.delete_requests([request_id]))
+    assert backend.get_request(request_id) is None
+
+
+def test_retention_pin_primary_key_kind_check_and_request_fk(request_database):
+    engine, backend = request_database
+    first_id = 'pin-owner-first'
+    second_id = 'pin-owner-second'
+    assert asyncio.run(
+        backend.create_if_not_exists_async(
+            _request(first_id, should_enqueue=False)))
+    assert asyncio.run(
+        backend.create_if_not_exists_async(
+            _request(second_id, should_enqueue=False)))
+    pin_id = uuid.uuid4()
+    with engine.begin() as connection:
+        request_postgres.insert_request_retention_pin_in_transaction(
+            connection, first_id, 'same-kind', pin_id)
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            request_postgres.insert_request_retention_pin_in_transaction(
+                connection, second_id, 'same-kind', pin_id)
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(
+                    request_postgres.REQUEST_RETENTION_PINS).values(
+                        request_id=second_id, pin_kind='', pin_id=uuid.uuid4()))
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with engine.begin() as connection:
+            request_postgres.insert_request_retention_pin_in_transaction(
+                connection, 'missing-request', 'test-owner.v1', uuid.uuid4())
+
+
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '008'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
         'api_request_store_metadata', 'api_controller_leadership',
         'api_controller_action_reservations', 'resource_events',
         'resource_event_targets', 'api_resource_actions',
-        'api_resource_action_attempts'
+        'api_resource_action_attempts', 'api_request_retention_pins'
     }.issubset(inspector.get_table_names())
     request_columns = {
         column['name'] for column in inspector.get_columns('api_requests')
@@ -676,10 +1526,21 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     assert 'event_context' in request_columns
     assert {'resource_action_id',
             'resource_action_attempt'}.issubset(request_columns)
+    assert 'ordinary_launch_association_id' in request_columns
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
         'execution_quiesced_at'
     }.issubset(request_columns)
+    instance_columns = {
+        column['name']
+        for column in inspector.get_columns('api_server_instances')
+    }
+    assert 'ordinary_launch_binding_capable' in instance_columns
+    binding_index = {
+        index['name']: index for index in inspector.get_indexes('api_requests')
+    }['uq_api_requests_ordinary_launch_association']
+    assert binding_index['unique']
+    assert binding_index['column_names'] == ['ordinary_launch_association_id']
     attempt_columns = {
         column['name']
         for column in inspector.get_columns('api_resource_action_attempts')
@@ -1014,21 +1875,22 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api006_downgrade_guard_retains_api008_head(request_database):
+def test_api009_downgrade_guard_retains_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
-    with pytest.raises(RuntimeError, match='additive and cannot be downgraded'):
+    with pytest.raises(RuntimeError, match='009 is additive'):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '008'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
+    assert 'api_request_retention_pins' in inspector.get_table_names()
 
 
-def test_api008_downgrade_guard_retains_quiescence_evidence(request_database):
+def test_api009_downgrade_guard_retains_binding_evidence(request_database):
     engine, _ = request_database
     columns_before = {
         column['name']
@@ -1041,14 +1903,14 @@ def test_api008_downgrade_guard_retains_quiescence_evidence(request_database):
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
 
-    with pytest.raises(RuntimeError, match='008 is additive'):
-        alembic_command.downgrade(config, '007')
+    with pytest.raises(RuntimeError, match='009 is additive'):
+        alembic_command.downgrade(config, '008')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '008'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
-        'execution_quiesced_at'
+        'execution_quiesced_at', 'ordinary_launch_association_id'
     } <= columns_before
     assert columns_before == {
         column['name']
@@ -1056,12 +1918,14 @@ def test_api008_downgrade_guard_retains_quiescence_evidence(request_database):
     }
     assert {
         'request_storage_backend', 'request_queue_backend',
-        'execution_quiescence_capable'
+        'execution_quiescence_capable', 'ordinary_launch_binding_capable'
     } <= instance_columns_before
     assert instance_columns_before == {
         column['name'] for column in sqlalchemy.inspect(engine).get_columns(
             'api_server_instances')
     }
+    assert 'api_request_retention_pins' in sqlalchemy.inspect(
+        engine).get_table_names()
 
 
 def test_server_instance_lease_publishes_ready_and_draining(
@@ -1103,6 +1967,9 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['request_queue_backend'] == (
         request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE)
     assert row['execution_quiescence_capable'] is True
+    assert row['ordinary_launch_binding_capable'] is True
+    assert (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME
+            in row['supported_handlers'])
     drain_marker.touch()
     assert not lease.is_locally_ready()
     assert not request_postgres.current_instance_is_ready()
@@ -1124,6 +1991,332 @@ def test_server_instance_lease_publishes_ready_and_draining(
                     instance_id))).mappings().one()
     assert not row['ready']
     assert row['draining_at'] is not None
+
+
+def test_binding_fleet_requires_every_recent_participant_and_local_handler(
+        request_database):
+    engine, _ = request_database
+    bound_handler = (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME)
+
+    def _insert_instance(connection,
+                         role,
+                         *,
+                         capable=True,
+                         handlers=(),
+                         ready=True,
+                         draining=False):
+        instance_id = uuid.uuid4()
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=instance_id,
+                role=role,
+                version='api009',
+                started_at=sqlalchemy.func.clock_timestamp(),
+                heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                draining_at=(sqlalchemy.func.clock_timestamp()
+                             if draining else None),
+                ready=ready,
+                health_detail={},
+                supported_handlers=list(handlers),
+                supported_payload_versions={},
+                ordinary_launch_binding_capable=capable))
+        return instance_id
+
+    with engine.begin() as connection:
+        _insert_instance(connection, 'api')
+        _insert_instance(connection, 'executor', handlers=(bound_handler,))
+        _insert_instance(connection, 'controller')
+    assert request_postgres.ordinary_launch_binding_fleet_capable()
+
+    with engine.begin() as connection:
+        legacy_controller = _insert_instance(connection,
+                                             'controller',
+                                             capable=False,
+                                             ready=False,
+                                             draining=True)
+    assert not request_postgres.ordinary_launch_binding_fleet_capable()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id ==
+                legacy_controller).values(
+                    heartbeat_at=sqlalchemy.func.clock_timestamp() -
+                    datetime.timedelta(seconds=(
+                        request_postgres.
+                        ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS +
+                        1))))
+    assert request_postgres.ordinary_launch_binding_fleet_capable()
+
+    with engine.begin() as connection:
+        draining_legacy = _insert_instance(connection,
+                                           'executor',
+                                           capable=False,
+                                           ready=False,
+                                           draining=True)
+    assert not request_postgres.ordinary_launch_binding_fleet_capable()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id ==
+                draining_legacy).values(
+                    heartbeat_at=sqlalchemy.func.clock_timestamp() -
+                    datetime.timedelta(seconds=(
+                        request_postgres.
+                        ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS +
+                        1))))
+    assert request_postgres.ordinary_launch_binding_fleet_capable()
+
+    with engine.begin() as connection:
+        _insert_instance(connection,
+                         'executor',
+                         capable=True,
+                         handlers=(),
+                         ready=False)
+    assert not request_postgres.ordinary_launch_binding_fleet_capable()
+
+
+def test_legacy_admission_waits_behind_service_promotion_lock(
+        bound_request_database):
+    engine, backend = bound_request_database
+    request = _legacy_serve_launch_request('legacy-admission-after-scan')
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        with serve_state.service_replica_launch_authority_write_session(
+                'gc-service') as (_, session):
+            assert request_postgres._legacy_ordinary_launch_requests_drained_in_transaction(
+                session.connection(), 'gc-service')
+            future = executor.submit(lambda: asyncio.run(
+                backend.create_if_not_exists_async(request)))
+
+            deadline = time.monotonic() + 10
+            while True:
+                with engine.connect() as observer:
+                    waiting = observer.execute(
+                        sqlalchemy.text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND pid <> pg_backend_pid() "
+                            "AND state = 'active' "
+                            "AND wait_event_type = 'Lock' "
+                            "AND query LIKE "
+                            "'SELECT pg_catalog.pg_advisory_xact_lock_shared%')"
+                        )).scalar_one()
+                if waiting:
+                    break
+                if future.done():
+                    future.result()
+                    pytest.fail('Legacy admission crossed the exclusive '
+                                'service transition lock.')
+                if time.monotonic() >= deadline:
+                    pytest.fail('Legacy admission did not reach the shared '
+                                'service transition lock.')
+                time.sleep(0.01)
+            assert not future.done()
+
+        assert future.result(timeout=10)
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).mappings().one()
+    assert row['handler_name'] == 'sky.execution:launch'
+
+
+def test_legacy_drain_does_not_deadlock_queue_claimant_lock_upgrade(
+        bound_request_database):
+    engine, backend = bound_request_database
+    request = _legacy_serve_launch_request('legacy-claim-during-drain')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    worker = engine.connect()
+    worker_transaction = worker.begin()
+    worker.exec_driver_sql("SET LOCAL lock_timeout = '1s'")
+    locked = worker.execute(
+        sqlalchemy.select(
+            request_postgres.QUEUE, request_postgres.REQUESTS).join(
+                request_postgres.REQUESTS,
+                request_postgres.REQUESTS.c.request_id ==
+                request_postgres.QUEUE.c.request_id).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    request.request_id).with_for_update()).mappings().one()
+    execution_generation = int(locked['execution_generation'])
+
+    scan_started = threading.Event()
+    scanner_pid: list[int] = []
+
+    def _scan_legacy_requests() -> bool:
+        with engine.begin() as connection:
+            scanner_pid.append(
+                int(
+                    connection.execute(
+                        sqlalchemy.text(
+                            'SELECT pg_backend_pid()')).scalar_one()))
+            scan_started.set()
+            return request_postgres._legacy_ordinary_launch_requests_drained_in_transaction(
+                connection, 'gc-service')
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_scan_legacy_requests)
+    try:
+        assert scan_started.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while True:
+            with engine.connect() as observer:
+                waiting = observer.execute(
+                    sqlalchemy.text("SELECT wait_event_type = 'Lock' "
+                                    'FROM pg_stat_activity WHERE pid = :pid'), {
+                                        'pid': scanner_pid[0]
+                                    }).scalar_one_or_none()
+            if waiting:
+                break
+            if future.done():
+                future.result()
+                pytest.fail('Legacy drain did not wait for the claimed row.')
+            if time.monotonic() >= deadline:
+                pytest.fail('Legacy drain did not reach the claimed row lock.')
+            time.sleep(0.01)
+
+        now = sqlalchemy.func.clock_timestamp()
+        worker.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id).values(
+                    status=requests.RequestStatus.CANCELLED.value,
+                    terminal_cause=(
+                        event_api_models.EventCause.EXPLICIT_CANCEL.value),
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=execution_generation,
+                    execution_quiesced_at=now,
+                    finished_at=now))
+        worker.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == request.request_id))
+        worker_transaction.commit()
+        assert future.result(timeout=10)
+    finally:
+        if worker_transaction.is_active:
+            worker_transaction.rollback()
+        worker.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def test_bound_cancel_intent_does_not_wait_for_shared_provider_guard(
+        bound_request_database):
+    engine, _ = bound_request_database
+    identity = _gc_binding_identity()
+    with engine.begin() as connection:
+        admission = ordinary_launch_binding.insert_or_get_locked(
+            connection, identity)
+    context = _gc_binding_context(identity, admission.launch_generation)
+    authority = _gc_binding_authority()
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    try:
+        with serve_state.service_replica_launch_authority_guard('gc-service'):
+            future = executor.submit(
+                request_postgres._commit_bound_ordinary_launch_cancel_intent,
+                context, authority, 'replica-teardown')
+            # Cancellation is the operation that interrupts an opaque provider
+            # call.  It must commit while that call still owns the shared guard.
+            assert future.result(timeout=2) is None
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == identity.association_id)).mappings().one()
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.CANCEL_REQUESTED.value)
+    assert association['cancel_reason'] == 'replica-teardown'
+    assert association['cancel_requested_at'] is not None
+
+
+def test_demotion_retry_is_idempotent_only_for_exact_transition(
+        bound_request_database):
+    engine, _ = bound_request_database
+    authority = ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='gc-service',
+        service_hash='gc-service-hash',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=4,
+        controller_pid=123,
+        controller_ip='10.0.0.2',
+        controller_incarnation=uuid.UUID(
+            '33333333-3333-4333-8333-333333333333'),
+        controller_owner_epoch=6,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=5)
+
+    assert request_postgres.demote_ordinary_launch_binding_service(
+        authority) == 6
+    # The stale bound authority deliberately fails the wrapper's normal BOUND
+    # barrier. Success proves the exact already-legacy path is evaluated first.
+    assert request_postgres.demote_ordinary_launch_binding_service(
+        authority) == 6
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.
+                ordinary_launch_binding_mode, serve_state_schema.services_table.
+                c.ordinary_launch_binding_epoch).where(
+                    serve_state_schema.services_table.c.name ==
+                    'gc-service')).one()
+    assert row.ordinary_launch_binding_mode == 'legacy'
+    assert row.ordinary_launch_binding_epoch == 6
+
+
+def test_demotion_waits_for_legacy_request_admitted_while_bound(
+        bound_request_database):
+    engine, backend = bound_request_database
+    request = _legacy_serve_launch_request('legacy-admitted-while-bound')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    authority = ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='gc-service',
+        service_hash='gc-service-hash',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=4,
+        controller_pid=123,
+        controller_ip='10.0.0.2',
+        controller_incarnation=_GC_CONTROLLER_ID,
+        controller_owner_epoch=6,
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        binding_epoch=5)
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
+                       match='request/pin quiescence barrier'):
+        request_postgres.demote_ordinary_launch_binding_service(authority)
+
+    now = sqlalchemy.func.clock_timestamp()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id).values(
+                    status=requests.RequestStatus.CANCELLED.value,
+                    terminal_cause=(
+                        event_api_models.EventCause.EXPLICIT_CANCEL.value),
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=(
+                        request_postgres.REQUESTS.c.execution_generation),
+                    execution_quiesced_at=now,
+                    finished_at=now))
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == request.request_id))
+
+    assert request_postgres.demote_ordinary_launch_binding_service(
+        authority) == 6
 
 
 def test_server_instance_lease_rejects_plugin_backend_subclasses(
@@ -1155,6 +2348,7 @@ def test_server_instance_lease_rejects_plugin_backend_subclasses(
         assert row['request_storage_backend'].endswith('.PluginRequestBackend')
         assert row['request_queue_backend'].endswith('.PluginQueueFactory')
         assert row['execution_quiescence_capable'] is False
+        assert row['ordinary_launch_binding_capable'] is False
     finally:
         lease.stop()
 
@@ -2478,11 +3672,66 @@ def test_registry_rejects_row_selected_code_and_execution_class():
         requests.Request.from_durable_values(values)
 
 
+def test_bound_handler_and_effect_bridge_require_active_full_claim(monkeypatch):
+    monkeypatch.setattr(ordinary_launch_request, 'execution', mock.Mock())
+    ordinary_launch_request.execution.launch.return_value = 'launched'
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='no exact durable execution claim'):
+        ordinary_launch_request.launch()
+
+    claim = storage.ExecutionClaim('request-id', 3, str(uuid.uuid4()),
+                                   str(uuid.uuid4()))
+    token = storage.activate_execution_claim(claim.request_id,
+                                             claim.execution_generation,
+                                             claim.claim_token,
+                                             claim.worker_instance_id)
+    try:
+        assert ordinary_launch_request.launch('task') == 'launched'
+        ordinary_launch_request.execution.launch.assert_called_once_with('task')
+
+        fake_binding = mock.Mock()
+        guard = mock.MagicMock()
+        fake_binding.provider_effect_guard.return_value = guard
+        validator = mock.Mock()
+        fake_postgres = mock.Mock()
+        fake_postgres.validate_bound_ordinary_launch_claim_in_transaction = (
+            validator)
+        monkeypatch.setattr(ordinary_launch_request, 'ordinary_launch_binding',
+                            fake_binding)
+        monkeypatch.setattr(ordinary_launch_request, 'request_postgres',
+                            fake_postgres)
+        bound_context = {
+            'sky_serve_ordinary_launch_association_id': str(uuid.uuid4()),
+            'sky_serve_ordinary_launch_generation': 1,
+            'sky_serve_ordinary_launch_request_id': claim.request_id,
+            'sky_serve_ordinary_launch_input_digest': 'a' * 64,
+        }
+        assert ordinary_launch_request._provider_effect_guard(
+            bound_context) is guard
+        fake_binding.parse_bound_launch_context.assert_called_once_with(
+            bound_context)
+        fake_binding.provider_effect_guard.assert_called_once_with(
+            bound_context, claim, claim_validator=validator)
+    finally:
+        storage.deactivate_execution_claim(token)
+
+    with ordinary_launch_request._provider_effect_guard({}) as authorization:
+        assert authorization is None
+    fake_binding.reset_mock()
+    fake_binding.parse_bound_launch_context.side_effect = ValueError(
+        'partial bound context')
+    with pytest.raises(ValueError, match='partial bound context'):
+        ordinary_launch_request._provider_effect_guard(
+            {'sky_serve_ordinary_launch_request_id': 'partial'})
+
+
 def test_registry_owns_controller_classes_and_replay_policies():
     jobs_launch = registry.registration_for_handler(managed_jobs_core.launch)
     jobs_queue = registry.registration_for_handler(managed_jobs_core.queue)
     serve_status = registry.registration_for_handler(serve_core.status)
     normal_read = registry.registration_for_handler(core.enabled_clouds)
+    bound_launch = registry.registration_for_handler(
+        ordinary_launch_request.launch)
     volume_apply = registry.registration_for_handler(volume_core.volume_apply)
     volume_delete = registry.registration_for_handler(volume_core.volume_delete)
     volume_list = registry.registration_for_handler(volume_core.volume_list)
@@ -2497,6 +3746,10 @@ def test_registry_owns_controller_classes_and_replay_policies():
     assert serve_status.replay_policy is registry.ReplayPolicy.READ_ONLY
     assert normal_read.execution_class is registry.ExecutionClass.NORMAL
     assert normal_read.replay_policy is registry.ReplayPolicy.READ_ONLY
+    assert bound_launch.name == (
+        ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME)
+    assert bound_launch.execution_class is registry.ExecutionClass.NORMAL
+    assert bound_launch.replay_policy is registry.ReplayPolicy.NEVER
     assert volume_apply.execution_class is registry.ExecutionClass.NORMAL
     assert volume_apply.replay_policy is registry.ReplayPolicy.NEVER
     assert volume_delete.execution_class is registry.ExecutionClass.NORMAL
@@ -3008,17 +4261,10 @@ def _quiescence_state(engine, request_id):
                     request_id)).first()
 
 
-def test_orphaned_execution_quiescence_is_reaped(request_database):
-    """A dead executor's unacknowledged quiescence must not wedge barriers.
-
-    Serve's interrupted reserved-fill recovery waits for every cancelled
-    launch to prove quiescence. Only the owning worker may publish that
-    proof, so a worker killed mid-flight (an API server restart) leaves the
-    row unprovable and blocks the whole replica manager forever.
-    """
+def test_expired_or_absent_lease_does_not_invent_quiescence(request_database):
+    """Lease timeout revokes authority but is not positive process death."""
     engine, backend = request_database
-    stale = datetime.timedelta(
-        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    stale = datetime.timedelta(seconds=360)
     _orphaned_quiescence_row(engine,
                              backend,
                              'orphaned-quiescence',
@@ -3029,8 +4275,8 @@ def test_orphaned_execution_quiescence_is_reaped(request_database):
     assert queue.get() is None
 
     row = _quiescence_state(engine, 'orphaned-quiescence')
-    assert row.execution_quiesced_generation == 1
-    assert row.execution_quiesced_at is not None
+    assert row.execution_quiesced_generation is None
+    assert row.execution_quiesced_at is None
 
 
 def test_recently_finished_execution_keeps_its_own_acknowledgement(
@@ -3054,8 +4300,7 @@ def test_recently_finished_execution_keeps_its_own_acknowledgement(
 def test_live_lease_holder_is_never_declared_quiescent(request_database):
     """A live lease is the one thing that may still run effect-bearing code."""
     engine, backend = request_database
-    stale = datetime.timedelta(
-        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    stale = datetime.timedelta(seconds=360)
     _orphaned_quiescence_row(engine,
                              backend,
                              'live-lease',
@@ -3072,8 +4317,7 @@ def test_live_lease_holder_is_never_declared_quiescent(request_database):
 
 def test_requests_without_a_quiescence_contract_are_untouched(request_database):
     engine, backend = request_database
-    stale = datetime.timedelta(
-        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    stale = datetime.timedelta(seconds=360)
     _orphaned_quiescence_row(engine,
                              backend,
                              'no-contract',
@@ -3092,8 +4336,7 @@ def test_requests_without_a_quiescence_contract_are_untouched(request_database):
 def test_non_terminal_requests_are_never_reaped(request_database):
     """An unfinished execution is still running; it owns its own proof."""
     engine, backend = request_database
-    stale = datetime.timedelta(
-        seconds=request_postgres._ORPHANED_QUIESCENCE_GRACE_SECONDS + 60)
+    stale = datetime.timedelta(seconds=360)
     _orphaned_quiescence_row(engine,
                              backend,
                              'still-running',

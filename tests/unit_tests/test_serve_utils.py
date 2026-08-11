@@ -23,6 +23,7 @@ from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
 from sky.serve import maintenance
+from sky.serve import ordinary_launch_binding
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -2636,6 +2637,67 @@ def test_all_down_uses_controller_distributed_lifecycle_fence(tmp_path):
                                        expected_lifecycle_epoch=23)
 
 
+@pytest.mark.parametrize('bound_mode', [True, False])
+def test_down_uses_atomic_begin_or_unsupported_legacy_fallback(
+        tmp_path, bound_mode):
+    """Bound down cannot queue behind its request's provider retry guard."""
+    record = {
+        'name': 'svc',
+        'status': serve_state.ServiceStatus.READY,
+        'pool': False,
+        'hash': 'incarnation-a',
+        'controller_pid': 123,
+        'controller_ip': '10.0.0.1',
+    }
+    lifecycle_lock = mock.MagicMock(epoch=23)
+    authority = object() if bound_mode else None
+    teardown_result = ordinary_launch_binding.ServiceTeardownResult(
+        (ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND
+         if bound_mode else
+         ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED),
+        authority)
+    signal_template = str(tmp_path / '{}.signal')
+    with mock.patch.object(serve_state,
+                           'get_glob_service_names',
+                           return_value=['svc']), \
+         mock.patch.object(serve_utils,
+                           '_get_service_status',
+                           return_value=record), \
+         mock.patch.object(serve_state,
+                           'get_service_controller_owner',
+                           return_value=record), \
+         mock.patch.object(serve_utils,
+                           'get_service_lifecycle_lock',
+                           return_value=lifecycle_lock), \
+         mock.patch.object(serve_utils,
+                           'lifecycle_lock_is_valid',
+                           return_value=True), \
+         mock.patch(
+             'sky.serve.ordinary_launch_binding.'
+             'begin_service_teardown_if_owner',
+             return_value=teardown_result) as begin_teardown, \
+         mock.patch.object(
+             serve_state,
+             'set_service_status_and_active_versions_if_hash',
+             return_value=True) as legacy_set_status, \
+         mock.patch.object(constants, 'SIGNAL_FILE_PATH', signal_template):
+        message = serve_utils.terminate_services(['svc'],
+                                                 purge=False,
+                                                 pool=False)
+
+    assert 'scheduled to be terminated' in message
+    begin_teardown.assert_called_once_with('svc', 'incarnation-a',
+                                           (123, '10.0.0.1'))
+    if bound_mode:
+        legacy_set_status.assert_not_called()
+    else:
+        legacy_set_status.assert_called_once_with(
+            'svc',
+            'incarnation-a',
+            serve_state.ServiceStatus.SHUTTING_DOWN,
+            expected_lifecycle_epoch=23)
+
+
 class TestPoolStatusBatchedQuery:
     """`_get_service_status(pool=True)` must batch its per-replica job lookups
     into a single grouped query. The previous per-replica fan-out scaled with
@@ -4521,7 +4583,10 @@ class TestTerminateFailedServices:
              terminate_side_effect=None,
              lb_side_effect=None,
              resource_scope=None,
-             teardown_identities=None):
+             teardown_identities=None,
+             bound_authority=None,
+             bound_settle_side_effect=None,
+             quiesce_side_effect=None):
         terminated = []
         self.termination_kwargs = []
 
@@ -4543,13 +4608,27 @@ class TestTerminateFailedServices:
 
         lifecycle_lock = mock.MagicMock()
         lifecycle_lock.epoch = 17
+        teardown_result = ordinary_launch_binding.ServiceTeardownResult(
+            (ordinary_launch_binding.ServiceTeardownDisposition.MARKED_BOUND
+             if bound_authority is not None else
+             ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED),
+            bound_authority)
         with mock.patch(
                 'sky.serve.serve_utils.serve_state.get_replica_infos',
                 return_value=replica_infos), \
              mock.patch(
                  'sky.serve.serve_utils.'
                  'quiesce_service_replica_launch_requests',
-                 return_value=True) as quiesce, \
+                 return_value=True,
+                 side_effect=quiesce_side_effect) as quiesce, \
+             mock.patch(
+                 'sky.serve.ordinary_launch_binding.'
+                 'begin_service_teardown_if_owner',
+                 return_value=teardown_result), \
+             mock.patch(
+                 'sky.serve.service.'
+                 '_settle_bound_ordinary_launches_for_teardown',
+                 side_effect=bound_settle_side_effect) as settle_bound, \
              mock.patch(
                  'sky.serve.serve_utils.global_user_state.'
                  'get_cluster_status_fields',
@@ -4596,6 +4675,7 @@ class TestTerminateFailedServices:
             result = serve_utils._terminate_failed_services(
                 'svc', 'incarnation-a', None)
         self.quiesce = quiesce
+        self.settle_bound = settle_bound
         return (terminated, remove_service, delete_lb, result.message,
                 set_owner_status, remove_directory)
 
@@ -4618,6 +4698,46 @@ class TestTerminateFailedServices:
                                                'incarnation-a',
                                                expected_lifecycle_epoch=17)
         assert message is None
+
+    def test_bound_launches_settle_before_generic_quiescence(self):
+        events = []
+        authority = object()
+        info = self._replica(1, 'svc-1')
+
+        def _settle(*_args):
+            events.append('exact-settle')
+
+        def _quiesce(*_args, **_kwargs):
+            events.append('generic-quiesce')
+            return True
+
+        _, remove_service, _, message, _, _ = self._run(
+            [info],
+            exists=lambda _name: False,
+            bound_authority=authority,
+            bound_settle_side_effect=_settle,
+            quiesce_side_effect=_quiesce)
+
+        assert message is None
+        assert events == ['exact-settle', 'generic-quiesce']
+        self.settle_bound.assert_called_once_with(authority, [info])
+        remove_service.assert_called_once()
+
+    def test_bound_settlement_failure_retains_all_cleanup_rows(self):
+        authority = object()
+        info = self._replica(1, 'svc-1')
+        terminated, remove_service, delete_lb, message, _, _ = self._run(
+            [info],
+            exists=lambda _name: True,
+            bound_authority=authority,
+            bound_settle_side_effect=RuntimeError('owner changed'))
+
+        assert message is not None and 'could not be cancelled and settled' in (
+            message)
+        assert not terminated
+        self.quiesce.assert_not_called()
+        delete_lb.assert_not_called()
+        remove_service.assert_not_called()
 
     def test_action_owned_cluster_termination_uses_exact_record_uuid(self):
         info = self._replica(1, 'svc-1')
@@ -5130,6 +5250,107 @@ class TestTerminateFailedServices:
                                       os.getpid(),
                                       os.environ.get('POD_IP'),
                                       expected_lifecycle_epoch=17)
+
+    def test_bound_orphan_settles_then_rotates_authority_before_claim(self):
+        lifecycle_lock = mock.MagicMock(epoch=17)
+        old_owner = {
+            'hash': 'incarnation-a',
+            'controller_pid': 101,
+            'controller_ip': '10.0.0.1',
+            'controller_port': None,
+        }
+        purge_owner = (os.getpid(), os.environ.get('POD_IP'))
+        claimed_owner = {
+            **old_owner,
+            'controller_pid': purge_owner[0],
+            'controller_ip': purge_owner[1],
+            'controller_port': constants.CONTROLLER_TEARDOWN_ACK_PORT,
+        }
+        old_authority = object()
+        claimed_authority = object()
+        events = []
+
+        def _settle(*_args):
+            events.append('exact-settle')
+
+        def _rotate(*_args, **_kwargs):
+            events.append('rotate-authority')
+            return claimed_authority
+
+        def _claim(*_args, **_kwargs):
+            events.append('claim-orphan')
+            return True
+
+        with mock.patch.object(serve_utils,
+                               'lifecycle_lock_is_valid',
+                               return_value=True), \
+             mock.patch.object(serve_state,
+                               'service_owner_matches',
+                               return_value=True), \
+             mock.patch.object(
+                 serve_state,
+                 'set_service_status_and_active_versions_if_hash') as legacy, \
+             mock.patch.object(
+                 serve_state,
+                 'get_service_controller_owner',
+                 side_effect=[old_owner, claimed_owner]), \
+             mock.patch(
+                 'sky.serve.ordinary_launch_binding.'
+                 'begin_service_teardown_if_owner',
+                 return_value=ordinary_launch_binding.ServiceTeardownResult(
+                     ordinary_launch_binding.ServiceTeardownDisposition.
+                     MARKED_BOUND, old_authority)), \
+             mock.patch(
+                 'sky.serve.service.'
+                 '_settle_bound_ordinary_launches_for_teardown',
+                 side_effect=_settle) as settle, \
+             mock.patch(
+                 'sky.serve.ordinary_launch_binding.'
+                 'claim_controller_incarnation',
+                 side_effect=_rotate) as rotate, \
+             mock.patch.object(serve_state,
+                               'get_ha_recovery_script',
+                               return_value=None), \
+             mock.patch.object(serve_state,
+                               'claim_orphaned_service_teardown',
+                               side_effect=_claim) as claim, \
+             mock.patch.object(serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 serve_utils,
+                 'quiesce_service_replica_launch_requests',
+                 return_value=True), \
+             mock.patch.object(serve_utils, 'remove_service_directory'), \
+             mock.patch.object(serve_state,
+                               'remove_service_completely',
+                               return_value=True), \
+             mock.patch(
+                 'sky.serve.lb_k8s.get_api_deployment_owner_uid',
+                 return_value='api-deployment-uid'), \
+             mock.patch('sky.serve.lb_k8s.delete_lb_objects'):
+            message = serve_utils._terminate_failed_services_locked(
+                'svc', 'incarnation-a', False, lifecycle_lock)
+
+        assert message is None
+        assert events == ['exact-settle', 'rotate-authority', 'claim-orphan']
+        settle.assert_called_once_with(old_authority, [])
+        rotate.assert_called_once_with(
+            'svc',
+            'incarnation-a', (101, '10.0.0.1'),
+            mock.ANY,
+            new_parent_owner=purge_owner,
+            expected_lifecycle_epoch=17,
+            expected_status=serve_state.ServiceStatus.SHUTTING_DOWN,
+            wait_for_authority=False)
+        claim.assert_called_once_with('svc',
+                                      'incarnation-a',
+                                      purge_owner[0],
+                                      purge_owner[1],
+                                      purge_owner[0],
+                                      purge_owner[1],
+                                      expected_lifecycle_epoch=17)
+        legacy.assert_not_called()
 
     def test_orphan_with_unbootable_recovery_script_can_claim_teardown(self):
         lifecycle_lock = mock.MagicMock()

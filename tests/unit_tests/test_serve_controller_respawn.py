@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 import hashlib
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -74,6 +75,9 @@ def _setup(monkeypatch,
         latest_snapshot = (1, _spec())
     monkeypatch.setattr(serve_state, 'get_recovery_version_spec',
                         lambda unused_name: latest_snapshot)
+    monkeypatch.setattr(service.ordinary_launch_binding,
+                        'claim_controller_incarnation',
+                        lambda *unused_args, **unused_kwargs: None)
 
     spawn_calls = []
 
@@ -88,6 +92,8 @@ def _setup(monkeypatch,
             'service_hash': service_hash,
             'controller_ip': controller_ip,
             'enforce_launch_fence': kwargs.get('enforce_launch_fence', False),
+            'controller_binding_authority':
+                kwargs.get('controller_binding_authority'),
         })
         if isinstance(new_controller, BaseException):
             raise new_controller
@@ -221,6 +227,73 @@ def test_respawn_port_publish_fences_hash_pid_and_ip(monkeypatch):
     assert result == (replacement, _PORT)
     assert owner_calls == [('svc', 'incarnation-a', service.os.getpid(),
                             '10.0.0.2', _PORT)]
+
+
+def test_same_parent_respawn_claims_fresh_child_authority(monkeypatch):
+    replacement = _FakeProc(True, 333)
+    spawn_calls, _ = _setup(monkeypatch, new_controller=replacement)
+    claims = []
+    publications = []
+
+    def _claim(service_name, service_hash, expected_parent_owner,
+               incarnation_uuid, **kwargs):
+        claims.append((service_name, service_hash, expected_parent_owner,
+                       incarnation_uuid, kwargs))
+        return service.ordinary_launch_binding.ControllerBindingAuthority(
+            service_name=service_name,
+            service_hash=service_hash,
+            service_workspace='workspace-a',
+            service_lifecycle_epoch=4,
+            controller_pid=service.os.getpid(),
+            controller_ip='10.0.0.2',
+            controller_incarnation=incarnation_uuid,
+            controller_owner_epoch=6 + len(claims),
+            capable=True,
+            binding_mode=(service.ordinary_launch_binding.BindingMode.BOUND),
+            binding_epoch=5)
+
+    monkeypatch.setattr(service.ordinary_launch_binding,
+                        'claim_controller_incarnation', _claim)
+    monkeypatch.setattr(
+        service.ordinary_launch_binding, 'publish_controller_port_if_authority',
+        lambda authority, port: publications.append((authority, port)) or True)
+
+    for dead_pid in (111, 112):
+        assert service._respawn_controller(
+            'svc',
+            '127.0.0.1',
+            _FakeProc(False, dead_pid),
+            service_hash=_HASH,
+            controller_ip='10.0.0.2') == (replacement, _PORT)
+
+    assert [claim[2] for claim in claims] == [(service.os.getpid(), '10.0.0.2'),
+                                              (service.os.getpid(), '10.0.0.2')]
+    assert claims[0][3] != claims[1][3]
+    assert all(claim[4]['new_parent_owner'] == claim[2] for claim in claims)
+    assert all(claim[4]['wait_for_authority'] is False for claim in claims)
+    assert [
+        call['controller_binding_authority'].controller_owner_epoch
+        for call in spawn_calls
+    ] == [7, 8]
+    assert [authority for authority, _ in publications
+           ] == [call['controller_binding_authority'] for call in spawn_calls]
+
+
+def test_respawn_defers_instead_of_waiting_for_provider_authority(monkeypatch):
+    spawn_calls, _ = _setup(monkeypatch, new_controller=_FakeProc(True, 333))
+    monkeypatch.setattr(
+        service.ordinary_launch_binding, 'claim_controller_incarnation',
+        mock.Mock(side_effect=(service.ordinary_launch_binding.
+                               OrdinaryLaunchBindingBusy('provider active'))))
+
+    result = service._respawn_controller('svc',
+                                         '127.0.0.1',
+                                         _FakeProc(False, 111),
+                                         service_hash=_HASH,
+                                         controller_ip='10.0.0.2')
+
+    assert result is None
+    assert not spawn_calls
 
 
 def test_respawn_reloads_latest_committed_spec(monkeypatch):

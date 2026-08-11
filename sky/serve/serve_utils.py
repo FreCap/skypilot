@@ -2571,6 +2571,64 @@ def cleanup_staged_config_update_encoded(service_name: str, service_hash: str,
     return bool(response.json().get('removed', False))
 
 
+def set_ordinary_launch_binding_mode_encoded(
+    service_name: str,
+    mode: str,
+    expected_service_hash: str,
+    expected_binding_epoch: int,
+) -> dict[str, Any]:
+    """Ask the exact live controller to run a fenced binding transition."""
+    if mode not in ('legacy', 'bound'):
+        raise ValueError(
+            'Ordinary launch binding mode must be legacy or bound.')
+    if (isinstance(expected_binding_epoch, bool) or
+            not isinstance(expected_binding_epoch, int) or
+            expected_binding_epoch < 0):
+        raise ValueError(
+            'Expected ordinary launch binding epoch must be nonnegative.')
+    service_status = _get_service_status(service_name,
+                                         pool=False,
+                                         with_replica_info=False,
+                                         with_yaml=False,
+                                         status_snapshot_only=True)
+    if service_status is None:
+        raise ValueError(f'Service {service_name!r} does not exist.')
+    service_hash = service_status['hash']
+    if service_hash != expected_service_hash:
+        raise RuntimeError(f'Service {service_name!r} was replaced before '
+                           'the binding transition was submitted.')
+    response = _post_to_controller_with_retry(
+        service_name,
+        service_hash,
+        constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+        json={
+            'mode': mode,
+            'expected_service_hash': expected_service_hash,
+            'expected_binding_epoch': expected_binding_epoch,
+        },
+        timeout=(_CONTROLLER_HTTP_TIMEOUT_SECONDS[0],
+                 constants.UPDATE_SERVICE_TIMEOUT_SECONDS))
+    if response.status_code == 404:
+        raise RuntimeError(
+            f'Service {service_name!r} controller does not support durable '
+            'ordinary-launch binding transitions.')
+    if response.status_code == 409:
+        raise RuntimeError(
+            f'Binding transition for service {service_name!r} was rejected: '
+            f'{response.text}')
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Binding transition for service {service_name!r} failed: '
+            f'{response.text}')
+    result = response.json()
+    epoch = result.get('binding_epoch')
+    if (result.get('binding_mode') != mode or isinstance(epoch, bool) or
+            not isinstance(epoch, int) or epoch < 1):
+        raise RuntimeError(
+            'Controller returned an invalid ordinary-launch binding epoch.')
+    return result
+
+
 def update_service_encoded(service_name: str,
                            version: int,
                            mode: str,
@@ -3887,6 +3945,44 @@ def _purge_ownership_failure(service_name: str, detail: str) -> str:
             f'{colorama.Style.RESET_ALL}')
 
 
+def _begin_service_teardown_if_owner(
+    service_name: str,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_lifecycle_epoch: int,
+) -> tuple[bool, Any | None]:
+    """Publish SHUTTING_DOWN without blocking bound request cancellation.
+
+    Bound ordinary launches can hold the shared launch-authority advisory
+    guard for an entire provider retry.  Their cancellation must therefore be
+    made reachable by the canonical row-lock transition before any exclusive
+    writer is attempted.  Serve042 legacy mode is classified and marked in the
+    same transaction, closing promotion races; unsupported stores keep the
+    established advisory-locked hash CAS.
+
+    Returns whether teardown was published and, for bound mode, the exact
+    controller authority that may cancel and reduce existing associations.
+    Binding conflicts are intentionally raised so cleanup fails closed.
+    """
+    # Local to avoid loading the PostgreSQL-only binding state machine on
+    # legacy CLI paths during serve_utils import.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import ordinary_launch_binding
+
+    # pylint: enable=import-outside-toplevel
+    result = ordinary_launch_binding.begin_service_teardown_if_owner(
+        service_name, expected_service_hash, expected_controller_owner)
+    if result.disposition != (
+            ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED):
+        return True, result.authority
+    marked = serve_state.set_service_status_and_active_versions_if_hash(
+        service_name,
+        expected_service_hash,
+        serve_state.ServiceStatus.SHUTTING_DOWN,
+        expected_lifecycle_epoch=expected_lifecycle_epoch)
+    return marked, None
+
+
 def quiesce_service_replica_launch_requests(
     service_name: str,
     replica_infos: list['replica_managers.ReplicaInfo'],
@@ -4245,28 +4341,110 @@ def _terminate_failed_services_locked(
     if not _still_owns():
         return _purge_ownership_failure(service_name,
                                         'ownership lost before cleanup')
-    if not serve_state.set_service_status_and_active_versions_if_hash(
-            service_name,
-            expected_service_hash,
-            serve_state.ServiceStatus.SHUTTING_DOWN,
-            expected_lifecycle_epoch=lifecycle_epoch):
+    owner = serve_state.get_service_controller_owner(service_name,
+                                                     include_lb_state=True)
+    if owner is None or owner.get('hash') != expected_service_hash:
+        return _purge_ownership_failure(service_name,
+                                        'owner disappeared before teardown')
+    expected_controller_owner = (owner.get('controller_pid'),
+                                 owner.get('controller_ip'))
+    try:
+        marked_for_teardown, bound_authority = (
+            _begin_service_teardown_if_owner(service_name,
+                                             expected_service_hash,
+                                             expected_controller_owner,
+                                             lifecycle_epoch))
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(
+            f'Failed to establish ordinary-launch teardown authority for '
+            f'{service_name!r}; retaining purge state for retry: '
+            f'{common_utils.format_exception(e)}')
+        return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                'could not be purged because its ordinary-launch teardown '
+                'authority could not be established; durable cleanup '
+                f'inventory was retained for retry.{colorama.Style.RESET_ALL}')
+    if not marked_for_teardown:
         return _purge_ownership_failure(
             service_name, 'could not claim durable teardown state')
+
+    # Generic API cancellation intentionally excludes requests associated with
+    # the closed ordinary-launch state machine.  Resolve those requests under
+    # the pre-teardown controller authority before any orphan claim can rotate
+    # that authority, and before generic quiescence or provider deletion.
+    if bound_authority is not None:
+        try:
+            bound_replica_infos = serve_state.get_replica_infos(service_name)
+            # Local to break service -> serve_utils at module import time.
+            # pylint: disable=import-outside-toplevel,protected-access
+            from sky.serve import service as service_lib
+
+            service_lib._settle_bound_ordinary_launches_for_teardown(
+                bound_authority, bound_replica_infos)
+            # pylint: enable=import-outside-toplevel,protected-access
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(
+                f'Failed to settle exact bound ordinary launches for failed '
+                f'service {service_name!r}; retaining purge state for retry: '
+                f'{common_utils.format_exception(e)}')
+            return (f'{colorama.Fore.YELLOW}failed service {service_name!r} '
+                    'could not be purged because its exact bound replica '
+                    'launches could not be cancelled and settled; durable '
+                    'cleanup inventory was retained for retry.'
+                    f'{colorama.Style.RESET_ALL}')
 
     # A CONTROLLER_FAILED row may still have a live parent/child (for example,
     # a transient LB failure). The parent polls durable SHUTTING_DOWN at the
     # top of every tick, kills and joins its child, then clears controller_port
     # before waiting for this same lifecycle lock. Do not down name-reused
     # replica clusters until that acknowledgement arrives.
-    owner = serve_state.get_service_controller_owner(service_name,
-                                                     include_lb_state=True)
-    if owner is None or owner.get('hash') != expected_service_hash:
-        return _purge_ownership_failure(service_name,
-                                        'owner disappeared before teardown')
     resource_scope = owner.get('resource_scope')
     high_availability = bool(owner.get('lb_ha_enabled'))
     if owner.get('controller_port') != constants.CONTROLLER_TEARDOWN_ACK_PORT:
         recovery_script = serve_state.get_ha_recovery_script(service_name)
+        unrecoverable = (recovery_script is not None and
+                         serve_state.get_latest_committed_version(service_name)
+                         is None)
+        if (bound_authority is not None and
+            (recovery_script is None or unrecoverable)):
+            # The old PID/IP cannot be rewritten in place for a bound service:
+            # owner rotation must also rotate the controller incarnation and
+            # transfer every unsettled association.  Exact settlement above
+            # makes that transfer immediately available; try rather than wait
+            # so any unexpected authority holder leaves cleanup retryable.
+            try:
+                # Local to keep the PostgreSQL-only protocol off legacy CLI
+                # import paths.
+                # pylint: disable=import-outside-toplevel
+                from sky.serve import ordinary_launch_binding
+
+                # pylint: enable=import-outside-toplevel
+                purge_owner = (os.getpid(), os.environ.get('POD_IP'))
+                claimed_authority = (
+                    ordinary_launch_binding.claim_controller_incarnation(
+                        service_name,
+                        expected_service_hash,
+                        expected_controller_owner,
+                        uuid.uuid4(),
+                        new_parent_owner=purge_owner,
+                        expected_lifecycle_epoch=lifecycle_epoch,
+                        expected_status=(
+                            serve_state.ServiceStatus.SHUTTING_DOWN),
+                        wait_for_authority=False))
+                if claimed_authority is None:
+                    raise RuntimeError(
+                        'Bound orphan claim returned no controller authority.')
+                owner = dict(owner)
+                owner['controller_pid'], owner['controller_ip'] = purge_owner
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(
+                    f'Failed to claim exact bound orphan teardown for '
+                    f'{service_name!r}; retaining cleanup state for retry: '
+                    f'{common_utils.format_exception(e)}')
+                return (f'{colorama.Fore.YELLOW}failed service '
+                        f'{service_name!r} could not be purged because its '
+                        'bound orphan authority could not be claimed; durable '
+                        'cleanup inventory was retained for retry.'
+                        f'{colorama.Style.RESET_ALL}')
         if recovery_script is None:
             # Legacy orphan/FAILED_CLEANUP rows may have no parent left to
             # write the new acknowledgement. Absence of the recovery script
@@ -4279,7 +4457,7 @@ def _terminate_failed_services_locked(
                 os.getpid(),
                 os.environ.get('POD_IP'),
                 expected_lifecycle_epoch=lifecycle_epoch)
-        elif serve_state.get_latest_committed_version(service_name) is None:
+        elif unrecoverable:
             # Old partial-registration rows can retain a recovery script but
             # no committed yaml. Such a script can never boot a controller;
             # atomically consume it while claiming teardown so purge does not
@@ -4833,19 +5011,25 @@ def terminate_services(service_names: list[str] | None, purge: bool,
                 # ``--all`` calls alike, so no client-side lock topology can
                 # re-open the race.
                 current = serve_state.get_service_controller_owner(service_name)
-                marked_for_teardown = (
-                    lifecycle_lock_is_valid(lifecycle_lock) and
-                    isinstance(expected_service_hash, str) and
-                    bool(expected_service_hash) and current is not None and
-                    current.get('hash') == expected_service_hash and
-                    current['status']
-                    not in serve_state.ServiceStatus.terminal_statuses() and
-                    serve_state.set_service_status_and_active_versions_if_hash(
-                        service_name,
-                        expected_service_hash,
-                        serve_state.ServiceStatus.SHUTTING_DOWN,
-                        expected_lifecycle_epoch=get_service_lifecycle_epoch(
-                            lifecycle_lock)))
+                marked_for_teardown = False
+                if (lifecycle_lock_is_valid(lifecycle_lock) and
+                        isinstance(expected_service_hash, str) and
+                        bool(expected_service_hash) and current is not None and
+                        current.get('hash') == expected_service_hash and
+                        current['status']
+                        not in serve_state.ServiceStatus.terminal_statuses()):
+                    try:
+                        marked_for_teardown, _ = (
+                            _begin_service_teardown_if_owner(
+                                service_name, expected_service_hash,
+                                (current.get('controller_pid'),
+                                 current.get('controller_ip')),
+                                get_service_lifecycle_epoch(lifecycle_lock)))
+                    except Exception as e:  # pylint: disable=broad-except
+                        logger.warning(
+                            f'Could not establish ordinary-launch teardown '
+                            f'authority for {service_name!r}: '
+                            f'{common_utils.format_exception(e)}')
             if not marked_for_teardown:
                 messages.append(
                     f'{colorama.Fore.YELLOW}{capnoun} {service_name!r} '

@@ -147,6 +147,49 @@ def test_run_controller_preserves_authoritative_launch_fence_bit(monkeypatch):
     controller_instance.run.assert_called_once_with()
 
 
+def test_run_controller_threads_exact_binding_authority(monkeypatch):
+    controller_instance = mock.Mock()
+    constructor = mock.Mock(return_value=controller_instance)
+    monkeypatch.setattr(controller, 'SkyServeController', constructor)
+    monkeypatch.setattr(controller.context_utils, 'hijack_sys_attrs',
+                        mock.Mock())
+    authority = mock.sentinel.controller_binding_authority
+
+    controller.run_controller('svc', mock.Mock(), 1, '127.0.0.1', 20001,
+                              'fingerprint', None, 'incarnation-a', 123,
+                              '10.0.0.1', False, None, authority)
+
+    assert constructor.call_args.kwargs['controller_binding_authority'] is (
+        authority)
+    controller_instance.run.assert_called_once_with()
+
+
+def test_controller_validates_binding_authority_before_manager_construction(
+        monkeypatch):
+    manager = mock.Mock()
+    monkeypatch.setattr(controller.replica_managers, 'SkyPilotReplicaManager',
+                        manager)
+    validator = mock.Mock(side_effect=RuntimeError('stale authority'))
+    monkeypatch.setattr(controller.ordinary_launch_binding,
+                        'validate_controller_authority', validator)
+
+    with pytest.raises(RuntimeError, match='stale authority'):
+        controller.SkyServeController(
+            'svc',
+            mock.Mock(),
+            version=1,
+            host='127.0.0.1',
+            port=20001,
+            controller_owner_fingerprint='fingerprint',
+            service_hash='incarnation-a',
+            controller_pid=123,
+            controller_ip='10.0.0.1',
+            controller_binding_authority=mock.sentinel.authority)
+
+    validator.assert_called_once()
+    manager.assert_not_called()
+
+
 def test_run_controller_uses_parent_owner_for_child_cutover_fence(monkeypatch):
     """The child fence must compare the durable parent owner, not its PID."""
     actual_controller_class = controller.SkyServeController
@@ -1070,6 +1113,148 @@ def _register_update_test_routes(
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
     ctrl.run()
     return fastapi_testclient.TestClient(ctrl._app)  # pylint: disable=protected-access
+
+
+def _binding_authority(mode: str, epoch: int):
+    return controller.ordinary_launch_binding.ControllerBindingAuthority(
+        service_name='svc',
+        service_hash='incarnation-a',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=4,
+        controller_pid=123,
+        controller_ip='10.0.0.1',
+        controller_incarnation=controller.uuid.UUID(
+            '33333333-3333-4333-8333-333333333333'),
+        controller_owner_epoch=6,
+        capable=True,
+        binding_mode=controller.ordinary_launch_binding.BindingMode(mode),
+        binding_epoch=epoch)
+
+
+def test_binding_promotion_refreshes_controller_and_manager_under_actuation_lock(
+        monkeypatch):
+    ctrl = _make_update_controller()
+    previous = _binding_authority('legacy', 5)
+    refreshed = _binding_authority('bound', 6)
+    ctrl._ordinary_launch_binding_authority = previous  # pylint: disable=protected-access
+    installed = []
+
+    @contextlib.contextmanager
+    def _transition():
+        assert ctrl._actuation_epoch_lock._is_owned()  # pylint: disable=protected-access
+        yield installed.append
+
+    ctrl._replica_manager.ordinary_launch_binding_transition.side_effect = (  # pylint: disable=protected-access
+        _transition)
+    promote = mock.Mock(return_value=6)
+    monkeypatch.setattr(controller.request_postgres,
+                        'promote_ordinary_launch_binding_service', promote)
+
+    @contextlib.contextmanager
+    def _refresh(authority):
+        assert authority is previous
+        yield refreshed
+
+    monkeypatch.setattr(controller.ordinary_launch_binding,
+                        'refresh_controller_authority', _refresh)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.post(
+        constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+        json={
+            'mode': 'bound',
+            'expected_service_hash': 'incarnation-a',
+            'expected_binding_epoch': 5,
+        })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'binding_mode': 'bound',
+        'binding_epoch': 6,
+    }
+    promote.assert_called_once_with(previous)
+    assert installed == [refreshed]
+    assert ctrl._ordinary_launch_binding_authority is refreshed  # pylint: disable=protected-access
+
+
+def test_binding_transition_lost_response_retry_uses_source_epoch(monkeypatch):
+    ctrl = _make_update_controller()
+    installed = _binding_authority('bound', 6)
+    ctrl._ordinary_launch_binding_authority = installed  # pylint: disable=protected-access
+    promote = mock.Mock()
+    monkeypatch.setattr(controller.request_postgres,
+                        'promote_ordinary_launch_binding_service', promote)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+
+    response = client.post(
+        constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+        json={
+            'mode': 'bound',
+            'expected_service_hash': 'incarnation-a',
+            'expected_binding_epoch': 5,
+        })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'binding_mode': 'bound',
+        'binding_epoch': 6,
+    }
+    promote.assert_not_called()
+    ctrl._replica_manager.ordinary_launch_binding_transition.assert_not_called(  # pylint: disable=protected-access
+    )
+
+
+def test_binding_transition_rejects_nonadjacent_epoch_retry(monkeypatch):
+    ctrl = _make_update_controller()
+    ctrl._ordinary_launch_binding_authority = _binding_authority(  # pylint: disable=protected-access
+        'bound', 8)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+
+    response = client.post(
+        constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+        json={
+            'mode': 'bound',
+            'expected_service_hash': 'incarnation-a',
+            'expected_binding_epoch': 5,
+        })
+
+    assert response.status_code == 409
+    assert 'adjacent-epoch retry' in response.json()['message']
+
+
+def test_binding_promotion_refresh_failure_keeps_local_authority(monkeypatch):
+    ctrl = _make_update_controller()
+    previous = _binding_authority('legacy', 5)
+    ctrl._ordinary_launch_binding_authority = previous  # pylint: disable=protected-access
+    installed = []
+
+    @contextlib.contextmanager
+    def _transition():
+        yield installed.append
+
+    ctrl._replica_manager.ordinary_launch_binding_transition.side_effect = (  # pylint: disable=protected-access
+        _transition)
+    monkeypatch.setattr(controller.request_postgres,
+                        'promote_ordinary_launch_binding_service',
+                        lambda _authority: 6)
+
+    def _fail_refresh(_authority):
+        raise controller.ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'owner changed')
+
+    monkeypatch.setattr(controller.ordinary_launch_binding,
+                        'refresh_controller_authority', _fail_refresh)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.post(
+        constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+        json={
+            'mode': 'bound',
+            'expected_service_hash': 'incarnation-a',
+            'expected_binding_epoch': 5,
+        })
+
+    assert response.status_code == 409
+    assert not installed
+    assert ctrl._ordinary_launch_binding_authority is previous  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize('path,body,expected_status', [

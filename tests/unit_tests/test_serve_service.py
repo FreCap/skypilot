@@ -1316,6 +1316,7 @@ def test_cleanup_mixed_inventory_bulk_removes_only_absent_replica():
             'expected_lifecycle_epoch': 31,
             'expected_controller_owner': expected_owner,
             'expected_replica_exists': True,
+            'guard_launch_exclusion': False,
         }
     remove_one.assert_called_once_with(
         'svc',
@@ -1377,7 +1378,8 @@ def test_cleanup_retains_replica_when_teardown_identity_snapshot_changes():
                                     expected_service_hash='incarnation-a',
                                     expected_lifecycle_epoch=31,
                                     expected_controller_owner=expected_owner,
-                                    expected_replica_exists=True)
+                                    expected_replica_exists=True,
+                                    guard_launch_exclusion=False)
     remove.assert_not_called()
     terminate.assert_not_called()
 
@@ -1445,7 +1447,8 @@ def test_cleanup_retains_absent_protocol_v2_replica_as_failed_cleanup():
                                     expected_service_hash='incarnation-a',
                                     expected_lifecycle_epoch=31,
                                     expected_controller_owner=expected_owner,
-                                    expected_replica_exists=True)
+                                    expected_replica_exists=True,
+                                    guard_launch_exclusion=False)
     assert (protocol_v2.status_property.sky_down_status ==
             service.common_utils.ProcessStatus.FAILED)
     remove_one.assert_not_called()

@@ -324,7 +324,7 @@ class RequestWorker:
                 _request_execution_wrapper, request_id, ignore_return_value,
                 self.num_db_connections_per_worker,
                 request_element.execution_generation,
-                request_element.claim_token)
+                request_element.claim_token, request_element.worker_instance_id)
             # Decrement the free executor count when a request starts
             if metrics_utils.METRICS_ENABLED:
                 if self.schedule_type == api_requests.ScheduleType.LONG:
@@ -994,7 +994,8 @@ def _request_execution_wrapper(request_id: str,
                                ignore_return_value: bool,
                                num_db_connections_per_worker: int = 0,
                                execution_generation: int = 0,
-                               claim_token: str | None = None) -> None:
+                               claim_token: str | None = None,
+                               worker_instance_id: str | None = None) -> None:
     """Wrapper for a request execution.
 
     It wraps the execution of a request to:
@@ -1060,7 +1061,7 @@ def _request_execution_wrapper(request_id: str,
             request_storage.ExecutionClaim(request_id, execution_generation,
                                            claim_token))
     execution_claim_token = request_storage.activate_execution_claim(
-        request_id, execution_generation, claim_token)
+        request_id, execution_generation, claim_token, worker_instance_id)
     try:
         _execution_cancellation_marker = cancellation_marker
         _in_request_execution = True
@@ -1433,7 +1434,7 @@ async def _execute_request_coroutine(request: api_requests.Request):
         ctx.cancel()
 
 
-async def prepare_request_async(
+async def build_request_async(
     request_id: str,
     request_name: request_names.RequestName,
     request_body: payloads.RequestBody,
@@ -1447,7 +1448,7 @@ async def prepare_request_async(
     should_enqueue: bool = False,
     precondition: preconditions.Precondition | None = None,
 ) -> api_requests.Request:
-    """Prepare a request for execution.
+    """Build a complete request without persisting or publishing it.
 
     The enqueue flags (ignore_return_value, retryable) are persisted with the
     initial INSERT so a request still queued when the server restarts can be
@@ -1528,6 +1529,36 @@ async def prepare_request_async(
         ),
     )
 
+    return request
+
+
+async def prepare_request_async(
+    request_id: str,
+    request_name: request_names.RequestName,
+    request_body: payloads.RequestBody,
+    func: Callable[P, Any],
+    request_cluster_name: str | None = None,
+    schedule_type: api_requests.ScheduleType = (api_requests.ScheduleType.LONG),
+    is_skypilot_system: bool = False,
+    auth_user: models.User | None = None,
+    ignore_return_value: bool = False,
+    retryable: bool = False,
+    should_enqueue: bool = False,
+    precondition: preconditions.Precondition | None = None,
+) -> api_requests.Request:
+    """Build and persist one ordinary request through the selected backend."""
+    request = await build_request_async(request_id,
+                                        request_name,
+                                        request_body,
+                                        func,
+                                        request_cluster_name,
+                                        schedule_type,
+                                        is_skypilot_system,
+                                        auth_user=auth_user,
+                                        ignore_return_value=ignore_return_value,
+                                        retryable=retryable,
+                                        should_enqueue=should_enqueue,
+                                        precondition=precondition)
     if not await api_requests.create_if_not_exists_async(request):
         raise exceptions.RequestAlreadyExistsError(
             f'Request {request_id} already exists.')

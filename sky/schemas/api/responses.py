@@ -2,6 +2,7 @@
 
 import enum
 from typing import Any
+import uuid
 
 import pydantic
 
@@ -99,6 +100,19 @@ class APIHealthResponse(ResponseBaseModel):
     external_proxy_auth_enabled: bool = False
     # Whether telemetry/usage collection is enabled
     telemetry_enabled: bool = True
+    # Fleet-wide, fail-closed readiness for the private ordinary Serve launch
+    # binding protocol.  False includes mixed API/executor generations.
+    ordinary_launch_binding_capable: bool = False
+
+
+class OrdinaryLaunchBindingResponse(ResponseBaseModel):
+    """Identity returned by the private ordinary Serve launch endpoint."""
+
+    submission_uuid: uuid.UUID
+    association_id: uuid.UUID
+    request_id: uuid.UUID
+    launch_generation: pydantic.PositiveInt
+    created: pydantic.StrictBool
 
 
 class StatusResponse(ResponseBaseModel):

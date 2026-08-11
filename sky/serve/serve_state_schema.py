@@ -82,6 +82,32 @@ services_table = sqlalchemy.Table(
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
     sqlalchemy.Column('controller_ip', sqlalchemy.Text, server_default=None),
+    # ABA-safe owner identity for durable ordinary-launch request binding.
+    # PID/IP remain routing metadata; every controller takeover installs a
+    # fresh incarnation and advances the owner epoch atomically in Serve042.
+    sqlalchemy.Column('controller_incarnation',
+                      sqlalchemy.Uuid(as_uuid=True),
+                      nullable=False,
+                      server_default=sqlalchemy.text('gen_random_uuid()')),
+    sqlalchemy.Column('controller_owner_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='1'),
+    # Capability is bound to the exact controller incarnation above.  Existing
+    # services remain dark until a capable subprocess explicitly promotes the
+    # non-pool service from legacy to bound mode.
+    sqlalchemy.Column('ordinary_launch_binding_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('ordinary_launch_binding_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='legacy'),
+    sqlalchemy.Column('ordinary_launch_binding_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that
@@ -181,6 +207,11 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column(
         'replica_state',
         sqlalchemy.JSON().with_variant(postgresql.JSONB(), 'postgresql')),
+    # Neutral request association for the ordinary launch path.  Generic
+    # ReplicaInfo persistence omits this scalar so old writers cannot erase a
+    # durable binding by rewriting the JSON payload.
+    sqlalchemy.Column('ordinary_launch_association_id',
+                      sqlalchemy.Uuid(as_uuid=True)),
     # These columns are initialized and mutated only by typed resource-action
     # transitions.  Generic ReplicaInfo persistence deliberately omits them.
     # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed

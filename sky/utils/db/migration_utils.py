@@ -52,7 +52,7 @@ SPOT_JOBS_VERSION = '027'  # ordered managed-job scheduler lookup
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '041'  # ordinary-launch handoff telemetry
+SERVE_VERSION = '042'  # durable ordinary-launch request binding
 SERVE_NON_POSTGRES_VERSION = '037'  # retained local/controller SQLite head
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 SERVE_MIGRATION_CEILING_ENV_VAR = (
@@ -124,7 +124,7 @@ RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
 
 API_REQUESTS_DB_NAME = 'api_requests_db'
-API_REQUESTS_VERSION = '008'
+API_REQUESTS_VERSION = '009'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
 LIFECYCLE_ACTIONS_DB_NAME = 'lifecycle_actions_db'

@@ -83,9 +83,9 @@ def test_serve041_lineage_and_sqlite_ceiling() -> None:
     scripts = alembic_script.ScriptDirectory.from_config(_config(sqlite))
     revision = scripts.get_revision('041')
 
-    assert scripts.get_heads() == ['041']
+    assert scripts.get_heads() == ['042']
     assert revision.down_revision == '040'
-    assert migration_utils.SERVE_VERSION == '041'
+    assert migration_utils.SERVE_VERSION == '042'
     assert migration_utils.serve_target_version(sqlite) == '037'
 
 
