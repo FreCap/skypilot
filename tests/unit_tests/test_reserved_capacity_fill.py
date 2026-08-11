@@ -2013,15 +2013,18 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
 
         # A transient empty publication is a hard rotation boundary even when
         # the next heartbeat restores the same pool keys, generation, and UIDs.
-        # The detached pre-removal wave must not recreate the cleared anchor.
+        # The detached pre-removal wave must not escape or recreate the cleared
+        # anchor, while the caller's ordinary decision remains untouched.
+        ordinary = autoscalers.AutoscalerDecision(_SCALE_DOWN, 999)
         with mock.patch.object(autoscalers,
                                '_generate_scale_up_decisions',
                                side_effect=_remove_and_readd):
-            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+            decisions = autoscaler._apply_reserved_capacity_fill([], [ordinary])
 
-        self.assertTrue(_ups(decisions))
+        self.assertEqual(decisions, [ordinary])
         self.assertTrue(readded)
         self.assertEqual(set(autoscaler._fill_pool_states), set(snapshots))
+        self.assertEqual(autoscaler._fill_target, 0)
         self.assertEqual(
             {
                 key: state.free_slots
@@ -2031,6 +2034,20 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 self.phx_pool: 1,
             })
         self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+        fresh = _ups(autoscaler._apply_reserved_capacity_fill([], []))
+        self.assertEqual([item.target[_POOL_KEY] for item in fresh],
+                         [self.east_pool, self.phx_pool])
+        self.assertEqual(autoscaler._fill_target, 2)
+        self.assertEqual(
+            {
+                key: state.free_slots
+                for key, state in autoscaler._fill_pool_states.items()
+            }, {
+                self.east_pool: 0,
+                self.phx_pool: 0,
+            })
+        self.assertEqual(autoscaler._fill_pool_last_started_key, self.east_pool)
 
     def test_rotation_anchor_survives_valid_dynamic_restore(self):
         old = _make_autoscaler(min_replicas=0, max_replicas=4)

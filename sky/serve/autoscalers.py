@@ -1842,13 +1842,6 @@ class Autoscaler:
             remaining_target_budget -= targets[key]
 
         total_target = sum(targets.values())
-        self._fill_target = total_target
-        with self._fill_pool_state_lock:
-            for key, target in targets.items():
-                live = self._fill_pool_states.get(key)
-                if (live is not None and live.service_generation
-                        == states[key].service_generation):
-                    live.fill_target = target
         result = list(decisions)
 
         # Partition the exact v1 shelter equation over pools. When complete
@@ -2043,9 +2036,17 @@ class Autoscaler:
             if not made_progress:
                 break
 
-        if first_emitted_key is not None:
-            with self._fill_pool_state_lock:
-                if self._fill_pool_order_revision == pool_order_revision:
+        with self._fill_pool_state_lock:
+            pool_order_is_current = (
+                self._fill_pool_order_revision == pool_order_revision)
+            if pool_order_is_current:
+                self._fill_target = total_target
+                for key, target in targets.items():
+                    live = self._fill_pool_states.get(key)
+                    if (live is not None and live.service_generation
+                            == states[key].service_generation):
+                        live.fill_target = target
+                if first_emitted_key is not None:
                     for key, emitted in emitted_by_pool.items():
                         if emitted <= 0:
                             continue
@@ -2074,6 +2075,15 @@ class Autoscaler:
                         self._fill_pool_last_started_key = first_emitted_key
                     self._refresh_legacy_fill_projection_locked()
 
+        if not pool_order_is_current:
+            # The complete ordered map is part of the decision authority. A
+            # detached tick from before a membership/order lifecycle boundary
+            # must not suppress ordinary work or escape fill decisions to the
+            # replica manager: the next fresh tick would emit the replacement
+            # feed again.
+            return decisions
+
+        if first_emitted_key is not None:
             # Reserved fill is computed after ordinary decisions so the
             # conservative exact-card debits above can account for every
             # demand launch. Execution order need not match computation
