@@ -326,3 +326,35 @@ test('keeps a child failure local and retryable', async () => {
   expect(screen.getByText('Alice')).toBeTruthy();
   expect(screen.getByRole('button', { name: 'Retry' })).toBeTruthy();
 });
+
+test('keeps loaded children visible while retrying a failed next page', async () => {
+  let nextPageAttempts = 0;
+  getEstimatedSpendDrilldown.mockImplementation(async ({ level, offset }) => {
+    if (level === 'owner') return page('owner', [owner()]);
+    if (offset === 0) {
+      return page('workload', [workload()], true, 0, 2);
+    }
+    nextPageAttempts += 1;
+    if (nextPageAttempts === 1) throw new Error('Next page failed');
+    return page(
+      'workload',
+      [workload({ workload_id: '43', estimated_cost: 2 })],
+      false,
+      1,
+      2
+    );
+  });
+
+  renderTable();
+  fireEvent.click(await screen.findByRole('button', { name: 'Expand Alice' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'Load more' }));
+
+  expect(await screen.findByText('Next page failed')).toBeTruthy();
+  expect(screen.getByText('Managed job #42')).toBeTruthy();
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+  expect(await screen.findByText('Managed job #43')).toBeTruthy();
+  expect(getEstimatedSpendDrilldown).toHaveBeenLastCalledWith(
+    expect.objectContaining({ level: 'workload', offset: 1 })
+  );
+});

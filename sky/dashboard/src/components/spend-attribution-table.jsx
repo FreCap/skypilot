@@ -353,34 +353,6 @@ export function SpendAttributionTable({
               </TableCell>
             </TableRow>
           );
-        } else if (childPage.error) {
-          rendered.push(
-            <TableRow key={`${key}:error`}>
-              <TableCell colSpan={6}>
-                <div
-                  className="flex items-center gap-3 py-2 text-sm text-red-700 dark:text-red-300"
-                  style={{ paddingLeft: `${(depth + 1) * 24}px` }}
-                >
-                  <span>{childPage.error.message}</span>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() =>
-                      loadPage({
-                        pageKey: key,
-                        level: descriptor.level,
-                        scope: descriptor.scope,
-                      })
-                    }
-                  >
-                    <RefreshCw className="mr-1 h-3.5 w-3.5" />
-                    Retry
-                  </Button>
-                </div>
-              </TableCell>
-            </TableRow>
-          );
         } else {
           rendered.push(
             ...renderRows(
@@ -391,7 +363,36 @@ export function SpendAttributionTable({
               key
             )
           );
-          if (childPage.hasMore) {
+          if (childPage.error) {
+            rendered.push(
+              <TableRow key={`${key}:error`}>
+                <TableCell colSpan={6}>
+                  <div
+                    className="flex items-center gap-3 py-2 text-sm text-red-700 dark:text-red-300"
+                    style={{ paddingLeft: `${(depth + 1) * 24}px` }}
+                  >
+                    <span>{childPage.error.message}</span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() =>
+                        loadPage({
+                          pageKey: key,
+                          level: descriptor.level,
+                          scope: descriptor.scope,
+                          offset: childPage.rows.length,
+                        })
+                      }
+                    >
+                      <RefreshCw className="mr-1 h-3.5 w-3.5" />
+                      Retry
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            );
+          } else if (childPage.hasMore) {
             rendered.push(
               <TableRow key={`${key}:more`}>
                 <TableCell colSpan={6}>

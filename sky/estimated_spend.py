@@ -830,8 +830,6 @@ def _get_group_rows(session: orm.Session, daily: Any, base_filter: Any,
 
 def _group_match_condition(daily: Any, group_by: GroupBy, row: Any) -> Any:
     if group_by == GroupBy.JOB:
-        if row.workload_type == 'managed_unattributed':
-            return daily.c.workload_type == 'managed'
         workload_id = row.workload_id
         workload_id_condition = (daily.c.workload_id.is_(None)
                                  if workload_id is None else daily.c.workload_id
@@ -854,12 +852,7 @@ def _get_daily_group_rows(session: orm.Session, daily: Any, base_filter: Any,
         _group_match_condition(daily, group_by, row) for row in top_group_rows
     ]
     if group_by == GroupBy.JOB:
-        displayed_workload_type = _workload_type_expression(daily)
-        displayed_workload_id = _workload_id_expression(daily)
-        key_columns = [
-            displayed_workload_type.label('workload_type'),
-            displayed_workload_id.label('workload_id')
-        ]
+        key_columns = [daily.c.workload_type, daily.c.workload_id]
         group_columns = key_columns
     elif group_by == GroupBy.USER:
         key_columns = [daily.c.user_hash]
@@ -1134,8 +1127,10 @@ def get_estimated_spend(
         base_filter = sqlalchemy.and_(
             daily.c.day_start_utc >= first_day, daily.c.day_start_utc
             < last_day + SECONDS_PER_DAY)
-        displayed_workload_type = _workload_type_expression(daily)
-        displayed_workload_id = _workload_id_expression(daily)
+        # Keep the established flat workload response backward compatible.
+        # The hierarchy endpoint owns its additive synthetic legacy grouping.
+        displayed_workload_type = daily.c.workload_type
+        displayed_workload_id = daily.c.workload_id
         day_rows = session.execute(
             sqlalchemy.select(
                 daily.c.day_start_utc.label('day_start_utc'),
