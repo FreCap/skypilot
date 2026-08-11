@@ -1842,6 +1842,133 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 self.east_pool,
             ])
 
+    def test_non_emitting_tick_does_not_advance_pool_rotation(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        first = _ups(_decisions(autoscaler, []))
+        self.assertEqual(first[0].target[_POOL_KEY], self.east_pool)
+
+        # Replenish authority, but let demand consume all hard headroom. The
+        # actionable set is nonempty even though this tick emits no fill.
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        unrelated = [
+            _replica(index, location_key=None, reserved_fill=False)
+            for index in range(1, 5)
+        ]
+        self.assertEqual(_fill_ups(_decisions(autoscaler, unrelated)), [])
+
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        resumed = _ups(_decisions(autoscaler, []))
+        self.assertEqual(resumed[0].target[_POOL_KEY], self.phx_pool)
+
+    def test_rotation_uses_stable_identity_before_actionable_filter(self):
+        west = make_location('west-context',
+                             accelerators={'A100': 1},
+                             cloud_name='Kubernetes',
+                             use_spot=False)
+        west_pool = reserved_capacity_broker.make_pool_key(
+            'west-context',
+            'a100',
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            physical_cluster_uid='west-uid')
+        timestamp = time.time()
+        first_snapshots = self._snapshots(east_feed=1, phx_feed=1)
+        first_snapshots[west_pool] = {
+            'protocol_version': 2,
+            'pool_key': west_pool,
+            'physical_cluster_uid': 'west-uid',
+            'service_generation': 1,
+            'edge_cap': 1,
+            'zero_cost_location_keys': [west.to_pickleable()],
+            'free_slots': 0,
+            'free_slots_by_accelerator': {},
+            'grant': 1,
+            'grant_epoch': 23,
+            'timestamp': timestamp,
+        }
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=2)
+        autoscaler.collect_reserved_capacity_pools(first_snapshots)
+        autoscaler.collect_reserved_capacity_pools(first_snapshots)
+        first = _ups(_decisions(autoscaler, []))
+        self.assertEqual([item.target[_POOL_KEY] for item in first],
+                         [self.east_pool, self.phx_pool])
+
+        second_snapshots = self._snapshots(east_feed=0, phx_feed=1)
+        second_snapshots[west_pool] = dict(
+            first_snapshots[west_pool],
+            free_slots=1,
+            free_slots_by_accelerator={'a100': 1},
+            timestamp=time.time())
+        autoscaler.collect_reserved_capacity_pools(second_snapshots)
+        autoscaler.collect_reserved_capacity_pools(second_snapshots)
+        second = _ups(_decisions(autoscaler, []))
+        self.assertEqual([item.target[_POOL_KEY] for item in second],
+                         [self.phx_pool, west_pool])
+
+    def test_rotation_anchor_survives_valid_dynamic_restore(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        first = _ups(_decisions(old, []))
+        self.assertEqual(first[0].target[_POOL_KEY], self.east_pool)
+
+        dumped = old.dump_dynamic_states()
+        self.assertEqual(
+            dumped['reserved_capacity_fill_state']
+            ['fill_pool_last_started_key'], self.east_pool)
+        restored = _make_autoscaler(min_replicas=0, max_replicas=4)
+        restored.load_dynamic_states(dumped)
+        restored.collect_reserved_capacity_pools(snapshots)
+        restored.collect_reserved_capacity_pools(snapshots)
+        resumed = _ups(_decisions(restored, []))
+        self.assertEqual(resumed[0].target[_POOL_KEY], self.phx_pool)
+
+    def test_rotation_anchor_rejects_removed_or_malformed_identity(self):
+        old = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+        self.assertTrue(_ups(_decisions(old, [])))
+
+        cases = ('missing', 'retired-pool', True, 7)
+        for anchor in cases:
+            with self.subTest(anchor=anchor):
+                dumped = old.dump_dynamic_states()
+                if anchor == 'missing':
+                    dumped['reserved_capacity_fill_state'].pop(
+                        'fill_pool_last_started_key')
+                else:
+                    dumped['reserved_capacity_fill_state'][
+                        'fill_pool_last_started_key'] = anchor
+                restored = _make_autoscaler(min_replicas=0, max_replicas=4)
+                restored.load_dynamic_states(dumped)
+                restored.collect_reserved_capacity_pools(snapshots)
+                restored.collect_reserved_capacity_pools(snapshots)
+                resumed = _ups(_decisions(restored, []))
+                self.assertEqual(resumed[0].target[_POOL_KEY], self.east_pool)
+
+    def test_live_pool_removal_then_readd_resets_rotation_anchor(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots()
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        first = _ups(_decisions(autoscaler, []))
+        self.assertEqual(first[0].target[_POOL_KEY], self.east_pool)
+
+        phx_only = {self.phx_pool: self._snapshots()[self.phx_pool]}
+        autoscaler.collect_reserved_capacity_pools(phx_only)
+        self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        resumed = _ups(_decisions(autoscaler, []))
+        self.assertEqual(resumed[0].target[_POOL_KEY], self.east_pool)
+
     def test_fill_precedes_blocking_ordinary_scale_up(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
         snapshots = self._snapshots()

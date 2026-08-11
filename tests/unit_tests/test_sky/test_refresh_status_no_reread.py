@@ -520,6 +520,7 @@ def test_nominated_service_no_yaml_is_retained_under_refresh_locks():
 
 
 @pytest.mark.parametrize('cluster_yaml', [None, '/fake/path/cluster.yaml'])
+@pytest.mark.parametrize('cheap_snapshot_is_stale_service', [False, True])
 @pytest.mark.parametrize(('is_managed', 'workload_type', 'cluster_hash'), [
     (True, 'managed_job', 'fake-hash'),
     (True, 'pool', 'fake-hash'),
@@ -527,16 +528,28 @@ def test_nominated_service_no_yaml_is_retained_under_refresh_locks():
     (False, None, 'fake-hash'),
 ])
 def test_stale_service_nomination_cannot_act_on_same_name_successor(
-        is_managed, workload_type, cluster_hash, cluster_yaml):
+        is_managed, workload_type, cluster_hash,
+        cheap_snapshot_is_stale_service, cluster_yaml):
     handle = _make_handle()
     handle.cluster_yaml = cluster_yaml
     predecessor = _make_refreshable_record(handle)
     predecessor['is_managed'] = True
     predecessor['workload_type'] = 'service'
+    changed_at = predecessor['status_updated_at'] + 1
     successor = dict(predecessor,
                      is_managed=is_managed,
                      cluster_hash=cluster_hash,
+                     status_updated_at=changed_at,
                      workload_type=workload_type)
+    if cheap_snapshot_is_stale_service:
+        # The cheap B snapshot still describes the old service identity,
+        # while the following full read returns successor C at the same
+        # timestamp. Refresh fields must come from C, not be copied from B.
+        cheap_record = dict(predecessor, status_updated_at=changed_at)
+        cheap_workload_type = 'service'
+    else:
+        cheap_record = successor
+        cheap_workload_type = workload_type
     candidate = _managed_candidate(predecessor)
     status_lock = mock.MagicMock()
     status_lock.acquire.return_value.__enter__.return_value = None
@@ -548,7 +561,8 @@ def test_stale_service_nomination_cannot_act_on_same_name_successor(
          mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_refresh_fields',
                            return_value=_refresh_fields(
-                               successor, workload_type=workload_type)), \
+                               cheap_record,
+                               workload_type=cheap_workload_type)) as cheap_read, \
          mock.patch.object(backend_utils,
                            '_check_owner_identity_with_record') as owner, \
          mock.patch.object(backend_utils.locks,
@@ -571,9 +585,18 @@ def test_stale_service_nomination_cannot_act_on_same_name_successor(
             _managed_no_yaml_candidate=candidate)
 
     assert result is successor
-    assert full_read.call_count == 2
+    assert full_read.call_args_list == [
+        mock.call('test-cluster',
+                  include_user_info=False,
+                  summary_response=True),
+        mock.call('test-cluster',
+                  include_user_info=False,
+                  summary_response=True),
+    ]
+    cheap_read.assert_called_once_with('test-cluster')
     get_lock.assert_called_once_with(
         backend_utils.cluster_status_lock_id('test-cluster'))
+    status_lock.acquire.assert_called_once_with(blocking=False)
     owner.assert_not_called()
     update.assert_not_called()
     provider.assert_not_called()
@@ -694,21 +717,27 @@ def test_reload_skips_full_read_when_status_unchanged():
 
 def test_reload_fetches_full_record_when_status_changed():
     record = _make_refreshable_record(_make_handle())
-    fresh_record = dict(record,
+    record.update(is_managed=True, workload_type='service')
+    cheap_record = dict(record,
                         status=status_lib.ClusterStatus.STOPPED,
-                        status_updated_at=int(time.time()))
-    refresh_fields = _refresh_fields(fresh_record)
+                        status_updated_at=record['status_updated_at'] + 1)
+    fresh_record = dict(cheap_record, workload_type='managed_job')
+    refresh_fields = _refresh_fields(cheap_record, workload_type='service')
+    expected_fields = _refresh_fields(fresh_record, workload_type='managed_job')
     with mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_refresh_fields',
-                           return_value=refresh_fields), \
+                           return_value=refresh_fields) as cheap_read, \
          mock.patch.object(backend_utils.global_user_state,
                            'get_cluster_from_name',
                            return_value=fresh_record) as full_read:
         result, fields = backend_utils._reload_record_if_refresh_fields_changed(
             'test-cluster', record, True, False)
     assert result is fresh_record
-    assert fields == _refresh_fields(fresh_record)
+    assert fields == expected_fields
+    assert fields != refresh_fields
     assert fields is not refresh_fields
+    assert fields.workload_type == 'managed_job'
+    cheap_read.assert_called_once_with('test-cluster')
     full_read.assert_called_once_with('test-cluster',
                                       include_user_info=True,
                                       summary_response=False)
