@@ -340,14 +340,22 @@ def test_get_managed_cluster_status_fields_filters_workload_type(
     _fresh_db(tmp_path, monkeypatch)
     _add_cluster('user-service', workload_type='service')
     _add_cluster('managed-service', is_managed=True, workload_type='service')
+    _add_cluster('managed-unfenced', is_managed=True, workload_type='service')
     _add_cluster('managed-pool', is_managed=True, workload_type='pool')
     _add_cluster('managed-job', is_managed=True, workload_type='managed_job')
     _add_cluster('managed-legacy', is_managed=True)
+    engine = global_user_state._db_manager.get_engine()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(global_user_state.cluster_table).where(
+                global_user_state.cluster_table.c.name ==
+                'managed-unfenced').values(cluster_hash=None))
 
     result = global_user_state.get_managed_cluster_status_fields('service')
 
     assert set(result) == {'managed-service'}
     assert result['managed-service'][0] == 'INIT'
+    assert result['managed-service'].cluster_hash
 
 
 def test_get_managed_job_cluster_cleanup_candidates_includes_legacy(

@@ -78,6 +78,27 @@ _UNIQUE_CONSTRAINT_FAILED_ERROR_MSGS = [
     'duplicate key value violates unique constraint',
 ]
 
+
+class ManagedClusterStatusFields(typing.NamedTuple):
+    """Plain reconciliation snapshot bound to one cluster generation."""
+
+    status: str | None
+    status_updated_at: int | None
+    cluster_hash: str | None
+
+
+class ClusterRefreshFields(typing.NamedTuple):
+    """Plain snapshot fencing status refresh under the cluster lock."""
+
+    status: str | None
+    status_updated_at: int | None
+    autostop: int
+    to_down: bool
+    cluster_hash: str | None
+    is_managed: bool
+    workload_type: str | None
+
+
 Base = global_user_state_schema.Base
 auth_session_table = global_user_state_schema.auth_session_table
 cluster_event_table = global_user_state_schema.cluster_event_table
@@ -2213,13 +2234,14 @@ def get_cluster_status_fields_by_prefix(
 
 @metrics_lib.time_me
 def get_managed_cluster_status_fields(
-    workload_type: str,) -> dict[str, tuple[str | None, int | None]]:
-    """Returns plain status fields for one managed workload type.
+    workload_type: str,) -> dict[str, ManagedClusterStatusFields]:
+    """Returns generation-fenced status fields for one managed workload type.
 
     This is intentionally separate from ``get_cluster_status_fields``:
     ordinary cluster refresh excludes every managed cluster, while a
     workload owner may use this narrower inventory to nominate only rows for
-    which it no longer has an exact child record.
+    which it no longer has an exact child record. Rows without a non-empty
+    cluster hash cannot be safely fenced and are omitted.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2227,11 +2249,17 @@ def get_managed_cluster_status_fields(
             cluster_table.c.name,
             cluster_table.c.status,
             cluster_table.c.status_updated_at,
+            cluster_table.c.cluster_hash,
         ).filter(
             cluster_table.c.is_managed == int(True),
             cluster_table.c.workload_type == workload_type,
+            cluster_table.c.cluster_hash.is_not(None),
+            cluster_table.c.cluster_hash != '',
         ).all()
-    return {row.name: (row.status, row.status_updated_at) for row in rows}
+    return {
+        row.name: ManagedClusterStatusFields(row.status, row.status_updated_at,
+                                             row.cluster_hash) for row in rows
+    }
 
 
 @metrics_lib.time_me
@@ -2319,12 +2347,12 @@ def get_cluster_image_consumer_in_session(
 
 @metrics_lib.time_me
 def get_cluster_refresh_fields(
-        cluster_name: str) -> tuple[str | None, int | None, int, bool] | None:
+        cluster_name: str) -> ClusterRefreshFields | None:
     """Returns plain columns that can change status-refresh behavior.
 
     This avoids deserializing the handle or fetching presentation fields while
-    still fencing concurrent autostop updates, which do not bump
-    ``status_updated_at``.
+    still fencing concurrent autostop updates and row replacement, neither of
+    which necessarily bumps ``status_updated_at``.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
@@ -2333,10 +2361,15 @@ def get_cluster_refresh_fields(
             cluster_table.c.status_updated_at,
             cluster_table.c.autostop,
             cluster_table.c.to_down,
+            cluster_table.c.cluster_hash,
+            cluster_table.c.is_managed,
+            cluster_table.c.workload_type,
         ).filter_by(name=cluster_name).first()
     if row is None:
         return None
-    return (row.status, row.status_updated_at, row.autostop, bool(row.to_down))
+    return ClusterRefreshFields(row.status, row.status_updated_at, row.autostop,
+                                bool(row.to_down), row.cluster_hash,
+                                bool(row.is_managed), row.workload_type)
 
 
 @metrics_lib.time_me

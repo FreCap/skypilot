@@ -4088,7 +4088,7 @@ def get_existing_replica_cluster_names(
 
 
 def get_orphaned_service_cluster_status_fields(
-) -> dict[str, tuple[str | None, int | None]]:
+) -> dict[str, global_user_state.ManagedClusterStatusFields]:
     """Returns managed service clusters without an exact replica owner.
 
     Only consolidated SkyServe has both inventories in the API server's
