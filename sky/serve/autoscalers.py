@@ -466,9 +466,10 @@ class Autoscaler:
         # pool in configured order. Identity (rather than an actionable-list
         # index) keeps rotation stable as other pools become actionable.
         self._fill_pool_last_started_key: str | None = None
-        # Fences a detached decision wave from mutating a replacement ordered
-        # pool map after membership, ordering, or an explicit lifecycle reset.
-        # Same-order feed refreshes deliberately retain the revision.
+        # Fences a detached decision wave from debiting replacement feed or
+        # restoring a rotation anchor after membership, ordering, or an
+        # explicit lifecycle reset. Same-order feed refreshes deliberately
+        # retain the revision.
         self._fill_pool_order_revision = 0
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
