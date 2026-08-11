@@ -305,8 +305,15 @@ or database calls; ordering remains linear in the number of pools.  A detached
 decision wave also captures the ordered-map revision.  If pool membership or
 ordering changes, or a lifecycle reset removes and then re-adds the same pool
 identity, the stale wave is discarded before the replica manager and may
-neither debit the replacement feed nor recreate the cleared rotation anchor;
-ordinary non-fill decisions from the tick remain unchanged.
+neither suppress ordinary work, mutate the replacement feed, nor recreate the
+cleared rotation anchor; the caller's ordinary decisions remain unchanged.  If
+the live pool's generation, physical UID, or broker epoch differs without a
+map-order change, only that pool's fill decisions are discarded, so peers whose
+authority is unchanged remain live.  Only the first surviving decision's pool
+advances the rotation anchor.  This is an in-method commit seam for fill
+decisions, feed, targets, and rotation state; production serialization through
+the controller's actuation-epoch lock and the manager's durable broker fences
+remains authoritative across method return and actuation.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that

@@ -1979,19 +1979,168 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
 
         # Advance the complete live map after computation detached generation
         # one but before it tries to debit and record the wave under the lock.
+        ordinary = autoscalers.AutoscalerDecision(_SCALE_DOWN, 999)
         with mock.patch.object(autoscalers,
                                '_generate_scale_up_decisions',
                                side_effect=_advance_generation):
-            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+            decisions = autoscaler._apply_reserved_capacity_fill([], [ordinary])
 
-        self.assertTrue(_ups(decisions))
+        self.assertEqual(decisions, [ordinary])
         self.assertTrue(advanced)
         self.assertEqual(
             {
                 state.service_generation
                 for state in autoscaler._fill_pool_states.values()
             }, {2})
+        self.assertEqual(autoscaler._fill_target, 0)
         self.assertIsNone(autoscaler._fill_pool_last_started_key)
+
+    def test_same_order_new_epoch_cannot_debit_or_anchor_stale_wave(self):
+
+        def _assert_epoch_case(epoch_updates, expected_feed, expected_pools,
+                               expected_anchor, expected_target):
+            autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+            snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+            original_generate = autoscalers._generate_scale_up_decisions
+            refreshed = False
+
+            def _advance_epochs(num, target):
+                nonlocal refreshed
+                if not refreshed:
+                    refreshed = True
+                    next_round = self._snapshots(generation=1,
+                                                 east_feed=1,
+                                                 phx_feed=1)
+                    for key, epoch in epoch_updates.items():
+                        next_round[key]['grant_epoch'] = epoch
+                    autoscaler.collect_reserved_capacity_pools(next_round)
+                return original_generate(num, target)
+
+            # Detached decisions carry epochs 11/17. Any changed epoch will
+            # fail the broker persist fence; unchanged peers remain eligible
+            # for their ordinary local debit.
+            with mock.patch.object(autoscalers,
+                                   '_generate_scale_up_decisions',
+                                   side_effect=_advance_epochs):
+                decisions = autoscaler._apply_reserved_capacity_fill([], [])
+
+            self.assertEqual(
+                [decision.target[_POOL_KEY] for decision in _ups(decisions)],
+                expected_pools)
+            self.assertTrue(refreshed)
+            self.assertEqual(
+                {
+                    key: state.free_slots
+                    for key, state in autoscaler._fill_pool_states.items()
+                }, expected_feed)
+            self.assertEqual(autoscaler._fill_pool_last_started_key,
+                             expected_anchor)
+            self.assertEqual(autoscaler._fill_target, expected_target)
+
+        cases = (({
+            self.east_pool: 12,
+            self.phx_pool: 18,
+        }, {
+            self.east_pool: 1,
+            self.phx_pool: 1,
+        }, [], None, 0), ({
+            self.east_pool: 12,
+        }, {
+            self.east_pool: 1,
+            self.phx_pool: 0,
+        }, [self.phx_pool], self.phx_pool, 1))
+        for (epoch_updates, expected_feed, expected_pools, expected_anchor,
+             expected_target) in cases:
+            with self.subTest(epoch_updates=epoch_updates):
+                _assert_epoch_case(epoch_updates, expected_feed, expected_pools,
+                                   expected_anchor, expected_target)
+
+    def test_failed_allocation_blackout_filters_detached_epoch(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        original_generate = autoscalers._generate_scale_up_decisions
+        blacked_out = False
+
+        def _blackout_east(num, target):
+            nonlocal blacked_out
+            if not blacked_out:
+                blacked_out = True
+                next_round = self._snapshots(generation=1,
+                                             east_feed=1,
+                                             phx_feed=1)
+                next_round[self.east_pool].update({
+                    'free_slots': 0,
+                    'free_slots_by_accelerator': None,
+                    'grant': 0,
+                    'grant_epoch': None,
+                })
+                autoscaler.collect_reserved_capacity_pools(next_round)
+            return original_generate(num, target)
+
+        # A failed allocation read clears the local launch authority, but the
+        # durable broker can still recognize epoch 11. Do not return the
+        # detached EAST decision carrying that otherwise-admissible epoch.
+        with mock.patch.object(autoscalers,
+                               '_generate_scale_up_decisions',
+                               side_effect=_blackout_east):
+            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+
+        self.assertEqual(
+            [decision.target[_POOL_KEY] for decision in _ups(decisions)],
+            [self.phx_pool])
+        self.assertTrue(blacked_out)
+        self.assertEqual(
+            {
+                key: state.free_slots
+                for key, state in autoscaler._fill_pool_states.items()
+            }, {
+                self.east_pool: 0,
+                self.phx_pool: 0,
+            })
+        self.assertEqual(autoscaler._fill_target, 1)
+        self.assertEqual(autoscaler._fill_pool_last_started_key, self.phx_pool)
+
+    def test_same_authority_refresh_keeps_detached_wave(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)
+        snapshots = self._snapshots(generation=1, east_feed=1, phx_feed=1)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        original_generate = autoscalers._generate_scale_up_decisions
+        republished = False
+
+        def _republish_same_authority(num, target):
+            nonlocal republished
+            if not republished:
+                republished = True
+                autoscaler.collect_reserved_capacity_pools(
+                    self._snapshots(generation=1, east_feed=1, phx_feed=1))
+            return original_generate(num, target)
+
+        # Timestamp/damping refreshes within one immutable broker epoch are
+        # valid. The commit fence must not over-fence their detached wave.
+        with mock.patch.object(autoscalers,
+                               '_generate_scale_up_decisions',
+                               side_effect=_republish_same_authority):
+            decisions = autoscaler._apply_reserved_capacity_fill([], [])
+
+        self.assertEqual(
+            [decision.target[_POOL_KEY] for decision in _ups(decisions)],
+            [self.east_pool, self.phx_pool])
+        self.assertTrue(republished)
+        self.assertEqual(
+            {
+                key: state.free_slots
+                for key, state in autoscaler._fill_pool_states.items()
+            }, {
+                self.east_pool: 0,
+                self.phx_pool: 0,
+            })
+        self.assertEqual(autoscaler._fill_target, 2)
+        self.assertEqual(autoscaler._fill_pool_last_started_key, self.east_pool)
 
     def test_same_identity_readd_cannot_restore_rotation_anchor(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=4)

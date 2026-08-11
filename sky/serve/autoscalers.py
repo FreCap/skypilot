@@ -1841,7 +1841,6 @@ class Autoscaler:
             targets[key] = min(targets[key], remaining_target_budget)
             remaining_target_budget -= targets[key]
 
-        total_target = sum(targets.values())
         result = list(decisions)
 
         # Partition the exact v1 shelter equation over pools. When complete
@@ -2036,25 +2035,43 @@ class Autoscaler:
             if not made_progress:
                 break
 
+        ordinary = result
+        fill: list[AutoscalerDecision] = []
+        if first_emitted_key is not None:
+            num_fill_decisions = sum(emitted_by_pool.values())
+            ordinary = result[:-num_fill_decisions]
+            fill = result[-num_fill_decisions:]
+
+        valid_fill: list[AutoscalerDecision] = []
         with self._fill_pool_state_lock:
             pool_order_is_current = (
                 self._fill_pool_order_revision == pool_order_revision)
             if pool_order_is_current:
-                self._fill_target = total_target
-                for key, target in targets.items():
+                # Commit only authority that still matches the detached
+                # calculation. A failed pool refresh can clear its local
+                # epoch while the durable broker still recognizes the old
+                # one, so returning that pool's stale decision would not be
+                # made safe merely by skipping its local debit.
+                valid_pool_keys: set[str] = set()
+                for key, source in states.items():
                     live = self._fill_pool_states.get(key)
                     if (live is not None and live.service_generation
-                            == states[key].service_generation):
-                        live.fill_target = target
+                            == source.service_generation and
+                            live.physical_cluster_uid
+                            == source.physical_cluster_uid and
+                            live.grant_epoch == source.grant_epoch):
+                        valid_pool_keys.add(key)
+                for key, target in targets.items():
+                    if key in valid_pool_keys:
+                        self._fill_pool_states[key].fill_target = target
+                self._fill_target = sum(
+                    state.fill_target
+                    for state in self._fill_pool_states.values())
                 if first_emitted_key is not None:
                     for key, emitted in emitted_by_pool.items():
-                        if emitted <= 0:
+                        if emitted <= 0 or key not in valid_pool_keys:
                             continue
-                        live = self._fill_pool_states.get(key)
-                        source = states[key]
-                        if (live is None or live.service_generation
-                                != source.service_generation):
-                            continue
+                        live = self._fill_pool_states[key]
                         live.free_slots = max(0, live.free_slots - emitted)
                         if live.last_raw_free_slots is not None:
                             live.last_raw_free_slots = max(
@@ -2066,13 +2083,19 @@ class Autoscaler:
                                     0,
                                     live.free_slots_by_accelerator.get(card, 0)
                                     - card_emitted)
-                    first_live = self._fill_pool_states.get(first_emitted_key)
-                    first_source = states[first_emitted_key]
-                    if (first_live is not None and first_live.service_generation
-                            == first_source.service_generation and
-                            first_live.physical_cluster_uid
-                            == first_source.physical_cluster_uid):
-                        self._fill_pool_last_started_key = first_emitted_key
+                    for decision in fill:
+                        decision_target = decision.target
+                        if not isinstance(decision_target, dict):
+                            continue
+                        pool_key = decision_target.get(
+                            constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY)
+                        if pool_key in valid_pool_keys:
+                            valid_fill.append(decision)
+                    if valid_fill:
+                        first_valid_target = valid_fill[0].target
+                        assert isinstance(first_valid_target, dict)
+                        self._fill_pool_last_started_key = first_valid_target[
+                            constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY]
                     self._refresh_legacy_fill_projection_locked()
 
         if not pool_order_is_current:
@@ -2094,14 +2117,11 @@ class Autoscaler:
             # admission. Put this tick's already-debited fill decisions before
             # the first ordinary scale-up while retaining any leading
             # scale-down decisions and their existing ordering contract.
-            num_fill_decisions = sum(emitted_by_pool.values())
-            ordinary = result[:-num_fill_decisions]
-            fill = result[-num_fill_decisions:]
             first_ordinary_up = next(
                 (index for index, decision in enumerate(ordinary)
                  if decision.operator == AutoscalerDecisionOperator.SCALE_UP),
                 len(ordinary))
-            result = (ordinary[:first_ordinary_up] + fill +
+            result = (ordinary[:first_ordinary_up] + valid_fill +
                       ordinary[first_ordinary_up:])
         return result
 
