@@ -219,6 +219,33 @@ tuna import.log  # pip install tuna
 
 ## Architecture Patterns
 
+### Root-Cause Design and a Single Happy Path
+
+Design changes for the long-term steady state, not merely for the immediate
+symptom. Start from the root cause and prefer solutions that reduce complexity,
+clarify ownership, and make responsibilities more modular. Gain flexibility
+through small composable interfaces and explicit invariants, not through
+duplicated implementations, accumulating conditionals, or parallel happy paths.
+
+- Choose one canonical path for each supported behavior and route new work
+  through it. Refactor or delete superseded paths instead of leaving multiple
+  equally valid implementations that can drift.
+- Treat a timeout increase, retry, feature flag, compatibility shim, fallback,
+  or one-off special case as a temporary mitigation unless it removes the root
+  cause and leaves the architecture simpler. Shipping a mitigation does not
+  complete the underlying change.
+- When compatibility or staged rollout temporarily requires old and new paths,
+  define the steady-state winner before implementation. Mark the old path as
+  deprecated, state the migration and rollback gates, and create the concrete
+  removal path described in **Transitional Feature PR Stacks** below.
+- Keep temporary code isolated behind a narrow boundary, instrument which path
+  is used, and test both the transition and final steady states. Remove the
+  compatibility branch, flag, metrics, and transition-only tests when the
+  documented removal gate passes.
+- Evaluate designs by their final topology: the completed system should have
+  fewer concepts and ownership boundaries, while supporting future variation
+  through the canonical abstraction rather than additional special cases.
+
 ### Design Documents and Implementation Plans
 
 For non-trivial changes, the repository must contain the canonical design at
