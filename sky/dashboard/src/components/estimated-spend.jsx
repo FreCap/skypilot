@@ -188,9 +188,8 @@ export function workloadLabel(workload) {
   if (type === 'service') return `Service · ${id}`;
   if (type === 'pool') return `Pool · ${id}`;
   if (type === 'controller') return `Platform · ${id}`;
-  if (type === 'managed' || type === 'managed_unattributed') {
-    return 'Legacy managed, parent unknown';
-  }
+  if (type === 'managed_unattributed') return 'Legacy managed, parent unknown';
+  if (type === 'managed') return `Legacy managed attempt · ${id}`;
   return `Cluster · ${id}`;
 }
 

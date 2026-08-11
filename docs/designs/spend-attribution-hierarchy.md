@@ -122,6 +122,12 @@ This is a read-time presentation grouping. The source rows are not rewritten.
 Expanding the synthetic workload filters the original `managed` rows and shows
 their physical clusters, so no cost becomes inaccessible.
 
+The synthetic identity is exclusive to the additive drill-down endpoint. The
+existing flat `/estimated_spend` response retains its established `managed`
+type and stored workload IDs so an older dashboard never receives a grouping
+value it cannot label correctly. The new dashboard labels those flat rows as
+legacy physical attempts rather than presenting their IDs as proven parents.
+
 The endpoint rejects incomplete or contradictory scope combinations with a
 422 response. It applies the same admin authorization as `/estimated_spend`.
 
@@ -129,7 +135,8 @@ The endpoint rejects incomplete or contradictory scope combinations with a
 
 An expandable row uses a button with an accessible name and `aria-expanded`.
 Loading and error states are local to that row, so a failed descendant query
-does not replace the valid root estimate.
+does not replace the valid root estimate. When a later page fails, already
+loaded descendants remain visible and Retry resumes from their current count.
 
 A managed workload with more than one distinct non-null task ID expands to
 task rows only when every physical attempt has an evidenced task ID. A
@@ -150,8 +157,10 @@ through the owner hierarchy. `Other` is never rendered as a workload row.
 
 ### Compatibility
 
-The existing `/estimated_spend` response and grouping values remain additive
-and unchanged. Older dashboard clients ignore the new route. During a
+The existing `/estimated_spend` response and grouping values remain unchanged,
+including legacy `managed` rows and their stored identifiers. Synthetic
+`managed_unattributed` rows appear only on the new drill-down route. Older
+dashboard clients ignore the new route. During a
 partially upgraded deployment, a server that supports user breakdowns but not
 the new route falls back to the existing flat user table when a drill-down
 request returns 404 or 405 and surfaces a small unavailable message. Older
@@ -202,6 +211,7 @@ Backend unit tests must prove:
 - Multi-task aggregation and task-scoped cluster results.
 - Null-task attempts bypass an incomplete task hierarchy without lost cost.
 - Legacy `managed` consolidation without lost cost.
+- Flat legacy workload identities remain unchanged for older clients.
 - Deterministic ordering, pagination metadata, and exact date filtering.
 - Parent totals equal the sum of all unpaginated children in representative
   fixtures.
@@ -213,6 +223,7 @@ Dashboard tests must prove:
 - A multi-task managed job expands into tasks and then attempts.
 - A single-task workload expands directly into attempts.
 - `Load more` appends without replacing existing children.
+- A failed later page preserves loaded children and retries at the same offset.
 - Row-local loading, failure, and unsupported-server states.
 - A new materialized snapshot refreshes the hierarchy root.
 - The chart copy explains `Other` without presenting it as an attributable

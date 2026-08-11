@@ -33,6 +33,7 @@ jobs:
           src/components/utils.test.jsx \
           src/components/volumes.test.jsx \
           src/components/estimated-spend.test.jsx \
+          src/components/spend-attribution-table.test.jsx \
           src/components/infra.test.jsx \
           src/components/infra-refresh-lifecycle.test.jsx \
           src/components/infra-page.test.jsx \

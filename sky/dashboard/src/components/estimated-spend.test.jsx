@@ -73,6 +73,7 @@ import {
   formatCostPerRequest,
   shiftUtcDate,
   utcDateString,
+  workloadLabel,
 } from '@/components/estimated-spend';
 
 beforeEach(() => {
@@ -126,6 +127,15 @@ function response(days, estimatedCost) {
     requested_days: days,
   };
 }
+
+test('keeps legacy flat workload identities distinguishable', () => {
+  expect(
+    workloadLabel({ workload_type: 'managed', workload_id: 'legacy-a' })
+  ).toBe('Legacy managed attempt · legacy-a');
+  expect(
+    workloadLabel({ workload_type: 'managed_unattributed', workload_id: null })
+  ).toBe('Legacy managed, parent unknown');
+});
 
 function rollingRange(days, endOffset = 0) {
   const endDate = shiftUtcDate(utcDateString(), endOffset);
