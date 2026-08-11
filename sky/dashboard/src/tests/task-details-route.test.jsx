@@ -130,7 +130,7 @@ describe('TaskDetails route ownership rendering', () => {
 
     expect(screen.getByTestId('log-filter')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: /logs/i }));
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle task 0 logs' }));
     expect(screen.queryByTestId('log-filter')).not.toBeInTheDocument();
 
     routerState.query = { job: '1', task: '1' };
@@ -138,6 +138,27 @@ describe('TaskDetails route ownership rendering', () => {
 
     expect(screen.getByTestId('log-filter')).toBeInTheDocument();
     expect(screen.getByText('(Task 1 logs)')).toBeInTheDocument();
+  });
+
+  it('keeps log actions outside the disclosure button', () => {
+    const view = render(<TaskDetails />);
+    const disclosure = screen.getByRole('button', {
+      name: 'Toggle task 0 logs',
+    });
+    const download = screen.getByRole('button', {
+      name: 'Download task logs',
+    });
+    const refresh = screen.getByRole('button', {
+      name: 'Refresh task logs',
+    });
+
+    expect(
+      view.container.querySelectorAll('#logs-section button button')
+    ).toHaveLength(0);
+    expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+    expect(disclosure).toHaveAttribute('aria-controls', 'task-logs-content');
+    expect(disclosure).not.toContainElement(download);
+    expect(disclosure).not.toContainElement(refresh);
   });
 
   it('drops stale log-loading state on the first render of a new task route', async () => {
