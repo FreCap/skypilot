@@ -1,14 +1,15 @@
 name: Documentation Build
 
 on:
-  # Trigger the workflow on push or pull request,
-  # but only for the master branch
+  # Trigger the workflow on push or pull request for active release branches.
   push:
     branches:
+      - improvements
       - master
       - 'releases/**'
   pull_request:
     branches:
+      - improvements
       - master
       - 'releases/**'
   merge_group:
@@ -20,7 +21,7 @@ jobs:
       matrix:
         python-version: ["3.14"]
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install the latest version of uv
       uses: astral-sh/setup-uv@v4
       with:
@@ -29,6 +30,7 @@ jobs:
     - name: Install dependencies
       run: |
         uv venv --seed ~/test-env
+        # shellcheck source=/dev/null
         source ~/test-env/bin/activate
         uv pip install "."
         cd docs
@@ -36,6 +38,7 @@ jobs:
     - name: Build documentation
       run: |
         set -e
+        # shellcheck source=/dev/null
         source ~/test-env/bin/activate
         cd ./docs
         # Set production environment for llms.txt generation
