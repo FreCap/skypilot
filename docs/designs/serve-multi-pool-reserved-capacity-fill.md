@@ -294,12 +294,12 @@ emitted the prior wave's first decision; the next wave starts after that pool
 in the complete ordered pool map and only then filters pools with no spendable
 feed.  A tick that emits no fill decision does not consume a fairness turn.
 The identity is carried across an in-process autoscaler state transfer only
-when it is a string naming a pool in the validated restored map.  Pool removal,
-protocol demotion, fill disablement, malformed state, and a full controller
-restart reset the anchor.  Thus a continuously running controller gives every
-continuously actionable pool a first-admission opportunity within at most one
-emitted wave per pool in the validated map, without adding provider or database
-calls; ordering remains linear in the number of pools.
+when it is a string naming a pool in the validated restored map.  Anchored-pool
+removal, protocol demotion, fill disablement, a malformed or unknown anchor,
+and a full controller restart reset it.  Thus a continuously running controller
+gives every continuously actionable pool a first-admission opportunity within
+at most one emitted wave per pool in the validated map, without adding provider
+or database calls; ordering remains linear in the number of pools.
 
 There is deliberately no exclusive manager-wide reconciliation round: one
 unreachable job-status SSH call must not block readiness or the refresher that
@@ -1687,11 +1687,11 @@ larger than the configured `max_replicas`.
   drift item until both platform pool roots consume the fixed module. At that
   point remove the bridge binding, prove both exact UID reads still pass, and
   then remove the bridge role.
-- The Helm release is declaratively owned by boltz-platform Terragrunt, whose
-  `skypilot-pin.json` remains at `1.1.1084`. Revisions 331 through 336 and this
-  requested phase-scope Helm rollout are intentional direct-deploy drift; a
-  later Terragrunt apply will revert them unless the pin is reconciled. This
-  rollout deliberately creates no boltz-platform PR, per operator direction.
+- The live SkyPilot Helm release is the deployment authority.  The
+  boltz-platform pin is independent configuration and is not a rollback source
+  for a direct SkyPilot rollout; changing it requires separate explicit scope.
+  Verify the live chart version, image tag, and image digest after each rollout
+  and do not infer deployment state from the platform repository.
 - The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
   Isolated exact-context and two-pool canaries passed, including an H200 replica
   and HTTP 200 from Rainier, but versions 51--53 retained east-only placement
