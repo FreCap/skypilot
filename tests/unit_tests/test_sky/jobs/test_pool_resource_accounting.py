@@ -4,18 +4,46 @@
 
 import asyncio
 import contextlib
+import inspect
+import pickle
 import shutil
 
 import filelock
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import state_pool_queries
 from sky.jobs.state import ManagedJobStatus
 from sky.resources import Resources
+
+_POOL_QUERY_PUBLIC_FUNCTIONS = (
+    state.get_pending_jobs_count_by_pool,
+    state.get_nonterminal_job_ids_by_pool,
+    state.get_nonterminal_job_counts_by_pool,
+    state.get_nonterminal_job_status_counts_by_pool,
+    state.get_nonterminal_job_ids_by_pool_grouped,
+    state.get_pool_worker_used_resources,
+    state.get_pool_worker_used_resources_by_cluster,
+)
+
+
+@contextlib.contextmanager
+def _count_sql_statements(engine):
+    count = {'value': 0}
+
+    def _before_cursor_execute(*_args, **_kwargs):
+        count['value'] += 1
+
+    event.listen(engine, 'before_cursor_execute', _before_cursor_execute)
+    try:
+        yield count
+    finally:
+        event.remove(engine, 'before_cursor_execute', _before_cursor_execute)
 
 
 @pytest.fixture
@@ -96,6 +124,60 @@ def _new_pool_job(engine, *, pool: str, status: ManagedJobStatus,
                  full_resources=full_resources)
     state.set_current_cluster_name(job_id, cluster_name)
     return job_id
+
+
+def test_pool_query_facade_identity_signatures_and_pickle_lookup():
+    """The historical state facade remains the public function owner."""
+    expected_signatures = {
+        'get_pending_jobs_count_by_pool': '(pool: str) -> int',
+        'get_nonterminal_job_ids_by_pool': "(pool: str, cluster_name: str | None = None) -> list[int]",
+        'get_nonterminal_job_counts_by_pool': '(pool: str) -> dict[str, int]',
+        'get_nonterminal_job_status_counts_by_pool': '(pool: str) -> dict[str, int]',
+        'get_nonterminal_job_ids_by_pool_grouped': '(pool: str) -> dict[str | None, list[int]]',
+        'get_pool_worker_used_resources':
+            "(job_ids: set[int]) -> "
+            "Optional[ForwardRef('resources_lib.Resources')]",
+        'get_pool_worker_used_resources_by_cluster': "(pool: str) -> dict[str | None, 'resources_lib.Resources'] | None",
+    }
+
+    for function in _POOL_QUERY_PUBLIC_FUNCTIONS:
+        assert function.__module__ == 'sky.jobs.state'
+        assert function is getattr(state_pool_queries, function.__name__)
+        assert str(inspect.signature(function)) == expected_signatures[
+            function.__name__]
+        assert pickle.loads(pickle.dumps(function)) is function
+
+
+def test_pool_queries_keep_one_query_budget(managed_jobs_db):
+    """Every non-empty pool projection remains one SQL round trip."""
+    running_job = _new_pool_job(
+        managed_jobs_db,
+        pool='pool-a',
+        status=ManagedJobStatus.RUNNING,
+        full_resources=Resources(cpus='2').to_yaml_config(),
+        cluster_name='replica-1',
+    )
+
+    calls = (
+        lambda: state.get_pending_jobs_count_by_pool('pool-a'),
+        lambda: state.get_nonterminal_job_ids_by_pool('pool-a'),
+        lambda: state.get_nonterminal_job_counts_by_pool('pool-a'),
+        lambda: state.get_nonterminal_job_status_counts_by_pool('pool-a'),
+        lambda: state.get_nonterminal_job_ids_by_pool_grouped('pool-a'),
+        lambda: state.get_pool_worker_used_resources({running_job}),
+        lambda: state.get_pool_worker_used_resources_by_cluster('pool-a'),
+    )
+    for call in calls:
+        with _count_sql_statements(managed_jobs_db) as count:
+            call()
+        assert count['value'] == 1
+
+
+def test_pool_worker_empty_job_set_keeps_zero_query_budget(managed_jobs_db):
+    """An empty worker projection must not open a database session."""
+    with _count_sql_statements(managed_jobs_db) as count:
+        assert state.get_pool_worker_used_resources(set()) is None
+    assert count['value'] == 0
 
 
 def test_grouped_pool_resource_accounting_fails_closed_on_empty_job(
