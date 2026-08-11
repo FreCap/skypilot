@@ -460,6 +460,13 @@ class Autoscaler:
         # protocol-v1 implementation and compatibility/status projection.
         self._fill_pool_state_lock = threading.RLock()
         self._fill_pool_states: dict[str, _PoolFillState] = {}
+        # Rotate which actionable pool starts each emitted wave. The replica
+        # manager deliberately stops a v2 batch when provider admission is
+        # busy so it can release its lock to the queued phase owner. Without
+        # cross-wave rotation, one persistently busy first pool can therefore
+        # prevent every later pool from reaching admission despite the
+        # within-wave round robin below.
+        self._fill_pool_round_robin_cursor = 0
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
         self.cost_rebalance: bool = bool(spec.cost_rebalance)
@@ -1953,12 +1960,21 @@ class Autoscaler:
         # Interleave independent physical pools one launch at a time. Provider
         # admission and durable reservation happen serially in the replica
         # manager, and a large/slow/broken first pool can otherwise consume the
-        # whole validity window before a later pool is attempted. Round-robin
-        # ordering preserves every pool's exact authority and total budget
-        # while guaranteeing bounded progress for each actionable pool.
+        # whole validity window before a later pool is attempted. Rotate the
+        # first actionable pool across waves too: provider-phase contention
+        # intentionally stops a batch, so a fixed first pool would still be
+        # able to starve every later pool before the within-wave round robin
+        # gets its first turn.
+        launch_order = [
+            key for key in ordered_keys if launch_remaining.get(key, 0) > 0
+        ]
+        if launch_order:
+            start = self._fill_pool_round_robin_cursor % len(launch_order)
+            launch_order = launch_order[start:] + launch_order[:start]
+            self._fill_pool_round_robin_cursor += 1
         while hard_headroom > 0:
             made_progress = False
-            for key in ordered_keys:
+            for key in launch_order:
                 if hard_headroom <= 0:
                     break
                 remaining = launch_remaining.get(key, 0)

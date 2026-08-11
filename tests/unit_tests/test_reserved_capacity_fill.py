@@ -1825,6 +1825,23 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
             self.assertEqual(override['accelerators'], {expected_card: 1})
         self.assertEqual(by_pool, {self.east_pool: 2, self.phx_pool: 2})
 
+        # Replenish both pools and emit another wave. A batch may stop at its
+        # first busy provider-phase boundary, so the next wave must give the
+        # other pool the first admission opportunity.
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        next_fill_ups = [
+            decision for decision in _ups(_decisions(autoscaler, []))
+            if decision.target is not None
+        ]
+        self.assertEqual(
+            [decision.target[_POOL_KEY] for decision in next_fill_ups], [
+                self.phx_pool,
+                self.east_pool,
+                self.phx_pool,
+                self.east_pool,
+            ])
+
     def test_exact_measurement_selects_available_card_in_mixed_pool(self):
         mixed_l4 = make_location('phx-context',
                                  accelerators={'L4': 1},
