@@ -270,10 +270,14 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
     assert summary['evidence_is_lower_bound'] is True
     assert summary['observed_events'] == 13
     assert summary['eligible_ordinary_launches'] == 2
-    assert summary['controller_starts_during_nonterminal_launches'] == 2
+    # Both rows came from the same service/route epoch and therefore represent
+    # one controller start, even though two nonterminal records were observed.
+    assert summary['controller_starts_during_nonterminal_launches'] == 1
     assert summary[
         'replica_records_with_multiple_requests_before_projection'] == 1
-    assert summary['restart_redrives_with_active_predecessor'] == 1
+    # Missing one-shot terminal evidence cannot prove that a predecessor was
+    # active; it is reported explicitly as unknown.
+    assert summary['restart_redrives_with_predecessor_status_unknown'] == 1
     assert summary[
         'restart_redrives_with_terminal_unprojected_predecessor'] == 1
     assert summary['restart_redrives_without_observed_predecessor'] == 1

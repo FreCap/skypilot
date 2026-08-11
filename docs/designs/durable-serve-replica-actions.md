@@ -492,8 +492,9 @@ retry after a route-epoch change. Queries report:
   launch windows;
 - replica records associated with more than one ordinary request ID before
   terminal projection;
-- restart redrives whose predecessor request was still active or terminal but
-  unreduced;
+- restart redrives whose predecessor status is unknown because no terminal
+  observation was retained, or whose predecessor was observed terminal but
+  remained unreduced;
 - duplicate service-job submissions for one replica record;
 - owner-loss cancellations; and
 - cleanup retries whose process-local backoff reset after controller restart.
@@ -510,25 +511,39 @@ controller launches, versioned diagnostic identity travels inside the existing
 launch context; the API process publishes `REQUEST_PUBLISHED` only after
 request scheduling returns, so a lost HTTP acknowledgement does not hide the
 accepted request merely because `sdk.launch()` never returned to the
-controller. This API-side publication remains asynchronous and fail-open.
-Event timestamps use the database clock, payloads and credentials are never
-stored, and updates and truncation are rejected. A writer-owned five-minute
-cadence deletes at most 1,000 rows per pass, and only rows strictly older than
-60 days; event insertion never performs retention work.
+controller. Publication requires all five durable service-owner fence fields,
+cross-checks the nested diagnostic service/version against that outer fence,
+and queues only the closed fence. Before inserting the event, the writer
+performs a fresh PostgreSQL authorization read; invalid, stale, or unavailable
+provenance drops only the evidence. This API-side publication remains
+asynchronous and fail-open.
 
-The summary query labels all event evidence as a lower bound, reports redrives
-whose predecessor publication was not observed, and includes explicitly
-process-local queue depths, queue drops, writer failures, backend-unavailable
-events, retention-prune failures, and terminal-lookup failures since module
-import. A low-cardinality multiprocess Prometheus counter exports enqueue,
-persist, drop, unavailable, lookup, and prune outcomes across scraped fleet
+Event timestamps use the database clock, payloads and credentials are never
+stored, and updates and truncation are rejected. One PostgreSQL-backed
+distributed singleton owned by the central server's controller/all background
+runtime runs a five-minute retention cadence. It deletes at most 1,000 rows per
+pass, and only rows strictly older than 60 days; event insertion never performs
+retention work and additional controller processes do not prune independently.
+
+The summary query labels all event evidence as a lower bound, counts controller
+starts as distinct service/route-epoch pairs rather than replica rows, reports
+redrives with no observed predecessor publication, and uses an explicit
+predecessor-status-unknown bucket when the one-shot terminal observer retained
+no terminal evidence. Absence of that evidence is never labeled active.
+It also includes explicitly process-local queue depths, queue drops, writer
+failures, backend-unavailable events, provenance rejections/check failures,
+retention-prune failures, and terminal-lookup failures since module import. A
+low-cardinality multiprocess Prometheus counter exports enqueue, persist, drop,
+unavailable, provenance, lookup, and prune outcomes across scraped fleet
 processes. These surfaces prevent a lossy diagnostic process from presenting
 unexplained zeros as fleet-wide completeness; they do not make asynchronous
 telemetry an authority or a complete audit log. Initial instrumentation covers
 ordinary request publication, controller-start observation and restart
 redrive, owner-loss cancellation, observed API terminal result with a closed
 `SUCCEEDED`/`FAILED`/`CANCELLED` status, service-job observation, and Serve
-result projection. Terminal lookup runs on a separate bounded daemon, ignores
+result projection. A system-recovery candidate's bound recovery request is
+excluded, while any later retry is instrumented once durable demotion makes it
+ordinary. Terminal lookup runs on a separate bounded daemon, ignores
 missing/nonterminal/inexact results, and cannot delay launch. The closed
 cleanup-retry kind is retained for the point where a route-epoch change can be
 proved rather than inferred.

@@ -3603,6 +3603,16 @@ run: echo hi
         get_bound = mock.Mock(return_value='request-id')
         persist_job = mock.Mock(return_value=True)
         demote = mock.Mock(return_value=True)
+        events = []
+        handoff = {
+            'context_version': 1,
+            'service_name': 'svc',
+            'service_version': 2,
+            'replica_id': 1,
+            'replica_record_id': '11111111-1111-4111-8111-111111111111',
+            'controller_route_epoch': ('22222222-2222-4222-8222-222222222222'),
+            'input_digest': 'a' * 64,
+        }
 
         mock_sdk, _, raised = self._run_launch_cluster(
             tmp_path, [malformed_result, None],
@@ -3610,12 +3620,73 @@ run: echo hi
             system_recovery_launch_context={'closed': 'context'},
             get_bound_system_recovery_request_id=get_bound,
             persist_system_recovery_job_id=persist_job,
-            demote_system_recovery_candidate=demote)
+            demote_system_recovery_candidate=demote,
+            ordinary_launch_handoff_context=handoff,
+            ordinary_launch_event=lambda kind, request_id, job_id, status:
+            events.append((kind, request_id, job_id, status)))
 
         assert raised is None
         assert mock_sdk.launch.call_count == 2
+        first_context = mock_sdk.launch.call_args_list[0].kwargs[
+            '_extra_launch_context']
+        second_context = mock_sdk.launch.call_args_list[1].kwargs[
+            '_extra_launch_context']
+        # The recovery protocol is a closed exact-key contract. Diagnostic
+        # identity appears only after durable demotion makes the retry ordinary.
+        assert first_context == {'closed': 'context'}
+        assert second_context == {
+            replica_managers.serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY: handoff,
+        }
         demote.assert_called_once_with()
         persist_job.assert_not_called()
+        # The bound recovery request is intentionally excluded.  Once durable
+        # demotion succeeds, the subsequent ordinary request is observable.
+        assert events == [
+            (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+             'ordinary-request', None, None),
+        ]
+
+    def test_demoted_candidate_callback_requires_explicit_retry_marker(self):
+        route_epoch = '22222222-2222-4222-8222-222222222222'
+        record_id = '11111111-1111-4111-8111-111111111111'
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._is_pool = False
+        manager._service_name = 'svc'
+        manager._ordinary_launch_handoff_route_epoch = route_epoch
+        info = mock.Mock()
+        info.reserved_fill = False
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        info.version = 2
+        info.replica_id = 1
+        info.replica_record_id = record_id
+
+        with mock.patch.object(ordinary_launch_handoff,
+                               'emit_event') as emit_event:
+            manager._emit_ordinary_launch_handoff_event(
+                info,
+                ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                'initial-recovery-request',
+                input_digest='a' * 64)
+            manager._emit_ordinary_launch_handoff_event(
+                info,
+                ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                'ordinary-request',
+                input_digest='a' * 64,
+                allow_demoted_candidate=True)
+
+        emit_event.assert_called_once_with(
+            event_kind=ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+            service_name='svc',
+            service_version=2,
+            replica_id=1,
+            replica_record_id=record_id,
+            controller_route_epoch=route_epoch,
+            ordinary_request_id='ordinary-request',
+            service_job_id=None,
+            terminal_status=None,
+            input_digest='a' * 64)
 
 
 class TestLaunchReplicaAvailabilityMaxRetry:

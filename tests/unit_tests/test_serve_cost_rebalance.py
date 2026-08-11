@@ -745,6 +745,7 @@ class TestPinnedReplacementLaunch:
             'service_spec',
             'service_name',
             'workspace',
+            'ordinary_launch_handoff_context',
             'ordinary_launch_event',
             'frozen_controller_config',
             'frozen_controller_config_path',
@@ -769,6 +770,14 @@ class TestPinnedReplacementLaunch:
         assert launch_kwargs['service_spec'] is manager._version_specs[1]
         assert launch_kwargs['service_name'] == 'svc'
         assert isinstance(launch_kwargs['workspace'], str)
+        handoff = launch_kwargs['ordinary_launch_handoff_context']
+        assert handoff['context_version'] == 1
+        assert handoff['service_name'] == 'svc'
+        assert handoff['service_version'] == 1
+        assert handoff['replica_id'] == 8
+        assert handoff['replica_record_id'] == info.replica_record_id
+        assert handoff['controller_route_epoch']
+        assert len(handoff['input_digest']) == 64
         assert launch_kwargs['frozen_controller_config'] is not None
         launch_thread = launch_thread_cls.return_value
         assert manager._launch_thread_pool[8] is launch_thread

@@ -5,6 +5,7 @@ events without waiting for PostgreSQL; neither a dropped event nor a writer
 failure can authorize, delay, cancel, retry, or project a replica launch.
 """
 
+import asyncio
 from collections.abc import Callable
 import dataclasses
 import datetime
@@ -14,7 +15,6 @@ import json
 import queue
 import re
 import threading
-import time
 from typing import Any
 import uuid
 
@@ -22,6 +22,7 @@ import prometheus_client as prom
 import sqlalchemy
 
 from sky import sky_logging
+from sky.serve import constants as serve_constants
 from sky.serve import serve_state
 from sky.utils.db import db_utils
 
@@ -40,6 +41,8 @@ DELIVERY_OUTCOMES = (
     'event_persisted',
     'event_backend_unavailable',
     'event_write_failed',
+    'event_provenance_rejected',
+    'event_provenance_check_failed',
     'terminal_observation_enqueued',
     'terminal_observation_queue_dropped',
     'terminal_lookup_failed',
@@ -165,7 +168,16 @@ class _Event:
         return dataclasses.asdict(self)
 
 
-_pending_events: 'queue.Queue[_Event]' = queue.Queue(maxsize=MAX_PENDING_EVENTS)
+@dataclasses.dataclass(frozen=True)
+class _PendingEvent:
+    """One event plus optional server-validated publication provenance."""
+
+    event: _Event
+    required_launch_fence: dict[str, Any] | None = None
+
+
+_pending_events: 'queue.Queue[_PendingEvent]' = queue.Queue(
+    maxsize=MAX_PENDING_EVENTS)
 _pending_terminal_observations: 'queue.Queue[_TerminalObservation]' = (
     queue.Queue(maxsize=MAX_PENDING_TERMINAL_OBSERVATIONS))
 _writer_lock = threading.Lock()
@@ -177,6 +189,8 @@ _write_failure_count = 0
 _terminal_lookup_failure_count = 0
 _backend_unavailable_count = 0
 _retention_prune_failure_count = 0
+_provenance_rejected_count = 0
+_provenance_check_failure_count = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -394,37 +408,75 @@ def _log_retention_prune_failure(error: Exception) -> None:
             error)
 
 
-def _maybe_prune_expired_events(next_prune_at: float, *, now: float) -> float:
-    """Run one fail-open maintenance batch when the cadence is due."""
-    if now < next_prune_at:
-        return next_prune_at
+def _record_provenance_rejected() -> None:
+    global _provenance_rejected_count
+    with _writer_lock:
+        _provenance_rejected_count += 1
+        rejected_count = _provenance_rejected_count
+    _record_delivery_outcome('event_provenance_rejected')
+    if rejected_count == 1 or rejected_count % 100 == 0:
+        logger.warning(
+            'Ordinary-launch publication telemetry rejected a stale or invalid '
+            'service-owner fence (rejection %s).', rejected_count)
+
+
+def _record_provenance_check_failure(error: Exception) -> None:
+    global _provenance_check_failure_count
+    with _writer_lock:
+        _provenance_check_failure_count += 1
+        failure_count = _provenance_check_failure_count
+    _record_delivery_outcome('event_provenance_check_failed')
+    if failure_count == 1 or failure_count % 100 == 0:
+        logger.warning(
+            'Ordinary-launch publication telemetry could not validate its '
+            'service-owner fence; dropping evidence without changing launch '
+            'behavior (failure %s): %s', failure_count, error)
+
+
+def _pending_event_provenance_holds(pending: _PendingEvent) -> bool:
+    """Validate API-side publication provenance outside the request path."""
+    launch_fence = pending.required_launch_fence
+    if launch_fence is None:
+        return True
     try:
-        _prune_expired_events()
+        authorized = serve_state.service_replica_launch_fence_holds(
+            launch_fence)
     except Exception as error:  # pylint: disable=broad-except
-        _log_retention_prune_failure(error)
-    return now + RETENTION_PRUNE_INTERVAL_SECONDS
+        _record_provenance_check_failure(error)
+        return False
+    if not authorized:
+        _record_provenance_rejected()
+        return False
+    return True
 
 
 def _writer_loop() -> None:
-    next_prune_at = time.monotonic() + RETENTION_PRUNE_INTERVAL_SECONDS
     while True:
-        timeout = max(0.0, next_prune_at - time.monotonic())
+        pending = _pending_events.get()
         try:
-            event = _pending_events.get(timeout=timeout)
-        except queue.Empty:
-            event = None
-        if event is not None:
-            try:
-                if _write_event(event):
-                    _record_delivery_outcome('event_persisted')
-                else:
-                    _record_backend_unavailable()
-            except Exception as error:  # pylint: disable=broad-except
-                _log_write_failure(error)
-            finally:
-                _pending_events.task_done()
-        now = time.monotonic()
-        next_prune_at = _maybe_prune_expired_events(next_prune_at, now=now)
+            if not _pending_event_provenance_holds(pending):
+                continue
+            if _write_event(pending.event):
+                _record_delivery_outcome('event_persisted')
+            else:
+                _record_backend_unavailable()
+        except Exception as error:  # pylint: disable=broad-except
+            _log_write_failure(error)
+        finally:
+            _pending_events.task_done()
+
+
+async def retention_daemon() -> None:
+    """Delete one bounded batch per distributed-singleton cadence."""
+    while True:
+        try:
+            await asyncio.sleep(RETENTION_PRUNE_INTERVAL_SECONDS)
+            await asyncio.to_thread(_prune_expired_events)
+        except asyncio.CancelledError:
+            logger.info('Ordinary-launch handoff retention daemon cancelled.')
+            raise
+        except Exception as error:  # pylint: disable=broad-except
+            _log_retention_prune_failure(error)
 
 
 def _process_terminal_observation(observation: _TerminalObservation) -> None:
@@ -498,10 +550,16 @@ def _record_queue_drop(*, terminal_observation: bool) -> None:
             queue_name, drop_count)
 
 
-def _enqueue_event(event: _Event) -> bool:
+def _enqueue_event(
+    event: _Event,
+    *,
+    required_launch_fence: dict[str, Any] | None = None,
+) -> bool:
     try:
         _ensure_writer()
-        _pending_events.put_nowait(event)
+        _pending_events.put_nowait(
+            _PendingEvent(event=event,
+                          required_launch_fence=required_launch_fence))
     except queue.Full:
         _record_queue_drop(terminal_observation=False)
         return False
@@ -574,6 +632,54 @@ def emit_event(
         return _enqueue_event(event)
     except Exception as error:  # pylint: disable=broad-except
         logger.debug('Dropping invalid ordinary-launch diagnostic event: %s',
+                     error)
+        return False
+
+
+def emit_verified_request_publication(
+    *,
+    service_name: str,
+    service_version: int,
+    replica_id: int,
+    replica_record_id: str,
+    controller_route_epoch: str,
+    ordinary_request_id: str,
+    input_digest: str,
+    launch_fence: dict[str, Any],
+) -> bool:
+    """Queue API publication only with exact durable-owner provenance.
+
+    Structural checks happen synchronously, but the fresh PostgreSQL authority
+    read runs in the event writer.  Consequently an invalid, stale, or
+    unavailable fence drops only telemetry and never delays the HTTP response.
+    """
+    try:
+        if not isinstance(launch_fence, dict) or not all(
+                key in launch_fence
+                for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
+            raise ValueError('request publication requires a complete fence.')
+        closed_fence = {
+            key: launch_fence[key]
+            for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS
+        }
+        if (closed_fence[serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
+                != service_name or closed_fence[
+                    serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY]
+                != service_version):
+            raise ValueError(
+                'request publication identity does not match its launch fence.')
+        event = _event(event_kind=EventKind.REQUEST_PUBLISHED,
+                       service_name=service_name,
+                       service_version=service_version,
+                       replica_id=replica_id,
+                       replica_record_id=replica_record_id,
+                       controller_route_epoch=controller_route_epoch,
+                       ordinary_request_id=ordinary_request_id,
+                       service_job_id=None,
+                       input_digest=input_digest)
+        return _enqueue_event(event, required_launch_fence=closed_fence)
+    except Exception as error:  # pylint: disable=broad-except
+        logger.debug('Dropping invalid ordinary-launch publication context: %s',
                      error)
         return False
 
@@ -652,14 +758,17 @@ SELECT
     (SELECT COUNT(*) FROM window_events) AS observed_events,
     (SELECT COUNT(DISTINCT replica_record_id) FROM window_events
      WHERE event_kind = 'request_published') AS eligible_ordinary_launches,
-    (SELECT COUNT(*) FROM window_events
-     WHERE event_kind = 'controller_start_nonterminal') AS
+    (SELECT COUNT(*) FROM (
+         SELECT DISTINCT service_name, controller_route_epoch
+         FROM window_events
+         WHERE event_kind = 'controller_start_nonterminal'
+     ) AS controller_starts) AS
         controller_starts_during_nonterminal_launches,
     (SELECT COUNT(*) FROM multi_request_records) AS
         replica_records_with_multiple_requests_before_projection,
     (SELECT COUNT(*) FROM redrive_classes
      WHERE has_predecessor AND NOT predecessor_terminal) AS
-        restart_redrives_with_active_predecessor,
+        restart_redrives_with_predecessor_status_unknown,
     (SELECT COUNT(*) FROM redrive_classes
      WHERE predecessor_terminal AND NOT predecessor_projected) AS
         restart_redrives_with_terminal_unprojected_predecessor,
@@ -686,6 +795,8 @@ def _process_local_delivery_summary() -> dict[str, Any]:
         terminal_lookup_failures = _terminal_lookup_failure_count
         backend_unavailable = _backend_unavailable_count
         retention_prune_failures = _retention_prune_failure_count
+        provenance_rejections = _provenance_rejected_count
+        provenance_check_failures = _provenance_check_failure_count
     return {
         'scope': 'current_process_since_module_import',
         'queue_drops': (event_queue_drops + terminal_observation_queue_drops),
@@ -695,6 +806,8 @@ def _process_local_delivery_summary() -> dict[str, Any]:
         'terminal_lookup_failures': terminal_lookup_failures,
         'backend_unavailable': backend_unavailable,
         'retention_prune_failures': retention_prune_failures,
+        'provenance_rejections': provenance_rejections,
+        'provenance_check_failures': provenance_check_failures,
         'pending_events': _pending_events.qsize(),
         'pending_terminal_observations':
             (_pending_terminal_observations.qsize()),

@@ -758,9 +758,10 @@ def launch_cluster(
             return
         try:
             sdk.api_cancel(request_id)
-            _emit_ordinary_launch_event(
-                ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCELLED,
-                request_id)
+            if not recovery_request_attempted:
+                _emit_ordinary_launch_event(
+                    ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCELLED,
+                    request_id)
         except Exception as e:  # pylint: disable=broad-except
             # The successor still owns the durable replica row and can
             # recover/garbage-collect the incarnation-scoped cluster. Never
@@ -936,10 +937,13 @@ def launch_cluster(
             launch_kwargs: dict[str, Any] = {}
             launch_context = (system_recovery_launch_context
                               if recovery_context_available else launch_fence)
-            if ordinary_launch_handoff_context is not None:
+            if (ordinary_launch_handoff_context is not None and
+                    not recovery_context_available):
                 # Reuse the existing internal launch context transport.  This
                 # metadata is diagnostic only and remains separate from every
                 # provider-authority fence inside one nested versioned value.
+                # The initial recovery context is an exact-key contract; add
+                # this value only after durable demotion makes a retry ordinary.
                 launch_context = dict(launch_context or {})
                 launch_context[
                     serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY] = (
@@ -984,20 +988,24 @@ def launch_cluster(
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
-            _emit_ordinary_launch_event(
-                ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, request_id)
+            if not recovery_request_attempted:
+                _emit_ordinary_launch_event(
+                    ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                    request_id)
             try:
                 launch_result = _stream_with_launch_watchdogs(request_id)
             except Exception:  # pylint: disable=broad-except
-                _observe_terminal_nonblocking(request_id)
+                if not recovery_request_attempted:
+                    _observe_terminal_nonblocking(request_id)
                 raise
-            _observe_terminal_nonblocking(request_id)
+            if not recovery_request_attempted:
+                _observe_terminal_nonblocking(request_id)
             service_job_id = (launch_result[0] if isinstance(
                 launch_result, tuple) and len(launch_result) == 2 and
                               isinstance(launch_result[0], int) and
                               not isinstance(launch_result[0], bool) and
                               launch_result[0] > 0 else None)
-            if service_job_id is not None:
+            if service_job_id is not None and not recovery_request_attempted:
                 _emit_ordinary_launch_event(
                     ordinary_launch_handoff.EventKind.SERVICE_JOB_OBSERVED,
                     request_id, service_job_id)
@@ -3215,11 +3223,21 @@ class SkyPilotReplicaManager(ReplicaManager):
         terminal_status: ordinary_launch_handoff.TerminalStatus | None = None,
         *,
         input_digest: str | None = None,
+        allow_demoted_candidate: bool = False,
     ) -> None:
         """Emit diagnostic evidence without changing replica behavior."""
-        if (self._is_pool or info.reserved_fill or
-                info.system_recovery_disposition
-                != system_recovery_state.SystemRecoveryDisposition.ORDINARY):
+        if self._is_pool or info.reserved_fill:
+            return
+        disposition = info.system_recovery_disposition
+        # The launch thread captures the candidate object before durable
+        # demotion.  Its callback may use that stale value only on attempts
+        # that launch_cluster has already classified as ordinary; the bound
+        # recovery attempt is gated before every callback invocation.
+        if (disposition
+                != system_recovery_state.SystemRecoveryDisposition.ORDINARY and
+                not (allow_demoted_candidate and
+                     disposition == system_recovery_state.
+                     SystemRecoveryDisposition.CANDIDATE)):
             return
         ordinary_launch_handoff.emit_event(
             event_kind=event_kind,
@@ -5332,8 +5350,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'frozen_controller_config_path': frozen_controller_config_path,
                 **recovery_launch_kwargs,
             }
-            if (not recovery_launch_kwargs and not self._is_pool and
-                    not zero_cost_only):
+            if not self._is_pool and not zero_cost_only:
                 input_digest = (ordinary_launch_handoff.redacted_input_digest(
                     launch_yaml_content, resources_override))
                 launch_thread_kwargs['ordinary_launch_handoff_context'] = {
@@ -5349,9 +5366,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'input_digest': input_digest,
                 }
                 launch_thread_kwargs['ordinary_launch_event'] = (
-                    functools.partial(self._emit_ordinary_launch_handoff_event,
-                                      info,
-                                      input_digest=input_digest))
+                    functools.partial(
+                        self._emit_ordinary_launch_handoff_event,
+                        info,
+                        input_digest=input_digest,
+                        allow_demoted_candidate=bool(recovery_launch_kwargs)))
             return _ReplicaLaunchThread(
                 target=launch_cluster_with_frozen_controller_config,
                 replica_id=replica_id,

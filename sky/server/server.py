@@ -946,6 +946,9 @@ async def launch(launch_body: payloads.LaunchBody,
         launch_body.extra_launch_context = bound_context
         launch_context = bound_context
     launch_precondition = None
+    has_launch_fence = False
+    service_name = None
+    service_version = None
     if launch_body.is_launched_by_sky_serve_controller:
         has_launch_fence = any(
             key in launch_context
@@ -993,15 +996,17 @@ async def launch(launch_body: payloads.LaunchBody,
     )
     # Publish from the API process only after request scheduling has returned.
     # On the built-in PostgreSQL backend that means both the request and its
-    # durable queue row committed.  This closes the diagnostic blind spot when
-    # the HTTP acknowledgement is lost before sdk.launch() returns the ID to
-    # the controller.  Validation, queue pressure, and writer failures remain
-    # fail-open and can never change launch behavior.
+    # durable queue row committed.  The telemetry writer validates the complete
+    # service-owner fence on a fresh PostgreSQL snapshot before inserting the
+    # event.  Validation, queue pressure, and writer failures remain fail-open
+    # and can never change launch behavior or delay the HTTP acknowledgement.
     handoff_context = launch_context.get(
         serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY)
     if (launch_body.is_launched_by_sky_serve_controller and
             not has_system_recovery_context and
-            reserved_fill_launch_fence is None and
+            reserved_fill_launch_fence is None and has_launch_fence and
+            all(key in launch_context
+                for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS) and
             isinstance(handoff_context, dict)):
         context_version = handoff_context.get('context_version')
         handoff_service_name = handoff_context.get('service_name')
@@ -1017,22 +1022,23 @@ async def launch(launch_body: payloads.LaunchBody,
                 type(handoff_service_version) is int and
                 handoff_service_version > 0 and
                 type(handoff_replica_id) is int and handoff_replica_id > 0 and
+                handoff_service_name == service_name and
+                handoff_service_version == service_version and
                 isinstance(replica_record_id, str) and
                 bool(replica_record_id) and
                 isinstance(controller_route_epoch, str) and
                 bool(controller_route_epoch) and
                 isinstance(input_digest, str) and bool(input_digest)):
             try:
-                ordinary_launch_handoff.emit_event(
-                    event_kind=(
-                        ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED),
+                ordinary_launch_handoff.emit_verified_request_publication(
                     service_name=handoff_service_name,
                     service_version=handoff_service_version,
                     replica_id=handoff_replica_id,
                     replica_record_id=replica_record_id,
                     controller_route_epoch=controller_route_epoch,
                     ordinary_request_id=request_id,
-                    input_digest=input_digest)
+                    input_digest=input_digest,
+                    launch_fence=launch_context)
             except Exception as error:  # pylint: disable=broad-except
                 logger.debug(
                     'Ordinary-launch request publication telemetry '

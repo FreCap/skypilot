@@ -1,6 +1,7 @@
 """Unit tests for diagnostic ordinary-launch handoff telemetry."""
 # pylint: disable=protected-access
 
+import asyncio
 import queue
 import uuid
 
@@ -11,6 +12,16 @@ from sky.serve import ordinary_launch_handoff
 
 _RECORD_ID = '11111111-1111-4111-8111-111111111111'
 _ROUTE_EPOCH = '22222222-2222-4222-8222-222222222222'
+
+
+def _launch_fence() -> dict[str, object]:
+    return {
+        'sky_serve_service_name': 'svc',
+        'sky_serve_service_hash': 'incarnation-a',
+        'sky_serve_service_version': 2,
+        'sky_serve_controller_pid': 123,
+        'sky_serve_controller_ip': '10.0.0.1',
+    }
 
 
 def _event_kwargs(**overrides):
@@ -103,6 +114,93 @@ def test_emit_enqueues_validated_uuid_event(monkeypatch):
     assert 'observed_at' not in event.insert_values()
 
 
+def test_verified_publication_carries_only_closed_launch_fence(monkeypatch):
+    pending = []
+
+    def _enqueue(event, *, required_launch_fence=None):
+        pending.append((event, required_launch_fence))
+        return True
+
+    monkeypatch.setattr(ordinary_launch_handoff, '_enqueue_event', _enqueue)
+    fence = {
+        **_launch_fence(),
+        'sky_serve_ordinary_launch_handoff': {
+            'untrusted': 'nested-value'
+        },
+    }
+
+    assert ordinary_launch_handoff.emit_verified_request_publication(
+        service_name='svc',
+        service_version=2,
+        replica_id=7,
+        replica_record_id=_RECORD_ID,
+        controller_route_epoch=_ROUTE_EPOCH,
+        ordinary_request_id='request-a',
+        input_digest='a' * 64,
+        launch_fence=fence)
+
+    event, required_fence = pending[0]
+    assert event.event_kind == 'request_published'
+    assert required_fence == _launch_fence()
+    assert 'sky_serve_ordinary_launch_handoff' not in required_fence
+
+
+@pytest.mark.parametrize('fence', [
+    {
+        **_launch_fence(), 'sky_serve_service_name': 'other'
+    },
+    {
+        key: value
+        for key, value in _launch_fence().items()
+        if key != 'sky_serve_controller_ip'
+    },
+])
+def test_verified_publication_rejects_mismatched_or_incomplete_fence(
+        monkeypatch, fence):
+    monkeypatch.setattr(
+        ordinary_launch_handoff, '_enqueue_event',
+        lambda *args, **kwargs: pytest.fail('invalid provenance was queued'))
+
+    assert not ordinary_launch_handoff.emit_verified_request_publication(
+        service_name='svc',
+        service_version=2,
+        replica_id=7,
+        replica_record_id=_RECORD_ID,
+        controller_route_epoch=_ROUTE_EPOCH,
+        ordinary_request_id='request-a',
+        input_digest='a' * 64,
+        launch_fence=fence)
+
+
+def test_pending_publication_requires_fresh_durable_fence(monkeypatch):
+    event = ordinary_launch_handoff._event(**_event_kwargs())
+    pending = ordinary_launch_handoff._PendingEvent(
+        event=event, required_launch_fence=_launch_fence())
+    outcomes = []
+    monkeypatch.setattr(ordinary_launch_handoff, '_provenance_rejected_count',
+                        0)
+    monkeypatch.setattr(ordinary_launch_handoff,
+                        '_provenance_check_failure_count', 0)
+    monkeypatch.setattr(ordinary_launch_handoff, '_record_delivery_outcome',
+                        outcomes.append)
+    monkeypatch.setattr(ordinary_launch_handoff.serve_state,
+                        'service_replica_launch_fence_holds',
+                        lambda unused_fence: False)
+
+    assert not ordinary_launch_handoff._pending_event_provenance_holds(pending)
+    assert ordinary_launch_handoff._provenance_rejected_count == 1
+    assert outcomes == ['event_provenance_rejected']
+
+    def _fail_check(unused_fence):
+        raise RuntimeError('database unavailable')
+
+    monkeypatch.setattr(ordinary_launch_handoff.serve_state,
+                        'service_replica_launch_fence_holds', _fail_check)
+    assert not ordinary_launch_handoff._pending_event_provenance_holds(pending)
+    assert ordinary_launch_handoff._provenance_check_failure_count == 1
+    assert outcomes[-1] == 'event_provenance_check_failed'
+
+
 @pytest.mark.parametrize('terminal_status',
                          list(ordinary_launch_handoff.TerminalStatus))
 def test_api_terminal_requires_and_retains_closed_status(
@@ -185,6 +283,10 @@ def test_non_postgres_write_and_summary_are_explicitly_unavailable(monkeypatch):
                 ordinary_launch_handoff._backend_unavailable_count,
             'retention_prune_failures':
                 ordinary_launch_handoff._retention_prune_failure_count,
+            'provenance_rejections':
+                ordinary_launch_handoff._provenance_rejected_count,
+            'provenance_check_failures':
+                ordinary_launch_handoff._provenance_check_failure_count,
             'pending_events': ordinary_launch_handoff._pending_events.qsize(),
             'pending_terminal_observations':
                 ordinary_launch_handoff._pending_terminal_observations.qsize(),
@@ -207,6 +309,10 @@ def test_process_local_delivery_failures_are_counted_and_scoped(monkeypatch):
                         0)
     monkeypatch.setattr(ordinary_launch_handoff,
                         '_retention_prune_failure_count', 0)
+    monkeypatch.setattr(ordinary_launch_handoff, '_provenance_rejected_count',
+                        0)
+    monkeypatch.setattr(ordinary_launch_handoff,
+                        '_provenance_check_failure_count', 0)
     monkeypatch.setattr(ordinary_launch_handoff, '_ensure_writer', lambda: None)
     sqlite = sqlalchemy.create_engine('sqlite://')
     monkeypatch.setattr(ordinary_launch_handoff.serve_state,
@@ -228,6 +334,8 @@ def test_process_local_delivery_failures_are_counted_and_scoped(monkeypatch):
         'terminal_lookup_failures': 1,
         'backend_unavailable': 0,
         'retention_prune_failures': 0,
+        'provenance_rejections': 0,
+        'provenance_check_failures': 0,
         'pending_events': 1,
         'pending_terminal_observations':
             ordinary_launch_handoff._pending_terminal_observations.qsize(),
@@ -256,16 +364,23 @@ def test_terminal_observation_queue_drop_is_counted(monkeypatch):
     assert delivery['terminal_observation_queue_drops'] == 1
 
 
-def test_retention_pruning_is_cadenced_and_fail_open(monkeypatch):
+@pytest.mark.asyncio
+async def test_retention_pruning_is_cadenced_and_fail_open(monkeypatch):
     calls = []
     monkeypatch.setattr(ordinary_launch_handoff, '_prune_expired_events',
                         lambda: calls.append('pruned'))
+    sleeps = []
 
-    assert ordinary_launch_handoff._maybe_prune_expired_events(20.0,
-                                                               now=19.0) == 20.0
-    assert not calls
-    assert ordinary_launch_handoff._maybe_prune_expired_events(
-        20.0, now=20.0) == 320.0
+    async def _sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(ordinary_launch_handoff.asyncio, 'sleep', _sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await ordinary_launch_handoff.retention_daemon()
+
+    assert sleeps == [300, 300]
     assert calls == ['pruned']
 
     outcomes = []
@@ -279,8 +394,9 @@ def test_retention_pruning_is_cadenced_and_fail_open(monkeypatch):
 
     monkeypatch.setattr(ordinary_launch_handoff, '_prune_expired_events',
                         _fail_prune)
-    assert ordinary_launch_handoff._maybe_prune_expired_events(
-        320.0, now=320.0) == 620.0
+    sleeps.clear()
+    with pytest.raises(asyncio.CancelledError):
+        await ordinary_launch_handoff.retention_daemon()
     assert ordinary_launch_handoff._retention_prune_failure_count == 1
     assert outcomes == ['retention_prune_failed']
 

@@ -806,21 +806,55 @@ async def test_ordinary_launch_publication_follows_durable_schedule():
     with mock.patch('sky.server.server.executor.schedule_request_async',
                     new_callable=mock.AsyncMock) as mock_schedule, \
          mock.patch.object(server.ordinary_launch_handoff,
-                           'emit_event') as mock_emit:
+                           'emit_verified_request_publication') as mock_emit:
         mock_schedule.side_effect = lambda *_, **__: sequence.append('schedule')
         mock_emit.side_effect = lambda **_: sequence.append('publish')
         await server.launch(launch_body, request)
 
     assert sequence == ['schedule', 'publish']
     mock_emit.assert_called_once_with(
-        event_kind=(server.ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED),
         service_name='svc',
         service_version=3,
         replica_id=7,
         replica_record_id='11111111-1111-4111-8111-111111111111',
         controller_route_epoch='22222222-2222-4222-8222-222222222222',
         ordinary_request_id='launch-request-id',
-        input_digest='a' * 64)
+        input_digest='a' * 64,
+        launch_fence=launch_body.extra_launch_context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('context_mutation', [
+    lambda context: context[server.serve_constants.
+                            ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY].update(
+                                service_name='other'),
+    lambda context: context[server.serve_constants.
+                            ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY].update(
+                                service_version=4),
+    lambda context: context.pop(server.serve_constants.
+                                REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY),
+])
+async def test_ordinary_launch_publication_requires_matching_complete_fence(
+        context_mutation):
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = _ordinary_launch_handoff_context()
+    context_mutation(launch_context)
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica-7',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         mock.patch.object(
+             server.ordinary_launch_handoff,
+             'emit_verified_request_publication') as mock_emit:
+        await server.launch(launch_body, request)
+
+    mock_schedule.assert_awaited_once()
+    mock_emit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -837,7 +871,7 @@ async def test_ordinary_launch_publication_failure_does_not_fail_launch():
     with mock.patch('sky.server.server.executor.schedule_request_async',
                     new_callable=mock.AsyncMock) as mock_schedule, \
          mock.patch.object(server.ordinary_launch_handoff,
-                           'emit_event',
+                           'emit_verified_request_publication',
                            side_effect=RuntimeError('telemetry unavailable')):
         await server.launch(launch_body, request)
 
@@ -859,7 +893,7 @@ async def test_ordinary_launch_is_not_published_before_schedule_commits():
                     new_callable=mock.AsyncMock,
                     side_effect=RuntimeError('request was not committed')), \
          mock.patch.object(server.ordinary_launch_handoff,
-                           'emit_event') as mock_emit, \
+                           'emit_verified_request_publication') as mock_emit, \
          pytest.raises(RuntimeError, match='not committed'):
         await server.launch(launch_body, request)
 
