@@ -57,6 +57,7 @@ jobs:
           src/components/operator-notifications.test.jsx \
           src/data/connectors/client.test.js \
           src/data/connectors/clusters.test.jsx \
+          src/data/connectors/events.test.js \
           src/data/connectors/services.test.jsx \
           src/data/connectors/jobs.test.jsx \
           src/data/connectors/jobs-stream-timeout.test.jsx \
