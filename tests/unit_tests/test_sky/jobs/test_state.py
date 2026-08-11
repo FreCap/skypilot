@@ -3,8 +3,8 @@
 
 import asyncio
 import contextlib
+import pickle
 import time
-from typing import Optional
 
 import filelock
 import pytest
@@ -14,7 +14,57 @@ from sqlalchemy import orm
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import state_task_lookups
 from sky.jobs.state import ManagedJobStatus
+
+
+def test_task_lookup_public_identity_and_facade_patch(monkeypatch):
+    assert state.TaskLogStreamLookup is state_task_lookups.TaskLogStreamLookup
+    assert state.TaskWaitStatusLookup is state_task_lookups.TaskWaitStatusLookup
+    assert (state.get_task_wait_status_lookup
+            is state_task_lookups.get_task_wait_status_lookup)
+    assert (state.get_task_wait_status_lookup_by_name
+            is state_task_lookups.get_task_wait_status_lookup_by_name)
+    assert (state.get_task_log_stream_lookup
+            is state_task_lookups.get_task_log_stream_lookup)
+    assert (state.get_task_log_stream_lookup_by_name
+            is state_task_lookups.get_task_log_stream_lookup_by_name)
+    assert state.TaskLogStreamLookup.__module__ == 'sky.jobs.state'
+    assert state.TaskWaitStatusLookup.__module__ == 'sky.jobs.state'
+    assert pickle.loads(pickle.dumps(
+        state.TaskLogStreamLookup)) is state.TaskLogStreamLookup
+    assert pickle.loads(pickle.dumps(
+        state.TaskWaitStatusLookup)) is state.TaskWaitStatusLookup
+
+    lookup_functions = (
+        state.get_task_wait_status_lookup,
+        state.get_task_wait_status_lookup_by_name,
+        state.get_task_log_stream_lookup,
+        state.get_task_log_stream_lookup_by_name,
+    )
+    assert all(function.__module__ == 'sky.jobs.state'
+               for function in lookup_functions)
+    assert all(function.__wrapped__.__module__ == 'sky.jobs.state'
+               for function in lookup_functions)
+
+    snapshot = state.JobLogStreamSnapshot(
+        2,
+        ManagedJobStatus.RUNNING,
+        'pool-a',
+        'replica-a',
+        41,
+        'task-2',
+    )
+    calls = []
+
+    def _lookup(job_id: int, task_id: int) -> state.TaskLogStreamLookup:
+        calls.append((job_id, task_id))
+        return state.TaskLogStreamLookup(snapshot, None, None, 1)
+
+    monkeypatch.setattr(state, 'get_task_log_stream_lookup', _lookup)
+
+    assert state.get_task_log_stream_snapshot(7, 2) is snapshot
+    assert calls == [(7, 2)]
 
 
 @pytest.fixture
@@ -52,9 +102,9 @@ def _insert_task(
     task_id: int,
     *,
     status: ManagedJobStatus,
-    end_at: Optional[float] = None,
-    local_log_file: Optional[str] = None,
-    logs_cleaned_at: Optional[float] = None,
+    end_at: float | None = None,
+    local_log_file: str | None = None,
+    logs_cleaned_at: float | None = None,
 ):
     with orm.Session(engine) as session:
         session.execute(
@@ -72,7 +122,7 @@ def _insert_task(
 
 def _insert_job_info(engine,
                      *,
-                     controller_logs_cleaned_at: Optional[float] = None):
+                     controller_logs_cleaned_at: float | None = None):
     with orm.Session(engine) as session:
         # Insert row; let PK autoincrement.
         engine = state._db_manager.get_engine()
