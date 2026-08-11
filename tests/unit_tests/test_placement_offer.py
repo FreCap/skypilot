@@ -1738,6 +1738,19 @@ def test_envelope_rejects_unknown_duplicate_float_and_secret_like_values():
         assert node.fields[0][0] == key
 
 
+def test_from_json_normalizes_decoder_recursion(monkeypatch):
+    module = _offer_lib()
+    schema = _kubernetes_schema(module)
+
+    def raise_recursion(*unused_args, **unused_kwargs):
+        raise RecursionError('forced decoder recursion exhaustion')
+
+    monkeypatch.setattr(module.json, 'loads', raise_recursion)
+    with pytest.raises(ValueError, match='not valid V1 JSON') as exc_info:
+        module.PlacementOfferV1.from_json('{}', payload_schema=schema)
+    assert isinstance(exc_info.value.__cause__, RecursionError)
+
+
 def test_envelope_scalar_collection_depth_and_byte_boundaries(monkeypatch):
     module = _offer_lib()
 
