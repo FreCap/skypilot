@@ -657,10 +657,14 @@ def launch_cluster(
             logger.debug('Ordinary-launch telemetry callback failed: %s', error)
 
     def _lookup_terminal_status(request_id: str) -> str | None:
-        requests = sdk.api_status(request_ids=[request_id],
-                                  fields=['request_id', 'status'],
-                                  _exact_request_ids=True,
-                                  _use_body=True)
+        requests = sdk.api_status(
+            request_ids=[request_id],
+            fields=['request_id', 'status'],
+            _exact_request_ids=True,
+            _use_body=True,
+            _request_timeout_seconds=(
+                ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
+            _retry_on_server_unavailable=False)
         exact_matches = [
             request for request in requests if request.request_id == request_id
         ]
@@ -696,6 +700,20 @@ def launch_cluster(
     launch_superseded = threading.Event()
     supersession_reason = ['unknown']
     supersession_cancel_failures = 0
+    ownership_loss_cancel_event_lock = threading.Lock()
+    ownership_loss_cancel_event_request_ids: set[str] = set()
+
+    def _emit_owner_loss_cancel_request_once(request_id: str) -> None:
+        """Record local cancellation intent once; it is not terminal proof."""
+        if recovery_request_attempted:
+            return
+        with ownership_loss_cancel_event_lock:
+            if request_id in ownership_loss_cancel_event_request_ids:
+                return
+            ownership_loss_cancel_event_request_ids.add(request_id)
+        _emit_ordinary_launch_event(
+            ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+            request_id)
 
     def _guard_allows(guard: Callable[[], bool] | None) -> bool:
         if guard is None:
@@ -756,12 +774,9 @@ def launch_cluster(
         request_id = replica_to_request_id.get(replica_id)
         if request_id is None:
             return
+        _emit_owner_loss_cancel_request_once(request_id)
         try:
             sdk.api_cancel(request_id)
-            if not recovery_request_attempted:
-                _emit_ordinary_launch_event(
-                    ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCELLED,
-                    request_id)
         except Exception as e:  # pylint: disable=broad-except
             # The successor still owns the durable replica row and can
             # recover/garbage-collect the incarnation-scoped cluster. Never
@@ -4197,15 +4212,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                         prior_paid_pool_key)
                 input_digest = ordinary_launch_handoff.redacted_input_digest(
                     prior_yaml_content, replica_info.resources_override)
-                self._emit_ordinary_launch_handoff_event(
-                    replica_info,
-                    ordinary_launch_handoff.EventKind.
-                    CONTROLLER_START_NONTERMINAL,
-                    input_digest=input_digest)
-                self._emit_ordinary_launch_handoff_event(
-                    replica_info,
-                    ordinary_launch_handoff.EventKind.RESTART_REDRIVE,
-                    input_digest=input_digest)
+                if input_digest is not None:
+                    self._emit_ordinary_launch_handoff_event(
+                        replica_info,
+                        ordinary_launch_handoff.EventKind.
+                        CONTROLLER_START_NONTERMINAL,
+                        input_digest=input_digest)
+                    self._emit_ordinary_launch_handoff_event(
+                        replica_info,
+                        ordinary_launch_handoff.EventKind.RESTART_REDRIVE,
+                        input_digest=input_digest)
                 self._launch_replica(replica_info.replica_id, **launch_kwargs)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive launch of replica '
@@ -5353,24 +5369,26 @@ class SkyPilotReplicaManager(ReplicaManager):
             if not self._is_pool and not zero_cost_only:
                 input_digest = (ordinary_launch_handoff.redacted_input_digest(
                     launch_yaml_content, resources_override))
-                launch_thread_kwargs['ordinary_launch_handoff_context'] = {
-                    'context_version':
-                        (serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION
-                        ),
-                    'service_name': self._service_name,
-                    'service_version': launch_version,
-                    'replica_id': replica_id,
-                    'replica_record_id': info.replica_record_id,
-                    'controller_route_epoch':
-                        (self._ordinary_launch_handoff_route_epoch),
-                    'input_digest': input_digest,
-                }
-                launch_thread_kwargs['ordinary_launch_event'] = (
-                    functools.partial(
-                        self._emit_ordinary_launch_handoff_event,
-                        info,
-                        input_digest=input_digest,
-                        allow_demoted_candidate=bool(recovery_launch_kwargs)))
+                if input_digest is not None:
+                    launch_thread_kwargs['ordinary_launch_handoff_context'] = {
+                        'context_version':
+                            (serve_constants.
+                             ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION),
+                        'service_name': self._service_name,
+                        'service_version': launch_version,
+                        'replica_id': replica_id,
+                        'replica_record_id': info.replica_record_id,
+                        'controller_route_epoch':
+                            (self._ordinary_launch_handoff_route_epoch),
+                        'input_digest': input_digest,
+                    }
+                    launch_thread_kwargs['ordinary_launch_event'] = (
+                        functools.partial(
+                            self._emit_ordinary_launch_handoff_event,
+                            info,
+                            input_digest=input_digest,
+                            allow_demoted_candidate=bool(
+                                recovery_launch_kwargs)))
             return _ReplicaLaunchThread(
                 target=launch_cluster_with_frozen_controller_config,
                 replica_id=replica_id,

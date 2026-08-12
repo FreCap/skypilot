@@ -3,6 +3,7 @@
 
 import asyncio
 import queue
+import threading
 import uuid
 
 import pytest
@@ -46,7 +47,7 @@ def test_closed_event_kinds_and_table_contract():
         'request_published',
         'controller_start_nonterminal',
         'restart_redrive',
-        'owner_loss_cancelled',
+        'owner_loss_cancel_requested',
         'api_terminal',
         'serve_result_projected',
         'service_job_observed',
@@ -96,6 +97,25 @@ def test_redacted_digest_is_deterministic_and_order_independent():
     assert left != changed
     assert len(left) == 64
     assert 'us-east-1' not in left
+
+
+def test_redacted_digest_failure_is_fail_open():
+
+    class _BadRepr:
+
+        def __repr__(self):
+            raise RuntimeError('repr unavailable')
+
+    class _BadEncode(str):
+
+        def encode(self, *args, **kwargs):
+            del args, kwargs
+            raise RuntimeError('encoding unavailable')
+
+    assert ordinary_launch_handoff.redacted_input_digest(
+        'resources: {}', {'typed': _BadRepr()}) is None
+    assert ordinary_launch_handoff.redacted_input_digest(
+        _BadEncode('resources: {}'), {}) is None
 
 
 def test_emit_enqueues_validated_uuid_event(monkeypatch):
@@ -448,6 +468,54 @@ def test_terminal_observer_lookup_failure_is_fail_open(monkeypatch):
 
     assert not emitted
     assert ordinary_launch_handoff._terminal_lookup_failure_count == 1
+
+
+def test_terminal_observer_pool_keeps_queue_live_after_one_hung_lookup(
+        monkeypatch):
+    pending = queue.Queue()
+    monkeypatch.setattr(ordinary_launch_handoff,
+                        '_pending_terminal_observations', pending)
+    first_started = threading.Event()
+    release_first = threading.Event()
+    first_finished = threading.Event()
+    second_emitted = threading.Event()
+    stop = threading.Event()
+
+    def _hung_lookup(unused_request_id):
+        first_started.set()
+        assert release_first.wait(timeout=5)
+        first_finished.set()
+        return None
+
+    workers = [
+        threading.Thread(target=ordinary_launch_handoff._terminal_observer_loop,
+                         args=(stop,),
+                         daemon=True)
+        for _ in range(ordinary_launch_handoff.TERMINAL_OBSERVER_WORKERS)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        pending.put(
+            ordinary_launch_handoff._TerminalObservation(
+                request_id='request-hung',
+                lookup=_hung_lookup,
+                emit=lambda unused_status: None))
+        assert first_started.wait(timeout=2)
+        pending.put(
+            ordinary_launch_handoff._TerminalObservation(
+                request_id='request-live',
+                lookup=lambda unused_request_id: 'SUCCEEDED',
+                emit=lambda unused_status: second_emitted.set()))
+        assert second_emitted.wait(timeout=2)
+    finally:
+        release_first.set()
+        assert first_finished.wait(timeout=2)
+        stop.set()
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+    assert pending.unfinished_tasks == 0
 
 
 @pytest.mark.parametrize('days', [0, 61, True, 1.5])

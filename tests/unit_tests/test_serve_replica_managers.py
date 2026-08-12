@@ -2954,7 +2954,10 @@ class TestLaunchClusterRetry:
             request_ids=['request-id'],
             fields=['request_id', 'status'],
             _exact_request_ids=True,
-            _use_body=True)
+            _use_body=True,
+            _request_timeout_seconds=(
+                ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
+            _retry_on_server_unavailable=False)
         assert events == [
             (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, 'request-id',
              None, None),
@@ -3430,6 +3433,48 @@ run: echo hi
         assert 'ownership loss' in str(raised)
         mock_sdk.api_cancel.assert_called_once_with('request-id')
 
+    def test_owner_loss_success_race_records_one_cancellation_request(
+            self, tmp_path):
+        allowed = threading.Event()
+        watchdog_observed_loss = threading.Event()
+        allowed.set()
+        events = []
+
+        def _continue_guard():
+            if allowed.is_set():
+                return True
+            watchdog_observed_loss.set()
+            return False
+
+        def _complete_while_watchdog_cancels(unused_request_id):
+            allowed.clear()
+            assert watchdog_observed_loss.wait(timeout=5)
+            return (17, object())
+
+        with mock.patch(
+                'sky.serve.replica_managers.'
+                '_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS', 0.01):
+            mock_sdk, _, raised = self._run_launch_cluster(
+                tmp_path,
+                _complete_while_watchdog_cancels,
+                continue_guard=_continue_guard,
+                ordinary_launch_event=lambda kind, request_id, job_id, status:
+                events.append((kind, request_id, job_id, status)))
+
+        assert raised is not None
+        assert 'ownership was lost' in str(raised)
+        # The watchdog and the post-success authority check both request
+        # cancellation, but the lower-bound evidence records the intent once.
+        assert mock_sdk.api_cancel.call_count == 2
+        cancellation_requests = [
+            event for event in events if event[0] ==
+            ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED
+        ]
+        assert cancellation_requests == [
+            (ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+             'request-id', None, None)
+        ]
+
     def test_inflight_version_supersession_keeps_manager_healthy(
             self, tmp_path):
         manager = _make_manager()
@@ -3767,6 +3812,18 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         call = self._launch_replica(use_spot=False, with_placer=True)
         assert call.kwargs['kwargs']['availability_max_retry'] is None
         assert call.kwargs['args'][-1] is True
+
+    def test_digest_failure_omits_telemetry_without_blocking_initial_launch(
+            self):
+        with mock.patch.object(ordinary_launch_handoff,
+                               'redacted_input_digest',
+                               return_value=None) as digest:
+            call = self._launch_replica(use_spot=False, with_placer=False)
+
+        digest.assert_called_once()
+        launch_kwargs = call.kwargs['kwargs']
+        assert 'ordinary_launch_handoff_context' not in launch_kwargs
+        assert 'ordinary_launch_event' not in launch_kwargs
 
 
 class TestUpdateVersionHoldsManagerLock:
@@ -13156,6 +13213,32 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
         # Replica 2 failed; 1 and 3 still re-driven.
         assert launched == [1, 3]
+
+    def test_digest_failure_omits_telemetry_without_skipping_restart_redrive(
+            self):
+        mgr = _make_manager()
+        info = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.resources_override = {'typed': mock.sentinel.value}
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(ordinary_launch_handoff,
+                               'redacted_input_digest',
+                               return_value=None) as digest, \
+             mock.patch.object(
+                 mgr, '_emit_ordinary_launch_handoff_event') as emit_event, \
+             mock.patch.object(mgr, '_launch_replica') as launch:
+            mgr._recover_replica_operations()
+
+        digest.assert_called_once_with(mgr.yaml_content,
+                                       info.resources_override)
+        emit_event.assert_not_called()
+        launch.assert_called_once()
+        assert launch.call_args.args == (1,)
+        assert launch.call_args.kwargs['recovering_existing_replica'] is True
 
     def test_newer_pending_version_stops_stale_recovery_wave(self):
         mgr = _make_manager(next_replica_id=1)

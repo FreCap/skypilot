@@ -246,11 +246,19 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
                    record_id=_RECORD_B,
                    route_epoch=_ROUTE_B,
                    observed_at=now - 3 * minute),
-            _event(ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCELLED,
-                   record_id=_RECORD_B,
-                   route_epoch=_ROUTE_B,
-                   observed_at=now - 2 * minute,
-                   request_id='request-b1'),
+            _event(
+                ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+                record_id=_RECORD_B,
+                route_epoch=_ROUTE_B,
+                observed_at=now - 2 * minute,
+                request_id='request-b1'),
+            # Duplicate delivery of one request is still one summary fact.
+            _event(
+                ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+                record_id=_RECORD_B,
+                route_epoch=_ROUTE_B,
+                observed_at=now - 2 * minute,
+                request_id='request-b1'),
             _event(ordinary_launch_handoff.EventKind.
                    CLEANUP_RETRY_AFTER_ROUTE_EPOCH_CHANGE,
                    record_id=_RECORD_B,
@@ -268,7 +276,7 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
     assert summary['available'] is True
     assert summary['retention_days'] == 60
     assert summary['evidence_is_lower_bound'] is True
-    assert summary['observed_events'] == 13
+    assert summary['observed_events'] == 14
     assert summary['eligible_ordinary_launches'] == 2
     # Both rows came from the same service/route epoch and therefore represent
     # one controller start, even though two nonterminal records were observed.
@@ -282,7 +290,7 @@ def test_summary_reports_restart_and_duplicate_evidence(serve041,
         'restart_redrives_with_terminal_unprojected_predecessor'] == 1
     assert summary['restart_redrives_without_observed_predecessor'] == 1
     assert summary['replica_records_with_duplicate_service_jobs'] == 1
-    assert summary['owner_loss_cancellations'] == 1
+    assert summary['owner_loss_cancellation_requests'] == 1
     assert summary['cleanup_retries_after_route_epoch_change'] == 1
 
 

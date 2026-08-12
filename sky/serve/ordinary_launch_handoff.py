@@ -33,6 +33,8 @@ MAX_PENDING_EVENTS = 4096
 MAX_PENDING_TERMINAL_OBSERVATIONS = 1024
 RETENTION_PRUNE_INTERVAL_SECONDS = 5 * 60
 RETENTION_PRUNE_BATCH_SIZE = 1000
+TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS = 5
+TERMINAL_OBSERVER_WORKERS = 2
 
 DELIVERY_METRIC_NAME = 'sky_serve_ordinary_launch_handoff_delivery_total'
 DELIVERY_OUTCOMES = (
@@ -60,7 +62,7 @@ class EventKind(str, enum.Enum):
     REQUEST_PUBLISHED = 'request_published'
     CONTROLLER_START_NONTERMINAL = 'controller_start_nonterminal'
     RESTART_REDRIVE = 'restart_redrive'
-    OWNER_LOSS_CANCELLED = 'owner_loss_cancelled'
+    OWNER_LOSS_CANCEL_REQUESTED = 'owner_loss_cancel_requested'
     API_TERMINAL = 'api_terminal'
     SERVE_RESULT_PROJECTED = 'serve_result_projected'
     SERVICE_JOB_OBSERVED = 'service_job_observed'
@@ -182,7 +184,7 @@ _pending_terminal_observations: 'queue.Queue[_TerminalObservation]' = (
     queue.Queue(maxsize=MAX_PENDING_TERMINAL_OBSERVATIONS))
 _writer_lock = threading.Lock()
 _writer_thread: threading.Thread | None = None
-_observer_thread: threading.Thread | None = None
+_observer_threads: list[threading.Thread] = []
 _event_queue_drop_count = 0
 _terminal_observation_queue_drop_count = 0
 _write_failure_count = 0
@@ -225,26 +227,36 @@ def _canonical_uuid(value: str, field_name: str) -> uuid.UUID:
 def redacted_input_digest(
     yaml_content: str,
     resources_override: dict[str, Any] | None,
-) -> str:
-    """Hash ordinary launch inputs without retaining either input payload."""
-    if not isinstance(yaml_content, str):
-        raise ValueError('yaml_content must be text.')
+) -> str | None:
+    """Hash launch inputs, or fail open when diagnostic encoding is unsafe."""
     try:
-        override = json.dumps(resources_override,
-                              sort_keys=True,
-                              separators=(',', ':'),
-                              ensure_ascii=True,
-                              allow_nan=False)
-    except (TypeError, ValueError):
-        # Overrides accepted by the existing launch path may contain typed
-        # values.  Their repr is used only inside this one-way diagnostic hash.
-        override = repr(resources_override)
-    digest = hashlib.sha256()
-    for value in (yaml_content, override):
-        encoded = value.encode('utf-8')
-        digest.update(len(encoded).to_bytes(8, byteorder='big'))
-        digest.update(encoded)
-    return digest.hexdigest()
+        if not isinstance(yaml_content, str):
+            raise ValueError('yaml_content must be text.')
+        try:
+            override = json.dumps(resources_override,
+                                  sort_keys=True,
+                                  separators=(',', ':'),
+                                  ensure_ascii=True,
+                                  allow_nan=False)
+        except (TypeError, ValueError):
+            # Overrides accepted by the existing launch path may contain typed
+            # values. Their repr is used only inside this diagnostic hash.
+            override = repr(resources_override)
+        digest = hashlib.sha256()
+        for value in (yaml_content, override):
+            encoded = value.encode('utf-8')
+            digest.update(len(encoded).to_bytes(8, byteorder='big'))
+            digest.update(encoded)
+        return digest.hexdigest()
+    except Exception as error:  # pylint: disable=broad-except
+        # Diagnostic serialization is not part of launch correctness. In
+        # particular, arbitrary accepted typed overrides can raise from repr(),
+        # and a str subclass can raise while encoding. Callers treat None as a
+        # closed instruction to omit all telemetry for that launch attempt.
+        logger.debug(
+            'Omitting ordinary-launch telemetry because its redacted '
+            'input digest could not be computed: %s', error)
+        return None
 
 
 def _event(
@@ -498,9 +510,13 @@ def _process_terminal_observation(observation: _TerminalObservation) -> None:
         _log_terminal_lookup_failure(error)
 
 
-def _terminal_observer_loop() -> None:
-    while True:
-        observation = _pending_terminal_observations.get()
+def _terminal_observer_loop(stop_event: threading.Event | None = None) -> None:
+    while stop_event is None or not stop_event.is_set():
+        try:
+            observation = _pending_terminal_observations.get(
+                timeout=0.05 if stop_event is not None else None)
+        except queue.Empty:
+            continue
         try:
             _process_terminal_observation(observation)
         finally:
@@ -520,15 +536,19 @@ def _ensure_writer() -> None:
 
 
 def _ensure_terminal_observer() -> None:
-    global _observer_thread
     with _writer_lock:
-        if _observer_thread is not None and _observer_thread.is_alive():
-            return
-        _observer_thread = threading.Thread(
-            target=_terminal_observer_loop,
-            name='serve-ordinary-launch-terminal-observer',
-            daemon=True)
-        _observer_thread.start()
+        _observer_threads[:] = [
+            thread for thread in _observer_threads if thread.is_alive()
+        ]
+        while len(_observer_threads) < TERMINAL_OBSERVER_WORKERS:
+            worker_number = len(_observer_threads) + 1
+            observer_thread = threading.Thread(
+                target=_terminal_observer_loop,
+                name=('serve-ordinary-launch-terminal-observer-'
+                      f'{worker_number}'),
+                daemon=True)
+            _observer_threads.append(observer_thread)
+            observer_thread.start()
 
 
 def _record_queue_drop(*, terminal_observation: bool) -> None:
@@ -777,8 +797,11 @@ SELECT
         restart_redrives_without_observed_predecessor,
     (SELECT COUNT(*) FROM duplicate_service_jobs) AS
         replica_records_with_duplicate_service_jobs,
-    (SELECT COUNT(*) FROM window_events
-     WHERE event_kind = 'owner_loss_cancelled') AS owner_loss_cancellations,
+    (SELECT COUNT(*) FROM (
+         SELECT DISTINCT replica_record_id, ordinary_request_id
+         FROM window_events
+         WHERE event_kind = 'owner_loss_cancel_requested'
+     ) AS cancellation_requests) AS owner_loss_cancellation_requests,
     (SELECT COUNT(*) FROM window_events
      WHERE event_kind = 'cleanup_retry_after_route_epoch_change') AS
         cleanup_retries_after_route_epoch_change

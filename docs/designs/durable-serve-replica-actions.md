@@ -484,7 +484,7 @@ ordinary request ID when known, service job ID when known, and a redacted input
 digest. It stores no provider payload or credential.
 
 The closed event kinds cover request publication, controller-start observation
-of a nonterminal replica, restart redrive, owner-loss cancellation, API
+of a nonterminal replica, restart redrive, owner-loss cancellation request, API
 terminal result, Serve result projection, service-job observation, and cleanup
 retry after a route-epoch change. Queries report:
 
@@ -496,7 +496,8 @@ retry after a route-epoch change. Queries report:
   observation was retained, or whose predecessor was observed terminal but
   remained unreduced;
 - duplicate service-job submissions for one replica record;
-- owner-loss cancellations; and
+- distinct owner-loss cancellation requests, explicitly not terminal
+  cancellation proof; and
 - cleanup retries whose process-local backoff reset after controller restart.
 
 Observe those queries for 30--60 days of eligible production traffic, or record
@@ -528,8 +529,9 @@ retention work and additional controller processes do not prune independently.
 The summary query labels all event evidence as a lower bound, counts controller
 starts as distinct service/route-epoch pairs rather than replica rows, reports
 redrives with no observed predecessor publication, and uses an explicit
-predecessor-status-unknown bucket when the one-shot terminal observer retained
-no terminal evidence. Absence of that evidence is never labeled active.
+predecessor-status-unknown bucket when the one-shot terminal observation
+retained no terminal evidence. Absence of that evidence is never labeled
+active.
 It also includes explicitly process-local queue depths, queue drops, writer
 failures, backend-unavailable events, provenance rejections/check failures,
 retention-prune failures, and terminal-lookup failures since module import. A
@@ -539,12 +541,20 @@ processes. These surfaces prevent a lossy diagnostic process from presenting
 unexplained zeros as fleet-wide completeness; they do not make asynchronous
 telemetry an authority or a complete audit log. Initial instrumentation covers
 ordinary request publication, controller-start observation and restart
-redrive, owner-loss cancellation, observed API terminal result with a closed
-`SUCCEEDED`/`FAILED`/`CANCELLED` status, service-job observation, and Serve
-result projection. A system-recovery candidate's bound recovery request is
-excluded, while any later retry is instrumented once durable demotion makes it
-ordinary. Terminal lookup runs on a separate bounded daemon, ignores
-missing/nonterminal/inexact results, and cannot delay launch. The closed
+redrive, owner-loss cancellation request, observed API terminal result with a
+closed `SUCCEEDED`/`FAILED`/`CANCELLED` status, service-job observation, and
+Serve result projection. The cancellation-request event records local intent
+once per ordinary request ID; it never claims that the target became terminal,
+and the summary deduplicates by replica-record/request identity. A
+system-recovery candidate's bound recovery request is excluded, while any
+later retry is instrumented once durable demotion makes it ordinary. Terminal
+lookup uses a fixed two-worker daemon pool and one no-retry HTTP attempt with a
+five-second connect/read timeout. Thus one unexpectedly hung lookup cannot
+starve the queue, while production lookups are bounded and
+missing/nonterminal/inexact results remain unclassified. If redacted digest
+serialization, fallback `repr()`, or UTF-8 encoding fails, the complete
+telemetry envelope for that launch attempt is omitted; both initial launch and
+restart redrive continue through the unchanged canonical path. The closed
 cleanup-retry kind is retained for the point where a route-epoch change can be
 proved rather than inferred.
 
