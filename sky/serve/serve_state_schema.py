@@ -1,5 +1,6 @@
 """Shared SQLAlchemy schema and bootstrap for SkyServe state."""
 import json
+import uuid
 
 import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
@@ -88,7 +89,7 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_incarnation',
                       sqlalchemy.Uuid(as_uuid=True),
                       nullable=False,
-                      server_default=sqlalchemy.text('gen_random_uuid()')),
+                      default=uuid.uuid4),
     sqlalchemy.Column('controller_owner_epoch',
                       sqlalchemy.BigInteger,
                       nullable=False,

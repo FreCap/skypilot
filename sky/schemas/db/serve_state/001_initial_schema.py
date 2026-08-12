@@ -41,22 +41,26 @@ _SERVE042_POSTGRES_ONLY_COLUMNS = {
 
 
 def _initial_metadata(bind: sa.engine.Connection) -> sa.MetaData:
-    """Keep PostgreSQL-only Serve038 fields out of fresh SQLite catalogs."""
-    if bind.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
-        return Base.metadata
+    """Project the exact revision-001 catalog for the target dialect."""
     metadata = sa.MetaData()
     for table in Base.metadata.tables.values():
         table.to_metadata(metadata)
-    for table_name, factory in _SERVE038_BOOTSTRAP_FACTORIES.items():
-        table = metadata.tables[table_name]
-        for expected in factory():
-            column = table.c.get(expected.name)
-            if column is not None:
-                # These additive fields intentionally own no Base constraint,
-                # index, or FK.  Removing them from this private clone leaves
-                # runtime Base metadata complete without leaking 038 into a
-                # fresh non-PostgreSQL historical schema.
-                table._columns.remove(column)
+    if bind.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        for table_name, factory in _SERVE038_BOOTSTRAP_FACTORIES.items():
+            table = metadata.tables[table_name]
+            for expected in factory():
+                column = table.c.get(expected.name)
+                if column is not None:
+                    # These additive fields intentionally own no Base
+                    # constraint, index, or FK. Removing them from this
+                    # private clone leaves runtime Base metadata complete
+                    # without leaking 038 into a fresh non-PostgreSQL
+                    # historical schema.
+                    table._columns.remove(column)
+    # Serve042 owns these columns.  Strip them from the revision-001 catalog
+    # on every dialect so a fresh PostgreSQL upgrade receives the exact
+    # server defaults and constraints from the forward-only migration, while
+    # SQLite remains at its supported Serve037 ceiling.
     for table_name, column_names in _SERVE042_POSTGRES_ONLY_COLUMNS.items():
         table = metadata.tables[table_name]
         for column_name in column_names:
