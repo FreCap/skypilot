@@ -991,8 +991,7 @@ def _ordinary_launch_handoff_context() -> dict[str, object]:
         server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
         server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 3,
         server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
-        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY:
-            '10.0.0.1',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
         server.serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY: {
             'context_version': 1,
             'service_name': 'svc',

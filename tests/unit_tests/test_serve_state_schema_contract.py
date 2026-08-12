@@ -257,6 +257,7 @@ def test_resource_action_existing_table_columns_are_dialect_portable():
     }
     assert serve_state._ACTION_OWNED_REPLICA_COLUMNS == uuid_columns | {
         'desired_generation',
+        'ordinary_launch_association_id',
         'resource_action_spec_identity_sha256',
     }
     assert set(serve_state._LEGACY_REPLICA_ROW_COLUMNS).isdisjoint(

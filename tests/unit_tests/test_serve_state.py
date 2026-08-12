@@ -1154,6 +1154,7 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             'launch_shadow_sample_id': launch_shadow_coverage_id,
             'down_shadow_sample_id': down_shadow_coverage_id,
             'resource_action_spec_identity_sha256': None,
+            'ordinary_launch_association_id': None,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(_mock_serve_db) as session:
@@ -1534,9 +1535,12 @@ def test_elected_version_migration_backfills_latest_committed_version(
     engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
     monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '013')
     serve_state.create_table(engine)
+    legacy_services = sqlalchemy.Table('services',
+                                       sqlalchemy.MetaData(),
+                                       autoload_with=engine)
     with engine.begin() as connection:
-        connection.execute(serve_state.services_table.insert().values(
-            name='svc', current_version=1))
+        connection.execute(legacy_services.insert().values(name='svc',
+                                                           current_version=1))
         connection.execute(serve_state.version_specs_table.insert(), [{
             'service_name': 'svc',
             'version': 1,
