@@ -3,8 +3,10 @@
 
 import asyncio
 import contextlib
+import inspect
+import pickle
 import time
-from typing import Optional
+import types
 
 import filelock
 import pytest
@@ -14,7 +16,99 @@ from sqlalchemy import orm
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
+from sky.jobs import state_api_access_tokens
+from sky.jobs import state_log_cleanup
+from sky.jobs import state_task_lookups
 from sky.jobs.state import ManagedJobStatus
+
+
+def test_task_lookup_public_identity_and_facade_patch(monkeypatch):
+    assert state.TaskLogStreamLookup is state_task_lookups.TaskLogStreamLookup
+    assert state.TaskWaitStatusLookup is state_task_lookups.TaskWaitStatusLookup
+    assert (state.get_task_wait_status_lookup
+            is state_task_lookups.get_task_wait_status_lookup)
+    assert (state.get_task_wait_status_lookup_by_name
+            is state_task_lookups.get_task_wait_status_lookup_by_name)
+    assert (state.get_task_log_stream_lookup
+            is state_task_lookups.get_task_log_stream_lookup)
+    assert (state.get_task_log_stream_lookup_by_name
+            is state_task_lookups.get_task_log_stream_lookup_by_name)
+    assert state.TaskLogStreamLookup.__module__ == 'sky.jobs.state'
+    assert state.TaskWaitStatusLookup.__module__ == 'sky.jobs.state'
+    assert pickle.loads(pickle.dumps(
+        state.TaskLogStreamLookup)) is state.TaskLogStreamLookup
+    assert pickle.loads(pickle.dumps(
+        state.TaskWaitStatusLookup)) is state.TaskWaitStatusLookup
+
+    lookup_functions = (
+        state.get_task_wait_status_lookup,
+        state.get_task_wait_status_lookup_by_name,
+        state.get_task_log_stream_lookup,
+        state.get_task_log_stream_lookup_by_name,
+    )
+    assert all(function.__module__ == 'sky.jobs.state'
+               for function in lookup_functions)
+    assert all(function.__wrapped__.__module__ == 'sky.jobs.state'
+               for function in lookup_functions)
+
+    snapshot = state.JobLogStreamSnapshot(
+        2,
+        ManagedJobStatus.RUNNING,
+        'pool-a',
+        'replica-a',
+        41,
+        'task-2',
+    )
+    calls = []
+
+    def _lookup(job_id: int, task_id: int) -> state.TaskLogStreamLookup:
+        calls.append((job_id, task_id))
+        return state.TaskLogStreamLookup(snapshot, None, None, 1)
+
+    monkeypatch.setattr(state, 'get_task_log_stream_lookup', _lookup)
+
+    assert state.get_task_log_stream_snapshot(7, 2) is snapshot
+    assert calls == [(7, 2)]
+
+
+def test_log_cleanup_metadata_public_contract():
+    expected_signatures = {
+        'get_task_logs_to_clean':
+            '(retention_seconds: int, batch_size: int, '
+            'exclude_tasks: collections.abc.Collection[tuple[int, int]] | '
+            'None = None) -> list[dict[str, typing.Any]]',
+        'get_controller_logs_to_clean':
+            '(retention_seconds: int, batch_size: int, '
+            'exclude_job_ids: collections.abc.Collection[int] | None = None) '
+            '-> list[dict[str, typing.Any]]',
+        'set_task_logs_cleaned': '(tasks: list[tuple[int, int]], logs_cleaned_at: float)',
+        'set_controller_logs_cleaned': '(job_ids: list[int], logs_cleaned_at: float)',
+    }
+    for name, expected_signature in expected_signatures.items():
+        function = getattr(state, name)
+        assert function is getattr(state_log_cleanup, name)
+        assert function.__name__ == name
+        assert function.__module__ == 'sky.jobs.state'
+        assert str(inspect.signature(function)) == expected_signature
+        assert pickle.loads(pickle.dumps(function)) is function
+
+
+def test_api_access_token_repository_public_contract():
+    expected_signatures = {
+        'set_api_access_token_ids': '(job_ids: list[int], token_id: str) -> None',
+        'get_releasable_api_access_token_id': '(job_id: int) -> str | None',
+    }
+    for name, expected_signature in expected_signatures.items():
+        function = getattr(state, name)
+        assert function is getattr(state_api_access_tokens, name)
+        assert function.__name__ == name
+        assert function.__module__ == 'sky.jobs.state'
+        assert str(inspect.signature(function)) == expected_signature
+        assert pickle.loads(pickle.dumps(function)) is function
+
+    releasable = state.get_releasable_api_access_token_id
+    assert releasable.__wrapped__.__name__ == releasable.__name__
+    assert releasable.__wrapped__.__module__ == 'sky.jobs.state'
 
 
 @pytest.fixture
@@ -52,9 +146,9 @@ def _insert_task(
     task_id: int,
     *,
     status: ManagedJobStatus,
-    end_at: Optional[float] = None,
-    local_log_file: Optional[str] = None,
-    logs_cleaned_at: Optional[float] = None,
+    end_at: float | None = None,
+    local_log_file: str | None = None,
+    logs_cleaned_at: float | None = None,
 ):
     with orm.Session(engine) as session:
         session.execute(
@@ -72,7 +166,7 @@ def _insert_task(
 
 def _insert_job_info(engine,
                      *,
-                     controller_logs_cleaned_at: Optional[float] = None):
+                     controller_logs_cleaned_at: float | None = None):
     with orm.Session(engine) as session:
         # Insert row; let PK autoincrement.
         engine = state._db_manager.get_engine()
@@ -555,6 +649,42 @@ def test_set_api_access_token_ids_batches_upserts(_mock_managed_jobs_db_conn):
         (2, 'shared-token'),
         (3, 'replacement-token'),
     ]
+
+
+def test_set_api_access_token_ids_compiles_postgresql_upsert(monkeypatch):
+    engine = types.SimpleNamespace(dialect=types.SimpleNamespace(
+        name='postgresql'))
+    statements = []
+    commits = []
+
+    class _Session:
+        """Capture PostgreSQL statements without opening a connection."""
+
+        def __init__(self, session_engine):
+            assert session_engine is engine
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del exc_type, exc_value, traceback
+
+        def execute(self, statement):
+            statements.append(statement)
+
+        def commit(self):
+            commits.append(True)
+
+    monkeypatch.setattr(state_api_access_tokens._db_manager, 'get_engine',
+                        lambda: engine)
+    monkeypatch.setattr(state_api_access_tokens.orm, 'Session', _Session)
+
+    state.set_api_access_token_ids([2, 1, 2], 'shared-token')
+
+    assert len(statements) == 1
+    sql = str(statements[0].compile(dialect=state.postgresql.dialect()))
+    assert 'ON CONFLICT (job_id) DO UPDATE' in sql
+    assert commits == [True]
 
 
 def test_set_api_access_token_ids_empty_input_uses_no_query(
@@ -1808,6 +1938,69 @@ def test_set_controller_logs_cleaned(_mock_managed_jobs_db_conn):
                     state.job_info_table.c.spot_job_id == job_id)).fetchone()
         assert row is not None
         assert row[0] == now
+
+
+def test_log_cleanup_empty_marker_batches_do_not_open_database(monkeypatch):
+
+    def _unexpected_engine_lookup():
+        raise AssertionError('empty cleanup markers must not obtain an engine')
+
+    monkeypatch.setattr(state._db_manager, 'get_engine',
+                        _unexpected_engine_lookup)
+
+    assert state.set_task_logs_cleaned([], 123.0) is None
+    assert state.set_controller_logs_cleaned([], 123.0) is None
+
+
+def test_log_cleanup_metadata_statement_budgets_and_deduplication(
+        _mock_managed_jobs_db_conn):
+    now = time.time()
+    engine = _mock_managed_jobs_db_conn
+    job_id = _insert_job_info(engine, controller_logs_cleaned_at=None)
+    _insert_task(
+        engine,
+        job_id,
+        0,
+        status=ManagedJobStatus.SUCCEEDED,
+        end_at=now - 120,
+        local_log_file='/tmp/cleanup-budget.log',
+        logs_cleaned_at=None,
+    )
+    state.scheduler_set_done(job_id)
+
+    with _count_sql_statements(engine) as task_read_counts:
+        task_rows = state.get_task_logs_to_clean(60, batch_size=10)
+    assert task_rows == [{
+        'job_id': job_id,
+        'task_id': 0,
+        'local_log_file': '/tmp/cleanup-budget.log',
+    }]
+    assert task_read_counts['n'] == 1
+
+    with _count_sql_statements(engine) as controller_read_counts:
+        controller_rows = state.get_controller_logs_to_clean(60, batch_size=10)
+    assert controller_rows == [{'job_id': job_id}]
+    assert controller_read_counts['n'] == 1
+
+    with _count_sql_statements(engine) as task_write_counts:
+        state.set_task_logs_cleaned([(job_id, 0), (job_id, 0)], now)
+    assert task_write_counts['n'] == 1
+
+    with _count_sql_statements(engine) as controller_write_counts:
+        state.set_controller_logs_cleaned([job_id, job_id], now)
+    assert controller_write_counts['n'] == 1
+
+    with orm.Session(engine) as session:
+        task_cleaned_at = session.execute(
+            sqlalchemy.select(state.spot_table.c.logs_cleaned_at).where(
+                sqlalchemy.and_(state.spot_table.c.spot_job_id == job_id,
+                                state.spot_table.c.task_id == 0))).scalar_one()
+        controller_cleaned_at = session.execute(
+            sqlalchemy.select(
+                state.job_info_table.c.controller_logs_cleaned_at).where(
+                    state.job_info_table.c.spot_job_id == job_id)).scalar_one()
+    assert task_cleaned_at == now
+    assert controller_cleaned_at == now
 
 
 def test_get_active_file_mounts_blob_ids(_mock_managed_jobs_db_conn):

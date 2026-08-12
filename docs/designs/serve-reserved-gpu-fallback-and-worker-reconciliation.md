@@ -4,6 +4,10 @@
 
 Approved for implementation on 2026-07-20. The first two milestones are independently shippable and are intentionally split into separate pull requests and deployments. Milestone 2 was added after live research-only validation on 2026-08-05 exposed an indefinite-wait regression.
 
+Last updated 2026-08-11. Milestone 3 extends the indefinite-wait contract to an
+explicit Kubernetes-only heterogeneous placement policy while ensuring one
+unknown or occupied location cannot monopolize the initial launch wave.
+
 Fable review 1 reshaped the design to use current-pod Karpenter Events rather than unproven pod conditions, and narrowed stale-worker cleanup to the confirmed launch-row race.
 
 ## Problem
@@ -24,14 +28,35 @@ Both changes must preserve existing mixed-version behavior, require no schema or
 
 When a caller explicitly selects an indefinite Kubernetes provisioning wait,
 occupied fixed GPU capacity must remain pending instead of taking the fast
-fallback path. This third behavior composes with the original goal: finite
-waits still fail fast so heterogeneous services can try their next candidate.
+fallback path. This behavior composes with the original goal: finite waits
+still fail fast so heterogeneous services can try their next candidate.
+
+When every candidate is a non-spot Kubernetes exact positive whole-GPU shape
+and a non-pool service explicitly enables a placement policy, accept the
+catalog and make that policy own exact-shape selection. Use fresh free-capacity
+observations for wide admission when capacity is available, and spread bounded
+zero/unknown scheduler probes across the configured locations so separate
+clusters can make progress concurrently and wait for occupied slots to return,
+including when an admitted probe waits indefinitely.
 
 ## Non-goals
 
 This design does not add GPU capacity to the research cluster, modify its Karpenter NodePools, shorten the global Kubernetes provisioning timeout, or permanently disable the reserved cluster after one failed placement.
 
-It does not change Serve demand calculation, reserved-capacity budgeting, candidate ordering, rollout version election, or teardown commitment semantics.
+Milestones 0–2 do not change Serve demand calculation, reserved-capacity
+budgeting, candidate ordering, rollout version election, or teardown commitment
+semantics. Milestone 3 changes only the interpretation and balanced consumption
+order of the existing demand-launch budget; it does not change demand targets,
+reserved-capacity-fill broker grants, rollout election, or teardown commitment.
+
+Kubernetes context aliases that resolve to the same physical cluster are out of
+scope. The production research configuration has two distinct context names
+backed by two distinct EKS clusters. Operators must not list aliases as separate
+placement locations because the demand cache is keyed by context and exact
+accelerator name.
+
+SkyPilot Pools remain outside Milestone 3. An all-nonspot placement catalog is
+still rejected for a pool.
 
 It does not change missing-row teardown handling. Safely recovering a failed teardown without its durable replica identity requires a separate tombstone design; silently discarding such a worker could lose the last evidence of leaked infrastructure.
 
@@ -130,6 +155,96 @@ the loop reaches the later scheduled observation. Retain the existing exact
 Karpenter Event test as proof that finite-timeout fast failure and GPU
 classification are unchanged.
 
+## Milestone 3: Kubernetes-only Heterogeneous Placement
+
+An ordinary `resources.any_of` catalog does not make the Serve placement policy
+own a non-spot launch. The generic launch path may therefore choose one
+accelerator shape and retry it in place instead of returning a typed capacity
+failure to the policy. Before this milestone, enabling the policy did not solve
+that problem because submission validation rejected a catalog with no spot
+entry.
+
+For a non-empty catalog whose entries are all non-spot Kubernetes locations
+with exactly one positive whole-number accelerator shape, an explicitly enabled
+placement policy is valid. CPU-only, fractional-GPU, and compound accelerator
+shapes remain invalid because the shared free-GPU budget cannot account for
+them. Fresh demand launches use the policy's active-location snapshot, persist
+one exact selected location, and set the availability retry limit to one. A
+typed capacity failure therefore benches that shape and lets a later
+reconciliation select another active candidate. Batch launch decisions take
+the same placement snapshot before selecting any of their shapes.
+
+The existing capacity snapshot distinguishes measured free capacity from an
+ambiguous zero before provider launch. A zero remains authoritative for an
+ordinary fixed zero-cost tier in a mixed paid fallback. In an all-Kubernetes
+placement catalog, however, zero cannot distinguish a truly unavailable pool
+from scale-to-zero capacity or a slot expected to return, so it receives only
+the bounded speculative allowance. A context with a configured Kubernetes
+autoscaler receives the same bounded allowance so a pending pod can trigger
+scale-up from zero. Missing observations also receive only that allowance.
+Selection consumes speculative and measured allowances in balanced rounds
+across exact locations instead of exhausting the first equal-cost location
+before considering the next. With two Kubernetes contexts, an admission wave
+of at least two backends therefore contains work for both contexts whenever
+both have measured or speculative budget.
+
+Balancing applies across the backends in one demand wave; it does not hedge one
+logical replica. A one-replica wave has only one selected location, so with
+``provision_timeout: -1`` that sole probe may remain pending indefinitely on an
+unavailable context. Operators who want concurrent cluster initialization must
+drive demand for at least two backends.
+
+A zero-capacity probe enables a Kubernetes scheduling decision; it does not
+alter priority or guarantee eviction. Milestone 3 does not rewrite task
+priority configuration. The production inference class is intentionally
+``-1000`` with ``preemptionPolicy: Never``: it cannot evict BCL occupants,
+while higher-priority BCL pods can reclaim GPUs from these inference pods.
+Verification of BCL reclamation must inspect the admitted pods' resolved
+priorities and the scheduler's nomination or preemption Events.
+
+`kubernetes.provision_timeout: -1` remains valid in this mode. It means an
+individual admitted, unscheduled pod may wait indefinitely; it does not disable
+other locations in the same demand wave. A scheduled/bound pod has already
+acquired capacity and leaves the scheduling-timeout path, so container, image,
+and model initialization remain governed by their existing startup/readiness
+contracts rather than by `provision_timeout`. Finite timeouts still provide a
+bounded escape for ambiguous unscheduled states, while definitive autoscaler
+progress retains the existing deadline extension.
+
+This milestone does not change the public `provision_timeout` default and does
+not introduce a special 30-second default. For a fallback-oriented fleet,
+omitting the setting retains the ordinary single-pod 10-second ambiguity
+guard; the
+autoscaler-aware path raises its initial detection window and extends it after
+definitive scale-up evidence. For fixed reserved pools where an occupied slot
+is expected to become available again, `-1` is the appropriate queueing policy.
+Clusters whose GPU nodes can scale dynamically still use the infrastructure's
+existing, deliberately longer autoscaler timeout policy. A 200-backend target
+with 200 GPUs already measured free can be admitted in one 120/80-balanced
+wave. If all 200 GPUs are occupied but reclaimable, admission starts with four
+bounded probes per context (eight across two contexts) and grows in later
+reconciliation waves as probes schedule; the 200-backend free-capacity test
+does not claim instant reclamation of 200 occupied slots.
+
+### Milestone 3 tests
+
+Validate that an A100-80GB/H200 non-spot Kubernetes catalog is accepted when
+the placement policy is enabled and the effective provisioning timeout is
+finite, absent, or `-1`, while an all-on-demand non-Kubernetes catalog remains
+invalid. Reject all-nonspot Kubernetes catalogs that are CPU-only, fractional,
+or otherwise lack one exact whole-GPU shape per entry. At runtime, prove that a
+fresh Kubernetes-only launch is pinned to one configured GPU shape, uses
+placement-owned availability handling for finite attempts, and requests a batch
+placement snapshot. Prove that equal measured or speculative budgets across two
+contexts are selected in alternating rounds, so both contexts enter the
+admission wave before either receives its second launch. For a 200-replica
+measured budget split 120/80, prove the first 128 selections split 64/64 and the
+final selections consume exactly 120/80. Retain the mixed-placement test proving
+that an ordinary non-spot fallback keeps its existing retry behavior. Prove a
+measured zero remains authoritative in that mixed fixed-pool mode, while an
+all-Kubernetes catalog and a context with a configured autoscaler each receive
+only the bounded probe allowance.
+
 ## Resulting Flow
 
 ```text
@@ -144,6 +259,16 @@ Serve demand
                 -> next candidate
           -> any other pending signal
              -> existing timeout behavior
+
+Kubernetes-only heterogeneous Serve demand with placement policy
+    -> measured-free locations get their exact budget
+    -> measured-zero and unknown locations get bounded scheduler probes
+    -> balanced budget selection puts distinct locations in the same launch wave
+    -> policy selects and persists one exact GPU shape per physical attempt
+       -> success: launch that shape
+       -> finite typed capacity failure: bench it for later reconciliation
+       -> indefinite unscheduled attempt: remain pending without blocking
+          already-enqueued attempts for the other locations
 
 completed Serve launch worker
     -> refresh durable replica mapping
@@ -173,6 +298,17 @@ Each milestone is formatted, tested, reviewed, merged, and deployed independentl
 
 Deploy the exact generated release with Helm `--reuse-values`. Verify the live API image and commit identity before evaluating service behavior.
 
+Pre-deployment read-only evidence on 2026-08-11 confirmed that the east and
+Phoenix research contexts are distinct EKS clusters (not aliases), neither has
+a SkyPilot ``kubernetes.autoscaler`` setting, and the affected east service
+uses ``provision_timeout: -1`` with priority ``-1000`` / preemption policy
+``Never``. At observation time, 73 low-priority inference GPU pods were running;
+31 BCL GPU pods requested 200 GPUs at priority 0 with
+``PreemptLowerPriority``. No workload PDB covered either set, and recent
+scheduler Events recorded low-priority inference pods as preemption victims.
+This proves the configured priority direction and supplies strong operational
+evidence for BCL reclaim, but it is not a fresh end-to-end BCL canary.
+
 For milestone 0, verify that controller refreshes no longer emit the missing-launch-row assertion and that teardown counts continue falling when a stale completed launch worker is encountered.
 
 For milestone 1, verify from a controlled saturation case or equivalent production event evidence that a deterministic reserved-cluster GPU incompatibility exits quickly and the next candidate begins provisioning. Also verify that reserved placements still succeed when matching GPU slots are available.
@@ -183,4 +319,24 @@ unbound and Pending across the observation window, then remove only the exact
 temporary service. Verify no AWS resource or GPU allocation occurred. A later
 free-capacity acceptance must prove the waiting pod can proceed normally.
 
-Rollback is a Helm rollback to the prior chart revision. Neither milestone changes durable schema or API contracts.
+For milestone 3, submit a zero-replica A100-80GB/H200 research-only service with
+the placement policy. With two contexts and unknown capacity, drive demand for
+at least two backends and verify that queued exact placements alternate between
+them. With a fresh zero-capacity observation, verify only the bounded Serve
+probes are submitted. In a separately authorized priority canary, place a
+low-priority inference replica on a free GPU, submit a higher-priority BCL
+workload, and verify BCL reclaims that GPU while the inference replica is
+redriven. Repeat with
+`provision_timeout: -1` and verify both contexts receive their first admitted
+probe before either receives a second; remove the temporary service and every
+probe afterward. No ordinary on-demand resource is eligible in this test.
+
+The control-plane deployment is independently verifiable without launching a
+GPU workload: require the exact immutable image digest, successful migration
+hook, API readiness, controller recovery, and unchanged existing-service
+status. A live Milestone 3 GPU/preemption canary remains an explicit operational
+gate because it exercises real scheduling and can affect live GPU workloads; do
+not run it without separate workload and capacity authorization.
+
+Rollback is a Helm rollback to the prior chart revision. No milestone changes
+durable schema or API contracts.

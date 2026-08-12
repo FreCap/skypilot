@@ -2861,12 +2861,26 @@ def check_can_clone_disk_and_override_task(
     return task, handle
 
 
+def _record_matches_managed_service_candidate(
+    record: dict[str, Any],
+    candidate: global_user_state.ManagedClusterStatusFields,
+) -> bool:
+    """Whether a full record is the nominated managed service generation."""
+    return (bool(candidate.cluster_hash) and
+            record.get('cluster_hash') == candidate.cluster_hash and
+            record.get('is_managed', False) and
+            record.get('workload_type') == 'service')
+
+
 def _update_cluster_status(
-        cluster_name: str,
-        record: dict[str, Any],
-        retry_if_missing: bool,
-        include_user_info: bool = True,
-        summary_response: bool = False) -> dict[str, Any] | None:
+    cluster_name: str,
+    record: dict[str, Any],
+    retry_if_missing: bool,
+    include_user_info: bool = True,
+    summary_response: bool = False,
+    managed_no_yaml_candidate: global_user_state.ManagedClusterStatusFields |
+    None = None
+) -> dict[str, Any] | None:
     """Update the cluster status.
 
     The cluster status is updated by checking ray cluster and real status from
@@ -2893,14 +2907,23 @@ def _update_cluster_status(
           fetched from the cloud provider or there are leaked nodes causing
           the node number larger than expected.
     """
+    if (managed_no_yaml_candidate is not None and
+            not _record_matches_managed_service_candidate(
+                record, managed_no_yaml_candidate)):
+        # A sweep nomination is admission authority for one exact managed
+        # service generation, never provider or cleanup authority for a
+        # same-name successor. Fence every path before inspecting its handle.
+        logger.debug(f'Ignoring stale ownerless-service nomination for cluster '
+                     f'{cluster_name!r}.')
+        return record
+
     handle = record['handle']
     status = record['status']
     if handle.cluster_yaml is None:
-        if record.get('is_managed', False):
-            # Ownerless managed service rows are nominated specifically for a
-            # provider-authoritative refresh. Without the YAML, the provider
-            # cannot be queried, so deleting the row would turn "unknown" into
-            # false absence and could hide a live resource.
+        if managed_no_yaml_candidate is not None:
+            # Without the YAML, the provider cannot be queried, so deleting
+            # the row would turn "unknown" into false absence and could hide a
+            # live resource.
             logger.debug(f'Managed cluster {cluster_name!r} has no YAML file; '
                          'retaining its cache row because provider absence '
                          'cannot be verified.')
@@ -3705,39 +3728,71 @@ def _must_refresh_cluster_status(
 
 
 def _reload_record_if_refresh_fields_changed(
-        cluster_name: str, record: dict[str, Any], include_user_info: bool,
-        summary_response: bool) -> dict[str, Any] | None:
+    cluster_name: str, record: dict[str, Any], include_user_info: bool,
+    summary_response: bool
+) -> tuple[dict[str, Any] | None, global_user_state.ClusterRefreshFields |
+           None]:
     """Reload the full record only if fields used by refresh changed.
 
     Status writers bump status/status_updated_at, while autostop writers update
-    autostop/to_down without touching the status timestamp. Comparing all four
-    plain columns preserves the pre-lock refresh snapshot without fetching the
-    full row (which unpickles the handle and queries the event table).
+    autostop/to_down without touching the status timestamp. Identity and
+    workload fields also fence a same-name replacement without unpickling a
+    second handle when the row is unchanged.
 
-    Returns None if the cluster no longer exists.
+    Returns the current record and its plain fields, or two ``None`` values if
+    the cluster no longer exists.
     """
     refresh_fields = global_user_state.get_cluster_refresh_fields(cluster_name)
     if refresh_fields is None:
-        return None
-    status, status_updated_at, autostop, to_down = refresh_fields
-    if (record['status'].name == status and
-            record['status_updated_at'] == status_updated_at and
-            record['autostop'] == autostop and record['to_down'] == to_down):
-        return record
-    return global_user_state.get_cluster_from_name(
+        return None, None
+    if (record['status'].name == refresh_fields.status and
+            record['status_updated_at'] == refresh_fields.status_updated_at and
+            record['autostop'] == refresh_fields.autostop and
+            record['to_down'] == refresh_fields.to_down and
+            record.get('cluster_hash') == refresh_fields.cluster_hash and
+            record.get('is_managed', False) == refresh_fields.is_managed and
+            record.get('workload_type') == refresh_fields.workload_type):
+        return record, refresh_fields
+    record = global_user_state.get_cluster_from_name(
         cluster_name,
         include_user_info=include_user_info,
         summary_response=summary_response)
+    if record is None:
+        return None, None
+    # The plain snapshot can itself be superseded before this full read. Derive
+    # the admission fields from the full record that will actually be acted on.
+    return record, global_user_state.ClusterRefreshFields(
+        record['status'].name, record['status_updated_at'], record['autostop'],
+        record['to_down'], record.get('cluster_hash'),
+        record.get('is_managed', False), record.get('workload_type'))
+
+
+def _is_current_managed_no_yaml_candidate(
+    refresh_fields: global_user_state.ClusterRefreshFields,
+    candidate: global_user_state.ManagedClusterStatusFields,
+) -> bool:
+    """Whether a sweep nomination still names this exact service row."""
+    return (bool(candidate.cluster_hash) and
+            refresh_fields.cluster_hash == candidate.cluster_hash and
+            refresh_fields.is_managed and
+            refresh_fields.workload_type == 'service')
 
 
 def _update_cluster_status_with_resource_lock(
-        cluster_name: str, record: dict[str, Any], retry_if_missing: bool,
-        include_user_info: bool, summary_response: bool,
-        resource_lock_already_held: bool) -> dict[str, Any] | None:
+    cluster_name: str,
+    record: dict[str, Any],
+    retry_if_missing: bool,
+    include_user_info: bool,
+    summary_response: bool,
+    resource_lock_already_held: bool,
+    managed_no_yaml_candidate: global_user_state.ManagedClusterStatusFields |
+    None = None
+) -> dict[str, Any] | None:
     """Update status while excluding provider and shared-file mutations."""
     if resource_lock_already_held:
         return _update_cluster_status(cluster_name, record, retry_if_missing,
-                                      include_user_info, summary_response)
+                                      include_user_info, summary_response,
+                                      managed_no_yaml_candidate)
 
     resource_lock = locks.get_lock(
         cluster_resource_operation_lock_id(cluster_name))
@@ -3745,7 +3800,8 @@ def _update_cluster_status_with_resource_lock(
         with resource_lock.acquire(blocking=False):
             return _update_cluster_status(cluster_name, record,
                                           retry_if_missing, include_user_info,
-                                          summary_response)
+                                          summary_response,
+                                          managed_no_yaml_candidate)
     except locks.LockTimeout:
         logger.debug('Refreshing status: resource operations are in progress '
                      f'for cluster {cluster_name!r}. Using the cached status.')
@@ -3753,15 +3809,18 @@ def _update_cluster_status_with_resource_lock(
 
 
 def refresh_cluster_record(
-        cluster_name: str,
-        *,
-        force_refresh_statuses: set[status_lib.ClusterStatus] | None = None,
-        cluster_lock_already_held: bool = False,
-        cluster_resource_lock_already_held: bool = False,
-        cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
-        include_user_info: bool = True,
-        summary_response: bool = False,
-        retry_if_missing: bool = True) -> dict[str, Any] | None:
+    cluster_name: str,
+    *,
+    force_refresh_statuses: set[status_lib.ClusterStatus] | None = None,
+    cluster_lock_already_held: bool = False,
+    cluster_resource_lock_already_held: bool = False,
+    cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
+    include_user_info: bool = True,
+    summary_response: bool = False,
+    retry_if_missing: bool = True,
+    _managed_no_yaml_candidate: global_user_state.ManagedClusterStatusFields |
+    None = None
+) -> dict[str, Any] | None:
     """Refresh the cluster, and return the possibly updated record.
 
     The function will update the cached cluster status in the global state. For
@@ -3797,6 +3856,9 @@ def refresh_cluster_record(
           if correctness is required, you must set this to -1.
         retry_if_missing: Whether to retry the call to the cloud api if the
           cluster is not found when querying the live status on the cloud.
+        _managed_no_yaml_candidate: Generation-bound fields when the
+          ownerless-service sweep nominated this exact managed service row for
+          provider-authoritative reconciliation.
 
     Returns:
         If the cluster is terminated or does not exist, return None.
@@ -3832,9 +3894,17 @@ def refresh_cluster_record(
     # using the correct cloud credentials.
     workspace = record.get('workspace', constants.SKYPILOT_DEFAULT_WORKSPACE)
     with skypilot_config.local_active_workspace_ctx(workspace):
-        # check_owner_identity returns if the record handle is
-        # not a CloudVmRayResourceHandle
-        _check_owner_identity_with_record(cluster_name, record)
+        if _managed_no_yaml_candidate is not None:
+            # Reject an already-stale nomination before any cloud identity or
+            # lock work. Re-prove the full identity after acquiring the lock.
+            if not _record_matches_managed_service_candidate(
+                    record, _managed_no_yaml_candidate):
+                return record
+        else:
+            # check_owner_identity returns if the record handle is
+            # not a CloudVmRayResourceHandle. Candidate refreshes defer this
+            # lookup until their generation is revalidated under the lock.
+            _check_owner_identity_with_record(cluster_name, record)
 
         # The loop logic allows us to notice if the status was updated in the
         # global_user_state by another process and stop trying to get the lock.
@@ -3852,21 +3922,41 @@ def refresh_cluster_record(
                 return record
 
             if cluster_lock_already_held:
+                if _managed_no_yaml_candidate is not None:
+                    refresh_fields = (global_user_state.
+                                      get_cluster_refresh_fields(cluster_name))
+                    if refresh_fields is None:
+                        return None
+                    if not _is_current_managed_no_yaml_candidate(
+                            refresh_fields, _managed_no_yaml_candidate):
+                        return record
+                    _check_owner_identity_with_record(cluster_name, record)
                 return _update_cluster_status_with_resource_lock(
                     cluster_name, record, retry_if_missing, include_user_info,
-                    summary_response, cluster_resource_lock_already_held)
+                    summary_response, cluster_resource_lock_already_held,
+                    _managed_no_yaml_candidate)
 
             # Try to acquire the lock so we can fetch the status.
             try:
                 with lock.acquire(blocking=False):
                     # Check the cluster status again, since it could have been
                     # updated between our last check and acquiring the lock.
-                    record = _reload_record_if_refresh_fields_changed(
-                        cluster_name, record, include_user_info,
-                        summary_response)
-                    if record is None or not _must_refresh_cluster_status(
-                            record, force_refresh_statuses):
+                    record, refresh_fields = (
+                        _reload_record_if_refresh_fields_changed(
+                            cluster_name, record, include_user_info,
+                            summary_response))
+                    if record is None:
+                        return None
+                    if (_managed_no_yaml_candidate is not None and
+                            refresh_fields is not None and
+                            not _is_current_managed_no_yaml_candidate(
+                                refresh_fields, _managed_no_yaml_candidate)):
                         return record
+                    if not _must_refresh_cluster_status(record,
+                                                        force_refresh_statuses):
+                        return record
+                    if _managed_no_yaml_candidate is not None:
+                        _check_owner_identity_with_record(cluster_name, record)
                     # Update and return the cluster status.
                     return _update_cluster_status_with_resource_lock(
                         cluster_name,
@@ -3874,7 +3964,8 @@ def refresh_cluster_record(
                         retry_if_missing,
                         include_user_info,
                         summary_response,
-                        resource_lock_already_held=False)
+                        resource_lock_already_held=False,
+                        managed_no_yaml_candidate=_managed_no_yaml_candidate)
 
             except locks.LockTimeout:
                 # lock.acquire() will throw a Timeout exception if the lock is not
@@ -3896,10 +3987,15 @@ def refresh_cluster_record(
             context_utils.sleep_with_cancellation(sleep_seconds)
 
             # Refresh for next loop iteration.
-            record = _reload_record_if_refresh_fields_changed(
+            record, refresh_fields = _reload_record_if_refresh_fields_changed(
                 cluster_name, record, include_user_info, summary_response)
             if record is None:
                 return None
+            if (_managed_no_yaml_candidate is not None and
+                    refresh_fields is not None and
+                    not _is_current_managed_no_yaml_candidate(
+                        refresh_fields, _managed_no_yaml_candidate)):
+                return record
 
 
 @timeline.event
@@ -4348,7 +4444,9 @@ def _refresh_cluster(
     force_refresh_statuses: set[status_lib.ClusterStatus] | None,
     include_user_info: bool = True,
     summary_response: bool = False,
-    cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS
+    cluster_status_lock_timeout: int = CLUSTER_STATUS_LOCK_TIMEOUT_SECONDS,
+    managed_no_yaml_candidate: global_user_state.ManagedClusterStatusFields |
+    None = None,
 ) -> dict[str, Any] | None:
     try:
         record = refresh_cluster_record(
@@ -4357,7 +4455,8 @@ def _refresh_cluster(
             cluster_lock_already_held=False,
             cluster_status_lock_timeout=cluster_status_lock_timeout,
             include_user_info=include_user_info,
-            summary_response=summary_response)
+            summary_response=summary_response,
+            _managed_no_yaml_candidate=managed_no_yaml_candidate)
     except (exceptions.ClusterStatusFetchingError,
             exceptions.CloudUserIdentityError,
             exceptions.ClusterOwnerIdentityMismatchError) as e:
@@ -4498,15 +4597,18 @@ def refresh_cluster_records() -> None:
         for cluster_name, fields in orphaned_service_status_fields.items():
             if cluster_name not in status_fields:
                 cluster_names.append(cluster_name)
-                status_fields[cluster_name] = fields
+                status_fields[cluster_name] = (fields.status,
+                                               fields.status_updated_at)
 
     def _refresh_cluster_record(cluster_name):
-        return _refresh_cluster(cluster_name,
-                                force_refresh_statuses=set(
-                                    status_lib.ClusterStatus),
-                                cluster_status_lock_timeout=0,
-                                include_user_info=False,
-                                summary_response=True)
+        return _refresh_cluster(
+            cluster_name,
+            force_refresh_statuses=set(status_lib.ClusterStatus),
+            cluster_status_lock_timeout=0,
+            include_user_info=False,
+            summary_response=True,
+            managed_no_yaml_candidate=(
+                orphaned_service_status_fields.get(cluster_name)))
 
     if cluster_names:
         subprocess_utils.run_in_parallel(

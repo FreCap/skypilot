@@ -770,12 +770,11 @@ def test_spend_drilldown_hierarchy_and_pagination(tmp_path, monkeypatch):
         start_date=selected_date, end_date=selected_date,
         group_by='job')['groups']
     flat_legacy = [
-        row for row in flat_workloads
-        if row['workload_type'] == 'managed_unattributed'
+        row for row in flat_workloads if row['workload_type'] == 'managed'
     ]
-    assert len(flat_legacy) == 1
-    assert flat_legacy[0]['workload_id'] is None
-    assert flat_legacy[0]['estimated_cost'] == 5
+    assert {row['workload_id'] for row in flat_legacy
+           } == {'legacy-managed-a', 'legacy-managed-b'}
+    assert sum(row['estimated_cost'] for row in flat_legacy) == 5
 
     bob_workloads = estimated_spend.get_estimated_spend_drilldown(
         'workload',

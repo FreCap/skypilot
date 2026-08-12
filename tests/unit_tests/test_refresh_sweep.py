@@ -11,12 +11,19 @@ import threading
 import types
 from unittest import mock
 
+from sky import global_user_state
 from sky.backends import backend_utils
 from sky.utils import status_lib
 
 
 def _record(status, status_updated_at):
     return {'status': status, 'status_updated_at': status_updated_at}
+
+
+def _candidate(status, status_updated_at, cluster_hash='candidate-hash'):
+    return global_user_state.ManagedClusterStatusFields(status,
+                                                        status_updated_at,
+                                                        cluster_hash)
 
 
 def _fail_request_task_lookup(*args, **kwargs):
@@ -119,10 +126,11 @@ class TestRefreshFaultIsolation:
     def test_sweep_adds_only_nominated_ownerless_managed_services(
             self, monkeypatch):
         attempted = []
+        refresh_kwargs = {}
 
         def _fake_refresh_cluster_record(cluster_name, **kwargs):
-            del kwargs
             attempted.append(cluster_name)
+            refresh_kwargs[cluster_name] = kwargs
             return _record(status_lib.ClusterStatus.UP, 1)
 
         monkeypatch.setattr(
@@ -132,8 +140,10 @@ class TestRefreshFaultIsolation:
             {'user-cluster': (status_lib.ClusterStatus.UP.value, 10)})
         monkeypatch.setattr(
             backend_utils.serve_utils,
-            'get_orphaned_service_cluster_status_fields', lambda:
-            {'orphaned-service': (status_lib.ClusterStatus.INIT.value, 1)})
+            'get_orphaned_service_cluster_status_fields', lambda: {
+                'orphaned-service': _candidate(
+                    status_lib.ClusterStatus.INIT.value, 1)
+            })
         monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
                             _fake_refresh_cluster_record)
         monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
@@ -142,6 +152,10 @@ class TestRefreshFaultIsolation:
         backend_utils.refresh_cluster_records()
 
         assert attempted == ['orphaned-service', 'user-cluster']
+        assert (refresh_kwargs['orphaned-service']['_managed_no_yaml_candidate']
+                == _candidate(status_lib.ClusterStatus.INIT.value, 1))
+        assert (refresh_kwargs['user-cluster']['_managed_no_yaml_candidate']
+                is None)
 
     def test_owner_discovery_failure_preserves_ordinary_sweep(
             self, monkeypatch):
@@ -176,8 +190,10 @@ class TestRefreshFaultIsolation:
             lambda names=None, *, exclude_managed_clusters=False: {})
         monkeypatch.setattr(
             backend_utils.serve_utils,
-            'get_orphaned_service_cluster_status_fields', lambda:
-            {'ownerless-service': (status_lib.ClusterStatus.UP.value, 1)})
+            'get_orphaned_service_cluster_status_fields', lambda: {
+                'ownerless-service': _candidate(
+                    status_lib.ClusterStatus.UP.value, 1)
+            })
         monkeypatch.setattr(backend_utils, '_get_cluster_refresh_parallelism',
                             lambda: 1)
         monkeypatch.setattr(backend_utils.global_user_state,
@@ -188,15 +204,18 @@ class TestRefreshFaultIsolation:
                 (cluster_name, terminate)))
 
         def _refresh_record(cluster_name, **kwargs):
-            del kwargs
             record = {
                 'handle': types.SimpleNamespace(cluster_yaml=None),
                 'status': status_lib.ClusterStatus.UP,
                 'is_managed': True,
+                'workload_type': 'service',
+                'cluster_hash': 'candidate-hash',
             }
-            return backend_utils._update_cluster_status(cluster_name,
-                                                        record,
-                                                        retry_if_missing=True)
+            return backend_utils._update_cluster_status(
+                cluster_name,
+                record,
+                retry_if_missing=True,
+                managed_no_yaml_candidate=kwargs['_managed_no_yaml_candidate'])
 
         monkeypatch.setattr(backend_utils, 'refresh_cluster_record',
                             _refresh_record)
@@ -205,7 +224,7 @@ class TestRefreshFaultIsolation:
 
         assert not removed
 
-    def test_unmanaged_cluster_without_yaml_keeps_legacy_cleanup(
+    def test_non_candidate_cluster_without_yaml_keeps_legacy_cleanup(
             self, monkeypatch):
         removed = []
         monkeypatch.setattr(backend_utils.global_user_state,
@@ -214,18 +233,25 @@ class TestRefreshFaultIsolation:
             backend_utils.global_user_state, 'remove_cluster',
             lambda cluster_name, terminate: removed.append(
                 (cluster_name, terminate)))
-        record = {
-            'handle': types.SimpleNamespace(cluster_yaml=None),
-            'status': status_lib.ClusterStatus.UP,
-            'is_managed': False,
-        }
-
-        result = backend_utils._update_cluster_status('user-cluster',
-                                                      record,
-                                                      retry_if_missing=True)
-
-        assert result is None
-        assert removed == [('user-cluster', True)]
+        cases = [
+            ('user-cluster', False, None),
+            ('managed-job', True, 'managed_job'),
+            ('managed-pool', True, 'pool'),
+            ('owned-service', True, 'service'),
+        ]
+        for cluster_name, is_managed, workload_type in cases:
+            record = {
+                'handle': types.SimpleNamespace(cluster_yaml=None),
+                'status': status_lib.ClusterStatus.UP,
+                'is_managed': is_managed,
+                'workload_type': workload_type,
+                'cluster_hash': f'{cluster_name}-hash',
+            }
+            result = backend_utils._update_cluster_status(cluster_name,
+                                                          record,
+                                                          retry_if_missing=True)
+            assert result is None
+        assert removed == [(cluster_name, True) for cluster_name, _, _ in cases]
 
     def test_sweep_covers_all_clusters_when_snapshot_fails(self, monkeypatch):
         """A status-snapshot failure falls back to the names-only sweep."""

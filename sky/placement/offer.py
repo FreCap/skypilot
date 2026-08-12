@@ -729,7 +729,6 @@ class PlacementOfferV1:
         _require_payload_schema(payload_schema)
         if type(envelope) is not dict:
             raise ValueError('offer envelope must be an exact dictionary.')
-        _require_json_builtins(envelope, 'offer envelope')
         outer = _require_object(envelope, _OFFER_ENVELOPE_KEYS,
                                 'offer envelope')
         schema_version = outer['schema_version']
@@ -757,6 +756,8 @@ class PlacementOfferV1:
         accelerator_values = resources_json['accelerators']
         if type(accelerator_values) is not list:
             raise ValueError('resources.accelerators must be a JSON array.')
+        if len(accelerator_values) > 8:
+            raise ValueError('resources.accelerators exceeds 8 entries.')
         accelerators: list[OfferAcceleratorV1] = []
         for index, value in enumerate(accelerator_values):
             accelerator_json = _require_object(
@@ -787,6 +788,8 @@ class PlacementOfferV1:
         zones_json = outer['candidate_zones']
         if type(zones_json) is not list:
             raise ValueError('candidate_zones must be a JSON array.')
+        if len(zones_json) > 32:
+            raise ValueError('candidate_zones exceeds 32 entries.')
         candidate_zones = tuple(
             _require_string(zone, f'candidate_zones[{index}]')
             for index, zone in enumerate(zones_json))
@@ -885,7 +888,7 @@ class PlacementOfferV1:
                                 object_pairs_hook=_reject_duplicate_keys,
                                 parse_float=_reject_json_float,
                                 parse_constant=_reject_json_constant)
-        except (json.JSONDecodeError, UnicodeError) as error:
+        except (json.JSONDecodeError, RecursionError, UnicodeError) as error:
             raise ValueError(
                 'serialized offer is not valid V1 JSON.') from error
         if type(parsed) is not dict:
@@ -1559,23 +1562,6 @@ def _require_evidence_row(
         raise ValueError('Replacement quota violates its matrix row.')
     if offer.evidence.capacity is not capacity:
         raise ValueError('Replacement capacity violates its matrix row.')
-
-
-def _require_json_builtins(value: object, path: str) -> None:
-    if type(value) is dict:
-        object_value = typing.cast(dict[object, object], value)
-        for key, child in object_value.items():
-            if type(key) is not str:
-                raise ValueError(f'{path} object keys must be exact strings.')
-            _require_json_builtins(child, f'{path}.{key}')
-        return
-    if type(value) is list:
-        for index, child in enumerate(typing.cast(list[object], value)):
-            _require_json_builtins(child, f'{path}[{index}]')
-        return
-    if value is None or type(value) in (str, int, bool):
-        return
-    raise ValueError(f'{path} contains a non-JSON or forbidden float value.')
 
 
 def _require_object(

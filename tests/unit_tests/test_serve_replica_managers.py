@@ -3736,9 +3736,12 @@ run: echo hi
 
 class TestLaunchReplicaAvailabilityMaxRetry:
     """`_launch_replica` must cap availability failures at one attempt only
-    for spot replicas managed by a spot placer."""
+    when a placement policy owns failover."""
 
-    def _launch_replica(self, use_spot: bool, with_placer: bool):
+    def _launch_replica(self,
+                        use_spot: bool,
+                        with_placer: bool,
+                        kubernetes_only: bool = False):
         # pylint: disable=protected-access
         manager = replica_managers.SkyPilotReplicaManager.__new__(
             replica_managers.SkyPilotReplicaManager)
@@ -3751,13 +3754,24 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         manager._replica_to_launch_cancelled = thread_utils.ThreadSafeDict()
         placer = None
         if with_placer:
-            placer = mock.Mock()
-            placer.active_locations.return_value = []
-            placer.ranked_active_locations.return_value = []
-            placer.zero_cost_locations.return_value = []
-            location = mock.Mock()
-            location.to_dict.return_value = {'zone': 'z'}
-            placer.select_next_location.return_value = location
+            if kubernetes_only:
+                a100 = make_location('prod_research_cluster_eks',
+                                     accelerators={'A100-80GB': 1},
+                                     use_spot=False,
+                                     cloud_name='Kubernetes')
+                h200 = make_location('prod_research_cluster_eks',
+                                     accelerators={'H200': 1},
+                                     use_spot=False,
+                                     cloud_name='Kubernetes')
+                placer = make_placer({a100: 0.0, h200: 0.0})
+            else:
+                placer = mock.Mock()
+                placer.active_locations.return_value = []
+                placer.ranked_active_locations.return_value = []
+                placer.zero_cost_locations.return_value = []
+                location = mock.Mock()
+                location.to_dict.return_value = {'zone': 'z'}
+                placer.select_next_location.return_value = location
         manager._spot_placer = placer
 
         with mock.patch('sky.serve.replica_managers._should_use_spot',
@@ -3824,6 +3838,37 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         launch_kwargs = call.kwargs['kwargs']
         assert 'ordinary_launch_handoff_context' not in launch_kwargs
         assert 'ordinary_launch_event' not in launch_kwargs
+
+    def test_non_spot_kubernetes_only_placer_owns_failover(self):
+        call = self._launch_replica(use_spot=False,
+                                    with_placer=True,
+                                    kubernetes_only=True)
+
+        assert call.kwargs['kwargs']['availability_max_retry'] == 1
+        assert call.kwargs['kwargs']['exact_resources_override'] is True
+        assert call.kwargs['args'][-1] is False
+        resources_override = call.kwargs['args'][-2]
+        assert resources_override['use_spot'] is False
+        assert resources_override['accelerators'] in ({
+            'A100-80GB': 1
+        }, {
+            'H200': 1
+        })
+
+    def test_non_spot_kubernetes_only_batch_takes_placement_snapshot(self):
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        a100 = make_location('prod_research_cluster_eks',
+                             accelerators={'A100-80GB': 1},
+                             use_spot=False,
+                             cloud_name='Kubernetes')
+        h200 = make_location('prod_research_cluster_eks',
+                             accelerators={'H200': 1},
+                             use_spot=False,
+                             cloud_name='Kubernetes')
+        manager._spot_placer = make_placer({a100: 0.0, h200: 0.0})
+
+        assert manager._batch_needs_placement_snapshot([None])
 
 
 class TestUpdateVersionHoldsManagerLock:
@@ -13041,6 +13086,65 @@ class TestZeroCostDemandProbeBudget:
             ('ctx-b', 'a100'): None,
         }
 
+    def test_equal_unknown_budgets_alternate_across_contexts(self):
+        zero_a = self._location('Kubernetes', 'ctx-a', 'A100', use_spot=False)
+        zero_b = self._location('Kubernetes', 'ctx-b', 'A100', use_spot=False)
+        manager = self._manager([zero_a, zero_b], [zero_a, zero_b])
+        manager._spot_placer.select_next_zero_cost_location.side_effect = (
+            lambda *, allowed_locations: min(
+                allowed_locations, key=lambda location: location.region))
+        attempts = (
+            replica_managers._ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION)
+        budget = replica_managers._ZeroCostDemandBudget(
+            remaining_by_pool={
+                ('ctx-a', 'a100'): attempts,
+                ('ctx-b', 'a100'): attempts,
+            },
+            measured_by_pool={
+                ('ctx-a', 'a100'): None,
+                ('ctx-b', 'a100'): None,
+            })
+
+        selected = [
+            manager._select_budgeted_zero_cost_location(budget)
+            for _ in range(4)
+        ]
+
+        assert selected == [zero_a, zero_b, zero_a, zero_b]
+        assert budget.remaining_by_pool == {
+            ('ctx-a', 'a100'): attempts - 2,
+            ('ctx-b', 'a100'): attempts - 2,
+        }
+
+    def test_two_hundred_measured_slots_are_distributed_by_capacity(self):
+        zero_a = self._location('Kubernetes', 'ctx-a', 'A100', use_spot=False)
+        zero_b = self._location('Kubernetes', 'ctx-b', 'A100', use_spot=False)
+        manager = self._manager([zero_a, zero_b], [zero_a, zero_b])
+        manager._spot_placer.select_next_zero_cost_location.side_effect = (
+            lambda *, allowed_locations: min(
+                allowed_locations, key=lambda location: location.region))
+        budget = replica_managers._ZeroCostDemandBudget(
+            remaining_by_pool={
+                ('ctx-a', 'a100'): 120,
+                ('ctx-b', 'a100'): 80,
+            },
+            measured_by_pool={
+                ('ctx-a', 'a100'): 120,
+                ('ctx-b', 'a100'): 80,
+            })
+
+        selected = [
+            manager._select_budgeted_zero_cost_location(budget)
+            for _ in range(200)
+        ]
+
+        assert selected[:4] == [zero_a, zero_b, zero_a, zero_b]
+        assert selected[:128].count(zero_a) == 64
+        assert selected[:128].count(zero_b) == 64
+        assert selected.count(zero_a) == 120
+        assert selected.count(zero_b) == 80
+        assert manager._select_budgeted_zero_cost_location(budget) is None
+
     def test_accelerators_in_same_context_have_independent_gpu_budgets(self):
         a100 = self._location('Kubernetes',
                               'research-ctx',
@@ -13108,7 +13212,11 @@ class TestZeroCostDemandProbeBudget:
         paid = self._location('AWS', 'us-east-1', 'L4', use_spot=True)
         manager = self._manager([zero], [zero, paid])
 
-        with mock.patch.object(replica_managers.reserved_capacity,
+        with mock.patch.object(
+                replica_managers,
+                '_kubernetes_context_has_configured_autoscaler',
+                return_value=False), \
+             mock.patch.object(replica_managers.reserved_capacity,
                                'get_cached_free_gpus_by_pool',
                                return_value=self._observations({
                                    ('research-ctx', 'a100'): 0
@@ -13127,7 +13235,11 @@ class TestZeroCostDemandProbeBudget:
                               count=8)
         manager = self._manager([zero], [zero])
 
-        with mock.patch.object(replica_managers.reserved_capacity,
+        with mock.patch.object(
+                replica_managers,
+                '_kubernetes_context_has_configured_autoscaler',
+                return_value=False), \
+             mock.patch.object(replica_managers.reserved_capacity,
                                'get_cached_free_gpus_by_pool',
                                return_value=self._observations({
                                    ('research-ctx', 'a100'): 0
@@ -13136,6 +13248,58 @@ class TestZeroCostDemandProbeBudget:
 
         assert budget is not None
         assert budget.remaining_by_pool == {('research-ctx', 'a100'): 0}
+
+    def test_zero_snapshot_with_configured_autoscaler_gets_bounded_probes(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        manager = self._manager([zero], [zero])
+
+        with mock.patch.object(
+                replica_managers,
+                '_kubernetes_context_has_configured_autoscaler',
+                return_value=True), \
+             mock.patch.object(replica_managers.reserved_capacity,
+                               'get_cached_free_gpus_by_pool',
+                               return_value=self._observations({
+                                   ('research-ctx', 'a100'): 0
+                               })):
+            budget = manager._build_zero_cost_demand_budget([], [None] * 500)
+
+        assert budget is not None
+        attempts = (
+            replica_managers._ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION)
+        assert budget.remaining_by_pool == {('research-ctx', 'a100'): attempts}
+        assert budget.measured_by_pool == {('research-ctx', 'a100'): None}
+
+    def test_kubernetes_only_zero_snapshot_gets_reclamation_probes(self):
+        zero = self._location('Kubernetes',
+                              'research-ctx',
+                              'A100',
+                              use_spot=False)
+        manager = self._manager([zero], [zero])
+
+        with mock.patch.object(
+                replica_managers,
+                '_placer_has_only_non_spot_kubernetes_gpu_locations',
+                return_value=True), \
+             mock.patch.object(
+                 replica_managers,
+                 '_kubernetes_context_has_configured_autoscaler',
+                 return_value=False), \
+             mock.patch.object(replica_managers.reserved_capacity,
+                               'get_cached_free_gpus_by_pool',
+                               return_value=self._observations({
+                                   ('research-ctx', 'a100'): 0
+                               })):
+            budget = manager._build_zero_cost_demand_budget([], [None] * 500)
+
+        assert budget is not None
+        attempts = (
+            replica_managers._ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION)
+        assert budget.remaining_by_pool == {('research-ctx', 'a100'): attempts}
+        assert budget.measured_by_pool == {('research-ctx', 'a100'): None}
 
 
 class TestRecoveryRetryAndIsolation:

@@ -310,7 +310,7 @@ def test_nested_status_refresh_reuses_resource_lock(monkeypatch):
     assert result is updated_record
     get_lock.assert_not_called()
     update_cluster_status.assert_called_once_with('test-cluster', record, False,
-                                                  False, True)
+                                                  False, True, None)
 
 
 def test_teardown_waits_for_resource_operation_lock(monkeypatch):

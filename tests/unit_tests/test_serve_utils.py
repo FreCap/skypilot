@@ -18,6 +18,7 @@ from sqlalchemy import orm
 
 from sky import clouds
 from sky import exceptions
+from sky import global_user_state
 from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
@@ -2514,9 +2515,12 @@ def test_orphaned_service_cluster_fields_require_consolidation():
 
 def test_orphaned_service_cluster_fields_use_exact_replica_ownership():
     candidates = {
-        'predecessor-r1': ('UP', 1),
-        'current-r1': ('UP', 2),
-        'failed-launch-r2': ('INIT', 3),
+        'predecessor-r1': global_user_state.ManagedClusterStatusFields(
+            'UP', 1, 'old-hash'),
+        'current-r1': global_user_state.ManagedClusterStatusFields(
+            'UP', 2, 'new-hash'),
+        'failed-launch-r2': global_user_state.ManagedClusterStatusFields(
+            'INIT', 3, 'failed-hash'),
     }
     with mock.patch.object(serve_utils,
                            'is_consolidation_mode',
@@ -2532,8 +2536,8 @@ def test_orphaned_service_cluster_fields_use_exact_replica_ownership():
         result = serve_utils.get_orphaned_service_cluster_status_fields()
 
     assert result == {
-        'predecessor-r1': ('UP', 1),
-        'failed-launch-r2': ('INIT', 3),
+        'predecessor-r1': candidates['predecessor-r1'],
+        'failed-launch-r2': candidates['failed-launch-r2'],
     }
     get_candidates.assert_called_once_with('service')
     get_owners.assert_called_once_with()

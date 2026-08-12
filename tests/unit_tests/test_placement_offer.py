@@ -1650,6 +1650,19 @@ def test_envelope_rejects_unknown_duplicate_float_and_secret_like_values():
         with pytest.raises((TypeError, ValueError)):
             module.PlacementOfferV1.from_json(serialized, payload_schema=schema)
 
+    deeply_nested = None
+    for _ in range(1200):
+        deeply_nested = [deeply_nested]
+    deep_unknown = copy.deepcopy(envelope)
+    deep_unknown['unknown'] = deeply_nested
+    with pytest.raises(ValueError):
+        module.PlacementOfferV1.from_envelope(deep_unknown,
+                                              payload_schema=schema)
+    deep_serialized = ('{"unknown":' + '[' * 1200 + 'null' + ']' * 1200 + '}')
+    with pytest.raises(ValueError):
+        module.PlacementOfferV1.from_json(deep_serialized,
+                                          payload_schema=schema)
+
     for timestamp in (
             '2026-07-30T12:34:56+00:00',
             '2026-02-30T12:34:56Z',
@@ -1723,6 +1736,19 @@ def test_envelope_rejects_unknown_duplicate_float_and_secret_like_values():
     for key in allow_keys:
         node = _object_node(module, fields=((key, _string_node(module)),))
         assert node.fields[0][0] == key
+
+
+def test_from_json_normalizes_decoder_recursion(monkeypatch):
+    module = _offer_lib()
+    schema = _kubernetes_schema(module)
+
+    def raise_recursion(*unused_args, **unused_kwargs):
+        raise RecursionError('forced decoder recursion exhaustion')
+
+    monkeypatch.setattr(module.json, 'loads', raise_recursion)
+    with pytest.raises(ValueError, match='not valid V1 JSON') as exc_info:
+        module.PlacementOfferV1.from_json('{}', payload_schema=schema)
+    assert isinstance(exc_info.value.__cause__, RecursionError)
 
 
 def test_envelope_scalar_collection_depth_and_byte_boundaries(monkeypatch):

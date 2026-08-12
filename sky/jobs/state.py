@@ -3,29 +3,32 @@
 # that we can easily switch to a s3-based storage.
 from collections.abc import Awaitable
 from collections.abc import Callable
-from collections.abc import Collection
 import enum
 import json
 import time
-import typing
-from typing import Any, Optional
+from typing import Any
 
 import sqlalchemy
 from sqlalchemy import orm
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.dialects import sqlite
+from sqlalchemy.dialects import postgresql  # pylint: disable=unused-import
+from sqlalchemy.dialects import sqlite  # pylint: disable=unused-import
 from sqlalchemy.ext import asyncio as sql_async
 
 from sky import exceptions
-from sky import resources as resources_lib
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.jobs import batch_state
+from sky.jobs import state_api_access_tokens
 from sky.jobs import state_events
+from sky.jobs import state_file_mount_blobs
+from sky.jobs import state_job_registration
+from sky.jobs import state_log_cleanup
+from sky.jobs import state_pool_execution
+from sky.jobs import state_pool_queries
 from sky.jobs import state_queries
 from sky.jobs import state_schema
 from sky.jobs import state_storage
-from sky.jobs.state_schema import api_access_token_table
+from sky.jobs import state_task_lookups
 from sky.jobs.state_schema import ha_recovery_script_table
 from sky.jobs.state_schema import job_info_table
 from sky.jobs.state_schema import spot_table
@@ -41,6 +44,10 @@ from sky.utils.db import db_utils
 from sky.utils.db import retries as db_retries
 from sky.utils.plugin_extensions import ExternalClusterFailure
 
+# Preserve the historical dialect helper exports used by state tests and
+# external debugging code. Registration implementations live in
+# state_job_registration.
+
 # Separate callback types for sync and async contexts
 SyncCallbackType = Callable[[str], None]
 AsyncCallbackType = Callable[[str], Awaitable[Any]]
@@ -55,28 +62,13 @@ request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 
 _DB_RETRY_TIMES = 30
 
-# Bound parameters per token upsert while keeping all chunks in one transaction.
-_API_ACCESS_TOKEN_UPSERT_BATCH_SIZE = 1000
+# Preserve the historical schema export used by migrations and callers.
+api_access_token_table = state_schema.api_access_token_table
 _TERMINAL_IDENTITY_QUERY_BATCH_SIZE = 250
 
 
 class ControllerLeadershipLostError(RuntimeError):
     """Raised when a split-role managed-job write has lost its outer fence."""
-
-
-class TaskLogStreamLookup(typing.NamedTuple):
-    """One task-filtered log snapshot plus exact task-count context."""
-    snapshot: JobLogStreamSnapshot
-    local_log_file: str | None
-    logs_cleaned_at: float | None
-    num_tasks: int
-
-
-class TaskWaitStatusLookup(typing.NamedTuple):
-    """One task-filtered wait snapshot plus exact task-count context."""
-    task_id: int | None
-    status: ManagedJobStatus | None
-    num_tasks: int
 
 
 class ControllerFailureDecision(enum.Enum):
@@ -200,6 +192,44 @@ requeue_expired_batch_attempts = batch_state.requeue_expired_batch_attempts
 set_batch_winding_down = batch_state.set_batch_winding_down
 set_batch_succeeded = batch_state.set_batch_succeeded
 set_batch_failed = batch_state.set_batch_failed
+
+# Keep the historical task-filtered lookup facade as direct aliases.
+TaskLogStreamLookup = state_task_lookups.TaskLogStreamLookup
+TaskWaitStatusLookup = state_task_lookups.TaskWaitStatusLookup
+get_task_wait_status_lookup = (state_task_lookups.get_task_wait_status_lookup)
+get_task_wait_status_lookup_by_name = (
+    state_task_lookups.get_task_wait_status_lookup_by_name)
+get_task_log_stream_lookup = state_task_lookups.get_task_log_stream_lookup
+get_task_log_stream_lookup_by_name = (
+    state_task_lookups.get_task_log_stream_lookup_by_name)
+
+# Keep the historical log-cleanup metadata facade as direct aliases.
+get_task_logs_to_clean = state_log_cleanup.get_task_logs_to_clean
+get_controller_logs_to_clean = state_log_cleanup.get_controller_logs_to_clean
+set_task_logs_cleaned = state_log_cleanup.set_task_logs_cleaned
+set_controller_logs_cleaned = state_log_cleanup.set_controller_logs_cleaned
+
+# Keep the historical pool-query facade as direct aliases.
+get_pending_jobs_count_by_pool = (
+    state_pool_queries.get_pending_jobs_count_by_pool)
+get_nonterminal_job_ids_by_pool = (
+    state_pool_queries.get_nonterminal_job_ids_by_pool)
+get_nonterminal_job_counts_by_pool = (
+    state_pool_queries.get_nonterminal_job_counts_by_pool)
+get_nonterminal_job_status_counts_by_pool = (
+    state_pool_queries.get_nonterminal_job_status_counts_by_pool)
+get_nonterminal_job_ids_by_pool_grouped = (
+    state_pool_queries.get_nonterminal_job_ids_by_pool_grouped)
+# pylint: disable=protected-access
+_is_any_of_or_ordered = state_pool_queries._is_any_of_or_ordered
+_parse_job_full_resources = state_pool_queries._parse_job_full_resources
+_ranked_nonterminal_job_resources = (
+    state_pool_queries._ranked_nonterminal_job_resources)
+# pylint: enable=protected-access
+get_pool_worker_used_resources = (
+    state_pool_queries.get_pool_worker_used_resources)
+get_pool_worker_used_resources_by_cluster = (
+    state_pool_queries.get_pool_worker_used_resources_by_cluster)
 
 
 async def _retry_session(operation):
@@ -327,54 +357,9 @@ _get_jobs_dict = state_queries._get_jobs_dict
 
 # pylint: enable=protected-access
 
-
 # === Status transition functions ===
-def set_job_info_without_job_id(name: str,
-                                workspace: str,
-                                entrypoint: str,
-                                pool: str | None,
-                                pool_hash: str | None,
-                                user_hash: str | None,
-                                execution: str | None = None,
-                                is_batch: bool = False,
-                                file_mounts_blob_id: str | None = None) -> int:
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-
-        insert_stmt = insert_func(job_info_table).values(
-            name=name,
-            schedule_state=ManagedJobScheduleState.INACTIVE.value,
-            workspace=workspace,
-            entrypoint=entrypoint,
-            pool=pool,
-            pool_hash=pool_hash,
-            user_hash=user_hash,
-            execution=execution,
-            is_batch=is_batch,
-            file_mounts_blob_id=file_mounts_blob_id,
-        )
-
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            result = session.execute(insert_stmt)
-            ret = result.lastrowid
-            session.commit()
-            return ret
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            result = session.execute(
-                insert_stmt.returning(job_info_table.c.spot_job_id))
-            ret = result.scalar()
-            session.commit()
-            return ret
-        else:
-            raise ValueError('Unsupported database dialect')
+set_job_info_without_job_id = (
+    state_job_registration.set_job_info_without_job_id)
 
 
 def set_pending(
@@ -1576,34 +1561,8 @@ _map_response_field_to_db_column = (
 # pylint: enable=protected-access
 get_managed_jobs_total = state_queries.get_managed_jobs_total
 
-
-def get_active_file_mounts_blob_ids() -> set[str]:
-    """Return blob ids referenced by jobs still in a non-terminal state.
-
-    Used by the API server's blob GC so that a blob is not reclaimed while
-    any managed job (including queued / recovering / winding-down jobs) still
-    needs its contents.
-    """
-    engine = _db_manager.get_engine()
-    terminal_status_values = [
-        s.value for s in ManagedJobStatus.terminal_statuses()
-    ]
-    non_terminal_job_ids_subquery = (sqlalchemy.select(
-        spot_table.c.spot_job_id).where(
-            sqlalchemy.or_(
-                spot_table.c.status.is_(None),
-                sqlalchemy.not_(
-                    spot_table.c.status.in_(terminal_status_values)),
-            )).distinct())
-    query = sqlalchemy.select(
-        job_info_table.c.file_mounts_blob_id).distinct().where(
-            sqlalchemy.and_(
-                job_info_table.c.file_mounts_blob_id.is_not(None),
-                job_info_table.c.spot_job_id.in_(non_terminal_job_ids_subquery),
-            ))
-    with orm.Session(engine) as session:
-        rows = session.execute(query).fetchall()
-    return {row[0] for row in rows if row[0] is not None}
+get_active_file_mounts_blob_ids = (
+    state_file_mount_blobs.get_active_file_mounts_blob_ids)
 
 
 def get_managed_jobs_highest_priority() -> int:
@@ -1681,215 +1640,6 @@ def get_log_stream_context(
     if context is None:
         return None, None, None, None
     return context[0], context[1], context[2], context[3]
-
-
-def _task_wait_job_scope(job_id: int) -> Any:
-    task_count = sqlalchemy.select(
-        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
-    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
-    return sqlalchemy.select(
-        sqlalchemy.literal(job_id).label('spot_job_id'),
-        task_count.label('num_tasks'),
-    ).subquery()
-
-
-def _task_wait_lookup(row: Any) -> TaskWaitStatusLookup:
-    return TaskWaitStatusLookup(
-        task_id=row.task_id,
-        status=None if row.status is None else ManagedJobStatus(row.status),
-        num_tasks=int(row.num_tasks or 0),
-    )
-
-
-@db_retries.retry
-def get_task_wait_status_lookup(job_id: int,
-                                task_id: int) -> TaskWaitStatusLookup:
-    """Return one task-filtered status lookup for the wait polling path.
-
-    ``wait()`` only needs the matched task id, its current status, and the
-    exact task count for missing-task classification. Keep that contract on one
-    database snapshot without paying for log-routing or log-file metadata.
-    """
-    job_scope = _task_wait_job_scope(job_id)
-    matching_task = sqlalchemy.select(
-        spot_table.c.spot_job_id,
-        spot_table.c.task_id,
-        spot_table.c.status,
-    ).where(
-        sqlalchemy.and_(
-            spot_table.c.spot_job_id == job_id,
-            spot_table.c.task_id == task_id,
-        )).subquery()
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                matching_task.c.task_id,
-                matching_task.c.status,
-                job_scope.c.num_tasks,
-            ).select_from(
-                job_scope.outerjoin(
-                    matching_task, matching_task.c.spot_job_id ==
-                    job_scope.c.spot_job_id))).fetchone()
-    assert row is not None, (job_id, task_id)
-    return _task_wait_lookup(row)
-
-
-@db_retries.retry
-def get_task_wait_status_lookup_by_name(job_id: int,
-                                        task_name: str) -> TaskWaitStatusLookup:
-    """Return one name-filtered status lookup for the wait polling path.
-
-    String task filters historically matched the first task with that name in
-    task_id order. Preserve that contract while keeping the wait path on one
-    slim database snapshot.
-    """
-    job_scope = _task_wait_job_scope(job_id)
-    matching_task = sqlalchemy.select(
-        spot_table.c.spot_job_id,
-        spot_table.c.task_id,
-        spot_table.c.status,
-    ).where(
-        sqlalchemy.and_(
-            spot_table.c.spot_job_id == job_id,
-            spot_table.c.task_name == task_name,
-        )).order_by(spot_table.c.task_id.asc()).limit(1).subquery()
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                matching_task.c.task_id,
-                matching_task.c.status,
-                job_scope.c.num_tasks,
-            ).select_from(
-                job_scope.outerjoin(
-                    matching_task, matching_task.c.spot_job_id ==
-                    job_scope.c.spot_job_id))).fetchone()
-    assert row is not None, (job_id, task_name)
-    return _task_wait_lookup(row)
-
-
-@db_retries.retry
-def get_task_log_stream_lookup(job_id: int,
-                               task_id: int) -> TaskLogStreamLookup:
-    """Return one task-filtered lookup plus exact task-count context.
-
-    When callers follow a specific task in a JobGroup, the task status and its
-    routing context must come from the same database snapshot. Otherwise a
-    later task can advance the job-level latest-task status between the two
-    reads and make the follower wait on the wrong lifecycle. The same lookup
-    also returns the exact task count for this job snapshot so a missing task
-    can be classified as either "job missing" or "task ID invalid" without a
-    second point query.
-    """
-    task_count = sqlalchemy.select(
-        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
-    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
-    job_scope = sqlalchemy.select(
-        sqlalchemy.literal(job_id).label('spot_job_id'),
-        task_count.label('num_tasks'),
-    ).subquery()
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                spot_table.c.task_id,
-                spot_table.c.status,
-                job_info_table.c.pool,
-                job_info_table.c.current_cluster_name,
-                job_info_table.c.job_id_on_pool_cluster,
-                spot_table.c.task_name,
-                spot_table.c.local_log_file,
-                spot_table.c.logs_cleaned_at,
-                job_scope.c.num_tasks,
-            ).select_from(
-                job_scope.outerjoin(
-                    spot_table,
-                    sqlalchemy.and_(
-                        spot_table.c.spot_job_id == job_scope.c.spot_job_id,
-                        spot_table.c.task_id == task_id,
-                    )).outerjoin(
-                        job_info_table, job_info_table.c.spot_job_id ==
-                        spot_table.c.spot_job_id))).fetchone()
-    assert row is not None, (job_id, task_id)
-    snapshot = JobLogStreamSnapshot(
-        row.task_id,
-        (None if row.status is None else ManagedJobStatus(row.status)),
-        row.pool,
-        row.current_cluster_name,
-        row.job_id_on_pool_cluster,
-        row.task_name,
-    )
-    return TaskLogStreamLookup(
-        snapshot=snapshot,
-        local_log_file=row.local_log_file,
-        logs_cleaned_at=row.logs_cleaned_at,
-        num_tasks=int(row.num_tasks or 0),
-    )
-
-
-@db_retries.retry
-def get_task_log_stream_lookup_by_name(job_id: int,
-                                       task_name: str) -> TaskLogStreamLookup:
-    """Return one name-filtered lookup plus exact task-count context.
-
-    String task filters historically matched the first task with that name in
-    task_id order. Preserve that contract while resolving the match, task
-    status, and the exact task count from one database snapshot.
-    """
-    task_count = sqlalchemy.select(
-        sqlalchemy.func.count(spot_table.c.task_id)  # pylint: disable=not-callable
-    ).where(spot_table.c.spot_job_id == job_id).scalar_subquery()
-    job_scope = sqlalchemy.select(
-        sqlalchemy.literal(job_id).label('spot_job_id'),
-        task_count.label('num_tasks'),
-    ).subquery()
-    matching_task = sqlalchemy.select(
-        spot_table.c.spot_job_id,
-        spot_table.c.task_id,
-        spot_table.c.status,
-        spot_table.c.task_name,
-        spot_table.c.local_log_file,
-        spot_table.c.logs_cleaned_at,
-    ).where(
-        sqlalchemy.and_(
-            spot_table.c.spot_job_id == job_id,
-            spot_table.c.task_name == task_name,
-        )).order_by(spot_table.c.task_id.asc()).limit(1).subquery()
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        row = session.execute(
-            sqlalchemy.select(
-                matching_task.c.task_id,
-                matching_task.c.status,
-                job_info_table.c.pool,
-                job_info_table.c.current_cluster_name,
-                job_info_table.c.job_id_on_pool_cluster,
-                matching_task.c.task_name,
-                matching_task.c.local_log_file,
-                matching_task.c.logs_cleaned_at,
-                job_scope.c.num_tasks,
-            ).select_from(
-                job_scope.outerjoin(
-                    matching_task, matching_task.c.spot_job_id ==
-                    job_scope.c.spot_job_id).outerjoin(
-                        job_info_table, job_info_table.c.spot_job_id ==
-                        matching_task.c.spot_job_id))).fetchone()
-    assert row is not None, (job_id, task_name)
-    snapshot = JobLogStreamSnapshot(
-        row.task_id,
-        (None if row.status is None else ManagedJobStatus(row.status)),
-        row.pool,
-        row.current_cluster_name,
-        row.job_id_on_pool_cluster,
-        row.task_name,
-    )
-    return TaskLogStreamLookup(
-        snapshot=snapshot,
-        local_log_file=row.local_log_file,
-        logs_cleaned_at=row.logs_cleaned_at,
-        num_tasks=int(row.num_tasks or 0),
-    )
 
 
 @db_retries.retry
@@ -2084,228 +1834,22 @@ def get_job_file_contents(job_id: int) -> dict[str, str | None]:
     }
 
 
-@db_retries.retry
-def get_pool_from_job_id(job_id: int) -> str | None:
-    """Get the pool from the job id."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        pool = session.execute(
-            sqlalchemy.select(job_info_table.c.pool).where(
-                job_info_table.c.spot_job_id == job_id)).fetchone()
-        return pool[0] if pool else None
+get_pool_from_job_id = state_pool_execution.get_pool_from_job_id
+get_pool_and_current_cluster_name = (
+    state_pool_execution.get_pool_and_current_cluster_name)
+get_pool_and_execution_from_job_id_async = (
+    state_pool_execution.get_pool_and_execution_from_job_id_async)
+set_current_cluster_name = state_pool_execution.set_current_cluster_name
+set_job_infra = state_pool_execution.set_job_infra
+update_job_full_resources = state_pool_execution.update_job_full_resources
+set_job_id_on_pool_cluster_async = (
+    state_pool_execution.set_job_id_on_pool_cluster_async)
+get_pool_submit_info = state_pool_execution.get_pool_submit_info
+get_pool_submit_info_async = state_pool_execution.get_pool_submit_info_async
 
-
-@db_retries.retry
-def get_pool_and_current_cluster_name(
-        job_id: int) -> tuple[str | None, str | None]:
-    """Read the pool binding and current pool worker from one job row."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        info = session.execute(
-            sqlalchemy.select(
-                job_info_table.c.pool,
-                job_info_table.c.current_cluster_name).where(
-                    job_info_table.c.spot_job_id == job_id)).fetchone()
-        if info is None:
-            return None, None
-        return info[0], info[1]
-
-
-@db_retries.retry_async
-async def get_pool_and_execution_from_job_id_async(
-        job_id: int) -> tuple[str | None, str | None]:
-    """Get the pool and DAG execution mode from the job id in one query.
-
-    Both columns are fixed at submission time, so they can always be read
-    together. Each is None when the job is unknown or its row has no recorded
-    value (writers may store an explicit NULL for execution, e.g. legacy code
-    paths that predate the column). Callers use execution to decide
-    JobGroup-ness ('parallel' == JobGroup) without fetching and re-parsing the
-    full DAG YAML.
-    """
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        result = await session.execute(
-            sqlalchemy.select(job_info_table.c.pool,
-                              job_info_table.c.execution).where(
-                                  job_info_table.c.spot_job_id == job_id))
-        info = result.fetchone()
-        if info is None:
-            return None, None
-        return info[0], info[1]
-
-
-def set_current_cluster_name(job_id: int, current_cluster_name: str) -> None:
-    """Set the current cluster name for a job."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.query(job_info_table).filter(
-            job_info_table.c.spot_job_id == job_id).update(
-                {job_info_table.c.current_cluster_name: current_cluster_name})
-        session.commit()
-
-
-@db_retries.retry
-def set_job_infra(job_id: int,
-                  cloud: str | None = None,
-                  region: str | None = None,
-                  zone: str | None = None,
-                  current_node_names: list[str] | None = None) -> None:
-    """Update the infrastructure info for a job.
-
-    This is called after a job is launched to record the cloud/region/zone
-    and node names for sorting, filtering, and dashboard display purposes.
-
-    Args:
-        job_id: The job ID to update.
-        cloud: The cloud provider (e.g., 'GCP', 'AWS').
-        region: The region (e.g., 'us-central1').
-        zone: The zone (e.g., 'us-central1-a').
-        current_node_names: List of current node names (head first) to merge
-            into the existing lineage.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        update_values: dict[Any, Any] = {}
-        if cloud is not None:
-            update_values[job_info_table.c.cloud] = cloud
-        if region is not None:
-            update_values[job_info_table.c.region] = region
-        if zone is not None:
-            update_values[job_info_table.c.zone] = zone
-        if current_node_names is not None:
-            row = session.query(job_info_table.c.node_names).filter(
-                job_info_table.c.spot_job_id ==
-                job_id).with_for_update().first()
-            existing_json = row.node_names if row else None
-            node_names = common_utils.merge_node_names_lineage(
-                existing_json, current_node_names)
-            update_values[job_info_table.c.node_names] = node_names
-        if update_values:
-            session.query(job_info_table).filter(
-                job_info_table.c.spot_job_id == job_id).update(update_values)
-            session.commit()
-
-
-def update_job_full_resources(job_id: int,
-                              full_resources_json: dict[str, Any]) -> None:
-    """Update the full_resources column for a job.
-
-    This is called after scheduling to set the specific resource that was
-    selected from an any_of or ordered list. The update happens within the
-    filelock in get_next_cluster_name to ensure atomicity.
-
-    Args:
-        job_id: The spot_job_id to update
-        full_resources_json: The resolved resource configuration (single
-            resource, not any_of/ordered)
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.execute(
-            sqlalchemy.update(spot_table).where(
-                spot_table.c.spot_job_id == job_id).values(
-                    {spot_table.c.full_resources: full_resources_json}))
-        session.commit()
-
-
-async def set_job_id_on_pool_cluster_async(job_id: int,
-                                           job_id_on_pool_cluster: int) -> None:
-    """Set the job id on the pool cluster for a job."""
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        await session.execute(
-            sqlalchemy.update(job_info_table).
-            where(job_info_table.c.spot_job_id == job_id).values({
-                job_info_table.c.job_id_on_pool_cluster: job_id_on_pool_cluster
-            }))
-        await session.commit()
-
-
-@db_retries.retry
-def get_pool_submit_info(job_id: int) -> tuple[str | None, int | None]:
-    """Get the cluster name and job id on the pool from the managed job id."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        info = session.execute(
-            sqlalchemy.select(
-                job_info_table.c.current_cluster_name,
-                job_info_table.c.job_id_on_pool_cluster).where(
-                    job_info_table.c.spot_job_id == job_id)).fetchone()
-        if info is None:
-            return None, None
-        return info[0], info[1]
-
-
-@db_retries.retry_async
-async def get_pool_submit_info_async(
-        job_id: int) -> tuple[str | None, int | None]:
-    """Get the cluster name and job id on the pool from the managed job id."""
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        result = await session.execute(
-            sqlalchemy.select(job_info_table.c.current_cluster_name,
-                              job_info_table.c.job_id_on_pool_cluster).where(
-                                  job_info_table.c.spot_job_id == job_id))
-        info = result.fetchone()
-        if info is None:
-            return None, None
-        return info[0], info[1]
-
-
-def set_api_access_token_ids(job_ids: list[int], token_id: str) -> None:
-    """Store one API access token ID for a batch of managed jobs."""
-    unique_job_ids = list(dict.fromkeys(job_ids))
-    if not unique_job_ids:
-        return
-
-    engine = _db_manager.get_engine()
-    dialect_map = {
-        db_utils.SQLAlchemyDialect.SQLITE.value: sqlite.insert,
-        db_utils.SQLAlchemyDialect.POSTGRESQL.value: postgresql.insert,
-    }
-    insert_func = dialect_map.get(engine.dialect.name)
-    if insert_func is None:
-        raise ValueError(f'Unsupported database dialect: {engine.dialect.name}')
-    with orm.Session(engine) as session:
-        for offset in range(0, len(unique_job_ids),
-                            _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE):
-            job_id_batch = unique_job_ids[offset:offset +
-                                          _API_ACCESS_TOKEN_UPSERT_BATCH_SIZE]
-            insert_stmt = insert_func(api_access_token_table).values([{
-                'job_id': job_id,
-                'token_id': token_id,
-            } for job_id in job_id_batch])
-            upsert_stmt = insert_stmt.on_conflict_do_update(
-                index_elements=[api_access_token_table.c.job_id],
-                set_={
-                    api_access_token_table.c.token_id:
-                        insert_stmt.excluded.token_id
-                })
-            session.execute(upsert_stmt)
-        session.commit()
-
-
-@db_retries.retry
-def get_releasable_api_access_token_id(job_id: int) -> str | None:
-    """Return this job's token only when every associated job is terminal."""
-    engine = _db_manager.get_engine()
-    owner = api_access_token_table.alias('token_owner')
-    sibling = api_access_token_table.alias('token_sibling')
-    sibling_tasks = sibling.outerjoin(
-        spot_table, sibling.c.job_id == spot_table.c.spot_job_id)
-    terminal_values = [
-        status.value for status in ManagedJobStatus.terminal_statuses()
-    ]
-    unreleasable_sibling = sqlalchemy.exists(
-        sqlalchemy.select(1).select_from(sibling_tasks).where(
-            sibling.c.token_id == owner.c.token_id,
-            sqlalchemy.or_(spot_table.c.status.is_(None),
-                           spot_table.c.status.not_in(terminal_values))))
-    query = sqlalchemy.select(owner.c.token_id).where(owner.c.job_id == job_id,
-                                                      ~unreleasable_sibling)
-    with orm.Session(engine) as session:
-        return session.execute(query).scalar_one_or_none()
+set_api_access_token_ids = state_api_access_tokens.set_api_access_token_ids
+get_releasable_api_access_token_id = (
+    state_api_access_tokens.get_releasable_api_access_token_id)
 
 
 @db_retries.retry_async
@@ -2454,325 +1998,6 @@ def get_num_alive_jobs(pool: str | None = None) -> int:
                 sqlalchemy.and_(*where_conditions))).fetchone()[0]
 
 
-def get_pending_jobs_count_by_pool(pool: str) -> int:
-    """Get the count of pending jobs in a pool.
-
-    Pending jobs are distinct managed jobs that are waiting for a worker.
-    A single job can contribute multiple task rows while it remains queued, so
-    the queue length must count unique job IDs instead of raw task rows. Jobs
-    already assigned to a replica must not keep contributing queued demand just
-    because later task rows are still pending in the task table.
-
-    Args:
-        pool: The pool name
-
-    Returns:
-        The number of pending jobs in the pool
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        # pylint: disable=not-callable
-        query = sqlalchemy.select(
-            sqlalchemy.func.count(
-                spot_table.c.spot_job_id.distinct())).select_from(
-                    job_info_table.join(
-                        spot_table, job_info_table.c.spot_job_id ==
-                        spot_table.c.spot_job_id)).where(
-                            sqlalchemy.and_(
-                                spot_table.c.status ==
-                                ManagedJobStatus.PENDING.value,
-                                job_info_table.c.pool == pool,
-                                job_info_table.c.current_cluster_name.is_(None),
-                            ))
-        result = session.execute(query).fetchone()
-        return result[0] if result else 0
-
-
-def get_nonterminal_job_ids_by_pool(pool: str,
-                                    cluster_name: str | None = None
-                                   ) -> list[int]:
-    """Get nonterminal job ids in a pool."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        query = sqlalchemy.select(
-            spot_table.c.spot_job_id).distinct().select_from(
-                spot_table.outerjoin(
-                    job_info_table,
-                    spot_table.c.spot_job_id == job_info_table.c.spot_job_id))
-        and_conditions = [
-            ~spot_table.c.status.in_([
-                status.value for status in ManagedJobStatus.terminal_statuses()
-            ]),
-            job_info_table.c.pool == pool,
-        ]
-        if cluster_name is not None:
-            and_conditions.append(
-                job_info_table.c.current_cluster_name == cluster_name)
-        query = query.where(sqlalchemy.and_(*and_conditions)).order_by(
-            spot_table.c.spot_job_id.asc())
-        rows = session.execute(query).fetchall()
-        job_ids = [row[0] for row in rows if row[0] is not None]
-        return job_ids
-
-
-def get_nonterminal_job_counts_by_pool(pool: str) -> dict[str, int]:
-    """Get the number of nonterminal jobs per cluster in a pool.
-
-    Returns a dict mapping cluster_name to the count of nonterminal jobs
-    running on that cluster. Uses a single GROUP BY query instead of
-    per-cluster queries.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        query = sqlalchemy.select(
-            job_info_table.c.current_cluster_name,
-            # pylint: disable=not-callable
-            sqlalchemy.func.count(
-                spot_table.c.spot_job_id.distinct()
-            )).select_from(
-                spot_table.outerjoin(
-                    job_info_table,
-                    spot_table.c.spot_job_id == job_info_table.c.spot_job_id)
-            ).where(
-                sqlalchemy.and_(
-                    ~spot_table.c.status.in_([
-                        status.value
-                        for status in ManagedJobStatus.terminal_statuses()
-                    ]),
-                    job_info_table.c.pool == pool,
-                )).group_by(job_info_table.c.current_cluster_name)
-        rows = session.execute(query).fetchall()
-        return {row[0]: row[1] for row in rows if row[0] is not None}
-
-
-def get_nonterminal_job_status_counts_by_pool(pool: str) -> dict[str, int]:
-    """Get nonterminal pool queue-row counts grouped by status.
-
-    The pool dashboard badges historically counted the nonterminal task rows
-    returned by ``jobs/queue/v2`` for a pool, not distinct job ids. Keep that
-    semantics while replacing the dashboard's second full queue fetch with one
-    grouped DB query owned by the pool-status snapshot.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        query = sqlalchemy.select(
-            spot_table.c.status,
-            # pylint: disable=not-callable
-            sqlalchemy.func.count(spot_table.c.task_id),
-        ).select_from(
-            spot_table.outerjoin(
-                job_info_table, spot_table.c.spot_job_id ==
-                job_info_table.c.spot_job_id)).where(
-                    sqlalchemy.and_(
-                        ~spot_table.c.status.in_([
-                            status.value
-                            for status in ManagedJobStatus.terminal_statuses()
-                        ]),
-                        job_info_table.c.pool == pool,
-                    )).group_by(spot_table.c.status)
-        rows = session.execute(query).fetchall()
-        return {row[0]: row[1] for row in rows if row[0] is not None}
-
-
-def get_nonterminal_job_ids_by_pool_grouped(
-        pool: str) -> dict[str | None, list[int]]:
-    """Get nonterminal job ids in a pool, grouped by current_cluster_name.
-
-    Equivalent to calling get_nonterminal_job_ids_by_pool once per replica
-    (plus once for the pool as a whole), but executed in a single query so
-    callers like pool_status avoid the N+1 round-trips that dominate
-    dashboard latency when there are many finished jobs.
-
-    Returns:
-        A dict mapping current_cluster_name to the list of nonterminal
-        spot_job_ids assigned to that cluster. Jobs not yet bound to a
-        specific cluster (current_cluster_name IS NULL) are grouped under
-        the ``None`` key. Each list is sorted by spot_job_id ascending.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        query = sqlalchemy.select(
-            job_info_table.c.current_cluster_name,
-            spot_table.c.spot_job_id,
-        ).distinct().select_from(
-            spot_table.outerjoin(
-                job_info_table, spot_table.c.spot_job_id ==
-                job_info_table.c.spot_job_id)).where(
-                    sqlalchemy.and_(
-                        ~spot_table.c.status.in_([
-                            status.value
-                            for status in ManagedJobStatus.terminal_statuses()
-                        ]),
-                        job_info_table.c.pool == pool,
-                    )).order_by(spot_table.c.spot_job_id.asc())
-        rows = session.execute(query).fetchall()
-        result: dict[str | None, list[int]] = {}
-        for cluster_name, job_id in rows:
-            if job_id is None:
-                continue
-            result.setdefault(cluster_name, []).append(job_id)
-        return result
-
-
-def _is_any_of_or_ordered(resource_config: dict[str, Any]) -> bool:
-    """Check if resource config is heterogeneous (any_of or ordered).
-
-    Args:
-        resource_config: Resource configuration dictionary
-
-    Returns:
-        True if the config contains 'any_of' or 'ordered' keys, indicating
-        heterogeneous resources that haven't been resolved to a specific
-        resource yet.
-    """
-    return 'any_of' in resource_config or 'ordered' in resource_config
-
-
-def _parse_job_full_resources(
-    resource_config: dict[str, Any] | None
-) -> Optional['resources_lib.Resources']:
-    """Parse one persisted full_resources payload."""
-    if resource_config is None:
-        return None
-    if _is_any_of_or_ordered(resource_config):
-        return None
-    resources_set = resources_lib.Resources.from_yaml_config(resource_config)
-    if len(resources_set) == 0:
-        return None
-    return next(iter(resources_set))
-
-
-def _ranked_nonterminal_job_resources(
-    *,
-    job_ids: set[int] | None = None,
-    pool: str | None = None,
-) -> Any:
-    """Return nonterminal task resources ranked within each Managed Job.
-
-    ``full_resources`` is a PostgreSQL ``json`` column, so it cannot
-    participate in ``DISTINCT`` or ``GROUP BY``. Rank rows using scalar task
-    identity instead, then let callers select rank one.
-    """
-    columns = [
-        spot_table.c.spot_job_id,
-        spot_table.c.full_resources,
-        sqlalchemy.func.row_number().over(
-            partition_by=spot_table.c.spot_job_id,
-            order_by=spot_table.c.task_id.asc(),
-        ).label('task_rank'),
-    ]
-    from_clause = spot_table
-    conditions = [
-        ~spot_table.c.status.in_(
-            [status.value for status in ManagedJobStatus.terminal_statuses()])
-    ]
-    if job_ids is not None:
-        conditions.append(spot_table.c.spot_job_id.in_(job_ids))
-    if pool is not None:
-        columns.insert(0, job_info_table.c.current_cluster_name)
-        from_clause = spot_table.join(
-            job_info_table,
-            spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
-        )
-        conditions.append(job_info_table.c.pool == pool)
-    return sqlalchemy.select(*columns).select_from(from_clause).where(
-        sqlalchemy.and_(*conditions)).subquery()
-
-
-def get_pool_worker_used_resources(
-        job_ids: set[int]) -> Optional['resources_lib.Resources']:
-    """Get the total used resources by running jobs.
-
-    Args:
-        job_ids: Set of spot_job_id values to check
-
-    Returns:
-        Resources object with summed resources from all running jobs, or None
-        if we couldn't parse the resources string for any job.
-    """
-    if not job_ids:
-        return None
-
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        # Count only live task rows for each job. Multi-task managed jobs keep
-        # terminal task history in spot_table, and those historical rows can
-        # retain older full_resources values that should not contribute to the
-        # worker's active resource usage.
-        ranked_resources = _ranked_nonterminal_job_resources(job_ids=job_ids)
-        query = sqlalchemy.select(
-            ranked_resources.c.spot_job_id,
-            ranked_resources.c.full_resources,
-        ).where(ranked_resources.c.task_rank == 1)
-        rows = session.execute(query).fetchall()
-
-        resource_configs = []
-        for row in rows:
-            if row[1] is None:
-                # We don't have full_resources for this job. We should return
-                # none since we can't make any guarantees about what resources
-                # are being used.
-                return None
-            resource_configs.append(row[1])
-
-    # Parse resources dicts into Resources objects and sum them using +.
-    # If any job on the worker has an empty resource request, fail closed for
-    # resource-aware scheduling by treating the worker as fully occupied.
-    total_resources = None
-    saw_empty_request = False
-    for resource_config in resource_configs:
-        parsed = _parse_job_full_resources(resource_config)
-        if parsed is None:
-            return None
-        if parsed.is_empty():
-            saw_empty_request = True
-            continue
-        if total_resources is None:
-            total_resources = parsed
-        else:
-            total_resources = total_resources + parsed
-    if saw_empty_request:
-        return resources_lib.Resources()
-    return total_resources
-
-
-def get_pool_worker_used_resources_by_cluster(
-        pool: str) -> dict[str | None, 'resources_lib.Resources'] | None:
-    """Get used resources for all nonterminal jobs in a pool in one query."""
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        ranked_resources = _ranked_nonterminal_job_resources(pool=pool)
-        query = sqlalchemy.select(
-            ranked_resources.c.current_cluster_name,
-            ranked_resources.c.spot_job_id,
-            ranked_resources.c.full_resources,
-        ).where(ranked_resources.c.task_rank == 1)
-        rows = session.execute(query).fetchall()
-
-    totals: dict[str | None, resources_lib.Resources] = {}
-    clusters_with_empty_request: set[str | None] = set()
-    for cluster_name, _, resource_config in rows:
-        parsed = _parse_job_full_resources(resource_config)
-        if parsed is None:
-            return None
-        if parsed.is_empty():
-            clusters_with_empty_request.add(cluster_name)
-            continue
-        if cluster_name in clusters_with_empty_request:
-            continue
-        total = totals.get(cluster_name)
-        if total is None:
-            totals[cluster_name] = parsed
-        else:
-            combined = total + parsed
-            assert combined is not None
-            totals[cluster_name] = combined
-
-    for cluster_name in clusters_with_empty_request:
-        totals[cluster_name] = resources_lib.Resources()
-    return totals
-
-
 @db_retries.retry_async
 async def get_waiting_job_async(pid: int,
                                 pid_started_at: float) -> dict[str, Any] | None:
@@ -2891,17 +2116,8 @@ def get_workspace(job_id: int) -> str:
         return job_workspace
 
 
-@db_retries.retry_async
-async def get_file_mounts_blob_id_async(job_id: int) -> str | None:
-    """Return the file_mounts_blob_id persisted for a job, if any."""
-    engine = await _db_manager.get_async_engine()
-    async with sql_async.AsyncSession(engine) as session:
-        row = (await session.execute(
-            sqlalchemy.select(job_info_table.c.file_mounts_blob_id).where(
-                job_info_table.c.spot_job_id == job_id))).fetchone()
-        if row is None:
-            return None
-        return row[0]
+get_file_mounts_blob_id_async = (
+    state_file_mount_blobs.get_file_mounts_blob_id_async)
 
 
 @db_retries.retry_async
@@ -3470,39 +2686,7 @@ async def scheduler_set_done_async(job_id: int,
 # ==== needed for codegen ====
 # functions have no use outside of codegen, remove at your own peril
 
-
-def set_job_info(job_id: int,
-                 name: str,
-                 workspace: str,
-                 entrypoint: str,
-                 pool: str | None,
-                 pool_hash: str | None,
-                 user_hash: str | None = None,
-                 execution: str | None = None,
-                 is_batch: bool = False):
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        if engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value:
-            insert_func = sqlite.insert
-        elif (engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value
-             ):
-            insert_func = postgresql.insert
-        else:
-            raise ValueError('Unsupported database dialect')
-        insert_stmt = insert_func(job_info_table).values(
-            spot_job_id=job_id,
-            name=name,
-            schedule_state=ManagedJobScheduleState.INACTIVE.value,
-            workspace=workspace,
-            entrypoint=entrypoint,
-            pool=pool,
-            pool_hash=pool_hash,
-            user_hash=user_hash,
-            execution=execution,
-            is_batch=is_batch,
-        )
-        session.execute(insert_stmt)
-        session.commit()
+set_job_info = state_job_registration.set_job_info
 
 
 def reset_jobs_for_recovery() -> None:
@@ -3664,124 +2848,3 @@ def get_all_job_ids_by_name(name: str | None) -> list[int]:
         rows = session.execute(query).fetchall()
         job_ids = [row[0] for row in rows if row[0] is not None]
         return job_ids
-
-
-def get_task_logs_to_clean(
-    retention_seconds: int,
-    batch_size: int,
-    exclude_tasks: Collection[tuple[int, int]] | None = None
-) -> list[dict[str, Any]]:
-    """Get the logs of job tasks to clean.
-
-    The logs of a task will only cleaned when:
-    - the job schedule state is DONE
-    - AND the end time of the task is older than the retention period
-
-    Tasks in `exclude_tasks` ((job_id, task_id) pairs) are skipped so a
-    caller can page past rows whose cleanup already failed in this pass.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        now = time.time()
-        conditions = [
-            job_info_table.c.schedule_state ==
-            ManagedJobScheduleState.DONE.value,
-            spot_table.c.end_at.isnot(None),
-            spot_table.c.end_at < (now - retention_seconds),
-            spot_table.c.logs_cleaned_at.is_(None),
-            # The local log file is set AFTER the task is finished,
-            # add this condition to ensure the entire log file has
-            # been written.
-            spot_table.c.local_log_file.isnot(None),
-        ]
-        if exclude_tasks:
-            conditions.append(
-                sqlalchemy.tuple_(spot_table.c.spot_job_id,
-                                  spot_table.c.task_id).notin_(
-                                      list(exclude_tasks)))
-        result = session.execute(
-            sqlalchemy.select(
-                spot_table.c.spot_job_id,
-                spot_table.c.task_id,
-                spot_table.c.local_log_file,
-            ).select_from(
-                spot_table.join(
-                    job_info_table,
-                    spot_table.c.spot_job_id == job_info_table.c.spot_job_id,
-                )).where(sqlalchemy.and_(*conditions)).limit(batch_size))
-        rows = result.fetchall()
-        return [{
-            'job_id': row[0],
-            'task_id': row[1],
-            'local_log_file': row[2]
-        } for row in rows]
-
-
-def get_controller_logs_to_clean(
-        retention_seconds: int,
-        batch_size: int,
-        exclude_job_ids: Collection[int] | None = None) -> list[dict[str, Any]]:
-    """Get the controller logs to clean.
-
-    The controller logs will only cleaned when:
-    - the job schedule state is DONE
-    - AND the end time of the latest task is older than the retention period
-
-    Jobs in `exclude_job_ids` are skipped so a caller can page past rows
-    whose cleanup already failed in this pass.
-    """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        now = time.time()
-        conditions = [
-            job_info_table.c.schedule_state ==
-            ManagedJobScheduleState.DONE.value,
-            spot_table.c.local_log_file.isnot(None),
-            job_info_table.c.controller_logs_cleaned_at.is_(None),
-        ]
-        if exclude_job_ids:
-            conditions.append(
-                job_info_table.c.spot_job_id.notin_(list(exclude_job_ids)))
-        result = session.execute(
-            sqlalchemy.select(job_info_table.c.spot_job_id,).select_from(
-                job_info_table.join(
-                    spot_table,
-                    job_info_table.c.spot_job_id == spot_table.c.spot_job_id,
-                )).where(sqlalchemy.and_(*conditions)).group_by(
-                    job_info_table.c.spot_job_id,
-                    job_info_table.c.current_cluster_name,
-                ).having(sqlalchemy.func.max(
-                    spot_table.c.end_at).isnot(None),).having(
-                        sqlalchemy.func.max(spot_table.c.end_at) < (
-                            now - retention_seconds)).limit(batch_size))
-        rows = result.fetchall()
-        return [{'job_id': row[0]} for row in rows]
-
-
-def set_task_logs_cleaned(tasks: list[tuple[int, int]], logs_cleaned_at: float):
-    """Set the task logs cleaned at."""
-    if not tasks:
-        return
-    task_keys = list(dict.fromkeys(tasks))
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.execute(
-            sqlalchemy.update(spot_table).where(
-                sqlalchemy.tuple_(spot_table.c.spot_job_id,
-                                  spot_table.c.task_id).in_(task_keys)).values(
-                                      logs_cleaned_at=logs_cleaned_at))
-        session.commit()
-
-
-def set_controller_logs_cleaned(job_ids: list[int], logs_cleaned_at: float):
-    """Set the controller logs cleaned at."""
-    if not job_ids:
-        return
-    job_ids = list(dict.fromkeys(job_ids))
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.execute(
-            sqlalchemy.update(job_info_table).where(
-                job_info_table.c.spot_job_id.in_(job_ids)).values(
-                    controller_logs_cleaned_at=logs_cleaned_at))
-        session.commit()
