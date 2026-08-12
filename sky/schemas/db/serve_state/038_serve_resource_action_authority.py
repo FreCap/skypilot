@@ -45,6 +45,22 @@ _SERVE037_PLACEMENT_TABLES = (
     serve_state_schema.placement_normalization_rows_table,
 )
 
+# The common runtime metadata is the steady-state schema, while a sequential
+# upgrade reaches revision 038 before Serve042 installs its PostgreSQL-only
+# ordinary-launch columns.  Project those future-owned fields out
+# unconditionally: revision 038 must reject even a complete early lookalike,
+# leaving revision 042 as their sole DDL owner.
+_SERVE042_FUTURE_COLUMNS = {
+    _SERVICES: frozenset({
+        'controller_incarnation',
+        'controller_owner_epoch',
+        'ordinary_launch_binding_capable',
+        'ordinary_launch_binding_mode',
+        'ordinary_launch_binding_epoch',
+    }),
+    _REPLICAS: frozenset({'ordinary_launch_association_id'}),
+}
+
 _CHECK_ATTRIBUTE_PATTERN = re.compile(r' :(varattno|varattnosyn) (-?[0-9]+)')
 
 _ALTERED_RELATIONS = (
@@ -475,6 +491,21 @@ def _common_runtime_table(table_name: str) -> sa.Table:
     }[table_name]
 
 
+def _common_revision_038_table(table_name: str,
+                               metadata: sa.MetaData) -> sa.Table:
+    """Project steady-state metadata onto the exact revision-038 contract."""
+    # Clone the complete graph so foreign-key targets remain resolvable when
+    # the historical envelope compares constraint semantics.
+    for table in serve_state_schema.Base.metadata.sorted_tables:
+        table.to_metadata(metadata)
+    expected = metadata.tables[table_name]
+    for column_name in _SERVE042_FUTURE_COLUMNS.get(table_name, frozenset()):
+        column = expected.c.get(column_name)
+        if column is not None:
+            expected._columns.remove(column)
+    return expected
+
+
 def _common_expected_checks(
         bind: sa.engine.Connection, table_name: str, *,
         post_038: bool) -> dict[str, tuple[str, bool, bool]]:
@@ -507,7 +538,7 @@ def _common_expected_index_table(bind: sa.engine.Connection,
                                  table_name: str) -> sa.Table:
     serve033 = _serve033_module()
     metadata = sa.MetaData()
-    expected = _common_runtime_table(table_name).to_metadata(metadata)
+    expected = _common_revision_038_table(table_name, metadata)
     actual_columns = set(_column_map(bind, table_name))
     for column in tuple(expected.c):
         if column.name not in actual_columns:
@@ -526,9 +557,9 @@ def _assert_common_relation_envelope(bind: sa.engine.Connection,
                                      post_038: bool) -> None:
     """Reject common-table columns, keys, checks, indexes, and behavior drift."""
     serve034 = _serve034_module()
-    runtime = _common_runtime_table(table_name)
+    expected = _common_revision_038_table(table_name, sa.MetaData())
     actual_columns = set(_column_map(bind, table_name))
-    expected_columns = set(runtime.c.keys())
+    expected_columns = set(expected.c.keys())
     candidate_columns = {
         column.name for column in _COLUMN_FACTORIES[table_name]()
     }
@@ -547,14 +578,14 @@ def _assert_common_relation_envelope(bind: sa.engine.Connection,
                            f'behavior for {table_name!r}.')
     primary = sa.inspect(bind).get_pk_constraint(table_name)
     expected_primary_columns = tuple(
-        column.name for column in runtime.primary_key.columns)
+        column.name for column in expected.primary_key.columns)
     expected_primary_name = f'{table_name}_pkey'
     if (primary.get('name') != expected_primary_name or
             tuple(primary.get('constrained_columns') or
                   ()) != expected_primary_columns):
         raise RuntimeError('SkyServe schema 038 found an incompatible primary '
                            f'key for {table_name!r}.')
-    expected_flags = serve034._expected_noncheck_constraint_flags(runtime)
+    expected_flags = serve034._expected_noncheck_constraint_flags(expected)
     # SQLAlchemy leaves conventionally named primary keys unnamed in the
     # runtime metadata, while PostgreSQL materializes them as
     # ``<table>_pkey``.  The explicit primary-key shape check above pins the
@@ -579,7 +610,7 @@ def _assert_common_relation_envelope(bind: sa.engine.Connection,
             (constraint.get('options') or {}).get('match'),
         ) for constraint in sa.inspect(bind).get_foreign_keys(table_name)
     }
-    if actual_foreign_keys != serve034._expected_foreign_keys(runtime):
+    if actual_foreign_keys != serve034._expected_foreign_keys(expected):
         raise RuntimeError('SkyServe schema 038 found incompatible foreign '
                            f'keys for {table_name!r}.')
     actual_checks = _canonical_check_node_trees(bind, table_name)

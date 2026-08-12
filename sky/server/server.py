@@ -178,7 +178,12 @@ def _bind_and_enqueue_ordinary_launch(
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'The atomic ordinary launch request binding integration is not '
             'installed on this API server.')
-    return bind(request_task, identity)
+    admission = bind(request_task, identity)
+    if not isinstance(admission, ordinary_launch_binding.BindingAdmission):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'The atomic ordinary launch request binding integration returned '
+            'an invalid admission result.')
+    return admission
 
 
 # Portable deployment provenance for the code instance serving this process.

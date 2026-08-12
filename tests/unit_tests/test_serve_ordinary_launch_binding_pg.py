@@ -579,6 +579,74 @@ def test_schema_042_catalog_is_complete_and_self_contained(
     } <= triggers
 
 
+def test_serve042_is_the_only_owner_of_binding_columns(empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '041')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '041'
+
+    inspector = sqlalchemy.inspect(empty_postgres)
+    service_columns = {
+        column['name'] for column in inspector.get_columns('services')
+    }
+    replica_columns = {
+        column['name'] for column in inspector.get_columns('replicas')
+    }
+    binding_service_columns = {
+        'controller_incarnation', 'controller_owner_epoch',
+        'ordinary_launch_binding_capable', 'ordinary_launch_binding_mode',
+        'ordinary_launch_binding_epoch'
+    }
+    assert binding_service_columns.isdisjoint(service_columns)
+    assert 'ordinary_launch_association_id' not in replica_columns
+
+    alembic_command.upgrade(config, '042')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '042'
+    inspector = sqlalchemy.inspect(empty_postgres)
+    assert binding_service_columns <= {
+        column['name'] for column in inspector.get_columns('services')
+    }
+    assert 'ordinary_launch_association_id' in {
+        column['name'] for column in inspector.get_columns('replicas')
+    }
+
+
+@pytest.mark.parametrize('early_column_ddl', [
+    ('ALTER TABLE services ADD COLUMN controller_incarnation '
+     'UUID NOT NULL DEFAULT gen_random_uuid()',),
+    (
+        'ALTER TABLE services ADD COLUMN controller_incarnation '
+        'UUID NOT NULL DEFAULT gen_random_uuid()',
+        'ALTER TABLE services ADD COLUMN controller_owner_epoch '
+        'BIGINT NOT NULL DEFAULT 1',
+        'ALTER TABLE services ADD COLUMN ordinary_launch_binding_capable '
+        'BOOLEAN NOT NULL DEFAULT false',
+        'ALTER TABLE services ADD COLUMN ordinary_launch_binding_mode '
+        "TEXT NOT NULL DEFAULT 'legacy'",
+        'ALTER TABLE services ADD COLUMN ordinary_launch_binding_epoch '
+        'BIGINT NOT NULL DEFAULT 0',
+        'ALTER TABLE replicas ADD COLUMN ordinary_launch_association_id UUID',
+    ),
+])
+def test_serve038_rejects_partial_and_malformed_complete_serve042_catalog(
+        empty_postgres, early_column_ddl) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '037')
+    with empty_postgres.begin() as connection:
+        for statement in early_column_ddl:
+            connection.exec_driver_sql(statement)
+
+    with pytest.raises(RuntimeError, match='incompatible column inventory'):
+        alembic_command.upgrade(config, '038')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '037'
+    assert not sqlalchemy.inspect(empty_postgres).has_table(
+        'serve_resource_actions')
+
+
 def test_serve042_downgrade_is_forward_only(binding_database) -> None:
     config = migration_utils.get_alembic_config(binding_database,
                                                 migration_utils.SERVE_DB_NAME)
@@ -714,7 +782,7 @@ def test_quarantine_aware_election_fences_stale_admission_and_provider_effect(
                 service_name='svc',
                 version=3,
                 yaml_content='service:\n  min_replicas: 1\n',
-                quarantined_at=sqlalchemy.func.clock_timestamp(),
+                quarantined_at=time.time(),
                 quarantine_reason='invalid controller config'))
 
     identity, admission = _admit(binding_database)

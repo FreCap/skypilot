@@ -135,9 +135,9 @@ class OrdinaryLaunchReductionDisposition(str, enum.Enum):
 class BoundOrdinaryLaunchProjectionInput:
     """Typed terminal result supplied to an atomic ReplicaInfo projector."""
 
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext'
+    context: ordinary_launch_binding_lib.BoundLaunchContext
     request: BoundOrdinaryLaunchRequestFacts
-    locked_replica_info: 'replica_managers.ReplicaInfo'
+    locked_replica_info: replica_managers.ReplicaInfo
     status: requests_lib.RequestStatus
     cause: event_api_models.EventCause
     service_job_id: int | None
@@ -164,7 +164,7 @@ class BoundOrdinaryLaunchReplicaProjector(typing.Protocol):
 class OrdinaryLaunchReduction:
     """Controller-visible outcome of one exact association inspection."""
 
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext'
+    context: ordinary_launch_binding_lib.BoundLaunchContext
     disposition: OrdinaryLaunchReductionDisposition
     request: BoundOrdinaryLaunchRequestFacts
     service_job_id: int | None
@@ -176,7 +176,7 @@ class OrdinaryLaunchReduction:
 class BoundOrdinaryLaunchCancelTarget:
     """Non-authorizing pointer snapshot used only to address exact cancel."""
 
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext'
+    context: ordinary_launch_binding_lib.BoundLaunchContext
     cancel_reason: str | None
 
 
@@ -1480,8 +1480,8 @@ def insert_bound_request_and_queue_in_transaction(
 def _validate_existing_bound_request_in_transaction(
     connection: sqlalchemy.engine.Connection,
     request: requests_lib.Request,
-    identity: 'ordinary_launch_binding_lib.BindingIdentity',
-    admission: 'ordinary_launch_binding_lib.BindingAdmission',
+    identity: ordinary_launch_binding_lib.BindingIdentity,
+    admission: ordinary_launch_binding_lib.BindingAdmission,
 ) -> None:
     """Lock and verify the API half of one exact admission retry."""
     request_row = connection.execute(
@@ -1572,8 +1572,8 @@ def _validate_existing_bound_request_in_transaction(
 
 def bind_and_enqueue_ordinary_launch(
     request: requests_lib.Request,
-    identity: 'ordinary_launch_binding_lib.BindingIdentity',
-) -> 'ordinary_launch_binding_lib.BindingAdmission':
+    identity: ordinary_launch_binding_lib.BindingIdentity,
+) -> ordinary_launch_binding_lib.BindingAdmission:
     """Atomically create or verify both halves of a bound Serve launch."""
     if request.request_id != identity.request_id:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -1625,7 +1625,7 @@ def bind_and_enqueue_ordinary_launch(
 
 def _bound_context_from_association(
     association: Mapping[str, Any],
-) -> 'ordinary_launch_binding_lib.BoundLaunchContext':
+) -> ordinary_launch_binding_lib.BoundLaunchContext:
     """Build the immutable controller view without trusting process state."""
     return ordinary_launch_binding.BoundLaunchContext(
         association_id=uuid.UUID(str(association['association_id'])),
@@ -1640,7 +1640,7 @@ def _bound_context_from_association(
 
 def _lock_bound_request_evidence(
     connection: sqlalchemy.engine.Connection,
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
 ) -> tuple[BoundOrdinaryLaunchRequestFacts, Mapping[str, Any] | None,
            Mapping[str, Any] | None, Mapping[str, Any] | None]:
     """Lock the request/queue/pin suffix after Serve authority is locked."""
@@ -1960,7 +1960,7 @@ def lookup_bound_ordinary_launch_cancel_target(
 
 def _terminal_evidence(
     facts: BoundOrdinaryLaunchRequestFacts,
-) -> 'ordinary_launch_binding_lib.TerminalEvidence':
+) -> ordinary_launch_binding_lib.TerminalEvidence:
     if (facts.status not in requests_lib.RequestStatus.finished_status() or
             facts.terminal_cause is None or
             facts.execution_generation is None or not facts.quiescent):
@@ -2018,7 +2018,7 @@ def _reduction_result(
 
 def _controller_authority_matches_reduction(
     association: Mapping[str, Any],
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
 ) -> bool:
     return bool(
         isinstance(authority,
@@ -2068,7 +2068,7 @@ def _paid_capacity_claim_is_exact(
 
 def _mark_reduction_ambiguous(
     connection: sqlalchemy.engine.Connection,
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
     association: Mapping[str, Any],
     facts: BoundOrdinaryLaunchRequestFacts,
     code: str,
@@ -2083,7 +2083,7 @@ def _mark_reduction_ambiguous(
 
 def _startup_request_facts(
     facts: BoundOrdinaryLaunchRequestFacts,
-) -> 'ordinary_launch_binding_lib.RequestStartupFacts':
+) -> ordinary_launch_binding_lib.RequestStartupFacts:
     return ordinary_launch_binding.RequestStartupFacts(
         exists=facts.exists,
         status=(None if facts.status is None else facts.status.value),
@@ -2095,7 +2095,7 @@ def _startup_request_facts(
 
 def _settle_projected_paid_capacity_claim_in_transaction(
     connection: sqlalchemy.engine.Connection,
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
     association: Mapping[str, Any],
     *,
     pre_effect: bool,
@@ -2110,8 +2110,8 @@ def _settle_projected_paid_capacity_claim_in_transaction(
 
 def reduce_bound_ordinary_launch_in_transaction(
     connection: sqlalchemy.engine.Connection,
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
     *,
     project_replica_result: BoundOrdinaryLaunchReplicaProjector,
 ) -> OrdinaryLaunchReduction:
@@ -2373,8 +2373,8 @@ def reduce_bound_ordinary_launch_in_transaction(
 
 
 def reduce_bound_ordinary_launch(
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
     *,
     project_replica_result: BoundOrdinaryLaunchReplicaProjector,
 ) -> OrdinaryLaunchReduction:
@@ -2397,8 +2397,8 @@ def reduce_bound_ordinary_launch(
 
 
 def _commit_bound_ordinary_launch_cancel_intent(
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
     reason: str,
 ) -> None:
     """Commit Serve-owned cancel intent before touching the API request."""
@@ -2428,7 +2428,7 @@ def _commit_bound_ordinary_launch_cancel_intent(
 
 def _cancel_bound_ordinary_launch_request_in_transaction(
     connection: sqlalchemy.engine.Connection,
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
 ) -> BoundOrdinaryLaunchRequestFacts:
     """Publish exact request cancellation after Serve intent is durable."""
     facts, request_row, queue_row, _ = _lock_bound_request_evidence(
@@ -2469,8 +2469,8 @@ def _cancel_bound_ordinary_launch_request_in_transaction(
 
 
 def cancel_bound_ordinary_launch_request(
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
     reason: str,
     *,
     project_replica_result: BoundOrdinaryLaunchReplicaProjector,
@@ -2482,8 +2482,8 @@ def cancel_bound_ordinary_launch_request(
 
 
 def request_bound_ordinary_launch_cancel(
-    context: 'ordinary_launch_binding_lib.BoundLaunchContext',
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
     reason: str,
 ) -> BoundOrdinaryLaunchRequestFacts:
     """Durably deliver exact cancellation before provider quiescence."""
@@ -2592,8 +2592,8 @@ def _bound_ordinary_launch_requests_clear_in_transaction(
 
 def _transition_authority_is_current(
     connection: sqlalchemy.engine.Connection,
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
-    expected_mode: 'ordinary_launch_binding_lib.BindingMode',
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    expected_mode: ordinary_launch_binding_lib.BindingMode,
 ) -> bool:
     row = connection.execute(
         sqlalchemy.select(
@@ -2630,8 +2630,7 @@ def _ordinary_launch_binding_participants_quiesced_in_transaction(
 
 
 def promote_ordinary_launch_binding_service(
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
-) -> int:
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
     """Explicitly promote one service under fleet and legacy-drain barriers."""
     if not isinstance(authority,
                       ordinary_launch_binding.ControllerBindingAuthority):
@@ -2658,8 +2657,7 @@ def promote_ordinary_launch_binding_service(
 
 
 def demote_ordinary_launch_binding_service(
-    authority: 'ordinary_launch_binding_lib.ControllerBindingAuthority',
-) -> int:
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
     """Explicitly demote after every bound generation is fully settled."""
     if not isinstance(authority,
                       ordinary_launch_binding.ControllerBindingAuthority):

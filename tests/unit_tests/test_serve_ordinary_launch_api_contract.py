@@ -174,6 +174,16 @@ def test_missing_transactional_integration_fails_closed(
         server._bind_and_enqueue_ordinary_launch(mock.Mock(), mock.Mock())
 
 
+def test_invalid_transactional_integration_result_fails_closed(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        server, '_ordinary_launch_request_postgres',
+        types.SimpleNamespace(bind_and_enqueue_ordinary_launch=lambda *_: None))
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
+                       match='invalid admission result'):
+        server._bind_and_enqueue_ordinary_launch(mock.Mock(), mock.Mock())
+
+
 @pytest.mark.parametrize('server_owned_key', [
     ordinary_launch_binding.SUBMISSION_ID_KEY,
     ordinary_launch_binding.ASSOCIATION_ID_KEY,
