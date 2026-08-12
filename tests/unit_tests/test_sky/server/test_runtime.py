@@ -45,6 +45,36 @@ def _args() -> SimpleNamespace:
                            role_health_port=46581)
 
 
+def test_controller_owns_one_distributed_handoff_retention_task(monkeypatch):
+    created_tasks = []
+
+    class FakeBackgroundLoop:
+
+        def __init__(self) -> None:
+            self.started = False
+
+        def create_task(self, task):
+            created_tasks.append(task)
+
+        def start(self) -> None:
+            self.started = True
+
+    singleton_task = mock.Mock(
+        side_effect=lambda name, task_factory: (name, task_factory))
+    monkeypatch.setattr(runtime, '_BackgroundLoop', FakeBackgroundLoop)
+    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: True)
+    monkeypatch.setattr(runtime, '_singleton_task', singleton_task)
+
+    # pylint: disable-next=protected-access
+    background = runtime._start_background_loop('controller')
+
+    retention_task = ('serve-ordinary-launch-handoff-retention',
+                      runtime.ordinary_launch_handoff.retention_daemon)
+    assert created_tasks.count(retention_task) == 1
+    singleton_task.assert_any_call(*retention_task)
+    assert background.started
+
+
 @pytest.mark.parametrize(('phase', 'backend_kind', 'raises'), [
     ('blocked', 'sqlite', False),
     ('blocked', 'postgres', True),

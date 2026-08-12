@@ -36,6 +36,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
+from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
 from sky.serve import provider_phase
 from sky.serve import replica_info as replica_info_lib
@@ -580,6 +581,11 @@ def launch_cluster(
     None = None,
     persist_system_recovery_job_id: Callable[[str, int], bool] | None = None,
     demote_system_recovery_candidate: Callable[[], bool] | None = None,
+    ordinary_launch_handoff_context: dict[str, Any] | None = None,
+    ordinary_launch_event: Callable[[
+        ordinary_launch_handoff.EventKind, str | None, int |
+        None, ordinary_launch_handoff.TerminalStatus | None
+    ], None] | None = None,
 ) -> None:
     """Launch a sky serve replica cluster.
 
@@ -637,6 +643,53 @@ def launch_cluster(
             kubernetes_context=protocol_v2_fence.kubernetes_context,
             physical_cluster_uid=protocol_v2_fence.physical_cluster_uid))
 
+    def _emit_ordinary_launch_event(
+        event_kind: ordinary_launch_handoff.EventKind,
+        request_id: str | None = None,
+        service_job_id: int | None = None,
+        terminal_status: ordinary_launch_handoff.TerminalStatus | None = None
+    ) -> None:
+        if ordinary_launch_event is None:
+            return
+        try:
+            ordinary_launch_event(event_kind, request_id, service_job_id,
+                                  terminal_status)
+        except Exception as error:  # pylint: disable=broad-except
+            # Telemetry is never part of launch correctness or availability.
+            logger.debug('Ordinary-launch telemetry callback failed: %s', error)
+
+    def _lookup_terminal_status(request_id: str) -> str | None:
+        requests = sdk.api_status(
+            request_ids=[request_id],
+            fields=['request_id', 'status'],
+            _exact_request_ids=True,
+            _use_body=True,
+            _request_timeout_seconds=(
+                ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
+            _retry_on_server_unavailable=False)
+        exact_matches = [
+            request for request in requests if request.request_id == request_id
+        ]
+        if len(exact_matches) != 1:
+            return None
+        status = exact_matches[0].status
+        return status if isinstance(status, str) else None
+
+    def _observe_terminal_nonblocking(request_id: str) -> None:
+        if ordinary_launch_event is None:
+            return
+
+        def _emit_terminal(
+                terminal_status: ordinary_launch_handoff.TerminalStatus
+        ) -> None:
+            _emit_ordinary_launch_event(
+                ordinary_launch_handoff.EventKind.API_TERMINAL,
+                request_id,
+                terminal_status=terminal_status)
+
+        ordinary_launch_handoff.observe_terminal_nonblocking(
+            request_id, lookup=_lookup_terminal_status, emit=_emit_terminal)
+
     def _check_is_cancelled() -> bool:
         is_cancelled = replica_to_launch_cancelled.get(replica_id, False)
         if is_cancelled:
@@ -649,6 +702,20 @@ def launch_cluster(
     launch_superseded = threading.Event()
     supersession_reason = ['unknown']
     supersession_cancel_failures = 0
+    ownership_loss_cancel_event_lock = threading.Lock()
+    ownership_loss_cancel_event_request_ids: set[str] = set()
+
+    def _emit_owner_loss_cancel_request_once(request_id: str) -> None:
+        """Record local cancellation intent once; it is not terminal proof."""
+        if recovery_request_attempted:
+            return
+        with ownership_loss_cancel_event_lock:
+            if request_id in ownership_loss_cancel_event_request_ids:
+                return
+            ownership_loss_cancel_event_request_ids.add(request_id)
+        _emit_ordinary_launch_event(
+            ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+            request_id)
 
     def _guard_allows(guard: Callable[[], bool] | None) -> bool:
         if guard is None:
@@ -709,6 +776,7 @@ def launch_cluster(
         request_id = replica_to_request_id.get(replica_id)
         if request_id is None:
             return
+        _emit_owner_loss_cancel_request_once(request_id)
         try:
             sdk.api_cancel(request_id)
         except Exception as e:  # pylint: disable=broad-except
@@ -886,6 +954,17 @@ def launch_cluster(
             launch_kwargs: dict[str, Any] = {}
             launch_context = (system_recovery_launch_context
                               if recovery_context_available else launch_fence)
+            if (ordinary_launch_handoff_context is not None and
+                    not recovery_context_available):
+                # Reuse the existing internal launch context transport.  This
+                # metadata is diagnostic only and remains separate from every
+                # provider-authority fence inside one nested versioned value.
+                # The initial recovery context is an exact-key contract; add
+                # this value only after durable demotion makes a retry ordinary.
+                launch_context = dict(launch_context or {})
+                launch_context[
+                    serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY] = (
+                        dict(ordinary_launch_handoff_context))
             if launch_context is not None:
                 launch_kwargs['_extra_launch_context'] = launch_context
             workspace_ctx: contextlib.AbstractContextManager = (
@@ -926,7 +1005,27 @@ def launch_cluster(
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
-            launch_result = _stream_with_launch_watchdogs(request_id)
+            if not recovery_request_attempted:
+                _emit_ordinary_launch_event(
+                    ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                    request_id)
+            try:
+                launch_result = _stream_with_launch_watchdogs(request_id)
+            except Exception:  # pylint: disable=broad-except
+                if not recovery_request_attempted:
+                    _observe_terminal_nonblocking(request_id)
+                raise
+            if not recovery_request_attempted:
+                _observe_terminal_nonblocking(request_id)
+            service_job_id = (launch_result[0] if isinstance(
+                launch_result, tuple) and len(launch_result) == 2 and
+                              isinstance(launch_result[0], int) and
+                              not isinstance(launch_result[0], bool) and
+                              launch_result[0] > 0 else None)
+            if service_job_id is not None and not recovery_request_attempted:
+                _emit_ordinary_launch_event(
+                    ordinary_launch_handoff.EventKind.SERVICE_JOB_OBSERVED,
+                    request_id, service_job_id)
             _assert_launch_not_superseded()
             _assert_launch_authorized()
             if recovery_request_attempted:
@@ -2408,6 +2507,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._manager_daemon_stop = threading.Event()
         self._scale_reconciliation_event = threading.Event()
         self._system_recovery_route_epoch = str(uuid.uuid4())
+        self._ordinary_launch_handoff_route_epoch = str(uuid.uuid4())
         self._system_recovery_route_registry = (
             system_recovery_route_lease.ManagerRouteLeaseRegistry())
         # Durable wall-clock anchors are restored separately. These monotonic
@@ -3155,6 +3255,43 @@ class SkyPilotReplicaManager(ReplicaManager):
         # delayed callback still carries the same numeric replica ID.
         self._route_lease_registry().observe_record_identity(
             replica_id, info.replica_record_id)
+
+    def _emit_ordinary_launch_handoff_event(
+        self,
+        info: ReplicaInfo,
+        event_kind: ordinary_launch_handoff.EventKind,
+        ordinary_request_id: str | None = None,
+        service_job_id: int | None = None,
+        terminal_status: ordinary_launch_handoff.TerminalStatus | None = None,
+        *,
+        input_digest: str | None = None,
+        allow_demoted_candidate: bool = False,
+    ) -> None:
+        """Emit diagnostic evidence without changing replica behavior."""
+        if self._is_pool or info.reserved_fill:
+            return
+        disposition = info.system_recovery_disposition
+        # The launch thread captures the candidate object before durable
+        # demotion.  Its callback may use that stale value only on attempts
+        # that launch_cluster has already classified as ordinary; the bound
+        # recovery attempt is gated before every callback invocation.
+        if (disposition
+                != system_recovery_state.SystemRecoveryDisposition.ORDINARY and
+                not (allow_demoted_candidate and
+                     disposition == system_recovery_state.
+                     SystemRecoveryDisposition.CANDIDATE)):
+            return
+        ordinary_launch_handoff.emit_event(
+            event_kind=event_kind,
+            service_name=self._service_name,
+            service_version=info.version,
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id,
+            controller_route_epoch=self._ordinary_launch_handoff_route_epoch,
+            ordinary_request_id=ordinary_request_id,
+            service_job_id=service_job_id,
+            terminal_status=terminal_status,
+            input_digest=input_digest)
 
     def _persist_replicas(
         self,
@@ -4100,6 +4237,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if isinstance(prior_paid_pool_key, str):
                     launch_kwargs['prior_paid_capacity_pool_key'] = (
                         prior_paid_pool_key)
+                input_digest = ordinary_launch_handoff.redacted_input_digest(
+                    prior_yaml_content, replica_info.resources_override)
+                if input_digest is not None:
+                    self._emit_ordinary_launch_handoff_event(
+                        replica_info,
+                        ordinary_launch_handoff.EventKind.
+                        CONTROLLER_START_NONTERMINAL,
+                        input_digest=input_digest)
+                    self._emit_ordinary_launch_handoff_event(
+                        replica_info,
+                        ordinary_launch_handoff.EventKind.RESTART_REDRIVE,
+                        input_digest=input_digest)
                 self._launch_replica(replica_info.replica_id, **launch_kwargs)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive launch of replica '
@@ -5232,6 +5381,47 @@ class SkyPilotReplicaManager(ReplicaManager):
             frozen_controller_config = skypilot_config.to_dict()
             frozen_controller_config_path = os.environ.get(
                 skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
+            launch_thread_kwargs: dict[str, Any] = {
+                'availability_max_retry': availability_max_retry,
+                'exact_resources_override': location is not None,
+                'pre_launch_guard': self._service_is_launch_authorized,
+                'cloud_launch_guard': cloud_launch_guard,
+                'supersession_guard': functools.partial(
+                    self._queued_launch_generation_decision,
+                    expected_manager_version),
+                'continue_guard': self._launch_owner_watchdog_allows_continue,
+                'cleanup_continue_guard': self._service_is_cleanup_authorized,
+                'launch_fence': launch_fence,
+                'service_spec': launch_spec,
+                'service_name': self._service_name,
+                'workspace': self._workspace,
+                'frozen_controller_config': frozen_controller_config,
+                'frozen_controller_config_path': frozen_controller_config_path,
+                **recovery_launch_kwargs,
+            }
+            if not self._is_pool and not zero_cost_only:
+                input_digest = (ordinary_launch_handoff.redacted_input_digest(
+                    launch_yaml_content, resources_override))
+                if input_digest is not None:
+                    launch_thread_kwargs['ordinary_launch_handoff_context'] = {
+                        'context_version':
+                            (serve_constants.
+                             ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION),
+                        'service_name': self._service_name,
+                        'service_version': launch_version,
+                        'replica_id': replica_id,
+                        'replica_record_id': info.replica_record_id,
+                        'controller_route_epoch':
+                            (self._ordinary_launch_handoff_route_epoch),
+                        'input_digest': input_digest,
+                    }
+                    launch_thread_kwargs['ordinary_launch_event'] = (
+                        functools.partial(
+                            self._emit_ordinary_launch_handoff_event,
+                            info,
+                            input_digest=input_digest,
+                            allow_demoted_candidate=bool(
+                                recovery_launch_kwargs)))
             return _ReplicaLaunchThread(
                 target=launch_cluster_with_frozen_controller_config,
                 replica_id=replica_id,
@@ -5241,27 +5431,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                       log_file_name, legacy_runtime.replica_to_request_id,
                       legacy_runtime.replica_to_launch_cancelled,
                       resources_override, retry_until_up),
-                kwargs={
-                    'availability_max_retry': availability_max_retry,
-                    'exact_resources_override': location is not None,
-                    'pre_launch_guard': self._service_is_launch_authorized,
-                    'cloud_launch_guard': cloud_launch_guard,
-                    'supersession_guard': functools.partial(
-                        self._queued_launch_generation_decision,
-                        expected_manager_version),
-                    'continue_guard':
-                        self._launch_owner_watchdog_allows_continue,
-                    'cleanup_continue_guard':
-                        self._service_is_cleanup_authorized,
-                    'launch_fence': launch_fence,
-                    'service_spec': launch_spec,
-                    'service_name': self._service_name,
-                    'workspace': self._workspace,
-                    'frozen_controller_config': frozen_controller_config,
-                    'frozen_controller_config_path':
-                        (frozen_controller_config_path),
-                    **recovery_launch_kwargs,
-                },
+                kwargs=launch_thread_kwargs,
             )
 
         if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
@@ -9370,6 +9540,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # controller then performs one ordinary target-fenced
                 # autoscaler tick.
                 self._scale_reconciliation_event.set()
+            for replica_id, info, _ in completed_launches:
+                self._emit_ordinary_launch_handoff_event(
+                    info,
+                    ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+                    legacy_runtime.replica_to_request_id.get(replica_id))
 
         # Retire v2 failures before any ordinary log/drain provider work. The
         # worker remains registered until its row outcome has been persisted;

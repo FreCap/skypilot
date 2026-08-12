@@ -24,6 +24,7 @@ from sky import global_user_state
 from sky import sky_logging
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
+from sky.serve import ordinary_launch_handoff
 from sky.serve import serve_state
 from sky.server import clean_env as clean_env_module
 from sky.server import config as server_config
@@ -452,6 +453,9 @@ def _start_background_loop(role: str) -> _BackgroundLoop:
             background.create_task(
                 _singleton_task('operational-event-retention',
                                 operational_event_store.retention_daemon))
+            background.create_task(
+                _singleton_task('serve-ordinary-launch-handoff-retention',
+                                ordinary_launch_handoff.retention_daemon))
         background.create_task(
             _singleton_task('job-event-retention',
                             managed_job_state.job_event_retention_daemon))

@@ -34,6 +34,7 @@ from sky import clouds
 from sky import exceptions
 from sky import skypilot_config
 from sky.provision import common as provision_common
+from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
 from sky.serve import placement_policy
 from sky.serve import replica_managers
@@ -2844,6 +2845,7 @@ class TestLaunchClusterRetry:
         launch_side_effect = kwargs.pop('launch_side_effect', None)
         terminate_side_effect = kwargs.pop('terminate_side_effect', None)
         cancel_side_effect = kwargs.pop('cancel_side_effect', None)
+        api_status_results = kwargs.pop('api_status_results', [])
         raised = None
         task = mock.MagicMock()
         resource = mock.MagicMock()
@@ -2856,14 +2858,30 @@ class TestLaunchClusterRetry:
              mock.patch('sky.serve.replica_managers.sdk') as mock_sdk, \
              mock.patch('sky.serve.replica_managers.terminate_cluster'
                        ) as mock_terminate, \
+             mock.patch.object(
+                 ordinary_launch_handoff,
+                 'observe_terminal_nonblocking') as mock_observe_terminal, \
              mock.patch('sky.serve.replica_managers.common_utils.Backoff'
                        ) as mock_backoff:
+
+            def _observe_terminal(request_id, *, lookup, emit):
+                status = lookup(request_id)
+                try:
+                    terminal_status = ordinary_launch_handoff.TerminalStatus(
+                        status)
+                except (TypeError, ValueError):
+                    return True
+                emit(terminal_status)
+                return True
+
+            mock_observe_terminal.side_effect = _observe_terminal
             mock_backoff.return_value.current_backoff.return_value = (
                 backoff_seconds)
             if terminate_side_effect is not None:
                 mock_terminate.side_effect = terminate_side_effect
             if cancel_side_effect is not None:
                 mock_sdk.api_cancel.side_effect = cancel_side_effect
+            mock_sdk.api_status.return_value = api_status_results
             if launch_side_effect is not None:
                 mock_sdk.launch.side_effect = launch_side_effect
             elif observed_workspaces is None:
@@ -2917,6 +2935,123 @@ class TestLaunchClusterRetry:
         assert mock_sdk.launch.call_count == 2
         assert sleeps == pytest.approx([0.1, 0.05])
         assert now == pytest.approx(0.15)
+
+    def test_ordinary_launch_events_follow_exact_request_result(self, tmp_path):
+        events = []
+        result_handle = object()
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [(17, result_handle)],
+            api_status_results=[
+                types.SimpleNamespace(request_id='request-id',
+                                      status='SUCCEEDED')
+            ],
+            ordinary_launch_event=lambda kind, request_id, job_id, status:
+            events.append((kind, request_id, job_id, status)))
+
+        assert raised is None
+        mock_sdk.api_status.assert_called_once_with(
+            request_ids=['request-id'],
+            fields=['request_id', 'status'],
+            _exact_request_ids=True,
+            _use_body=True,
+            _request_timeout_seconds=(
+                ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
+            _retry_on_server_unavailable=False)
+        assert events == [
+            (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, 'request-id',
+             None, None),
+            (ordinary_launch_handoff.EventKind.API_TERMINAL, 'request-id', None,
+             ordinary_launch_handoff.TerminalStatus.SUCCEEDED),
+            (ordinary_launch_handoff.EventKind.SERVICE_JOB_OBSERVED,
+             'request-id', 17, None),
+        ]
+
+    def test_ordinary_handoff_context_is_carried_with_launch_fence(
+            self, tmp_path):
+        fence = {
+            'sky_serve_service_name': 'svc',
+            'sky_serve_service_hash': 'incarnation-a',
+        }
+        handoff = {
+            'context_version': 1,
+            'service_name': 'svc',
+            'service_version': 2,
+            'replica_id': 7,
+            'replica_record_id': '11111111-1111-4111-8111-111111111111',
+            'controller_route_epoch': ('22222222-2222-4222-8222-222222222222'),
+            'input_digest': 'a' * 64,
+        }
+
+        mock_sdk, _, raised = self._run_launch_cluster(
+            tmp_path, [None],
+            launch_fence=fence,
+            ordinary_launch_handoff_context=handoff)
+
+        assert raised is None
+        launch_context = mock_sdk.launch.call_args.kwargs[
+            '_extra_launch_context']
+        assert launch_context['sky_serve_service_hash'] == 'incarnation-a'
+        assert launch_context[replica_managers.serve_constants.
+                              ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY] == handoff
+        # Context assembly must not mutate the durable fence or caller-owned
+        # diagnostic dictionary.
+        assert (
+            replica_managers.serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY
+            not in fence)
+        assert handoff == {
+            'context_version': 1,
+            'service_name': 'svc',
+            'service_version': 2,
+            'replica_id': 7,
+            'replica_record_id': '11111111-1111-4111-8111-111111111111',
+            'controller_route_epoch': ('22222222-2222-4222-8222-222222222222'),
+            'input_digest': 'a' * 64,
+        }
+
+    @pytest.mark.parametrize('status', ['SUCCEEDED', 'FAILED', 'CANCELLED'])
+    def test_stream_error_records_only_observed_terminal_status(
+            self, tmp_path, status):
+        events = []
+
+        _, _, raised = self._run_launch_cluster(
+            tmp_path, [RuntimeError('transport lost')],
+            max_retry=1,
+            api_status_results=[
+                types.SimpleNamespace(request_id='request-id', status=status)
+            ],
+            ordinary_launch_event=lambda kind, request_id, job_id,
+            terminal_status: events.append(
+                (kind, request_id, job_id, terminal_status)))
+
+        assert isinstance(raised, RuntimeError)
+        assert events == [
+            (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, 'request-id',
+             None, None),
+            (ordinary_launch_handoff.EventKind.API_TERMINAL, 'request-id', None,
+             ordinary_launch_handoff.TerminalStatus(status)),
+        ]
+
+    @pytest.mark.parametrize('api_status_results', [
+        [types.SimpleNamespace(request_id='request-id', status='RUNNING')],
+        [types.SimpleNamespace(request_id='different', status='FAILED')],
+        [],
+    ])
+    def test_transport_error_does_not_misclassify_nonterminal_or_inexact_status(
+            self, tmp_path, api_status_results):
+        events = []
+
+        _, _, raised = self._run_launch_cluster(
+            tmp_path, [RuntimeError('transport lost')],
+            max_retry=1,
+            api_status_results=api_status_results,
+            ordinary_launch_event=lambda kind, request_id, job_id,
+            terminal_status: events.append(
+                (kind, request_id, job_id, terminal_status)))
+
+        assert isinstance(raised, RuntimeError)
+        assert events == [(ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                           'request-id', None, None)]
 
     def test_retry_backoff_stops_on_cancellation(self, tmp_path):
         now = 0.0
@@ -3298,6 +3433,48 @@ run: echo hi
         assert 'ownership loss' in str(raised)
         mock_sdk.api_cancel.assert_called_once_with('request-id')
 
+    def test_owner_loss_success_race_records_one_cancellation_request(
+            self, tmp_path):
+        allowed = threading.Event()
+        watchdog_observed_loss = threading.Event()
+        allowed.set()
+        events = []
+
+        def _continue_guard():
+            if allowed.is_set():
+                return True
+            watchdog_observed_loss.set()
+            return False
+
+        def _complete_while_watchdog_cancels(unused_request_id):
+            allowed.clear()
+            assert watchdog_observed_loss.wait(timeout=5)
+            return (17, object())
+
+        with mock.patch(
+                'sky.serve.replica_managers.'
+                '_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS', 0.01):
+            mock_sdk, _, raised = self._run_launch_cluster(
+                tmp_path,
+                _complete_while_watchdog_cancels,
+                continue_guard=_continue_guard,
+                ordinary_launch_event=lambda kind, request_id, job_id, status:
+                events.append((kind, request_id, job_id, status)))
+
+        assert raised is not None
+        assert 'ownership was lost' in str(raised)
+        # The watchdog and the post-success authority check both request
+        # cancellation, but the lower-bound evidence records the intent once.
+        assert mock_sdk.api_cancel.call_count == 2
+        cancellation_requests = [
+            event for event in events if event[0] ==
+            ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED
+        ]
+        assert cancellation_requests == [
+            (ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+             'request-id', None, None)
+        ]
+
     def test_inflight_version_supersession_keeps_manager_healthy(
             self, tmp_path):
         manager = _make_manager()
@@ -3471,6 +3648,16 @@ run: echo hi
         get_bound = mock.Mock(return_value='request-id')
         persist_job = mock.Mock(return_value=True)
         demote = mock.Mock(return_value=True)
+        events = []
+        handoff = {
+            'context_version': 1,
+            'service_name': 'svc',
+            'service_version': 2,
+            'replica_id': 1,
+            'replica_record_id': '11111111-1111-4111-8111-111111111111',
+            'controller_route_epoch': ('22222222-2222-4222-8222-222222222222'),
+            'input_digest': 'a' * 64,
+        }
 
         mock_sdk, _, raised = self._run_launch_cluster(
             tmp_path, [malformed_result, None],
@@ -3478,12 +3665,73 @@ run: echo hi
             system_recovery_launch_context={'closed': 'context'},
             get_bound_system_recovery_request_id=get_bound,
             persist_system_recovery_job_id=persist_job,
-            demote_system_recovery_candidate=demote)
+            demote_system_recovery_candidate=demote,
+            ordinary_launch_handoff_context=handoff,
+            ordinary_launch_event=lambda kind, request_id, job_id, status:
+            events.append((kind, request_id, job_id, status)))
 
         assert raised is None
         assert mock_sdk.launch.call_count == 2
+        first_context = mock_sdk.launch.call_args_list[0].kwargs[
+            '_extra_launch_context']
+        second_context = mock_sdk.launch.call_args_list[1].kwargs[
+            '_extra_launch_context']
+        # The recovery protocol is a closed exact-key contract. Diagnostic
+        # identity appears only after durable demotion makes the retry ordinary.
+        assert first_context == {'closed': 'context'}
+        assert second_context == {
+            replica_managers.serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY: handoff,
+        }
         demote.assert_called_once_with()
         persist_job.assert_not_called()
+        # The bound recovery request is intentionally excluded.  Once durable
+        # demotion succeeds, the subsequent ordinary request is observable.
+        assert events == [
+            (ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+             'ordinary-request', None, None),
+        ]
+
+    def test_demoted_candidate_callback_requires_explicit_retry_marker(self):
+        route_epoch = '22222222-2222-4222-8222-222222222222'
+        record_id = '11111111-1111-4111-8111-111111111111'
+        manager = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        manager._is_pool = False
+        manager._service_name = 'svc'
+        manager._ordinary_launch_handoff_route_epoch = route_epoch
+        info = mock.Mock()
+        info.reserved_fill = False
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        info.version = 2
+        info.replica_id = 1
+        info.replica_record_id = record_id
+
+        with mock.patch.object(ordinary_launch_handoff,
+                               'emit_event') as emit_event:
+            manager._emit_ordinary_launch_handoff_event(
+                info,
+                ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                'initial-recovery-request',
+                input_digest='a' * 64)
+            manager._emit_ordinary_launch_handoff_event(
+                info,
+                ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                'ordinary-request',
+                input_digest='a' * 64,
+                allow_demoted_candidate=True)
+
+        emit_event.assert_called_once_with(
+            event_kind=ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+            service_name='svc',
+            service_version=2,
+            replica_id=1,
+            replica_record_id=record_id,
+            controller_route_epoch=route_epoch,
+            ordinary_request_id='ordinary-request',
+            service_job_id=None,
+            terminal_status=None,
+            input_digest='a' * 64)
 
 
 class TestLaunchReplicaAvailabilityMaxRetry:
@@ -3555,6 +3803,15 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         assert callable(call.kwargs['kwargs']['pre_launch_guard'])
         assert callable(call.kwargs['kwargs']['continue_guard'])
         assert callable(call.kwargs['kwargs']['cleanup_continue_guard'])
+        handoff = call.kwargs['kwargs']['ordinary_launch_handoff_context']
+        assert handoff['context_version'] == 1
+        assert handoff['service_name'] == 'svc'
+        assert handoff['service_version'] == 1
+        assert handoff['replica_id'] == 1
+        assert handoff['replica_record_id'] == (
+            '00000000-0000-4000-8000-000000000001')
+        assert handoff['controller_route_epoch']
+        assert len(handoff['input_digest']) == 64
         # retry_until_up must be False: failover is owned by the placer.
         assert call.kwargs['args'][-1] is False
 
@@ -3569,6 +3826,18 @@ class TestLaunchReplicaAvailabilityMaxRetry:
         call = self._launch_replica(use_spot=False, with_placer=True)
         assert call.kwargs['kwargs']['availability_max_retry'] is None
         assert call.kwargs['args'][-1] is True
+
+    def test_digest_failure_omits_telemetry_without_blocking_initial_launch(
+            self):
+        with mock.patch.object(ordinary_launch_handoff,
+                               'redacted_input_digest',
+                               return_value=None) as digest:
+            call = self._launch_replica(use_spot=False, with_placer=False)
+
+        digest.assert_called_once()
+        launch_kwargs = call.kwargs['kwargs']
+        assert 'ordinary_launch_handoff_context' not in launch_kwargs
+        assert 'ordinary_launch_event' not in launch_kwargs
 
     def test_non_spot_kubernetes_only_placer_owns_failover(self):
         call = self._launch_replica(use_spot=False,
@@ -13108,6 +13377,32 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
         # Replica 2 failed; 1 and 3 still re-driven.
         assert launched == [1, 3]
+
+    def test_digest_failure_omits_telemetry_without_skipping_restart_redrive(
+            self):
+        mgr = _make_manager()
+        info = _fake_replica_info(
+            1, status=replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.resources_override = {'typed': mock.sentinel.value}
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(ordinary_launch_handoff,
+                               'redacted_input_digest',
+                               return_value=None) as digest, \
+             mock.patch.object(
+                 mgr, '_emit_ordinary_launch_handoff_event') as emit_event, \
+             mock.patch.object(mgr, '_launch_replica') as launch:
+            mgr._recover_replica_operations()
+
+        digest.assert_called_once_with(mgr.yaml_content,
+                                       info.resources_override)
+        emit_event.assert_not_called()
+        launch.assert_called_once()
+        assert launch.call_args.args == (1,)
+        assert launch.call_args.kwargs['recovering_existing_replica'] is True
 
     def test_newer_pending_version_stops_stale_recovery_wave(self):
         mgr = _make_manager(next_replica_id=1)

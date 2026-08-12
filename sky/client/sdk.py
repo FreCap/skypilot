@@ -2727,6 +2727,8 @@ def api_status(
     _execution_quiescence_candidates_only: bool = False,
     _exact_request_ids: bool = False,
     _use_body: bool = False,
+    _request_timeout_seconds: float | None = None,
+    _retry_on_server_unavailable: bool = True,
 ) -> list[payloads.RequestPayload]:
     """Lists all requests.
 
@@ -2750,6 +2752,10 @@ def api_status(
             query them in one server-side batch instead of as prefixes.
         _use_body: Use the v70 body-backed endpoint for a potentially large
             filter set.
+        _request_timeout_seconds: Internal bounded connect/read timeout. The
+            default preserves the ordinary unbounded status-read contract.
+        _retry_on_server_unavailable: Internal switch for callers that own a
+            bounded, best-effort observation rather than an operator request.
 
     Returns:
         A list of request payloads.
@@ -2761,6 +2767,11 @@ def api_status(
     if cluster_name is not None and cluster_names is not None:
         raise ValueError('cluster_name and cluster_names are mutually '
                          'exclusive.')
+    if (_request_timeout_seconds is not None and
+        (isinstance(_request_timeout_seconds, bool) or
+         not isinstance(_request_timeout_seconds,
+                        (int, float)) or _request_timeout_seconds <= 0)):
+        raise ValueError('_request_timeout_seconds must be positive.')
 
     # Backward compatibility check for the new flag cluster_name
     version = versions.get_remote_api_version()
@@ -2798,12 +2809,20 @@ def api_status(
         request_kwargs = {
             'params': server_common.request_body_to_params(body),
         }
+    request_timeout: float | tuple[int, None]
+    if _request_timeout_seconds is None:
+        request_timeout = (
+            client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None)
+    else:
+        request_timeout = _request_timeout_seconds
     response = server_common.make_authenticated_request(
         'POST' if use_body else 'GET',
         '/api/status/query' if use_body else '/api/status',
         **request_kwargs,
-        timeout=(client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS,
-                 None))
+        timeout=request_timeout,
+        retry=_retry_on_server_unavailable,
+        allow_non_get_without_retry=(use_body and
+                                     not _retry_on_server_unavailable))
     server_common.handle_request_error(response)
     return [payloads.RequestPayload(**request) for request in response.json()]
 

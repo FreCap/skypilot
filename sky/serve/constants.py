@@ -47,6 +47,14 @@ REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
 )
 
+# Diagnostic-only metadata carried alongside the existing replica launch
+# fence.  The API server uses it to publish the request ID after the request
+# and durable queue row have been persisted, before the HTTP acknowledgement
+# is returned.  It is deliberately one nested, versioned value so old servers
+# ignore it and no field can be mistaken for launch authority.
+ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY = 'sky_serve_ordinary_launch_handoff'
+ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION = 1
+
 # Protocol-v2 reserved-fill authority carried in the durable API launch row.
 # Unlike the underscore-prefixed resources_override fields below, these values
 # survive the controller-to-API queue boundary and are revalidated by the
