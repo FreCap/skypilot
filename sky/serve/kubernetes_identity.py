@@ -1,5 +1,6 @@
 """Immutable server-owned Kubernetes projections for SkyServe versions."""
 
+from collections.abc import Mapping
 import copy
 import json
 import re
@@ -982,8 +983,8 @@ def _project_accelerator_scheduling(
 def _catalog_candidates(
     task: task_lib.Task,
     placement_catalog: dict[str, Any] | None,
-) -> list[tuple[int, clouds.Cloud | None, str | None, dict[str, int] | None,
-                dict[str, Any]]]:
+) -> list[tuple[int, clouds.Cloud | None, str | None,
+                Mapping[str, int | float] | None, dict[str, Any]]]:
     resources = list(task.resources)
     if not resources:
         return []
