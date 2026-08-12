@@ -2030,6 +2030,7 @@ class Resources:
         num_nodes: int,
         dryrun: bool,
         volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+        worker_placement_projection: dict[str, Any] | None = None,
     ) -> dict[str, str | None]:
         """Converts planned sky.Resources to resource variables.
 
@@ -2051,8 +2052,24 @@ class Resources:
 
         # Cloud specific variables
         assert self.cloud is not None, 'Cloud must be specified'
-        cloud_specific_variables = self.cloud.make_deploy_resources_variables(
-            self, cluster_name, region, zones, num_nodes, dryrun, volume_mounts)
+        if worker_placement_projection is not None:
+            if (not isinstance(self.cloud, clouds.Kubernetes) or
+                    isinstance(self.cloud, clouds.SSH)):
+                raise ValueError('Worker placement projections require the '
+                                 'Kubernetes cloud.')
+            cloud_specific_variables = self.cloud.make_deploy_resources_variables(
+                self,
+                cluster_name,
+                region,
+                zones,
+                num_nodes,
+                dryrun,
+                volume_mounts,
+                worker_placement_projection=worker_placement_projection)
+        else:
+            cloud_specific_variables = self.cloud.make_deploy_resources_variables(
+                self, cluster_name, region, zones, num_nodes, dryrun,
+                volume_mounts)
 
         # TODO(andyl): Should we print some warnings if users' envs share
         # same names with the cloud specific variables, but not enabled

@@ -34,6 +34,7 @@ from sky.execution_autostop import (
 from sky.execution_autostop import apply_launch_autostop
 from sky.execution_autostop import autostop_requested_features
 from sky.serve import constants as serve_constants
+from sky.serve import kubernetes_identity
 from sky.serve import provider_phase
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -117,6 +118,123 @@ def _validate_service_replica_launch_fence(
         raise exceptions.ServeReplicaLaunchFenceError(
             f'Refusing replica launch for stale service owner '
             f'{service_name!r}/{service_hash!r}.')
+
+
+def _load_service_worker_projections(launch_context: dict[str, Any]) -> None:
+    """Replace caller data with immutable per-version worker projections."""
+    key = serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY
+    launch_context.pop(key, None)
+    service_name = launch_context[
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
+    service_version = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+    if service_version is None:
+        return
+    assert isinstance(service_name, str)
+    assert type(service_version) is int
+    found, _, _, stored_projections, _ = (
+        serve_state.get_placement_projection_record(service_name,
+                                                    service_version))
+    if not found:
+        raise exceptions.RequestCancelled(
+            f'SkyServe version {service_name!r}/{service_version} is no '
+            'longer committed.')
+    try:
+        projections = (
+            kubernetes_identity.validate_worker_placement_projections(
+                stored_projections))
+    except ValueError as e:
+        raise exceptions.RequestCancelled(
+            f'SkyServe version {service_name!r}/{service_version} has invalid '
+            'persisted worker placements.') from e
+    if projections is not None:
+        launch_context[key] = projections
+
+
+def _validate_projected_service_task_inputs(
+    dag: 'sky.Dag',
+    launch_context: dict[str, Any],
+) -> None:
+    """Reject campaign-owned Pod and volume attachment surfaces."""
+    if launch_context.get(
+            serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY) is None:
+        return
+    server_owned_keys = frozenset(
+        {'pod_config', 'namespace', 'remote_identity'})
+
+    def _contains_server_owned_key(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for key, child in value.items():
+            if key in server_owned_keys:
+                return True
+            if (isinstance(child, dict) and _contains_server_owned_key(child)):
+                return True
+        return False
+
+    for projected_task in dag.tasks:
+        if projected_task.volumes or projected_task.volume_mounts is not None:
+            raise exceptions.RequestCancelled(
+                'Projected SkyServe worker launches cannot accept campaign '
+                'volumes or volume_mounts. Use the server-owned cache '
+                'projection instead.')
+        for resource in projected_task.resources:
+            if resource.volumes:
+                raise exceptions.RequestCancelled(
+                    'Projected SkyServe worker launches cannot accept '
+                    'campaign resource volumes.')
+            overrides = resource.cluster_config_overrides
+            kubernetes_overrides = overrides.get('kubernetes', overrides)
+            if not isinstance(kubernetes_overrides, dict):
+                raise exceptions.RequestCancelled(
+                    'Projected SkyServe worker launches require Kubernetes '
+                    'config overrides to be a mapping.')
+
+            context_configs = kubernetes_overrides.get('context_configs')
+            if context_configs is not None:
+                if not isinstance(context_configs, dict) or any(
+                        not isinstance(value, dict)
+                        for value in context_configs.values()):
+                    raise exceptions.RequestCancelled(
+                        'Projected SkyServe worker launches require every '
+                        'Kubernetes context config to be a mapping.')
+            if _contains_server_owned_key(kubernetes_overrides):
+                raise exceptions.RequestCancelled(
+                    'Projected SkyServe worker launches cannot accept '
+                    'campaign pod_config, namespace, or remote_identity '
+                    'overrides. Configure trusted Kubernetes identity in the '
+                    'server workspace instead.')
+
+
+def _apply_service_worker_cache_to_task(
+    task: task_lib.Task,
+    launch_context: dict[str, Any],
+    resource: 'resources_lib.Resources',
+) -> None:
+    """Override caller cache variables from the final frozen candidate."""
+    projections = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
+    if projections is None:
+        return
+    if (not isinstance(resource.cloud, clouds.Kubernetes) or
+            isinstance(resource.cloud, clouds.SSH)):
+        return
+    if not isinstance(resource.region, str) or not resource.region:
+        raise exceptions.RequestCancelled(
+            'A projected SkyServe replica launch must pin its Kubernetes '
+            'context.')
+    projection = kubernetes_identity.worker_projection_for_context(
+        projections, resource.region, resource.accelerators)
+    if projection is None:
+        raise exceptions.RequestCancelled(
+            'SkyServe replica launch does not match a frozen worker '
+            'placement.')
+    for task_environment in (task.envs, task.secrets):
+        for key in list(task_environment):
+            if key == kubernetes_identity.CACHE_ENV_VAR or key.startswith(
+                    kubernetes_identity.CACHE_ENV_PREFIX):
+                task_environment.pop(key)
+    task.update_envs(kubernetes_identity.cache_environment(projection))
 
 
 def _parse_reserved_fill_launch_fence(
@@ -335,6 +453,8 @@ def _execute(
                 request_names.AdminPolicyRequestName.SERVE_LAUNCH_REPLICA)
     if _extra_launch_context is None:
         _extra_launch_context = {}
+    projection_key = serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY
+    _extra_launch_context.pop(projection_key, None)
     reserved_fill_launch_fence = _parse_reserved_fill_launch_fence(
         _extra_launch_context,
         is_launched_by_sky_serve_controller=_is_launched_by_sky_serve_controller
@@ -362,7 +482,10 @@ def _execute(
         (has_launch_fence or reserved_fill_launch_fence is not None or
          serve_utils.is_external_load_balancer_mode())):
         _validate_service_replica_launch_fence(_extra_launch_context)
+    if (_is_launched_by_sky_serve_controller and has_launch_fence):
+        _load_service_worker_projections(_extra_launch_context)
     dag = dag_utils.convert_entrypoint_to_dag(entrypoint)
+    _validate_projected_service_task_inputs(dag, _extra_launch_context)
     for task in dag.tasks:
         for resource in task.resources:
             # For backward compatibility, we need to override the autostop
@@ -793,6 +916,21 @@ def _execute_dag_under_provider_fence(
                             'Stage.PROVISION must be included in stages.')
             job_logger.info('Dryrun finished.')
             return None, None
+
+        # Admin policy, optimization, cluster reuse, and the under-lock planner
+        # may each choose or replace the concrete east/PHX resource. Apply
+        # runtime cache variables from the actual provisioned handle, matching
+        # the projection already enforced on the generated Kubernetes Pod.
+        projections = _extra_launch_context.get(
+            serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
+        if (_is_launched_by_sky_serve_controller and projections is not None):
+            if (not isinstance(handle, backends.CloudVmRayResourceHandle) or
+                    handle.launched_resources is None):
+                raise exceptions.RequestCancelled(
+                    'A projected SkyServe replica launch has no final '
+                    'provisioned resource.')
+            _apply_service_worker_cache_to_task(task, _extra_launch_context,
+                                                handle.launched_resources)
 
         do_workdir = (Stage.SYNC_WORKDIR in stages and not dryrun and
                       task.workdir is not None)

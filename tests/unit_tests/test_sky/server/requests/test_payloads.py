@@ -140,12 +140,37 @@ def test_request_body_projection_placeholder_is_inert(monkeypatch):
 
 def test_persisted_payload_strips_server_owned_kubernetes_fields():
     body = payloads.ServeUpBody(
-        task='name: task',
+        task='''
+name: task
+resources:
+  infra: k8s/research
+  accelerators: H200:1
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 0
+    max_replicas: 1
+    target_qps_per_replica: 1
+    spot_placer: dynamic_fallback
+run: echo hi
+''',
         service_name='service',
         override_skypilot_config={
             'active_workspace': 'workspace',
             'kubernetes': {
                 'autoscaler': 'generic',
+                'namespace': 'caller-namespace',
+                'remote_identity': 'caller-sa',
+                'pod_config': {
+                    'spec': {
+                        'volumes': [{
+                            'name': 'caller-host',
+                            'hostPath': {
+                                'path': '/caller'
+                            },
+                        }],
+                    },
+                },
                 'ports': 'podip',
                 'kueue': {
                     'local_queue_name': 'client-queue',
@@ -154,6 +179,13 @@ def test_persisted_payload_strips_server_owned_kubernetes_fields():
                 'context_configs': {
                     'research': {
                         'autoscaler': 'generic',
+                        'namespace': 'caller-context-namespace',
+                        'remote_identity': 'caller-context-sa',
+                        'pod_config': {
+                            'spec': {
+                                'serviceAccountName': 'caller-sa'
+                            },
+                        },
                         'provision_timeout': 15,
                         'kueue': {
                             'local_queue_name': 'research-queue',
@@ -188,4 +220,51 @@ def test_persisted_payload_strips_server_owned_kubernetes_fields():
                 },
             },
         },
+    }
+
+
+def test_serve_pod_config_filter_is_source_and_request_aware():
+    pod_config = {'spec': {'serviceAccountName': 'caller-sa'}}
+    launch = payloads.LaunchBody(
+        task='name: task',
+        cluster_name='cluster',
+        override_skypilot_config={'kubernetes': {
+            'pod_config': pod_config
+        }})
+
+    payloads.validate_task_request_body_for_persistence(launch)
+
+    # Ordinary cluster launches retain their established client override.
+    # The Serve path above strips only the client contribution, so an
+    # authoritative API-server pod_config remains available after merging.
+    assert launch.override_skypilot_config == {
+        'kubernetes': {
+            'pod_config': pod_config
+        }
+    }
+
+    legacy_serve = payloads.ServeUpBody(
+        task='''
+name: legacy
+resources:
+  infra: k8s/research
+service:
+  readiness_probe: /health
+  replica_policy:
+    min_replicas: 1
+    max_replicas: 1
+    target_qps_per_replica: 1
+run: echo hi
+''',
+        service_name='legacy',
+        override_skypilot_config={'kubernetes': {
+            'pod_config': pod_config
+        }})
+
+    payloads.validate_task_request_body_for_persistence(legacy_serve)
+
+    assert legacy_serve.override_skypilot_config == {
+        'kubernetes': {
+            'pod_config': pod_config
+        }
     }

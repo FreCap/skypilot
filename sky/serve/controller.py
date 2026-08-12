@@ -40,6 +40,7 @@ from sky.adaptors import common as adaptors_common
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
+from sky.serve import kubernetes_identity
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
@@ -133,6 +134,20 @@ def _catalog_missing_task_contexts(
 
     _walk(placement_catalog)
     return declared - present
+
+
+def _catalog_missing_task_shapes(
+        yaml_content: str,
+        placement_catalog: dict[str, Any]) -> set[tuple[str, str, int]]:
+    """Exact Kubernetes context/accelerator/count task shapes not cataloged."""
+    try:
+        task = task_lib.Task.from_yaml_str(yaml_content)
+    except Exception:  # pylint: disable=broad-except
+        # The ordinary task parser returns the user-facing error later in the
+        # update path. Do not replace it with a catalog diagnostic.
+        return set()
+    return kubernetes_identity.catalog_missing_task_shapes(
+        task, placement_catalog)
 
 
 def _uses_current_request_classification_protocol(
@@ -3836,12 +3851,12 @@ class SkyServeController:
             # production with a spec-declared context absent from six
             # consecutive versions' catalogs. Rebuild rather than inherit an
             # enumeration the spec has outgrown.
-            missing = _catalog_missing_task_contexts(yaml_content,
-                                                     placement_catalog)
+            missing = _catalog_missing_task_shapes(yaml_content,
+                                                   placement_catalog)
             if missing:
                 logger.info(
                     f'Rebuilding the placement catalog for version {version}: '
-                    f'the inherited catalog is missing Kubernetes context(s) '
+                    f'the inherited catalog is missing Kubernetes shape(s) '
                     f'{sorted(missing)} that the task declares.')
                 placement_catalog = None
         needs_catalog = (validation_service.placement_contract.enabled and
@@ -3849,6 +3864,7 @@ class SkyServeController:
         needs_logical_validation = (authoritative_retry_service is None and
                                     validation_service.uses_logical_replicas
                                     is True)
+        update_task = None
         if needs_catalog or needs_logical_validation:
             try:
                 if needs_catalog:
@@ -3862,11 +3878,13 @@ class SkyServeController:
                         'single-node services. Multi-node replica routing '
                         'does not yet define a safe logical capacity contract.')
                 if needs_catalog:
+                    assert update_task is not None
+                    catalog_task = update_task
 
                     def _build_catalog() -> Any:
                         return spot_placer.SpotPlacer.build_catalog(
                             validation_service,
-                            update_task,
+                            catalog_task,
                             workspace=self._replica_manager.workspace)
 
                     if prepared_config is None:
@@ -3881,18 +3899,69 @@ class SkyServeController:
                     # in this service's workspace, not that the catalog is
                     # stale. Say so: the alternative is a service that runs
                     # indefinitely without the capacity its spec asks for.
-                    still_missing = _catalog_missing_task_contexts(
+                    still_missing = _catalog_missing_task_shapes(
                         yaml_content, placement_catalog)
                     if still_missing:
-                        logger.error(
+                        raise ValueError(
                             'Placement catalog for version '
-                            f'{version} omits Kubernetes context(s) '
+                            f'{version} omits Kubernetes shape(s) '
                             f'{sorted(still_missing)} declared by the task. '
-                            'Reserved fill will not claim a pool for them. '
-                            'Check that each context is reachable and allowed '
-                            'in workspace '
+                            'Check that each exact context/accelerator/count '
+                            'is reachable and allowed in workspace '
                             f'{self._replica_manager.workspace!r}.')
             except (ValueError, RuntimeError) as e:
+                self._discard_prepared_controller_config(prepared_config)
+                return responses.JSONResponse(content={'message': str(e)},
+                                              status_code=400)
+        if authoritative_retry_service is not None:
+            (found, controller_job_projection, controller_work_cache,
+             worker_placement_projections,
+             storage_broker) = (serve_state.get_placement_projection_record(
+                 self._service_name, version))
+            if not found:
+                self._discard_prepared_controller_config(prepared_config)
+                return responses.JSONResponse(content={
+                    'message': f'Service version {version} is no longer '
+                               'committed.'
+                },
+                                              status_code=409)
+        else:
+            if update_task is None:
+                try:
+                    update_task = replica_managers.load_task_with_service_spec(
+                        yaml_content, validation_service)
+                except (ValueError, RuntimeError) as e:
+                    self._discard_prepared_controller_config(prepared_config)
+                    return responses.JSONResponse(content={'message': str(e)},
+                                                  status_code=400)
+            try:
+
+                def _build_projections() -> tuple[Any, Any, Any, Any]:
+                    if not validation_service.placement_contract.enabled:
+                        return None, None, None, None
+                    workspace = self._replica_manager.workspace
+                    return (
+                        kubernetes_identity.build_controller_job_projection(
+                            update_task, workspace=workspace),
+                        kubernetes_identity.
+                        build_controller_work_cache_projection(
+                            update_task, workspace=workspace),
+                        kubernetes_identity.build_worker_placement_projections(
+                            update_task,
+                            workspace=workspace,
+                            placement_catalog=placement_catalog),
+                        kubernetes_identity.build_storage_broker_projection(
+                            workspace=workspace),
+                    )
+
+                if prepared_config is None:
+                    projections = _build_projections()
+                else:
+                    projections = self._run_with_prepared_config(
+                        prepared_config, _build_projections)
+                (controller_job_projection, controller_work_cache,
+                 worker_placement_projections, storage_broker) = projections
+            except ValueError as e:
                 self._discard_prepared_controller_config(prepared_config)
                 return responses.JSONResponse(content={'message': str(e)},
                                               status_code=400)
@@ -3923,6 +3992,10 @@ class SkyServeController:
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=self._controller_owner,
+            controller_job_projection=controller_job_projection,
+            controller_work_cache=controller_work_cache,
+            worker_placement_projections=worker_placement_projections,
+            storage_broker=storage_broker,
             **catalog_kwargs,
             **recovery_kwargs)
         if result not in (serve_state.VersionCommitResult.COMMITTED,

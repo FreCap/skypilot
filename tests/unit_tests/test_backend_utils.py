@@ -7,6 +7,7 @@ import functools
 import gzip
 import hashlib
 import io
+import json
 import os
 import pathlib
 from types import SimpleNamespace
@@ -441,6 +442,95 @@ def test_builtin_kubernetes_writer_preserves_fill_template_facade(
     assert call.kwargs == {'output_path': f'{output_path}.tmp'}
     assert result['ray'] == f'{output_path}.tmp'
     safe_load.assert_called_once()
+
+
+def test_projected_serve_worker_suppresses_all_static_credential_mounts(
+        monkeypatch, tmp_path):
+    writer_kwargs, _ = _builtin_kubernetes_writer_kwargs(
+        monkeypatch, tmp_path, 'projected-worker-no-static-credentials')
+    credential_mounts = mock.Mock(
+        return_value={
+            '~/.aws/credentials': '/server/.aws/credentials',
+            '~/.kube/config': '/server/.kube/config',
+        })
+    logging_agent = mock.MagicMock()
+    logging_agent.get_credential_file_mounts.return_value = {
+        '~/.logging-agent/credentials': '/server/logging-agent/credentials',
+    }
+    get_logging_agent = mock.Mock(return_value=logging_agent)
+    monkeypatch.setattr(backend_utils.sky_check,
+                        'get_cloud_credential_file_mounts', credential_mounts)
+    monkeypatch.setattr(backend_utils.logs, 'get_logging_agent',
+                        get_logging_agent)
+    live_gpu_detection = mock.Mock(side_effect=AssertionError(
+        'projected rendering must not inspect live GPU nodes'))
+    label_discovery = mock.Mock(side_effect=AssertionError(
+        'projected rendering must use frozen accelerator labels'))
+    resource_discovery = mock.Mock(side_effect=AssertionError(
+        'projected rendering must use the frozen resource key'))
+    allocatable_discovery = mock.Mock(side_effect=AssertionError(
+        'projected rendering must support zero live capacity'))
+    monkeypatch.setattr(kubernetes_utils, 'detect_accelerator_resource',
+                        live_gpu_detection)
+    monkeypatch.setattr(kubernetes_utils, 'get_accelerator_label_key_values',
+                        label_discovery)
+    monkeypatch.setattr(kubernetes_utils, 'get_gpu_resource_key',
+                        resource_discovery)
+    monkeypatch.setattr(kubernetes_utils, 'adjust_resources_to_allocatable',
+                        allocatable_discovery)
+    monkeypatch.setenv('CUSTOM_GPU_RESOURCE_KEY', 'mutable.example/gpu')
+    writer_kwargs['to_provision'] = Resources(
+        cloud=clouds.Kubernetes(), instance_type='4CPU--16GB--H200:1')
+    writer_kwargs['worker_placement_projections'] = [{
+        'candidate_id': 'kubernetes-0000',
+        'kubernetes_context': 'test-context',
+        'namespace': 'inference',
+        'service_account_name': 'worker-sa',
+        'priority_class_name': 'preemptible-inference-low',
+        'priority_value': -1000,
+        'preemption_policy': 'Never',
+        'pod_identity_role_arn':
+            ('arn:aws:iam::123456789012:role/skyserve-worker-test'),
+        'accelerator_name': 'H200',
+        'accelerator_count': 1,
+        'accelerator_scheduling': {
+            'label_key': 'nvidia.com/gpu.product',
+            'label_values': ['NVIDIA-H200'],
+            'resource_key': 'nvidia.com/gpu',
+        },
+        'cache': {
+            'kind': 'none',
+        },
+    }]
+
+    result = backend_utils.write_cluster_config(**writer_kwargs)
+    rendered = yaml_utils.read_yaml(result['ray'])
+    serialized_mounts = json.dumps(rendered.get('file_mounts', {}),
+                                   sort_keys=True)
+    pod_spec = rendered['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    ray_node = next(container for container in pod_spec['containers']
+                    if container['name'] == 'ray-node')
+
+    credential_mounts.assert_not_called()
+    get_logging_agent.assert_not_called()
+    live_gpu_detection.assert_not_called()
+    label_discovery.assert_not_called()
+    resource_discovery.assert_not_called()
+    allocatable_discovery.assert_not_called()
+    assert pod_spec['affinity']['nodeAffinity'][
+        'requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms'][
+            0]['matchExpressions'][-1] == {
+                'key': 'nvidia.com/gpu.product',
+                'operator': 'In',
+                'values': ['NVIDIA-H200'],
+            }
+    assert ray_node['resources']['requests']['nvidia.com/gpu'] == 1
+    assert ray_node['resources']['limits']['nvidia.com/gpu'] == 1
+    assert 'mutable.example/gpu' not in json.dumps(pod_spec)
+    assert '.aws' not in serialized_mounts
+    assert '.kube' not in serialized_mounts
+    assert 'logging-agent' not in serialized_mounts
 
 
 def test_builtin_kubernetes_writer_preserves_delegating_wrapper(

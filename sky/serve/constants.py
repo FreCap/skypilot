@@ -47,6 +47,10 @@ REPLICA_LAUNCH_FENCE_KEYS = (
     REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY,
 )
 
+# Server-owned immutable per-version worker placement projections. Caller
+# values are discarded and reloaded from the central Serve database.
+REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY = 'sky_serve_worker_projections'
+
 # Diagnostic-only metadata carried alongside the existing replica launch
 # fence.  The API server uses it to publish the request ID after the request
 # and durable queue row have been persisted, before the HTTP acknowledgement

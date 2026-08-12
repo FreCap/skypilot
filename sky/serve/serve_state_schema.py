@@ -318,6 +318,22 @@ version_specs_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_applied_at',
                       sqlalchemy.Float,
                       server_default=None),
+    sqlalchemy.Column('controller_job_projection',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
+    sqlalchemy.Column('controller_work_cache',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
+    sqlalchemy.Column('worker_placement_projections',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
+    sqlalchemy.Column('storage_broker',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
     *resource_action_m4_state_schema.version_spec_identity_columns(),
     sqlalchemy.CheckConstraint(
         '((retired_at IS NULL AND retired_yaml_content IS NULL AND '

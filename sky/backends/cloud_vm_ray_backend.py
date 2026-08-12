@@ -1397,6 +1397,9 @@ class RetryingVmProvisioner:
                         volume_mounts=volume_mounts,
                         cloud_specific_failover_overrides=failover_overrides,
                         extra_template_variables=extra_vars,
+                        worker_placement_projections=self._extra_launch_context.
+                        get(serve_constants.
+                            REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY),
                     )
                 except exceptions.ResourcesUnavailableError as e:
                     # Failed due to catalog issue, e.g. image not found, or
@@ -1590,12 +1593,28 @@ class RetryingVmProvisioner:
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
-                        resources_vars = (
-                            to_provision.cloud.make_deploy_resources_variables(
+                        worker_projection = backend_utils._select_worker_projection(  # pylint: disable=protected-access
+                            to_provision.cloud, region, to_provision,
+                            self._extra_launch_context.get(
+                                serve_constants.
+                                REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY))
+                        if worker_projection is None:
+                            resources_vars = to_provision.cloud.make_deploy_resources_variables(
                                 to_provision,
                                 resources_utils.ClusterName(
                                     cluster_name, handle.cluster_name_on_cloud),
-                                region, zones, num_nodes))
+                                region, zones, num_nodes)
+                        else:
+                            assert isinstance(to_provision.cloud,
+                                              clouds.Kubernetes)
+                            resources_vars = to_provision.cloud.make_deploy_resources_variables(
+                                to_provision,
+                                resources_utils.ClusterName(
+                                    cluster_name, handle.cluster_name_on_cloud),
+                                region,
+                                zones,
+                                num_nodes,
+                                worker_placement_projection=worker_projection)
                         config_dict['provision_record'] = provision_record
                         config_dict['resources_vars'] = resources_vars
                         config_dict['handle'] = handle

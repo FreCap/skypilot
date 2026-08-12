@@ -14,6 +14,7 @@ import yaml
 from sky import clouds
 from sky import exceptions
 from sky import resources as resources_lib
+from sky import skypilot_config
 from sky import task as task_lib
 from sky.jobs import constants as managed_job_constants
 from sky.serve import constants as serve_constants
@@ -73,6 +74,162 @@ def test_controller_config_snapshot_is_copied_and_keeps_workspace_policy():
     ]
     snapshot['kubernetes']['allowed_contexts'].append('other')
     assert original['kubernetes']['allowed_contexts'] == ['east', 'phx']
+
+
+def test_snapshot_retains_minimal_distinct_controller_workspace():
+    inference_config = {
+        'serve_controller_workspace': 'controller',
+        'serve_worker_priority_class_name': 'worker-priority',
+    }
+    controller_auth = {
+        'secret_name': 'skyserve-lb-auth',
+        'secret_key': 'tokens',
+    }
+    unsafe_controller_auth = {
+        **controller_auth,
+        'token': 'must-not-survive',
+    }
+    controller_cache = {
+        'kind': 'empty_dir',
+        'mount_path': '/mnt/controller-work',
+        'required_bytes': 100,
+        'required_inodes': 10,
+        'size_limit_bytes': 120,
+    }
+    original = {
+        'active_workspace': 'inference',
+        'workspaces': {
+            'inference': {
+                'private': True,
+                'allowed_users': ['researcher@example.com'],
+                'kubernetes': inference_config,
+            },
+            'controller': {
+                'private': True,
+                'allowed_users': ['platform@example.com'],
+                'aws': {
+                    'access_key': 'must-not-reach-controller'
+                },
+                'kubernetes': {
+                    'allowed_contexts': ['controller-east', 'other-context'],
+                    'serve_controller_context': 'controller-east',
+                    'namespace': 'controller-default',
+                    'remote_identity': 'controller-default-sa',
+                    'serve_controller_work_cache': controller_cache,
+                    'serve_controller_lb_data_plane_auth': unsafe_controller_auth,
+                    'pod_config': {
+                        'metadata': {
+                            'annotations': {
+                                'credential': 'must-not-survive'
+                            }
+                        },
+                        'spec': {
+                            'serviceAccountName': 'controller-default-sa',
+                            'priorityClassName': 'controller-priority',
+                            'containers': [{
+                                'env': [{
+                                    'name': 'TOKEN',
+                                    'value': 'must-not-survive',
+                                }]
+                            }],
+                        },
+                    },
+                    'context_configs': {
+                        'controller-east': {
+                            'namespace': 'controller-system',
+                            'remote_identity': 'controller-east-sa',
+                            'serve_controller_work_cache': controller_cache,
+                            'serve_controller_lb_data_plane_auth': unsafe_controller_auth,
+                            'pod_config': {
+                                'spec': {
+                                    'serviceAccountName': 'controller-east-sa',
+                                    'priorityClassName': 'controller-priority',
+                                    'containers': [{
+                                        'env': [{
+                                            'name': 'TOKEN',
+                                            'value': 'must-not-survive',
+                                        }]
+                                    }],
+                                },
+                            },
+                            'credentials': 'must-not-survive',
+                        },
+                        'other-context': {
+                            'namespace': 'must-not-survive',
+                        },
+                    },
+                },
+            },
+            'unrelated': {
+                'kubernetes': {
+                    'namespace': 'must-not-survive'
+                }
+            },
+        },
+    }
+
+    snapshot = controller_utils.controller_config_snapshot(
+        original, workspace='inference')
+
+    assert snapshot['workspaces']['inference'] == {
+        'kubernetes': inference_config,
+    }
+    assert snapshot['workspaces']['controller'] == {
+        'kubernetes': {
+            'namespace': 'controller-default',
+            'remote_identity': 'controller-default-sa',
+            'serve_controller_context': 'controller-east',
+            'serve_controller_work_cache': controller_cache,
+            'serve_controller_lb_data_plane_auth': controller_auth,
+            'pod_config': {
+                'spec': {
+                    'serviceAccountName': 'controller-default-sa',
+                    'priorityClassName': 'controller-priority',
+                },
+            },
+            'context_configs': {
+                'controller-east': {
+                    'namespace': 'controller-system',
+                    'remote_identity': 'controller-east-sa',
+                    'serve_controller_work_cache': controller_cache,
+                    'serve_controller_lb_data_plane_auth': controller_auth,
+                    'pod_config': {
+                        'spec': {
+                            'serviceAccountName': 'controller-east-sa',
+                            'priorityClassName': 'controller-priority',
+                        },
+                    },
+                },
+            },
+        },
+    }
+    assert set(snapshot['workspaces']) == {'inference', 'controller'}
+    assert 'must-not-survive' not in yaml_utils.dump_yaml_str(snapshot)
+
+    # Exercise the same loaded-snapshot resolution path used later by
+    # kubernetes_identity._controller_location; no projection getter is
+    # monkeypatched here.
+    with skypilot_config.replace_skypilot_config_in_memory(
+            config_utils.Config.from_dict(snapshot)):
+        assert skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            keys=('serve_controller_workspace',),
+            workspace='inference',
+            default_value=None) == 'controller'
+        assert isinstance(
+            skypilot_config.get_nested(keys=('workspaces', 'controller'),
+                                       default_value=None), dict)
+        assert skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            keys=('serve_controller_context',),
+            workspace='controller',
+            default_value=None) == 'controller-east'
+        assert skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            keys=('namespace',),
+            region='controller-east',
+            workspace='controller',
+            default_value=None) == 'controller-system'
 
 
 def _server_shaped_config() -> config_utils.Config:

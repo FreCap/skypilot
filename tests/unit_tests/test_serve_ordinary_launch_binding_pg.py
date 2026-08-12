@@ -11,6 +11,7 @@ import uuid
 from alembic import command as alembic_command
 import pytest
 import sqlalchemy
+from sqlalchemy.dialects import postgresql
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
@@ -610,6 +611,41 @@ def test_serve042_is_the_only_owner_of_binding_columns(empty_postgres) -> None:
     }
     assert 'ordinary_launch_association_id' in {
         column['name'] for column in inspector.get_columns('replicas')
+    }
+
+
+def test_serve043_adds_nullable_jsonb_projections_and_retains_on_rollback(
+        empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '043')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '043'
+
+    projection_names = {
+        'controller_job_projection',
+        'controller_work_cache',
+        'worker_placement_projections',
+        'storage_broker',
+    }
+    projection_columns = {
+        column['name']: column
+        for column in sqlalchemy.inspect(empty_postgres).get_columns(
+            'version_specs')
+        if column['name'] in projection_names
+    }
+    assert set(projection_columns) == projection_names
+    assert all(column['nullable'] for column in projection_columns.values())
+    assert all(
+        isinstance(column['type'], postgresql.JSONB)
+        for column in projection_columns.values())
+
+    alembic_command.downgrade(config, '042')
+    assert migration_utils.get_current_alembic_revision(
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '042'
+    assert projection_names <= {
+        column['name'] for column in sqlalchemy.inspect(
+            empty_postgres).get_columns('version_specs')
     }
 
 

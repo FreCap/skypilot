@@ -203,6 +203,85 @@ def test_create_pods_resolves_placement_once_before_finalizing_each_pod(
     assert record.created_instance_ids == finalizer_calls
 
 
+def test_projected_worker_uses_frozen_gpu_resource_key_through_finalizer(
+        monkeypatch):
+    cluster_on_cloud = 'test-cluster-frozen-gpu-key'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    discovery = mock.Mock(side_effect=AssertionError(
+        'projected provisioning must not discover a mutable GPU key'))
+    monkeypatch.setattr(kubernetes_utils, 'get_gpu_resource_key', discovery)
+    finalizer_calls = []
+    original_finalize = instance.pod_spec_lib.finalize_pod_spec
+
+    def finalize_pod_spec(*args, **kwargs):
+        finalizer_calls.append(kwargs)
+        return original_finalize(*args, **kwargs)
+
+    def create_pod(_namespace, pod_spec, _context):
+        pod = types.SimpleNamespace()
+        pod.metadata = types.SimpleNamespace(
+            name=pod_spec['metadata']['name'],
+            labels=pod_spec['metadata']['labels'],
+        )
+        pod.status = types.SimpleNamespace(phase='Pending')
+        return pod
+
+    monkeypatch.setattr(instance.pod_spec_lib, 'finalize_pod_spec',
+                        finalize_pod_spec)
+    monkeypatch.setattr(instance.volume, 'check_pvc_usage_for_pod',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+    monkeypatch.setattr(instance, '_attest_serve_worker_accelerator_scheduling',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+    })
+    config.node_config['spec'].update({
+        'affinity': {
+            'nodeAffinity': {
+                'requiredDuringSchedulingIgnoredDuringExecution': {
+                    'nodeSelectorTerms': [{
+                        'matchExpressions': [{
+                            'key': 'nvidia.com/gpu.product',
+                            'operator': 'In',
+                            'values': ['NVIDIA-H200'],
+                        }],
+                    }],
+                },
+            },
+        },
+        'containers': [{
+            'name': 'ray-node',
+            'resources': {
+                'requests': {
+                    'nvidia.com/gpu': 1,
+                },
+                'limits': {
+                    'nvidia.com/gpu': 1,
+                },
+            },
+        }],
+    })
+
+    instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    discovery.assert_not_called()
+    assert len(finalizer_calls) == 1
+    assert finalizer_calls[0]['gpu_resource_key'] == 'nvidia.com/gpu'
+    assert finalizer_calls[0]['needs_gpus'] is True
+    assert finalizer_calls[0]['needs_gpus_nvidia'] is True
+
+
 def test_create_pods_enforces_required_kueue_after_finalization(monkeypatch):
     """Custom node metadata is overwritten before the Pod API boundary."""
     cluster_on_cloud = 'test-cluster-strict-kueue'

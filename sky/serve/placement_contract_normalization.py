@@ -827,12 +827,16 @@ def _require_contract_matches_parent(analysis: RawSpecAnalysis,
 def _scan_inventory(
         session: orm.Session,
         row_bound: int) -> tuple[list[_RowWork], dict[str, dict[str, Any]]]:
+    version_table = serve_state.version_specs_table
+    frozen_columns = [
+        version_table.c[column]
+        for column in placement_normalization_manifest.VERSION_SPEC_COLUMNS
+    ]
     version_rows = [
         dict(row) for row in session.execute(
-            sqlalchemy.select(serve_state.version_specs_table).order_by(
-                serve_state.version_specs_table.c.service_name, serve_state.
-                version_specs_table.c.version).limit(row_bound +
-                                                     1)).mappings().all()
+            sqlalchemy.select(*frozen_columns).order_by(
+                version_table.c.service_name, version_table.c.version).limit(
+                    row_bound + 1)).mappings().all()
     ]
     if len(version_rows) > row_bound:
         raise NormalizationBlocker(

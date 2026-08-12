@@ -1190,6 +1190,284 @@ _CONTEXT_CONFIG_SCHEMA_MINIMAL = {
     },
 }
 
+_SERVE_CACHE_ATTESTATION_SCHEMA = {
+    'type': 'object',
+    'required': [
+        'attestation_id', 'device_source_pattern', 'filesystem_type',
+        'required_bytes_per_replica', 'required_inodes_per_replica',
+        'max_replicas_per_node', 'reserved_bytes_per_node',
+        'reserved_inodes_per_node', 'usable_bytes_per_node',
+        'usable_inodes_per_node'
+    ],
+    'additionalProperties': False,
+    'properties': {
+        'attestation_id': {
+            'type': 'string',
+            'minLength': 1,
+        },
+        'device_source_pattern': {
+            'type': 'string',
+            'minLength': 3,
+        },
+        'filesystem_type': {
+            'type': 'string',
+            'minLength': 1,
+        },
+        'required_bytes_per_replica': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'required_inodes_per_replica': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'max_replicas_per_node': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'reserved_bytes_per_node': {
+            'type': 'integer',
+            'minimum': 0,
+        },
+        'reserved_inodes_per_node': {
+            'type': 'integer',
+            'minimum': 0,
+        },
+        'usable_bytes_per_node': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+        'usable_inodes_per_node': {
+            'type': 'integer',
+            'minimum': 1,
+        },
+    },
+}
+
+_SERVE_WORKER_CACHE_SCHEMA = {
+    'oneOf': [{
+        'type': 'object',
+        'required': ['kind'],
+        'additionalProperties': False,
+        'properties': {
+            'kind': {
+                'const': 'none',
+            },
+        },
+    }, {
+        'type': 'object',
+        'required': ['kind', 'mount_path', 'volume_name', 'attestation'],
+        'additionalProperties': False,
+        'properties': {
+            'kind': {
+                'const': 'node_local',
+            },
+            'mount_path': {
+                'type': 'string',
+                'pattern': '^/',
+            },
+            'volume_name': {
+                'type': 'string',
+                'minLength': 1,
+            },
+            'attestation': _SERVE_CACHE_ATTESTATION_SCHEMA,
+        },
+    }],
+}
+
+_SERVE_CONTROLLER_WORK_CACHE_SCHEMA = {
+    'oneOf': [{
+        'type': 'object',
+        'required': [
+            'kind', 'mount_path', 'required_bytes', 'required_inodes',
+            'size_limit_bytes'
+        ],
+        'additionalProperties': False,
+        'properties': {
+            'kind': {
+                'const': 'empty_dir',
+            },
+            'mount_path': {
+                'type': 'string',
+                'pattern': '^/',
+            },
+            **{
+                key: {
+                    'type': 'integer',
+                    'minimum': 1,
+                } for key in ('required_bytes', 'required_inodes', 'size_limit_bytes')
+            }
+        },
+    }, {
+        'type': 'object',
+        'required': [
+            'kind', 'mount_path', 'volume_name', 'required_bytes',
+            'required_inodes', 'attestation'
+        ],
+        'additionalProperties': False,
+        'properties': {
+            'kind': {
+                'const': 'node_local',
+            },
+            'mount_path': {
+                'type': 'string',
+                'pattern': '^/',
+            },
+            'volume_name': {
+                'type': 'string',
+                'minLength': 1,
+            },
+            'required_bytes': {
+                'type': 'integer',
+                'minimum': 1,
+            },
+            'required_inodes': {
+                'type': 'integer',
+                'minimum': 1,
+            },
+            'attestation': _SERVE_CACHE_ATTESTATION_SCHEMA,
+        },
+    }],
+}
+
+_SERVE_STORAGE_BROKER_SCHEMA = {
+    'type': 'object',
+    'required': [
+        'endpoint', 'audience', 'api_version', 'grant_uri_prefix',
+        'authenticated_worker_role_arns', 'kms_key_id'
+    ],
+    'additionalProperties': False,
+    'properties': {
+        'endpoint': {
+            'type': 'string',
+            'pattern': '^https://[^/?#]+(?:/[^?#]*)?$',
+        },
+        'audience': {
+            'type': 'string',
+            'minLength': 1,
+        },
+        'api_version': {
+            'const': 2,
+        },
+        'grant_uri_prefix': {
+            'type': 'string',
+            'pattern': '^s3://[^/?#]+(?:/[^?#]*)?$',
+        },
+        'authenticated_worker_role_arns': {
+            'type': 'array',
+            'minItems': 1,
+            'maxItems': 16,
+            'uniqueItems': True,
+            'items': {
+                'type': 'string',
+                'pattern': ('^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
+                            'role/[A-Za-z0-9+=,.@_/-]+$'),
+            },
+        },
+        'kms_key_id': {
+            'type': 'string',
+            'minLength': 1,
+        },
+    },
+}
+
+_SERVE_CONTROLLER_CONTEXT_SCHEMA = {
+    'type': 'string',
+    'minLength': 1,
+}
+
+_SERVE_CONTROLLER_WORKSPACE_SCHEMA = {
+    'type': 'string',
+    'minLength': 1,
+}
+
+_SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA = {
+    'oneOf': [{
+        'type': 'string',
+        'minLength': 1,
+    }, {
+        'type': 'null',
+    }],
+}
+
+_SERVE_WORKER_PRIORITY_VALUE_SCHEMA = {
+    'oneOf': [{
+        'type': 'integer',
+        'minimum': -2147483648,
+        'maximum': 1000000000,
+    }, {
+        'type': 'null',
+    }],
+}
+
+_SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA = {
+    'type': 'object',
+    'minProperties': 1,
+    'additionalProperties': {
+        'type': 'object',
+        'required': ['label_key', 'label_values', 'resource_key'],
+        'additionalProperties': False,
+        'properties': {
+            'label_key': {
+                'type': 'string',
+                'minLength': 1,
+            },
+            'label_values': {
+                'type': 'array',
+                'minItems': 1,
+                'maxItems': 16,
+                'uniqueItems': True,
+                'items': {
+                    'type': 'string',
+                    'minLength': 1,
+                },
+            },
+            'resource_key': {
+                'type': 'string',
+                'minLength': 1,
+            },
+        },
+    },
+}
+
+_SERVE_WORKER_PREEMPTION_POLICY_SCHEMA = {
+    'oneOf': [{
+        'enum': ['Never', 'PreemptLowerPriority'],
+    }, {
+        'type': 'null',
+    }],
+}
+
+_SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA = {
+    'type': 'object',
+    'required': ['secret_name', 'secret_key'],
+    'additionalProperties': False,
+    'properties': {
+        'secret_name': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 253,
+            'pattern': '^[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?$',
+        },
+        'secret_key': {
+            'type': 'string',
+            'minLength': 1,
+            'maxLength': 253,
+            'pattern': '^[-._A-Za-z0-9]+$',
+        },
+    },
+}
+
+_SERVE_WORKER_POD_IDENTITY_ROLE_ARN_SCHEMA = {
+    'oneOf': [{
+        'type': 'string',
+        'pattern': ('^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
+                    'role/[A-Za-z0-9+=,.@_/-]+$'),
+    }, {
+        'type': 'null',
+    }],
+}
+
 _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
     'allowed_nodes': {
         'type': 'object',
@@ -1219,6 +1497,14 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
             },
         },
     },
+    'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
+    'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
+    'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
+    'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
+    'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
+    'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
+    'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
+    'serve_worker_pod_identity_role_arn': _SERVE_WORKER_POD_IDENTITY_ROLE_ARN_SCHEMA,
     # TODO(kevin): Remove 'networking' in v0.13.0.
     'networking': {
         'type': 'string',
@@ -2098,6 +2384,8 @@ def get_config_schema():
                         'pattern': '^all$'
                     }]
                 },
+                'serve_controller_workspace': _SERVE_CONTROLLER_WORKSPACE_SCHEMA,
+                'serve_controller_context': _SERVE_CONTROLLER_CONTEXT_SCHEMA,
                 'context_configs': {
                     'type': 'object',
                     'required': [],
@@ -2522,6 +2810,14 @@ def get_config_schema():
                 'private': {
                     'type': 'boolean',
                 },
+                'serve': {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': False,
+                    'properties': {
+                        'storage_broker': _SERVE_STORAGE_BROKER_SCHEMA,
+                    },
+                },
                 'allowed_users': {
                     'type': 'array',
                     'items': {
@@ -2642,6 +2938,16 @@ def get_config_schema():
                         'disabled': {
                             'type': 'boolean'
                         },
+                        'serve_controller_workspace': _SERVE_CONTROLLER_WORKSPACE_SCHEMA,
+                        'serve_controller_context': _SERVE_CONTROLLER_CONTEXT_SCHEMA,
+                        'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
+                        'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
+                        'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
+                        'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
+                        'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
+                        'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
+                        'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
+                        'serve_worker_pod_identity_role_arn': _SERVE_WORKER_POD_IDENTITY_ROLE_ARN_SCHEMA,
                         'namespace': {
                             'type': 'string',
                         },
@@ -2717,6 +3023,14 @@ def get_config_schema():
                                             },
                                         },
                                     },
+                                    'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
+                                    'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
+                                    'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
+                                    'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
+                                    'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
+                                    'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
+                                    'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
+                                    'serve_worker_pod_identity_role_arn': _SERVE_WORKER_POD_IDENTITY_ROLE_ARN_SCHEMA,
                                     **_extra_kubernetes_properties,
                                     **_REMOTE_IDENTITY_SCHEMA_KUBERNETES,
                                 },
@@ -2910,6 +3224,9 @@ def get_config_schema():
                         'type': 'boolean',
                         'default': False,
                     },
+                },
+                extra_properties={
+                    'storage_broker': _SERVE_STORAGE_BROKER_SCHEMA,
                 }),
             'allowed_clouds': allowed_clouds,
             'admin_policy': admin_policy_schema,
