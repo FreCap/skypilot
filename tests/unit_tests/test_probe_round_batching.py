@@ -261,8 +261,10 @@ class TestProbeRoundBatching(unittest.TestCase):
             manager._probe_all_replicas()
 
         self.assertEqual(mock_batch.call_count, 1)
-        self.assertEqual(mock_batch.call_args.kwargs,
-                         {'expected_replica_exists': True})
+        self.assertEqual(mock_batch.call_args.kwargs, {
+            'expected_replica_exists': True,
+            'guard_launch_exclusion': False,
+        })
         written = mock_batch.call_args.args[1]
         self.assertEqual(sorted(rid for rid, _ in written), [1, 2])
         self.assertEqual(calls, ['batch', 'teardown'])
@@ -463,14 +465,17 @@ class TestProbeRoundBatching(unittest.TestCase):
         with mock.patch.object(serve_state,
                                'add_or_update_replicas',
                                return_value=True) as persist:
-            manager._persist_replicas([], route_suspensions=[suspension])
+            manager._persist_replicas(  # pylint: disable=unexpected-keyword-arg
+                [],
+                route_suspensions=[suspension])
 
         persist.assert_called_once_with('svc', [],
                                         expected_service_hash='incarnation-a',
                                         expected_controller_owner=(100,
                                                                    '10.0.0.1'),
                                         validate_fence_on_empty=True,
-                                        expected_replica_exists=True)
+                                        expected_replica_exists=True,
+                                        guard_launch_exclusion=False)
         route_registry.commit_suspension.assert_called_once_with(suspension)
 
     def test_initial_delay_sentinel_persists_before_teardown(self):
