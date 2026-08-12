@@ -473,6 +473,8 @@ def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
     request_values.pop('execution_quiescence_required')
     request_values.pop('execution_quiesced_generation')
     request_values.pop('execution_quiesced_at')
+    request_values.pop('terminal_cause', None)
+    request_values.pop('ordinary_launch_association_id', None)
     with postgres_engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -619,6 +621,8 @@ def test_api009_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
     request_values.pop('execution_quiescence_required')
     request_values.pop('execution_quiesced_generation')
     request_values.pop('execution_quiesced_at')
+    request_values.pop('terminal_cause', None)
+    request_values.pop('ordinary_launch_association_id', None)
     legacy_instance_id = uuid.uuid4()
     with postgres_engine.begin() as connection:
         connection.execute(
@@ -1018,46 +1022,46 @@ def test_generic_kill_requests_skips_correlated_bound_launch(request_database):
 
 def test_bound_tombstone_gc_rechecks_request_absence_at_delete(
         bound_request_database):
-    engine, _ = bound_request_database
-    association_id = uuid.UUID('44444444-4444-4444-8444-444444444444')
-    request_id = 'gc-bound-request'
+    engine, backend = bound_request_database
+    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    association_id = identity.association_id
+    request_id = identity.request_id
     now = datetime.datetime.now(datetime.timezone.utc)
+    facts = request_postgres.request_bound_ordinary_launch_cancel(
+        context, _gc_binding_authority(), 'gc-fixture-settlement')
+    assert facts.status is requests.RequestStatus.CANCELLED
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    assert backend.acknowledge_execution_quiescence(claim)
+    reduction = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
     with engine.begin() as connection:
         connection.execute(
-            sqlalchemy.insert(
+            sqlalchemy.delete(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id))
+    # The state machine correctly makes this deadline immutable. Simulate the
+    # passage of its 60-day retention window without fabricating an illegal
+    # association insert or transition. Trigger DDL and the update use
+    # separate transactions so deferred consistency events are fully drained.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'ALTER TABLE serve_ordinary_launch_associations DISABLE TRIGGER '
+            'skyserve042_association_guard')
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
                 ordinary_launch_binding.ordinary_launch_associations_table).
-            values(
-                association_id=association_id,
-                submission_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
-                tenant_scope='tenant-a',
-                service_name='gc-service',
-                service_hash='gc-service-hash',
-                service_workspace='workspace-a',
-                service_lifecycle_epoch=4,
-                service_binding_epoch=5,
-                service_version=2,
-                replica_id=3,
-                replica_record_id=uuid.UUID(
-                    '22222222-2222-4222-8222-222222222222'),
-                launch_generation=1,
-                cluster_name='gc-service-3',
-                request_id=request_id,
-                input_digest='a' * 64,
-                owner_controller_incarnation=uuid.UUID(
-                    '33333333-3333-4333-8333-333333333333'),
-                owner_controller_epoch=6,
-                effect_phase='NOT_STARTED',
-                resolution='PRE_EFFECT_TERMINAL',
-                terminal_status='CANCELLED',
-                terminal_cause='dispatcher_submit_failed',
-                terminal_execution_generation=0,
-                execution_quiescence_required=True,
-                execution_quiesced_generation=0,
-                execution_quiesced_at=now,
-                result_recorded_at=now,
-                projected_at=now,
-                pin_released_at=now,
-                tombstone_not_before=now - datetime.timedelta(seconds=1)))
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == association_id).values(
+                      tombstone_not_before=now - datetime.timedelta(seconds=1)))
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            'ALTER TABLE serve_ordinary_launch_associations ENABLE TRIGGER '
+            'skyserve042_association_guard')
 
     request_values = request_postgres._request_values_for_db(
         _bound_request(request_id))
@@ -1329,7 +1333,7 @@ def test_expired_bound_claim_after_provider_io_is_ambiguous(
     identity, context, queue, item = _claim_gc_bound_request(engine, backend)
     assert backend.try_mark_running(item.request_id, 1234,
                                     item.execution_generation, item.claim_token)
-    body = _bound_request(identity.request_id).request_body
+    body = _legacy_serve_launch_request(identity.request_id).request_body
     ordinary_launch_binding.install_bound_context(body, identity,
                                                   context.launch_generation)
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
@@ -1370,30 +1374,31 @@ def test_expired_bound_claim_after_provider_io_is_ambiguous(
 def test_malformed_success_result_is_durably_ambiguous(bound_request_database):
     engine, backend = bound_request_database
     identity, context, _, item = _claim_gc_bound_request(engine, backend)
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(
-                ordinary_launch_binding.ordinary_launch_associations_table).
-            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
-                  association_id == identity.association_id).values(
-                      effect_phase=(ordinary_launch_binding.EffectPhase.
-                                    SERVICE_JOB_RECORDED.value),
-                      service_job_id=17,
-                      owner_revision=(
-                          ordinary_launch_binding.
-                          ordinary_launch_associations_table.c.owner_revision +
-                          1)))
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token)
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token, item.worker_instance_id)
+    body = _legacy_serve_launch_request(identity.request_id).request_body
+    ordinary_launch_binding.install_bound_context(body, identity,
+                                                  context.launch_generation)
+    with ordinary_launch_binding.provider_effect_guard(
+            body.extra_launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_ordinary_launch_claim_in_transaction)):
+        ordinary_launch_binding.begin_service_job_io(body.extra_launch_context)
+        ordinary_launch_binding.record_service_job(body.extra_launch_context,
+                                                   17)
     active_claim = storage.activate_execution_claim(claim.request_id,
                                                     claim.execution_generation,
                                                     claim.claim_token)
     try:
-        # A generic list is serializable, but it is not the exact
-        # ``(service_job_id, CloudVmRayResourceHandle)`` success contract.
+        # The launch encoder accepts the two-tuple, but a null resource handle
+        # violates the reducer's exact success-result contract.
         assert backend.set_request_finished(identity.request_id,
                                             requests.RequestStatus.SUCCEEDED,
-                                            result=[])
+                                            result=(17, None))
     finally:
         storage.deactivate_execution_claim(active_claim)
     assert backend.acknowledge_execution_quiescence(claim)
@@ -2729,16 +2734,20 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
     leader = _controller_leader(engine, monkeypatch, instance_id)
     backend = request_postgres.PostgresRequestBackend()
     try:
+        normal_request = _request('normal-class')
+        controller_request = _controller_request('controller-class')
         assert asyncio.run(
-            fixture_backend.create_if_not_exists_async(
-                _request('normal-class')))
+            fixture_backend.create_if_not_exists_async(normal_request))
         assert asyncio.run(
-            fixture_backend.create_if_not_exists_async(
-                _controller_request('controller-class')))
+            fixture_backend.create_if_not_exists_async(controller_request))
 
         normal_queue = request_postgres.PostgresQueueBackend(
             'short',
-            execution_classes=frozenset({registry.ExecutionClass.NORMAL.value}))
+            execution_classes=frozenset({registry.ExecutionClass.NORMAL.value}),
+            supported_handler_names=frozenset({
+                registry.registration_for_handler(
+                    normal_request.entrypoint).name
+            }))
         normal_item = normal_queue.get()
         assert normal_item is not None
         assert normal_item.request_id == 'normal-class'
@@ -2748,7 +2757,11 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
             'short',
             execution_classes=frozenset(
                 {registry.ExecutionClass.CONTROLLER.value}),
-            controller_generation=leader.generation)
+            controller_generation=leader.generation,
+            supported_handler_names=frozenset({
+                registry.registration_for_handler(
+                    controller_request.entrypoint).name
+            }))
         controller_item = controller_queue.get()
         assert controller_item is not None
         assert controller_item.request_id == 'controller-class'

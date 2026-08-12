@@ -1,11 +1,11 @@
 """Shared SQLAlchemy schema and bootstrap for SkyServe state."""
 import json
-import uuid
 
 import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext import compiler as sqlalchemy_compiler
 from sqlalchemy.ext import declarative
 
 from sky.serve import constants
@@ -16,6 +16,34 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 Base = declarative.declarative_base()
+
+
+class _ControllerIncarnationDefault(sqlalchemy.sql.expression.FunctionElement):
+    """Dialect-native UUID default for the canonical current metadata."""
+
+    inherit_cache = True
+    type = sqlalchemy.Uuid(as_uuid=True)
+
+
+@sqlalchemy_compiler.compiles(_ControllerIncarnationDefault, 'postgresql')
+def _compile_controller_incarnation_postgres(_element, _compiler, **_kwargs):
+    return 'gen_random_uuid()'
+
+
+@sqlalchemy_compiler.compiles(_ControllerIncarnationDefault, 'sqlite')
+def _compile_controller_incarnation_sqlite(_element, _compiler, **_kwargs):
+    # Local SQLite is physically capped before Serve042, but unit tests build
+    # the canonical metadata directly.  Keep that graph insertable without a
+    # client-side default, which would leak this future column into statements
+    # against historical schemas.
+    return ("(lower(hex(randomblob(4))) || '-' || "
+            "lower(hex(randomblob(2))) || '-4' || "
+            "substr(lower(hex(randomblob(2))), 2) || '-' || "
+            "substr('89ab', (random() & 3) + 1, 1) || "
+            "substr(lower(hex(randomblob(2))), 2) || '-' || "
+            "lower(hex(randomblob(6))))")
+
+
 # === Database schema ===
 services_table = sqlalchemy.Table(
     'services',
@@ -86,10 +114,13 @@ services_table = sqlalchemy.Table(
     # ABA-safe owner identity for durable ordinary-launch request binding.
     # PID/IP remain routing metadata; every controller takeover installs a
     # fresh incarnation and advances the owner epoch atomically in Serve042.
-    sqlalchemy.Column('controller_incarnation',
-                      sqlalchemy.Uuid(as_uuid=True),
-                      nullable=False,
-                      default=uuid.uuid4),
+    sqlalchemy.Column(
+        'controller_incarnation',
+        sqlalchemy.Uuid(as_uuid=True),
+        nullable=False,
+        # A server default mirrors Serve042 without injecting
+        # this future column into historical INSERT statements.
+        server_default=_ControllerIncarnationDefault()),
     sqlalchemy.Column('controller_owner_epoch',
                       sqlalchemy.BigInteger,
                       nullable=False,

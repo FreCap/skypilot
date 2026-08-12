@@ -19,6 +19,7 @@ from sky.serve import serve_state_schema
 from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.utils import common_utils
+from sky.utils.db import db_utils
 
 _SERVICE_NAME = 'svc'
 _SERVICE_HASH = 'service-hash'
@@ -257,12 +258,21 @@ def _capture_sql(engine):
                           _context, _executemany):
         statements.append(statement.lower())
 
-    sqlalchemy.event.listen(engine, 'before_cursor_execute', _record_statement)
+    # Replica launch-authority mutations deliberately run on the dedicated
+    # PostgreSQL lock engine so the advisory lock and mutation share one
+    # transaction without consuming the bounded Serve pool.  Observe both
+    # engines; otherwise this lock-order assertion sees an empty trace even
+    # though the production transaction took every required row lock.
+    engines = (engine, db_utils.get_postgres_lock_engine(engine))
+    for observed_engine in engines:
+        sqlalchemy.event.listen(observed_engine, 'before_cursor_execute',
+                                _record_statement)
     try:
         yield statements
     finally:
-        sqlalchemy.event.remove(engine, 'before_cursor_execute',
-                                _record_statement)
+        for observed_engine in engines:
+            sqlalchemy.event.remove(observed_engine, 'before_cursor_execute',
+                                    _record_statement)
 
 
 def _assert_lifecycle_service_replica_lock_order(statements: list[str]) -> None:

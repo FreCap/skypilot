@@ -710,6 +710,8 @@ class TestPinnedReplacementLaunch:
             'replica_id',
             'completion_queue',
             'completion_event',
+            'bound_ordinary_launch',
+            'ordinary_legacy_launch',
             'args',
             'kwargs',
         }
@@ -722,6 +724,8 @@ class TestPinnedReplacementLaunch:
                 is runtime.launch_completion_queue)
         assert (construction.kwargs['completion_event']
                 is runtime.launch_completion_event)
+        assert construction.kwargs['bound_ordinary_launch'] is False
+        assert construction.kwargs['ordinary_legacy_launch'] is False
         assert construction.kwargs['args'] == (
             8,
             manager.yaml_content,

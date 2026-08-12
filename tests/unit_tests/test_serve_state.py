@@ -687,6 +687,7 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
             requested_resources_str='1x[CPU:1+]',
             pool=int(pool),
             controller_pid=12345,
+            controller_incarnation=uuid.uuid4(),
             hash='orphan',
             entrypoint='entry'))
         session.commit()
@@ -1154,7 +1155,8 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             'launch_shadow_sample_id': launch_shadow_coverage_id,
             'down_shadow_sample_id': down_shadow_coverage_id,
             'resource_action_spec_identity_sha256': None,
-            'ordinary_launch_association_id': None,
+            'ordinary_launch_association_id': uuid.UUID(int=replica_id * 100 + 7
+                                                       ),
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(_mock_serve_db) as session:
@@ -1535,13 +1537,17 @@ def test_elected_version_migration_backfills_latest_committed_version(
     engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
     monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '013')
     serve_state.create_table(engine)
+    legacy_metadata = sqlalchemy.MetaData()
     legacy_services = sqlalchemy.Table('services',
-                                       sqlalchemy.MetaData(),
+                                       legacy_metadata,
                                        autoload_with=engine)
+    legacy_version_specs = sqlalchemy.Table('version_specs',
+                                            legacy_metadata,
+                                            autoload_with=engine)
     with engine.begin() as connection:
         connection.execute(legacy_services.insert().values(name='svc',
                                                            current_version=1))
-        connection.execute(serve_state.version_specs_table.insert(), [{
+        connection.execute(legacy_version_specs.insert(), [{
             'service_name': 'svc',
             'version': 1,
             'spec': pickle.dumps(None),
