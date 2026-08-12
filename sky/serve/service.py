@@ -10,6 +10,8 @@ from collections.abc import Iterator
 import contextlib
 import contextvars
 import dataclasses
+import enum
+import functools
 import hashlib
 import json
 import multiprocessing
@@ -23,6 +25,7 @@ import threading
 import time
 import traceback
 from typing import Any, NoReturn, TYPE_CHECKING
+import uuid
 
 import filelock
 
@@ -30,6 +33,7 @@ from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.data import data_utils
@@ -37,6 +41,8 @@ from sky.serve import constants
 from sky.serve import controller
 from sky.serve import lb_k8s
 from sky.serve import maintenance
+from sky.serve import ordinary_launch_binding
+from sky.serve import paid_capacity
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import serve_state
@@ -58,6 +64,9 @@ if TYPE_CHECKING:
 # `sky.serve.service` namespace when executed directly, so as
 # to inherit the setup from the `sky` logger.
 logger = sky_logging.init_logger('sky.serve.service')
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+
+_BOUND_ORDINARY_LAUNCH_SETTLE_INTERVAL_SECONDS = 0.5
 
 
 class ServiceOwnershipLostError(RuntimeError):
@@ -138,12 +147,46 @@ def _handle_signal(service_name: str,
                 # then sees either SHUTTING_DOWN (and resumes teardown) or the
                 # still-present signal (and re-fires terminate) -- never a
                 # downed service that comes back up serving.
-                set_status_if_owner = (
-                    serve_state.set_service_status_and_active_versions_if_owner)
                 try:
-                    persisted = set_status_if_owner(
-                        service_name, service_hash, controller_pid,
-                        controller_ip, serve_state.ServiceStatus.SHUTTING_DOWN)
+                    teardown_result = (
+                        ordinary_launch_binding.begin_service_teardown_if_owner(
+                            service_name, service_hash,
+                            (controller_pid, controller_ip)))
+                    bound_authority = teardown_result.authority
+                    if teardown_result.disposition == (
+                            ordinary_launch_binding.ServiceTeardownDisposition.
+                            UNSUPPORTED):
+                        persisted = (
+                            serve_state.
+                            set_service_status_and_active_versions_if_owner(
+                                service_name, service_hash, controller_pid,
+                                controller_ip,
+                                serve_state.ServiceStatus.SHUTTING_DOWN))
+                    elif bound_authority is not None:
+                        # The direct row-lock status transition above closes
+                        # admission without waiting behind a provider retry.
+                        # Deliver exact cancellation before any later
+                        # exclusive authority barrier, then prove all request
+                        # executions quiescent while the signal remains
+                        # durable.  Terminal status now fences the still-live
+                        # child from producing a new valid launch.
+                        replica_infos = serve_state.get_replica_infos(
+                            service_name)
+                        _settle_bound_ordinary_launches_for_teardown(
+                            bound_authority, replica_infos)
+                        persisted = (
+                            serve_utils.quiesce_service_replica_launch_requests(
+                                service_name,
+                                replica_infos,
+                                continue_guard=lambda:
+                                serve_state.service_owner_matches(
+                                    service_name, service_hash,
+                                    (controller_pid, controller_ip)),
+                                include_terminal_history=True))
+                    else:
+                        # Serve042 legacy mode was classified and marked in the
+                        # same row-lock transaction; no racy second CAS exists.
+                        persisted = True
                 except Exception as e:  # pylint: disable=broad-except
                     # A DB blip must not escape into _start's destructive
                     # unexpected-exception finalizer. Keep the signal durable
@@ -380,7 +423,9 @@ def _cleanup(service_name: str,
             expected_service_hash=service_hash,
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=expected_owner,
-            expected_replica_exists=True)
+            expected_replica_exists=True,
+            guard_launch_exclusion=(
+                serve_state.replica_info_has_binding_excluded_profile(info)))
         if persisted is False:
             raise ServiceOwnershipLostError(
                 f'Lost lifecycle epoch or replica {info.replica_id} was '
@@ -751,16 +796,18 @@ def _bail_on_boot_failure(service_name: str,
 
 
 def _spawn_controller(
-        service_name: str,
-        service_spec: 'service_spec_lib.SkyServiceSpec',
-        version: int,
-        controller_host: str,
-        controller_port: int,
-        service_hash: str,
-        controller_ip: str | None,
-        resource_scope: str | None = None,
-        enforce_launch_fence: bool = False,
-        controller_socket: socket.socket | None = None
+    service_name: str,
+    service_spec: 'service_spec_lib.SkyServiceSpec',
+    version: int,
+    controller_host: str,
+    controller_port: int,
+    service_hash: str,
+    controller_ip: str | None,
+    resource_scope: str | None = None,
+    enforce_launch_fence: bool = False,
+    controller_socket: socket.socket | None = None,
+    controller_binding_authority: ordinary_launch_binding.
+    ControllerBindingAuthority | None = None,
 ) -> multiprocessing.Process:
     """Spawn (and start) the controller server subprocess for a service.
 
@@ -777,7 +824,7 @@ def _spawn_controller(
         args=(service_name, service_spec, version, controller_host,
               controller_port, owner_fingerprint, resource_scope, service_hash,
               os.getpid(), controller_ip, enforce_launch_fence,
-              controller_socket))
+              controller_socket, controller_binding_authority))
     process.start()
     return process
 
@@ -810,7 +857,9 @@ def _spawn_controller_on_reserved_port(
     service_hash: str,
     controller_ip: str | None,
     resource_scope: str | None = None,
-    enforce_launch_fence: bool = False
+    enforce_launch_fence: bool = False,
+    controller_binding_authority: ordinary_launch_binding.
+    ControllerBindingAuthority | None = None,
 ) -> Iterator[tuple[multiprocessing.Process, int]]:
     """Yield a child while retaining its parent-side socket reservation."""
     controller_socket = None
@@ -825,13 +874,15 @@ def _spawn_controller_on_reserved_port(
                 process = _spawn_controller(
                     *spawn_args,
                     enforce_launch_fence=enforce_launch_fence,
-                    controller_socket=controller_socket)
+                    controller_socket=controller_socket,
+                    controller_binding_authority=controller_binding_authority)
             else:
                 process = _spawn_controller(
                     *spawn_args,
                     resource_scope=resource_scope,
                     enforce_launch_fence=enforce_launch_fence,
-                    controller_socket=controller_socket)
+                    controller_socket=controller_socket,
+                    controller_binding_authority=controller_binding_authority)
         # The lock is released before readiness and owner publication. Keep
         # the parent duplicate open so child death cannot free and cross-wire
         # the port during that decision window.
@@ -1195,6 +1246,18 @@ def _respawn_controller(
 
     new_controller = None
     try:
+        controller_binding_authority = (
+            ordinary_launch_binding.claim_controller_incarnation(
+                service_name,
+                service_hash,
+                (os.getpid(), controller_ip),
+                uuid.uuid4(),
+                new_parent_owner=(os.getpid(), controller_ip),
+                expected_recovery_version=version,
+                # Never strand the supervision loop behind an opaque provider
+                # retry. The next tick can observe SHUTTING_DOWN and deliver
+                # the exact cancellation that releases shared authority.
+                wait_for_authority=False))
         with _spawn_controller_on_reserved_port(
                 service_name,
                 service_spec,
@@ -1203,8 +1266,9 @@ def _respawn_controller(
                 service_hash,
                 controller_ip,
                 resource_scope=resource_scope,
-                enforce_launch_fence=enforce_launch_fence) as (new_controller,
-                                                               controller_port):
+                enforce_launch_fence=enforce_launch_fence,
+                controller_binding_authority=controller_binding_authority) as (
+                    new_controller, controller_port):
             # The parent reservation remains open while we wait outside the
             # host-global lock, so child death cannot let another service
             # reuse this port before publication finishes.
@@ -1216,9 +1280,15 @@ def _respawn_controller(
             if not new_controller.is_alive():
                 raise RuntimeError(
                     'replacement controller exited during startup')
-            if not serve_state.set_service_controller_port_if_owner(
+            if controller_binding_authority is None:
+                published = serve_state.set_service_controller_port_if_owner(
                     service_name, service_hash, os.getpid(), controller_ip,
-                    controller_port):
+                    controller_port)
+            else:
+                published = (ordinary_launch_binding.
+                             publish_controller_port_if_authority(
+                                 controller_binding_authority, controller_port))
+            if not published:
                 # Another instance (HA recovery on a different pod) took over
                 # the row while we were bringing up the replacement. Discard
                 # it; the orphan check in _start's loop will exit this parent
@@ -1281,6 +1351,105 @@ def _should_resume_teardown(is_recovery: bool,
                                   serve_state.ServiceStatus.FAILED_CLEANUP))
 
 
+def _bound_ordinary_launch_disposition(reduction: Any) -> str:
+    disposition = getattr(reduction, 'disposition', None)
+    if isinstance(disposition, enum.Enum):
+        disposition = disposition.value
+    if not isinstance(disposition, str) or not disposition:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Teardown reducer returned no ordinary-launch disposition.')
+    return disposition
+
+
+def _project_bound_ordinary_launch_for_teardown(
+    authority: ordinary_launch_binding.ControllerBindingAuthority,
+    connection: Any,
+    projection: Any,
+) -> bool:
+    """Project an exact bound result without reviving teardown intent."""
+    info = projection.locked_replica_info
+    if (info.status_property.sky_launch_status
+            != common_utils.ProcessStatus.INTERRUPTED):
+        if projection.status.value == 'SUCCEEDED':
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.SUCCEEDED)
+        else:
+            info.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.FAILED)
+    paid_outcome: paid_capacity.LaunchOutcome | None = (
+        paid_capacity.LaunchOutcome.SUCCESS if projection.status.value
+        == 'SUCCEEDED' else paid_capacity.LaunchOutcome.OTHER_FAILURE)
+    if projection.paid_capacity_pool_key is None:
+        paid_outcome = None
+    return serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
+        connection,
+        authority.service_name,
+        authority.service_hash,
+        info.replica_id,
+        info.replica_record_id,
+        projection.context.association_id,
+        info,
+        paid_capacity_pool_key=projection.paid_capacity_pool_key,
+        paid_capacity_outcome=paid_outcome)
+
+
+def _settle_bound_ordinary_launches_for_teardown(
+    authority: ordinary_launch_binding.ControllerBindingAuthority | None,
+    replica_infos: list[Any],
+) -> None:
+    """Cancel and project every exact association before generic cleanup."""
+    if (authority is None or authority.capable is not True or
+            authority.binding_mode
+            != ordinary_launch_binding.BindingMode.BOUND):
+        return
+    projector = functools.partial(_project_bound_ordinary_launch_for_teardown,
+                                  authority)
+    targets: list[tuple[Any, Any]] = []
+    for info in replica_infos:
+        target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
+            authority.service_name, info.replica_id, info.replica_record_id)
+        if target is None:
+            continue
+        durable_reason = target.cancel_reason
+        # First pass: make every exact cancellation reachable before waiting
+        # for any one executor's quiescence. Provider authority is
+        # service-scoped, so reducing replica N before cancelling N+1 could
+        # otherwise let one stuck request delay cancellation for all peers.
+        request_postgres.request_bound_ordinary_launch_cancel(
+            target.context, authority, durable_reason or 'service-teardown')
+        targets.append((info, target))
+
+    for info, target in targets:
+        context = target.context
+        reduction = request_postgres.reduce_bound_ordinary_launch(
+            context, authority, project_replica_result=projector)
+        attempts = 0
+        while True:
+            disposition = _bound_ordinary_launch_disposition(reduction)
+            if disposition == 'AMBIGUOUS':
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Teardown found a durably ambiguous ordinary launch for '
+                    f'replica {info.replica_id}; refusing provider cleanup.')
+            if (getattr(reduction, 'projected', False) or disposition
+                    in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
+                break
+            if disposition not in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE',
+                                   'REDUCE_TERMINAL', 'PRE_EFFECT_TERMINALIZE'):
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Teardown reducer returned unknown ordinary-launch '
+                    f'disposition {disposition!r}.')
+            attempts += 1
+            if attempts == 1 or attempts % 20 == 0:
+                logger.info(
+                    'Waiting for exact ordinary-launch quiescence before '
+                    'service teardown (service=%s replica=%s '
+                    'disposition=%s).', authority.service_name, info.replica_id,
+                    disposition)
+            time.sleep(_BOUND_ORDINARY_LAUNCH_SETTLE_INTERVAL_SECONDS)
+            reduction = request_postgres.reduce_bound_ordinary_launch(
+                context, authority, project_replica_result=projector)
+
+
 def _run_cleanup_and_finalize(service_name: str,
                               service_spec: 'service_spec_lib.SkyServiceSpec',
                               service_dir: str,
@@ -1296,18 +1465,78 @@ def _run_cleanup_and_finalize(service_name: str,
     FAILED_CLEANUP so an operator can ``--purge``; on success the service row
     and working dir are removed.
     """
-    # Publish the durable terminal fence BEFORE scanning launch requests. The
-    # API scheduler and the persisted execution entrypoint both reject a Serve
-    # launch whose owner is terminal, so an HTTP request appearing after an
-    # empty scan cannot begin provisioning. The controller-port
-    # acknowledgement remains later: purge may only proceed after every
-    # already-persisted request is terminal.
-    if not serve_state.set_service_status_and_active_versions_if_owner(
-            service_name, service_hash, controller_pid, controller_ip,
-            serve_state.ServiceStatus.SHUTTING_DOWN):
+    # A bound provider retry can hold the shared launch-authority guard until
+    # its API request is cancelled. Publish terminal intent under canonical
+    # row locks first, deliver cancellation, and prove request quiescence
+    # before taking any exclusive authority guard. Legacy mode retains the
+    # established exclusive status transition on unsupported stores.
+    try:
+        teardown_result = (
+            ordinary_launch_binding.begin_service_teardown_if_owner(
+                service_name, service_hash, (controller_pid, controller_ip)))
+        pre_teardown_binding_authority = teardown_result.authority
+    except Exception as e:  # pylint: disable=broad-except
         logger.warning(
-            f'Lost ownership before fencing new replica launches for '
-            f'{service_name!r}.')
+            f'Could not fence bound launch admission before teardown of '
+            f'{service_name!r}: {common_utils.format_exception(e)}')
+        return
+    if teardown_result.disposition == (
+            ordinary_launch_binding.ServiceTeardownDisposition.UNSUPPORTED):
+        if not serve_state.set_service_status_and_active_versions_if_owner(
+                service_name, service_hash, controller_pid, controller_ip,
+                serve_state.ServiceStatus.SHUTTING_DOWN):
+            logger.warning(
+                f'Lost ownership before fencing new replica launches for '
+                f'{service_name!r}.')
+            return
+
+    try:
+        replica_infos = serve_state.get_replica_infos(service_name)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(f'Could not read replica launch inventory before '
+                       f'teardown of {service_name!r}: '
+                       f'{common_utils.format_exception(e)}')
+        return
+    if pre_teardown_binding_authority is not None:
+        try:
+            _settle_bound_ordinary_launches_for_teardown(
+                pre_teardown_binding_authority, replica_infos)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f'Could not deliver exact bound launch cancellation before '
+                f'teardown of {service_name!r}: '
+                f'{common_utils.format_exception(e)}')
+            return
+        if not serve_utils.quiesce_service_replica_launch_requests(
+                service_name,
+                replica_infos,
+                continue_guard=lambda: serve_state.service_owner_matches(
+                    service_name, service_hash,
+                    (controller_pid, controller_ip)),
+                include_terminal_history=True):
+            logger.warning(
+                f'Refusing exclusive teardown authority for {service_name!r} '
+                'until all bound and special launch requests are quiescent.')
+            return
+
+    # The controller child has already been killed.  Claim a fresh restricted
+    # reducer incarnation before touching its unresolved associations.  This
+    # is required even on an ordinary (non-HA) teardown: the child may have
+    # respawned since the parent last received an authority object.  The
+    # transfer is atomic with every unsettled association and is retry-safe
+    # after a parent crash.
+    try:
+        teardown_binding_authority = (
+            ordinary_launch_binding.claim_controller_incarnation(
+                service_name,
+                service_hash, (controller_pid, controller_ip),
+                uuid.uuid4(),
+                new_parent_owner=(controller_pid, controller_ip),
+                expected_status=serve_state.ServiceStatus.SHUTTING_DOWN))
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            f'Could not claim exact ordinary-launch teardown authority for '
+            f'{service_name!r}: {common_utils.format_exception(e)}')
         return
 
     # The caller has killed/joined the controller child before entering here.
@@ -1315,11 +1544,13 @@ def _run_cleanup_and_finalize(service_name: str,
     # killing the child alone does not prove launch quiescence. Every request is
     # backed by a replica row created before sdk.launch is submitted.
     try:
-        replica_infos = serve_state.get_replica_infos(service_name)
+        _settle_bound_ordinary_launches_for_teardown(teardown_binding_authority,
+                                                     replica_infos)
     except Exception as e:  # pylint: disable=broad-except
-        logger.warning(f'Could not read replica launch inventory before '
-                       f'teardown of {service_name!r}: '
-                       f'{common_utils.format_exception(e)}')
+        logger.warning(
+            f'Refusing generic cleanup until exact bound ordinary launches '
+            f'for {service_name!r} settle: '
+            f'{common_utils.format_exception(e)}')
         return
     if not serve_utils.quiesce_service_replica_launch_requests(
             service_name,
@@ -1663,6 +1894,8 @@ def _start(service_name: str,
         else:
             recovery_expected_controller_pid = service.get('controller_pid')
             recovery_expected_controller_ip = service.get('controller_ip')
+            recovery_expected_lifecycle_epoch = service.get('lifecycle_epoch')
+            recovery_expected_status = service.get('status')
         resource_scope = service.get('resource_scope')
     else:
         # add_service accepts the caller-generated UUID while preserving its
@@ -1675,6 +1908,8 @@ def _start(service_name: str,
             f'Service {service_name!r} has no durable incarnation hash.')
     # Pod IP for full controller-owner fencing, including teardown recovery.
     pod_ip: str | None = os.environ.get('POD_IP')
+    controller_binding_authority: (
+        ordinary_launch_binding.ControllerBindingAuthority | None) = None
 
     def _read_yaml_content(yaml_path: str) -> str:
         with open(os.path.expanduser(yaml_path), encoding='utf-8') as f:
@@ -1774,16 +2009,85 @@ def _start(service_name: str,
     # cleanup instead.
     if _should_resume_teardown(is_recovery, service):
         assert service is not None
-        claimed = serve_state.update_service_controller_pid_if_owner(
-            service_name,
-            expected_service_hash=service_incarnation,
-            expected_controller_pid=recovery_expected_controller_pid,
-            expected_controller_ip=recovery_expected_controller_ip,
-            controller_pid=os.getpid(),
-            controller_ip=pod_ip,
-            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
-            expected_status=recovery_expected_status,
-            expected_recovery_version=recovery_expected_version)
+        # The prior controller may have died after publishing SHUTTING_DOWN
+        # while its API executor still owns the shared provider guard. Use the
+        # old row-locked association authority to deliver cancellation and
+        # prove execution quiescence before the fresh process attempts the
+        # exclusive controller transfer.
+        teardown_claim_expected_status = recovery_expected_status
+        try:
+            teardown_result = (
+                ordinary_launch_binding.begin_service_teardown_if_owner(
+                    service_name, service_incarnation,
+                    (recovery_expected_controller_pid,
+                     recovery_expected_controller_ip)))
+            pre_teardown_authority = teardown_result.authority
+            if teardown_result.disposition != (
+                    ordinary_launch_binding.ServiceTeardownDisposition.
+                    UNSUPPORTED):
+                # The atomic admission fence advances any prior teardown
+                # status (including FAILED_CLEANUP) to the status accepted by
+                # the exclusive ownership transfer below.
+                teardown_claim_expected_status = (
+                    serve_state.ServiceStatus.SHUTTING_DOWN)
+            if pre_teardown_authority is not None:
+                pre_teardown_replicas = serve_state.get_replica_infos(
+                    service_name)
+                _settle_bound_ordinary_launches_for_teardown(
+                    pre_teardown_authority, pre_teardown_replicas)
+                if not serve_utils.quiesce_service_replica_launch_requests(
+                        service_name,
+                        pre_teardown_replicas,
+                        continue_guard=lambda:
+                        serve_state.service_owner_matches(
+                            service_name, service_incarnation,
+                            (recovery_expected_controller_pid,
+                             recovery_expected_controller_ip)),
+                        include_terminal_history=True):
+                    logger.warning(
+                        f'Deferring teardown recovery for {service_name!r} '
+                        'until every prior launch execution is quiescent.')
+                    return
+        except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+            _exit_on_ownership_loss(False, service_name,
+                                    'preparing teardown recovery', None)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f'Could not prepare exact launch cancellation for teardown '
+                f'recovery of {service_name!r}: '
+                f'{common_utils.format_exception(e)}')
+            return
+        teardown_binding_authority = None
+        try:
+            teardown_binding_authority = (
+                ordinary_launch_binding.claim_controller_incarnation(
+                    service_name,
+                    service_incarnation, (recovery_expected_controller_pid,
+                                          recovery_expected_controller_ip),
+                    uuid.uuid4(),
+                    new_parent_owner=(os.getpid(), pod_ip),
+                    expected_lifecycle_epoch=(
+                        recovery_expected_lifecycle_epoch),
+                    expected_status=teardown_claim_expected_status,
+                    expected_recovery_version=(recovery_version
+                                               if recovery_snapshot is not None
+                                               else None)))
+        except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+            _exit_on_ownership_loss(False, service_name,
+                                    'claiming teardown recovery', None)
+        if teardown_binding_authority is None:
+            claimed = serve_state.update_service_controller_pid_if_owner(
+                service_name,
+                expected_service_hash=service_incarnation,
+                expected_controller_pid=recovery_expected_controller_pid,
+                expected_controller_ip=recovery_expected_controller_ip,
+                controller_pid=os.getpid(),
+                controller_ip=pod_ip,
+                expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+                expected_status=teardown_claim_expected_status,
+                expected_recovery_version=recovery_expected_version)
+        else:
+            claimed = True
         _exit_on_ownership_loss(claimed, service_name,
                                 'claiming teardown recovery', None)
         logger.info(f'Recovering service {service_name} in status '
@@ -1956,16 +2260,46 @@ def _start(service_name: str,
         # makes the stable proxy fail closed with 503 during boot instead of
         # routing to the dead prior owner. The ready port is published only
         # after _wait_for_controller_ready succeeds below.
-        claimed = serve_state.update_service_controller_pid_if_owner(
-            service_name,
-            expected_service_hash=service_incarnation,
-            expected_controller_pid=recovery_expected_controller_pid,
-            expected_controller_ip=recovery_expected_controller_ip,
-            controller_pid=os.getpid(),
-            controller_ip=pod_ip,
-            expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
-            expected_status=recovery_expected_status,
-            expected_recovery_version=recovery_expected_version)
+        try:
+            controller_binding_authority = (
+                ordinary_launch_binding.claim_controller_incarnation(
+                    service_name,
+                    service_incarnation,
+                    (recovery_expected_controller_pid,
+                     recovery_expected_controller_ip),
+                    uuid.uuid4(),
+                    new_parent_owner=(os.getpid(), pod_ip),
+                    expected_lifecycle_epoch=(
+                        recovery_expected_lifecycle_epoch),
+                    expected_status=recovery_expected_status,
+                    expected_recovery_version=(version if recovery_snapshot
+                                               is not None else None),
+                    # A prior executor can still own shared provider authority
+                    # after the old parent dies. Exit this HA attempt instead
+                    # of blocking the only process that can later resume a
+                    # durably requested teardown and deliver cancellation.
+                    wait_for_authority=False))
+        except ordinary_launch_binding.OrdinaryLaunchBindingBusy:
+            logger.warning(
+                f'Deferring recovery ownership for {service_name!r} while '
+                'prior provider work retains shared authority.')
+            return
+        except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+            _exit_on_ownership_loss(False, service_name, 'preclaiming recovery',
+                                    None)
+        if controller_binding_authority is None:
+            claimed = serve_state.update_service_controller_pid_if_owner(
+                service_name,
+                expected_service_hash=service_incarnation,
+                expected_controller_pid=recovery_expected_controller_pid,
+                expected_controller_ip=recovery_expected_controller_ip,
+                controller_pid=os.getpid(),
+                controller_ip=pod_ip,
+                expected_lifecycle_epoch=recovery_expected_lifecycle_epoch,
+                expected_status=recovery_expected_status,
+                expected_recovery_version=recovery_expected_version)
+        else:
+            claimed = True
         _exit_on_ownership_loss(claimed, service_name, 'preclaiming recovery',
                                 None)
 
@@ -1978,6 +2312,22 @@ def _start(service_name: str,
     # the finally returns (None, None, None) for the caught path.
     shutdown_via_user_signal = False
     try:
+        if not is_recovery:
+            try:
+                controller_binding_authority = (
+                    ordinary_launch_binding.claim_controller_incarnation(
+                        service_name,
+                        service_incarnation, (os.getpid(), pod_ip),
+                        uuid.uuid4(),
+                        new_parent_owner=(os.getpid(), pod_ip),
+                        expected_lifecycle_epoch=lifecycle_epoch,
+                        expected_status=(
+                            serve_state.ServiceStatus.CONTROLLER_INIT),
+                        expected_recovery_version=version))
+            except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+                _exit_on_ownership_loss(False, service_name,
+                                        'claiming fresh controller startup',
+                                        None)
 
         def _get_controller_host():
             """Get the controller host address.
@@ -1998,7 +2348,9 @@ def _start(service_name: str,
         with _spawn_controller_on_reserved_port(
                 service_name, service_spec, version, controller_host,
                 service_incarnation, pod_ip, resource_scope,
-                enforce_launch_fence) as (controller_process, controller_port):
+                enforce_launch_fence,
+                controller_binding_authority) as (controller_process,
+                                                  controller_port):
             logger.debug(f'_start() spawned controller_process pid='
                          f'{controller_process.pid} host={controller_host} '
                          f'port={controller_port}')
@@ -2031,14 +2383,20 @@ def _start(service_name: str,
                          f'controller_ip -> {pod_ip}, controller_port -> '
                          f'{controller_port}, service_hash -> '
                          f'{service_incarnation}')
-            published = (serve_state.update_service_controller_pid_ip_and_port(
-                service_name,
-                controller_pid=os.getpid(),
-                controller_ip=pod_ip,
-                controller_port=controller_port,
-                expected_service_hash=service_incarnation,
-                expected_controller_pid=os.getpid(),
-                expected_controller_ip=pod_ip))
+            if controller_binding_authority is None:
+                published = (
+                    serve_state.update_service_controller_pid_ip_and_port(
+                        service_name,
+                        controller_pid=os.getpid(),
+                        controller_ip=pod_ip,
+                        controller_port=controller_port,
+                        expected_service_hash=service_incarnation,
+                        expected_controller_pid=os.getpid(),
+                        expected_controller_ip=pod_ip))
+            else:
+                published = (ordinary_launch_binding.
+                             publish_controller_port_if_authority(
+                                 controller_binding_authority, controller_port))
             _exit_on_ownership_loss(published, service_name,
                                     'publishing the ready controller',
                                     controller_process)

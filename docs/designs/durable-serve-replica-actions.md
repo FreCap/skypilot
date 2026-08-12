@@ -217,15 +217,20 @@ It reaches the Serve association and replica tables through the same physical
 database and the same SQLAlchemy connection; Serve does not duplicate request
 serialization or attempt a transaction across two engines. Admission fails
 closed on SQLite, plugin request or queue backends, or either schema lineage
-being behind its required head. Every effect-authorizing cross-table path takes
-the service launch-authority guard, then locks lifecycle, service, replica,
-association, request, queue, and retention-pin rows in that order, omitting only
-unused suffixes and never inverting it. Generic API terminal/quiescence writes
-remain request-only. Queue claim locks only request/queue rows and performs a
-non-locking association validity read; the authoritative association lock and
-revalidation is the later pre-I/O fence, so claim cannot create a lock cycle or
-grant effect authority by itself. No component may own both an unfenced stale
-replica snapshot and permission to start provider I/O.
+being behind its required head. Every provider-effect-authorizing cross-table
+path takes the shared service launch-authority guard, then locks lifecycle,
+service, replica, association, request, queue, and retention-pin rows in that
+order, omitting only unused suffixes and never inverting it. Owner transfer and
+binding-mode changes take the exclusive side. Cancellation and reduction grant
+no provider authority and deliberately do not wait for either advisory side;
+they take the same canonical row sequence and revalidate owner epoch/revision.
+Generic API terminal/quiescence writes remain request-only. Queue claim locks
+only request/queue rows and performs a non-locking association validity read;
+the authoritative association lock and revalidation is the later pre-I/O
+fence, so claim cannot create a lock cycle or grant effect authority by itself.
+Non-authorizing adoption/cancel-target snapshots also take no advisory guard
+and can only feed a later canonical transaction. No component may own both an
+unfenced stale replica snapshot and permission to start provider I/O.
 
 ### Commit-before-effect
 
@@ -275,10 +280,19 @@ An active correlated bound request without its queue row is invariant
 corruption, not an activation state. Startup locks the correlated evidence. If
 execution generation is zero, no claim/lease exists, and effect phase is
 `NOT_STARTED`, it cancels/quiesces generation zero and records
-`PRE_EFFECT_TERMINAL`. Any nonzero generation, claim evidence, or advanced
-effect phase becomes `AMBIGUOUS`; startup terminalizes the request and requires
-the exact owner acknowledgement or lease-expiry quiescence proof. It never
-synthesizes execution or infers a successor.
+`PRE_EFFECT_TERMINAL`. A claimed `PENDING` or `WAITING` row between queue
+handoff and `RUNNING` publication remains active when its exact token, worker,
+generation, queue delivery, and live lease agree. Correlated bound rows are
+excluded from the generic queue lease reaper: only the association-aware
+reducer may interpret their expiry. An exact expired owner generation may be
+terminalized and marked quiescent atomically only while the association still
+proves `NOT_STARTED`, because the expired claim can no longer acquire the
+provider fence. This also closes an already-terminal, queue-deleted exact
+generation while retaining its token/worker evidence for a late idempotent
+owner acknowledgement. The same expiry at `PROVIDER_IO` or later becomes
+durably `AMBIGUOUS`. Lease expiry alone never proves that post-effect executor
+code stopped, and no generic timeout sweep synthesizes that proof. Startup
+never synthesizes execution or infers a successor.
 
 The transaction compares at least:
 
@@ -319,7 +333,7 @@ Identity/digest fields never change, and unresolved history cannot be deleted.
 | `BOUND` | Request active or terminal evidence not yet reduced; effect phase is authoritative | yes | result reduction, fenced cancel, or ambiguity |
 | `CANCEL_REQUESTED` | Current owner committed exact supersede/teardown intent | yes | exact terminal + quiescence reduction |
 | `RESULT_RECORDED` | Exact terminal/quiescence and service-job ID copied after `SERVICE_JOB_RECORDED` | yes | atomic replica projection |
-| `PRE_EFFECT_TERMINAL` | Exact terminal/quiescence copied while effect remained `NOT_STARTED`; failure projected, pointer cleared, pin deleted | no | successor generation may be admitted |
+| `PRE_EFFECT_TERMINAL` | Exact terminal/quiescence copied while effect remained `NOT_STARTED`; replica reprojected pending unless teardown already interrupted it; pointer and retention pin cleared | no | non-cancelled demand may admit a successor generation with the same exact paid claim; cancellation releases the claim and cannot retry |
 | `PROJECTED` | Exact result/tombstone projected, pointer cleared, pin deleted | no | 60-day tombstone retention |
 | `AMBIGUOUS` | Effect/claim/result cannot prove a safe terminal disposition | yes | explicit operator reconciliation only |
 
@@ -386,9 +400,12 @@ must revalidate:
 A failed check terminates without provider I/O. Under the existing shared
 service launch-authority guard, the backend repeats validation and atomically
 advances `NOT_STARTED` to `PROVIDER_IO` immediately before provider work. The
+fenced provider tail includes every `Storage.construct()` call, since bucket
+creation/checks and source synchronization are externally effectful. No bound
+storage construction occurs in the pre-effect policy/optimization prefix. The
 service-job boundary revalidates the same tuple, advances to `SERVICE_JOB_IO`
 before its call, then records `SERVICE_JOB_RECORDED` plus the exact returned job
-ID. A crash in that interval is conservative may-have-submitted ambiguity. A
+ID. A crash in either interval is conservative may-have-submitted ambiguity. A
 lost claim never becomes permission for another effect. Controller takeover
 takes the exclusive guard, waits for opaque provider work already in progress,
 and adopts the same request; it never replays that call.
@@ -403,9 +420,17 @@ Generic request terminal and quiescence transactions update request state only;
 the retention pin prevents collection. Using canonical service/replica/
 association lock order, the Serve completion reducer reads immutable request
 terminal status/cause, result/service-job ID, execution generation, and exact
-quiescence without locking request after association. It copies that evidence,
+quiescence by locking the request, queue, and retention pin after the
+association. It copies that evidence,
 updates replica status, marks the association `PROJECTED`, and releases the pin
-in one transaction on both ordinary and paid-capacity completion paths.
+in one transaction on both ordinary and paid-capacity completion paths. The
+reducer relies on those canonical row locks rather than the exclusive provider
+advisory guard. This is safe because its only expiry writes either settle an
+exact `NOT_STARTED` generation whose expired lease can no longer enter the
+provider guard or mark an advanced phase `AMBIGUOUS`; projection additionally
+requires the executor's exact-generation quiescence receipt, which is emitted
+only after its provider guard has exited. The same rows serialize controller
+owner transfer and effect-phase advance.
 
 Failure and retry policy use the database clock. Terminal plus quiescent does
 not prove effect absence. A successor generation is allowed only from
@@ -419,11 +444,14 @@ effect absence.
 ### Cleanup
 
 The existing durable cleanup intent remains authoritative. This project does
-not need a second cleanup action graph. Teardown or supersession finds the
-association by exact record identity and serializes with the service launch-
-authority guard. It first commits an owner-epoch/revision-fenced cancel intent,
-cancels only that request, and proves execution quiescence before deleting or
-replacing the replica row and projecting a tombstone. Ordinary
+not need a second cleanup action graph. Teardown or supersession finds every
+association through a non-authorizing exact record snapshot. It first commits
+owner-epoch/revision-fenced cancel intent for all targets in one complete pass,
+without an advisory guard, so one stuck provider cannot make cancellation of a
+peer unreachable. A second pass drives each canonical row-lock reducer to
+projection, safe pre-effect settlement, or durable ambiguity, then the generic
+barrier covers legacy/special requests. Only after those proofs may teardown
+take exclusive owner authority and delete or replace replica rows. Ordinary
 `remove_replica(s)` cannot race a bound pre-I/O check with a direct ORM delete.
 Association history is retained so a same-number successor record cannot
 inherit, cancel, or project predecessor work.
@@ -592,7 +620,26 @@ If R1 authorizes work:
 
 System-OOM recovery, pools, reserved-fill launches, and other special launch
 profiles remain on their existing contracts and may not enter this ordinary
-association path.
+association path. For a non-pool service in `bound` mode, retaining those
+contracts is not an unmarked fallback: every excluded request carries one
+closed, versioned discriminator through queue persistence and the provider
+boundary. The persistent-special form names the exact replica ID and canonical
+`replica_record_id`; the system-recovery form names the exact replica ID,
+launch generation, and server-bound request ID. Both admission checks reread
+the named PENDING/PROVISIONING replica in the same PostgreSQL authorization
+snapshot and require the corresponding persisted exclusion state. Unknown,
+partial, stale, mismatched, or ordinary unmarked claims fail closed. Pools
+retain their separate existing authority and do not use this discriminator.
+The dedicated bound endpoint rejects every caller-authored excluded-profile
+key. Admission and every provider, service-job, cancellation, and projection
+boundary decode the full versioned replica payload and require the exact narrow
+ordinary defaults: no reserved-fill metadata, zero-cost placement, unknown-
+capacity replacement, cost-rebalance predecessor, or system-recovery state.
+They also require the scalar and decoded replica ID, canonical record ID,
+cluster, status, and service version to agree, and require that version to
+remain the current quarantine-aware elected version. A special-profile marker
+or profile drift therefore removes bound effect authority rather than creating
+a second launch contract.
 
 The crash matrix includes timeout before transaction commit, response loss
 after atomic commit, identical and conflicting submission-key retries, old-
@@ -605,6 +652,70 @@ ambiguous state.
 
 This phase must be one focused feature PR. If it temporarily preserves an old
 fallback, the removal PR is created at the same time as a blocked stacked PR.
+
+The R2 implementation keeps every service in `legacy` mode by default and
+exposes no public SDK or CLI switch. The only transition surface is a hidden,
+administrator-authenticated API operation carrying the exact service hash and
+source binding epoch. It forwards to the exact owner-protected controller
+endpoint, which holds the
+controller actuation lock and the manager admission lock while one PostgreSQL
+transaction advances the binding epoch. Promotion pairs that transaction with
+the service's existing launch-authority advisory lock; legacy request
+admission takes the shared side before request/queue insertion. This closes
+the admission phantom without global request-table locks or a queue-claim lock
+upgrade cycle. Promotion and demotion retries accept only the immediately
+adjacent epoch under the same controller incarnation. A controller that
+already installed that exact target returns the committed epoch without
+rerunning barriers, so a lost response is idempotent but an epoch ABA fails
+closed.
+
+The exact reducer validates the complete successful `(service_job_id,
+CloudVmRayResourceHandle)` result and cluster identity before projection. A
+non-cancelled `PRE_EFFECT_TERMINAL` keeps the replica pending and retains any
+exact paid-capacity claim for generation `N+1`; teardown or supersession
+cancellation releases the claim and cannot retry. An exact association pointer
+keeps the paid-capacity claim live through the replica's transient
+`INTERRUPTED` teardown state until projection releases it, so another service
+sharing the pool cannot consume that capacity early. Service teardown first
+publishes `SHUTTING_DOWN` under canonical lifecycle/service row locks and
+delivers exact cancellation to every target while a provider retry may still
+hold shared authority. It then reduces/projects under the old exact owner and
+runs the generic legacy/special quiescence barrier before taking exclusive
+authority and claiming a fresh restricted teardown incarnation. Dead-child
+respawn and ordinary HA recovery try that exclusive ownership nonblockingly, so
+they cannot occupy the only process that can observe a later teardown.
+`FAILED_CLEANUP` recovery uses the post-fence `SHUTTING_DOWN` status in that
+ownership transfer. This also
+covers teardown recovery after the serving controller subprocess has
+disappeared. Request-owned GC selects and deletes only settled, aged, unpinned,
+unreferenced association tombstones in one transaction; unresolved or
+ambiguous evidence remains durable.
+
+Cancellation is absorbing. A first transaction durably records the association
+cancel intent and immutable reason; idempotent redelivery then terminalizes the
+request and removes its queue row in a separate request transaction. Once the
+association has durably entered
+`CANCEL_REQUESTED`, its reason and timestamp are immutable, a cancelled
+`PRE_EFFECT_TERMINAL` predecessor cannot allocate generation `N+1`, and generic
+request cancellation skips every request carrying an ordinary association.
+The association cancel-intent transaction locks the canonical lifecycle,
+service, replica, and association rows directly; it does not wait behind the
+shared provider-authority advisory guard. The request cancellation transaction
+then locks the exact request and queue rows. A crash between them is recovered
+by redelivering the durable reason, never by inventing a replacement reason.
+The row-lock reducer similarly never waits for that advisory guard: it cannot
+authorize cleanup from an unquiesced post-effect request, but it can durably
+expose ambiguity instead of deadlocking behind the opaque call.
+
+A live controller locally re-drives a pointerless unresolved admission with the
+same stable submission UUID instead of waiting for another restart. A persisted
+`SHUTTING_DOWN` race re-enters exact settlement and teardown with its saved
+scale-down, purge, and drain-cap fields. Restart adoption freezes the replica's
+persisted service version, retires superseded rows, and refuses a newly elected
+version at both admission and effect boundaries. Finally, the parent marks a
+started bound worker `RUNNING` only through a locked compare-and-update that
+requires the exact active association and still-`SCHEDULED` row; a faster child
+projection always wins.
 
 ### R3: rollout and removal
 
@@ -725,7 +836,11 @@ open, and requires rollback if investigation connects it to the new artifact.
 R2 ships with every service in durable `legacy` mode, so schema and capability
 writes are dark. Promotion changes one approved non-pool service to `bound`
 only after its controller capability, the full participant barrier, and the
-legacy-drain transaction pass. An incapable controller cannot own that service.
+legacy-drain transaction pass. The participant barrier includes every API,
+queue-executor, and service-controller role that must preserve and revalidate
+the closed excluded-profile discriminator; a queued special request may cross
+promotion only because all of those roles understand its exact persisted
+identity. An incapable controller cannot own that service.
 Rollback disables further promotion, keeps capable binaries serving existing
 bound rows, and waits for every request to become terminal, quiescent, copied,
 projected, and unpinned. The fenced demotion transaction then proves no active
@@ -733,8 +848,18 @@ generation, sets the service back to `legacy`, and increments its binding epoch
 before any incapable image may own it. A rollback must not clear associations
 or tombstones, release pins early, change replica record IDs, or race a
 predecessor with a successor. R3 makes `bound` the creation/steady-state mode
-for eligible non-pool services after all such services are promoted; excluded
-profiles retain explicit `legacy` mode.
+for non-pool services after all such services are promoted; excluded profiles
+retain their existing contracts through the closed discriminator rather than
+entering the ordinary association path.
+
+Eligibility is deliberately narrower than "not a pool": reserved-fill,
+zero-cost/reservation, system-OOM recovery, unknown-capacity replacement, and
+cost-rebalance launches stay on their existing contracts. Bound mode permits
+them only through the exact excluded-profile discriminator above; it never
+turns their exclusion into generic unmarked launch authority. A fresh paid
+launch that otherwise has the ordinary profile may use R2; if its request
+terminates before either effect boundary, the exact paid claim remains attached
+to the pending replica and is reused by the next durable generation.
 
 No canary that creates provider capacity is authorized by this design alone.
 Before such a canary, record the logical GPU slots, physical instance shape and
@@ -1654,6 +1779,14 @@ leaves its queue row unclaimed. The R3 removal remains draft until this mixed-
 version and rollback sequence,
 the exact crash matrix, and the monitoring window below have passed.
 
+The operational promotion/demotion request is intentionally absent from the
+public Serve API contract. An operator must first read the current service hash
+and binding epoch and submit both with the requested mode; a replaced service,
+stale owner,
+non-adjacent epoch, active local launch worker, incapable participant, legacy
+request that is not terminal and exactly quiescent, queued legacy request, or
+unsettled bound association returns a conflict without changing mode.
+
 R2 completion, if authorized, requires all of the following in tests and the
 approved canary:
 
@@ -1667,15 +1800,31 @@ approved canary:
   fence;
 - zero cancellation or deletion caused by ordinary controller replacement and
   zero cancellation or deletion of a successor replica record;
+- every caller-authored exclusion marker and every persisted special-profile
+  marker is rejected by bound admission and by the final effect fence;
 - zero eligible launches using restart inference after promotion;
 - exact handoff and adoption after controller restart while queued, claimed,
   and inside the existing launch/provider call;
+- a claimed pre-`RUNNING` handoff remains active, the generic expiry reaper
+  leaves all correlated bound claim evidence untouched in either lock order,
+  and exact active or already-terminal expiry settles only at `NOT_STARTED`;
+- all bound storage construction occurs after `PROVIDER_IO` publication under
+  the exact claim/service guards, and interruption there blocks a successor;
 - no successor after `PROVIDER_IO`, or after `SERVICE_JOB_IO` without an exact
   recorded/projectable outcome, regardless of terminal/quiescence state;
+- malformed durable request errors or successful service-job result payloads
+  become explicit operator-visible ambiguity rather than an in-memory retry
+  loop, while valid decoded capacity/quota errors retain exact paid-pool
+  feedback;
+- expired active or terminal owner evidence at `PROVIDER_IO` or later becomes
+  durable `AMBIGUOUS`, with no timeout-only execution-quiescence synthesis;
 - no request collection while its retention pin is active, and normal
   collection after exact projection releases it;
 - teardown commits cancel intent and proves exact-request quiescence before
   replica deletion or replacement;
+- cancel intent commits while a provider retry holds its shared authority
+  guard, generic cancellation cannot bypass the Serve transaction, and
+  cancellation cannot be cleared, rewritten, or followed by a successor;
 - terminal/quiescence publication racing fenced cancel or projection completes
   without request/association lock inversion and preserves one outcome;
 - terminal projection within two controller polls after the API result;

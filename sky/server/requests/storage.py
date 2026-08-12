@@ -29,6 +29,9 @@ class ExecutionClaim:
     request_id: str
     execution_generation: int
     claim_token: str
+    # Durable claimant identity, populated for PostgreSQL queue deliveries.
+    # Local/plugin backends retain None and cannot execute bound handlers.
+    worker_instance_id: str | None = None
 
 
 _EXECUTION_CANCELLATION_DIRECTORY = pathlib.Path(
@@ -108,11 +111,13 @@ def activate_execution_claim(
     request_id: str,
     execution_generation: int,
     claim_token: str | None,
+    worker_instance_id: str | None = None,
 ) -> contextvars.Token:
     """Activate a durable claim for fenced writes in this context."""
     claim = None
     if claim_token is not None:
-        claim = ExecutionClaim(request_id, execution_generation, claim_token)
+        claim = ExecutionClaim(request_id, execution_generation, claim_token,
+                               worker_instance_id)
     return _EXECUTION_CLAIM.set(claim)
 
 
@@ -243,6 +248,14 @@ class RequestBackend(abc.ABC):
     async def delete_requests(self, request_ids: list[str]) -> None:
         """Delete requests by their IDs."""
         raise NotImplementedError
+
+    async def gc_request_owned_tombstones(self) -> int:
+        """Collect backend-owned cross-domain tombstones, if supported.
+
+        This source-compatible default keeps local and plugin request
+        backends outside the central PostgreSQL binding contract.
+        """
+        return 0
 
     @abc.abstractmethod
     async def update_status_async(self, request_id: str,

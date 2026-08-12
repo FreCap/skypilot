@@ -2,6 +2,7 @@
 import asyncio
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 import contextlib
 import dataclasses
@@ -30,6 +31,7 @@ from sky import resources as resources_lib
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
@@ -68,6 +70,7 @@ from sky.utils import yaml_utils
 if typing.TYPE_CHECKING:
 
     from sky.serve import service_spec
+    from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
     from sky.serve.replica_info import ReplicaInfo
     from sky.serve.replica_info import ReplicaStatusProperty
     SpotPlacerType: typing.TypeAlias = spot_placer.SpotPlacer
@@ -76,6 +79,10 @@ else:
     ReplicaInfo = replica_info_lib.ReplicaInfo
 
 logger = sky_logging.init_logger(__name__)
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+requests = adaptors_common.LazyImport('requests')
 
 # Keep the established replica_managers import and pickle identities while the
 # versioned record implementation lives in its own low-state module.
@@ -216,13 +223,20 @@ class _ReplicaLaunchResult:
 class _ReplicaLaunchThread(thread_utils.SafeThread):
     """Launch worker that publishes a joinable completion notification."""
 
-    def __init__(self, *args: Any, replica_id: int,
+    def __init__(self,
+                 *args: Any,
+                 replica_id: int,
                  completion_queue: 'queue.SimpleQueue[int]',
-                 completion_event: threading.Event, **kwargs: Any) -> None:
+                 completion_event: threading.Event,
+                 bound_ordinary_launch: bool = False,
+                 ordinary_legacy_launch: bool = False,
+                 **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._completion_replica_id = replica_id
         self._completion_queue = completion_queue
         self._completion_event = completion_event
+        self.bound_ordinary_launch = bound_ordinary_launch
+        self.ordinary_legacy_launch = ordinary_legacy_launch
 
     def run(self) -> None:
         try:
@@ -370,6 +384,45 @@ class _ReplicaLaunchOwnershipLostError(RuntimeError):
 
 class _ReplicaLaunchSupersededError(RuntimeError):
     """A queued logical launch lost its exact-card target authority."""
+
+
+class _BoundOrdinaryLaunchUnresolvedError(RuntimeError):
+    """A bound request cannot safely be replaced or projected yet."""
+
+
+class _BoundOrdinaryLaunchTerminalError(RuntimeError):
+    """An exactly projected bound request finished without a launch."""
+
+
+class _BoundOrdinaryLaunchPreEffectTerminalError(
+        _BoundOrdinaryLaunchTerminalError):
+    """A bound request failed before either external-effect boundary."""
+
+
+def _bound_submission_may_have_committed(error: BaseException) -> bool:
+    """Whether submission failed at a boundary that can lose a committed ACK.
+
+    A deterministic 4xx response proves that the server rejected this exact
+    payload.  Inspecting and adopting an older replica pointer in that case
+    would turn a digest/identity conflict into success.  Network failures,
+    server failures, and response-decoding failures rooted in a truncated
+    transport remain ambiguous and may be resolved through the exact pointer.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, requests.exceptions.HTTPError):
+            response = getattr(current, 'response', None)
+            status_code = getattr(response, 'status_code', None)
+            return (not isinstance(status_code, int) or status_code >= 500)
+        if isinstance(current, requests.exceptions.RequestException):
+            return True
+        if isinstance(current, (exceptions.RequestInterruptedError,
+                                exceptions.ServerTemporarilyUnavailableError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class _ReplicaLaunchCapacityError(RuntimeError):
@@ -551,6 +604,377 @@ def adopt_system_recovery_launch(
             f'candidate replica {replica_id}.')
 
 
+def _bound_projection_classification(projection: Any) -> str:
+    classification = getattr(projection, 'disposition', None)
+    if classification is None:
+        classification = getattr(projection, 'classification', None)
+    if isinstance(classification, enum.Enum):
+        classification = classification.value
+    if not isinstance(classification, str) or not classification:
+        raise _BoundOrdinaryLaunchUnresolvedError(
+            'The exact ordinary-launch reducer returned no classification.')
+    return classification
+
+
+def _bound_reduction_request_id(reduction: Any) -> str:
+    request = getattr(reduction, 'request', None)
+    request_id = getattr(request, 'request_id', None)
+    if request_id is None:
+        request_id = getattr(reduction, 'request_id', None)
+    if not isinstance(request_id, str) or not request_id:
+        raise _BoundOrdinaryLaunchUnresolvedError(
+            'The exact ordinary-launch association returned no request ID.')
+    return request_id
+
+
+def _decoded_bound_request_error(error: Any) -> BaseException | None:
+    """Extract the exception from the exact durable request error shape."""
+    if isinstance(error, BaseException):
+        return error
+    if not isinstance(error, dict):
+        return None
+    error_object = error.get('object')
+    error_type = error.get('type')
+    error_message = error.get('message')
+    if (set(error) != {'object', 'type', 'message'} or
+            not isinstance(error_object, BaseException) or
+            error_type != type(error_object).__name__ or
+            error_message != str(error_object)):
+        return None
+    return error_object
+
+
+def _wait_for_bound_ordinary_launch(
+    replica_id: int,
+    cluster_name: str,
+    request_id: str,
+    stream_logs: bool,
+    launch_cloud: clouds.Cloud | None,
+    reduce_exact: Callable[[Any, BaseException | None], Any],
+    cancel_exact: Callable[[str], Any],
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+    continue_guard: Callable[[], bool] | None = None,
+    supersession_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+) -> None:
+    """Adopt, quiesce, and reduce one exact durable request binding."""
+    cancel_reason: str | None = None
+    cancel_committed = False
+    cancellation_failures = 0
+    cancel_projection: Any = None
+
+    def _still_owned() -> bool:
+        if continue_guard is not None:
+            try:
+                owned = continue_guard()
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to verify bound ordinary-launch ownership; '
+                    'detaching: %s', common_utils.format_exception(error))
+                return False
+            return owned
+        return True
+
+    def _raise_if_owner_lost() -> None:
+        if _still_owned():
+            return
+        # Controller replacement transfers the durable association. It is not
+        # a cancellation decision, and the successor adopts the exact pointer.
+        raise _ReplicaLaunchOwnershipLostError(
+            f'Detaching bound ordinary launch for replica {replica_id} after '
+            'controller ownership loss.')
+
+    def _observe_cancel_reason() -> str | None:
+        nonlocal cancel_reason
+
+        if cancel_reason is None and replica_to_launch_cancelled.get(
+                replica_id, False):
+            replica_to_launch_cancelled.pop(replica_id)
+            cancel_reason = 'replica-teardown'
+        if cancel_reason is None and supersession_guard is not None:
+            try:
+                decision = supersession_guard()
+            except Exception as error:  # pylint: disable=broad-except
+                decision = (False, f'guard-error-{type(error).__name__}')
+            if isinstance(decision, bool):
+                allowed = decision
+                reason = 'guard-rejected'
+            elif (isinstance(decision, tuple) and len(decision) == 2 and
+                  isinstance(decision[0], bool) and
+                  isinstance(decision[1], str) and decision[1]):
+                allowed, reason = decision
+            else:
+                allowed, reason = False, 'invalid-guard-result'
+            if not allowed:
+                cancel_reason = reason[:128]
+        return cancel_reason
+
+    def _commit_cancel_if_needed() -> None:
+        nonlocal cancel_committed, cancellation_failures, cancel_projection
+        reason = _observe_cancel_reason()
+        if reason is not None and not cancel_committed:
+            try:
+                cancel_result = cancel_exact(reason)
+                if cancel_result is None or cancel_result is False:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Exact ordinary-launch cancellation found no binding.')
+                cancellation_failures = 0
+                cancel_committed = True
+                cancel_projection = cancel_result
+            except Exception as error:  # pylint: disable=broad-except
+                cancellation_failures += 1
+                if (cancellation_failures == 1 or
+                        cancellation_failures % 10 == 0):
+                    logger.warning(
+                        'Exact cancellation for bound replica %s is not yet '
+                        'committed (attempt %s): %s', replica_id,
+                        cancellation_failures,
+                        common_utils.format_exception(error))
+                raise
+
+    def _request_status(projection: Any) -> str | None:
+        request = getattr(projection, 'request', None)
+        status = getattr(request, 'status', None)
+        if isinstance(status, enum.Enum):
+            status = status.value
+        return status if isinstance(status, str) else None
+
+    def _request_error(projection: Any) -> BaseException | None:
+        request = getattr(projection, 'request', None)
+        error = getattr(request, 'error', None)
+        return _decoded_bound_request_error(error)
+
+    def _finish_projection(projection: Any,
+                           waiter_error: BaseException | None = None) -> None:
+        classification = _bound_projection_classification(projection)
+        if classification == 'AMBIGUOUS':
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                f'Bound ordinary launch for replica {replica_id} is '
+                'durably ambiguous; refusing a successor or cleanup.')
+        if not (getattr(projection, 'projected', False) or classification
+                in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                f'Bound ordinary launch for replica {replica_id} returned '
+                f'nonterminal classification {classification!r}.')
+
+        status = _request_status(projection)
+        request_error = _request_error(projection)
+        exact_error = request_error or waiter_error
+        persisted_cancel_reason = getattr(projection, 'cancel_reason', None)
+        if (persisted_cancel_reason is not None and
+            (not isinstance(persisted_cancel_reason, str) or
+             not persisted_cancel_reason)):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch returned a malformed durable cancel '
+                'reason.')
+        if (cancel_reason is not None and
+                persisted_cancel_reason is not None and
+                cancel_reason != persisted_cancel_reason):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch local and durable cancellation '
+                'reasons disagree.')
+        effective_cancel_reason = persisted_cancel_reason or cancel_reason
+        if effective_cancel_reason is not None:
+            if effective_cancel_reason == 'replica-teardown':
+                # Teardown owns the next action.  Exact projection has cleared
+                # the request pointer, so its caller may now proceed to down.
+                return
+            raise _ReplicaLaunchSupersededError(
+                f'Bound ordinary launch for replica {replica_id} was '
+                'cancelled after supersession: '
+                f'reason={effective_cancel_reason}.')
+        if classification == 'PRE_EFFECT_TERMINAL':
+            error = _BoundOrdinaryLaunchPreEffectTerminalError(
+                f'Bound ordinary launch for replica {replica_id} terminated '
+                'before provider or service-job I/O; the projected failure '
+                'is safe for a later retry generation.')
+            if exact_error is not None:
+                raise error from exact_error
+            raise error
+        if status == 'SUCCEEDED':
+            if exact_error is not None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound ordinary launch for replica {replica_id} has a '
+                    'successful durable result but its exact waiter failed.'
+                ) from exact_error
+            return
+        if (isinstance(exact_error, exceptions.ResourcesUnavailableError) and
+                launch_cloud is not None):
+            reason = cloud_vm_ray_backend.classify_resources_unavailable_error(
+                launch_cloud, exact_error)
+            if reason is not None:
+                raise _ReplicaLaunchCapacityError(
+                    f'Bound ordinary launch for replica {replica_id} failed '
+                    f'due to provider {reason}.',
+                    reason=reason) from exact_error
+        if exact_error is not None:
+            raise exact_error
+        raise _BoundOrdinaryLaunchTerminalError(
+            f'Bound ordinary launch for replica {replica_id} projected '
+            f'terminal status {status!r} without a launch result.')
+
+    reduction_failures = 0
+
+    def _reduce_until_wait_or_terminal(
+            waiter_result: Any = None,
+            waiter_error: BaseException | None = None) -> str:
+        """Drive the reducer and return only when an active wait is needed."""
+        nonlocal reduction_failures, cancel_projection, cancel_reason
+        nonlocal cancel_committed
+        while True:
+            _raise_if_owner_lost()
+            try:
+                _commit_cancel_if_needed()
+            except Exception:  # pylint: disable=broad-except
+                time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+                continue
+            try:
+                if cancel_projection is not None:
+                    projection = cancel_projection
+                    cancel_projection = None
+                else:
+                    projection = reduce_exact(waiter_result, waiter_error)
+            except Exception as error:  # pylint: disable=broad-except
+                reduction_failures += 1
+                if reduction_failures == 1 or reduction_failures % 10 == 0:
+                    logger.warning(
+                        'Exact ordinary-launch reduction for replica %s is '
+                        'temporarily unavailable (attempt %s): %s',
+                        replica_id, reduction_failures,
+                        common_utils.format_exception(error))
+                time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+                continue
+            reduction_failures = 0
+            if projection is None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound ordinary launch for replica {replica_id} lost '
+                    'its exact durable pointer.')
+            classification = _bound_projection_classification(projection)
+            if (getattr(projection, 'projected', False) or
+                    classification in ('PROJECTED', 'PRE_EFFECT_TERMINAL',
+                                       'SETTLED', 'AMBIGUOUS')):
+                # A reducer may atomically finish a recovered CANCEL_REQUESTED
+                # row (including expired NOT_STARTED ownership). Its pointer
+                # and pin are already cleared, so attempting cancel redelivery
+                # after projection would target a deliberately settled row.
+                _finish_projection(projection, waiter_error)
+                return 'TERMINAL'
+            durable_cancel_reason = getattr(projection, 'cancel_reason', None)
+            if durable_cancel_reason is not None:
+                if (not isinstance(durable_cancel_reason, str) or
+                        not durable_cancel_reason):
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Bound ordinary launch returned a malformed durable '
+                        'cancel reason.')
+                if (cancel_reason is not None and
+                        cancel_reason != durable_cancel_reason):
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Bound ordinary launch local and durable '
+                        'cancellation reasons disagree.')
+                if cancel_reason is None:
+                    # A replacement controller recovered a previously
+                    # committed cancel intent.  Redeliver the exact API cancel
+                    # before waiting; association CAS makes this idempotent.
+                    cancel_reason = durable_cancel_reason
+                    cancel_committed = False
+                if not cancel_committed:
+                    continue
+            if classification == 'ADOPT_ACTIVE':
+                return classification
+            if classification not in ('WAIT_QUIESCENCE', 'REDUCE_TERMINAL',
+                                      'PRE_EFFECT_TERMINALIZE'):
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound ordinary launch for replica {replica_id} returned '
+                    f'unknown classification {classification!r}.')
+            # A terminal request can precede its executor's exact-generation
+            # acknowledgement.  It cannot be replaced or cleaned up yet; poll
+            # the one reducer transaction rather than guessing from sdk.get().
+            time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+
+    # Classify before blocking in sdk.get().  In particular this closes the
+    # generation-zero terminalization case: an active request whose queue row
+    # vanished has no executor that could ever wake an SDK waiter, but its
+    # NOT_STARTED effect phase makes exact terminalization safe.
+    if _reduce_until_wait_or_terminal() == 'TERMINAL':
+        return
+
+    launch_request_id = server_common.RequestId[tuple[int | None,
+                                                      backends.ResourceHandle |
+                                                      None]](request_id)
+    result_box: list[Any] = []
+    parent_context = context.get()
+
+    def _wait_exact_request() -> None:
+        with context.initialize(parent_context):
+            if stream_logs:
+                result_box.append(sdk.stream_and_get(launch_request_id))
+            else:
+                result_box.append(sdk.get(launch_request_id))
+
+    # The exact SDK wait preserves typed results/errors and the normal log
+    # stream. Keeping it in a daemon child lets controller replacement detach
+    # promptly without cancelling the durable request it just handed off.
+    exact_waiter = thread_utils.SafeThread(
+        target=_wait_exact_request,
+        name=f'replica-{replica_id}-bound-request-wait',
+        daemon=True)
+    exact_waiter.start()
+    while exact_waiter.is_alive():
+        _raise_if_owner_lost()
+        # Drive claim expiry and terminal/quiescence even while the SDK waiter
+        # is still blocked. Bound requests are intentionally excluded from the
+        # generic queue reaper because only this association-aware reducer can
+        # distinguish NOT_STARTED settlement from post-effect ambiguity.
+        if _reduce_until_wait_or_terminal() == 'TERMINAL':
+            return
+        exact_waiter.join(timeout=_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+    exact_waiter.join()
+    exact_error = exact_waiter.exception
+    launch_result = result_box[0] if result_box else None
+    if exact_error is None:
+        result_is_exact = False
+        if isinstance(launch_result, tuple) and len(launch_result) == 2:
+            service_job_id, handle = launch_result  # pylint: disable=unpacking-non-sequence
+            result_is_exact = bool(
+                not isinstance(service_job_id, bool) and
+                isinstance(service_job_id, int) and service_job_id > 0 and
+                isinstance(handle, backends.CloudVmRayResourceHandle) and
+                handle.cluster_name == cluster_name)
+        if not result_is_exact:
+            exact_error = _BoundOrdinaryLaunchUnresolvedError(
+                f'Bound request {request_id} returned a malformed or '
+                f'mismatched result for replica {replica_id}.')
+    _reduce_until_wait_or_terminal(launch_result, exact_error)
+
+
+@context.contextual
+def adopt_bound_ordinary_launch(
+    replica_id: int,
+    cluster_name: str,
+    log_file: str,
+    request_id: str,
+    launch_cloud: clouds.Cloud | None,
+    reduce_exact: Callable[[Any, BaseException | None], Any],
+    cancel_exact: Callable[[str], Any],
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+    continue_guard: Callable[[], bool] | None = None,
+    supersession_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+) -> None:
+    """Adopt only the association named by the exact replica pointer."""
+    ctx = context.get()
+    assert ctx is not None, 'Context is not initialized'
+    ctx.redirect_log(pathlib.Path(log_file))
+    _wait_for_bound_ordinary_launch(replica_id,
+                                    cluster_name,
+                                    request_id,
+                                    False,
+                                    launch_cloud,
+                                    reduce_exact,
+                                    cancel_exact,
+                                    replica_to_launch_cancelled,
+                                    continue_guard=continue_guard,
+                                    supersession_guard=supersession_guard)
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
@@ -586,6 +1010,11 @@ def launch_cluster(
         ordinary_launch_handoff.EventKind, str | None, int |
         None, ordinary_launch_handoff.TerminalStatus | None
     ], None] | None = None,
+    ordinary_launch_submission_uuid: str | None = None,
+    inspect_bound_ordinary_launch: Callable[[], Any] | None = None,
+    reduce_bound_ordinary_launch: Callable[[Any, BaseException | None], Any] |
+    None = None,
+    cancel_bound_ordinary_launch: Callable[[str], Any] | None = None,
 ) -> None:
     """Launch a sky serve replica cluster.
 
@@ -659,7 +1088,7 @@ def launch_cluster(
             logger.debug('Ordinary-launch telemetry callback failed: %s', error)
 
     def _lookup_terminal_status(request_id: str) -> str | None:
-        requests = sdk.api_status(
+        request_payloads = sdk.api_status(
             request_ids=[request_id],
             fields=['request_id', 'status'],
             _exact_request_ids=True,
@@ -668,7 +1097,8 @@ def launch_cluster(
                 ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
             _retry_on_server_unavailable=False)
         exact_matches = [
-            request for request in requests if request.request_id == request_id
+            request for request in request_payloads
+            if request.request_id == request_id
         ]
         if len(exact_matches) != 1:
             return None
@@ -772,6 +1202,11 @@ def launch_cluster(
 
     def _cancel_request_for_ownership_loss() -> None:
         ownership_lost.set()
+        if ordinary_launch_submission_uuid is not None:
+            # A capable successor atomically transfers this association and
+            # adopts the same API request.  Process-local owner loss is never a
+            # durable cancellation decision for a bound launch.
+            return
         replica_to_launch_cancelled[replica_id] = True
         request_id = replica_to_request_id.get(replica_id)
         if request_id is None:
@@ -796,7 +1231,15 @@ def launch_cluster(
         if request_id is None:
             return True
         try:
-            sdk.api_cancel(request_id)
+            if ordinary_launch_submission_uuid is not None:
+                if cancel_bound_ordinary_launch is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Bound launch has no exact cancellation callback.')
+                if not cancel_bound_ordinary_launch(reason):
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Exact bound launch cancellation was not committed.')
+            else:
+                sdk.api_cancel(request_id)
         except Exception as e:  # pylint: disable=broad-except
             supersession_cancel_failures += 1
             if (supersession_cancel_failures == 1 or
@@ -912,6 +1355,129 @@ def launch_cluster(
 
     if availability_max_retry is None:
         availability_max_retry = max_retry
+
+    if ordinary_launch_submission_uuid is not None:
+        if recovery_context_available or protocol_v2_fence is not None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Special recovery and reserved-fill launches cannot enter the '
+                'ordinary binding path.')
+        if (launch_fence is None or inspect_bound_ordinary_launch is None or
+                reduce_bound_ordinary_launch is None or
+                cancel_bound_ordinary_launch is None):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch requires complete context and exact '
+                'inspection, reduction, and cancellation authority.')
+        bound_workspace_ctx: contextlib.AbstractContextManager = (
+            skypilot_config.local_active_workspace_ctx(workspace)
+            if workspace is not None else contextlib.nullcontext())
+        usage_lib.messages.usage.set_internal()
+        with bound_workspace_ctx:
+            # Freeze once. Every transport retry below submits these exact
+            # bytes with the same controller-generated UUID.
+            prepared_request = sdk.prepare_launch_request(
+                task,
+                cluster_name,
+                retry_until_up=retry_until_up,
+                _is_launched_by_sky_serve_controller=True,
+                _extra_launch_context=launch_fence)
+        expected_input_digest = ordinary_launch_binding.canonical_launch_digest(
+            prepared_request.body)
+        submit_backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
+        request_id = None
+        adopted_after_lost_ack = False
+        for submit_attempt in range(1, max_retry + 1):
+            if _check_is_cancelled():
+                return
+            _assert_launch_not_superseded()
+            cloud_launch_allowed, cloud_launch_reason = _cloud_guard_decision()
+            if not cloud_launch_allowed:
+                raise _ReplicaLaunchSupersededError(
+                    f'Refusing superseded cloud launch for replica '
+                    f'{replica_id}: reason={cloud_launch_reason}.')
+            _assert_launch_authorized()
+            try:
+                with (skypilot_config.local_active_workspace_ctx(workspace)
+                      if workspace is not None else contextlib.nullcontext()):
+                    request_id = (sdk.submit_prepared_ordinary_launch_request(
+                        prepared_request, ordinary_launch_submission_uuid))
+                break
+            except Exception as error:  # pylint: disable=broad-except
+                if not _bound_submission_may_have_committed(error):
+                    # A deterministic rejection (most importantly a 4xx digest
+                    # or identity conflict) cannot be converted into a lost-ACK
+                    # adoption of some older exact replica pointer.
+                    raise
+                # A response may be lost after the atomic transaction commits.
+                # Resolve only through this replica record's exact durable
+                # pointer; request history/latest inference is forbidden.
+                try:
+                    snapshot = inspect_bound_ordinary_launch()
+                except Exception as inspect_error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Could not inspect exact bound admission for replica '
+                        '%s after transport failure: %s', replica_id,
+                        common_utils.format_exception(inspect_error))
+                else:
+                    if snapshot is not None:
+                        snapshot_context = getattr(snapshot, 'context', None)
+                        snapshot_digest = getattr(snapshot_context,
+                                                  'input_digest', None)
+                        if snapshot_digest != expected_input_digest:
+                            raise _BoundOrdinaryLaunchUnresolvedError(
+                                'Lost-ACK inspection found a bound request with '
+                                'a different canonical launch digest.'
+                            ) from error
+                        exact_request_id = _bound_reduction_request_id(snapshot)
+                        request_id = server_common.RequestId[tuple[
+                            int | None,
+                            backends.ResourceHandle | None]](exact_request_id)
+                        adopted_after_lost_ack = True
+                        logger.warning(
+                            'Adopting exact bound request %s for replica %s '
+                            'after its admission acknowledgement was lost.',
+                            request_id, replica_id)
+                        break
+                if submit_attempt >= max_retry:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        f'Could not resolve bound ordinary launch admission for '
+                        f'replica {replica_id} after {submit_attempt} exact '
+                        'submission attempt(s).') from error
+                delay = submit_backoff.current_backoff()
+                logger.warning(
+                    f'Bound ordinary launch admission for replica {replica_id} '
+                    f'did not acknowledge attempt {submit_attempt}; retrying '
+                    f'the same submission UUID in {delay:.1f} seconds.')
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    if _check_is_cancelled():
+                        return
+                    time.sleep(min(0.1, deadline - time.monotonic()))
+        assert request_id is not None
+        logger.info(f'Replica cluster {cluster_name} bound launch requested '
+                    f'with request_id: {request_id}.')
+        replica_to_request_id[replica_id] = request_id
+        _emit_ordinary_launch_event(
+            ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, request_id)
+        try:
+            _wait_for_bound_ordinary_launch(
+                replica_id,
+                cluster_name,
+                str(request_id),
+                not adopted_after_lost_ack,
+                next(iter(task.resources)).cloud,
+                reduce_bound_ordinary_launch,
+                cancel_bound_ordinary_launch,
+                replica_to_launch_cancelled,
+                continue_guard=continue_guard,
+                supersession_guard=supersession_guard)
+        except Exception:
+            _observe_terminal_nonblocking(request_id)
+            raise
+        _observe_terminal_nonblocking(request_id)
+        logger.info(f'Replica cluster {cluster_name} launch was exactly '
+                    'projected.')
+        return
+
     # This remains the current launch retry/request owner.  A future bounded
     # request-binding change may make the exact request association durable,
     # but the retired action-authority design does not deprecate this loop.
@@ -2524,6 +3090,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache: dict[int,
                                             service_spec.SkyServiceSpec] = {}
         self._provider_identity_uncertain_ids: set[int] = set()
+        self._ordinary_launch_binding_authority: (ControllerBindingAuthority |
+                                                  None) = None
+        self._ordinary_launch_binding_transition_lock = threading.Lock()
+        self._ordinary_launch_binding_transition_in_progress = (
+            threading.Event())
 
     def _publish_legacy_mutation_runtime_state(
             self, runtime: _LegacyReplicaMutationRuntime) -> None:
@@ -2973,6 +3544,392 @@ class SkyPilotReplicaManager(ReplicaManager):
                     service_version)
         return fence_context
 
+    def _is_ordinary_launch_binding_profile(
+            self, info: ReplicaInfo,
+            recovery_launch_kwargs: Mapping[str, Any]) -> bool:
+        """Whether one worker belongs to the narrow ordinary profile."""
+        if self._is_pool or recovery_launch_kwargs:
+            return False
+        # These paths retain their existing identity, retry, and cleanup
+        # contracts.  In particular, a promoted service must never silently
+        # reinterpret a system-OOM or physical-capacity operation as ordinary.
+        return ordinary_launch_binding.replica_has_narrow_ordinary_profile(info)
+
+    def _bound_ordinary_launch_is_eligible(
+            self, info: ReplicaInfo,
+            recovery_launch_kwargs: Mapping[str, Any]) -> bool:
+        """Select only the explicitly promoted ordinary launch profile."""
+        authority = self._ordinary_launch_binding_authority
+        return bool(
+            self._is_ordinary_launch_binding_profile(
+                info, recovery_launch_kwargs) and authority is not None and
+            authority.capable is True and
+            authority.binding_mode == ordinary_launch_binding.BindingMode.BOUND)
+
+    def _ordinary_binding_profile_launch_is_authorized(self) -> bool:
+        """Close eligible process admission during a binding transition."""
+        return bool(
+            not self._ordinary_launch_binding_transition_in_progress.is_set()
+            and self._service_is_launch_authorized())
+
+    def _bound_ordinary_launch_fence_context(
+            self, info: ReplicaInfo, service_version: int) -> dict[str, Any]:
+        """Build the complete immutable admission fence for one replica."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch has no promoted controller authority.')
+        fence = self._replica_launch_fence_context(service_version)
+        if fence is None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch has no durable service-owner fence.')
+        fence = dict(fence)
+        fence.update({
+            ordinary_launch_binding.REPLICA_ID_KEY: info.replica_id,
+            ordinary_launch_binding.REPLICA_RECORD_ID_KEY:
+                info.replica_record_id,
+            ordinary_launch_binding.LIFECYCLE_EPOCH_KEY:
+                authority.service_lifecycle_epoch,
+            ordinary_launch_binding.BINDING_EPOCH_KEY: authority.binding_epoch,
+            ordinary_launch_binding.CONTROLLER_INCARNATION_KEY: str(
+                authority.controller_incarnation),
+            ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY:
+                authority.controller_owner_epoch,
+        })
+        # Parse locally before publishing the request. This keeps a partially
+        # assembled context from becoming a durable admission ambiguity.
+        ordinary_launch_binding.parse_unbound_launch_context(fence)
+        return fence
+
+    @staticmethod
+    def _binding_excluded_launch_fence_context(
+        info: ReplicaInfo,
+        launch_fence: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Bind a legacy special-profile request to its persisted replica."""
+        if launch_fence is None:
+            return None
+        excluded = dict(launch_fence)
+        excluded.update({
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+                (serve_constants.
+                 ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE),
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY:
+                info.replica_id,
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY:
+                info.replica_record_id,
+        })
+        # Keep manager emission and API/executor parsing on one closed shape.
+        serve_state.normalize_binding_excluded_launch_context(excluded)
+        return excluded
+
+    @staticmethod
+    def _bound_launch_capacity_reason(launch_cloud: clouds.Cloud | None,
+                                      error: Any) -> str | None:
+        error = _decoded_bound_request_error(error)
+        if (launch_cloud is None or
+                not isinstance(error, exceptions.ResourcesUnavailableError)):
+            return None
+        return cloud_vm_ray_backend.classify_resources_unavailable_error(
+            launch_cloud, error)
+
+    def _project_bound_ordinary_launch(self, launch_cloud: clouds.Cloud | None,
+                                       connection: Any,
+                                       projection: Any) -> bool:
+        """Project exact request evidence and paid feedback atomically."""
+        info = projection.locked_replica_info
+        request_error = projection.request.error
+        reason = self._bound_launch_capacity_reason(launch_cloud, request_error)
+        status = projection.status.value
+        paid_outcome: paid_capacity.LaunchOutcome | None
+        if projection.pre_effect_terminal:
+            # No provider or service-job effect occurred.  Leave this exact
+            # replica record pending so the same demand can publish a fresh
+            # association generation.  An already-durable teardown remains
+            # absorbing; its exact cancellation will release the claim and
+            # the down worker owns the next action.
+            if getattr(projection, 'cancel_reason', None) is not None:
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.INTERRUPTED)
+            elif (info.status_property.sky_launch_status
+                  != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SCHEDULED)
+            # OTHER_FAILURE deliberately makes no paid-pool feedback change.
+            # The reducer, which can see the association's cancel reason,
+            # decides whether the exact claim is retained for the successor.
+            paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+        elif status == 'SUCCEEDED':
+            # Teardown writes INTERRUPTED before exact cancellation.  A request
+            # may race that cancel and finish successfully, but its result must
+            # not erase the only durable cleanup intent before the down worker
+            # records SCHEDULED.
+            if (info.status_property.sky_launch_status
+                    != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SUCCEEDED)
+            paid_outcome = paid_capacity.LaunchOutcome.SUCCESS
+        else:
+            # A teardown persists INTERRUPTED before exact cancellation. Do
+            # not let the reducer turn that durable cleanup intent back into a
+            # generic failed launch. Post-effect terminal outcomes remain
+            # failures; they must never look successful merely because
+            # projection itself committed.
+            if (info.status_property.sky_launch_status
+                    != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.FAILED)
+            if reason == 'quota':
+                paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+                info.status_property.failed_spot_availability = True
+            elif reason == 'capacity':
+                paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                info.status_property.failed_spot_availability = True
+            else:
+                paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+        if projection.paid_capacity_pool_key is None:
+            paid_outcome = None
+        authority = self._ordinary_launch_binding_authority
+        if authority is None:
+            return False
+        return serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
+            connection,
+            self._service_name,
+            authority.service_hash,
+            info.replica_id,
+            info.replica_record_id,
+            projection.context.association_id,
+            info,
+            paid_capacity_pool_key=projection.paid_capacity_pool_key,
+            paid_capacity_outcome=paid_outcome)
+
+    def _bound_ordinary_launch_callbacks(
+        self,
+        info: ReplicaInfo,
+        launch_cloud: clouds.Cloud | None,
+        *,
+        initial_reduction: Any = None,
+    ) -> tuple[Callable[[], Any], Callable[[Any, BaseException | None], Any],
+               Callable[[str], Any]]:
+        """Close exact inspect/reduce/cancel calls over one record identity."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch has no controller authority.')
+        context_box: list[Any] = []
+        if initial_reduction is not None:
+            context_box.append(initial_reduction.context)
+
+        def _inspect() -> Any:
+            reduction = request_postgres.inspect_bound_ordinary_launch(
+                self._service_name, info.replica_id, info.replica_record_id)
+            if reduction is not None:
+                if context_box and context_box[0] != reduction.context:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Replica pointer resolved to a different bound '
+                        'ordinary-launch generation.')
+                if not context_box:
+                    context_box.append(reduction.context)
+            return reduction
+
+        def _context() -> Any:
+            if not context_box:
+                reduction = _inspect()
+                if reduction is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Replica has no exact bound ordinary-launch pointer.')
+            return context_box[0]
+
+        projector = functools.partial(self._project_bound_ordinary_launch,
+                                      launch_cloud)
+
+        def _reduce(_result: Any, _error: BaseException | None) -> Any:
+            del _result, _error
+            return request_postgres.reduce_bound_ordinary_launch(
+                _context(), authority, project_replica_result=projector)
+
+        def _cancel(reason: str) -> Any:
+            return request_postgres.cancel_bound_ordinary_launch_request(
+                _context(), authority, reason, project_replica_result=projector)
+
+        return _inspect, _reduce, _cancel
+
+    def _redrive_bound_ordinary_launch_after_pre_effect(
+            self, info: ReplicaInfo) -> bool:
+        """Re-enqueue one settled pre-effect row with its exact paid claim."""
+        prior_planned_capacity = info.planned_capacity
+        if (isinstance(prior_planned_capacity, bool) or
+                not isinstance(prior_planned_capacity, int) or
+                prior_planned_capacity < 1):
+            prior_planned_capacity = 1
+        prior_yaml_content: str | None
+        if info.version == self.latest_version:
+            prior_yaml_content = self.yaml_content
+        else:
+            prior_yaml_content = serve_state.get_yaml_content(
+                self._service_name, info.version)
+        if prior_yaml_content is None:
+            raise ValueError('yaml content not found for pre-effect retry '
+                             f'of {self._service_name} version '
+                             f'{info.version}')
+        result = self._launch_replica(
+            info.replica_id,
+            resources_override=info.resources_override,
+            recovering_existing_replica=True,
+            prior_is_zero_cost=info.is_zero_cost,
+            prior_planned_capacity=prior_planned_capacity,
+            prior_unknown_capacity_replacement=bool(
+                info.unknown_capacity_replacement),
+            prior_replica_record_id=info.replica_record_id,
+            prior_created_at=info.created_at,
+            prior_version=info.version,
+            prior_yaml_content=prior_yaml_content,
+            prior_paid_capacity_pool_key=(
+                info.paid_capacity_pool_key if isinstance(
+                    info.paid_capacity_pool_key, str) else None))
+        return result is not None
+
+    def _settle_bound_ordinary_launch_for_teardown(self,
+                                                   info: ReplicaInfo) -> None:
+        """Cancel, quiesce, and project an exact request before provider down."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND):
+            return
+        initial = request_postgres.lookup_bound_ordinary_launch_cancel_target(
+            self._service_name, info.replica_id, info.replica_record_id)
+        if initial is None:
+            return
+        _, reduce_exact, cancel_exact = (self._bound_ordinary_launch_callbacks(
+            info, None, initial_reduction=initial))
+        durable_reason = getattr(initial, 'cancel_reason', None)
+        if durable_reason is not None and (not isinstance(durable_reason, str)
+                                           or not durable_reason):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound teardown found a malformed durable cancel reason.')
+        projection = cancel_exact(durable_reason or 'replica-teardown')
+        attempts = 0
+        while True:
+            if projection is None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound teardown for replica {info.replica_id} lost its '
+                    'exact association.')
+            classification = _bound_projection_classification(projection)
+            if classification == 'AMBIGUOUS':
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound teardown for replica {info.replica_id} is '
+                    'durably ambiguous; refusing provider cleanup.')
+            if (getattr(projection, 'projected', False) or classification
+                    in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
+                return
+            if classification not in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE',
+                                      'REDUCE_TERMINAL',
+                                      'PRE_EFFECT_TERMINALIZE'):
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound teardown for replica {info.replica_id} returned '
+                    f'unknown classification {classification!r}.')
+            attempts += 1
+            if attempts == 1 or attempts % 20 == 0:
+                logger.info(
+                    'Waiting for exact ordinary-launch quiescence before '
+                    'tearing down replica %s (classification=%s).',
+                    info.replica_id, classification)
+            time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+            projection = reduce_exact(None, None)
+
+    def _request_bound_ordinary_launch_cancel_for_teardown(
+            self, info: ReplicaInfo) -> None:
+        """Deliver exact cancellation without waiting for provider authority."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND):
+            return
+        target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
+            self._service_name, info.replica_id, info.replica_record_id)
+        if target is None:
+            return
+        durable_reason = target.cancel_reason
+        request_postgres.request_bound_ordinary_launch_cancel(
+            target.context, authority, durable_reason or 'replica-teardown')
+
+    @contextlib.contextmanager
+    def ordinary_launch_binding_transition(
+        self,) -> Iterator[Callable[[Any], None]]:
+        """Fence process admission while the controller changes binding mode.
+
+        The controller must already hold its actuation-epoch lock. This method
+        then establishes the manager side of the lock order: transition lock,
+        followed by ``self.lock``. The yielded installer is called only after
+        the PostgreSQL promotion/demotion transaction commits and its returned
+        authority has been refreshed. Assignment occurs while both process
+        locks and the admission gate remain held.
+        """
+        with self._ordinary_launch_binding_transition_lock:
+            self._ordinary_launch_binding_transition_in_progress.set()
+            try:
+                with self.lock:
+                    eligible_workers = [
+                        replica_id for replica_id, worker in
+                        self._legacy_mutation_runtime_state(
+                        ).launch_thread_pool.items()
+                        if (isinstance(worker, _ReplicaLaunchThread) and
+                            (worker.ordinary_legacy_launch or
+                             worker.bound_ordinary_launch))
+                    ]
+                    if eligible_workers:
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            'Ordinary-launch binding transition found local '
+                            'eligible workers that have not crossed the '
+                            f'completion barrier: {sorted(eligible_workers)}.')
+
+                    installed = False
+
+                    def _install(authority: Any) -> None:
+                        nonlocal installed
+                        if installed:
+                            raise RuntimeError(
+                                'Binding transition authority was installed '
+                                'more than once.')
+                        if not isinstance(
+                                authority, ordinary_launch_binding.
+                                ControllerBindingAuthority):
+                            raise ValueError(
+                                'Binding transition returned malformed '
+                                'controller authority.')
+                        previous = self._ordinary_launch_binding_authority
+                        if previous is None:
+                            raise _BoundOrdinaryLaunchUnresolvedError(
+                                'Manager has no prior controller binding '
+                                'authority.')
+                        immutable_identity = (
+                            authority.service_name == self._service_name and
+                            authority.service_hash == previous.service_hash and
+                            authority.service_workspace
+                            == previous.service_workspace and
+                            authority.service_lifecycle_epoch
+                            == previous.service_lifecycle_epoch and
+                            authority.controller_incarnation
+                            == previous.controller_incarnation and
+                            authority.controller_owner_epoch
+                            == previous.controller_owner_epoch and
+                            authority.controller_pid == previous.controller_pid
+                            and
+                            authority.controller_ip == previous.controller_ip)
+                        if not immutable_identity or authority.capable is not True:
+                            raise _BoundOrdinaryLaunchUnresolvedError(
+                                'Binding transition changed controller or '
+                                'service identity.')
+                        self._ordinary_launch_binding_authority = authority
+                        installed = True
+
+                    yield _install
+            finally:
+                self._ordinary_launch_binding_transition_in_progress.clear()
+
     def _queued_launch_generation_decision(
             self, expected_manager_version: int) -> tuple[bool, str]:
         """Fence every queued worker to its construction-time manager epoch."""
@@ -3227,7 +4184,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 replica_id,
                 info,
                 **self._db_fence_kwargs(),
-                expected_replica_exists=True)
+                expected_replica_exists=True,
+                guard_launch_exclusion=(
+                    serve_state.replica_info_has_binding_excluded_profile(info)
+                ))
         except BaseException:
             if suspension is not None:
                 self._resolve_ambiguous_system_recovery_route_suspensions(
@@ -3244,9 +4204,13 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _persist_new_replica(self, replica_id: int, info: ReplicaInfo) -> None:
         """Persist an explicitly admitted initial replica row."""
-        persisted = serve_state.add_or_update_replica(self._service_name,
-                                                      replica_id, info,
-                                                      **self._db_fence_kwargs())
+        persisted = serve_state.add_or_update_replica(
+            self._service_name,
+            replica_id,
+            info,
+            **self._db_fence_kwargs(),
+            guard_launch_exclusion=(
+                serve_state.replica_info_has_binding_excluded_profile(info)))
         if persisted is False:
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
@@ -3339,7 +4303,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._service_name,
                 replica_infos,
                 **fence_kwargs,
-                expected_replica_exists=True)
+                expected_replica_exists=True,
+                guard_launch_exclusion=any(
+                    serve_state.replica_info_has_binding_excluded_profile(info)
+                    for _, info in replica_infos))
         except BaseException:
             self._resolve_ambiguous_system_recovery_route_suspensions(
                 suspensions)
@@ -3768,15 +4735,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.replica_id, replica_record_id)
         self._persist_replica(info.replica_id, info)
 
-    def __init__(self,
-                 service_name: str,
-                 spec: 'service_spec.SkyServiceSpec',
-                 version: int,
-                 resource_scope: str | None = None,
-                 service_hash: str | None = None,
-                 controller_pid: int | None = None,
-                 controller_ip: str | None = None,
-                 enforce_launch_fence: bool = True) -> None:
+    def __init__(
+        self,
+        service_name: str,
+        spec: 'service_spec.SkyServiceSpec',
+        version: int,
+        resource_scope: str | None = None,
+        service_hash: str | None = None,
+        controller_pid: int | None = None,
+        controller_ip: str | None = None,
+        enforce_launch_fence: bool = True,
+        controller_binding_authority: (
+            'ControllerBindingAuthority | None') = None
+    ) -> None:
         # Keep the historical three-argument base-init call for embedders that
         # replace it, then restore the scope it initializes to the legacy
         # default.  Setting this before super() would be silently overwritten.
@@ -3788,6 +4759,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   controller_pid is not None or
                                   controller_ip is not None else None)
         self._enforce_launch_fence = enforce_launch_fence
+        self._ordinary_launch_binding_authority = controller_binding_authority
         yaml_content = serve_state.get_yaml_content(service_name, version)
         assert yaml_content is not None, (
             f'yaml content not found for {service_name} version {version}')
@@ -4089,14 +5061,52 @@ class SkyPilotReplicaManager(ReplicaManager):
         recovery_yaml_contents = serve_state.get_yaml_contents(
             self._service_name, recovery_versions)
 
+        bound_recovery_errors: list[tuple[int, Exception]] = []
         for replica_info in to_up_replicas:
             pending_version = self._pending_version
             if (pending_version is not None and
                     pending_version > replica_info.version):
-                logger.info('Stopping recovery re-drive for version '
-                            f'{replica_info.version} because version '
-                            f'{pending_version} is waiting to be applied.')
-                break
+                authority = self._ordinary_launch_binding_authority
+                bound_reduction = None
+                if (authority is not None and authority.capable is True and
+                        authority.binding_mode
+                        == ordinary_launch_binding.BindingMode.BOUND):
+                    bound_reduction = (
+                        request_postgres.inspect_bound_ordinary_launch(
+                            self._service_name, replica_info.replica_id,
+                            replica_info.replica_record_id))
+                if bound_reduction is not None:
+                    logger.info(
+                        'Cancelling exact bound launch for replica %s at '
+                        'version %s because version %s is waiting to be '
+                        'applied.', replica_info.replica_id,
+                        replica_info.version, pending_version)
+                    self._terminate_replica(replica_info.replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                else:
+                    logger.info(
+                        'Deferring pointerless recovery re-drive for replica '
+                        '%s at version %s because version %s is waiting to be '
+                        'applied.', replica_info.replica_id,
+                        replica_info.version, pending_version)
+                continue
+            if replica_info.version != self.latest_version:
+                logger.info(
+                    'Retiring recovered replica %s at superseded version %s; '
+                    'the current manager version is %s.',
+                    replica_info.replica_id, replica_info.version,
+                    self.latest_version)
+                # _terminate_replica first settles any exact bound pointer;
+                # pointerless pre-admission rows proceed directly to cleanup.
+                self._terminate_replica(replica_info.replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+                continue
             if replica_info.system_recovery_quarantine is not None:
                 logger.warning(
                     f'Replica {replica_info.replica_id} has quarantined '
@@ -4195,6 +5205,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             # O(pending x total rows) — tens of minutes at fleet scale.
             # Per-replica isolation: one bad row must not strand the rest
             # un-redriven.
+            authority = self._ordinary_launch_binding_authority
+            bound_profile_recovery = bool(
+                not self._is_pool and authority is not None and
+                authority.capable is True and authority.binding_mode
+                == ordinary_launch_binding.BindingMode.BOUND and
+                ordinary_launch_binding.replica_has_narrow_ordinary_profile(
+                    replica_info))
             try:
                 prior_planned_capacity = replica_info.planned_capacity
                 if (isinstance(prior_planned_capacity, bool) or
@@ -4212,6 +5229,90 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{self._service_name} version '
                             f'{replica_info.version}')
                     prior_yaml_content = recovered_yaml_content
+                authority = self._ordinary_launch_binding_authority
+                if (authority is not None and authority.capable is True and
+                        authority.binding_mode
+                        == ordinary_launch_binding.BindingMode.BOUND):
+                    bound_reduction = (
+                        request_postgres.inspect_bound_ordinary_launch(
+                            self._service_name, replica_info.replica_id,
+                            replica_info.replica_record_id))
+                    if bound_reduction is not None:
+                        if (replica_info.replica_id
+                                in legacy_runtime.launch_thread_pool):
+                            continue
+                        recovery_spec = self._version_specs.get(
+                            replica_info.version)
+                        if recovery_spec is None:
+                            recovery_spec = serve_state.get_spec(
+                                self._service_name, replica_info.version)
+                        if recovery_spec is None:
+                            raise ValueError(
+                                'service spec not found for bound launch '
+                                f'recovery of version {replica_info.version}')
+                        recovery_task = _build_replica_launch_task(
+                            prior_yaml_content,
+                            replica_info.replica_id,
+                            replica_info.resources_override,
+                            exact_resources_override=(
+                                replica_info.get_spot_location() is not None),
+                            authoritative_service_spec=recovery_spec,
+                            service_name=self._service_name)
+                        recovery_cloud = next(iter(
+                            recovery_task.resources)).cloud
+                        _, reduce_bound, cancel_bound = (
+                            self._bound_ordinary_launch_callbacks(
+                                replica_info,
+                                recovery_cloud,
+                                initial_reduction=bound_reduction))
+                        log_file_name = (
+                            serve_utils.generate_replica_launch_log_file_name(
+                                self._service_name, replica_info.replica_id,
+                                self._resource_scope))
+                        completion_queue, completion_event = (
+                            self._launch_completion_state())
+                        launch_thread = _ReplicaLaunchThread(
+                            target=adopt_bound_ordinary_launch,
+                            replica_id=replica_info.replica_id,
+                            completion_queue=completion_queue,
+                            completion_event=completion_event,
+                            bound_ordinary_launch=True,
+                            args=(
+                                replica_info.replica_id,
+                                replica_info.cluster_name,
+                                log_file_name,
+                                bound_reduction.context.request_id,
+                                recovery_cloud,
+                                reduce_bound,
+                                cancel_bound,
+                                legacy_runtime.replica_to_launch_cancelled,
+                            ),
+                            kwargs={
+                                'continue_guard':
+                                    self._launch_owner_watchdog_allows_continue,
+                                'supersession_guard': functools.partial(
+                                    self._queued_launch_generation_decision,
+                                    replica_info.version),
+                            })
+                        legacy_runtime.replica_to_request_id[
+                            replica_info.replica_id] = (
+                                bound_reduction.context.request_id)
+                        legacy_runtime.launch_thread_pool[
+                            replica_info.replica_id] = launch_thread
+                        try:
+                            launch_thread.start()
+                        except Exception:
+                            legacy_runtime.launch_thread_pool.pop(
+                                replica_info.replica_id)
+                            legacy_runtime.replica_to_request_id.pop(
+                                replica_info.replica_id)
+                            raise
+                        logger.info(
+                            'Adopting exact bound ordinary launch %s for '
+                            'replica %s after controller restart.',
+                            bound_reduction.context.request_id,
+                            replica_info.replica_id)
+                        continue
                 launch_kwargs: dict[str, Any] = {
                     'resources_override': replica_info.resources_override,
                     'existing_replica_infos': all_replica_infos,
@@ -4254,6 +5355,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.error('Failed to re-drive launch of replica '
                              f'{replica_info.replica_id}: '
                              f'{common_utils.format_exception(e)}')
+                if bound_profile_recovery:
+                    # A bound row has no safe inference fallback.  Preserve
+                    # per-row isolation for this wave, but fail the recovery
+                    # pass after teardown reconstruction so the supervised
+                    # loop retries exact inspection/adoption in this same
+                    # live controller.  Otherwise a transient read, spec
+                    # reconstruction, or Thread.start failure leaves no local
+                    # owner and the normal refresher can never discover it.
+                    bound_recovery_errors.append((replica_info.replica_id, e))
 
         # A forced status refresh can remove an interrupted cluster from global
         # state before the replica row records the interruption. If the
@@ -4481,6 +5591,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Recovered {len(recovering_logical_ids)} uncommitted logical '
                 'retirements; keeping them off-route until current capacity '
                 'is revalidated.')
+        if bound_recovery_errors:
+            failed_ids = [replica_id for replica_id, _ in bound_recovery_errors]
+            raise RuntimeError(
+                'Exact bound ordinary-launch recovery remains incomplete for '
+                f'replicas {failed_ids!r}; retrying the recovery pass.') from (
+                    bound_recovery_errors[0][1])
 
     ################################
     # Replica management functions #
@@ -5190,7 +6306,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert cloud_launch_guard is None
             cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
-        expected_manager_version = self.latest_version
+        expected_manager_version = launch_version
         existing_cloud_launch_guard = cloud_launch_guard
 
         def _versioned_cloud_launch_guard() -> bool | tuple[bool, str]:
@@ -5381,17 +6497,37 @@ class SkyPilotReplicaManager(ReplicaManager):
             frozen_controller_config = skypilot_config.to_dict()
             frozen_controller_config_path = os.environ.get(
                 skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
+            ordinary_binding_profile = (
+                self._is_ordinary_launch_binding_profile(
+                    info, recovery_launch_kwargs))
+            bound_ordinary_launch = bool(
+                ordinary_binding_profile and
+                self._bound_ordinary_launch_is_eligible(info,
+                                                        recovery_launch_kwargs))
+            ordinary_legacy_launch = bool(ordinary_binding_profile and
+                                          not bound_ordinary_launch)
+            effective_launch_fence = launch_fence
+            if not ordinary_binding_profile and not self._is_pool:
+                # Emit this while still in legacy mode too.  A queued special
+                # launch can then cross an immediately following promotion
+                # without being mistaken for an unbound ordinary request.
+                effective_launch_fence = (
+                    self._binding_excluded_launch_fence_context(
+                        info, effective_launch_fence))
             launch_thread_kwargs: dict[str, Any] = {
                 'availability_max_retry': availability_max_retry,
                 'exact_resources_override': location is not None,
-                'pre_launch_guard': self._service_is_launch_authorized,
+                'pre_launch_guard':
+                    (self._ordinary_binding_profile_launch_is_authorized
+                     if ordinary_binding_profile else
+                     self._service_is_launch_authorized),
                 'cloud_launch_guard': cloud_launch_guard,
                 'supersession_guard': functools.partial(
                     self._queued_launch_generation_decision,
                     expected_manager_version),
                 'continue_guard': self._launch_owner_watchdog_allows_continue,
                 'cleanup_continue_guard': self._service_is_cleanup_authorized,
-                'launch_fence': launch_fence,
+                'launch_fence': effective_launch_fence,
                 'service_spec': launch_spec,
                 'service_name': self._service_name,
                 'workspace': self._workspace,
@@ -5399,6 +6535,34 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'frozen_controller_config_path': frozen_controller_config_path,
                 **recovery_launch_kwargs,
             }
+            if bound_ordinary_launch:
+                # Build the same launch task once locally so typed provider
+                # failures can update the exact paid-capacity pool in the
+                # reducer transaction. This construction is side-effect free.
+                bound_task = _build_replica_launch_task(
+                    launch_yaml_content,
+                    replica_id,
+                    resources_override,
+                    exact_resources_override=location is not None,
+                    authoritative_service_spec=launch_spec,
+                    service_name=self._service_name)
+                bound_cloud = next(iter(bound_task.resources)).cloud
+                effective_launch_fence = (
+                    self._bound_ordinary_launch_fence_context(
+                        info, launch_version))
+                inspect_bound, reduce_bound, cancel_bound = (
+                    self._bound_ordinary_launch_callbacks(info, bound_cloud))
+                launch_thread_kwargs.update({
+                    'launch_fence': effective_launch_fence,
+                    'ordinary_launch_submission_uuid':
+                        request_postgres.
+                        stable_bound_ordinary_launch_submission_id(
+                            self._service_name, info.replica_id,
+                            info.replica_record_id),
+                    'inspect_bound_ordinary_launch': inspect_bound,
+                    'reduce_bound_ordinary_launch': reduce_bound,
+                    'cancel_bound_ordinary_launch': cancel_bound,
+                })
             if not self._is_pool and not zero_cost_only:
                 input_digest = (ordinary_launch_handoff.redacted_input_digest(
                     launch_yaml_content, resources_override))
@@ -5427,6 +6591,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 replica_id=replica_id,
                 completion_queue=completion_queue,
                 completion_event=completion_event,
+                bound_ordinary_launch=bound_ordinary_launch,
+                ordinary_legacy_launch=ordinary_legacy_launch,
                 args=(replica_id, launch_yaml_content, cluster_name,
                       log_file_name, legacy_runtime.replica_to_request_id,
                       legacy_runtime.replica_to_launch_cancelled,
@@ -6943,46 +8109,88 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
             launch_thread = legacy_runtime.launch_thread_pool[replica_id]
+            bound_ordinary_launch = bool(
+                isinstance(launch_thread, _ReplicaLaunchThread) and
+                launch_thread.bound_ordinary_launch)
             if launch_thread.is_alive():
                 legacy_runtime.replica_to_launch_cancelled[replica_id] = True
-                wait_deadline = (time.monotonic() +
-                                 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
-                timeout_reached = False
-                while True:
-                    # Launch request id found. cancel it.
-                    if replica_id in legacy_runtime.replica_to_request_id:
-                        request_id = legacy_runtime.replica_to_request_id[
-                            replica_id]
-                        sdk.api_cancel(request_id)
-                        break
-                    if replica_id not in legacy_runtime.replica_to_launch_cancelled:
-                        # Indicates that the cancellation was received.
-                        break
-                    if not launch_thread.is_alive():
-                        # It's possible that the launch thread immediately
-                        # finished after we check. Exit the loop now.
-                        break
-                    remaining = wait_deadline - time.monotonic()
-                    if remaining <= 0:
-                        timeout_reached = True
-                        break
-                    time.sleep(min(0.1, remaining))
-                if timeout_reached:
-                    logger.warning(
-                        'Failed to cancel launch request for replica '
-                        f'{replica_id} after '
-                        f'{_WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS} seconds. '
-                        'Force waiting the launch thread to finish.')
+                if bound_ordinary_launch:
+                    # Deliver cancellation from the manager thread before
+                    # joining. The waiter may still be inside the provider's
+                    # shared guard; waiting for it before this direct
+                    # row-locked cancel would make the provider and join
+                    # depend cyclically on each other.
+                    self._request_bound_ordinary_launch_cancel_for_teardown(
+                        info)
+                    launch_thread.join()
                 else:
-                    logger.info('Interrupted launch thread for replica '
-                                f'{replica_id} and deleted the cluster.')
-                launch_thread.join()
+                    wait_deadline = (time.monotonic() +
+                                     _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
+                    timeout_reached = False
+                    while True:
+                        # Launch request id found. cancel it.
+                        if replica_id in legacy_runtime.replica_to_request_id:
+                            request_id = legacy_runtime.replica_to_request_id[
+                                replica_id]
+                            sdk.api_cancel(request_id)
+                            break
+                        if (replica_id not in
+                                legacy_runtime.replica_to_launch_cancelled):
+                            # Indicates that the cancellation was received.
+                            break
+                        if not launch_thread.is_alive():
+                            # The launch may finish between the map checks.
+                            break
+                        remaining = wait_deadline - time.monotonic()
+                        if remaining <= 0:
+                            timeout_reached = True
+                            break
+                        time.sleep(min(0.1, remaining))
+                    if timeout_reached:
+                        logger.warning(
+                            'Failed to cancel launch request for replica '
+                            f'{replica_id} after '
+                            f'{_WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS} seconds. '
+                            'Force waiting the launch thread to finish.')
+                    else:
+                        logger.info('Interrupted launch thread for replica '
+                                    f'{replica_id} and deleted the cluster.')
+                    launch_thread.join()
             else:
                 logger.info(f'Launch thread for replica {replica_id} '
                             'already finished. Delete the cluster now.')
+            if bound_ordinary_launch:
+                if isinstance(launch_thread.exception,
+                              _ReplicaLaunchOwnershipLostError):
+                    raise launch_thread.exception
+                if isinstance(launch_thread.exception,
+                              _BoundOrdinaryLaunchUnresolvedError):
+                    raise launch_thread.exception
+                # Handles a controller crash after the local worker completed
+                # but before its caller observed projection, and is a no-op
+                # after the normal exact reducer cleared the pointer.
+                fresh_info = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_id)
+                if fresh_info is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        f'Bound teardown lost replica row {replica_id}.')
+                self._settle_bound_ordinary_launch_for_teardown(fresh_info)
             legacy_runtime.launch_thread_pool.pop(replica_id)
             legacy_runtime.replica_to_request_id.pop(replica_id)
             legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
+
+        # Recovery may observe a durable SHUTTING_DOWN row before rebuilding a
+        # local launch waiter. Resolve its exact association before any log or
+        # provider operation; direct down/delete is forbidden while the API
+        # execution generation is active or ambiguous.
+        binding_authority = self._ordinary_launch_binding_authority
+        if (binding_authority is not None and binding_authority.binding_mode
+                == ordinary_launch_binding.BindingMode.BOUND):
+            bound_teardown_info = serve_state.get_replica_info_from_id(
+                self._service_name, replica_id)
+            if bound_teardown_info is not None:
+                self._settle_bound_ordinary_launch_for_teardown(
+                    bound_teardown_info)
 
         if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
@@ -9427,14 +10635,135 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._persist_spot_placement_state_if_dirty()
 
         completed_launches: list[tuple[int, ReplicaInfo, bool]] = []
+        bound_completed_launches: list[tuple[int, ReplicaInfo, bool, bool]] = []
+        bound_pre_effect_retries: list[tuple[int, ReplicaInfo,
+                                             _ReplicaLaunchThread]] = []
         superseded_launch_infos: list[tuple[int, ReplicaInfo]] = []
         capacity_launch_failures: set[int] = set()
         quota_launch_failures: set[int] = set()
+        bound_capacity_launch_failures: set[int] = set()
+        bound_quota_launch_failures: set[int] = set()
         for replica_id, t in finished_launches:
             info = launch_infos.get(replica_id)
             assert info is not None, replica_id
-            if info.status == serve_state.ReplicaStatus.PENDING:
+            bound_ordinary_launch = bool(
+                isinstance(t, _ReplicaLaunchThread) and t.bound_ordinary_launch)
+            if (info.status == serve_state.ReplicaStatus.PENDING and
+                (not bound_ordinary_launch or t.ident is None)):
+                # A thread is not alive before its first ``start()``.  Route
+                # every never-started durable PENDING row through admission
+                # before looking at bound-request completion; otherwise a
+                # freshly queued bound launch is mistaken for a finished
+                # worker and can be reduced or discarded without ever
+                # reaching the provider.  A started bound worker may project
+                # a retry back to PENDING, so its non-null thread identity
+                # must still reach bound completion handling below.
                 pending_launches.append((replica_id, t, info))
+                continue
+            if bound_ordinary_launch:
+                ownership_lost = isinstance(t.exception,
+                                            _ReplicaLaunchOwnershipLostError)
+                remaining = request_postgres.inspect_bound_ordinary_launch(
+                    self._service_name, replica_id, info.replica_record_id)
+                unresolved = bool(
+                    isinstance(t.exception, _BoundOrdinaryLaunchUnresolvedError)
+                    or remaining is not None)
+                if ownership_lost:
+                    logger.info(
+                        'Discarding bound ordinary-launch worker for replica '
+                        '%s after controller ownership loss.', replica_id)
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
+                    continue
+                if unresolved:
+                    if (remaining is not None and
+                            _bound_projection_classification(remaining)
+                            == 'AMBIGUOUS'):
+                        logger.error(
+                            'Retaining finished bound ordinary-launch worker '
+                            'for replica %s: its exact association is durably '
+                            'ambiguous (%s).', replica_id, t.exception)
+                        continue
+                    # A transport failure can happen before admission commits,
+                    # or after a commit whose response was lost.  Replace the
+                    # finished worker while this controller is still live:
+                    # the stable submission ID adopts an existing pointer or
+                    # safely performs the never-committed first admission.
+                    retry_request_id = (
+                        legacy_runtime.replica_to_request_id.get(replica_id))
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
+                    if info.status in (serve_state.ReplicaStatus.PENDING,
+                                       serve_state.ReplicaStatus.PROVISIONING):
+                        try:
+                            redriven = (
+                                self.
+                                _redrive_bound_ordinary_launch_after_pre_effect(
+                                    info))
+                        except Exception as error:  # pylint: disable=broad-except
+                            logger.warning(
+                                'Could not locally re-drive unresolved bound '
+                                'launch for replica %s: %s', replica_id,
+                                common_utils.format_exception(error))
+                            redriven = False
+                        if not redriven:
+                            # Retain a retry owner.  A later refresh repeats
+                            # the exact stable admission without waiting for a
+                            # controller restart.
+                            legacy_runtime.launch_thread_pool[replica_id] = t
+                    elif (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN
+                         ):
+                        # Teardown can persist INTERRUPTED and then lose the
+                        # final admission acknowledgement while joining this
+                        # worker.  The finished unresolved marker is no longer
+                        # an executable owner, but dropping it without
+                        # rebuilding teardown would strand the durable row: a
+                        # live controller does not rerun startup recovery.
+                        status = info.status_property
+                        is_scale_down = (status.is_scale_down or
+                                         status.preempted)
+                        purge = status.purged
+                        try:
+                            self._terminate_replica(
+                                replica_id,
+                                sync_down_logs=not (is_scale_down or purge),
+                                replica_drain_delay_seconds=0,
+                                is_scale_down=is_scale_down,
+                                purge=purge,
+                                in_flight_drain_cap_seconds=(
+                                    status.drain_cap_seconds))
+                        except Exception as error:  # pylint: disable=broad-except
+                            logger.warning(
+                                'Could not locally re-drive teardown after '
+                                'unresolved bound launch for replica %s; '
+                                'retaining its retry owner: %s', replica_id,
+                                common_utils.format_exception(error))
+                            legacy_runtime.launch_thread_pool[replica_id] = t
+                            if retry_request_id is not None:
+                                legacy_runtime.replica_to_request_id[
+                                    replica_id] = retry_request_id
+                    continue
+                if isinstance(t.exception,
+                              _BoundOrdinaryLaunchPreEffectTerminalError):
+                    assert isinstance(t, _ReplicaLaunchThread)
+                    bound_pre_effect_retries.append((replica_id, info, t))
+                    continue
+                superseded = isinstance(t.exception,
+                                        _ReplicaLaunchSupersededError)
+                error_in_sky_launch = t.format_exc is not None
+                if isinstance(t.exception, _ReplicaLaunchCapacityError):
+                    if t.exception.reason == 'quota':
+                        bound_quota_launch_failures.add(replica_id)
+                    else:
+                        bound_capacity_launch_failures.add(replica_id)
+                bound_completed_launches.append(
+                    (replica_id, info, error_in_sky_launch, superseded))
                 continue
             if replica_id in superseded_launches:
                 superseded_launch_infos.append((replica_id, info))
@@ -9546,6 +10875,58 @@ class SkyPilotReplicaManager(ReplicaManager):
                     ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
                     legacy_runtime.replica_to_request_id.get(replica_id))
 
+        # Bound reducers have already committed ReplicaInfo, exact paid-pool
+        # feedback, pointer clearing, and retention-pin release in one
+        # transaction. They release claims for terminal outcomes, while a
+        # non-cancelled PRE_EFFECT terminal keeps its exact claim for the next
+        # generation. Re-running the legacy batch here would apply the same
+        # economic outcome twice and could overwrite the typed projection with
+        # a stale pre-reducer snapshot.
+        if bound_completed_launches or bound_pre_effect_retries:
+            if (bound_capacity_launch_failures or bound_quota_launch_failures):
+                self._scale_reconciliation_event.set()
+            for replica_id, info, _, _ in bound_completed_launches:
+                self._emit_ordinary_launch_handoff_event(
+                    info,
+                    ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+                    legacy_runtime.replica_to_request_id.get(replica_id))
+            for replica_id, info, _ in bound_pre_effect_retries:
+                self._emit_ordinary_launch_handoff_event(
+                    info,
+                    ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+                    legacy_runtime.replica_to_request_id.get(replica_id))
+
+        # Projection made these exact rows PENDING and cleared their old
+        # association pointer. Replace the completed local worker with a fresh
+        # recovery-style admission: the stable submission identity plus the
+        # settled predecessor makes the request transaction allocate
+        # generation+1, and the retained paid claim is reused exactly. If
+        # local reconstruction is temporarily unavailable, keep the completed
+        # marker so the next refresh retries without teardown.
+        for replica_id, info, old_thread in bound_pre_effect_retries:
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
+            try:
+                retry_enqueued = (
+                    self._redrive_bound_ordinary_launch_after_pre_effect(info))
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Could not enqueue generation+1 bound ordinary launch '
+                    'for replica %s; retaining the pending retry marker: %s',
+                    replica_id, common_utils.format_exception(error))
+                retry_enqueued = False
+            if not retry_enqueued:
+                # _launch_replica either installs a complete fresh worker or
+                # installs none. Preserve a retry owner if admission deferred.
+                if replica_id not in legacy_runtime.launch_thread_pool:
+                    legacy_runtime.launch_thread_pool[replica_id] = old_thread
+                continue
+            logger.info(
+                'Queued generation+1 bound ordinary launch for replica %s '
+                'after exact pre-effect settlement.', replica_id)
+
         # Retire v2 failures before any ordinary log/drain provider work. The
         # worker remains registered until its row outcome has been persisted;
         # _terminate_replica consumes try-only phase contention and always
@@ -9585,6 +10966,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
+
+        for replica_id, info, error_in_sky_launch, superseded in (
+                bound_completed_launches):
+            if error_in_sky_launch:
+                # Keep the finished worker registered until teardown proves
+                # the exact request pointer is clear. Supersession is a
+                # scale-down decision; a launch failure keeps the historical
+                # failure record under existing Serve semantics.
+                self._terminate_replica(
+                    replica_id,
+                    sync_down_logs=not superseded,
+                    replica_drain_delay_seconds=0,
+                    is_scale_down=superseded,
+                    in_flight_drain_cap_seconds=(0 if superseded else None))
+            else:
+                legacy_runtime.launch_thread_pool.pop(replica_id)
+                legacy_runtime.replica_to_request_id.pop(replica_id)
+                legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
 
         if pending_launches:
             if self._spot_placer is not None:
@@ -9741,9 +11141,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # This replica is now provisioning; reflect it locally
                     # instead of re-scanning the DB on the next replica.
                     in_flight += 1
-                    info.status_property.sky_launch_status = (
-                        common_utils.ProcessStatus.RUNNING)
-                    self._persist_replica(replica_id, info)
+                    if (isinstance(t, _ReplicaLaunchThread) and
+                            t.bound_ordinary_launch):
+                        # The child may admit and project before this parent
+                        # bookkeeping write.  Update only the latest locked
+                        # SCHEDULED row while its scalar pointer is still
+                        # active; a completed projection wins permanently.
+                        serve_state.mark_bound_replica_launch_running_if_active(
+                            self._service_name, replica_id,
+                            info.replica_record_id)
+                    else:
+                        info.status_property.sky_launch_status = (
+                            common_utils.ProcessStatus.RUNNING)
+                        self._persist_replica(replica_id, info)
                 for replica_id, t, info in down_to_admit:
                     if concurrent_downs >= _MAX_CONCURRENT_DOWNS_PER_SERVICE:
                         break

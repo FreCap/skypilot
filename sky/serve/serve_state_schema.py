@@ -5,6 +5,7 @@ import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext import compiler as sqlalchemy_compiler
 from sqlalchemy.ext import declarative
 
 from sky.serve import constants
@@ -15,6 +16,34 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 Base = declarative.declarative_base()
+
+
+class _ControllerIncarnationDefault(sqlalchemy.sql.expression.FunctionElement):
+    """Dialect-native UUID default for the canonical current metadata."""
+
+    inherit_cache = True
+    type = sqlalchemy.Uuid(as_uuid=True)
+
+
+@sqlalchemy_compiler.compiles(_ControllerIncarnationDefault, 'postgresql')
+def _compile_controller_incarnation_postgres(_element, _compiler, **_kwargs):
+    return 'gen_random_uuid()'
+
+
+@sqlalchemy_compiler.compiles(_ControllerIncarnationDefault, 'sqlite')
+def _compile_controller_incarnation_sqlite(_element, _compiler, **_kwargs):
+    # Local SQLite is physically capped before Serve042, but unit tests build
+    # the canonical metadata directly.  Keep that graph insertable without a
+    # client-side default, which would leak this future column into statements
+    # against historical schemas.
+    return ("(lower(hex(randomblob(4))) || '-' || "
+            "lower(hex(randomblob(2))) || '-4' || "
+            "substr(lower(hex(randomblob(2))), 2) || '-' || "
+            "substr('89ab', (random() & 3) + 1, 1) || "
+            "substr(lower(hex(randomblob(2))), 2) || '-' || "
+            "lower(hex(randomblob(6))))")
+
+
 # === Database schema ===
 services_table = sqlalchemy.Table(
     'services',
@@ -82,6 +111,35 @@ services_table = sqlalchemy.Table(
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
     sqlalchemy.Column('controller_ip', sqlalchemy.Text, server_default=None),
+    # ABA-safe owner identity for durable ordinary-launch request binding.
+    # PID/IP remain routing metadata; every controller takeover installs a
+    # fresh incarnation and advances the owner epoch atomically in Serve042.
+    sqlalchemy.Column(
+        'controller_incarnation',
+        sqlalchemy.Uuid(as_uuid=True),
+        nullable=False,
+        # A server default mirrors Serve042 without injecting
+        # this future column into historical INSERT statements.
+        server_default=_ControllerIncarnationDefault()),
+    sqlalchemy.Column('controller_owner_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='1'),
+    # Capability is bound to the exact controller incarnation above.  Existing
+    # services remain dark until a capable subprocess explicitly promotes the
+    # non-pool service from legacy to bound mode.
+    sqlalchemy.Column('ordinary_launch_binding_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('ordinary_launch_binding_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='legacy'),
+    sqlalchemy.Column('ordinary_launch_binding_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that
@@ -181,6 +239,11 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column(
         'replica_state',
         sqlalchemy.JSON().with_variant(postgresql.JSONB(), 'postgresql')),
+    # Neutral request association for the ordinary launch path.  Generic
+    # ReplicaInfo persistence omits this scalar so old writers cannot erase a
+    # durable binding by rewriting the JSON payload.
+    sqlalchemy.Column('ordinary_launch_association_id',
+                      sqlalchemy.Uuid(as_uuid=True)),
     # These columns are initialized and mutated only by typed resource-action
     # transitions.  Generic ReplicaInfo persistence deliberately omits them.
     # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed

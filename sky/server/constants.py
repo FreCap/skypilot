@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 73  # Owner-scoped persisted request access
+API_VERSION = 74  # Durable ordinary SkyServe launch request binding
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -136,6 +136,10 @@ MIN_PUBLIC_CAPACITY_API_VERSION = 72
 
 # Minimum API version that scopes persisted request payload access by owner.
 MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
+
+# Minimum API version with the private atomic ordinary-launch binding endpoint.
+MIN_ORDINARY_LAUNCH_BINDING_API_VERSION = 74
+ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies

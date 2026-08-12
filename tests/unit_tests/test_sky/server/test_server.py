@@ -771,6 +771,220 @@ async def test_serve_launch_endpoint_attaches_owner_precondition():
     assert condition.service_hash == 'incarnation-a'
 
 
+def _binding_excluded_discriminator() -> dict[str, object]:
+    return {
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+            server.serve_constants.
+            ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE,
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 7,
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY: '12345678-1234-4234-8234-123456789abc',
+    }
+
+
+@pytest.mark.parametrize('excluded_key', [
+    *server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_KEYS,
+    f'{server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX}future',
+])
+@pytest.mark.asyncio
+async def test_ordinary_serve_launch_rejects_caller_excluded_scope_before_bind(
+        excluded_key: str) -> None:
+    launch_context = {
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'svc-hash',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 2,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.2',
+        server.ordinary_launch_binding.REPLICA_ID_KEY: 3,
+        server.ordinary_launch_binding.REPLICA_RECORD_ID_KEY: '22222222-2222-4222-8222-222222222222',
+        server.ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 4,
+        server.ordinary_launch_binding.BINDING_EPOCH_KEY: 5,
+        server.ordinary_launch_binding.CONTROLLER_INCARNATION_KEY: '33333333-3333-4333-8333-333333333333',
+        server.ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: 6,
+        excluded_key: 'caller-authored',
+    }
+    submission = server._OrdinaryServeLaunchSubmission(
+        submission_uuid='11111111-1111-4111-8111-111111111111',
+        launch=server.payloads.LaunchBody(
+            task='name: task\nresources:\n  cpus: 2\n',
+            cluster_name='svc-3',
+            is_launched_by_sky_serve_controller=True,
+            extra_launch_context=launch_context,
+            env_vars={'SKYPILOT_USER_ID': 'owner'}))
+    request = types.SimpleNamespace(state=types.SimpleNamespace(
+        request_id='transport-attempt-id', auth_user=None))
+
+    with mock.patch.object(
+            server.serve_state,
+            'get_service_config_recovery_identity',
+            return_value=('svc-hash', 'workspace-a')), \
+         mock.patch.object(server.executor,
+                           'build_request_async',
+                           new_callable=mock.AsyncMock) as mock_build, \
+         mock.patch.object(server,
+                           '_bind_and_enqueue_ordinary_launch') as mock_bind, \
+         pytest.raises(fastapi.HTTPException) as raised:
+        await server.ordinary_serve_launch(submission, request)
+
+    assert raised.value.status_code == 409
+    assert 'excluded' in raised.value.detail.lower()
+    mock_build.assert_not_awaited()
+    mock_bind.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_serve_launch_rejects_clone_disk_before_provider_work(
+) -> None:
+    launch_context = {
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'svc-hash',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 2,
+        server.ordinary_launch_binding.REPLICA_ID_KEY: 3,
+        server.ordinary_launch_binding.REPLICA_RECORD_ID_KEY: '22222222-2222-4222-8222-222222222222',
+        server.ordinary_launch_binding.LIFECYCLE_EPOCH_KEY: 4,
+        server.ordinary_launch_binding.BINDING_EPOCH_KEY: 5,
+        server.ordinary_launch_binding.CONTROLLER_INCARNATION_KEY: '33333333-3333-4333-8333-333333333333',
+        server.ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY: 6,
+    }
+    submission = server._OrdinaryServeLaunchSubmission(
+        submission_uuid='11111111-1111-4111-8111-111111111111',
+        launch=server.payloads.LaunchBody(
+            task='name: task\nresources:\n  cpus: 2\n',
+            cluster_name='svc-3',
+            clone_disk_from='source-cluster',
+            is_launched_by_sky_serve_controller=True,
+            extra_launch_context=launch_context,
+            env_vars={'SKYPILOT_USER_ID': 'owner'}))
+    request = types.SimpleNamespace(state=types.SimpleNamespace(
+        request_id='transport-attempt-id', auth_user=None))
+
+    with mock.patch.object(server.executor,
+                           'build_request_async',
+                           new_callable=mock.AsyncMock) as mock_build, \
+         mock.patch.object(server,
+                           '_bind_and_enqueue_ordinary_launch') as mock_bind, \
+         pytest.raises(fastapi.HTTPException) as raised:
+        await server.ordinary_serve_launch(submission, request)
+
+    assert raised.value.status_code == 409
+    mock_build.assert_not_awaited()
+    mock_bind.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_serve_launch_persists_normalized_excluded_profile_precondition():
+    """Queue replay retains the exact special-profile discriminator."""
+    from sky.server.requests import payloads
+    from sky.server.requests import preconditions
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = {
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 3,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+    }
+    discriminator = _binding_excluded_discriminator()
+    launch_context.update(discriminator)
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule:
+        await server.launch(launch_body, request)
+
+    condition = mock_schedule.await_args.kwargs['precondition']
+    assert isinstance(condition, preconditions.ServiceReplicaLaunchPrecondition)
+    assert condition.binding_excluded_launch_context == discriminator
+
+
+@pytest.mark.asyncio
+async def test_serve_launch_rejects_malformed_excluded_profile_before_queue():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context={
+            server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY: 'persisted-special.v1',
+        })
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException,
+                       match='excluded-profile discriminator') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_excluded_profile_rejects_non_serve_caller_before_queue():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_body = payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='user-cluster',
+        is_launched_by_sky_serve_controller=False,
+        extra_launch_context=_binding_excluded_discriminator())
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException,
+                       match='restricted to SkyServe') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_system_recovery_discriminator_cannot_borrow_request():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    launch_context = {
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+        server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 3,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+        server.serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+            server.serve_constants.
+            ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE,
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 7,
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY: 'another-request',
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY: 7,
+    }
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=launch_context)
+
+    with mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as mock_schedule, \
+         pytest.raises(fastapi.HTTPException,
+                       match='derived from this exact bound launch') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    mock_schedule.assert_not_awaited()
+
+
 def _ordinary_launch_handoff_context() -> dict[str, object]:
     return {
         server.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
@@ -796,7 +1010,7 @@ async def test_ordinary_launch_publication_follows_durable_schedule():
     request = mock.MagicMock()
     request.state.request_id = 'launch-request-id'
     request.state.auth_user = None
-    launch_body = payloads.LaunchBody(
+    launch_body = server.payloads.LaunchBody(
         task='test_task_yaml',
         cluster_name='svc-replica-7',
         is_launched_by_sky_serve_controller=True,
@@ -841,10 +1055,11 @@ async def test_ordinary_launch_publication_requires_matching_complete_fence(
     request.state.auth_user = None
     launch_context = _ordinary_launch_handoff_context()
     context_mutation(launch_context)
-    launch_body = payloads.LaunchBody(task='test_task_yaml',
-                                      cluster_name='svc-replica-7',
-                                      is_launched_by_sky_serve_controller=True,
-                                      extra_launch_context=launch_context)
+    launch_body = server.payloads.LaunchBody(
+        task='test_task_yaml',
+        cluster_name='svc-replica-7',
+        is_launched_by_sky_serve_controller=True,
+        extra_launch_context=launch_context)
 
     with mock.patch('sky.server.server.executor.schedule_request_async',
                     new_callable=mock.AsyncMock) as mock_schedule, \
@@ -862,7 +1077,7 @@ async def test_ordinary_launch_publication_failure_does_not_fail_launch():
     request = mock.MagicMock()
     request.state.request_id = 'launch-request-id'
     request.state.auth_user = None
-    launch_body = payloads.LaunchBody(
+    launch_body = server.payloads.LaunchBody(
         task='test_task_yaml',
         cluster_name='svc-replica-7',
         is_launched_by_sky_serve_controller=True,
@@ -883,7 +1098,7 @@ async def test_ordinary_launch_is_not_published_before_schedule_commits():
     request = mock.MagicMock()
     request.state.request_id = 'launch-request-id'
     request.state.auth_user = None
-    launch_body = payloads.LaunchBody(
+    launch_body = server.payloads.LaunchBody(
         task='test_task_yaml',
         cluster_name='svc-replica-7',
         is_launched_by_sky_serve_controller=True,
@@ -1108,10 +1323,46 @@ def _unbound_system_recovery_launch_context() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_system_recovery_rejects_caller_exclusion_before_nonce_bind():
+    from sky.server.requests import payloads
+
+    request = mock.MagicMock()
+    request.state.request_id = 'launch-request-id'
+    request.state.auth_user = None
+    context = _unbound_system_recovery_launch_context()
+    context.update({
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+            server.serve_constants.
+            ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE,
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 7,
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY: 'launch-request-id',
+        server.serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY: 7,
+    })
+    launch_body = payloads.LaunchBody(task='test_task_yaml',
+                                      cluster_name='svc-replica-7',
+                                      is_launched_by_sky_serve_controller=True,
+                                      extra_launch_context=context)
+
+    with mock.patch.object(
+            server.serve_state,
+            'bind_replica_system_recovery_launch_request') as bind, \
+         mock.patch('sky.server.server.executor.schedule_request_async',
+                    new_callable=mock.AsyncMock) as schedule, \
+         pytest.raises(fastapi.HTTPException,
+                       match='server-derived only') as exc:
+        await server.launch(launch_body, request)
+
+    assert exc.value.status_code == 409
+    bind.assert_not_called()
+    schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_system_recovery_launch_binds_request_before_nonretryable_queue():
     """The API consumes the nonce and queues only the bound one-shot body."""
     from sky.serve import constants as serve_constants
     from sky.server.requests import payloads
+    from sky.server.requests import preconditions
 
     request = mock.MagicMock()
     request.state.request_id = 'launch-request-id'
@@ -1123,17 +1374,24 @@ async def test_system_recovery_launch_binds_request_before_nonretryable_queue():
                                       is_launched_by_sky_serve_controller=True,
                                       extra_launch_context=unbound)
     events = []
+    normalize_excluded_context = (
+        server.serve_state.normalize_binding_excluded_launch_context)
 
     with mock.patch.object(
             server.serve_state,
             'bind_replica_system_recovery_launch_request') as mock_bind, \
+         mock.patch.object(
+             server.serve_state,
+             'normalize_binding_excluded_launch_context') as mock_normalize, \
          mock.patch('sky.server.server.executor.schedule_request_async',
                     new_callable=mock.AsyncMock) as mock_schedule:
         mock_bind.side_effect = lambda *_: events.append('bind')
+        mock_normalize.side_effect = (lambda context: events.append('normalize')
+                                      or normalize_excluded_context(context))
         mock_schedule.side_effect = lambda *_, **__: events.append('schedule')
         await server.launch(launch_body, request)
 
-    assert events == ['bind', 'schedule']
+    assert events == ['bind', 'normalize', 'schedule']
     mock_bind.assert_called_once_with(unbound, 'launch-request-id')
     assert serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY in unbound
     queued_body = mock_schedule.await_args.kwargs['request_body']
@@ -1144,6 +1402,17 @@ async def test_system_recovery_launch_binds_request_before_nonretryable_queue():
     assert queued_context[
         serve_constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY] == (
             'launch-request-id')
+    mock_normalize.assert_called_once_with(queued_context)
+    condition = mock_schedule.await_args.kwargs['precondition']
+    assert isinstance(condition, preconditions.ServiceReplicaLaunchPrecondition)
+    assert condition.binding_excluded_launch_context == {
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+            serve_constants.
+            ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE,
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 7,
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY: 'launch-request-id',
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY: 7,
+    }
     assert mock_schedule.await_args.kwargs['retryable'] is False
 
 

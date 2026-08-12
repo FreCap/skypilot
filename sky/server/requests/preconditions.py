@@ -18,6 +18,7 @@ from typing import Any
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.serve import constants as serve_constants
 from sky.serve import serve_state
 from sky.server.requests import requests as api_requests
@@ -30,6 +31,8 @@ _PRECONDITION_CHECK_INTERVAL = 1
 _PRECONDITION_TIMEOUT = 60 * 60
 
 logger = sky_logging.init_logger(__name__)
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
 
 # Strong references to background precondition tasks to prevent GC.
 # asyncio only keeps weak references to tasks, so without this set a
@@ -229,6 +232,7 @@ class ServiceReplicaLaunchPrecondition(Precondition):
                  controller_pid: int | None,
                  controller_ip: str | None,
                  service_version: int | None = None,
+                 binding_excluded_launch_context: dict[str, Any] | None = None,
                  check_interval: float = _PRECONDITION_CHECK_INTERVAL) -> None:
         super().__init__(request_id=request_id,
                          timeout=0,
@@ -238,8 +242,22 @@ class ServiceReplicaLaunchPrecondition(Precondition):
         self.controller_pid = controller_pid
         self.controller_ip = controller_ip
         self.service_version = service_version
+        self.binding_excluded_launch_context = (
+            None if binding_excluded_launch_context is None else
+            dict(binding_excluded_launch_context))
 
     async def check(self) -> tuple[bool, str | None]:
+        excluded = self.binding_excluded_launch_context
+        if (excluded is not None and excluded.get(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY)
+                == serve_constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE and
+                excluded.get(serve_constants.
+                             ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY)
+                != self.request_id):
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Refusing system-recovery launch whose excluded-profile '
+                'request identity does not match its durable queue row.')
         launch_context = {
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY:
                 self.service_name,
@@ -253,11 +271,35 @@ class ServiceReplicaLaunchPrecondition(Precondition):
                 self.controller_ip,
         }
         authorized = await asyncio.to_thread(
-            serve_state.service_replica_launch_fence_holds, launch_context)
+            serve_state.service_replica_launch_fence_holds, launch_context,
+            self.binding_excluded_launch_context)
         if not authorized:
             raise exceptions.ServeReplicaLaunchFenceError(
                 f'Refusing replica launch for stale service owner '
                 f'{self.service_name!r}/{self.service_hash!r}.')
+        return True, None
+
+
+class OrdinaryLaunchBindingPrecondition(Precondition):
+    """Gate queue admission on one exact durable ordinary association."""
+
+    def __init__(self,
+                 request_id: str,
+                 association_id: str,
+                 check_interval: float = _PRECONDITION_CHECK_INTERVAL) -> None:
+        super().__init__(request_id=request_id,
+                         timeout=0,
+                         check_interval=check_interval)
+        self.association_id = association_id
+
+    async def check(self) -> tuple[bool, str | None]:
+        authorized = await asyncio.to_thread(
+            ordinary_launch_binding.binding_allows_request, self.association_id,
+            self.request_id)
+        if not authorized:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'Refusing ordinary replica launch whose durable request '
+                'association is no longer current.')
         return True, None
 
 
@@ -286,6 +328,16 @@ def serialize(precondition: Precondition | None) -> DurablePrecondition | None:
                 'controller_pid': precondition.controller_pid,
                 'controller_ip': precondition.controller_ip,
                 'service_version': precondition.service_version,
+                'binding_excluded_launch_context':
+                    precondition.binding_excluded_launch_context,
+            },
+            deadline=deadline)
+    if isinstance(precondition, OrdinaryLaunchBindingPrecondition):
+        return DurablePrecondition(
+            type_name='ordinary-launch-binding.v1',
+            payload={
+                **common,
+                'association_id': precondition.association_id,
             },
             deadline=deadline)
     raise ValueError(
@@ -314,6 +366,32 @@ def deserialize(type_name: str, payload: dict[str, Any],
         if (service_version is not None and
             (type(service_version) is not int or service_version <= 0)):
             raise ValueError('Service replica launch version is malformed.')
+        binding_excluded_launch_context = payload.get(
+            'binding_excluded_launch_context')
+        if binding_excluded_launch_context is not None:
+            try:
+                binding_excluded_launch_context = (
+                    serve_state.normalize_binding_excluded_launch_context(
+                        binding_excluded_launch_context))
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    'Service replica launch excluded-profile discriminator '
+                    'is malformed.') from error
+            if binding_excluded_launch_context is None:
+                raise ValueError(
+                    'Service replica launch excluded-profile discriminator '
+                    'is malformed.')
+            if (binding_excluded_launch_context.get(
+                    serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY
+            ) == serve_constants.
+                    ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE and
+                    binding_excluded_launch_context.get(
+                        serve_constants.
+                        ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY)
+                    != request_id):
+                raise ValueError(
+                    'System-recovery excluded-profile request identity does '
+                    'not match its durable queue row.')
         return ServiceReplicaLaunchPrecondition(
             request_id=request_id,
             service_name=str(payload['service_name']),
@@ -321,6 +399,12 @@ def deserialize(type_name: str, payload: dict[str, Any],
             controller_pid=controller_pid,
             controller_ip=controller_ip,
             service_version=service_version,
+            binding_excluded_launch_context=binding_excluded_launch_context,
+            check_interval=float(payload['check_interval']))
+    if type_name == 'ordinary-launch-binding.v1':
+        return OrdinaryLaunchBindingPrecondition(
+            request_id=request_id,
+            association_id=str(payload['association_id']),
             check_interval=float(payload['check_interval']))
     raise ValueError(f'Unknown durable precondition type {type_name!r}.')
 

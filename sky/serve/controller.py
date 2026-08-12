@@ -36,6 +36,7 @@ from sky import serve
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import common as adaptors_common
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
@@ -43,6 +44,7 @@ from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
+from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import placement_policy
 from sky.serve import provider_phase
@@ -62,6 +64,7 @@ from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 # Keep the historical controller-module patch surface for tests and plugins.
 serve_history = controller_history.serve_history
 
@@ -361,21 +364,32 @@ class SkyServeController:
         - Providing the HTTP Server API for SkyServe to communicate with.
     """
 
-    def __init__(self,
-                 service_name: str,
-                 service_spec: serve.SkyServiceSpec,
-                 version: int,
-                 host: str,
-                 port: int,
-                 controller_owner_fingerprint: str,
-                 resource_scope: str | None = None,
-                 service_hash: str | None = None,
-                 controller_pid: int | None = None,
-                 controller_ip: str | None = None,
-                 enforce_launch_fence: bool = False) -> None:
+    def __init__(
+        self,
+        service_name: str,
+        service_spec: serve.SkyServiceSpec,
+        version: int,
+        host: str,
+        port: int,
+        controller_owner_fingerprint: str,
+        resource_scope: str | None = None,
+        service_hash: str | None = None,
+        controller_pid: int | None = None,
+        controller_ip: str | None = None,
+        enforce_launch_fence: bool = False,
+        controller_binding_authority: ordinary_launch_binding.
+        ControllerBindingAuthority | None = None
+    ) -> None:
         self._service_name = service_name
         self._resource_scope = resource_scope
         self._service_hash = service_hash
+        self._ordinary_launch_binding_authority = (
+            ordinary_launch_binding.validate_controller_authority(
+                controller_binding_authority,
+                service_name=service_name,
+                service_hash=service_hash,
+                controller_pid=controller_pid,
+                controller_ip=controller_ip))
         self._history_session_id = uuid.uuid4().hex
         self._controller_owner = ((controller_pid,
                                    controller_ip) if service_hash is not None or
@@ -480,7 +494,7 @@ class SkyServeController:
             if self._lb_ha_enabled else 0)
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
-        self._replica_manager: replica_managers.ReplicaManager = (
+        self._replica_manager: replica_managers.SkyPilotReplicaManager = (
             replica_managers.SkyPilotReplicaManager(
                 service_name=service_name,
                 spec=service_spec,
@@ -489,7 +503,9 @@ class SkyServeController:
                 service_hash=service_hash,
                 controller_pid=controller_pid,
                 controller_ip=controller_ip,
-                enforce_launch_fence=enforce_launch_fence))
+                enforce_launch_fence=enforce_launch_fence,
+                controller_binding_authority=(
+                    self._ordinary_launch_binding_authority)))
         # Pass `version` so a controller rebuilt on restart/respawn starts the
         # autoscaler at the recovered latest version (matching the replica
         # manager above), not INITIAL_VERSION. Otherwise a service updated past
@@ -4913,6 +4929,102 @@ class SkyServeController:
             return await self._handle_load_balancer_request_history_sync(
                 request_data)
 
+        @self._app.post(
+            serve_constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        def set_ordinary_launch_binding_mode(request_data: dict[
+            str, Any] = fastapi.Body(...)) -> fastapi.Response:
+            """Transition one live manager under controller-local fences."""
+            mode = request_data.get('mode')
+            expected_service_hash = request_data.get('expected_service_hash')
+            expected_binding_epoch = request_data.get('expected_binding_epoch')
+            if mode not in ('legacy', 'bound'):
+                return responses.JSONResponse(
+                    content={'message': 'mode must be legacy or bound.'},
+                    status_code=400)
+            if (isinstance(expected_binding_epoch, bool) or
+                    not isinstance(expected_binding_epoch, int) or
+                    expected_binding_epoch < 0):
+                return responses.JSONResponse(content={
+                    'message': ('expected_binding_epoch must be a '
+                                'nonnegative integer.')
+                },
+                                              status_code=400)
+            if expected_service_hash != self._service_hash:
+                return responses.JSONResponse(content={
+                    'message': 'Service incarnation changed before the '
+                               'binding transition.'
+                },
+                                              status_code=409)
+            try:
+                with self._actuation_epoch_lock:
+                    previous = self._ordinary_launch_binding_authority
+                    if previous is None:
+                        raise (ordinary_launch_binding.
+                               OrdinaryLaunchBindingUnavailable(
+                                   'Controller has no durable binding '
+                                   'authority.'))
+                    if previous.binding_mode.value == mode:
+                        if (previous.binding_epoch
+                                != expected_binding_epoch + 1):
+                            raise (ordinary_launch_binding.
+                                   OrdinaryLaunchBindingConflict(
+                                       'Requested binding transition is not '
+                                       'an exact adjacent-epoch retry.'))
+                        epoch = previous.binding_epoch
+                    else:
+                        if previous.binding_epoch != expected_binding_epoch:
+                            raise (ordinary_launch_binding.
+                                   OrdinaryLaunchBindingConflict(
+                                       'Binding source epoch changed before '
+                                       'the transition.'))
+                        transition = (self._replica_manager.
+                                      ordinary_launch_binding_transition)
+                        with transition() as install:
+                            if mode == 'bound':
+                                epoch = (
+                                    request_postgres.
+                                    promote_ordinary_launch_binding_service(
+                                        previous))
+                            else:
+                                epoch = (request_postgres.
+                                         demote_ordinary_launch_binding_service(
+                                             previous))
+                            refresh = (ordinary_launch_binding.
+                                       refresh_controller_authority)
+                            with refresh(previous) as refreshed:
+                                if (refreshed.binding_mode.value != mode or
+                                        refreshed.binding_epoch != epoch):
+                                    raise (ordinary_launch_binding.
+                                           OrdinaryLaunchBindingConflict(
+                                               'Committed binding transition '
+                                               'did not refresh to its exact '
+                                               'mode and epoch.'))
+                                install(refreshed)
+                                self._ordinary_launch_binding_authority = (
+                                    refreshed)
+                return responses.JSONResponse(content={
+                    'binding_mode': mode,
+                    'binding_epoch': epoch,
+                },
+                                              status_code=200)
+            except (ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                    ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
+                    RuntimeError) as error:
+                logger.warning(
+                    'Ordinary-launch binding transition rejected for %s: %s',
+                    self._service_name, common_utils.format_exception(error))
+                return responses.JSONResponse(content={'message': str(error)},
+                                              status_code=409)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.exception(
+                    'Ordinary-launch binding transition failed for %s.',
+                    self._service_name)
+                return responses.JSONResponse(content={
+                    'message': common_utils.format_exception(error),
+                },
+                                              status_code=500)
+
         # Deliberately a sync handler: parsing and committing the task YAML can
         # perform blocking file/DB I/O. Runtime application happens on the
         # reconciler, so this lock covers only the short durable commit.
@@ -5252,7 +5364,9 @@ def run_controller(service_name: str,
                    controller_pid: int | None = None,
                    controller_ip: str | None = None,
                    enforce_launch_fence: bool = False,
-                   controller_socket: socket.socket | None = None):
+                   controller_socket: socket.socket | None = None,
+                   controller_binding_authority: ordinary_launch_binding.
+                   ControllerBindingAuthority | None = None):
     setproctitle.setproctitle('sky.serve.controller '
                               f'--service-name {service_name} '
                               f'--service-incarnation {service_hash or ""}')
@@ -5260,12 +5374,16 @@ def run_controller(service_name: str,
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
+    controller_kwargs: dict[str, Any] = {}
+    if controller_binding_authority is not None:
+        controller_kwargs['controller_binding_authority'] = (
+            controller_binding_authority)
     controller = SkyServeController(service_name, service_spec, version,
                                     controller_host, controller_port,
                                     controller_owner_fingerprint,
                                     resource_scope, service_hash,
                                     controller_pid, controller_ip,
-                                    enforce_launch_fence)
+                                    enforce_launch_fence, **controller_kwargs)
     if controller_socket is None:
         controller.run()
     else:

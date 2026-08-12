@@ -17,6 +17,10 @@ REQUESTS = sqlalchemy.Table(
     sqlalchemy.Column('payload_json', postgresql.JSONB, nullable=False),
     sqlalchemy.Column('execution_class', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('status', sqlalchemy.Text, nullable=False),
+    # Nullable for API008 rows upgraded in place.  Every terminal transition
+    # written by API009 persists one of the closed operational-event causes;
+    # a bound reducer treats a legacy NULL as ambiguous evidence.
+    sqlalchemy.Column('terminal_cause', sqlalchemy.Text),
     sqlalchemy.Column('return_value', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('error', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('pid', sqlalchemy.Integer),
@@ -56,10 +60,50 @@ REQUESTS = sqlalchemy.Table(
     sqlalchemy.Column('event_context', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('resource_action_id', postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('resource_action_attempt', sqlalchemy.Integer),
+    # Immutable request-to-association correlation. Request retention is owned
+    # independently by REQUEST_RETENTION_PINS, so projection can release the
+    # active pin without rewriting this evidence.
+    sqlalchemy.Column('ordinary_launch_association_id',
+                      postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('updated_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
+    sqlalchemy.CheckConstraint(
+        '(ordinary_launch_association_id IS NULL) = '
+        "(handler_name <> 'sky.server.requests.ordinary_launch:launch')",
+        name='ck_api_requests_ordinary_launch_handler'),
+    sqlalchemy.CheckConstraint(
+        "terminal_cause IS NULL OR (status IN ('SUCCEEDED', 'FAILED', "
+        "'CANCELLED') AND terminal_cause IN ('handler_succeeded', "
+        "'handler_failed', 'dispatcher_submit_failed', 'explicit_cancel', "
+        "'coroutine_disconnected', 'graceful_shutdown_retry', "
+        "'compatibility_restart', 'controller_leadership_lost', "
+        "'execution_lease_expired', 'precondition_failed', "
+        "'controller_reservation_conflict'))",
+        name='ck_api_requests_terminal_cause'),
 )
+REQUEST_RETENTION_PINS = sqlalchemy.Table(
+    'api_request_retention_pins',
+    metadata,
+    sqlalchemy.Column('pin_kind', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('pin_id', postgresql.UUID(as_uuid=True),
+                      primary_key=True),
+    sqlalchemy.Column('request_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey(
+                          'api_requests.request_id',
+                          name='fk_api_request_retention_pins_request',
+                          ondelete='RESTRICT'),
+                      nullable=False),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.CheckConstraint('char_length(pin_kind) BETWEEN 1 AND 128',
+                               name='ck_api_request_retention_pins_kind'),
+)
+sqlalchemy.Index('ix_api_request_retention_pins_request',
+                 REQUEST_RETENTION_PINS.c.request_id)
 RESOURCE_ACTIONS = sqlalchemy.Table(
     'api_resource_actions',
     metadata,
@@ -204,6 +248,10 @@ SERVER_INSTANCES = sqlalchemy.Table(
                       nullable=False,
                       server_default=sqlalchemy.text("'unknown'")),
     sqlalchemy.Column('execution_quiescence_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('ordinary_launch_binding_capable',
                       sqlalchemy.Boolean,
                       nullable=False,
                       server_default=sqlalchemy.false()),

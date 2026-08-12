@@ -590,6 +590,8 @@ async def test_requests_gc_daemon(isolated_database):
 @pytest.mark.asyncio
 async def test_requests_gc_daemon_disabled(isolated_database):
     """Test daemon when retention is negative (disabled)."""
+    backend = mock.Mock()
+    backend.gc_request_owned_tombstones = mock.AsyncMock(return_value=0)
     with mock.patch(
             'sky.server.requests.requests.skypilot_config') as mock_config:
         with mock.patch(
@@ -608,11 +610,15 @@ async def test_requests_gc_daemon_disabled(isolated_database):
                     mock_sleep.side_effect = [None, asyncio.CancelledError()]
 
                     # Run the daemon
-                    with pytest.raises(asyncio.CancelledError):
-                        await requests.requests_gc_daemon()
+                    with mock.patch.object(requests.request_storage,
+                                           'get_request_backend',
+                                           return_value=backend):
+                        with pytest.raises(asyncio.CancelledError):
+                            await requests.requests_gc_daemon()
 
                 # Verify cleanup was NOT called due to negative retention
                     mock_clean.assert_not_called()
+                    backend.gc_request_owned_tombstones.assert_awaited_once()
 
                     # The pressure check remains active while normal retention is
                     # disabled, but performs no database cleanup when healthy.

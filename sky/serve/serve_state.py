@@ -46,6 +46,7 @@ from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
+from sky.utils.db import migration_utils
 
 # These modules import Serve state through ReplicaInfo/controller paths. Keep
 # their runtime imports lazy so recovery-only PostgreSQL helpers do not form an
@@ -85,9 +86,17 @@ version_specs_table = serve_state_schema.version_specs_table
 _SERVE038_SERVICE_COLUMN_NAMES = frozenset(
     column.name
     for column in resource_action_m4_state_schema.service_candidate_columns())
+_SERVE042_SERVICE_COLUMN_NAMES = frozenset({
+    'controller_incarnation',
+    'controller_owner_epoch',
+    'ordinary_launch_binding_capable',
+    'ordinary_launch_binding_mode',
+    'ordinary_launch_binding_epoch',
+})
 _SERVE037_SERVICE_COLUMNS = tuple(
     column for column in services_table.c
-    if column.name not in _SERVE038_SERVICE_COLUMN_NAMES)
+    if column.name not in (_SERVE038_SERVICE_COLUMN_NAMES |
+                           _SERVE042_SERVICE_COLUMN_NAMES))
 placement_normalization_runs_table = (
     serve_state_schema.placement_normalization_runs_table)
 placement_normalization_rows_table = (
@@ -436,6 +445,50 @@ def service_replica_launch_authority_guard_is_valid(
     if isinstance(lock, locks.PostgresLock):
         return lock.is_session_alive()
     return lock.is_locked()
+
+
+@contextlib.contextmanager
+# pylint: disable=contextmanager-generator-missing-cleanup
+def service_replica_launch_authority_write_session(
+    service_name: str,
+) -> typing.Iterator[tuple[sqlalchemy.engine.Engine, orm.Session]]:
+    """Hold exclusive launch authority for a controller/association mutation.
+
+    This narrow public wrapper lets the ordinary-launch state machine compose
+    its own typed transaction without depending on this module's private lock
+    implementation.
+    """
+    with _replica_launch_authority_write_session(service_name) as value:
+        yield value
+
+
+@contextlib.contextmanager
+# pylint: disable=contextmanager-generator-missing-cleanup
+def try_service_replica_launch_authority_write_session(
+    service_name: str,
+) -> typing.Iterator[tuple[sqlalchemy.engine.Engine, orm.Session] | None]:
+    """Try one exclusive PostgreSQL authority transaction without waiting.
+
+    Dead-child supervision uses this narrow path so a provider retry holding
+    shared authority cannot block the parent loop that must observe teardown
+    and deliver that retry's cancellation.  ``None`` means another authority
+    participant is active; no mutation has occurred.
+    """
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise RuntimeError('Nonblocking replica launch authority requires '
+                           'PostgreSQL.')
+    lock_id = _replica_launch_authority_lock_id(service_name, engine)
+    guard_engine = db_utils.get_postgres_lock_engine(engine)
+    with orm.Session(guard_engine) as session:
+        acquired = session.execute(
+            sqlalchemy.text('SELECT pg_try_advisory_xact_lock(:lock_key)'), {
+                'lock_key': locks.postgres_lock_key(lock_id)
+            }).scalar_one()
+        if not acquired:
+            yield None
+            return
+        yield engine, session
 
 
 @contextlib.contextmanager
@@ -2058,7 +2111,10 @@ def get_service_controller_owner(
 
 
 def get_service_replica_launch_authorization(
-        service_name: str) -> dict[str, Any] | None:
+        service_name: str,
+        *,
+        binding_excluded_replica_id: int | None = None
+) -> dict[str, Any] | None:
     """Atomically read a controller owner and its launch-authorized version.
 
     A newly committed version is normally the only generation authorized to
@@ -2069,6 +2125,11 @@ def get_service_replica_launch_authorization(
     transaction's quarantine decision.
     """
     engine = _db_manager.get_engine()
+    binding_mode_supported = False
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        revision = migration_utils.get_current_alembic_revision(
+            engine, migration_utils.SERVE_DB_NAME)
+        binding_mode_supported = (revision is not None and int(revision) >= 42)
     (latest_applicable, latest_quarantined,
      latest_applied_applicable) = _quarantine_aware_version_aggregates()
     launch_authorized_version = _quarantine_aware_version_sql_expression(
@@ -2090,12 +2151,40 @@ def get_service_replica_launch_authorization(
         services_table.c.lifecycle_epoch,
         services_table.c.pool,
         services_table.c.resource_scope,
+        *((services_table.c.ordinary_launch_binding_mode,)
+          if binding_mode_supported else ()),
     )
+    binding_excluded_columns: tuple[Any, ...] = ()
+    if binding_excluded_replica_id is not None:
+        excluded_replica_state = sqlalchemy.select(
+            replicas_table.c.replica_state).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id == binding_excluded_replica_id
+            ).scalar_subquery().label('_binding_excluded_replica_state')
+        excluded_replica_status = sqlalchemy.select(
+            replicas_table.c.status).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id == binding_excluded_replica_id
+            ).scalar_subquery().label('_binding_excluded_replica_status')
+        excluded_replica_state_version = sqlalchemy.select(
+            replicas_table.c.replica_state_version).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id == binding_excluded_replica_id
+            ).scalar_subquery().label('_binding_excluded_replica_state_version')
+        excluded_replica_version = sqlalchemy.select(
+            replicas_table.c.version).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id == binding_excluded_replica_id
+            ).scalar_subquery().label('_binding_excluded_replica_version')
+        binding_excluded_columns = (excluded_replica_state,
+                                    excluded_replica_status,
+                                    excluded_replica_state_version,
+                                    excluded_replica_version)
     with orm.Session(engine) as session:
         row = session.execute(
             sqlalchemy.select(
                 *owner_columns, launch_authorized_version,
-                config_protocol_active).select_from(
+                config_protocol_active, *binding_excluded_columns).select_from(
                     services_table.outerjoin(
                         version_specs_table, version_specs_table.c.service_name
                         == services_table.c.name)).where(
@@ -2111,10 +2200,169 @@ def get_service_replica_launch_authorization(
     record['pool_discriminator'] = mapping['pool']
     record['launch_authorized_version'] = mapping['launch_authorized_version']
     record['launch_version_required'] = bool(mapping['config_protocol_active'])
+    if binding_mode_supported:
+        record['ordinary_launch_binding_mode'] = mapping[
+            'ordinary_launch_binding_mode']
+    if binding_excluded_columns:
+        record['binding_excluded_replica_state'] = mapping[
+            '_binding_excluded_replica_state']
+        record['binding_excluded_replica_status'] = mapping[
+            '_binding_excluded_replica_status']
+        record['binding_excluded_replica_state_version'] = mapping[
+            '_binding_excluded_replica_state_version']
+        record['binding_excluded_replica_version'] = mapping[
+            '_binding_excluded_replica_version']
     return record
 
 
-def service_replica_launch_fence_holds(launch_context: dict[str, Any]) -> bool:
+def normalize_binding_excluded_launch_context(
+        launch_context: object) -> dict[str, Any] | None:
+    """Return the closed excluded-profile discriminator, if one is claimed."""
+    if not isinstance(launch_context, dict):
+        return None
+    profile_key = constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY
+    replica_id_key = (constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY)
+    record_id_key = (
+        constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY)
+    request_id_key = (constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY)
+    generation_key = (constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY)
+    claimed_keys = {
+        key for key in launch_context if isinstance(key, str) and
+        key.startswith(constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PREFIX)
+    }
+    if claimed_keys:
+        profile = launch_context.get(profile_key)
+        if profile == constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE:
+            expected_keys = {profile_key, replica_id_key, record_id_key}
+        elif profile == (
+                constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE):
+            expected_keys = {
+                profile_key, replica_id_key, request_id_key, generation_key
+            }
+        else:
+            raise ValueError('Unknown ordinary-launch exclusion profile.')
+        if claimed_keys != expected_keys:
+            raise ValueError(
+                'Ordinary-launch exclusion discriminator is incomplete.')
+        normalized = {key: launch_context[key] for key in expected_keys}
+    elif constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY in launch_context:
+        normalized = {
+            profile_key:
+                constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE,
+            replica_id_key: launch_context.get(
+                constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY),
+            request_id_key: launch_context.get(
+                constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY),
+            generation_key: launch_context.get(
+                constants.SYSTEM_OOM_RECOVERY_LAUNCH_GENERATION_KEY),
+        }
+    else:
+        return None
+
+    replica_id = normalized[replica_id_key]
+    if type(replica_id) is not int or replica_id < 1:
+        raise ValueError('Excluded-profile replica ID must be positive.')
+    if normalized[profile_key] == (
+            constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE):
+        record_id = normalized[record_id_key]
+        if not isinstance(record_id, str):
+            raise ValueError('Excluded-profile replica record ID is invalid.')
+        try:
+            parsed_record_id = uuid.UUID(record_id)
+        except ValueError as error:
+            raise ValueError(
+                'Excluded-profile replica record ID is invalid.') from error
+        if str(parsed_record_id) != record_id:
+            raise ValueError(
+                'Excluded-profile replica record ID must be canonical.')
+    else:
+        request_id = normalized[request_id_key]
+        generation = normalized[generation_key]
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError('Excluded system-recovery request ID is invalid.')
+        if type(generation) is not int or generation < 1:
+            raise ValueError(
+                'Excluded system-recovery generation must be positive.')
+    return normalized
+
+
+def _binding_excluded_replica_matches(
+    owner: Mapping[str, Any],
+    normalized: Mapping[str, Any],
+    service_version: int | None,
+) -> bool:
+    state = owner.get('binding_excluded_replica_state')
+    status = owner.get('binding_excluded_replica_status')
+    state_version = owner.get('binding_excluded_replica_state_version')
+    row_version = owner.get('binding_excluded_replica_version')
+    if (not isinstance(state, dict) or
+            state_version != _REPLICA_STATE_VERSION or
+            type(service_version) is not int or service_version < 1 or
+            row_version != service_version or
+            status not in (ReplicaStatus.PENDING.value,
+                           ReplicaStatus.PROVISIONING.value)):
+        return False
+    try:
+        info = _replica_from_state(state_version, state)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return False
+    replica_id = normalized[
+        constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY]
+    if (info.replica_id != replica_id or info.version != service_version or
+            info.status.value != status):
+        return False
+    profile = normalized[constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY]
+    if profile == constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE:
+        if info.replica_record_id != normalized[
+                constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY]:
+            return False
+        persisted_special = bool(
+            info.reserved_fill is True or info.is_zero_cost is True or
+            info.unknown_capacity_replacement is True or
+            type(info.cost_rebalance_for_replica_id) is int)
+        # A failed system-recovery admission may irreversibly demote its exact
+        # row before the already-running launch worker falls back to the
+        # ordinary request contract.  Permit only that closed state.  An
+        # active candidate, capable recovery, bound request, captured job, or
+        # quarantined row must retain the system-recovery contract and cannot
+        # be downgraded by a persistent-special claim.
+        demoted_recovery_retry = bool(
+            info.system_recovery_launch_intent is not None and
+            info.system_recovery_disposition.value == 'ORDINARY' and
+            info.system_recovery is None and
+            info.system_recovery_quarantine is None and
+            info.launch_request_id is None and info.service_job_id is None)
+        has_system_recovery_lifecycle = bool(
+            info.system_recovery_launch_intent is not None or
+            info.system_recovery_disposition.value != 'ORDINARY' or
+            info.system_recovery is not None or
+            info.system_recovery_quarantine is not None or
+            info.launch_request_id is not None or
+            info.service_job_id is not None)
+        if has_system_recovery_lifecycle:
+            return demoted_recovery_retry
+        return persisted_special
+    if profile != (
+            constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE):
+        return False
+    intent = info.system_recovery_launch_intent
+    return bool(
+        intent is not None and intent.replica_id == replica_id and
+        intent.launch_generation
+        == normalized[constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY]
+        and info.launch_request_id
+        == normalized[constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY]
+        and info.system_recovery_disposition.value == 'CANDIDATE' and
+        info.system_recovery_quarantine is None)
+
+
+def service_replica_launch_fence_holds(
+    launch_context: dict[str, Any],
+    binding_excluded_launch_context: dict[str, Any] | None = None,
+) -> bool:
     """Check one persisted replica request against its current DB authority.
 
     The check deliberately performs a fresh, single-snapshot authorization
@@ -2142,8 +2390,25 @@ def service_replica_launch_fence_holds(launch_context: dict[str, Any]) -> bool:
             not (controller_ip is None or isinstance(controller_ip, str))):
         return False
 
-    owner = get_service_replica_launch_authorization(service_name)
-    return bool(owner is not None and
+    try:
+        normalized_exclusion = normalize_binding_excluded_launch_context(
+            launch_context if binding_excluded_launch_context is
+            None else binding_excluded_launch_context)
+    except ValueError:
+        return False
+    excluded_replica_id = (
+        None if normalized_exclusion is None else normalized_exclusion[
+            constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY])
+    owner = get_service_replica_launch_authorization(
+        service_name,
+        **({} if excluded_replica_id is None else {
+            'binding_excluded_replica_id': excluded_replica_id
+        }))
+    binding_mode_allows = bool(owner is not None and (
+        owner.get('ordinary_launch_binding_mode') != 'bound' or
+        (normalized_exclusion is not None and _binding_excluded_replica_matches(
+            owner, normalized_exclusion, service_version))))
+    return bool(owner is not None and binding_mode_allows and
                 (not maintenance.is_controller_hold_active() or
                  (type(owner.get('pool_discriminator')) is int and
                   owner.get('pool_discriminator') == 1)) and
@@ -2536,6 +2801,7 @@ _ACTION_OWNED_REPLICA_COLUMNS = frozenset({
     'launch_shadow_sample_id',
     'down_shadow_sample_id',
     'resource_action_spec_identity_sha256',
+    'ordinary_launch_association_id',
 })
 _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PENDING.value,
@@ -2853,6 +3119,168 @@ def _replica_row_values(
     return values
 
 
+def update_replica_for_bound_ordinary_launch_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    service_hash: str,
+    replica_id: int,
+    replica_record_id: str,
+    association_id: uuid.UUID,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    paid_capacity_pool_key: str | None,
+    paid_capacity_outcome: paid_capacity.LaunchOutcome | None,
+) -> bool:
+    """Persist one exact bound-launch result on its reducer transaction.
+
+    The request reducer has already locked lifecycle, service, replica, and
+    association rows in canonical order.  This update-only helper deliberately
+    performs no commit and preserves the scalar association pointer until the
+    reducer clears it after the replica state is durable.
+    """
+    if connection.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    try:
+        record_uuid = uuid.UUID(replica_record_id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (str(record_uuid) != replica_record_id or not service_hash or
+            not isinstance(association_id, uuid.UUID) or
+            replica_info.replica_record_id != replica_record_id or
+            replica_info.replica_id != replica_id):
+        return False
+    claim = None
+    pool = None
+    if paid_capacity_pool_key is None:
+        if paid_capacity_outcome is not None:
+            return False
+    else:
+        if (not isinstance(paid_capacity_pool_key, str) or
+                not paid_capacity_pool_key or not isinstance(
+                    paid_capacity_outcome, paid_capacity.LaunchOutcome) or
+                replica_info.paid_capacity_pool_key != paid_capacity_pool_key):
+            return False
+        claim = connection.execute(
+            sqlalchemy.select(paid_capacity_claims_table).where(
+                paid_capacity_claims_table.c.service_name == service_name,
+                paid_capacity_claims_table.c.service_hash == service_hash,
+                paid_capacity_claims_table.c.replica_id == replica_id,
+                paid_capacity_claims_table.c.pool_key ==
+                paid_capacity_pool_key).with_for_update()).one_or_none()
+        pool = connection.execute(
+            sqlalchemy.select(paid_capacity_pools_table).where(
+                paid_capacity_pools_table.c.pool_key ==
+                paid_capacity_pool_key).with_for_update()).one_or_none()
+        if claim is None or pool is None:
+            return False
+    values = _replica_row_values(service_name, replica_id, replica_info)
+    result = connection.execute(
+        sqlalchemy.update(replicas_table).where(
+            replicas_table.c.service_name == service_name,
+            replicas_table.c.replica_id == replica_id,
+            replicas_table.c.ordinary_launch_association_id == association_id,
+            replicas_table.c.replica_state['replica_record_id'].as_string() ==
+            replica_record_id).values({
+                key: value
+                for key, value in values.items()
+                if key not in ('service_name', 'replica_id')
+            }))
+    if result.rowcount != 1:
+        return False
+    if paid_capacity_pool_key is None:
+        return True
+
+    assert paid_capacity_outcome is not None and claim is not None
+    assert pool is not None
+    now = _paid_capacity_clock_timestamp(connection, None)
+    base_limit = paid_capacity.base_limit()
+    max_limit = paid_capacity.max_limit()
+    success_ttl = paid_capacity.success_ttl_seconds()
+    failure_cooldown = paid_capacity.failure_cooldown_seconds()
+    if paid_capacity_outcome in (paid_capacity.LaunchOutcome.CAPACITY_FAILURE,
+                                 paid_capacity.LaunchOutcome.QUOTA_FAILURE):
+        connection.execute(
+            sqlalchemy.update(paid_capacity_pools_table).where(
+                paid_capacity_pools_table.c.pool_key ==
+                paid_capacity_pool_key).values(current_limit=base_limit,
+                                               successes_since_resize=0,
+                                               last_success_at=None,
+                                               last_failure_at=now,
+                                               updated_at=now))
+        return True
+    if paid_capacity_outcome != paid_capacity.LaunchOutcome.SUCCESS:
+        return True
+
+    if pool.last_failure_at is not None:
+        if not (pool.current_limit == 1 and
+                claim.claimed_at >= pool.last_failure_at + failure_cooldown):
+            return True
+        ramp_update = paid_capacity.record_outcomes(
+            base_limit,
+            0,
+            None, [paid_capacity.LaunchOutcome.SUCCESS],
+            bootstrap_limit=base_limit,
+            ceiling_limit=max_limit,
+            now=now,
+            ttl_seconds=success_ttl)
+        connection.execute(
+            sqlalchemy.update(paid_capacity_pools_table).where(
+                paid_capacity_pools_table.c.pool_key ==
+                paid_capacity_pool_key).values(
+                    current_limit=ramp_update.current_limit,
+                    successes_since_resize=ramp_update.successes_since_resize,
+                    last_success_at=now,
+                    last_failure_at=None,
+                    updated_at=now))
+        return True
+
+    ramp_update = paid_capacity.record_outcomes(
+        pool.current_limit,
+        pool.successes_since_resize,
+        pool.last_success_at, [paid_capacity.LaunchOutcome.SUCCESS],
+        bootstrap_limit=base_limit,
+        ceiling_limit=max_limit,
+        now=now,
+        ttl_seconds=success_ttl)
+    connection.execute(
+        sqlalchemy.update(paid_capacity_pools_table).where(
+            paid_capacity_pools_table.c.pool_key ==
+            paid_capacity_pool_key).values(
+                current_limit=ramp_update.current_limit,
+                successes_since_resize=ramp_update.successes_since_resize,
+                last_success_at=now,
+                updated_at=now))
+    return True
+
+
+def read_replica_for_bound_ordinary_launch_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    association_id: uuid.UUID,
+) -> 'replica_managers.ReplicaInfo':
+    """Decode the already-locked current row for an atomic result reducer."""
+    row = connection.execute(
+        sqlalchemy.select(
+            replicas_table.c.replica_state_version,
+            replicas_table.c.replica_state).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id == replica_id,
+                replicas_table.c.ordinary_launch_association_id ==
+                association_id,
+                replicas_table.c.replica_state['replica_record_id'].as_string()
+                == replica_record_id)).one_or_none()
+    if row is None:
+        raise ReplicaSystemRecoveryStateError(
+            'Bound ordinary launch lost its exact locked replica row.')
+    info = _replica_from_state(row.replica_state_version, row.replica_state)
+    if info.replica_id != replica_id or info.replica_record_id != replica_record_id:
+        raise ReplicaSystemRecoveryStateError(
+            'Bound ordinary launch replica identity is malformed.')
+    return info
+
+
 def _upsert_replica_rows_in_session(
     session: orm.Session,
     engine: sqlalchemy.engine.Engine,
@@ -2930,6 +3358,13 @@ def _replica_from_state(
         raise RuntimeError('Unsupported replica state version: '
                            f'{replica_state_version!r}')
     return replica_managers.ReplicaInfo.from_storage_dict(replica_state)
+
+
+def decode_replica_state_for_authority(
+        replica_state_version: int,
+        replica_state: dict[str, Any]) -> 'replica_managers.ReplicaInfo':
+    """Decode one replica row for a cross-table authority decision."""
+    return _replica_from_state(replica_state_version, replica_state)
 
 
 def _lock_service_owner_row_in_session(
@@ -3432,6 +3867,7 @@ def _valid_paid_capacity_claims_in_session(
             services_table.c.hash,
             replicas_table.c.status,
             replicas_table.c.paid_capacity_pool_key,
+            replicas_table.c.ordinary_launch_association_id,
         ).select_from(
             paid_capacity_claims_table.outerjoin(
                 services_table, services_table.c.name ==
@@ -3445,11 +3881,12 @@ def _valid_paid_capacity_claims_in_session(
         where(paid_capacity_claims_table.c.pool_key == pool_key)).fetchall()
     valid = []
     stale = []
-    for service_name, service_hash, replica_id, current_hash, status, row_pool in rows:
+    for (service_name, service_hash, replica_id, current_hash, status, row_pool,
+         association_id) in rows:
         identity = (service_name, service_hash, replica_id)
         if (current_hash == service_hash and
-                status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
-                row_pool == pool_key):
+            (status in _PAID_CAPACITY_UNRESOLVED_STATUSES or
+             association_id is not None) and row_pool == pool_key):
             valid.append(identity)
         else:
             stale.append(identity)
@@ -3468,6 +3905,7 @@ def _valid_paid_capacity_service_claims_in_session(
             paid_capacity_claims_table.c.pool_key,
             replicas_table.c.status,
             replicas_table.c.paid_capacity_pool_key,
+            replicas_table.c.ordinary_launch_association_id,
         ).select_from(
             paid_capacity_claims_table.outerjoin(
                 replicas_table,
@@ -3481,9 +3919,9 @@ def _valid_paid_capacity_service_claims_in_session(
                         == service_hash)).fetchall()
     valid = []
     stale = []
-    for replica_id, pool_key, status, row_pool in rows:
-        if (status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
-                row_pool == pool_key):
+    for replica_id, pool_key, status, row_pool, association_id in rows:
+        if ((status in _PAID_CAPACITY_UNRESOLVED_STATUSES or
+             association_id is not None) and row_pool == pool_key):
             valid.append((replica_id, pool_key))
         else:
             stale.append((service_name, service_hash, replica_id))
@@ -3664,6 +4102,7 @@ def get_paid_capacity_pool_states(
                 services_table.c.hash,
                 replicas_table.c.status,
                 replicas_table.c.paid_capacity_pool_key,
+                replicas_table.c.ordinary_launch_association_id,
             ).select_from(
                 paid_capacity_claims_table.outerjoin(
                     services_table, services_table.c.name ==
@@ -3676,10 +4115,11 @@ def get_paid_capacity_pool_states(
                             paid_capacity_claims_table.c.replica_id))).where(
                                 paid_capacity_claims_table.c.pool_key.in_(
                                     pool_keys))).fetchall()
-        for pool_key, claim_hash, current_hash, status, row_pool in rows:
+        for (pool_key, claim_hash, current_hash, status, row_pool,
+             association_id) in rows:
             if (claim_hash == current_hash and
-                    status in _PAID_CAPACITY_UNRESOLVED_STATUSES and
-                    row_pool == pool_key):
+                (status in _PAID_CAPACITY_UNRESOLVED_STATUSES or
+                 association_id is not None) and row_pool == pool_key):
                 valid_counts[pool_key] += 1
     result = {}
     for pool_key in pool_keys:
@@ -4209,6 +4649,25 @@ def add_or_update_replicas_with_paid_capacity_outcomes(
     return True
 
 
+def replica_info_has_binding_excluded_profile(
+        replica_info: 'replica_managers.ReplicaInfo') -> bool:
+    """Whether this row can authorize the retained special launch contract."""
+    # Use the versioned object's explicit storage fields instead of a runtime
+    # class-symbol check: tests and embedding processes may replace the public
+    # ``ReplicaInfo`` alias, while these exact markers are the durable
+    # authorization contract. Missing or dynamically synthesized attributes
+    # must remain ordinary and fail closed.
+    fields = vars(replica_info)
+    return bool(
+        fields.get('reserved_fill') is True or
+        fields.get('is_zero_cost') is True or
+        fields.get('unknown_capacity_replacement') is True or
+        type(fields.get('cost_rebalance_for_replica_id')) is int or
+        fields.get('system_recovery_launch_intent') is not None or
+        fields.get('system_recovery') is not None or
+        fields.get('system_recovery_quarantine') is not None)
+
+
 def add_or_update_replica(
     service_name: str,
     replica_id: int,
@@ -4218,6 +4677,7 @@ def add_or_update_replica(
     expected_controller_owner: tuple[int | None, str | None] | None = None,
     *,
     expected_replica_exists: bool = False,
+    guard_launch_exclusion: bool = False,
 ) -> bool:
     """Persist one replica, optionally requiring its row to already exist.
 
@@ -4226,8 +4686,10 @@ def add_or_update_replica(
     Callers admitting a new replica must leave it false explicitly; that path
     is INSERT-only and surfaces a primary-key conflict.
     """
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(
+            service_name,
+            invalidates_launch_authority=guard_launch_exclusion) as (engine,
+                                                                     session):
         _begin_immediate_if_sqlite(
             session, engine, expected_service_hash is not None or
             expected_lifecycle_epoch is not None or
@@ -4298,6 +4760,7 @@ def add_or_update_replicas(
     *,
     expected_replica_exists: bool = False,
     validate_fence_on_empty: bool = False,
+    guard_launch_exclusion: bool = False,
 ) -> bool:
     """Persist a batch of replicas in one transaction.
 
@@ -4324,8 +4787,10 @@ def add_or_update_replicas(
                 not isinstance(expected_pid, int) or expected_pid < 1 or
                 not isinstance(expected_ip, str) or not expected_ip):
             return False
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(
+            service_name,
+            invalidates_launch_authority=guard_launch_exclusion) as (engine,
+                                                                     session):
         _begin_immediate_if_sqlite(
             session, engine, expected_service_hash is not None or
             expected_lifecycle_epoch is not None or
@@ -4428,8 +4893,8 @@ def remove_replica(
 ) -> bool:
     """Remove one replica under service and immutable-record fences."""
     _validate_expected_replica_record_id(expected_replica_record_id)
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
         _begin_immediate_if_sqlite(
             session, engine, expected_service_hash is not None or
             expected_lifecycle_epoch is not None or
@@ -4519,8 +4984,8 @@ def remove_replicas(
         _validate_expected_replica_record_id(record_id)
     if not replica_ids:
         return True
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
         _begin_immediate_if_sqlite(session, engine, True)
         if not _lifecycle_epoch_matches_in_session(session, service_name,
                                                    expected_lifecycle_epoch):
@@ -5519,6 +5984,61 @@ def set_placement_catalog_if_missing(service_name: str, version: int,
                     placement_catalog=placement_catalog))
         session.commit()
     return result.rowcount == 1
+
+
+def mark_bound_replica_launch_running_if_active(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> bool:
+    """Advance only an active bound row from SCHEDULED to RUNNING.
+
+    The launch worker starts before this bookkeeping write.  Its reducer may
+    therefore project a result first.  Lock and decode the latest row, and
+    require the scalar association pointer to remain present, so a stale
+    parent snapshot can never overwrite that projection.
+    """
+    engine = _db_manager.get_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    with _replica_launch_authority_write_session(
+            service_name, invalidates_launch_authority=False) as (_, session):
+        _lock_service_row_if_present_for_replica_write(session, service_name)
+        row = session.execute(
+            sqlalchemy.select(
+                replicas_table.c.replica_state_version,
+                replicas_table.c.replica_state,
+                replicas_table.c.ordinary_launch_association_id,
+            ).where(replicas_table.c.service_name == service_name,
+                    replicas_table.c.replica_id ==
+                    replica_id).with_for_update()).mappings().one_or_none()
+        if row is None or row['ordinary_launch_association_id'] is None:
+            return False
+        info = _replica_from_state(row['replica_state_version'],
+                                   row['replica_state'])
+        if (info.replica_record_id != replica_record_id or
+                info.status_property.sky_launch_status
+                != common_utils.ProcessStatus.SCHEDULED):
+            return False
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.RUNNING)
+        values = _replica_row_values(service_name, replica_id, info)
+        result = session.execute(
+            sqlalchemy.update(replicas_table).where(
+                replicas_table.c.service_name == service_name,
+                replicas_table.c.replica_id == replica_id,
+                replicas_table.c.ordinary_launch_association_id ==
+                row['ordinary_launch_association_id'],
+                replicas_table.c.replica_state['replica_record_id'].as_string()
+                == replica_record_id).values({
+                    key: value
+                    for key, value in values.items()
+                    if key not in ('service_name', 'replica_id')
+                }))
+        if result.rowcount != 1:
+            return False
+        session.commit()
+        return True
 
 
 def get_specs(

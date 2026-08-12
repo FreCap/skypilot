@@ -423,6 +423,87 @@ class TestServiceReplicaLaunchPrecondition(unittest.IsolatedAsyncioTestCase):
                               preconditions.ServiceReplicaLaunchPrecondition)
         self.assertEqual(restored.service_version, 7)
 
+    @mock.patch.object(serve_state,
+                       'service_replica_launch_fence_holds',
+                       return_value=True)
+    async def test_excluded_profile_discriminator_round_trips_and_rechecks(
+            self, mock_fence_holds):
+        discriminator = {
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+                serve_constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE,
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 7,
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY: '12345678-1234-4234-8234-123456789abc',
+        }
+        condition = preconditions.ServiceReplicaLaunchPrecondition(
+            'request-id',
+            'svc',
+            'incarnation-a',
+            123,
+            '10.0.0.1',
+            7,
+            binding_excluded_launch_context=discriminator)
+
+        durable = preconditions.serialize(condition)
+
+        self.assertIsNotNone(durable)
+        assert durable is not None
+        self.assertEqual(durable.payload['binding_excluded_launch_context'],
+                         discriminator)
+        restored = preconditions.deserialize(durable.type_name, durable.payload,
+                                             'request-id')
+        self.assertIsInstance(restored,
+                              preconditions.ServiceReplicaLaunchPrecondition)
+        self.assertEqual(restored.binding_excluded_launch_context,
+                         discriminator)
+
+        met, message = await restored.check()
+
+        self.assertTrue(met)
+        self.assertIsNone(message)
+        mock_fence_holds.assert_called_once_with(
+            {
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'incarnation-a',
+                serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY: 7,
+                serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY: 123,
+                serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY: '10.0.0.1',
+            }, discriminator)
+
+    def test_malformed_serialized_excluded_profile_is_rejected(self):
+        with self.assertRaisesRegex(ValueError,
+                                    'excluded-profile discriminator'):
+            preconditions.deserialize(
+                'service-replica-launch.v1', {
+                    'check_interval': 1,
+                    'service_name': 'svc',
+                    'service_hash': 'incarnation-a',
+                    'controller_pid': 123,
+                    'controller_ip': '10.0.0.1',
+                    'binding_excluded_launch_context': {
+                        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY: 'persisted-special.v1',
+                    },
+                }, 'request-id')
+
+    def test_system_recovery_discriminator_must_name_its_queue_request(self):
+        with self.assertRaisesRegex(ValueError, 'request identity'):
+            preconditions.deserialize(
+                'service-replica-launch.v1', {
+                    'check_interval': 1,
+                    'service_name': 'svc',
+                    'service_hash': 'incarnation-a',
+                    'controller_pid': 123,
+                    'controller_ip': '10.0.0.1',
+                    'binding_excluded_launch_context': {
+                        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+                            serve_constants.
+                            ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE,
+                        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 7,
+                        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY: 'different-request',
+                        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_GENERATION_KEY: 7,
+                    },
+                }, 'request-id')
+
     @mock.patch('sky.execution.dag_utils.convert_entrypoint_to_dag')
     @mock.patch(
         'sky.serve.serve_state.get_service_replica_launch_authorization')

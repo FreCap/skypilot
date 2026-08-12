@@ -29,6 +29,27 @@ def test_version_admin_api_allows_auth_disabled_local_server():
     server._require_admin(request)
 
 
+@pytest.mark.asyncio
+async def test_binding_admin_api_forwards_exact_mode_and_incarnation():
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None))
+    result = {
+        'binding_mode': 'bound',
+        'binding_epoch': 6,
+    }
+    with mock.patch.object(server.serve_utils,
+                           'set_ordinary_launch_binding_mode_encoded',
+                           return_value=result) as transition:
+        response = await server.set_ordinary_launch_binding_mode(
+            request,
+            'svc',
+            mode='bound',
+            expected_service_hash='service-hash',
+            expected_binding_epoch=5)
+
+    assert response == result
+    transition.assert_called_once_with('svc', 'bound', 'service-hash', 5)
+
+
 def test_serve_request_retains_submitted_yaml_before_api_processing():
     task = mock.sentinel.task
     body = payloads.ServeUpBody(task='service:\n  min_replicas: 2\n',
