@@ -4260,9 +4260,10 @@ def _partition_replica_cleanup_targets(
     """Separate cleanup targets from rows whose provider absence is unknown.
 
     Legacy rows retain the historical cluster-table absence behavior. A
-    protocol-v2 row is removable only after its exact context/UID-fenced down
-    succeeds; local cluster-record absence is not provider-absence evidence.
-    Malformed v2 authority is likewise retained for operator repair.
+    protocol-v2 row whose local cluster record is absent is removable only
+    after an exact context/UID-fenced provider read proves that it owns no
+    Pods. A live, unreadable, or malformed v2 target remains retained for
+    operator repair.
     """
     # Local to avoid payloads -> task -> service_spec -> serve_utils ->
     # reserved_capacity_broker -> request_wire -> payloads during import.
@@ -4286,10 +4287,18 @@ def _partition_replica_cleanup_targets(
         if info.cluster_name in existing_cluster_names:
             to_terminate.append((info, cleanup_fence))
         elif cleanup_fence is not None:
+            presence = reserved_capacity.probe_physical_replica_presence(
+                cleanup_fence, info.cluster_name)
+            if presence is reserved_capacity.PhysicalReplicaPresence.ABSENT:
+                logger.info('Protocol-v2 replica cluster '
+                            f'{info.cluster_name!r} owns no Pod on its fenced '
+                            'physical cluster; provider cleanup is complete.')
+                continue
             logger.error(
                 'Retaining protocol-v2 replica cluster '
                 f'{info.cluster_name!r}: its SkyPilot cluster record is '
-                'absent but provider absence is not independently proven.')
+                'absent and fenced provider presence is '
+                f'{presence.value.lower()}.')
             unresolved_cluster_names.append(info.cluster_name)
     return to_terminate, unresolved_cluster_names
 

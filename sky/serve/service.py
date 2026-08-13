@@ -521,9 +521,19 @@ def _cleanup(service_name: str,
             if cleanup_fence is None:
                 absent_legacy_infos.append(info)
             else:
-                _set_to_failed_cleanup(
-                    info, 'the SkyPilot cluster record is absent but '
-                    'provider absence is not independently proven')
+                presence = reserved_capacity.probe_physical_replica_presence(
+                    cleanup_fence, info.cluster_name)
+                if (presence
+                        is reserved_capacity.PhysicalReplicaPresence.ABSENT):
+                    logger.info(
+                        f'Replica {info.replica_id} owns no Pod on its fenced '
+                        'physical cluster; provider cleanup is complete.')
+                    absent_legacy_infos.append(info)
+                else:
+                    _set_to_failed_cleanup(
+                        info, 'the SkyPilot cluster record is absent and '
+                        'fenced provider presence is '
+                        f'{presence.value.lower()}')
             continue
         cleanup_entries.append((info, cleanup_fence))
 
