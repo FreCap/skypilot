@@ -1308,9 +1308,9 @@ def write_cluster_config(
 
     if worker_projection is not None:
         # A projected Serve worker authenticates only through its frozen
-        # Kubernetes service account / Pod Identity and storage broker. Never
-        # copy API-server cloud credentials (AWS, GCP, kubeconfig, etc.) or
-        # logging-agent credential files into this trust domain.
+        # Kubernetes service account / Pod Identity. Never copy API-server
+        # cloud credentials (AWS, GCP, kubeconfig, etc.) or logging-agent
+        # credential files into this trust domain.
         credentials = {}
     else:
         credentials = sky_check.get_cloud_credential_file_mounts(

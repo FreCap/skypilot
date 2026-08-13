@@ -1,6 +1,5 @@
 """Strict immutable SkyServe platform projections."""
 # pylint: disable=protected-access
-import json
 from unittest import mock
 
 import pytest
@@ -15,26 +14,10 @@ from sky.provision.kubernetes import config as kubernetes_config
 from sky.provision.kubernetes import instance as kubernetes_instance
 from sky.serve import constants
 from sky.serve import kubernetes_identity
-from sky.serve import serve_state
-from sky.serve.server import server
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
 from sky.utils import schemas
 from sky.utils import yaml_utils
-
-
-def _storage_broker():
-    return {
-        'endpoint': 'https://storage-broker.int.boltz.bio/v2/grants',
-        'audience': 'boltz-skyserve-worker',
-        'api_version': 2,
-        'grant_uri_prefix': 's3://boltz-skyserve-grants/prod',
-        'authenticated_worker_role_arns': [
-            'arn:aws:iam::123456789012:role/skyserve-worker-east',
-            'arn:aws:iam::123456789012:role/skyserve-worker-phx',
-        ],
-        'kms_key_id': 'alias/skyserve-grants',
-    }
 
 
 def _controller_auth():
@@ -61,193 +44,12 @@ def _kubernetes_api_error(status):
     return kubernetes_instance.kubernetes.api_exception()(status=status)
 
 
-def test_storage_broker_schema_accepts_only_non_secret_descriptor():
-    config = {'serve': {'storage_broker': _storage_broker()}}
-    common_utils.validate_schema(config, schemas.get_config_schema(),
-                                 'Invalid config')
-    common_utils.validate_schema(
-        {
-            'workspaces': {
-                'research': {
-                    'serve': {
-                        'storage_broker': _storage_broker()
-                    }
-                }
-            }
-        }, schemas.get_config_schema(), 'Invalid config')
-
-    with pytest.raises(ValueError):
-        common_utils.validate_schema(
-            {
-                'serve': {
-                    'storage_broker': {
-                        **_storage_broker(), 'bearer_token': 'secret'
-                    }
-                }
-            }, schemas.get_config_schema(), 'Invalid config')
-
-
-@pytest.mark.parametrize('overrides', [{
-    'endpoint': 'http://broker.example/v2'
-}, {
-    'endpoint': 'https://user:password@broker.example/v2'
-}, {
-    'endpoint': 'https://broker.example:bad/v2'
-}, {
-    'grant_uri_prefix': 'https://bucket.example/prefix'
-}, {
-    'grant_uri_prefix': 's3://user:password@bucket/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket:443/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket/foo/../bar'
-}, {
-    'grant_uri_prefix': 's3://bucket/%2e%2e/bar'
-}, {
-    'grant_uri_prefix': 's3://bucket/pro%64'
-}, {
-    'grant_uri_prefix': 's3://bucket/%41'
-}, {
-    'grant_uri_prefix': 's3://bucket/foo%20bar'
-}, {
-    'grant_uri_prefix': 's3://bucket/foo%00bar'
-}, {
-    'grant_uri_prefix': 's3://bucket/foo%23bar'
-}, {
-    'grant_uri_prefix': 's3://bucket//prefix'
-}, {
-    'grant_uri_prefix': r's3://bucket/foo\bar'
-}, {
-    'grant_uri_prefix': 's3://bucket.-name/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket-.name/prefix'
-}, {
-    'grant_uri_prefix': 's3://xn--bucket/prefix'
-}, {
-    'grant_uri_prefix': 's3://sthree-bucket/prefix'
-}, {
-    'grant_uri_prefix': 's3://amzn-s3-demo-bucket/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket-s3alias/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket--ol-s3/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket.mrap/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket--x-s3/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket--table-s3/prefix'
-}, {
-    'grant_uri_prefix': 's3://bucket/prefix?X-Amz-Signature=secret'
-}, {
-    'api_version': 1
-}, {
-    'authenticated_worker_role_arns': ['not-an-iam-role']
-}, {
-    'kms_key_id': ''
-}])
-def test_storage_broker_validator_fails_closed(overrides):
-    value = {**_storage_broker(), **overrides}
-    with pytest.raises(ValueError):
-        kubernetes_identity.validate_storage_broker_projection(value,
-                                                               allow_none=False)
-
-
-def test_storage_broker_worker_roles_are_ordered_unique():
-    broker = _storage_broker()
-    projected = kubernetes_identity.validate_storage_broker_projection(
-        broker, allow_none=False)
-    assert projected is not None
-    assert projected['authenticated_worker_role_arns'] == broker[
-        'authenticated_worker_role_arns']
-    assert projected['authenticated_worker_role_arns'] is not broker[
-        'authenticated_worker_role_arns']
-
-    duplicate = broker['authenticated_worker_role_arns'][0]
-    with pytest.raises(ValueError, match='duplicates'):
-        kubernetes_identity.validate_storage_broker_projection(
-            {
-                **broker,
-                'authenticated_worker_role_arns': [duplicate, duplicate],
-            },
-            allow_none=False)
-    with pytest.raises(ValueError, match='between 1 and 16'):
-        kubernetes_identity.validate_storage_broker_projection(
-            {
-                **broker,
-                'authenticated_worker_role_arns': [
-                    f'arn:aws:iam::123456789012:role/worker-{index}'
-                    for index in range(17)
-                ],
-            },
-            allow_none=False)
-
-
-def test_storage_broker_projection_prefers_workspace_and_copies(monkeypatch):
-    workspace_broker = {**_storage_broker(), 'audience': 'workspace'}
-    global_broker = {**_storage_broker(), 'audience': 'global'}
-
-    def _get_nested(*, keys, default_value):
-        del default_value
-        if keys == ('workspaces', 'research', 'serve', 'storage_broker'):
-            return workspace_broker
-        if keys == ('serve', 'storage_broker'):
-            return global_broker
-        return None
-
-    monkeypatch.setattr(skypilot_config, 'get_nested', _get_nested)
-    projected = kubernetes_identity.build_storage_broker_projection(
-        workspace='research')
-    assert projected == workspace_broker
-    assert projected is not workspace_broker
-
-
-def test_version_history_exposes_descriptor_without_secrets():
-    broker = _storage_broker()
-    record = {
-        'pool': False,
-        'elected_version': 1,
-        'active_versions': [1],
-    }
-    version = {
-        'version': 1,
-        'spec': mock.Mock(autoscaling_policy_str=mock.Mock(return_value='p')),
-        'yaml_content': 'envs:\n  TOKEN: secret\n',
-        'submitted_yaml_content': 'envs:\n  TOKEN: secret\n',
-        'created_at': 1.0,
-        'created_by': 'user',
-        'quarantined_at': None,
-        'quarantine_reason': None,
-        'controller_job_projection': None,
-        'controller_work_cache': None,
-        'worker_placement_projections': None,
-        'storage_broker': broker,
-    }
-    with mock.patch.object(server.serve_state,
-                           'get_service_from_name',
-                           return_value=record), \
-         mock.patch.object(server.serve_state,
-                           'get_version_records',
-                           return_value=[version]), \
-         mock.patch.object(server.debug_dump_helpers,
-                           'redact_task_yaml',
-                           return_value='envs:\n  TOKEN: <redacted>\n'):
-        result = server._service_version_history('svc')
-
-    serialized = json.dumps(result)
-    assert result['placement_projection_protocol_version'] == 1
-    assert result['versions'][0]['storage_broker'] == broker
-    assert 'secret' not in serialized
-    assert 'X-Amz-Signature' not in serialized
-
-
 def test_historical_version_has_null_projections():
     assert kubernetes_identity.validate_controller_job_projection(None) is None
     assert kubernetes_identity.validate_controller_work_cache_projection(
         None) is None
     assert kubernetes_identity.validate_worker_placement_projections(
         None) is None
-    assert kubernetes_identity.validate_storage_broker_projection(None) is None
 
 
 def test_controller_projection_requires_explicit_workspace():
@@ -440,8 +242,6 @@ def test_controller_workspace_is_server_owned_config():
         }, schemas.get_config_schema(), 'Invalid config')
     assert ('kubernetes', 'serve_controller_workspace') in (
         skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
-    assert ('serve',
-            'storage_broker') in (skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
     assert ('kubernetes', 'serve_controller_lb_data_plane_auth') in (
         skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
 
@@ -968,28 +768,6 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         key.startswith(kubernetes_identity.CACHE_ENV_PREFIX)
         for key in task.secrets)
     assert task.envs_and_secrets['SKYPILOT_SERVE_CACHE_KIND'] == 'node_local'
-
-
-def test_storage_broker_must_list_every_projected_worker_role():
-    worker = {
-        'candidate_id': 'kubernetes-0000',
-        'kubernetes_context': 'east',
-        'namespace': 'inference',
-        'service_account_name': 'worker',
-        'priority_class_name': None,
-        'priority_value': None,
-        'preemption_policy': None,
-        'pod_identity_role_arn': 'arn:aws:iam::123456789012:role/unrelated-worker',
-        'accelerator_name': 'A100-80GB',
-        'accelerator_count': 1,
-        'accelerator_scheduling': _accelerator_scheduling('A100-SXM4-80GB'),
-        'cache': {
-            'kind': 'none'
-        },
-    }
-    with pytest.raises(ValueError, match='listed by the immutable storage'):
-        serve_state._validated_placement_projections(None, None, [worker],
-                                                     _storage_broker())
 
 
 def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():

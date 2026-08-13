@@ -5,7 +5,6 @@ import copy
 import json
 import re
 from typing import Any
-import urllib.parse
 
 from sky import clouds
 from sky import global_user_state
@@ -19,25 +18,9 @@ from sky.utils import volume as volume_utils
 
 PLACEMENT_PROJECTION_PROTOCOL_VERSION = 1
 
-_STORAGE_BROKER_KEYS = frozenset({
-    'endpoint',
-    'audience',
-    'api_version',
-    'grant_uri_prefix',
-    'authenticated_worker_role_arns',
-    'kms_key_id',
-})
 _AWS_ROLE_ARN_PATTERN = re.compile(
     r'^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
     r'role/[A-Za-z0-9+=,.@_/-]+$')
-_DNS_NAME_PATTERN = re.compile(
-    r'(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}'
-    r'[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}'
-    r'[A-Za-z0-9])?))*')
-_S3_BUCKET_PATTERN = re.compile(r'(?=.{3,63}$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?')
-_S3_RESERVED_BUCKET_PREFIXES = ('xn--', 'sthree-', 'amzn-s3-demo-')
-_S3_RESERVED_BUCKET_SUFFIXES = ('-s3alias', '--ol-s3', '.mrap', '--x-s3',
-                                '--table-s3')
 
 _CONTROLLER_KEYS = frozenset({
     'workspace',
@@ -221,151 +204,6 @@ def _validate_accelerator_scheduling_map(
             claimed_labels[claim] = accelerator_name
         result[accelerator_name] = validated
     return result
-
-
-def _validate_uri_path(path: str, description: str, *,
-                       require_path: bool) -> None:
-    """Reject ambiguous or traversal-capable URI path encodings."""
-    if ('\\' in path or '%' in path or (require_path and path in ('', '/'))):
-        raise ValueError(f'{description} has an invalid path.')
-    if not path:
-        return
-    if not path.startswith('/') or '//' in path:
-        raise ValueError(f'{description} path must be canonical.')
-    for raw_segment in path[1:].split('/'):
-        if not raw_segment or re.search(r'%(?![0-9A-Fa-f]{2})', raw_segment):
-            raise ValueError(f'{description} path must be canonical.')
-        decoded = raw_segment
-        for _ in range(8):
-            next_decoded = urllib.parse.unquote(decoded)
-            if next_decoded == decoded:
-                break
-            decoded = next_decoded
-        else:
-            raise ValueError(
-                f'{description} path encoding is too deeply nested.')
-        if decoded in ('.', '..') or '/' in decoded or '\\' in decoded:
-            raise ValueError(f'{description} path cannot contain ambiguous '
-                             'or traversal segments.')
-
-
-def _validate_https_endpoint(value: str) -> str:
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        port = parsed.port
-        hostname = parsed.hostname
-    except ValueError as e:
-        raise ValueError(
-            'Storage-broker endpoint has an invalid authority.') from e
-    if (parsed.scheme != 'https' or not parsed.netloc or
-            any(character.isspace() for character in value) or
-            parsed.username is not None or parsed.password is not None or
-            parsed.query or parsed.fragment or hostname is None or
-            _DNS_NAME_PATTERN.fullmatch(hostname) is None):
-        raise ValueError('Storage-broker endpoint must be an absolute HTTPS '
-                         'URL with a valid hostname and without credentials, '
-                         'query, or fragment.')
-    expected_authority = hostname if port is None else f'{hostname}:{port}'
-    if parsed.netloc.lower() != expected_authority.lower():
-        raise ValueError(
-            'Storage-broker endpoint has a non-canonical authority.')
-    _validate_uri_path(parsed.path,
-                       'Storage-broker endpoint',
-                       require_path=False)
-    return value
-
-
-def _validate_s3_prefix(value: str) -> str:
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        port = parsed.port
-        hostname = parsed.hostname
-    except ValueError as e:
-        raise ValueError('Storage-broker grant_uri_prefix has an invalid '
-                         'authority.') from e
-    bucket = parsed.netloc
-    if (parsed.scheme != 's3' or hostname is None or port is not None or
-            parsed.username is not None or parsed.password is not None or
-            parsed.query or parsed.fragment or bucket != hostname or
-            _S3_BUCKET_PATTERN.fullmatch(bucket) is None or '..' in bucket or
-            '.-' in bucket or '-.' in bucket or
-            bucket.startswith(_S3_RESERVED_BUCKET_PREFIXES) or
-            bucket.endswith(_S3_RESERVED_BUCKET_SUFFIXES) or
-            re.fullmatch(r'[0-9]+(?:\.[0-9]+){3}', bucket) is not None or
-            any(character.isspace() for character in value)):
-        raise ValueError('Storage-broker grant_uri_prefix must be an absolute '
-                         'canonical S3 bucket/prefix URI without credentials, '
-                         'port, query, or fragment.')
-    _validate_uri_path(parsed.path,
-                       'Storage-broker grant_uri_prefix',
-                       require_path=True)
-    return value
-
-
-def validate_storage_broker_projection(
-    value: Any,
-    *,
-    allow_none: bool = True,
-) -> dict[str, str | int | list[str]] | None:
-    """Strictly validate a non-secret storage-grant broker descriptor."""
-    if value is None:
-        if allow_none:
-            return None
-        raise ValueError('Storage-broker projection must not be null.')
-    if not isinstance(value, dict) or set(value) != _STORAGE_BROKER_KEYS:
-        raise ValueError('Storage-broker projection must contain exactly '
-                         f'{sorted(_STORAGE_BROKER_KEYS)!r}.')
-    endpoint = _strict_nonempty_string(value['endpoint'],
-                                       'Storage-broker endpoint')
-    endpoint = _validate_https_endpoint(endpoint)
-    grant_prefix = _strict_nonempty_string(value['grant_uri_prefix'],
-                                           'Storage-broker grant_uri_prefix')
-    grant_prefix = _validate_s3_prefix(grant_prefix)
-    if type(value['api_version']) is not int or value['api_version'] != 2:
-        raise ValueError('Storage-broker api_version must be exactly 2.')
-    role_arns = value['authenticated_worker_role_arns']
-    if (not isinstance(role_arns, list) or not 1 <= len(role_arns) <= 16):
-        raise ValueError('Storage-broker authenticated_worker_role_arns must '
-                         'contain between 1 and 16 entries.')
-    validated_role_arns: list[str] = []
-    for role_arn in role_arns:
-        role_arn = _strict_nonempty_string(
-            role_arn, 'Storage-broker authenticated_worker_role_arns entry')
-        if _AWS_ROLE_ARN_PATTERN.fullmatch(role_arn) is None:
-            raise ValueError('Every storage-broker '
-                             'authenticated_worker_role_arns entry must be '
-                             'an AWS IAM role ARN.')
-        validated_role_arns.append(role_arn)
-    if len(validated_role_arns) != len(set(validated_role_arns)):
-        raise ValueError('Storage-broker authenticated_worker_role_arns must '
-                         'not contain duplicates.')
-    return {
-        'endpoint': endpoint,
-        'audience': _strict_nonempty_string(value['audience'],
-                                            'Storage-broker audience'),
-        'api_version': 2,
-        'grant_uri_prefix': grant_prefix,
-        'authenticated_worker_role_arns': validated_role_arns,
-        'kms_key_id': _strict_nonempty_string(value['kms_key_id'],
-                                              'Storage-broker kms_key_id'),
-    }
-
-
-def build_storage_broker_projection(
-    *,
-    workspace: str | None,
-) -> dict[str, str | int | list[str]] | None:
-    """Freeze the server/workspace-owned storage broker for one version."""
-    resolved_workspace = workspace or skypilot_config.get_active_workspace()
-    configured = skypilot_config.get_nested(keys=('workspaces',
-                                                  resolved_workspace, 'serve',
-                                                  'storage_broker'),
-                                            default_value=None)
-    if configured is None:
-        configured = skypilot_config.get_nested(keys=('serve',
-                                                      'storage_broker'),
-                                                default_value=None)
-    return validate_storage_broker_projection(configured)
 
 
 def validate_controller_job_projection(

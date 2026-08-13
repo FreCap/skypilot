@@ -1330,47 +1330,6 @@ _SERVE_CONTROLLER_WORK_CACHE_SCHEMA = {
     }],
 }
 
-_SERVE_STORAGE_BROKER_SCHEMA = {
-    'type': 'object',
-    'required': [
-        'endpoint', 'audience', 'api_version', 'grant_uri_prefix',
-        'authenticated_worker_role_arns', 'kms_key_id'
-    ],
-    'additionalProperties': False,
-    'properties': {
-        'endpoint': {
-            'type': 'string',
-            'pattern': '^https://[^/?#]+(?:/[^?#]*)?$',
-        },
-        'audience': {
-            'type': 'string',
-            'minLength': 1,
-        },
-        'api_version': {
-            'const': 2,
-        },
-        'grant_uri_prefix': {
-            'type': 'string',
-            'pattern': '^s3://[^/?#]+(?:/[^?#]*)?$',
-        },
-        'authenticated_worker_role_arns': {
-            'type': 'array',
-            'minItems': 1,
-            'maxItems': 16,
-            'uniqueItems': True,
-            'items': {
-                'type': 'string',
-                'pattern': ('^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
-                            'role/[A-Za-z0-9+=,.@_/-]+$'),
-            },
-        },
-        'kms_key_id': {
-            'type': 'string',
-            'minLength': 1,
-        },
-    },
-}
-
 _SERVE_CONTROLLER_CONTEXT_SCHEMA = {
     'type': 'string',
     'minLength': 1,
@@ -2810,14 +2769,6 @@ def get_config_schema():
                 'private': {
                     'type': 'boolean',
                 },
-                'serve': {
-                    'type': 'object',
-                    'required': [],
-                    'additionalProperties': False,
-                    'properties': {
-                        'storage_broker': _SERVE_STORAGE_BROKER_SCHEMA,
-                    },
-                },
                 'allowed_users': {
                     'type': 'array',
                     'items': {
@@ -3224,9 +3175,6 @@ def get_config_schema():
                         'type': 'boolean',
                         'default': False,
                     },
-                },
-                extra_properties={
-                    'storage_broker': _SERVE_STORAGE_BROKER_SCHEMA,
                 }),
             'allowed_clouds': allowed_clouds,
             'admin_policy': admin_policy_schema,

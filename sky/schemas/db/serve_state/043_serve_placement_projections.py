@@ -34,6 +34,10 @@ def upgrade() -> None:
         db_utils.add_column_to_table_alembic('version_specs',
                                              'worker_placement_projections',
                                              projection_type)
+        # This applied revision is immutable. The abandoned broker projection
+        # is absent from current metadata and runtime code, but retaining its
+        # nullable physical column keeps rolling upgrades safe for older
+        # binaries that may still select it.
         db_utils.add_column_to_table_alembic('version_specs', 'storage_broker',
                                              projection_type)
 

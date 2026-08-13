@@ -132,7 +132,7 @@ def _load_service_worker_projections(launch_context: dict[str, Any]) -> None:
         return
     assert isinstance(service_name, str)
     assert type(service_version) is int
-    found, _, _, stored_projections, _ = (
+    found, _, _, stored_projections = (
         serve_state.get_placement_projection_record(service_name,
                                                     service_version))
     if not found:

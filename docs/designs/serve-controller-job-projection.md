@@ -14,15 +14,16 @@ smoke tests pending
 - Expose authenticated, versioned metadata that a campaign launcher can consume
   without copying arbitrary `pod_config`, credentials, PVCs, or host paths.
 - Allow fresh campaigns to launch while explicitly deferring automated
-  external campaign-controller recovery and replay until storage-lease
-  authority is end-to-end.
+  external campaign-controller recovery and replay until its authority is
+  designed and proven end-to-end.
 
 ## Non-goals
 
 - This contract does not persist campaign inputs or outputs. Canonical `s3://`
-  identities and immutable manifests remain durable truth; signed URLs are
-  minted only after dispatch and may cross regions only while expected
-  aggregate transfer is below 3 TB.
+  identities and immutable manifests remain durable truth. Workers access
+  their approved prefixes through the projected server-owned workload
+  identity; transfer estimates remain operator planning notes outside this
+  schema.
 - It does not make node-local cache durable, shared between regions, or safe by
   naming a path. A cache is advertised only with a complete platform
   attestation and must still be verified by the admitted worker.
@@ -36,9 +37,13 @@ smoke tests pending
 
 The admin-only service-version-history response advertises
 `placement_projection_protocol_version: 1`. Each version entry adds two
-nullable placement fields plus nullable controller-cache and storage-broker
-fields. A consumer must require the protocol field and strictly validate every
-non-null projection; API revision alone is not capability evidence.
+nullable placement fields plus a nullable controller-cache field. A consumer
+must require the protocol field and strictly validate every non-null
+projection; API revision alone is not capability evidence.
+
+API 75 introduced these retained placement fields. API 76 removes the
+abandoned storage-broker configuration and version-history field; it adds no
+replacement transport or compatibility branch.
 
 `controller_job_identity` is either null or exactly:
 
@@ -147,44 +152,6 @@ node-local controller cache is exactly:
 Its requirements cannot exceed the attestation's per-replica budgets. The
 controller cache is disposable and reconstructable from S3 in both cases.
 
-`storage_broker` is another immutable nullable sibling. Historical versions
-remain null. New versions freeze the server/workspace-owned non-secret broker
-descriptor exactly:
-
-```json
-{
-  "endpoint": "https://storage-broker.int.boltz.bio/v2/grants",
-  "audience": "boltz-skyserve-worker",
-  "api_version": 2,
-  "grant_uri_prefix": "s3://boltz-skyserve-grants/prod",
-  "authenticated_worker_role_arns": [
-    "arn:aws:iam::123456789012:role/skyserve-worker-east",
-    "arn:aws:iam::123456789012:role/skyserve-worker-phx"
-  ],
-  "kms_key_id": "alias/skyserve-grants"
-}
-```
-
-The endpoint is an absolute HTTPS URL without credentials, query, or fragment.
-The grant prefix is an absolute `s3://` URI without credentials, port, query, or
-fragment. Its authority is one canonical S3 bucket. Its nonempty path rejects
-empty or dot/traversal segments, backslashes, and all percent encodings so the
-persisted prefix has one authorization meaning. The
-bucket grammar also rejects AWS-reserved alias, access-point, MRAP, directory,
-and table-bucket name forms; the authority cannot silently name a different S3
-resource type. The
-worker-role array is ordered, non-empty, duplicate-free, and every entry is an
-IAM role ARN; it binds a grant to the finite set of ambient worker principals
-authorized across the service's regions. `api_version` is exactly 2. The
-object never contains a bearer token, secret, temporary credentials, signed
-URL, or grant.
-Clients require SkyPilot API >= 75 as well as placement protocol 1 before
-consuming this co-released field.
-
-Aggregate campaign transfer is a preparation-time estimate owned by the
-campaign. SkyPilot projects the signed-operation broker descriptor but does not
-project or enforce an aggregate transfer ceiling.
-
 The only cache kinds in protocol v1 are `none` and `node_local`. `none` has no
 other keys. `node_local` is exactly:
 
@@ -232,12 +199,12 @@ and verify an explicit fresh one-shot mode that launches and completes without
 depending on external campaign-controller recovery or replacement.
 
 Automated external campaign-controller recovery and takeover are deferred.
-Enabling either requires a separate end-to-end design in which the storage
-broker validates the immutable campaign scope and authoritative S3 lease before
-any queue replay can occur. That future contract needs its own credentials,
-coordinated Clin rollout, mixed-version behavior, rollback gates, and durable
-proof that replay cannot duplicate accepted work. Existing SkyServe service
-controller and ordinary-launch HA behavior is outside this deferral.
+Enabling either requires a separate end-to-end design that validates the
+immutable campaign scope and authoritative S3 lease before any queue replay can
+occur. That future contract needs coordinated Clin rollout, rollback gates,
+and durable proof that replay cannot duplicate accepted work. Existing
+SkyServe service-controller and ordinary-launch HA behavior is outside this
+deferral.
 
 ## Architecture and invariants
 
@@ -253,9 +220,9 @@ The service workspace selects the controller home using server-owned
 and controller cache are all resolved within that controller workspace. The
 named workspace must exist and differ from the service's inference workspace. A
 context without an explicit controller workspace fails closed so the
-controller can never inherit a worker's inference namespace or broker-only
-service account. Worker candidates continue resolving only from the original
-service workspace.
+controller can never inherit a worker's inference namespace or service
+account. Worker candidates continue resolving only from the original service
+workspace.
 
 Worker candidates come from the immutable placement catalog when present.
 Every task resource alternative must have an exact persisted-catalog match on
@@ -276,14 +243,11 @@ cloud candidate, unpinned Kubernetes context, malformed accelerator shape, or
 missing per-context `serve_worker_pod_identity_role_arn`, or incomplete
 server-owned cache attestation makes worker projection null and external
 launchers fail closed. Each non-null tuple binds context, namespace, service
-account, and exact AWS Pod Identity role ARN. If a storage broker is frozen,
-every projected role must occur in its ordered 1..16-role allowlist. SkyPilot
-core does not require exactly two roles; east+PHX is this deployment's profile.
-Explicit non-Kubernetes worker candidates do not prevent projection of exact
-Kubernetes candidates. Candidate projections must be unique by the runtime
-selection tuple `(context, case-insensitive accelerator name, count)`; ambiguous
-catalog alternatives are rejected at version commit rather than failing later
-at replica launch.
+account, and exact AWS Pod Identity role ARN. Explicit non-Kubernetes worker
+candidates do not prevent projection of exact Kubernetes candidates. Candidate
+projections must be unique by the runtime selection tuple `(context,
+case-insensitive accelerator name, count)`; ambiguous catalog alternatives are
+rejected at version commit rather than failing later at replica launch.
 
 Projected rendering selects the frozen candidate before Kubernetes deployment
 variables are built. It bypasses live label discovery, GPU resource-key
@@ -316,10 +280,9 @@ Neither priority nor Pod Identity role is read from campaign `pod_config`.
 Projection-bound workers receive no static cloud credential file mounts from
 the API server, including kubeconfig, AWS/GCP credentials, or logging-agent
 credential files. Their only cloud/storage authority is the frozen Kubernetes
-service account / Pod Identity plus the non-secret broker descriptor. Logging
-may use workload identity, but adding a file-backed logging credential requires
-a future explicit server-owned projection and cannot reuse the generic mount
-path.
+service account / Pod Identity. Logging may use workload identity, but adding a
+file-backed logging credential requires a future explicit server-owned
+projection and cannot reuse the generic mount path.
 
 This suppression applies only to credentials implicitly inherited from the API
 server. Stable service YAML, runtime secrets, and file mounts are trusted,
@@ -389,12 +352,16 @@ after this rejection boundary.
 Additive PostgreSQL migration 043 (down-revision 042) adds nullable JSONB columns
 `version_specs.controller_job_projection`,
 `version_specs.controller_work_cache`, and
-`version_specs.worker_placement_projections`, plus
-`version_specs.storage_broker`. Existing rows stay null. The
-columns are retained during application rollback so a later forward deployment
-can reuse immutable metadata. The Serve controller's separately supported
-local SQLite topology may use SQLAlchemy JSON for tests and local operation;
-there is no new central-API SQLite migration target.
+`version_specs.worker_placement_projections`. Existing rows stay null. The
+historical migration also added nullable `version_specs.storage_broker`; that
+abandoned field is absent from current SQLAlchemy metadata and every runtime,
+configuration, persistence, and API path. The physical column remains inert so
+a rolling deployment cannot break an older binary that still selects it; no
+new writer may populate it. The retained projection columns survive
+application rollback so a later forward deployment can reuse immutable
+metadata. The Serve controller's separately supported local SQLite topology
+may use SQLAlchemy JSON for tests and local operation; there is no new
+central-API SQLite migration target.
 
 ## Implementation phases
 
@@ -411,12 +378,15 @@ there is no new central-API SQLite migration target.
 
 ## Deployment and rollback
 
-Deploy the database migration before or with server/controller/load-balancer
-binaries. Older binaries ignore additive columns. New service updates freeze
-projections; old versions remain null and ineligible. Rollback never re-derives
-or deletes projections. External campaign-controller takeover remains
-unavailable before, during, and after this rollout; rollback cannot authorize
-campaign replay.
+Before deploying API 76, remove the optional abandoned broker configuration;
+API 75 tolerates its absence. Then deploy the server/controller/load-balancer
+binaries. Migration 043 is already present, and its inert nullable broker
+column remains so an older process cannot fail during a rolling deployment.
+New service updates freeze only the retained projections; old versions remain
+null and ineligible. Rollback to API 75 sees an absent broker configuration and
+leaves the inert column null; it never re-derives or deletes projections.
+External campaign-controller takeover remains unavailable before, during, and
+after this rollout; rollback cannot authorize campaign replay.
 
 ## Verification
 
@@ -446,11 +416,8 @@ replaying ambiguous work.
   encoded in the platform change. Deploy it and verify the admitted controller
   Job's identity, 64 GiB ephemeral-storage request, 80 GiB limit, and
   `/mnt/scratch` byte/inode checks. Its ambient role needs the controller's
-  S3/KMS permissions; worker service accounts must retain only broker-invoke
-  authority.
-- The broker descriptor must list the exact distinct east and PHX worker IAM
-  role ARNs, and the broker must prove that either ambient principal can redeem
-  only a grant bound to that finite set.
+  S3/KMS permissions; worker service accounts must use their projected Pod
+  Identity roles for the approved input and output prefixes.
 - Live PHX H200 and east probes supplied the filesystem, source, free
   byte/inode, reserve, and maximum-packing evidence now encoded by the platform
   change. After rollout, repeat the worker startup check on every admitted node;
@@ -468,8 +435,8 @@ replaying ambiguous work.
 - Do not enable nonempty campaigns until Clin ships and verifies a fresh
   one-shot mode independent of external campaign-controller recovery or
   takeover.
-- A separately designed broker-validated S3 lease contract and coordinated
-  Clin rollout remain required before enabling external campaign-controller
+- A separately designed S3 lease-authority contract and coordinated Clin
+  rollout remain required before enabling external campaign-controller
   recovery or takeover.
 - The east+PHX deployment smoke remains required before enabling H200 bulk
   traffic.

@@ -626,7 +626,6 @@ def test_serve043_adds_nullable_jsonb_projections_and_retains_on_rollback(
         'controller_job_projection',
         'controller_work_cache',
         'worker_placement_projections',
-        'storage_broker',
     }
     projection_columns = {
         column['name']: column
@@ -639,14 +638,21 @@ def test_serve043_adds_nullable_jsonb_projections_and_retains_on_rollback(
     assert all(
         isinstance(column['type'], postgresql.JSONB)
         for column in projection_columns.values())
+    historical_broker_column = next(column for column in sqlalchemy.inspect(
+        empty_postgres).get_columns('version_specs')
+                                    if column['name'] == 'storage_broker')
+    assert historical_broker_column['nullable']
+    assert isinstance(historical_broker_column['type'], postgresql.JSONB)
 
     alembic_command.downgrade(config, '042')
     assert migration_utils.get_current_alembic_revision(
         empty_postgres, migration_utils.SERVE_DB_NAME) == '042'
-    assert projection_names <= {
+    retained_columns = {
         column['name'] for column in sqlalchemy.inspect(
             empty_postgres).get_columns('version_specs')
     }
+    assert projection_names <= retained_columns
+    assert 'storage_broker' in retained_columns
 
 
 @pytest.mark.parametrize('early_column_ddl', [

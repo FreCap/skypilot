@@ -2226,13 +2226,9 @@ def _start(service_name: str,
                     task,
                     workspace=workspace,
                     placement_catalog=placement_catalog))
-            storage_broker = (
-                kubernetes_identity.build_storage_broker_projection(
-                    workspace=workspace))
         else:
             (controller_job_projection, controller_work_cache,
-             worker_placement_projections, storage_broker) = (None, None, None,
-                                                              None)
+             worker_placement_projections) = (None, None, None)
         with filelock.FileLock(controller_utils.get_resources_lock_path()):
             if not controller_utils.can_start_new_process(task.service.pool):
                 cleanup_storage(yaml_content, resource_scope)
@@ -2278,8 +2274,7 @@ def _start(service_name: str,
                         initial_controller_config_snapshot_id),
                     controller_job_projection=controller_job_projection,
                     controller_work_cache=controller_work_cache,
-                    worker_placement_projections=worker_placement_projections,
-                    storage_broker=storage_broker)
+                    worker_placement_projections=worker_placement_projections)
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):

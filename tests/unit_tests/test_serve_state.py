@@ -205,14 +205,6 @@ def _placement_projection_args() -> dict[str, object]:
                 'kind': 'none',
             },
         }],
-        'storage_broker': {
-            'endpoint': 'https://storage-broker.int.boltz.bio/v2/grants',
-            'audience': 'boltz-skyserve-worker',
-            'api_version': 2,
-            'grant_uri_prefix': 's3://boltz-skyserve-grants/prod',
-            'authenticated_worker_role_arns': [worker_role],
-            'kms_key_id': 'alias/skyserve-grants',
-        },
     }
 
 
@@ -1992,7 +1984,6 @@ def test_identical_projection_retry_is_idempotent_at_db_boundary(
     'controller_job_projection',
     'controller_work_cache',
     'worker_placement_projections',
-    'storage_broker',
 ])
 def test_projection_drift_conflicts_and_preserves_committed_row(
         _mock_serve_db, projection_name):
@@ -2011,10 +2002,8 @@ def test_projection_drift_conflicts_and_preserves_committed_row(
         changed[projection_name]['namespace'] = 'different-controller-system'
     elif projection_name == 'controller_work_cache':
         changed[projection_name]['size_limit_bytes'] = 300
-    elif projection_name == 'worker_placement_projections':
-        changed[projection_name][0]['accelerator_name'] = 'H100'
     else:
-        changed[projection_name]['audience'] = 'different-audience'
+        changed[projection_name][0]['accelerator_name'] = 'H100'
 
     assert (serve_state.add_or_update_version(
         service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
@@ -2037,7 +2026,6 @@ def test_identical_yaml_retry_cannot_backfill_legacy_null_projections(
         'controller_job_projection',
         'controller_work_cache',
         'worker_placement_projections',
-        'storage_broker',
     ))
 
     assert (serve_state.add_or_update_version(service_name, 2,
@@ -4983,7 +4971,6 @@ class TestRecoveryVersionSelection:
             'controller_job_projection': None,
             'controller_work_cache': None,
             'worker_placement_projections': None,
-            'storage_broker': None,
         }, {
             'version': 2,
             'spec': 'spec-2',
@@ -4996,7 +4983,6 @@ class TestRecoveryVersionSelection:
             'controller_job_projection': None,
             'controller_work_cache': None,
             'worker_placement_projections': None,
-            'storage_broker': None,
         }]
 
     def test_quarantine_is_durable_and_applicable_snapshot_skips_it(

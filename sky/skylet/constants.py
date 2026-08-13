@@ -658,7 +658,6 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     ('kubernetes', 'context_configs', '*',
      'serve_worker_pod_identity_role_arn'),
     ('kubernetes', 'context_configs', '*', 'auto_mounts'),
-    ('serve', 'storage_broker'),
     # TODO(kevin,tian): Override the whole controller config once our test
     # infrastructure supports setting dynamic server side configs.
     # Tests that are affected:

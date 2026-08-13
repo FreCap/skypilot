@@ -626,7 +626,7 @@ def test_api009_serve043_lineage_and_sqlite_stays_at_serve037(
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert server_constants.MIN_ORDINARY_LAUNCH_BINDING_API_VERSION == 74
     assert server_constants.MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION == 75
-    assert server_constants.API_VERSION == 75
+    assert server_constants.API_VERSION == 76
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)
@@ -655,8 +655,8 @@ def test_runtime_metadata_keeps_serve043_columns() -> None:
         'controller_job_projection',
         'controller_work_cache',
         'worker_placement_projections',
-        'storage_broker',
     }.issubset(serve_state_schema.version_specs_table.c.keys())
+    assert 'storage_broker' not in serve_state_schema.version_specs_table.c
 
 
 def test_controller_authority_stays_legacy_on_sqlite(tmp_path: pathlib.Path,

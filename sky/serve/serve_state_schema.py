@@ -330,10 +330,6 @@ version_specs_table = sqlalchemy.Table(
                       sqlalchemy.JSON(none_as_null=True).with_variant(
                           postgresql.JSONB(none_as_null=True), 'postgresql'),
                       server_default=None),
-    sqlalchemy.Column('storage_broker',
-                      sqlalchemy.JSON(none_as_null=True).with_variant(
-                          postgresql.JSONB(none_as_null=True), 'postgresql'),
-                      server_default=None),
     *resource_action_m4_state_schema.version_spec_identity_columns(),
     sqlalchemy.CheckConstraint(
         '((retired_at IS NULL AND retired_yaml_content IS NULL AND '

@@ -3915,9 +3915,9 @@ class SkyServeController:
                                               status_code=400)
         if authoritative_retry_service is not None:
             (found, controller_job_projection, controller_work_cache,
-             worker_placement_projections,
-             storage_broker) = (serve_state.get_placement_projection_record(
-                 self._service_name, version))
+             worker_placement_projections) = (
+                 serve_state.get_placement_projection_record(
+                     self._service_name, version))
             if not found:
                 self._discard_prepared_controller_config(prepared_config)
                 return responses.JSONResponse(content={
@@ -3936,9 +3936,9 @@ class SkyServeController:
                                                   status_code=400)
             try:
 
-                def _build_projections() -> tuple[Any, Any, Any, Any]:
+                def _build_projections() -> tuple[Any, Any, Any]:
                     if not validation_service.placement_contract.enabled:
-                        return None, None, None, None
+                        return None, None, None
                     workspace = self._replica_manager.workspace
                     return (
                         kubernetes_identity.build_controller_job_projection(
@@ -3950,8 +3950,6 @@ class SkyServeController:
                             update_task,
                             workspace=workspace,
                             placement_catalog=placement_catalog),
-                        kubernetes_identity.build_storage_broker_projection(
-                            workspace=workspace),
                     )
 
                 if prepared_config is None:
@@ -3960,7 +3958,7 @@ class SkyServeController:
                     projections = self._run_with_prepared_config(
                         prepared_config, _build_projections)
                 (controller_job_projection, controller_work_cache,
-                 worker_placement_projections, storage_broker) = projections
+                 worker_placement_projections) = projections
             except ValueError as e:
                 self._discard_prepared_controller_config(prepared_config)
                 return responses.JSONResponse(content={'message': str(e)},
@@ -3995,7 +3993,6 @@ class SkyServeController:
             controller_job_projection=controller_job_projection,
             controller_work_cache=controller_work_cache,
             worker_placement_projections=worker_placement_projections,
-            storage_broker=storage_broker,
             **catalog_kwargs,
             **recovery_kwargs)
         if result not in (serve_state.VersionCommitResult.COMMITTED,

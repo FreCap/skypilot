@@ -273,7 +273,7 @@ def test_excluded_profile_uses_production_legacy_fence_entrypoint():
          mock.patch.object(
              execution.serve_state,
              'get_placement_projection_record',
-             return_value=(True, None, None, None, None)), \
+             return_value=(True, None, None, None)), \
          mock.patch.object(
              execution, '_validate_service_replica_launch_fence') as legacy, \
          mock.patch.object(execution, '_execute_dag', return_value=expected):
