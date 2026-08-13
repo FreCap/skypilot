@@ -213,7 +213,7 @@ class TestConsolidationEventInstancePersistence:
 
     Background: SkyletEvent.run() throttles its expensive `_run()`
     callback via a per-instance counter `_n` that accumulates across
-    calls. The outer InternalRequestDaemon loop re-invokes the
+    calls. The outer RuntimeDaemon loop re-invokes the
     daemon's event_fn repeatedly; if the event is freshly instantiated
     on every call, `_n` resets to 0, run() only advances it to 1,
     `_n == 0` never re-fires, and the throttled work

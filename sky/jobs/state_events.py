@@ -38,6 +38,25 @@ def _normalize_timestamp(
     return timestamp.astimezone(datetime.timezone.utc)
 
 
+def job_event_insert_statement(
+    job_id: int,
+    task_id: int | None,
+    new_status: ManagedJobStatus,
+    reason: str,
+    code: str | None = None,
+    timestamp: datetime.datetime | None = None,
+) -> sqlalchemy.sql.dml.Insert:
+    """Build the canonical event insert for a caller-owned transaction."""
+    return job_events_table.insert().values(
+        spot_job_id=job_id,
+        task_id=task_id,
+        new_status=new_status.value,
+        code=code,
+        reason=reason,
+        timestamp=_normalize_timestamp(timestamp),
+    )
+
+
 def add_job_event(job_id: int,
                   task_id: int | None,
                   new_status: ManagedJobStatus,
@@ -54,19 +73,14 @@ def add_job_event(job_id: int,
         reason: A description of why the event occurred.
         timestamp: The timestamp of the event. If None, uses current time.
     """
-    timestamp = _normalize_timestamp(timestamp)
-
-    status_value = new_status.value
-
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        session.execute(job_events_table.insert().values(
-            spot_job_id=job_id,
-            task_id=task_id,  # Can be None for job-level events
-            new_status=status_value,
-            reason=reason,
-            timestamp=timestamp,
-        ))
+        session.execute(
+            job_event_insert_statement(job_id,
+                                       task_id,
+                                       new_status,
+                                       reason,
+                                       timestamp=timestamp))
         session.commit()
 
 
@@ -101,20 +115,15 @@ async def add_job_event_async(
         code: Optional error category code for failures.
         timestamp: The timestamp of the event. If None, uses current time.
     """
-    timestamp = _normalize_timestamp(timestamp)
-
-    status_value = new_status.value
-
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
-        await session.execute(job_events_table.insert().values(
-            spot_job_id=job_id,
-            task_id=task_id,  # Can be None for job-level events
-            new_status=status_value,
-            code=code,
-            reason=reason,
-            timestamp=timestamp,
-        ))
+        await session.execute(
+            job_event_insert_statement(job_id,
+                                       task_id,
+                                       new_status,
+                                       reason,
+                                       code=code,
+                                       timestamp=timestamp))
         await session.commit()
 
 

@@ -270,16 +270,6 @@
                 }
             }
         ],
-        "./sky/server/requests/executor.py": [
-            {
-                "code": "reportGeneralTypeIssues",
-                "range": {
-                    "startColumn": 22,
-                    "endColumn": 76,
-                    "lineCount": 2
-                }
-            }
-        ],
         "./sky/server/requests/requests.py": [
             {
                 "code": "reportGeneralTypeIssues",
@@ -294,22 +284,6 @@
                 "range": {
                     "startColumn": 15,
                     "endColumn": 48,
-                    "lineCount": 3
-                }
-            },
-            {
-                "code": "reportGeneralTypeIssues",
-                "range": {
-                    "startColumn": 19,
-                    "endColumn": 50,
-                    "lineCount": 3
-                }
-            },
-            {
-                "code": "reportGeneralTypeIssues",
-                "range": {
-                    "startColumn": 19,
-                    "endColumn": 50,
                     "lineCount": 3
                 }
             },

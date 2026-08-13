@@ -1,12 +1,14 @@
 """Kubernetes instance provisioning."""
 from collections.abc import Callable
+from collections.abc import Iterator
 from collections.abc import Mapping
+import contextlib
 import copy
 import datetime
 import json
 import re
 import time
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Literal, NoReturn, Optional, TYPE_CHECKING
 
 from sky import exceptions
 from sky import global_user_state
@@ -57,7 +59,26 @@ _PENDING_REASON_NORMAL_EVENT_ALLOWLIST = {
 # Pattern to extract SSH user from command output, handling MOTD contamination
 _SSH_USER_PATTERN = re.compile(r'SKYPILOT_SSH_USER: ([^\s\n]+)')
 
+# Kueue's AssignQueueLabelsForPods feature publishes the ClusterQueue name in
+# a Kubernetes label value.  It only emits that label when the name is also a
+# DNS-1123 label, even though the ClusterQueue API accepts DNS subdomains.
+_DNS_1123_LABEL_PATTERN = re.compile(r'^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$')
+
 logger = sky_logging.init_logger(__name__)
+
+_RequiredKueuePodLifecycle = Literal['create_response', 'adoption', 'admitted']
+
+
+@contextlib.contextmanager
+def _provider_mutation_guard(
+    factory: common.ProviderEffectGuardFactory | None,) -> Iterator[None]:
+    """Enters one fresh runtime-only provider-effect authorization."""
+    if factory is None:
+        yield
+        return
+    with factory():
+        yield
+
 
 # These direct aliases preserve the historical instance import surface while
 # the cross-process Kubernetes Event protocol lives in its own gateway module.
@@ -170,14 +191,15 @@ def _raise_command_running_error(message: str, command: str, pod_name: str,
 
 
 @timeline.event
-def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
+def _wait_for_pods_to_run(namespace, context, cluster_name,
+                          new_pods) -> dict[str, object]:
     """Wait for pods and their containers to be ready.
 
     Pods may be pulling images or may be in the process of container
     creation.
     """
     if not new_pods:
-        return
+        return {}
 
     # Create a set of pod names we're waiting for
     expected_pod_names = {pod.metadata.name for pod in new_pods}
@@ -376,7 +398,13 @@ def _wait_for_pods_to_run(namespace, context, cluster_name, new_pods):
                     pending_reasons_count.get(pending_reason, 0) + 1)
 
         if all_pods_running:
-            break
+            # Bind the exact object incarnation whose Running state ended the
+            # wait. A same-name replacement cannot inherit that proof at the
+            # post-admission attestation boundary.
+            return {
+                pod.metadata.name: getattr(pod.metadata, 'uid', None)
+                for pod in pods_to_check
+            }
 
         if pending_reasons_count:
             msg = ', '.join([
@@ -586,7 +614,7 @@ def _force_remove_terminating_pod(pod_name: str, namespace: str,
     finalizers: list[str] = []
     try:
         pod = kubernetes.core_api(context).read_namespaced_pod(
-            pod_name, namespace)
+            pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
         # The create response can race with a later read.  Fail closed if the
         # pod is no longer terminating: deleting it with grace period 0 would
         # otherwise remove a healthy pod.
@@ -632,20 +660,27 @@ def _force_remove_terminating_pod(pod_name: str, namespace: str,
             pod_name,
             namespace,
             grace_period_seconds=0,
-            _request_timeout=config_lib.DELETION_TIMEOUT)
+            _request_timeout=kubernetes.API_TIMEOUT)
     except kubernetes.api_exception() as e:
         if e.status != 404:
             logger.warning(
                 f'Force delete of terminating pod {pod_name} failed: {e}')
 
 
-def _prepare_pod_for_required_kueue(
-        pod_spec: dict, expected_queue: str, pod_group_name: str,
-        pod_group_total_count: int,
-        workload_priority_class_name: str | None) -> None:
+def _prepare_pod_for_required_kueue(pod_spec: dict,
+                                    expected_queue: str,
+                                    pod_group_name: str,
+                                    pod_group_total_count: int,
+                                    workload_priority_class_name: str | None,
+                                    *,
+                                    strict_projection: bool = False) -> None:
     """Reasserts the server-owned Kueue contract on a final Pod spec."""
     metadata = pod_spec.setdefault('metadata', {})
     labels = metadata.setdefault('labels', {})
+    if strict_projection:
+        for key in list(labels):
+            if key.startswith(k8s_constants.KUEUE_METADATA_PREFIX):
+                labels.pop(key)
     labels[k8s_constants.KUEUE_QUEUE_LABEL] = expected_queue
     labels[k8s_constants.KUEUE_POD_GROUP_LABEL] = pod_group_name
     # The managed label is admission attestation.  It must never arrive in the
@@ -658,6 +693,14 @@ def _prepare_pod_for_required_kueue(
             workload_priority_class_name)
 
     annotations = metadata.setdefault('annotations', {})
+    if strict_projection:
+        for key in list(annotations):
+            if key.startswith(k8s_constants.KUEUE_METADATA_PREFIX):
+                annotations.pop(key)
+    # Kueue's WorkloadIdentifierAnnotations feature gives the annotation form
+    # precedence over this canonical label identity. Keep one unambiguous
+    # label-based pod group across all supported Kueue configurations.
+    annotations.pop(k8s_constants.KUEUE_POD_GROUP_LABEL, None)
     annotations[k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION] = 'false'
     annotations[k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION] = str(
         pod_group_total_count)
@@ -673,8 +716,11 @@ def _prepare_pod_for_required_kueue(
     # Kueue adds this gate itself, but adding it before admission reverses the
     # failure mode: if the webhook is missing or excludes this namespace, the
     # unverified Pod cannot reach the default scheduler or consume a GPU.
-    scheduling_gates = pod_spec.setdefault('spec', {}).setdefault(
-        'schedulingGates', [])
+    pod_body = pod_spec.setdefault('spec', {})
+    scheduling_gates = pod_body.setdefault('schedulingGates', [])
+    if strict_projection:
+        scheduling_gates = []
+        pod_body['schedulingGates'] = scheduling_gates
     if not any(
             gate.get('name') == k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
             for gate in scheduling_gates):
@@ -914,8 +960,8 @@ def _get_required_namespace_labels(namespace: str,
 
 
 def _preflight_required_kueue_local_queue(namespace: str, context: str | None,
-                                          expected_queue: str) -> None:
-    """Requires an active LocalQueue whose current policy admits Namespace."""
+                                          expected_queue: str) -> str:
+    """Return the active ClusterQueue whose current policy admits Namespace."""
     api_version = _get_required_kueue_api_version(context)
     queue_ref = f'{namespace}/{expected_queue}'
     local_queue = _get_required_kueue_object(
@@ -937,6 +983,14 @@ def _preflight_required_kueue_local_queue(namespace: str, context: str | None,
         raise config_lib.KubernetesError(
             f'Required Kueue LocalQueue {queue_ref!r} has no valid '
             'spec.clusterQueue. SkyPilot refused to create Pods.')
+    if _DNS_1123_LABEL_PATTERN.fullmatch(cluster_queue_name) is None:
+        raise config_lib.KubernetesError(
+            f'Required Kueue LocalQueue {queue_ref!r} targets ClusterQueue '
+            f'{cluster_queue_name!r}, whose name cannot be published in '
+            "Kueue's AssignQueueLabelsForPods cluster-queue-name Pod label. "
+            'Rename it to a DNS-1123 label (1-63 lowercase alphanumeric or '
+            "'-' characters, starting and ending with an alphanumeric "
+            'character). SkyPilot refused to create Pods.')
 
     cluster_queue = _get_required_kueue_object(
         context=context,
@@ -956,53 +1010,208 @@ def _preflight_required_kueue_local_queue(namespace: str, context: str | None,
             f'Required Kueue ClusterQueue {cluster_queue_name!r} does not '
             f'admit Namespace {namespace!r} under its current '
             'spec.namespaceSelector. SkyPilot refused to create Pods.')
+    return cluster_queue_name
 
 
-def _attest_required_kueue_pod(pod: Any, namespace: str, context: str | None,
-                               expected_queue: str) -> None:
+def _attest_required_kueue_pod(
+        pod: Any,
+        namespace: str,
+        context: str | None,
+        expected_queue: str,
+        expected_pod_group_name: str,
+        expected_pod_group_total_count: int,
+        expected_workload_priority_class_name: str | None = None,
+        *,
+        expected_cluster_queue: str,
+        strict_projection: bool = False,
+        expected_lifecycle: _RequiredKueuePodLifecycle = 'create_response',
+        provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                        None) = None,
+        defer_cleanup: bool = False) -> None:
     """Verifies Kueue admission mutation, deleting a Pod that bypassed it."""
-    labels = pod.metadata.labels or {}
+    labels = pod.metadata.labels
+    if not isinstance(labels, Mapping):
+        labels = {}
     managed_value = labels.get(k8s_constants.KUEUE_MANAGED_KEY)
     actual_queue = labels.get(k8s_constants.KUEUE_QUEUE_LABEL)
+    actual_workload_priority = labels.get(
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL)
+    actual_pod_group_name = labels.get(k8s_constants.KUEUE_POD_GROUP_LABEL)
+    annotations = pod.metadata.annotations
+    if not isinstance(annotations, Mapping):
+        annotations = {}
+    actual_pod_group_total_count = annotations.get(
+        k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION)
+    actual_retriable_in_group = annotations.get(
+        k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION)
+    actual_role_hash = annotations.get(k8s_constants.KUEUE_ROLE_HASH_ANNOTATION)
+    role_hash_is_valid = bool(
+        isinstance(actual_role_hash, str) and
+        re.fullmatch(r'[0-9a-f]{8}', actual_role_hash))
+    actual_podset = labels.get(k8s_constants.KUEUE_PODSET_LABEL)
+    actual_workload = annotations.get(k8s_constants.KUEUE_WORKLOAD_ANNOTATION)
+    actual_local_queue = labels.get(k8s_constants.KUEUE_LOCAL_QUEUE_LABEL)
+    actual_cluster_queue = labels.get(k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL)
+    # The webhook always stamps role-hash. PodSet/workload/queue outputs are
+    # added only after Kueue admits and ungates the Workload, so they must be
+    # absent from the create response or form one exact admitted set later.
+    # The queue pair is mandatory after admission: without it, a LocalQueue
+    # retarget between preflight and admission would be indistinguishable from
+    # admission through the ClusterQueue that was actually reviewed.
+    admitted_metadata_absent = all(value is None
+                                   for value in (actual_podset, actual_workload,
+                                                 actual_local_queue,
+                                                 actual_cluster_queue))
+    queue_outputs_exact = bool(actual_local_queue == expected_queue and
+                               actual_cluster_queue == expected_cluster_queue)
+    admitted_metadata_exact = bool(
+        actual_podset == actual_role_hash and
+        (actual_workload is None or
+         actual_workload == expected_pod_group_name) and queue_outputs_exact)
+    competing_pod_group_annotation = annotations.get(
+        k8s_constants.KUEUE_POD_GROUP_LABEL)
+    pod_spec = _kueue_api_field(pod, 'spec')
+    scheduling_gates = _kueue_api_field(pod_spec, 'scheduling_gates')
+    if scheduling_gates is None and isinstance(pod_spec, Mapping):
+        scheduling_gates = pod_spec.get('schedulingGates')
+    gate_names = ([] if not isinstance(scheduling_gates, (list, tuple)) else
+                  [_kueue_api_field(gate, 'name') for gate in scheduling_gates])
+    has_admission_gate = (k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
+                          in gate_names)
+    allowed_gate_names = {
+        k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE,
+        k8s_constants.KUEUE_TOPOLOGY_SCHEDULING_GATE,
+    }
+    unexpected_scheduling_gates = ([] if not strict_projection else [
+        name for name in gate_names if name not in allowed_gate_names
+    ])
+    allowed_kueue_labels = {
+        k8s_constants.KUEUE_MANAGED_KEY,
+        k8s_constants.KUEUE_QUEUE_LABEL,
+        k8s_constants.KUEUE_POD_GROUP_LABEL,
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL,
+        k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL,
+        k8s_constants.KUEUE_LOCAL_QUEUE_LABEL,
+        k8s_constants.KUEUE_PODSET_LABEL,
+    }
+    unexpected_kueue_labels = ([] if not strict_projection else sorted(
+        key for key in labels
+        if key.startswith(k8s_constants.KUEUE_METADATA_PREFIX) and
+        key not in allowed_kueue_labels))
+    allowed_kueue_annotations = {
+        k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION,
+        k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION,
+        k8s_constants.KUEUE_ROLE_HASH_ANNOTATION,
+        k8s_constants.KUEUE_WORKLOAD_ANNOTATION,
+    }
+    unexpected_kueue_annotations = ([] if not strict_projection else sorted(
+        key for key in annotations
+        if key.startswith(k8s_constants.KUEUE_METADATA_PREFIX) and
+        key not in allowed_kueue_annotations))
+    finalizers = getattr(pod.metadata, 'finalizers', None)
+    has_managed_finalizer = (isinstance(finalizers, (list, tuple)) and
+                             k8s_constants.KUEUE_MANAGED_FINALIZER
+                             in finalizers)
+    # Kueue installs its managed finalizer before quota admission, so the
+    # finalizer cannot independently prove that an ungated Pod was admitted.
+    # Couple lifecycle proof to the metadata phase: gated Pods remain strictly
+    # pre-admission; ungated Pods need Kueue's exact PodSet admission binding.
+    if expected_lifecycle == 'create_response':
+        lifecycle_contract_matches = (has_admission_gate and
+                                      admitted_metadata_absent)
+    elif expected_lifecycle == 'adoption':
+        lifecycle_contract_matches = (
+            (has_admission_gate and admitted_metadata_absent) or
+            (not has_admission_gate and has_managed_finalizer and
+             admitted_metadata_exact))
+    else:
+        assert expected_lifecycle == 'admitted'
+        lifecycle_contract_matches = (not has_admission_gate and
+                                      has_managed_finalizer and
+                                      admitted_metadata_exact)
     if (managed_value == k8s_constants.KUEUE_MANAGED_VALUE and
-            actual_queue == expected_queue):
+            actual_queue == expected_queue and actual_workload_priority
+            == expected_workload_priority_class_name and
+            actual_pod_group_name == expected_pod_group_name and
+            actual_pod_group_total_count == str(expected_pod_group_total_count)
+            and actual_retriable_in_group == 'false' and role_hash_is_valid and
+            lifecycle_contract_matches and
+            competing_pod_group_annotation is None and
+            not unexpected_scheduling_gates and not unexpected_kueue_labels and
+            not unexpected_kueue_annotations):
         return
 
-    pod_name = pod.metadata.name
-    reasons = []
-    if managed_value != k8s_constants.KUEUE_MANAGED_VALUE:
-        reasons.append(f'{k8s_constants.KUEUE_MANAGED_KEY}={managed_value!r}')
-    if actual_queue != expected_queue:
-        reasons.append(f'{k8s_constants.KUEUE_QUEUE_LABEL}={actual_queue!r} '
-                       f'(expected {expected_queue!r})')
-    cleanup_error = None
-    try:
-        kubernetes.core_api(context).delete_namespaced_pod(
-            pod_name,
-            namespace,
-            grace_period_seconds=0,
-            _request_timeout=config_lib.DELETION_TIMEOUT)
-    except kubernetes.api_exception() as e:
-        if e.status != 404:
-            cleanup_error = common_utils.format_exception(e)
-            logger.error(f'Failed to delete unattested Kueue Pod {pod_name}: '
-                         f'{cleanup_error}')
-
-    detail = ', '.join(reasons)
-    cleanup_detail = ('' if cleanup_error is None else
-                      f' Cleanup also failed: {cleanup_error}')
-    raise config_lib.KubernetesError(
-        f'Pod {namespace}/{pod_name} was not admitted through the required '
-        f'Kueue LocalQueue {expected_queue!r}: {detail}. The Pod was rejected '
-        f'to prevent it from bypassing Kueue.{cleanup_detail}')
+    actual = {
+        'managed_label': managed_value,
+        'queue_label': actual_queue,
+        'workload_priority_class_label': actual_workload_priority,
+        'pod_group_label': actual_pod_group_name,
+        'pod_group_total_count_annotation': actual_pod_group_total_count,
+        'retriable_in_group_annotation': actual_retriable_in_group,
+        'role_hash_annotation': actual_role_hash,
+        'role_hash_is_valid': role_hash_is_valid,
+        'podset_label': actual_podset,
+        'workload_annotation': actual_workload,
+        'local_queue_label': actual_local_queue,
+        'cluster_queue_label': actual_cluster_queue,
+        'admitted_metadata_absent': admitted_metadata_absent,
+        'admitted_metadata_exact': admitted_metadata_exact,
+        'queue_outputs_exact': queue_outputs_exact,
+        'competing_pod_group_annotation': competing_pod_group_annotation,
+        'unexpected_scheduling_gates': unexpected_scheduling_gates,
+        'unexpected_kueue_labels': unexpected_kueue_labels,
+        'unexpected_kueue_annotations': unexpected_kueue_annotations,
+        'has_admission_scheduling_gate': has_admission_gate,
+        'has_kueue_managed_finalizer': has_managed_finalizer,
+        'lifecycle_contract_matches': lifecycle_contract_matches,
+    }
+    expected = {
+        'managed_label': k8s_constants.KUEUE_MANAGED_VALUE,
+        'queue_label': expected_queue,
+        'cluster_queue_label': expected_cluster_queue,
+        'workload_priority_class_label': expected_workload_priority_class_name,
+        'pod_group_label': expected_pod_group_name,
+        'pod_group_total_count_annotation': str(expected_pod_group_total_count),
+        'retriable_in_group_annotation': 'false',
+        'role_hash_annotation': '8 lowercase hexadecimal characters',
+        'admitted_metadata': ('absent from create response; on adoption, '
+                              'podset=role-hash, optional workload='
+                              'pod-group-name, and exact local-queue/cluster-'
+                              'queue outputs'),
+        'competing_pod_group_annotation': None,
+        'allowed_scheduling_gates': sorted(allowed_gate_names),
+        'unexpected_kueue_metadata': [],
+        'has_admission_scheduling_gate': True,
+        'lifecycle_contract': {
+            'create_response': 'pre-admission metadata plus admission scheduling gate',
+            'adoption':
+                ('gated pre-admission metadata, or ungated exact PodSet and '
+                 'queue admission binding plus managed finalizer'),
+            'admitted':
+                ('ungated exact PodSet and queue admission binding plus '
+                 'managed finalizer'),
+        }[expected_lifecycle],
+    }
+    _reject_admitted_serve_worker_identity(
+        pod,
+        namespace,
+        context,
+        'Kueue admission contract',
+        actual,
+        expected,
+        provider_effect_guard_factory=provider_effect_guard_factory,
+        defer_cleanup=defer_cleanup)
 
 
 @timeline.event
 def _create_namespaced_pod_with_retries(
-        namespace: str,
-        pod_spec: dict,
-        context: str | None,
-        expected_kueue_queue: str | None = None) -> Any:
+    namespace: str,
+    pod_spec: dict,
+    context: str | None,
+    post_create_attestation: Callable[[Any], None] | None = None,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None
+) -> Any:
     """Attempts to create a Kubernetes Pod and handle any errors.
 
     Currently, we handle errors due to the AppArmor annotation and retry if
@@ -1013,16 +1222,33 @@ def _create_namespaced_pod_with_retries(
     """
 
     def attest_if_required(pod: Any) -> Any:
-        if expected_kueue_queue is not None:
-            _attest_required_kueue_pod(pod, namespace, context,
-                                       expected_kueue_queue)
+        # Run every server-owned admission check on the exact API response
+        # before this create thread can return.  In particular, do not defer
+        # attestation until a parallel create batch joins: an earlier Pod may
+        # already be schedulable while a sibling admission request is blocked.
+        if post_create_attestation is not None:
+            post_create_attestation(pod)
         return pod
+
+    def create_and_attest() -> Any:
+        """Creates once and attests the response in the same authority epoch."""
+        try:
+            with _provider_mutation_guard(provider_effect_guard_factory):
+                pod = kubernetes.core_api(context).create_namespaced_pod(
+                    namespace,
+                    pod_spec,
+                    _request_timeout=kubernetes.API_TIMEOUT)
+                return attest_if_required(pod)
+        except _ServeWorkerIdentityRejection as rejection:
+            # Detection happened before the create epoch ended. Cleanup gets a
+            # new authorization per bounded attempt so its retry sleeps cannot
+            # monopolize service/fleet authority.
+            _raise_rejected_serve_worker_after_cleanup(
+                rejection, provider_effect_guard_factory)
 
     try:
         # Attempt to create the Pod with the AppArmor annotation
-        pod = kubernetes.core_api(context).create_namespaced_pod(
-            namespace, pod_spec)
-        return attest_if_required(pod)
+        return create_and_attest()
     except kubernetes.api_exception() as e:
         try:
             error_body = json.loads(e.body)
@@ -1058,11 +1284,10 @@ def _create_namespaced_pod_with_retries(
 
             # Retry Pod creation without the AppArmor annotation
             try:
-                pod = kubernetes.core_api(context).create_namespaced_pod(
-                    namespace, pod_spec)
+                pod = create_and_attest()
                 logger.info(f'Pod {pod.metadata.name} created successfully '
                             'without AppArmor annotation.')
-                return attest_if_required(pod)
+                return pod
             except kubernetes.api_exception() as retry_exception:
                 logger.info('Failed to create Pod without AppArmor annotation: '
                             f'{retry_exception}')
@@ -1097,13 +1322,13 @@ def _create_namespaced_pod_with_retries(
                 'Force-removing it and retrying pod creation.')
             # Both the Kueue finalizer and the termination grace period can keep
             # the old object around; _force_remove_terminating_pod clears both.
-            _force_remove_terminating_pod(pod_name, namespace, context)
+            with _provider_mutation_guard(provider_effect_guard_factory):
+                _force_remove_terminating_pod(pod_name, namespace, context)
             try:
-                pod = kubernetes.core_api(context).create_namespaced_pod(
-                    namespace, pod_spec)
+                pod = create_and_attest()
                 logger.info(f'Pod {pod.metadata.name} created successfully '
                             'after force-removing the terminating pod.')
-                return attest_if_required(pod)
+                return pod
             except kubernetes.api_exception() as retry_exception:
                 logger.warning(f'Failed to create pod {pod_name} on retry: '
                                f'{retry_exception}')
@@ -1178,36 +1403,68 @@ _NO_SERVE_WORKER_IDENTITY_ATTESTATION = object()
 _SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS = 3
 
 
+class _ServeWorkerIdentityRejection(Exception):
+    """An admitted worker response failed immutable identity attestation."""
+
+    def __init__(self, pod_name: str, namespace: str, context: str | None,
+                 identity_name: str, actual: object, expected: object) -> None:
+        super().__init__(identity_name)
+        self.pod_name = pod_name
+        self.namespace = namespace
+        self.context = context
+        self.identity_name = identity_name
+        self.actual = actual
+        self.expected = expected
+
+
 def _delete_admitted_serve_worker_and_confirm_absent(
-        pod_name: str, namespace: str, context: str | None) -> None:
+    pod_name: str,
+    namespace: str,
+    context: str | None,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+) -> None:
     """Force-delete an unsafe admitted Pod and prove it left the API."""
     core_api = kubernetes.core_api(context)
     last_observation = 'the Pod remained visible'
     for attempt in range(_SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS):
-        delete_error = None
-        try:
-            core_api.delete_namespaced_pod(
-                pod_name,
-                namespace,
-                grace_period_seconds=0,
-                _request_timeout=config_lib.DELETION_TIMEOUT)
-        except Exception as e:  # pylint: disable=broad-except
-            delete_error = common_utils.format_exception(e)
-        try:
-            core_api.read_namespaced_pod(
-                pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
-        except kubernetes.api_exception() as e:
-            if e.status == 404:
-                return
-            last_observation = common_utils.format_exception(e)
-        except Exception as e:  # pylint: disable=broad-except
-            last_observation = common_utils.format_exception(e)
-        else:
-            last_observation = ('the Pod remained visible'
-                                if delete_error is None else
-                                f'delete failed ({delete_error}) and the Pod '
-                                'remained visible')
+        confirmed_absent = False
+        with _provider_mutation_guard(provider_effect_guard_factory):
+            delete_error = None
+            try:
+                core_api.delete_namespaced_pod(
+                    pod_name,
+                    namespace,
+                    grace_period_seconds=0,
+                    _request_timeout=config_lib.DELETION_TIMEOUT)
+            except exceptions.RequestCancelled:
+                raise
+            except Exception as e:  # pylint: disable=broad-except
+                delete_error = common_utils.format_exception(e)
+            try:
+                core_api.read_namespaced_pod(
+                    pod_name,
+                    namespace,
+                    _request_timeout=kubernetes.API_TIMEOUT)
+            except exceptions.RequestCancelled:
+                raise
+            except kubernetes.api_exception() as e:
+                if e.status == 404:
+                    confirmed_absent = True
+                else:
+                    last_observation = common_utils.format_exception(e)
+            except Exception as e:  # pylint: disable=broad-except
+                last_observation = common_utils.format_exception(e)
+            else:
+                last_observation = ('the Pod remained visible'
+                                    if delete_error is None else
+                                    f'delete failed ({delete_error}) and the '
+                                    'Pod remained visible')
+        if confirmed_absent:
+            return
         if attempt + 1 < _SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS:
+            # This is deliberately outside the provider-effect guard. A later
+            # delete is a new mutation and must obtain fresh authority.
             time.sleep(POLL_INTERVAL)
     raise config_lib.KubernetesError(
         'Failed to confirm deletion of unsafe admitted SkyServe worker Pod '
@@ -1216,30 +1473,60 @@ def _delete_admitted_serve_worker_and_confirm_absent(
         f'observation: {last_observation}.')
 
 
-def _reject_admitted_serve_worker_identity(pod: Any, namespace: str,
-                                           context: str | None,
-                                           identity_name: str, actual: object,
-                                           expected: object) -> None:
-    """Delete, prove absence, and reject a Pod with changed identity."""
-    pod_name = pod.metadata.name
+def _raise_rejected_serve_worker_after_cleanup(
+    rejection: _ServeWorkerIdentityRejection,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+) -> NoReturn:
+    """Cleans one rejected worker under fresh authority, then rejects it."""
     cleanup_error = None
     try:
         _delete_admitted_serve_worker_and_confirm_absent(
-            pod_name, namespace, context)
+            rejection.pod_name, rejection.namespace, rejection.context,
+            provider_effect_guard_factory)
+    except exceptions.RequestCancelled:
+        # Losing durable authority is terminal: the stale executor must not
+        # turn this into an ordinary Kubernetes failure and fail over.
+        raise
     except Exception as e:  # pylint: disable=broad-except
         cleanup_error = common_utils.format_exception(e)
         logger.error(
             'Failed to confirm absence of a SkyServe worker Pod with an '
-            'unexpected %s: %s', identity_name, cleanup_error)
+            'unexpected %s: %s', rejection.identity_name, cleanup_error)
     cleanup_detail = (' Its absence was confirmed.'
                       if cleanup_error is None else
                       ' Cleanup could not confirm Pod absence and provisioning '
                       f'will fail closed: {cleanup_error}')
     raise config_lib.KubernetesError(
-        f'Admitted SkyServe worker Pod {namespace}/{pod_name} has '
-        f'{identity_name} {actual!r}; expected {expected!r}. The Pod was '
+        f'Admitted SkyServe worker Pod {rejection.namespace}/'
+        f'{rejection.pod_name} has {rejection.identity_name} '
+        f'{rejection.actual!r}; expected {rejection.expected!r}. The Pod was '
         'rejected to enforce the immutable platform placement contract.'
-        f'{cleanup_detail}')
+        f'{cleanup_detail}') from rejection
+
+
+def _reject_admitted_serve_worker_identity(
+    pod: Any,
+    namespace: str,
+    context: str | None,
+    identity_name: str,
+    actual: object,
+    expected: object,
+    *,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+    defer_cleanup: bool = False,
+) -> NoReturn:
+    """Delete, prove absence, and reject a Pod with changed identity."""
+    rejection = _ServeWorkerIdentityRejection(pod.metadata.name, namespace,
+                                              context, identity_name, actual,
+                                              expected)
+    if defer_cleanup:
+        # The caller is inside the Pod-create authorization. Raising first
+        # lets that epoch close before cleanup attempts obtain fresh guards.
+        raise rejection
+    _raise_rejected_serve_worker_after_cleanup(rejection,
+                                               provider_effect_guard_factory)
 
 
 def _attest_serve_worker_priority_class(
@@ -1248,7 +1535,11 @@ def _attest_serve_worker_priority_class(
     context: str | None,
     expected_priority_class_name: object,
     expected_priority_value: object = _NO_SERVE_WORKER_IDENTITY_ATTESTATION,
-    expected_preemption_policy: object = _NO_SERVE_WORKER_IDENTITY_ATTESTATION
+    expected_preemption_policy: object = _NO_SERVE_WORKER_IDENTITY_ATTESTATION,
+    *,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+    defer_cleanup: bool = False,
 ) -> None:
     """Reject a worker whose admitted priority contract is unexpected."""
     if (expected_priority_class_name is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
@@ -1271,25 +1562,53 @@ def _attest_serve_worker_priority_class(
                                           None), expected_preemption_policy))
     for identity_name, actual, expected in checks:
         if actual != expected:
-            _reject_admitted_serve_worker_identity(pod, namespace, context,
-                                                   identity_name, actual,
-                                                   expected)
+            _reject_admitted_serve_worker_identity(
+                pod,
+                namespace,
+                context,
+                identity_name,
+                actual,
+                expected,
+                provider_effect_guard_factory=(provider_effect_guard_factory),
+                defer_cleanup=defer_cleanup)
 
 
-def _attest_serve_worker_service_account(
-        pod: Any, namespace: str, context: str | None,
-        expected_service_account_name: object) -> None:
-    """Reject an admitted worker Pod whose service account is unexpected."""
+def _attest_serve_worker_service_account(pod: Any,
+                                         namespace: str,
+                                         context: str | None,
+                                         expected_service_account_name: object,
+                                         *,
+                                         provider_effect_guard_factory: (
+                                             common.ProviderEffectGuardFactory |
+                                             None) = None,
+                                         defer_cleanup: bool = False) -> None:
+    """Reject a worker whose admitted namespace or account is unexpected."""
     if (expected_service_account_name is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
         return
+    actual_namespace = getattr(pod.metadata, 'namespace', None)
+    if actual_namespace != namespace:
+        _reject_admitted_serve_worker_identity(
+            pod,
+            namespace,
+            context,
+            'namespace',
+            actual_namespace,
+            namespace,
+            provider_effect_guard_factory=(provider_effect_guard_factory),
+            defer_cleanup=defer_cleanup)
     actual_service_account_name = getattr(pod.spec, 'service_account_name',
                                           None)
     if actual_service_account_name == expected_service_account_name:
         return
-    _reject_admitted_serve_worker_identity(pod, namespace, context,
-                                           'service account',
-                                           actual_service_account_name,
-                                           expected_service_account_name)
+    _reject_admitted_serve_worker_identity(
+        pod,
+        namespace,
+        context,
+        'service account',
+        actual_service_account_name,
+        expected_service_account_name,
+        provider_effect_guard_factory=(provider_effect_guard_factory),
+        defer_cleanup=defer_cleanup)
 
 
 def _attest_serve_worker_accelerator_scheduling(
@@ -1300,27 +1619,27 @@ def _attest_serve_worker_accelerator_scheduling(
     expected_label_values: object,
     expected_resource_key: object,
     expected_accelerator_count: object,
+    *,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+    defer_cleanup: bool = False,
 ) -> None:
     """Reject admission mutations that weaken frozen accelerator placement."""
     if expected_label_key is _NO_SERVE_WORKER_IDENTITY_ATTESTATION:
         return
-    containers = getattr(pod.spec, 'containers', None)
-    ray_nodes = ([] if not isinstance(containers, list) else [
-        container for container in containers
-        if getattr(container, 'name', None) == 'ray-node'
-    ])
-    resource_contract_matches = False
-    if len(ray_nodes) == 1:
-        resources = getattr(ray_nodes[0], 'resources', None)
-        requests = getattr(resources, 'requests', None)
-        limits = getattr(resources, 'limits', None)
-        if isinstance(requests, Mapping) and isinstance(limits, Mapping):
-            actual_request = requests.get(expected_resource_key)
-            actual_limit = limits.get(expected_resource_key)
-            expected_quantity = str(expected_accelerator_count)
-            resource_contract_matches = (str(actual_request)
-                                         == expected_quantity and
-                                         str(actual_limit) == expected_quantity)
+    accelerator_contract_error: str | None
+    try:
+        accelerator_contract = (
+            pod_spec_lib.enforce_projected_accelerator_contract(
+                pod.spec,
+                str(expected_resource_key),
+                expected_accelerator_count,
+                rewrite=False))
+    except pod_spec_lib.ProjectedAcceleratorContractError as error:
+        accelerator_contract = None
+        accelerator_contract_error = str(error)
+    else:
+        accelerator_contract_error = None
 
     affinity = getattr(pod.spec, 'affinity', None)
     node_affinity = getattr(affinity, 'node_affinity', None)
@@ -1342,11 +1661,23 @@ def _attest_serve_worker_accelerator_scheduling(
                         matching[0], 'values', None) != expected_label_values):
                 affinity_contract_matches = False
                 break
-    if resource_contract_matches and affinity_contract_matches:
+    if (accelerator_contract is not None and accelerator_contract.matches and
+            affinity_contract_matches):
         return
     actual = {
-        'ray_node_container_count': len(ray_nodes),
-        'resource_contract_matches': resource_contract_matches,
+        'accelerator_contract_error': accelerator_contract_error,
+        'ray_node_container_count':
+            (None if accelerator_contract is None else
+             accelerator_contract.ray_node_container_count),
+        'resource_contract_matches':
+            (False if accelerator_contract is None else
+             accelerator_contract.ray_node_resource_contract_matches),
+        'unexpected_accelerator_resources':
+            ({} if accelerator_contract is None else
+             accelerator_contract.unexpected_accelerator_resources),
+        'dynamic_resource_claims':
+            ({} if accelerator_contract is None else
+             accelerator_contract.dynamic_resource_claims),
         'affinity_contract_matches': affinity_contract_matches,
     }
     expected = {
@@ -1355,9 +1686,284 @@ def _attest_serve_worker_accelerator_scheduling(
         'resource_key': expected_resource_key,
         'accelerator_count': expected_accelerator_count,
     }
-    _reject_admitted_serve_worker_identity(pod, namespace, context,
-                                           'accelerator scheduling contract',
-                                           actual, expected)
+    _reject_admitted_serve_worker_identity(
+        pod,
+        namespace,
+        context,
+        'accelerator scheduling contract',
+        actual,
+        expected,
+        provider_effect_guard_factory=(provider_effect_guard_factory),
+        defer_cleanup=defer_cleanup)
+
+
+def _pod_scheduling_gate_names(pod: Any) -> list[object]:
+    """Return the API-shape-independent scheduling-gate names for one Pod."""
+    pod_spec = _kueue_api_field(pod, 'spec')
+    scheduling_gates = _kueue_api_field(pod_spec, 'scheduling_gates')
+    if scheduling_gates is None and isinstance(pod_spec, Mapping):
+        scheduling_gates = pod_spec.get('schedulingGates')
+    if not isinstance(scheduling_gates, (list, tuple)):
+        return []
+    return [_kueue_api_field(gate, 'name') for gate in scheduling_gates]
+
+
+def _attest_serve_worker_scheduler_and_binding(
+    pod: Any,
+    namespace: str,
+    context: str | None,
+    expected_scheduler_name: object,
+    expected_label_key: object,
+    expected_label_values: object,
+    expected_lifecycle: _RequiredKueuePodLifecycle,
+    *,
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory |
+                                    None) = None,
+    defer_cleanup: bool = False,
+) -> None:
+    """Prove the projected scheduler and, when bound, the exact Node class."""
+    if expected_scheduler_name is _NO_SERVE_WORKER_IDENTITY_ATTESTATION:
+        return
+    pod_spec = getattr(pod, 'spec', None)
+    actual_scheduler_name = getattr(pod_spec, 'scheduler_name', None)
+    if actual_scheduler_name != expected_scheduler_name:
+        _reject_admitted_serve_worker_identity(
+            pod,
+            namespace,
+            context,
+            'scheduler',
+            actual_scheduler_name,
+            expected_scheduler_name,
+            provider_effect_guard_factory=provider_effect_guard_factory,
+            defer_cleanup=defer_cleanup)
+
+    node_name = getattr(pod_spec, 'node_name', None)
+    has_kueue_admission_gate = (k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
+                                in _pod_scheduling_gate_names(pod))
+    must_be_unbound = (expected_lifecycle == 'create_response' or
+                       (expected_lifecycle == 'adoption' and
+                        has_kueue_admission_gate))
+    if must_be_unbound:
+        if node_name not in (None, ''):
+            _reject_admitted_serve_worker_identity(
+                pod,
+                namespace,
+                context,
+                'pre-admission node binding',
+                node_name,
+                None,
+                provider_effect_guard_factory=provider_effect_guard_factory,
+                defer_cleanup=defer_cleanup)
+        return
+
+    # An admitted Pod can remain Pending and unbound during adoption.  The
+    # post-wait admitted phase, however, is the proof published as successful
+    # provisioning and must be bound.
+    if node_name in (None, ''):
+        if expected_lifecycle == 'adoption':
+            return
+        _reject_admitted_serve_worker_identity(
+            pod,
+            namespace,
+            context,
+            'post-admission node binding',
+            node_name,
+            'a non-empty nodeName',
+            provider_effect_guard_factory=provider_effect_guard_factory,
+            defer_cleanup=defer_cleanup)
+    if not isinstance(node_name, str):
+        _reject_admitted_serve_worker_identity(
+            pod,
+            namespace,
+            context,
+            'post-admission node binding',
+            node_name,
+            'a non-empty nodeName',
+            provider_effect_guard_factory=provider_effect_guard_factory,
+            defer_cleanup=defer_cleanup)
+
+    assert isinstance(node_name, str) and node_name
+    try:
+        node = kubernetes.core_api(context).read_node(
+            node_name, _request_timeout=kubernetes.API_TIMEOUT)
+    except exceptions.RequestCancelled:
+        # Authority loss is already a typed terminal fence.  It must not be
+        # converted into an identity cleanup attempted by a stale request.
+        raise
+    except Exception as error:  # pylint: disable=broad-except
+        # Kubernetes clients surface HTTP failures as ApiException and network
+        # failures through urllib3/transport exception types.  Neither is
+        # placement proof; converge all ordinary read uncertainty through the
+        # exact rejected-Pod cleanup seam.
+        _reject_admitted_serve_worker_identity(
+            pod,
+            namespace,
+            context,
+            'bound Node accelerator identity', {
+                'node_name': node_name,
+                'read_error': common_utils.format_exception(error),
+            }, {
+                'node_name': node_name,
+                'label_key': expected_label_key,
+                'label_values': expected_label_values,
+            },
+            provider_effect_guard_factory=provider_effect_guard_factory,
+            defer_cleanup=defer_cleanup)
+    node_metadata = getattr(node, 'metadata', None)
+    actual_node_name = getattr(node_metadata, 'name', None)
+    node_labels = getattr(node_metadata, 'labels', None)
+    if not isinstance(node_labels, Mapping):
+        node_labels = {}
+    actual_label_value = node_labels.get(expected_label_key)
+    if (actual_node_name == node_name and
+            isinstance(expected_label_values, list) and
+            actual_label_value in expected_label_values):
+        return
+    _reject_admitted_serve_worker_identity(
+        pod,
+        namespace,
+        context,
+        'bound Node accelerator identity', {
+            'node_name': actual_node_name,
+            'label_key': expected_label_key,
+            'label_value': actual_label_value,
+        }, {
+            'node_name': node_name,
+            'label_key': expected_label_key,
+            'label_values': expected_label_values,
+        },
+        provider_effect_guard_factory=provider_effect_guard_factory,
+        defer_cleanup=defer_cleanup)
+
+
+def _attest_created_serve_worker_pod(
+    pod: Any,
+    namespace: str,
+    context: str | None,
+    *,
+    expected_kueue_queue: str | None,
+    expected_kueue_cluster_queue: str | None,
+    expected_kueue_pod_group_name: str,
+    expected_kueue_pod_group_total_count: int,
+    expected_kueue_workload_priority_class_name: str | None,
+    strict_kueue_projection: bool,
+    expected_priority_class_name: object,
+    expected_priority_value: object,
+    expected_preemption_policy: object,
+    expected_service_account_name: object,
+    expected_scheduler_name: object,
+    expected_accelerator_label_key: object,
+    expected_accelerator_label_values: object,
+    expected_accelerator_resource_key: object,
+    expected_accelerator_count: object,
+    expected_kueue_lifecycle: _RequiredKueuePodLifecycle = 'create_response',
+) -> None:
+    """Attest one admitted Pod before its create thread returns."""
+    if expected_kueue_queue is not None:
+        assert expected_kueue_cluster_queue is not None
+        _attest_required_kueue_pod(
+            pod,
+            namespace,
+            context,
+            expected_kueue_queue,
+            expected_kueue_pod_group_name,
+            expected_kueue_pod_group_total_count,
+            expected_kueue_workload_priority_class_name,
+            expected_cluster_queue=(expected_kueue_cluster_queue),
+            strict_projection=strict_kueue_projection,
+            expected_lifecycle=expected_kueue_lifecycle,
+            defer_cleanup=True)
+    _attest_serve_worker_priority_class(pod,
+                                        namespace,
+                                        context,
+                                        expected_priority_class_name,
+                                        expected_priority_value,
+                                        expected_preemption_policy,
+                                        defer_cleanup=True)
+    _attest_serve_worker_service_account(pod,
+                                         namespace,
+                                         context,
+                                         expected_service_account_name,
+                                         defer_cleanup=True)
+    _attest_serve_worker_accelerator_scheduling(
+        pod,
+        namespace,
+        context,
+        expected_accelerator_label_key,
+        expected_accelerator_label_values,
+        expected_accelerator_resource_key,
+        expected_accelerator_count,
+        defer_cleanup=True)
+    _attest_serve_worker_scheduler_and_binding(
+        pod,
+        namespace,
+        context,
+        expected_scheduler_name,
+        expected_accelerator_label_key,
+        expected_accelerator_label_values,
+        expected_kueue_lifecycle,
+        defer_cleanup=True)
+
+
+def _attest_pod_with_provider_guard(
+    pod: Any,
+    post_create_attestation: Callable[[Any], None],
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory | None),
+) -> None:
+    """Attests an existing Pod, then separately cleans any rejection."""
+    try:
+        with _provider_mutation_guard(provider_effect_guard_factory):
+            post_create_attestation(pod)
+    except _ServeWorkerIdentityRejection as rejection:
+        _raise_rejected_serve_worker_after_cleanup(
+            rejection, provider_effect_guard_factory)
+
+
+def _read_and_attest_pod_with_provider_guard(
+    pod_name: str,
+    expected_pod_uid: object,
+    namespace: str,
+    context: str | None,
+    post_create_attestation: Callable[[Any], None],
+    provider_effect_guard_factory: (common.ProviderEffectGuardFactory | None),
+) -> None:
+    """Fresh-read and attest one exact Running Pod in one authority epoch."""
+    try:
+        with _provider_mutation_guard(provider_effect_guard_factory):
+            pod = kubernetes.core_api(context).read_namespaced_pod(
+                pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
+            actual_pod_name = getattr(pod.metadata, 'name', None)
+            if actual_pod_name != pod_name:
+                _reject_admitted_serve_worker_identity(pod,
+                                                       namespace,
+                                                       context,
+                                                       'post-wait Pod name',
+                                                       actual_pod_name,
+                                                       pod_name,
+                                                       defer_cleanup=True)
+            actual_pod_uid = getattr(pod.metadata, 'uid', None)
+            if (not isinstance(expected_pod_uid, str) or not expected_pod_uid or
+                    actual_pod_uid != expected_pod_uid):
+                _reject_admitted_serve_worker_identity(pod,
+                                                       namespace,
+                                                       context,
+                                                       'post-wait Pod UID',
+                                                       actual_pod_uid,
+                                                       expected_pod_uid,
+                                                       defer_cleanup=True)
+            actual_phase = getattr(pod.status, 'phase', None)
+            if actual_phase != 'Running':
+                _reject_admitted_serve_worker_identity(pod,
+                                                       namespace,
+                                                       context,
+                                                       'post-wait Pod phase',
+                                                       actual_phase,
+                                                       'Running',
+                                                       defer_cleanup=True)
+            post_create_attestation(pod)
+    except _ServeWorkerIdentityRejection as rejection:
+        _raise_rejected_serve_worker_after_cleanup(
+            rejection, provider_effect_guard_factory)
 
 
 @timeline.event
@@ -1386,6 +1992,21 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         kueue_local_queue_name)
     kueue_workload_priority_class_name = provider_config.get(
         'kueue_workload_priority_class_name')
+    serve_worker_projection_protocol_version = provider_config.get(
+        'serve_worker_projection_protocol_version')
+    if serve_worker_projection_protocol_version is not None and (
+            type(serve_worker_projection_protocol_version) is not int or
+            serve_worker_projection_protocol_version not in (1, 2)):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker projection protocol version must be '
+            '1, 2, or absent.')
+    strict_kueue_projection = (serve_worker_projection_protocol_version == 2)
+    if (kueue_workload_priority_class_name is not None and
+        (not isinstance(kueue_workload_priority_class_name, str) or
+         not kueue_workload_priority_class_name)):
+        raise config_lib.KubernetesError(
+            'The rendered Kueue WorkloadPriorityClass must be a non-empty '
+            'string or null.')
     serve_worker_expected_priority_class_name = provider_config.get(
         'serve_worker_expected_priority_class_name',
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
@@ -1397,6 +2018,9 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     serve_worker_expected_service_account_name = provider_config.get(
         'serve_worker_expected_service_account_name',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_scheduler_name = provider_config.get(
+        'serve_worker_expected_scheduler_name',
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
     serve_worker_expected_accelerator_label_key = provider_config.get(
         'serve_worker_expected_accelerator_label_key',
@@ -1434,6 +2058,16 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             'The rendered SkyServe worker accelerator attestation must '
             'include label key, label values, resource key, and count '
             'together.')
+    if strict_kueue_projection and (not all(priority_attestation_presence) or
+                                    serve_worker_expected_service_account_name
+                                    is _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+                                    serve_worker_expected_scheduler_name
+                                    is _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+                                    not all(accelerator_attestation_presence)):
+        raise config_lib.KubernetesError(
+            'Projection protocol v2 requires the complete priority, service '
+            'account, scheduler, and accelerator attestation contract.')
+    kueue_cluster_queue_name: str | None = None
     if kueue_require_managed:
         if not kueue_local_queue_name:
             raise config_lib.KubernetesError(
@@ -1443,8 +2077,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             raise config_lib.KubernetesError(
                 'Required Kueue management currently supports direct Pods, '
                 'not high-availability Deployment-owned Pods.')
-        _preflight_required_kueue_local_queue(namespace, context,
-                                              kueue_local_queue_name)
+        kueue_cluster_queue_name = _preflight_required_kueue_local_queue(
+            namespace, context, kueue_local_queue_name)
     if (serve_worker_expected_priority_class_name
             is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
             serve_worker_expected_priority_class_name is not None and
@@ -1485,6 +2119,13 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         raise config_lib.KubernetesError(
             'The rendered SkyServe worker expected service account must be a '
             'non-empty string.')
+    if (serve_worker_expected_scheduler_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
+        (not isinstance(serve_worker_expected_scheduler_name, str) or
+         not serve_worker_expected_scheduler_name)):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker expected scheduler must be a '
+            'non-empty string.')
     if all(accelerator_attestation_presence):
         if (not isinstance(serve_worker_expected_accelerator_label_key, str) or
                 not serve_worker_expected_accelerator_label_key or
@@ -1504,6 +2145,67 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             raise config_lib.KubernetesError(
                 'The rendered SkyServe worker accelerator attestation is '
                 'invalid.')
+
+    post_create_attestation: Callable[[Any], None] | None = None
+    existing_pod_attestation: Callable[[Any], None] | None = None
+    post_wait_pod_attestation: Callable[[Any], None] | None = None
+    if (kueue_require_managed or serve_worker_expected_priority_class_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+            serve_worker_expected_service_account_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+            serve_worker_expected_scheduler_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+            serve_worker_expected_accelerator_label_key
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+
+        def attest_pod(
+            pod: Any,
+            *,
+            expected_kueue_lifecycle: _RequiredKueuePodLifecycle,
+        ) -> None:
+            _attest_created_serve_worker_pod(
+                pod,
+                namespace,
+                context,
+                expected_kueue_queue=(kueue_local_queue_name
+                                      if kueue_require_managed else None),
+                expected_kueue_cluster_queue=(kueue_cluster_queue_name if
+                                              kueue_require_managed else None),
+                expected_kueue_pod_group_name=cluster_name_on_cloud,
+                expected_kueue_pod_group_total_count=config.count,
+                expected_kueue_workload_priority_class_name=(
+                    kueue_workload_priority_class_name),
+                strict_kueue_projection=strict_kueue_projection,
+                expected_priority_class_name=(
+                    serve_worker_expected_priority_class_name),
+                expected_priority_value=serve_worker_expected_priority_value,
+                expected_preemption_policy=(
+                    serve_worker_expected_preemption_policy),
+                expected_service_account_name=(
+                    serve_worker_expected_service_account_name),
+                expected_scheduler_name=serve_worker_expected_scheduler_name,
+                expected_accelerator_label_key=(
+                    serve_worker_expected_accelerator_label_key),
+                expected_accelerator_label_values=(
+                    serve_worker_expected_accelerator_label_values),
+                expected_accelerator_resource_key=(
+                    serve_worker_expected_accelerator_resource_key),
+                expected_accelerator_count=(
+                    serve_worker_expected_accelerator_count),
+                expected_kueue_lifecycle=expected_kueue_lifecycle)
+
+        def attest_created_pod(pod: Any) -> None:
+            attest_pod(pod, expected_kueue_lifecycle='create_response')
+
+        def attest_existing_pod(pod: Any) -> None:
+            attest_pod(pod, expected_kueue_lifecycle='adoption')
+
+        def attest_admitted_pod(pod: Any) -> None:
+            attest_pod(pod, expected_kueue_lifecycle='admitted')
+
+        post_create_attestation = attest_created_pod
+        existing_pod_attestation = attest_existing_pod
+        post_wait_pod_attestation = attest_admitted_pod
 
     tags = ray_tag_filter(cluster_name_on_cloud)
 
@@ -1585,11 +2287,12 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         for pod_name in terminating_pods.keys():
             # grace_period_seconds=0 means force delete the pod.
             # https://github.com/kubernetes-client/python/issues/508#issuecomment-1695759777
-            kubernetes.core_api(context).delete_namespaced_pod(
-                pod_name,
-                namespace,
-                _request_timeout=config_lib.DELETION_TIMEOUT,
-                grace_period_seconds=0)
+            with common.provider_effect_guard(config):
+                kubernetes.core_api(context).delete_namespaced_pod(
+                    pod_name,
+                    namespace,
+                    _request_timeout=config_lib.DELETION_TIMEOUT,
+                    grace_period_seconds=0)
 
     # Clean up pods in Failed/Succeeded phase from previous runs.
     # These are invisible to the Pending/Running filter below but still
@@ -1602,14 +2305,19 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         logger.info(f'Found {len(stale_pods)} pods in Failed/Succeeded '
                     f'phase: {list(stale_pods.keys())}. Deleting them.')
         for pod_name in stale_pods:
-            # pylint: disable=cell-var-from-loop
+
+            def delete_stale_pod(name: str = pod_name) -> None:
+                # Enter per attempt so delete retry backoff never monopolizes
+                # launch authority.
+                with common.provider_effect_guard(config):
+                    kubernetes.core_api(context).delete_namespaced_pod(
+                        name,
+                        namespace,
+                        _request_timeout=config_lib.DELETION_TIMEOUT,
+                        grace_period_seconds=0)
+
             kubernetes_utils.delete_k8s_resource_with_retry(
-                delete_func=lambda name=pod_name: kubernetes.core_api(
-                    context).delete_namespaced_pod(name,
-                                                   namespace,
-                                                   _request_timeout=config_lib.
-                                                   DELETION_TIMEOUT,
-                                                   grace_period_seconds=0),
+                delete_func=delete_stale_pod,
                 resource_type='pod',
                 resource_name=pod_name)
 
@@ -1617,26 +2325,13 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                                                 ['Pending', 'Running'])
     _validate_cluster_name_annotations(running_pods, cluster_name,
                                        cluster_name_on_cloud)
-    if kueue_require_managed:
-        assert kueue_local_queue_name is not None
+    if existing_pod_attestation is not None:
         for existing_pod in running_pods.values():
-            _attest_required_kueue_pod(existing_pod, namespace, context,
-                                       kueue_local_queue_name)
-    for existing_pod in running_pods.values():
-        _attest_serve_worker_priority_class(
-            existing_pod, namespace, context,
-            serve_worker_expected_priority_class_name,
-            serve_worker_expected_priority_value,
-            serve_worker_expected_preemption_policy)
-        _attest_serve_worker_service_account(
-            existing_pod, namespace, context,
-            serve_worker_expected_service_account_name)
-        _attest_serve_worker_accelerator_scheduling(
-            existing_pod, namespace, context,
-            serve_worker_expected_accelerator_label_key,
-            serve_worker_expected_accelerator_label_values,
-            serve_worker_expected_accelerator_resource_key,
-            serve_worker_expected_accelerator_count)
+            # Reattestation may force-delete a Pod whose admitted identity no
+            # longer matches the durable projection.
+            _attest_pod_with_provider_guard(
+                existing_pod, existing_pod_attestation,
+                config.provider_effect_guard_factory)
     head_pod_name = _get_head_pod_name(running_pods)
     running_pod_statuses = [{
         pod.metadata.name: pod.status.phase
@@ -1671,19 +2366,25 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     needs_gpus = False
     needs_gpus_nvidia = False
     gpu_resource_key = kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS['nvidia']
-    limits = pod_spec['spec']['containers'][0].get('resources',
-                                                   {}).get('limits')
-    if limits is not None:
-        if (serve_worker_expected_accelerator_resource_key
-                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+    if all(accelerator_attestation_presence):
+        # Projection v2 owns the whole Pod and may place the sole ray-node
+        # container after one or more sidecars. Its authenticated resource is
+        # therefore the source for runtime/toleration selection; container[0]
+        # is neither an identity nor necessarily accelerator-bearing.
+        assert isinstance(serve_worker_expected_accelerator_resource_key, str)
+        assert isinstance(serve_worker_expected_accelerator_count, int)
+        gpu_resource_key = serve_worker_expected_accelerator_resource_key
+        needs_gpus = serve_worker_expected_accelerator_count > 0
+        needs_gpus_nvidia = (gpu_resource_key == kubernetes_utils.
+                             SUPPORTED_GPU_RESOURCE_KEYS['nvidia'])
+    else:
+        limits = pod_spec['spec']['containers'][0].get('resources',
+                                                       {}).get('limits')
+        if limits is not None:
             gpu_resource_key = kubernetes_utils.get_gpu_resource_key(context)
-        else:
-            assert isinstance(serve_worker_expected_accelerator_resource_key,
-                              str)
-            gpu_resource_key = serve_worker_expected_accelerator_resource_key
-        needs_gpus = limits.get(gpu_resource_key, 0) > 0
-        needs_gpus_nvidia = limits.get(
-            kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS['nvidia'], 0) > 0
+            needs_gpus = limits.get(gpu_resource_key, 0) > 0
+            needs_gpus_nvidia = limits.get(
+                kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS['nvidia'], 0) > 0
 
     tpu_label = kubernetes_utils.GKELabelFormatter.TPU_LABEL_KEY
     needs_tpu = tpu_label in config.node_config.get('spec',
@@ -1755,12 +2456,15 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 pod_group_total_count=config.count,
                 workload_priority_class_name=(
                     kueue_workload_priority_class_name),
+                strict_projection=strict_kueue_projection,
             )
 
         if to_create_deployment:
             assert deployment_spec is not None
             assert pvc_spec is not None
-            volume.create_persistent_volume_claim(namespace, context, pvc_spec)
+            with common.provider_effect_guard(config):
+                volume.create_persistent_volume_claim(namespace, context,
+                                                      pvc_spec)
 
             # It's safe to directly modify the template spec in the deployment spec
             # because controller pod is singleton, i in [0].
@@ -1771,9 +2475,10 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             deployment_spec['metadata']['labels'] = pod_spec_copy['metadata'][
                 'labels']
             try:
-                return kubernetes.apps_api(
-                    context).create_namespaced_deployment(
-                        namespace, deployment_spec)
+                with common.provider_effect_guard(config):
+                    return kubernetes.apps_api(
+                        context).create_namespaced_deployment(
+                            namespace, deployment_spec)
             except Exception as e:
                 print('Deployment failed', e)
                 raise e
@@ -1782,15 +2487,16 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         # is used by any pod in the namespace.
         volume.check_pvc_usage_for_pod(context, namespace, pod_spec_copy)
 
-        if kueue_require_managed:
-            assert kueue_local_queue_name is not None
-            return _create_namespaced_pod_with_retries(
-                namespace,
-                pod_spec_copy,
-                context,
-                expected_kueue_queue=kueue_local_queue_name)
-        return _create_namespaced_pod_with_retries(namespace, pod_spec_copy,
-                                                   context)
+        # Keep every create/retry response and its immediate admission
+        # attestation in one fresh authority epoch. Internal retries reacquire;
+        # passive scheduling/readiness waits below hold no authority guard.
+        return _create_namespaced_pod_with_retries(
+            namespace,
+            pod_spec_copy,
+            context,
+            post_create_attestation=post_create_attestation,
+            provider_effect_guard_factory=(
+                config.provider_effect_guard_factory))
 
     if not to_start_count:
         is_provisioned_cluster_ha = is_high_availability_cluster_by_kubectl(
@@ -1839,21 +2545,14 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         if head_pod_name is None and _is_head(pod):
             head_pod_name = pod.metadata.name
     pods = valid_pods
-    for admitted_pod in pods:
-        _attest_serve_worker_priority_class(
-            admitted_pod, namespace, context,
-            serve_worker_expected_priority_class_name,
-            serve_worker_expected_priority_value,
-            serve_worker_expected_preemption_policy)
-        _attest_serve_worker_service_account(
-            admitted_pod, namespace, context,
-            serve_worker_expected_service_account_name)
-        _attest_serve_worker_accelerator_scheduling(
-            admitted_pod, namespace, context,
-            serve_worker_expected_accelerator_label_key,
-            serve_worker_expected_accelerator_label_values,
-            serve_worker_expected_accelerator_resource_key,
-            serve_worker_expected_accelerator_count)
+    if to_create_deployment and existing_pod_attestation is not None:
+        # Deployment-owned Pods do not pass through the direct Pod-create seam.
+        # Required Kueue already rejects this topology above; preserve the
+        # existing identity checks for other Deployment-based launches.
+        for admitted_pod in pods:
+            _attest_pod_with_provider_guard(
+                admitted_pod, existing_pod_attestation,
+                config.provider_effect_guard_factory)
 
     # The running_pods may include Pending Pods, so we add them to the pods
     # list to wait for scheduling and running
@@ -1879,13 +2578,32 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     # fail early if there is an error
     logger.debug(f'run_instances: waiting for pods to be running: '
                  f'{[pod.metadata.name for pod in pods]}')
-    _wait_for_pods_to_run(namespace, context, cluster_name, pods)
+    running_pod_uids = _wait_for_pods_to_run(namespace, context, cluster_name,
+                                             pods)
     # Reset spinner message here because it might have hinted the reason
     # pods were pending.
     rich_utils.force_update_status(
         ux_utils.spinner_message('Launching', cluster_name=cluster_name))
     logger.debug(f'run_instances: all pods are scheduled and running: '
                  f'{[pod.metadata.name for pod in pods]}')
+
+    if post_wait_pod_attestation is not None:
+        # The create response proves the webhook installed the closed,
+        # pre-admission contract. Scheduling can take arbitrarily long, during
+        # which a LocalQueue could be retargeted. Re-read every exact Pod only
+        # after it is Running and require the admitted identity (including the
+        # preflight ClusterQueue) before publishing provisioning success.
+        expected_pod_names = set(
+            dict.fromkeys(pod.metadata.name for pod in pods))
+        if set(running_pod_uids) != expected_pod_names:
+            raise config_lib.KubernetesError(
+                'The Kubernetes Running wait did not return exact identity '
+                'proof for every expected Pod. SkyPilot refused to publish '
+                'provisioning success.')
+        for pod_name, pod_uid in running_pod_uids.items():
+            _read_and_attest_pod_with_provider_guard(
+                pod_name, pod_uid, namespace, context,
+                post_wait_pod_attestation, config.provider_effect_guard_factory)
 
     assert head_pod_name is not None, 'head_instance_id should not be None'
     return common.ProvisionRecord(
@@ -2349,7 +3067,7 @@ def get_node_health_for_cluster(
     cluster_name_on_cloud: str,
     provider_config: dict[str, Any],
     unhealthy_pod_names: list[str],
-) -> dict[str, NodeHealthInfo]:
+) -> dict[str, pod_diagnostics.NodeHealthInfo]:
     """Check node health for specific unhealthy pods in a cluster.
 
     Fetches pods to determine which nodes they run on, then checks
@@ -2390,7 +3108,7 @@ def get_node_health_for_cluster(
         return {}
 
     # Build structured result: node -> NodeHealthInfo
-    result: dict[str, NodeHealthInfo] = {}
+    result: dict[str, pod_diagnostics.NodeHealthInfo] = {}
     for pod_name, node_name in pod_node_map.items():
         if node_name and node_name in node_issues:
             if node_name not in result:

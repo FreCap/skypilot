@@ -5,6 +5,7 @@ import concurrent.futures
 import os
 import signal
 import sys
+import threading
 import time
 import uuid
 
@@ -12,6 +13,8 @@ import grpc
 
 import sky
 from sky import sky_logging
+from sky.jobs import constants as managed_job_constants
+from sky.jobs import controller_slots
 from sky.schemas.generated import autostopv1_pb2_grpc
 from sky.schemas.generated import healthv1_pb2_grpc
 from sky.schemas.generated import jobsv1_pb2_grpc
@@ -47,6 +50,62 @@ EVENTS = [
     # Report usage heartbeat every 10 minutes.
     events.UsageHeartbeatReportEvent(),
 ]
+
+_MANAGED_JOB_RUNTIME_POLL_SECONDS = 1.0
+
+
+class _RemoteManagedJobControllerRuntime:
+    """Marker-gated fixed-slot runtime owned by this exact Skylet birth."""
+
+    def __init__(self) -> None:
+        self._failure = threading.Event()
+        self._runtime: controller_slots.LocalManagedJobControllerRuntime | None = (
+            None)
+
+    @property
+    def started(self) -> bool:
+        return self._runtime is not None and self._runtime.started
+
+    def _on_failure(self) -> None:
+        # The slot monitor cannot raise on the main Skylet thread. Wake its
+        # bounded poll so that thread observes the exact failure and enters the
+        # normal subsystem-specific drain path.
+        self._failure.set()
+
+    def start_if_configured(self) -> None:
+        """Start once the provisioned jobs-controller marker is visible."""
+        if self._runtime is not None:
+            self._runtime.raise_if_failed()
+            return
+        indicator_path = os.path.expanduser(
+            managed_job_constants.JOB_CONTROLLER_INDICATOR_FILE)
+        if not os.path.exists(indicator_path):
+            return
+        runtime = controller_slots.LocalManagedJobControllerRuntime(
+            on_failure=self._on_failure)
+        # Publish the handle before startup. A partial-admission failure must
+        # remain reachable by finally and retain its owner until all family
+        # proofs converge.
+        self._runtime = runtime
+        runtime.start()
+        runtime.raise_if_failed()
+        logger.info('Remote jobs-controller fixed-slot runtime is ready.')
+
+    def wait(self, timeout: float) -> None:
+        self._failure.wait(timeout)
+        self.raise_if_failed()
+
+    def raise_if_failed(self) -> None:
+        if self._runtime is not None:
+            self._runtime.raise_if_failed()
+
+    def request_shutdown(self) -> None:
+        if self._runtime is not None:
+            self._runtime.request_shutdown()
+
+    def wait_for_shutdown(self) -> None:
+        if self._runtime is not None:
+            self._runtime.wait_for_shutdown()
 
 
 def start_grpc_server(port: int = constants.SKYLET_GRPC_PORT) -> grpc.Server:
@@ -84,15 +143,39 @@ def start_grpc_server(port: int = constants.SKYLET_GRPC_PORT) -> grpc.Server:
     return server
 
 
-def run_event_loop():
+def run_event_loop(managed_job_runtime: _RemoteManagedJobControllerRuntime |
+                   None = None):
     """Run the existing event loop."""
+
+    if managed_job_runtime is None:
+        managed_job_runtime = _RemoteManagedJobControllerRuntime()
 
     for event in EVENTS:
         event.start()
 
+    next_event_at = time.monotonic() + events.EVENT_CHECKING_INTERVAL_SECONDS
     while True:
-        time.sleep(events.EVENT_CHECKING_INTERVAL_SECONDS)
+        # Skylet starts before a newly provisioned controller's user setup
+        # creates its marker. Poll that one-way configuration fact separately
+        # from the 20-second maintenance cadence so fixed slots are admitted
+        # eagerly and never depend on submit_jobs() or a PID inventory.
+        managed_job_runtime.start_if_configured()
+        delay = max(
+            0.0,
+            min(_MANAGED_JOB_RUNTIME_POLL_SECONDS,
+                next_event_at - time.monotonic()))
+        managed_job_runtime.wait(delay)
+        if time.monotonic() < next_event_at:
+            continue
+        next_event_at = (time.monotonic() +
+                         events.EVENT_CHECKING_INTERVAL_SECONDS)
         for event in EVENTS:
+            # The consolidated API runtime calls ManagedJobEvent through its
+            # own refresh owner. Inside Skylet, only the separate controller
+            # runtime may scan and reconcile managed jobs.
+            if (isinstance(event, events.ManagedJobEvent) and
+                    not managed_job_runtime.started):
+                continue
             event.run()
 
 
@@ -145,13 +228,27 @@ def main():
     if _should_install_preemption_sigterm_handler():
         signal.signal(signal.SIGTERM, _sigterm_handler)
 
-    grpc_server = start_grpc_server(port=args.port)
+    managed_job_runtime = _RemoteManagedJobControllerRuntime()
+    grpc_server = None
     try:
-        run_event_loop()
+        # Existing jobs-controller markers are handled before the Skylet opens
+        # its RPC surface. On first provisioning the marker is created later
+        # by setup and the bounded event-loop poll performs the same startup.
+        managed_job_runtime.start_if_configured()
+        grpc_server = start_grpc_server(port=args.port)
+        run_event_loop(managed_job_runtime)
     except KeyboardInterrupt:
         logger.info('Shutting down skylet...')
     finally:
-        grpc_server.stop(grace=5)
+        try:
+            if grpc_server is not None:
+                grpc_server.stop(grace=5)
+        finally:
+            managed_job_runtime.request_shutdown()
+            # The local owner is cleared only after every exact guardian proof
+            # has been accepted. A failed proof intentionally propagates and
+            # leaves the owner published while this process remains alive.
+            managed_job_runtime.wait_for_shutdown()
 
 
 if __name__ == '__main__':

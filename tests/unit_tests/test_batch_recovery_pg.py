@@ -16,32 +16,114 @@ import sqlalchemy
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 from sky.jobs import batch_state as batch_state_lib
+from sky.jobs import constants as jobs_constants
+from sky.jobs import controller_fencing
 from sky.jobs import state
 from sky.server.requests import postgres as request_postgres
 from sky.utils import locks
 
-testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
+_POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
+testcontainers_postgres = None
+if _POSTGRES_URL is None:
+    testcontainers_postgres = pytest.importorskip('testcontainers.postgres')
 pytest.importorskip('psycopg2')
 
 pytestmark = pytest.mark.skipif(
-    shutil.which('docker') is None,
+    _POSTGRES_URL is None and shutil.which('docker') is None,
     reason='docker unavailable; skipping real-Postgres Batch fence test')
+
+_CONTROLLER_SLOT_ID = 0
+_CONTROLLER_SLOT_ATTEMPT = '12345678-1234-4234-8234-123456789abc'
+
+
+def _async_postgres_url(engine: sqlalchemy.Engine) -> str:
+    """Render the fixture database URL with the asyncpg dialect explicitly."""
+    return engine.url.set(drivername='postgresql+asyncpg').render_as_string(
+        hide_password=False)
+
+
+def _publish_controller_attempt(monkeypatch, instance_id: str, generation: int,
+                                *, postgres: bool) -> dict[str, int | str]:
+    """Publish one exact test attempt through its real fencing authority."""
+    monkeypatch.setenv(
+        jobs_constants.CONTROLLER_OWNER_MODE_ENV_VAR,
+        controller_fencing.POSTGRES_OWNER_MODE
+        if postgres else controller_fencing.LOCAL_OWNER_MODE)
+    monkeypatch.setenv(jobs_constants.CONTROLLER_OWNER_INSTANCE_ID_ENV_VAR,
+                       instance_id)
+    monkeypatch.setenv(jobs_constants.CONTROLLER_OWNER_GENERATION_ENV_VAR,
+                       str(generation))
+    if postgres:
+        monkeypatch.delenv(jobs_constants.CONTROLLER_OWNER_PID_ENV_VAR,
+                           raising=False)
+        monkeypatch.delenv(jobs_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+                           raising=False)
+    else:
+        pid = os.getpid()
+        monkeypatch.setenv(jobs_constants.CONTROLLER_OWNER_PID_ENV_VAR,
+                           str(pid))
+        monkeypatch.setenv(
+            jobs_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+            str(controller_fencing._read_process_start_time_ticks(pid)))
+    monkeypatch.setenv(jobs_constants.CONTROLLER_SLOT_ID_ENV_VAR,
+                       str(_CONTROLLER_SLOT_ID))
+    monkeypatch.setenv(jobs_constants.CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
+                       _CONTROLLER_SLOT_ATTEMPT)
+    return {
+        'controller_slot_id': _CONTROLLER_SLOT_ID,
+        'controller_slot_attempt': _CONTROLLER_SLOT_ATTEMPT,
+    }
 
 
 @pytest.fixture(scope='module')
 def postgres_engine():
-    container = testcontainers_postgres.PostgresContainer('postgres:16')
-    try:
-        container.start()
-    except Exception as e:  # pylint: disable=broad-except
-        pytest.skip(f'could not start postgres container: {e}')
-    engine = sqlalchemy.create_engine(container.get_connection_url())
+    container = None
+    admin_engine = None
+    temporary_database = None
+    if _POSTGRES_URL is None:
+        assert testcontainers_postgres is not None
+        try:
+            container = testcontainers_postgres.PostgresContainer('postgres:16')
+            container.start()
+        except Exception as e:  # pylint: disable=broad-except
+            pytest.skip(f'could not start postgres container: {e}')
+        postgres_url = container.get_connection_url()
+    else:
+        temporary_database = f'skypilot_batch_test_{uuid.uuid4().hex}'
+        admin_engine = sqlalchemy.create_engine(_POSTGRES_URL,
+                                                isolation_level='AUTOCOMMIT')
+        quoted_database = admin_engine.dialect.identifier_preparer.quote(
+            temporary_database)
+        try:
+            with admin_engine.connect() as connection:
+                connection.exec_driver_sql(f'CREATE DATABASE {quoted_database}')
+        except Exception as e:  # pylint: disable=broad-except
+            admin_engine.dispose()
+            pytest.skip(f'could not create temporary postgres database: {e}')
+        postgres_url = sqlalchemy.engine.make_url(_POSTGRES_URL).set(
+            database=temporary_database).render_as_string(hide_password=False)
+    engine = sqlalchemy.create_engine(postgres_url)
     state.Base.metadata.create_all(engine)
     try:
         yield engine
     finally:
         engine.dispose()
-        container.stop()
+        if temporary_database is not None:
+            assert admin_engine is not None
+            quoted_database = admin_engine.dialect.identifier_preparer.quote(
+                temporary_database)
+            with admin_engine.connect() as connection:
+                connection.execute(
+                    sqlalchemy.text(
+                        'SELECT pg_terminate_backend(pid) '
+                        'FROM pg_stat_activity '
+                        'WHERE datname = :database AND pid <> pg_backend_pid()'
+                    ), {'database': temporary_database})
+                connection.exec_driver_sql(
+                    f'DROP DATABASE IF EXISTS {quoted_database}')
+            admin_engine.dispose()
+        elif container is not None:
+            container.stop()
 
 
 def test_postgres_waiting_job_index_shape_and_idle_plan(postgres_engine):
@@ -60,7 +142,13 @@ def test_postgres_waiting_job_index_shape_and_idle_plan(postgres_engine):
             'priority': 0,
             'is_batch': False,
         } for offset in range(job_count)])
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': first_job_id + offset,
+            'task_id': 0,
+            'status': state.ManagedJobStatus.SUCCEEDED.value,
+        } for offset in range(job_count)])
         connection.exec_driver_sql('ANALYZE job_info')
+        connection.exec_driver_sql('ANALYZE spot')
 
         active_batch_states = [
             state.ManagedJobScheduleState.LAUNCHING.value,
@@ -74,16 +162,34 @@ def test_postgres_waiting_job_index_shape_and_idle_plan(postgres_engine):
                 state.job_info_table.c.is_batch.is_(True),
                 state.job_info_table.c.schedule_state.in_(active_batch_states),
             )).correlate(None).scalar_subquery()
+        terminal_status_values = [
+            status.value
+            for status in state.ManagedJobStatus.terminal_statuses()
+        ]
+        has_task = sqlalchemy.exists(
+            sqlalchemy.select(state.spot_table.c.task_id).where(
+                state.spot_table.c.spot_job_id ==
+                state.job_info_table.c.spot_job_id))
+        has_nonterminal_task = sqlalchemy.exists(
+            sqlalchemy.select(state.spot_table.c.task_id).where(
+                state.spot_table.c.spot_job_id ==
+                state.job_info_table.c.spot_job_id,
+                state.spot_table.c.status.not_in(terminal_status_values)))
+        cleanup_only = sqlalchemy.and_(has_task, ~has_nonterminal_task)
         candidate = sqlalchemy.select(
             state.job_info_table.c.spot_job_id,
             state.job_info_table.c.schedule_state,
             state.job_info_table.c.pool,
+            cleanup_only.label('cleanup_only'),
         ).where(
             sqlalchemy.and_(
                 state.job_info_table.c.schedule_state.in_([
                     state.ManagedJobScheduleState.WAITING.value,
                 ]),
+                state.job_info_table.c.controller_slot_quiescing.is_(False),
+                has_task,
                 sqlalchemy.or_(
+                    cleanup_only,
                     state.job_info_table.c.is_batch.isnot(True),
                     ~state.job_info_table.c.pool.in_(busy_batch_pools),
                 ),
@@ -96,19 +202,33 @@ def test_postgres_waiting_job_index_shape_and_idle_plan(postgres_engine):
         plan_document = connection.exec_driver_sql(
             f'EXPLAIN (FORMAT JSON) {sql}').scalar_one()
 
+        connection.execute(state.spot_table.delete().where(
+            state.spot_table.c.spot_job_id.between(first_job_id, first_job_id +
+                                                   job_count - 1)))
         connection.execute(state.job_info_table.delete().where(
             state.job_info_table.c.spot_job_id.between(
                 first_job_id, first_job_id + job_count - 1)))
         connection.exec_driver_sql('ANALYZE job_info')
+        connection.exec_driver_sql('ANALYZE spot')
 
     plan = plan_document[0]['Plan']
     assert plan['Node Type'] == 'Limit'
     lock_rows = plan['Plans'][0]
     assert lock_rows['Node Type'] == 'LockRows'
-    index_scan = lock_rows['Plans'][0]
-    assert index_scan['Node Type'] == 'Index Scan'
-    assert index_scan['Relation Name'] == 'job_info'
-    assert index_scan['Index Name'] == 'ix_job_info_schedule_priority'
+
+    def _walk_plan(node):
+        yield node
+        for child in node.get('Plans', []):
+            yield from _walk_plan(child)
+
+    index_scans = [
+        node for node in _walk_plan(lock_rows)
+        if node['Node Type'] == 'Index Scan' and
+        node.get('Relation Name') == 'job_info'
+    ]
+    assert any(
+        scan.get('Index Name') == 'ix_job_info_schedule_priority'
+        for scan in index_scans)
 
 
 def test_postgres_job_event_writers_preserve_utc_instants(
@@ -124,9 +244,7 @@ def test_postgres_job_event_writers_preserve_utc_instants(
 
     sqlalchemy.event.listen(postgres_engine, 'checkout', _set_session_utc)
     monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
-    async_url = postgres_engine.url.render_as_string(
-        hide_password=False).replace('postgresql+psycopg2',
-                                     'postgresql+asyncpg')
+    async_url = _async_postgres_url(postgres_engine)
     async_engine = sqlalchemy_async.create_async_engine(
         async_url, connect_args={'server_settings': {
             'timezone': 'UTC'
@@ -318,9 +436,7 @@ def test_managed_job_claim_serializes_with_controller_generation_handoff(
         postgres_engine, monkeypatch):
     """The leadership row is the claim versus handoff serialization point."""
     monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
-    async_url = postgres_engine.url.render_as_string(
-        hide_password=False).replace('postgresql+psycopg2',
-                                     'postgresql+asyncpg')
+    async_url = _async_postgres_url(postgres_engine)
     # Claims run on different event loops below. NullPool keeps an asyncpg
     # connection from being reused by a loop other than the one that opened it.
     async_engine = sqlalchemy_async.create_async_engine(
@@ -333,6 +449,10 @@ def test_managed_job_claim_serializes_with_controller_generation_handoff(
     monkeypatch.setenv(request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
                        instance_id)
     monkeypatch.setenv(request_postgres.CONTROLLER_GENERATION_ENV_VAR, '31')
+    slot = _publish_controller_attempt(monkeypatch,
+                                       instance_id,
+                                       31,
+                                       postgres=True)
     _seed_waiting_pending_job(postgres_engine, 4103)
     _seed_waiting_pending_job(postgres_engine, 4104)
 
@@ -356,7 +476,9 @@ def test_managed_job_claim_serializes_with_controller_generation_handoff(
     def _claim():
         try:
             claim_result['value'] = asyncio.run(
-                state.get_waiting_job_async(pid=7777, pid_started_at=1.0))
+                state.get_waiting_job_async(pid=7777,
+                                            pid_started_at=1.0,
+                                            **slot))
         except Exception as e:  # pylint: disable=broad-except
             errors.append(e)
 
@@ -392,7 +514,11 @@ def test_managed_job_claim_serializes_with_controller_generation_handoff(
             assert not claim_thread.is_alive()
             assert not handoff_thread.is_alive()
             assert not errors
-            assert claim_result['value'] == {'job_id': 4103, 'pool': None}
+            assert claim_result['value'] == {
+                'job_id': 4103,
+                'pool': None,
+                'cleanup_only': False,
+            }
 
             with postgres_engine.connect() as connection:
                 owner = connection.execute(
@@ -406,7 +532,9 @@ def test_managed_job_claim_serializes_with_controller_generation_handoff(
             # has advanced. No subsequent waiting job may be claimed.
             with pytest.raises(state.ControllerLeadershipLostError):
                 asyncio.run(
-                    state.get_waiting_job_async(pid=8888, pid_started_at=2.0))
+                    state.get_waiting_job_async(pid=8888,
+                                                pid_started_at=2.0,
+                                                **slot))
             assert (state.get_job_schedule_state(4104) ==
                     state.ManagedJobScheduleState.WAITING)
     finally:
@@ -487,12 +615,14 @@ def test_postgres_cancel_and_claim_cannot_both_win(postgres_engine,
     monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
     _seed_waiting_pending_job(postgres_engine, 4102)
 
-    async_url = postgres_engine.url.render_as_string(
-        hide_password=False).replace('postgresql+psycopg2',
-                                     'postgresql+asyncpg')
+    async_url = _async_postgres_url(postgres_engine)
     async_engine = sqlalchemy_async.create_async_engine(
         async_url, poolclass=sqlalchemy.pool.NullPool)
     monkeypatch.setattr(state._db_manager, '_engine_async', async_engine)
+    slot = _publish_controller_attempt(monkeypatch,
+                                       '12345678-1234-4234-8234-123456789abd',
+                                       1,
+                                       postgres=False)
 
     cancel_result = {}
     claim_result = {}
@@ -505,7 +635,7 @@ def test_postgres_cancel_and_claim_cannot_both_win(postgres_engine,
     def _claim():
         barrier.wait()
         claimed = asyncio.run(
-            state.get_waiting_job_async(pid=7777, pid_started_at=1.0))
+            state.get_waiting_job_async(pid=7777, pid_started_at=1.0, **slot))
         claim_result['won'] = claimed is not None
 
     threads = [
@@ -534,9 +664,9 @@ def test_postgres_cancel_and_claim_cannot_both_win(postgres_engine,
         asyncio.run(async_engine.dispose())
 
 
-def test_postgres_controller_failure_decision_uses_live_generation(
+def test_postgres_controller_failure_terminalizes_for_slot_adoption(
         postgres_engine, monkeypatch):
-    """Terminalization and DONE compose with the real dual-lock fence."""
+    """Legacy terminalization composes with the real dual-lock fence."""
     monkeypatch.setattr(state._db_manager, '_engine', postgres_engine)
     instance_id = '96d9d1f6-8ba4-402b-85f5-27db321fd504'
     generation = 72
@@ -566,6 +696,8 @@ def test_postgres_controller_failure_decision_uses_live_generation(
         'controller_pid_started_at': 1.0,
         'controller_instance_id': instance_id,
         'controller_generation': generation,
+        'controller_slot_id': None,
+        'controller_slot_attempt': None,
     }
     try:
         with _live_controller_generation(postgres_engine, instance_id,
@@ -577,10 +709,8 @@ def test_postgres_controller_failure_decision_uses_live_generation(
                 state.ManagedJobStatus.FAILED_CONTROLLER)
             assert state.get_job_schedule_state(job_id) == (
                 state.ManagedJobScheduleState.ALIVE)
-            assert state.finish_controller_cleanup_if_current_snapshot(
-                job_id, **snapshot)
             assert state.get_job_schedule_state(job_id) == (
-                state.ManagedJobScheduleState.DONE)
+                state.ManagedJobScheduleState.ALIVE)
     finally:
         with postgres_engine.begin() as connection:
             connection.execute(state.spot_table.delete().where(

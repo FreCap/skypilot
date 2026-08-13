@@ -36,7 +36,45 @@ from sky.skylet import constants
 from sky.skylet import job_lib
 from sky.utils import asyncio_utils
 from sky.utils import common
+from sky.utils import controller_capability
 from sky.utils import status_lib
+
+_TEST_CONTROLLER_SLOT_ID = 0
+_TEST_CONTROLLER_SLOT_ATTEMPT = '00000000-0000-0000-0000-000000000001'
+
+
+def _make_controller_manager() -> ControllerManager:
+    return ControllerManager('test-uuid', _TEST_CONTROLLER_SLOT_ID,
+                             _TEST_CONTROLLER_SLOT_ATTEMPT)
+
+
+def test_manager_requires_preimport_capability_before_initialization(
+        monkeypatch):
+    capability = controller_capability.generate()
+    monkeypatch.setenv('SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY',
+                       capability)
+    monkeypatch.setenv(
+        'SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH',
+        '/old/hash-path')
+    controller_capability.clear_process_local()
+    controller_capability.install_process_local(capability)
+    try:
+        controller_lib._require_bootstrapped_controller_origin_capability()
+
+        assert controller_capability.get_process_local() == capability
+        assert all(name not in os.environ for name in (
+            'SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY',
+            'SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH'))
+    finally:
+        controller_capability.clear_process_local()
+
+
+def test_manager_rejects_capability_transport_after_import(monkeypatch):
+    monkeypatch.setenv('SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_CAPABILITY_FD',
+                       '17')
+
+    with pytest.raises(RuntimeError, match='pre-import bootstrap'):
+        controller_lib._require_bootstrapped_controller_origin_capability()
 
 
 @pytest.mark.asyncio
@@ -47,6 +85,9 @@ async def test_main_sets_connection_metric_role_before_initialization():
 
     initialization_order = []
 
+    def _require_capability():
+        initialization_order.append(('capability', None))
+
     def _set_metrics_role(role):
         initialization_order.append(('metrics-role', role))
 
@@ -54,16 +95,21 @@ async def test_main_sets_connection_metric_role_before_initialization():
         initialization_order.append(('context', None))
         raise StopInitialization
 
-    with patch.object(
-            controller_lib.db_utils,
-            'set_postgres_connection_metrics_process_role',
-            side_effect=_set_metrics_role), patch.object(
-                controller_lib.context_utils,
-                'hijack_sys_attrs',
-                side_effect=_hijack_context), pytest.raises(StopInitialization):
-        await controller_lib.main('controller-uuid')
+    with patch.object(controller_lib,
+                      '_require_bootstrapped_controller_origin_capability',
+                      side_effect=_require_capability), patch.object(
+                          controller_lib.db_utils,
+                          'set_postgres_connection_metrics_process_role',
+                          side_effect=_set_metrics_role), patch.object(
+                              controller_lib.context_utils,
+                              'hijack_sys_attrs',
+                              side_effect=_hijack_context), pytest.raises(
+                                  StopInitialization):
+        await controller_lib.main('controller-uuid', _TEST_CONTROLLER_SLOT_ID,
+                                  _TEST_CONTROLLER_SLOT_ATTEMPT)
 
-    assert initialization_order == [('metrics-role', 'managed-job-controller'),
+    assert initialization_order == [('capability', None),
+                                    ('metrics-role', 'managed-job-controller'),
                                     ('context', None)]
 
 
@@ -1842,7 +1888,7 @@ class TestTaskCleanup:
 
         task_cleanup() does three things:
         1. Cluster termination (mocked)
-        2. Storage teardown (mocked)
+        2. Fenced SDK status/storage requests (mocked)
         3. File mount cleanup (tested)
         """
         patches = {
@@ -1853,9 +1899,11 @@ class TestTaskCleanup:
             'gen_name': patch(
                 'sky.jobs.utils.generate_managed_job_cluster_name',
                 return_value='test-cluster'),
-            'status': patch('sky.core.status', return_value=[]),
-            'backend': patch('sky.backends.cloud_vm_ray_backend.'
-                             'CloudVmRayBackend'),
+            'status': patch('sky.jobs.controller.sdk.status',
+                            return_value='status-request'),
+            'get': patch('sky.jobs.controller.sdk.get', return_value=[]),
+            'storage_delete': patch('sky.jobs.controller.sdk.storage_delete',
+                                    return_value='storage-request'),
             'consolidation': patch('sky.jobs.utils.is_consolidation_mode',
                                    return_value=False),
         }
@@ -1893,12 +1941,103 @@ class TestTaskCleanup:
         dag.tasks = [task]
 
         from sky.jobs.controller import ControllerManager
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         with patch('sky.jobs.controller._get_dag', return_value=dag):
             await manager._cleanup(job_id=1)
 
         assert not mount_0.exists(), 'mount_0 should be cleaned up'
         assert not mount_1.exists(), 'mount_1 should be cleaned up'
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_storage_uses_fenced_sdk_request(
+            self, cleanup_patches):
+        """Only non-persistent storage is deleted through nested requests."""
+        ephemeral = MagicMock(name='ephemeral')
+        ephemeral.persistent = False
+        ephemeral.name = 'scratch-bucket'
+        persistent = MagicMock(name='persistent')
+        persistent.persistent = True
+        persistent.name = 'kept-bucket'
+        task = self._make_task()
+        task.storage_mounts = {
+            '/scratch': ephemeral,
+            '/kept': persistent,
+        }
+        dag = MagicMock()
+        dag.tasks = [task]
+
+        from sky.jobs.controller import ControllerManager
+        manager = _make_controller_manager()
+        with patch('sky.jobs.controller._get_dag', return_value=dag):
+            await manager._cleanup(job_id=1)
+
+        cleanup_patches['storage_delete'].assert_called_once_with(
+            'scratch-bucket')
+        assert cleanup_patches['get'].call_args_list == [
+            call('status-request'),
+            call('storage-request'),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_non_pool_cleanup_uses_down_status_and_ephemeral_sdk(
+            self, cleanup_patches):
+        """The cleanup-only path reuses every canonical nested effect."""
+        ephemeral = MagicMock()
+        ephemeral.persistent = False
+        ephemeral.name = 'scratch-bucket'
+        task = self._make_task()
+        task.storage_mounts = {'/scratch': ephemeral}
+        dag = MagicMock(tasks=[task])
+        cleanup_patches['terminate'].side_effect = lambda *_args, **_kwargs: (
+            controller_lib.sdk.get(
+                controller_lib.sdk.down(
+                    'test-cluster', graceful=False, graceful_timeout=None)))
+        with patch('sky.jobs.controller.sdk.down',
+                   return_value='down-request') as down, \
+                patch('sky.jobs.controller._get_dag', return_value=dag):
+            await _make_controller_manager()._cleanup(job_id=1)
+
+        down.assert_called_once_with('test-cluster',
+                                     graceful=False,
+                                     graceful_timeout=None)
+        cleanup_patches['status'].assert_called_once_with(
+            cluster_names=['test-cluster'], all_users=True)
+        cleanup_patches['storage_delete'].assert_called_once_with(
+            'scratch-bucket')
+        assert cleanup_patches['get'].call_args_list == [
+            call('down-request'),
+            call('status-request'),
+            call('storage-request'),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pool_cleanup_cancels_worker_job_and_ephemeral_storage(
+            self, cleanup_patches):
+        ephemeral = MagicMock()
+        ephemeral.persistent = False
+        ephemeral.name = 'scratch-bucket'
+        task = self._make_task()
+        task.storage_mounts = {'/scratch': ephemeral}
+        dag = MagicMock(tasks=[task])
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'get_pool_submit_info', return_value=('pool-worker', 91)), \
+                patch('sky.jobs.controller.sdk.cancel',
+                      return_value='cancel-request') as cancel, \
+                patch('sky.jobs.controller._get_dag', return_value=dag):
+            await _make_controller_manager()._cleanup(job_id=1, pool='pool-a')
+
+        cancel.assert_called_once_with(cluster_name='pool-worker',
+                                       job_ids=[91],
+                                       _try_cancel_if_cluster_is_init=True)
+        cleanup_patches['terminate'].assert_not_called()
+        cleanup_patches['status'].assert_not_called()
+        cleanup_patches['storage_delete'].assert_called_once_with(
+            'scratch-bucket')
+        assert cleanup_patches['get'].call_args_list == [
+            call('cancel-request'),
+            call('storage-request'),
+        ]
 
 
 class TestDownloadLogsForCancelledJob:
@@ -2615,7 +2754,7 @@ class TestCancelSignalScan:
             yield tmp_path
 
     def _make_manager(self):
-        return ControllerManager('test-uuid')
+        return _make_controller_manager()
 
     @pytest.mark.asyncio
     async def test_owned_job_cancelled_without_status_query(self, signal_dir):
@@ -3203,7 +3342,7 @@ class TestCancelSignalScan:
             nonlocal waiting_calls
             waiting_calls += 1
             if waiting_calls == 1:
-                return {'job_id': 12}
+                return {'job_id': 12, 'cleanup_only': False}
             raise asyncio.CancelledError
 
         with patch('sky.jobs.controller.controller_utils.'
@@ -3261,7 +3400,7 @@ class TestControllerManagerMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_capacity_snapshot_uses_one_lock_acquisition(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
 
         class CountingLock:
             """Count async context entries around a real lock."""
@@ -3295,7 +3434,7 @@ class TestControllerManagerMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_running_limit_wakes_when_tracked_job_finishes(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         release_job = asyncio.Event()
         tracked_job = asyncio.create_task(release_job.wait())
         manager.job_tasks[1] = tracked_job
@@ -3362,7 +3501,7 @@ class TestControllerManagerMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_zero_running_limit_retains_topology_recheck(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         sleep_started = asyncio.Event()
 
         async def sleep_for_recheck(delay):
@@ -3394,7 +3533,7 @@ class TestControllerManagerMonitorLoop:
 
     @pytest.mark.asyncio
     async def test_saturated_launch_slot_wakes_on_notification(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         manager.starting.add(1)
         wait_started = asyncio.Event()
         job_started = asyncio.Event()
@@ -3419,7 +3558,10 @@ class TestControllerManagerMonitorLoop:
                    'LAUNCHES_PER_WORKER', 1), \
                 patch('sky.jobs.controller.managed_job_state.'
                       'get_waiting_job_async',
-                      new=AsyncMock(return_value={'job_id': 2})), \
+                      new=AsyncMock(return_value={
+                          'job_id': 2,
+                          'cleanup_only': False,
+                      })), \
                 patch('sky.jobs.controller.os.listdir', return_value=[]), \
                 patch('sky.jobs.controller.asyncio.sleep',
                       new=AsyncMock(side_effect=AssertionError(
@@ -3518,7 +3660,7 @@ class TestRunJobLoopOwnershipCleanup:
 
     @pytest.mark.asyncio
     async def test_repeated_cancellation_waits_for_inner_finalization(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         inner_started = asyncio.Event()
         inner_finalizing = asyncio.Event()
         finish_finalization = asyncio.Event()
@@ -3582,7 +3724,7 @@ class TestRunJobLoopOwnershipCleanup:
     @pytest.mark.asyncio
     async def test_start_job_hands_off_slot_without_cancellation_gap(
             self, tmp_path):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         registered = []
 
         def register(coro):
@@ -3603,7 +3745,7 @@ class TestRunJobLoopOwnershipCleanup:
 
     @pytest.mark.asyncio
     async def test_initialization_failure_releases_slot_and_wakes_waiter(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         manager.starting.add(3)
         waiter_started = asyncio.Event()
 
@@ -3642,7 +3784,7 @@ class TestRunJobLoopOwnershipCleanup:
 
     @pytest.mark.asyncio
     async def test_success_path_pops_stale_cancel_info(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         manager.starting.add(3)
         manager._cancel_info[3] = (False, None)
         manager._cleanup = AsyncMock()
@@ -3675,7 +3817,7 @@ class TestRunJobLoopOwnershipCleanup:
 
     @pytest.mark.asyncio
     async def test_cleanup_failure_preserves_terminal_job_status(self, caplog):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         manager.starting.add(3)
         manager._cleanup = AsyncMock(
             side_effect=RuntimeError('worker connection timed out'))
@@ -3713,7 +3855,7 @@ class TestRunJobLoopOwnershipCleanup:
     @pytest.mark.asyncio
     async def test_cleanup_failure_marks_nonterminal_job_failed_controller(
             self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         manager.starting.add(3)
         manager._cleanup = AsyncMock(
             side_effect=RuntimeError('worker connection timed out'))
@@ -3750,6 +3892,172 @@ class TestRunJobLoopOwnershipCleanup:
         assert 'worker connection timed out' in kwargs['failure_reason']
         job_done.assert_not_awaited()
 
+
+class TestTerminalCleanupAdoption:
+    """A replacement manager adopts terminal work without running it."""
+
+    @pytest.mark.asyncio
+    async def test_start_cleanup_job_tracks_the_background_owner(
+            self, tmp_path):
+        manager = _make_controller_manager()
+        tracked_task = MagicMock(spec=asyncio.Task)
+        registered = []
+
+        def register(coro):
+            registered.append(coro)
+            coro.close()
+            return tracked_task
+
+        with patch('sky.jobs.controller.jobs_constants.'
+                   'JOBS_CONTROLLER_LOGS_DIR', str(tmp_path)), \
+                patch('sky.jobs.controller.create_background_task',
+                      side_effect=register) as create_task:
+            await manager.start_cleanup_job(3, 'pool-a')
+
+        create_task.assert_called_once()
+        assert len(registered) == 1
+        assert manager.job_tasks[3] is tracked_task
+        assert 3 in manager._cleanup_only_job_ids
+
+    @pytest.mark.asyncio
+    async def test_cleanup_only_retries_then_exactly_finalizes(self):
+        manager = _make_controller_manager()
+        manager.job_tasks[3] = asyncio.current_task()
+        manager._cleanup_only_job_ids.add(3)
+        manager._initialize_job_context = MagicMock(return_value=None)
+        manager._cleanup = AsyncMock(
+            side_effect=[RuntimeError('provider unavailable'), None])
+        manager._cleanup_api_server_access_token = MagicMock()
+
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new_callable=AsyncMock) as sleep, \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'scheduler_set_cleanup_done_async',
+                      new_callable=AsyncMock) as cleanup_done, \
+                patch('sky.jobs.controller.JobController') as job_controller, \
+                patch('sky.jobs.controller.managed_job_utils.'
+                      'event_callback_func') as callback:
+            await ControllerManager.run_cleanup_loop.__wrapped__(
+                manager, 3, '/tmp/controller.log', None)
+
+        assert manager._cleanup.await_args_list == [
+            call(3, pool=None),
+            call(3, pool=None),
+        ]
+        sleep.assert_awaited_once_with(1)
+        manager._cleanup_api_server_access_token.assert_called_once_with(3)
+        cleanup_done.assert_awaited_once_with(3)
+        job_controller.assert_not_called()
+        callback.assert_not_called()
+        assert 3 not in manager.job_tasks
+        assert 3 not in manager._cleanup_only_job_ids
+
+    @pytest.mark.asyncio
+    async def test_cleanup_completion_is_not_replayed_for_later_phase_retry(
+            self):
+        manager = _make_controller_manager()
+        manager.job_tasks[3] = asyncio.current_task()
+        manager._cleanup_only_job_ids.add(3)
+        manager._initialize_job_context = MagicMock(return_value=None)
+        manager._cleanup = AsyncMock()
+        manager._cleanup_api_server_access_token = MagicMock(
+            side_effect=[RuntimeError('token database unavailable'), None])
+
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new_callable=AsyncMock) as sleep, \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'scheduler_set_cleanup_done_async',
+                      new_callable=AsyncMock) as cleanup_done:
+            await ControllerManager.run_cleanup_loop.__wrapped__(
+                manager, 3, '/tmp/controller.log', 'pool-a')
+
+        manager._cleanup.assert_awaited_once_with(3, pool='pool-a')
+        assert manager._cleanup_api_server_access_token.call_count == 2
+        sleep.assert_awaited_once_with(1)
+        cleanup_done.assert_awaited_once_with(3)
+
+    @pytest.mark.asyncio
+    async def test_exact_claim_loss_exits_for_guardian_readoption(self):
+        manager = _make_controller_manager()
+        manager.job_tasks[3] = asyncio.current_task()
+        manager._cleanup_only_job_ids.add(3)
+        manager._initialize_job_context = MagicMock(return_value=None)
+        manager._cleanup = AsyncMock()
+        manager._cleanup_api_server_access_token = MagicMock()
+        lost = managed_job_state.ControllerLeadershipLostError(
+            'replacement owns this attempt')
+
+        with patch('sky.jobs.controller.asyncio.sleep',
+                   new_callable=AsyncMock) as sleep, \
+                patch('sky.jobs.controller.managed_job_state.'
+                      'scheduler_set_cleanup_done_async',
+                      new=AsyncMock(side_effect=lost)):
+            with pytest.raises(managed_job_state.ControllerLeadershipLostError,
+                               match='replacement owns'):
+                await ControllerManager.run_cleanup_loop.__wrapped__(
+                    manager, 3, '/tmp/controller.log', None)
+
+        manager._cleanup.assert_awaited_once_with(3, pool=None)
+        manager._cleanup_api_server_access_token.assert_called_once_with(3)
+        sleep.assert_not_awaited()
+        assert 3 not in manager.job_tasks
+        assert 3 not in manager._cleanup_only_job_ids
+
+    def test_cleanup_context_publishes_exact_job_origin(self):
+        manager = _make_controller_manager()
+        ctx = MagicMock()
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=''), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context') as usage:
+            manager._initialize_job_context(37, '/tmp/controller.log', None)
+
+        ctx.override_envs.assert_called_once_with(
+            {controller_lib.jobs_constants.CONTROLLER_JOB_ID_ENV_VAR: '37'})
+        ctx.redirect_log.assert_called_once_with(
+            pathlib.Path('/tmp/controller.log'))
+        usage.assert_called_once_with()
+
+    def test_cleanup_context_overrides_persisted_job_origin_last(self):
+        manager = _make_controller_manager()
+        ctx = MagicMock()
+        origin_key = controller_lib.jobs_constants.CONTROLLER_JOB_ID_ENV_VAR
+        env_content = f'{origin_key}=999\nUSER_VALUE=kept\n'
+        with patch('sky.jobs.controller.context.get', return_value=ctx), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'get_job_env_content', return_value=env_content), \
+                patch('sky.jobs.controller.file_content_utils.'
+                      'restore_job_config_file'), \
+                patch('sky.jobs.controller.skypilot_config.reload_config'), \
+                patch('sky.jobs.controller.usage_lib.'
+                      'install_fresh_messages_for_current_context'):
+            manager._initialize_job_context(37, '/tmp/controller.log', None)
+
+        assert ctx.override_envs.call_args_list[-1] == call({origin_key: '37'})
+        assert call({origin_key: '999'}) not in ctx.override_envs.call_args_list
+
+    @pytest.mark.asyncio
+    async def test_monitor_dispatches_cleanup_only_without_starting_workload(
+            self):
+        manager = _make_controller_manager()
+        manager.start_cleanup_job = AsyncMock(
+            side_effect=asyncio.CancelledError)
+        manager.start_job = AsyncMock()
+
+        with patch('sky.jobs.controller.managed_job_state.'
+                   'get_waiting_job_async', new=AsyncMock(return_value={
+                       'job_id': 9,
+                       'pool': 'pool-a',
+                       'cleanup_only': True,
+                   })), \
+                patch('sky.jobs.controller.os.listdir', return_value=[]):
+            with pytest.raises(asyncio.CancelledError):
+                await manager.monitor_loop()
+
+        manager.start_cleanup_job.assert_awaited_once_with(9, 'pool-a')
+        manager.start_job.assert_not_awaited()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize('cleanup_error', [
         None,
@@ -3757,7 +4065,7 @@ class TestRunJobLoopOwnershipCleanup:
     ])
     async def test_cancel_releases_api_token_only_after_terminal_transition(
             self, cleanup_error, caplog):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         manager.starting.add(3)
         manager._cleanup = AsyncMock()
         events = []
@@ -3824,7 +4132,7 @@ class TestApiAccessTokenCleanup:
     """Tests batch-aware API token cleanup decisions."""
 
     def test_active_sibling_defers_shared_token_revocation(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         with patch('sky.jobs.controller.managed_job_state.'
                    'get_releasable_api_access_token_id',
                    return_value=None) as releasable, \
@@ -3836,7 +4144,7 @@ class TestApiAccessTokenCleanup:
         delete.assert_not_called()
 
     def test_terminal_batch_revokes_shared_token_once(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         with patch('sky.jobs.controller.managed_job_state.'
                    'get_releasable_api_access_token_id',
                    return_value='shared-token') as releasable, \
@@ -3849,7 +4157,7 @@ class TestApiAccessTokenCleanup:
         delete.assert_called_once_with('shared-token')
 
     def test_concurrent_sibling_revocation_is_idempotent(self):
-        manager = ControllerManager('test-uuid')
+        manager = _make_controller_manager()
         with patch('sky.jobs.controller.managed_job_state.'
                    'get_releasable_api_access_token_id',
                    return_value='shared-token'), \

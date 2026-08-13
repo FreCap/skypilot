@@ -71,6 +71,8 @@ from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
 from sky.utils.db import db_utils
+from sky.utils.serve_types import ServiceComponent
+from sky.utils.serve_types import UpdateMode
 
 if typing.TYPE_CHECKING:
     import fastapi
@@ -78,14 +80,13 @@ if typing.TYPE_CHECKING:
     import requests
 
     import sky
+    from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
     from sky.data import storage as storage_lib
     from sky.serve import replica_managers
     from sky.serve import service_spec as service_spec_lib
-    WorkerHandle = backends.CloudVmRayResourceHandle | None
 else:
     psutil = adaptors_common.LazyImport('psutil')
     requests = controller_transport.requests
-    WorkerHandle = Any
 
 logger: logging.Logger = sky_logging.init_logger(__name__)
 controller_transport.logger = logger
@@ -576,12 +577,6 @@ _FAILED_TO_FIND_REPLICA_MSG = (
     f' to check all valid replica id.{colorama.Style.RESET_ALL}')
 
 
-class ServiceComponent(enum.Enum):
-    CONTROLLER = 'controller'
-    LOAD_BALANCER = 'load_balancer'
-    REPLICA = 'replica'
-
-
 @dataclasses.dataclass
 class ServiceComponentTarget:
     """Represents a target service component with an optional replica ID.
@@ -628,12 +623,6 @@ class UserSignal(enum.Enum):
     def error_type(self) -> type[Exception]:
         """Get the error corresponding to the signal."""
         return _SIGNAL_TO_ERROR[self]
-
-
-class UpdateMode(enum.Enum):
-    """Update mode for updating a service."""
-    ROLLING = 'rolling'
-    BLUE_GREEN = 'blue_green'
 
 
 @dataclasses.dataclass
@@ -3030,6 +3019,7 @@ def _prepare_service_status(
                 'free_reserved_slots_by_accelerator': 'free_reserved_slots_by_accelerator',
                 'fill_target': 'fill_target',
                 'fill_free_slots': 'fill_free_slots',
+                'reserved_fill_reconciliation': 'reserved_fill_reconciliation',
                 'recent_request_count': 'recent_request_count',
                 'request_window_seconds': 'request_window_seconds',
                 'requests_per_second': 'requests_per_second',
@@ -3685,7 +3675,7 @@ def get_free_worker_resources(
     pool: str,
     replicas: list['replica_managers.ReplicaInfo'] | None = None,
     cluster_records: dict[str, dict[str, Any] | None] | None = None,
-    resolved_handles: dict[str, WorkerHandle] | None = None,
+    resolved_handles: 'dict[str, CloudVmRayResourceHandle | None] | None' = None,
 ) -> dict[str, resources_lib.Resources | None] | None:
     """Get free resources for each worker in a pool.
 
@@ -3823,7 +3813,8 @@ def get_next_cluster_name(
 
         free_resources = None
         cluster_records = None
-        resolved_handles: dict[str, WorkerHandle] | None = None
+        resolved_handles: (dict[str, CloudVmRayResourceHandle | None] |
+                           None) = None
         if resource_aware:
             cluster_records = _get_pool_cluster_records(replicas)
             resolved_handles = {}

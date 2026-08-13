@@ -16,7 +16,6 @@ from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import env_options
 from sky.utils import locks
-from sky.utils import subprocess_utils
 from sky.utils import timeline
 from sky.utils import ux_utils
 
@@ -74,8 +73,8 @@ def _default_should_skip():
 
 
 @dataclasses.dataclass
-class InternalRequestDaemon:
-    """Internal daemon that runs an event in the background."""
+class RuntimeDaemon:
+    """Controller-owned maintenance loop run in a supervised subprocess."""
 
     id: str
     name: request_names.RequestName
@@ -149,10 +148,11 @@ class InternalRequestDaemon:
                 # using too much memory.
                 annotations.clear_request_level_cache()
                 timeline.save_timeline()
-                # Kill all children processes related to this request.
-                # Each executor handles a single request, so we can safely
-                # kill all children processes related to this request.
-                subprocess_utils.kill_children_processes()
+                # The runtime-daemon launcher owns one isolated process-group
+                # boundary and drains it when the daemon lifetime ends.  Do
+                # not perform request-worker-style broad child cleanup here:
+                # the independent group guardian is intentionally a direct
+                # child and must survive every successful event iteration.
                 common_utils.release_memory()
                 _rotate_daemon_log(log_path)
 
@@ -200,7 +200,7 @@ _serve_consolidation_mode_lock = None
 # would advance it only to 1, the `_n == 0` trigger would never fire,
 # and the throttled work (update_service_status / managed_job_utils
 # update) would NEVER execute. The outer `while True` in
-# InternalRequestDaemon.run_event re-invokes the event_fn, so these
+# RuntimeDaemon.run_event re-invokes the event_fn, so these
 # instances must outlive a single iteration.
 # (managed-job uses its own instance held by ManagedJobRefreshDaemonThread
 # in sky/jobs/managed_job_refresh_thread.py — it lives on the thread,
@@ -226,11 +226,10 @@ atexit.register(_release_serve_and_pool_consolidation_mode_locks)
 
 
 # Backward-compatibility no-op stubs for rolling upgrade. Pickled
-# InternalRequestDaemon rows from older server versions reference these
+# Runtime-daemon request rows from older server versions reference these
 # symbols via the `event_fn` / `should_skip` attributes, so pickle.loads
 # raises AttributeError without them. Orphan rows are then cleaned up by
-# the request-daemon restart path because no matching
-# INTERNAL_REQUEST_DAEMONS entry exists for the pickled daemon id.
+# startup's explicit legacy-row retirement path.
 def managed_job_status_refresh_event():
     """No-op stub for pickle compatibility with older server versions.
 
@@ -305,10 +304,9 @@ def _serve_status_refresh_event(pool: bool):
     from sky.serve import serve_utils
 
     if not pool and maintenance.is_controller_hold_active():
-        # Keep the durable daemon registered, but do no recovery, status
-        # mutation, or orphan-LB cleanup while operators rewrite persisted
-        # contracts.  Returning without sleeping would busy-loop in
-        # InternalRequestDaemon.run_event().
+        # Keep the runtime daemon alive, but do no recovery, status mutation,
+        # or orphan-LB cleanup while operators rewrite persisted contracts.
+        # Returning without sleeping would busy-loop in run_event().
         from sky.skylet import events
         logger.warning('SkyServe controller recovery and status refresh are '
                        'held by the server deployment.')
@@ -454,62 +452,59 @@ def server_heartbeat_event():
     time.sleep(server_constants.SERVER_HEARTBEAT_INTERVAL_SECONDS)
 
 
-# Register the events to run in the background.
-INTERNAL_REQUEST_DAEMONS = [
+# Runtime-owned maintenance processes.  These are deliberately not durable API
+# request handlers: the elected controller supervisor owns their lifecycle and
+# the request store contains only finite client/system operations.
+RUNTIME_DAEMONS = [
     # This status refresh daemon can cause the autostopp'ed/autodown'ed cluster
     # set to updated status automatically, without showing users the hint of
     # cluster being stopped or down when `sky status -r` is called.
-    InternalRequestDaemon(
-        id='skypilot-status-refresh-daemon',
-        name=request_names.RequestName.REQUEST_DAEMON_STATUS_REFRESH,
-        event_fn=refresh_cluster_status_event,
-        default_log_level='DEBUG'),
+    RuntimeDaemon(id='skypilot-status-refresh-daemon',
+                  name=request_names.RequestName.REQUEST_DAEMON_STATUS_REFRESH,
+                  event_fn=refresh_cluster_status_event,
+                  default_log_level='DEBUG'),
     # Volume status refresh daemon to update the volume status periodically.
-    InternalRequestDaemon(
-        id='skypilot-volume-status-refresh-daemon',
-        name=request_names.RequestName.REQUEST_DAEMON_VOLUME_REFRESH,
-        event_fn=refresh_volume_status_event),
-    InternalRequestDaemon(
+    RuntimeDaemon(id='skypilot-volume-status-refresh-daemon',
+                  name=request_names.RequestName.REQUEST_DAEMON_VOLUME_REFRESH,
+                  event_fn=refresh_volume_status_event),
+    RuntimeDaemon(
         id='sky-serve-status-refresh-daemon',
         name=request_names.RequestName.REQUEST_DAEMON_SKY_SERVE_STATUS_REFRESH,
         event_fn=sky_serve_status_refresh_event,
         should_skip=should_skip_sky_serve_status_refresh),
-    InternalRequestDaemon(
+    RuntimeDaemon(
         id='pool-status-refresh-daemon',
         name=request_names.RequestName.REQUEST_DAEMON_POOL_STATUS_REFRESH,
         event_fn=pool_status_refresh_event,
         should_skip=should_skip_pool_status_refresh),
-    InternalRequestDaemon(
+    RuntimeDaemon(
         id='server-heartbeat-daemon',
         name=request_names.RequestName.REQUEST_DAEMON_SERVER_HEARTBEAT,
         event_fn=server_heartbeat_event,
         should_skip=should_skip_server_heartbeat),
-    InternalRequestDaemon(
+    RuntimeDaemon(
         id='expired-token-cleanup-daemon',
         name=request_names.RequestName.REQUEST_DAEMON_EXPIRED_TOKEN_CLEANUP,
         event_fn=expired_token_cleanup_event),
 ]
 
-HIDDEN_REQUEST_NAMES = [
-    request_names.RequestName.REQUEST_DAEMON_SERVER_HEARTBEAT
-]
+_RUNTIME_DAEMONS_BY_ID = {daemon.id: daemon for daemon in RUNTIME_DAEMONS}
+if len(_RUNTIME_DAEMONS_BY_ID) != len(RUNTIME_DAEMONS):
+    raise RuntimeError('Runtime daemon IDs must be unique.')
 
-_DAEMON_IDS = set(d.id for d in INTERNAL_REQUEST_DAEMONS)
+# Explicit transition inventory.  Never replace this with a suffix query: a
+# user-selected finite request ID may legitimately end in ``-daemon``.  The
+# managed-jobs ID belongs to a retired implementation whose pickle symbols are
+# kept above solely so an old row can be deleted without decode failure.
+LEGACY_REQUEST_DAEMON_IDS = frozenset({
+    *(_RUNTIME_DAEMONS_BY_ID.keys()),
+    'managed-job-status-refresh-daemon',
+})
 
-# Naming convention for internal daemon request ids. Matching on the suffix
-# (in addition to the exact id set of the current build) lets consumers
-# recognize daemon rows written by a previous server version whose daemon ids
-# no longer exist in this build -- e.g. startup re-enqueue must not replay a
-# PENDING row of a removed daemon. Regular request ids are uuid4 strings and
-# can never end with this suffix.
-_DAEMON_ID_SUFFIX = '-daemon'
 
-
-def is_daemon_request_id(request_id: str) -> bool:
-    """Returns whether a specific request_id is an internal daemon.
-
-    Pattern-based: also matches daemon ids from other server versions that
-    follow the ``*-daemon`` naming convention but are not registered in this
-    build.
-    """
-    return (request_id in _DAEMON_IDS or request_id.endswith(_DAEMON_ID_SUFFIX))
+def get_runtime_daemon(daemon_id: str) -> RuntimeDaemon:
+    """Resolve one runtime daemon by its closed, code-owned identifier."""
+    try:
+        return _RUNTIME_DAEMONS_BY_ID[daemon_id]
+    except KeyError as e:
+        raise ValueError(f'Unknown runtime daemon ID: {daemon_id!r}.') from e

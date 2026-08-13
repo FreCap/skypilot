@@ -23,7 +23,6 @@ from sky.backends.cloud_vm_ray_backend import CloudVmRayBackend
 from sky.jobs import utils as managed_job_utils
 from sky.jobs.server import core as managed_jobs_core
 from sky.server import constants as server_constants
-from sky.server import daemons
 from sky.server.requests import request_names
 from sky.server.requests import requests as requests_lib
 from sky.skylet import constants as skylet_constants
@@ -130,14 +129,6 @@ _REQUEST_BODY_ALLOWLIST: dict[str, tuple[str, ...]] = {
     'sky.recipes.get': (),
     'sky.recipes.delete': (),
     'sky.recipes.pin': (),
-    # Internal daemons
-    'sky.status-refresh': (),
-    'sky.volume-refresh': (),
-    'sky.managed-job-status-refresh': (),
-    'sky.sky-serve-status-refresh': (),
-    'sky.pool-status-refresh': (),
-    'sky.server-heartbeat': (),
-    'sky.expired-token-cleanup': (),
     # Category 2: redact task/dag YAML fields before including
     'sky.launch': ('task',),
     'sky.exec': ('task',),
@@ -148,11 +139,9 @@ _REQUEST_BODY_ALLOWLIST: dict[str, tuple[str, ...]] = {
     'sky.serve.update': ('task',),
 }
 
-# System daemon request IDs to always include in debug dumps.
-# Built from INTERNAL_REQUEST_DAEMONS (background refresh daemons) plus the
-# on-boot check request.
-SYSTEM_REQUEST_IDS = [d.id for d in daemons.INTERNAL_REQUEST_DAEMONS
-                     ] + [server_constants.ON_BOOT_CHECK_REQUEST_ID]
+# The only system-owned finite request included by ID in debug dumps. Runtime
+# daemons have dedicated logs and no API request rows.
+SYSTEM_REQUEST_IDS = [server_constants.ON_BOOT_CHECK_REQUEST_ID]
 
 # Request names for managed job mutations (excludes read-only queue).
 # Used by both _get_requests_from_managed_jobs and
@@ -1020,7 +1009,7 @@ def _build_debug_dump(
     _get_clusters_from_requests(debug_dump_context)
     _get_clusters_from_managed_jobs(debug_dump_context)
 
-    # Always include system daemon requests
+    # Always include finite system requests used for server diagnostics.
     debug_dump_context['request_ids'].update(SYSTEM_REQUEST_IDS)
 
     logger.debug(f'After cross-linking: '

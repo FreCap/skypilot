@@ -16,10 +16,9 @@ from sky import global_user_state
 from sky import resources
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import state as managed_job_state
-from sky.serve import constants as serve_constants
-from sky.serve import serve_state
 from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import plugin_utils
@@ -44,9 +43,16 @@ if typing.TYPE_CHECKING:
 
     from sky import task as task_lib
     from sky.backends import cloud_vm_ray_backend
+    from sky.serve import constants as serve_constants
+    from sky.serve import serve_state
 else:
-    from sky.adaptors import common as adaptors_common
     psutil = adaptors_common.LazyImport('psutil')
+    # Importing a submodule through ``sky.serve`` eagerly executes its public
+    # package initializer.  controller_utils is itself imported while
+    # ``sky.jobs`` is initializing, so eager Serve initialization closes a
+    # jobs -> controller_utils -> serve -> request-payloads -> serve cycle.
+    serve_constants = adaptors_common.LazyImport('sky.serve.constants')
+    serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 
 logger = sky_logging.init_logger(__name__)
 

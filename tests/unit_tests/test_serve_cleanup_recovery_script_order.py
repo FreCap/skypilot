@@ -27,6 +27,7 @@ from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
+from sky.utils import common_utils
 from sky.utils import controller_utils
 
 
@@ -288,6 +289,31 @@ def test_teardown_reducer_cancels_then_polls_exact_association(monkeypatch):
         call.args == (context, authority) for call in reduce.call_args_list)
     assert all(call.kwargs['project_replica_result'] is not None
                for call in reduce.call_args_list)
+
+
+def test_teardown_success_projects_provider_materialization_evidence(
+        monkeypatch):
+    info = _replica(1)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    authority = types.SimpleNamespace(service_name='svc',
+                                      service_hash='service-hash')
+    projection = types.SimpleNamespace(
+        locked_replica_info=info,
+        status=types.SimpleNamespace(value='SUCCEEDED'),
+        pre_effect_terminal=False,
+        paid_capacity_pool_key=None,
+        context=types.SimpleNamespace(association_id='association-a'))
+    update = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        serve_state, 'update_replica_for_bound_ordinary_launch_in_transaction',
+        update)
+
+    assert service._project_bound_ordinary_launch_for_teardown(
+        authority, mock.sentinel.connection, projection)
+
+    assert (info.status_property.sky_launch_status ==
+            common_utils.ProcessStatus.INTERRUPTED)
+    assert update.call_args.kwargs['provider_launch_succeeded'] is True
 
 
 def test_teardown_reducer_reuses_prior_durable_cancel_reason(monkeypatch):

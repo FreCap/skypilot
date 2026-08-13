@@ -5,14 +5,16 @@ import datetime
 from unittest import mock
 import uuid
 
+from alembic import command as alembic_command
 import pytest
 import sqlalchemy
-from test_serve_resource_actions_pg import postgres_engine
+from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.server.requests import postgres as request_postgres
 from sky.server.requests import postgres_schema as request_postgres_schema
+from sky.utils.db import migration_utils
 
 
 def test_protocol_v2_state_rejects_sqlite(tmp_path):
@@ -53,11 +55,23 @@ def test_service_teardown_takes_broker_lock_before_database(
 
 
 @pytest.fixture
-def state_engine(postgres_engine, monkeypatch):
+def state_engine(postgres_engine, monkeypatch):  # noqa: F811
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
     serve_state.Base.metadata.create_all(postgres_engine)
+    config = migration_utils.get_alembic_config(postgres_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.stamp(config, '042')
+    # create_all() installs the current table shape but, unlike the real
+    # migration chain, does not seed the protocol singleton introduced by
+    # Serve035.  Serve045 intentionally refuses to invent that authority row.
+    alembic_command.upgrade(config, '044')
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            serve_state.reserved_fill_protocol_state_table.insert().values(
+                id=1))
+    alembic_command.upgrade(config, '045')
     monkeypatch.setattr(serve_state._db_manager, '_engine', postgres_engine)
     lock = mock.MagicMock()
     lock.acquire.return_value = contextlib.nullcontext()
@@ -738,13 +752,20 @@ def test_postgres_fill_persist_requires_exact_positive_lease_token(
             serve_state.reserved_fill_lease_table.insert().values(id=1,
                                                                   epoch=11))
 
-    replica = replica_managers.ReplicaInfo(replica_id=1,
-                                           cluster_name='svc-1',
-                                           replica_port='8080',
-                                           is_spot=False,
-                                           location=None,
-                                           version=1,
-                                           resources_override=None)
+    location = replica_managers.spot_placer.Location(
+        cloud=replica_managers.clouds.Kubernetes(),
+        region='east',
+        zone=None,
+        accelerators={'H200': 1},
+        use_spot=False)
+    replica = replica_managers.ReplicaInfo(
+        replica_id=1,
+        cluster_name='svc-1',
+        replica_port='8080',
+        is_spot=False,
+        location=location,
+        version=1,
+        resources_override=location.to_dict())
     replica.reserved_fill = True
     replica.reserved_fill_pool_key = pool_key
     replica.reserved_fill_service_generation = generation

@@ -47,6 +47,15 @@ SQLite. `cutover_gate_path` defaults to the chart's durable gate location.
 same effective values into `request_store` and remove the old block in one
 plan; this changes ownership without changing the rendered release contract.
 
+For an in-place upgrade of an existing release, capture its exact user values
+with `helm get values <release> --namespace <namespace> -o yaml` and pass the
+bytes plus their SHA-256 as `prior_helm_release_values`. The module then enables
+Helm `reuse_values` and supplies the captured document before its generated
+values and `extra_helm_values`. This makes the effective Helm merge order
+reproducible while preserving release-only database, authentication, and
+operator settings. The digest mismatch fails validation. Review the capture
+for secrets before committing it; this input enters Terraform state.
+
 ## RWX cutover authority fence
 
 After an existing control plane completes a reviewed migration from its legacy
@@ -352,6 +361,7 @@ No modules.
 | <a name="input_oidc_issuer_url"></a> [oidc\_issuer\_url](#input\_oidc\_issuer\_url) | OIDC issuer URL. | `string` | `"https://accounts.google.com"` | no |
 | <a name="input_operations_helper_image"></a> [operations\_helper\_image](#input\_operations\_helper\_image) | Exact image used for PostgreSQL config seeding and optional GCP/Azure login<br/>initialization. It must contain Python, SQLAlchemy, PyYAML, and the<br/>PostgreSQL driver; enabled cloud logins additionally require Bash and the<br/>corresponding gcloud or az CLI. Defaults to api\_server\_image. | `string` | `null` | no |
 | <a name="input_permissions_boundary_arn"></a> [permissions\_boundary\_arn](#input\_permissions\_boundary\_arn) | Optional organization-managed permissions boundary attached to the API-server IAM role. | `string` | `null` | no |
+| <a name="input_prior_helm_release_values"></a> [prior\_helm\_release\_values](#input\_prior\_helm\_release\_values) | Immutable existing-release user values and their exact SHA-256. Enables Helm value reuse and applies this capture before generated values and extra\_helm\_values. | <pre>object({<br/>    yaml   = string<br/>    sha256 = string<br/>  })</pre> | `null` | no |
 | <a name="input_prune_retired_serve_controller_keys"></a> [prune\_retired\_serve\_controller\_keys](#input\_prune\_retired\_serve\_controller\_keys) | Remove the retired serve.controller.consolidation\_mode and<br/>serve.controller.external\_load\_balancer keys from the DB-backed config during<br/>seeding. This is a one-way cutover aid and is disabled by default so public-chart<br/>consumers retain their existing config behavior. | `bool` | `false` | no |
 | <a name="input_rbac_default_role"></a> [rbac\_default\_role](#input\_rbac\_default\_role) | Default role for newly auto-provisioned SSO users. SkyPilot ships this as<br/>`admin` to ease setup; we default to `user` for least privilege. NOTE: verify<br/>it actually takes effect on your chart version (see skypilot issue #9271). | `string` | `"user"` | no |
 | <a name="input_release_name"></a> [release\_name](#input\_release\_name) | Helm release name. The chart derives the API service account as <release\_name>-api-sa. | `string` | `"skypilot"` | no |

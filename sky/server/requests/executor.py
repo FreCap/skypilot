@@ -25,13 +25,13 @@ import concurrent.futures
 import contextlib
 import multiprocessing
 import os
-import pathlib
 import signal
 import sys
 import threading
 import time
 import typing
 from typing import Any, Optional, ParamSpec, TextIO
+import uuid
 
 import psutil
 import setproctitle
@@ -49,7 +49,6 @@ from sky.server import clean_env as clean_env_module
 from sky.server import common as server_common
 from sky.server import config as server_config
 from sky.server import constants as server_constants
-from sky.server import daemons
 from sky.server import metrics as metrics_lib
 from sky.server import plugins
 from sky.server import versions
@@ -70,8 +69,8 @@ from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import context
 from sky.utils import context_utils
+from sky.utils import controller_capability
 from sky.utils import debug_dump_helpers
-from sky.utils import subprocess_utils
 from sky.utils import tempstore
 from sky.utils import timeline
 from sky.utils import yaml_utils
@@ -100,6 +99,8 @@ _REQUEST_THREADS_LIMIT = 128
 # Max length of the retry reason in a request's backoff status message; the
 # reason comes from the exception message, so truncate to keep it readable.
 _RETRY_STATUS_MSG_REASON_MAX_LEN = 200
+_QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS = 0.1
+_QUIESCENCE_RECEIPT_RETRY_MAX_SECONDS = 5.0
 
 _REQUEST_THREAD_EXECUTOR_LOCK = threading.Lock()
 # A dedicated thread pool executor for synced requests execution in coroutine to
@@ -107,6 +108,39 @@ _REQUEST_THREAD_EXECUTOR_LOCK = threading.Lock()
 # 1. blocking the event loop;
 # 2. exhausting the default thread pool executor of event loop;
 _REQUEST_THREAD_EXECUTOR: threads.OnDemandThreadExecutor | None = None
+
+
+def _open_controller_capability_transport(capability: str) -> int:
+    """Return one CLOEXEC pipe carrying canonical controller authority."""
+    controller_capability.digest(capability)
+    if hasattr(os, 'pipe2'):
+        read_fd, write_fd = os.pipe2(os.O_CLOEXEC)
+    else:
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(read_fd, False)
+        os.set_inheritable(write_fd, False)
+    keep_read_fd = False
+    try:
+        payload = capability.encode('ascii')
+        offset = 0
+        while offset < len(payload):
+            written = os.write(write_fd, payload[offset:])
+            if written <= 0:
+                raise OSError('Controller capability pipe made no progress.')
+            offset += written
+        keep_read_fd = True
+        return read_fd
+    finally:
+        os.close(write_fd)
+        if not keep_read_fd:
+            os.close(read_fd)
+
+
+def _request_role_shutdown_after_boundary_ambiguity(
+        error: process.AmbiguousBoundaryError) -> None:
+    """Enter the runtime's signal-driven not-Ready convergence path."""
+    del error
+    os.kill(os.getpid(), signal.SIGTERM)
 
 
 def api_process_execution_enabled() -> bool:
@@ -125,22 +159,6 @@ def get_request_thread_executor() -> threads.OnDemandThreadExecutor:
                 name='request_thread_executor',
                 max_workers=_REQUEST_THREADS_LIMIT)
         return _REQUEST_THREAD_EXECUTOR
-
-
-def _acknowledge_execution_quiescence(
-        claim: request_storage.ExecutionClaim) -> None:
-    """Best-effort publish that one exact invocation is quiescent."""
-    try:
-        request_storage.get_request_backend().acknowledge_execution_quiescence(
-            claim)
-    except Exception as e:  # pylint: disable=broad-except
-        # The execution itself is already quiescent. Keep its result intact;
-        # the wrapper and its normal-Future monitor each attempt this durable
-        # acknowledgement so a transient failure has an independent fallback.
-        logger.warning(
-            f'Failed to record execution quiescence for {claim.request_id} '
-            f'generation {claim.execution_generation}: '
-            f'{common_utils.format_exception(e)}')
 
 
 class RequestQueue:
@@ -181,6 +199,17 @@ class RequestQueue:
         return (queue_base.normalize_queue_item(item)
                 if item is not None else None)
 
+    def peek_provider_mutation(
+            self) -> queue_base.ProviderMutationCandidate | None:
+        """Read a provider mutation without creating durable ownership."""
+        return self._backend.peek_provider_mutation()
+
+    def claim_provider_mutation(
+        self, candidate: queue_base.ProviderMutationCandidate
+    ) -> queue_base.QueueItem | None:
+        """Try to claim an exact provider candidate after slot reservation."""
+        return self._backend.claim_provider_mutation(candidate)
+
     def __len__(self) -> int:
         """Get the length of the queue."""
         return self._backend.qsize()
@@ -192,6 +221,8 @@ _queue_factory: queue_base.QueueBackendFactory | None = None
 
 def executor_initializer(proc_group: str,
                          clean_env: dict[str, str] | None = None):
+    # The disposable boundary has already protected the handler and consumed
+    # any verified managed-origin transport before invoking this initializer.
     db_utils.set_postgres_connection_metrics_process_role('executor')
     setproctitle.setproctitle(f'SkyPilot:executor:{proc_group}:'
                               f'{multiprocessing.current_process().pid}')
@@ -258,6 +289,11 @@ class RequestWorker:
             config.num_db_connections_per_worker)
         self._thread: threading.Thread | None = None
         self._cancel_event = threading.Event()
+        self._monitor_condition = threading.Condition()
+        self._monitor_threads: set[threading.Thread] = set()
+        self._shutdown_error: BaseException | None = None
+        self._boundary_ambiguity_error: (process.AmbiguousBoundaryError |
+                                         None) = None
 
     def __str__(self) -> str:
         return f'Worker(schedule_type={self.schedule_type.value})'
@@ -282,14 +318,115 @@ class RequestWorker:
         """Wait for the worker dispatcher and its process pool to exit."""
         if self._thread is not None:
             self._thread.join()
+        # Pool termination makes every accepted Future complete. Each monitor
+        # remains registered until its exact outcome/receipt has durably
+        # converged (or the database proves its identity obsolete).
+        while True:
+            with self._monitor_condition:
+                monitors = tuple(self._monitor_threads)
+            if not monitors:
+                break
+            for monitor in monitors:
+                monitor.join()
+        shutdown_error = (self._boundary_ambiguity_error or
+                          self._shutdown_error)
+        if shutdown_error is not None:
+            raise RuntimeError(
+                f'{self} could not prove executor child shutdown.') from (
+                    shutdown_error)
+
+    def _handle_ambiguous_boundary(
+            self, error: process.AmbiguousBoundaryError) -> None:
+        """Poison this role after losing exact process-family proof."""
+        self._cancel_event.set()
+        with self._monitor_condition:
+            if self._boundary_ambiguity_error is not None:
+                return
+            self._boundary_ambiguity_error = error
+            self._monitor_condition.notify_all()
+        try:
+            logger.critical(
+                f'[{self}] Executor lost exact process-family quiescence proof; '
+                'stopping claims and draining role readiness while retaining '
+                f'ownership: {common_utils.format_exception(error)}')
+            self._mark_executor_poisoned()
+        finally:
+            try:
+                _request_role_shutdown_after_boundary_ambiguity(error)
+            # Synchronous dispatcher callback: retain the boundary ambiguity
+            # even if the role-level shutdown hook raises a BaseException.
+            except BaseException:  # noqa: ASYNC103  # pylint: disable=broad-except
+                # The worker is already locally fenced. Preserve the ambiguity
+                # for wait_for_shutdown() so runtime ownership still fails
+                # closed even when the role-level wakeup itself fails.
+                logger.exception('Failed to request role shutdown after losing '
+                                 'execution-boundary proof.')
+
+    def _start_task_monitor(self, fut: concurrent.futures.Future,
+                            request_element: queue_base.QueueItemLike) -> bool:
+        """Register a result monitor before making its thread runnable.
+
+        Returns whether the monitor thread started.  If thread creation fails,
+        this method cancels a gated invocation before admission and converges it
+        synchronously, so the caller must not publish RUNNING or admit effects.
+        """
+        monitor: threading.Thread
+
+        def run_monitor() -> None:
+            try:
+                self.handle_task_result(fut, request_element)
+            finally:
+                with self._monitor_condition:
+                    self._monitor_threads.discard(monitor)
+                    self._monitor_condition.notify_all()
+
+        monitor = threading.Thread(target=run_monitor, daemon=False)
+        with self._monitor_condition:
+            self._monitor_threads.add(monitor)
+        try:
+            monitor.start()
+        # Thread start is synchronous; every failure must converge the already
+        # accepted invocation before this dispatcher can return.
+        except BaseException as start_error:  # noqa: ASYNC103  # pylint: disable=broad-exception-caught
+            # The executor has already accepted the Future. Keep the registered
+            # ownership token while the dispatcher synchronously performs the
+            # exact same convergence work; dropping it here would leave an
+            # effect-bearing callable with no result/receipt owner.
+            logger.warning(
+                f'Could not start request result monitor; retaining ownership '
+                f'on the dispatcher thread: '
+                f'{type(start_error).__name__}: {start_error}')
+            if isinstance(fut, process.InvocationFuture):
+                fut.request_cancel()
+            run_monitor()
+            return False  # noqa: ASYNC104 - synchronous dispatcher path
+        return True
 
     def process_request(self, executor: process.BurstableExecutor,
                         queue: RequestQueue) -> None:
         request_id: str | None = None
         request_element: queue_base.QueueItem | None = None
-        fut: concurrent.futures.Future | None = None
+        fut: process.InvocationFuture | None = None
+        reservation: process.IdleWorkerReservation | None = None
         try:
-            queued = queue.get()
+            # Capacity is reserved before *every* dequeue.  A durable claim or
+            # legacy queue pop must never sit in a dispatcher-local backlog
+            # waiting for a process boundary to become available.
+            reservation = executor.try_reserve_idle_worker()
+            if reservation is None:
+                time.sleep(0.1)
+                return
+
+            # Provider-mutating PostgreSQL requests retain their distinct
+            # observe-then-claim order, but both provider and generic delivery
+            # now consume the same finite reservation capability.
+            peek_provider = getattr(queue, 'peek_provider_mutation', None)
+            provider_candidate = (peek_provider()
+                                  if callable(peek_provider) else None)
+            if provider_candidate is not None:
+                queued = queue.claim_provider_mutation(provider_candidate)
+            else:
+                queued = queue.get()
             if queued is None:
                 time.sleep(0.1)
                 return
@@ -306,6 +443,19 @@ class RequestWorker:
                                f'{request_id}: no request record found')
                 return
             if request.status == api_requests.RequestStatus.CANCELLED:
+                if request_element.claim_token is not None:
+                    # This exact generic or provider claim never reached a
+                    # child. Converge the generation-bound receipt with the
+                    # same retry-until-definitive protocol as a completed
+                    # boundary; cancellation racing a different owner makes
+                    # this exact identity definitively obsolete.
+                    self._converge_execution_completion(
+                        request_storage.ExecutionClaim(
+                            request_id, request_element.execution_generation,
+                            request_element.claim_token,
+                            request_element.worker_instance_id),
+                        error=concurrent.futures.CancelledError(),
+                        terminal_cause='dispatcher_submit_failed')
                 return
             if metrics_utils.METRICS_ENABLED:
                 metrics_utils.SKY_APISERVER_QUEUE_WAIT_SECONDS.labels(
@@ -314,27 +464,110 @@ class RequestWorker:
                             time.time() - request.created_at))
             del request
             logger.info(f'[{self}] Submitting request: {request_id}')
-            # Start additional process to run the request, so that it can be
-            # cancelled when requested by a user.
-            # TODO(zhwu): since the executor is reusing the request process,
-            # multiple requests can share the same process pid, which may cause
-            # issues with SkyPilot core functions if they rely on the exit of
-            # the process, such as subprocess_daemon.py.
-            fut = executor.submit_until_success(
-                _request_execution_wrapper, request_id, ignore_return_value,
-                self.num_db_connections_per_worker,
-                request_element.execution_generation,
-                request_element.claim_token, request_element.worker_instance_id)
+            # Start one disposable, invocation-owned process boundary.  Its
+            # outer guardian is the durable cancellation and liveness identity.
+            submit_args = (_request_execution_wrapper, request_id,
+                           ignore_return_value,
+                           self.num_db_connections_per_worker,
+                           request_element.execution_generation,
+                           request_element.claim_token,
+                           request_element.worker_instance_id,
+                           request_element.managed_job_origin)
+            capability_fd = None
+            if request_element.managed_job_origin is not None:
+                origin = request_element.managed_job_origin
+                if request_element.worker_instance_id != origin[1]:
+                    raise RuntimeError(
+                        'Managed-job nested request claim and origin disagree.')
+                capability = controller_capability.get_process_local()
+                if capability is None:
+                    raise RuntimeError(
+                        'Managed-job nested request has no controller '
+                        'capability authority.')
+                capability_fd = _open_controller_capability_transport(
+                    capability)
+            # submit_reserved consumes the capability before touching the
+            # selected lane, so this request can never enter a hidden backlog.
+            try:
+                fut = executor.submit_reserved(
+                    reservation,
+                    *submit_args,
+                    admission_gated=True,
+                    receipt_required=request_element.claim_token is not None,
+                    capability_fd=capability_fd)
+            finally:
+                if capability_fd is not None:
+                    os.close(capability_fd)
             # Decrement the free executor count when a request starts
             if metrics_utils.METRICS_ENABLED:
                 if self.schedule_type == api_requests.ScheduleType.LONG:
                     metrics_utils.SKY_APISERVER_LONG_EXECUTORS.dec()
                 elif self.schedule_type == api_requests.ScheduleType.SHORT:
                     metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.dec()
-            # Monitor the result of the request execution.
-            threading.Thread(target=self.handle_task_result,
-                             args=(fut, request_element),
-                             daemon=True).start()
+            # Establish the parent-owned result/receipt monitor before the
+            # guarded RUNNING transition or effect admission.  An accepted
+            # boundary can therefore never run without a durable convergence
+            # owner.
+            if not self._start_task_monitor(fut, request_element):
+                return
+
+            guardian = fut.guardian_identity
+            observed_start_ticks: int | None = None
+            try:
+                observed_start_ticks = (
+                    request_storage.read_linux_process_start_time_ticks(
+                        guardian.pid))
+            except (OSError, ValueError) as e:
+                fut.request_cancel()
+                raise process.BoundaryExecutionError(
+                    'Could not independently attest the invocation guardian.'
+                ) from e
+            if observed_start_ticks != guardian.start_time_ticks:
+                fut.request_cancel()
+                raise process.BoundaryExecutionError(
+                    'Invocation guardian birth identity changed before '
+                    'durable admission.')
+
+            # SQLite has no durable queue claim, so PID alone used to be its
+            # only cancellation identity. Persist the same exact guardian
+            # birth used by distributed claims for every local invocation.
+            process_start_ticks = guardian.start_time_ticks
+            admission_retry_seconds = (
+                _QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS)
+            admission_failure_reported = False
+            admitted = False
+            while True:
+                try:
+                    admitted = api_requests.try_mark_running(
+                        request_id, guardian.pid,
+                        request_element.execution_generation,
+                        request_element.claim_token, process_start_ticks)
+                    break
+                except Exception as admission_error:  # pylint: disable=broad-except
+                    # An authority/DB outage is not evidence that the exact
+                    # managed-job attempt is stale. Keep the guardian behind
+                    # its effect gate and retry until the backend returns a
+                    # definitive current/stale answer. Shutdown cancels the
+                    # still-pre-effect boundary.
+                    if not admission_failure_reported:
+                        logger.warning(
+                            f'RUNNING admission for request {request_id} is '
+                            'not yet durable; retaining its pre-effect '
+                            f'boundary and retrying: {common_utils.format_exception(admission_error)}'
+                        )
+                        admission_failure_reported = True
+                    if self._cancel_event.wait(admission_retry_seconds):
+                        fut.request_cancel()
+                        return
+                    admission_retry_seconds = min(
+                        admission_retry_seconds * 2,
+                        _QUIESCENCE_RECEIPT_RETRY_MAX_SECONDS)
+            if not admitted:
+                logger.warning(f'Request {request_id} is already finished or '
+                               'cancelled; cancelling before effect admission')
+                fut.request_cancel()
+                return
+            fut.admit()
 
             logger.info(f'[{self}] Submitted request: {request_id}')
         except (Exception, SystemExit) as e:  # pylint: disable=broad-except
@@ -353,28 +586,45 @@ class RequestWorker:
                 # and may already be RUNNING (or even finished); its lifecycle
                 # is owned by handle_task_result, so only log here.
                 self._fail_stranded_request(request_id, e, request_element)
+        finally:
+            if reservation is not None and fut is None:
+                # No-item/CAS-loss/cancellation paths still own the capability.
+                # A submit failure may already have consumed it, in which case
+                # the stale-token error proves there is nothing left to release.
+                try:
+                    executor.release_idle_worker_reservation(reservation)
+                except ValueError:
+                    pass
 
     def _fail_stranded_request(
             self, request_id: str, e: BaseException,
             request_element: queue_base.QueueItem | None) -> None:
-        """Best-effort: fail a dequeued request that never got submitted."""
+        """Durably fail a dequeued request that never got submitted."""
         claim_context_token = request_storage.activate_execution_claim(
             request_id, request_element.execution_generation
             if request_element is not None else 0, request_element.claim_token
             if request_element is not None else None)
         try:
             api_requests.set_exception_stacktrace(e)
-            transitioned = (request_storage.get_request_backend(
-            ).transition_request_terminal(request_id,
-                                          api_requests.RequestStatus.FAILED,
-                                          'dispatcher_submit_failed',
-                                          error=e))
-            if (transitioned and request_element is not None and
+            if (request_element is not None and
                     request_element.claim_token is not None):
-                _acknowledge_execution_quiescence(
+                # No Future exists, but the exact claimed delivery remains our
+                # responsibility. The same parent convergence protocol used by
+                # result monitors atomically terminalizes the pre-effect row
+                # and publishes its receipt, retrying transient database loss.
+                self._converge_execution_completion(
                     request_storage.ExecutionClaim(
                         request_id, request_element.execution_generation,
-                        request_element.claim_token))
+                        request_element.claim_token,
+                        request_element.worker_instance_id),
+                    error=e,
+                    terminal_cause='dispatcher_submit_failed')
+            else:
+                request_storage.get_request_backend(
+                ).transition_request_terminal(request_id,
+                                              api_requests.RequestStatus.FAILED,
+                                              'dispatcher_submit_failed',
+                                              error=e)
         except (Exception, SystemExit) as recovery_e:  # pylint: disable=broad-except
             # Never let the recovery itself crash the dispatcher thread.
             logger.error(
@@ -388,9 +638,9 @@ class RequestWorker:
     def _mark_executor_free(self) -> None:
         """Increment the free-executor gauge for this worker's schedule type.
 
-        Called the instant the worker process is released (i.e. the future
-        completes), so the gauge stays accurate even while a retry/pause wait
-        is still running in this monitor thread.
+        Called after the exact boundary result has been settled and its receipt
+        released, so the gauge never advertises capacity still retained by a
+        guardian.
         """
         if not metrics_utils.METRICS_ENABLED:
             return
@@ -399,6 +649,18 @@ class RequestWorker:
         elif self.schedule_type == api_requests.ScheduleType.SHORT:
             metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.inc()
 
+    def _mark_executor_poisoned(self) -> None:
+        """Stop advertising every slot in a permanently poisoned facade."""
+        if not metrics_utils.METRICS_ENABLED:
+            return
+        try:
+            if self.schedule_type == api_requests.ScheduleType.LONG:
+                metrics_utils.SKY_APISERVER_LONG_EXECUTORS.set(0)
+            elif self.schedule_type == api_requests.ScheduleType.SHORT:
+                metrics_utils.SKY_APISERVER_SHORT_EXECUTORS.set(0)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception('Failed to publish poisoned executor capacity.')
+
     def handle_task_result(self, fut: concurrent.futures.Future,
                            request_element: queue_base.QueueItemLike) -> None:
         original_request_element = request_element
@@ -406,182 +668,321 @@ class RequestWorker:
         claim_context_token = request_storage.activate_execution_claim(
             request_element.request_id, request_element.execution_generation,
             request_element.claim_token)
-        heartbeat_stop = threading.Event()
-        heartbeat_thread: threading.Thread | None = None
-        backend = request_storage.get_request_backend()
-        interval = backend.claim_heartbeat_interval_seconds
-        if request_element.claim_token is not None and interval is not None:
-            claim = request_storage.ExecutionClaim(
-                request_element.request_id,
-                request_element.execution_generation,
-                request_element.claim_token)
-
-            def heartbeat() -> None:
-                while not heartbeat_stop.is_set():
+        try:
+            if request_element.claim_token is not None:
+                claim = request_storage.ExecutionClaim(
+                    request_element.request_id,
+                    request_element.execution_generation,
+                    request_element.claim_token,
+                    request_element.worker_instance_id)
+                retry_seconds = _QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS
+                backend_failure_reported = False
+                backend: request_storage.RequestBackend | None = None
+                interval: float | None = None
+                while True:
                     try:
-                        if not backend.heartbeat_claim(claim):
-                            if backend.interrupt_cancelled_claim(claim):
-                                logger.info(f'Signalled cancellation for '
+                        backend = request_storage.get_request_backend()
+                        interval = backend.claim_heartbeat_interval_seconds
+                        break
+                    except Exception as backend_error:  # pylint: disable=broad-except
+                        if not backend_failure_reported:
+                            logger.warning(
+                                f'Cannot yet acquire the durable request '
+                                f'backend for {claim.request_id}; retaining '
+                                f'its monitor and retrying: '
+                                f'{common_utils.format_exception(backend_error)}'
+                            )
+                            backend_failure_reported = True
+                        time.sleep(retry_seconds)
+                        retry_seconds = min(
+                            retry_seconds * 2,
+                            _QUIESCENCE_RECEIPT_RETRY_MAX_SECONDS)
+
+                assert backend is not None
+                if interval is not None:
+                    # One registered thread owns both lease maintenance and
+                    # Future completion. This avoids a second thread-start gap
+                    # after the callable has already been accepted by the pool.
+                    future_done = threading.Event()
+                    fut.add_done_callback(lambda _future: future_done.set())
+                    revocation_reported = False
+                    while not future_done.is_set():
+                        try:
+                            if not backend.heartbeat_claim(claim):
+                                if backend.interrupt_cancelled_claim(claim):
+                                    if not revocation_reported:
+                                        logger.info(
+                                            f'Signalled cancellation for '
                                             f'{claim.request_id} generation '
                                             f'{claim.execution_generation}; '
-                                            'waiting for execution quiescence.')
-                                return
+                                            'waiting for exact execution '
+                                            'quiescence.')
+                                elif not revocation_reported:
+                                    logger.warning(
+                                        f'Execution claim for '
+                                        f'{claim.request_id} became stale; '
+                                        'subsequent writes are fenced and '
+                                        'exact cancellation delivery will be '
+                                        'retried until the wrapper exits.')
+                                # Signal delivery is not quiescence. Keep
+                                # re-delivering until this exact Future proves
+                                # that the wrapper returned.
+                                revocation_reported = True
+                        except Exception as heartbeat_error:  # pylint: disable=broad-except
                             logger.warning(
-                                f'Execution claim for {claim.request_id} '
-                                'became stale; subsequent writes are fenced.')
-                            return
-                    except Exception as e:  # pylint: disable=broad-except
-                        # A transient database failure must not kill the monitor
-                        # thread. If connectivity is not restored before lease
-                        # expiry, the next heartbeat and every result write are
-                        # rejected by the database-side fence.
-                        logger.warning(
-                            f'Failed to heartbeat execution claim for '
-                            f'{claim.request_id}: '
-                            f'{common_utils.format_exception(e)}')
-                    heartbeat_stop.wait(interval)
-
-            heartbeat_thread = threading.Thread(
-                target=heartbeat,
-                name=f'request-lease-{request_element.request_id}',
-                daemon=True)
-            heartbeat_thread.start()
-        try:
+                                f'Failed to heartbeat execution claim for '
+                                f'{claim.request_id}: '
+                                f'{common_utils.format_exception(heartbeat_error)}'
+                            )
+                        future_done.wait(interval)
             self._handle_task_result(fut, original_request_element)
         finally:
-            heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join(timeout=interval)
             request_storage.deactivate_execution_claim(claim_context_token)
+
+    def _converge_execution_completion(
+            self,
+            claim: request_storage.ExecutionClaim,
+            error: BaseException | None = None,
+            terminal_cause: str = 'handler_failed') -> bool:
+        """Retry parent-owned outcome/receipt delivery until definitive."""
+        retry_seconds = _QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS
+        failure_reported = False
+        while True:
+            try:
+                backend = request_storage.get_request_backend()
+                return backend.converge_execution_completion(
+                    claim, error=error, terminal_cause=terminal_cause)
+            except Exception as convergence_error:  # pylint: disable=broad-except
+                if not failure_reported:
+                    logger.warning(
+                        f'Execution completion for {claim.request_id} '
+                        f'generation {claim.execution_generation} is not yet '
+                        'durable; retaining its monitor and retrying: '
+                        f'{common_utils.format_exception(convergence_error)}')
+                    failure_reported = True
+                time.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2,
+                                    _QUIESCENCE_RECEIPT_RETRY_MAX_SECONDS)
+
+    def _converge_local_execution_quiescence(
+            self, request_id: str, fut: concurrent.futures.Future) -> None:
+        """Publish one SQLite receipt before releasing its exact boundary."""
+        if not isinstance(fut, process.InvocationFuture):
+            return
+        guardian = fut.guardian_identity
+        retry_seconds = _QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS
+        failure_reported = False
+        while True:
+            try:
+                backend = request_storage.get_request_backend()
+                if not backend.supports_local_execution_quiescence:
+                    return
+                backend.acknowledge_local_execution_quiescence(
+                    request_id, guardian.pid, guardian.start_time_ticks)
+                return
+            except Exception as convergence_error:  # pylint: disable=broad-except
+                if not failure_reported:
+                    logger.warning(
+                        f'Local execution receipt for {request_id} is not yet '
+                        'durable; retaining its boundary and retrying: '
+                        f'{common_utils.format_exception(convergence_error)}')
+                    failure_reported = True
+                time.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2,
+                                    _QUIESCENCE_RECEIPT_RETRY_MAX_SECONDS)
+
+    def _handoff_execution_retry(self, claim: request_storage.ExecutionClaim,
+                                 status_msg: str,
+                                 retry_wait_seconds: float) -> bool:
+        """Retry an atomic durable handoff until its outcome is known."""
+        retry_seconds = _QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS
+        failure_reported = False
+        while True:
+            try:
+                backend = request_storage.get_request_backend()
+                handed_off = backend.handoff_execution_retry(
+                    claim, status_msg, retry_wait_seconds)
+                if handed_off is None:
+                    raise RuntimeError(
+                        'A durable execution claim requires an atomic retry '
+                        'handoff implementation.')
+                return handed_off
+            except Exception as handoff_error:  # pylint: disable=broad-except
+                if not failure_reported:
+                    logger.warning(
+                        f'Retry handoff for {claim.request_id} generation '
+                        f'{claim.execution_generation} is not yet durable; '
+                        f'retaining its boundary and retrying: '
+                        f'{common_utils.format_exception(handoff_error)}')
+                    failure_reported = True
+                time.sleep(retry_seconds)
+                retry_seconds = min(retry_seconds * 2,
+                                    _QUIESCENCE_RECEIPT_RETRY_MAX_SECONDS)
+
+    @staticmethod
+    def _acknowledge_boundary_receipt(fut: concurrent.futures.Future) -> None:
+        """Release a proven boundary after its durable convergence attempt."""
+        if not isinstance(fut, process.InvocationFuture):
+            return
+        if fut.boundary_result is None:
+            raise RuntimeError('A non-ambiguous invocation Future completed '
+                               'without a boundary result.')
+        fut.acknowledge_receipt()
 
     def _handle_task_result(self, fut: concurrent.futures.Future,
                             request_element: queue_base.QueueItemLike) -> None:
         requeue_element = request_element
         request_element = queue_base.normalize_queue_item(request_element)
+        claim = (request_storage.ExecutionClaim(
+            request_element.request_id, request_element.execution_generation,
+            request_element.claim_token, request_element.worker_instance_id)
+                 if request_element.claim_token is not None else None)
+        boundary_ambiguous = False
+        boundary_released = False
         try:
             try:
                 fut.result()
-                # A normal ProcessPool Future completion proves that this
-                # exact wrapper returned. BrokenProcessPool and all other
-                # exceptional Future outcomes remain ambiguous: another pool
-                # child can break the Future while this request's child is
-                # still running effect-bearing code.
-                if request_element.claim_token is not None:
-                    _acknowledge_execution_quiescence(
-                        request_storage.ExecutionClaim(
-                            request_element.request_id,
-                            request_element.execution_generation,
-                            request_element.claim_token))
-            finally:
-                # The worker process is released the instant the future
-                # completes, before any retry/pause wait below. Account for it
-                # here so the free-executor gauge reflects the idle process
-                # during the wait, instead of staying decremented until the
-                # request finishes or reschedules.
-                self._mark_executor_free()
-        except concurrent.futures.process.BrokenProcessPool as e:
-            # Happens when the worker process dies unexpectedly, e.g. OOM
-            # killed.
-            request_id = request_element.request_id
-            retryable = request_element.retryable
-            logger.error(
-                f'Request {request_id} failed to get processed '
-                f'{common_utils.format_exception(e, use_bracket=True)}')
-            if request_element.claim_token is not None or not retryable:
-                # A durable claimed invocation cannot be proven stopped from a
-                # BrokenProcessPool Future. Requeueing it would create a new
-                # generation whose receipt could mask the old invocation.
-                api_requests.set_request_failed(request_id, e)
+            except process.AmbiguousBoundaryError as e:
+                boundary_ambiguous = True
+                self._handle_ambiguous_boundary(e)
+                logger.error(
+                    f'Request {request_element.request_id} lost both execution '
+                    'boundary owners without family-quiescence proof; retaining '
+                    'its durable claim fail closed: '
+                    f'{common_utils.format_exception(e, use_bracket=True)}')
+                # Neither terminalize, receipt, nor requeue. Guardian absence is
+                # not proof that the inner family stopped, and there is no
+                # second PID-death recovery path.
                 return
-            # A retry must remain in an executable state. Marking it FAILED
-            # before queueing makes the next execution wrapper reject it at
-            # try_mark_running(), so the apparent retry is a no-op. Serialize
-            # the transition with cancellation and leave WAITING recoverable
-            # if the API server exits before queue.put(). PENDING is possible
-            # when the worker died before the wrapper marked the row RUNNING.
-            with api_requests.update_request(request_id) as request_task:
-                if (request_task is None or request_task.status
-                        not in (api_requests.RequestStatus.PENDING,
-                                api_requests.RequestStatus.RUNNING)):
-                    logger.info(
-                        f'Dropping broken-pool retry for request {request_id}: '
-                        'request is gone or no longer executable')
-                    return
-                request_task.status = api_requests.RequestStatus.WAITING
-                request_task.pid = None
-                request_task.status_msg = (
-                    'Worker process exited unexpectedly; retrying')
-            # BurstableExecutor replaces the broken guaranteed pool on the
-            # next submission, so reschedule immediately.
-            queue = _get_queue(self.schedule_type)
-            queue.put(requeue_element)
-        except exceptions.ExecutionRetryableError as e:
-            request_id = request_element.request_id
-            # Unlike BrokenProcessPool, this exception was explicitly
-            # serialized only after the wrapper's finally block completed. A
-            # parent-side retry closes a transient child DB-write failure
-            # before this generation becomes WAITING and loses its live PID.
-            if request_element.claim_token is not None:
-                _acknowledge_execution_quiescence(
-                    request_storage.ExecutionClaim(
-                        request_id, request_element.execution_generation,
-                        request_element.claim_token))
-            # Clamp to avoid ValueError from time.sleep() on a negative wait.
-            retry_wait_seconds = max(0, e.retry_wait_seconds)
-            # A pause (ExecutionPausedError) may carry a continue condition that
-            # owns how to wait for the resume signal; without one, fall back to
-            # a fixed backoff. Either way the wait runs in this monitor thread,
-            # not an executor worker.
-            condition = getattr(e, 'continue_condition', None)
-            # Surface why we are retrying, not just the wait time. status_msg
-            # is a single-line field, so strip color and collapse whitespace.
-            request = api_requests.get_request(request_id,
-                                               fields=['name', 'request_body'])
-            safe_error = (api_requests.sanitize_request_error(
-                request.name, e, request.request_body)
-                          if request is not None else e)
-            reason = ' '.join(
-                common_utils.remove_color(str(safe_error)).split())
-            if len(reason) > _RETRY_STATUS_MSG_REASON_MAX_LEN:
-                reason = reason[:_RETRY_STATUS_MSG_REASON_MAX_LEN].rstrip(
-                ) + '...'
-            retry_suffix = ('waiting to resume' if condition is not None else
-                            f'retrying in {retry_wait_seconds}s')
-            status_msg = (f'{reason} ({retry_suffix})'
-                          if reason else retry_suffix.capitalize())
-            # Set request to WAITING status for visibility. Cancellation can
-            # win after the executor raises but before this monitor handles the
-            # future. Only the RUNNING owner may hand the request back to the
-            # retry queue; otherwise this write would resurrect CANCELLED.
-            with api_requests.update_request(request_id) as request_task:
-                if (request_task is None or request_task.status
-                        != api_requests.RequestStatus.RUNNING):
-                    logger.info(f'Dropping retry for request {request_id}: '
-                                'request is gone or no longer running')
-                    return
-                request_task.status = api_requests.RequestStatus.WAITING
-                request_task.status_msg = status_msg
-            try:
-                if condition is not None:
-                    should_reschedule = condition.wait(
-                        is_cancelled=lambda: _request_is_gone_or_cancelled(
-                            request_id),
-                        fallback_wait_seconds=retry_wait_seconds)
+            except concurrent.futures.CancelledError as e:
+                if claim is None:
+                    self._converge_local_execution_quiescence(
+                        request_element.request_id, fut)
+                if claim is not None:
+                    self._converge_execution_completion(
+                        claim,
+                        error=e,
+                        terminal_cause='dispatcher_submit_failed')
                 else:
+                    api_requests.set_request_failed(request_element.request_id,
+                                                    e)
+            except exceptions.ExecutionRetryableError as e:
+                if claim is None:
+                    self._converge_local_execution_quiescence(
+                        request_element.request_id, fut)
+                request_id = request_element.request_id
+                # Clamp to avoid ValueError from time.sleep() on a negative wait.
+                retry_wait_seconds = max(0, e.retry_wait_seconds)
+                # A pause (ExecutionPausedError) may carry a continue condition
+                # that owns how to wait for the resume signal; without one, fall
+                # back to a fixed backoff. Either way the wait runs in this
+                # monitor thread, while the receipt-retained boundary continues
+                # to own the executor slot.
+                condition = getattr(e, 'continue_condition', None)
+                # Surface why we are retrying, not just the wait time. status_msg
+                # is a single-line field, so strip color and collapse whitespace.
+                request = api_requests.get_request(
+                    request_id, fields=['name', 'request_body'])
+                safe_error = (api_requests.sanitize_request_error(
+                    request.name, e, request.request_body)
+                              if request is not None else e)
+                reason = ' '.join(
+                    common_utils.remove_color(str(safe_error)).split())
+                if len(reason) > _RETRY_STATUS_MSG_REASON_MAX_LEN:
+                    reason = reason[:_RETRY_STATUS_MSG_REASON_MAX_LEN].rstrip(
+                    ) + '...'
+                retry_suffix = ('waiting to resume'
+                                if condition is not None and claim is None else
+                                f'retrying in {retry_wait_seconds}s')
+                status_msg = (f'{reason} ({retry_suffix})'
+                              if reason else retry_suffix.capitalize())
+                if claim is not None:
+                    # The returned Future proves that the complete invocation
+                    # family stopped.  Consume that proof directly into one
+                    # delayed durable delivery; never retain this monitor (or
+                    # its finite executor capability) for the backoff period.
+                    if self._handoff_execution_retry(claim, status_msg,
+                                                     retry_wait_seconds):
+                        logger.info(f'Rescheduled request {request_id} for '
+                                    f'retry in {retry_wait_seconds}s')
+                    else:
+                        # Cancellation or an owner transition may have won.
+                        # Publish the same family proof to any retained exact
+                        # tombstone, without reopening or requeueing it.
+                        self._converge_execution_completion(claim)
+                        logger.info(
+                            f'Dropping retry for request {request_id}: its '
+                            'exact execution identity is obsolete')
+                    return
+                # Set request to WAITING status for visibility. Cancellation can
+                # win after the executor raises but before this monitor handles
+                # the future. Only the RUNNING owner may hand the request back
+                # to the retry queue; otherwise this write would resurrect
+                # CANCELLED.
+                with api_requests.update_request(request_id) as request_task:
+                    if (request_task is None or request_task.status
+                            != api_requests.RequestStatus.RUNNING):
+                        logger.info(
+                            f'Dropping retry for request {request_id}: request '
+                            'is gone or no longer running')
+                        return
+                    request_task.status = api_requests.RequestStatus.WAITING
+                    request_task.status_msg = status_msg
+                # Local backends have no durable claim to consume atomically.
+                # The Future nevertheless proves this invocation family is
+                # empty, so release its disposable boundary and finite worker
+                # capability before the compatibility wait.  SQLite startup
+                # recovery owns a WAITING row if this monitor then disappears.
+                self._acknowledge_boundary_receipt(fut)
+                self._mark_executor_free()
+                boundary_released = True
+                try:
+                    if condition is not None:
+                        should_reschedule = condition.wait(
+                            is_cancelled=lambda: _request_is_gone_or_cancelled(
+                                request_id),
+                            fallback_wait_seconds=retry_wait_seconds)
+                    else:
+                        time.sleep(retry_wait_seconds)
+                        should_reschedule = True
+                except Exception as wait_err:  # pylint: disable=broad-except
+                    logger.error(
+                        f'Continue-condition wait failed for {request_id}: '
+                        f'{common_utils.format_exception(wait_err)}')
                     time.sleep(retry_wait_seconds)
                     should_reschedule = True
-            except Exception as wait_err:  # pylint: disable=broad-except
-                logger.error(
-                    f'Continue-condition wait failed for {request_id}: '
-                    f'{common_utils.format_exception(wait_err)}')
-                time.sleep(retry_wait_seconds)
-                should_reschedule = True
-            if (should_reschedule and
-                    not _request_is_gone_or_cancelled(request_id)):
-                # Reschedule the request.
-                queue = _get_queue(self.schedule_type)
-                queue.put(requeue_element)
-                logger.info(f'Rescheduled request {request_id} for retry')
+                if (should_reschedule and
+                        not _request_is_gone_or_cancelled(request_id)):
+                    queue = _get_queue(self.schedule_type)
+                    queue.put(requeue_element)
+                    logger.info(f'Rescheduled request {request_id} for retry')
+            # The result monitor is a synchronous thread and transports child
+            # BaseExceptions as durable request outcomes.
+            except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
+                if claim is None:
+                    self._converge_local_execution_quiescence(
+                        request_element.request_id, fut)
+                # A transported callable exception still proves that this exact
+                # invocation's family drained. Terminalize only if the child did
+                # not already persist a terminal result, then durably deliver
+                # its receipt.
+                if claim is not None:
+                    self._converge_execution_completion(claim, error=e)
+                else:
+                    api_requests.set_request_failed(request_element.request_id,
+                                                    e)
+            else:
+                if claim is not None:
+                    self._converge_execution_completion(claim)
+                else:
+                    self._converge_local_execution_quiescence(
+                        request_element.request_id, fut)
+        finally:
+            if not boundary_ambiguous and not boundary_released:
+                try:
+                    self._acknowledge_boundary_receipt(fut)
+                finally:
+                    self._mark_executor_free()
 
     def run(self) -> None:
         # Handle the SIGTERM signal to abort the executor process gracefully.
@@ -606,7 +1007,8 @@ class RequestWorker:
                 garanteed_workers=self.garanteed_parallelism,
                 burst_workers=self.burstable_parallelism,
                 initializer=executor_initializer,
-                initargs=(proc_group, clean_env_module.get_clean_server_env()))
+                initargs=(proc_group, clean_env_module.get_clean_server_env()),
+                on_ambiguous_boundary=self._handle_ambiguous_boundary)
             # Initialize the appropriate gauge for the number of free executors
             total_executors = (self.garanteed_parallelism +
                                self.burstable_parallelism)
@@ -631,7 +1033,31 @@ class RequestWorker:
             # to avoid broken state in such cases.
             logger.info(f'[{self}] Worker process interrupted')
             if executor is not None:
-                executor.shutdown()
+                pending_reported = False
+                while True:
+                    try:
+                        executor.shutdown()
+                    except process.BoundaryShutdownPendingError as e:
+                        # Result monitors retain receipt-required guardians while
+                        # their exact database convergence is unavailable. Keep
+                        # this dispatcher—and therefore its runtime ownership—
+                        # alive and retry the authoritative shutdown instead of
+                        # caching a transient proof gap forever.
+                        if not pending_reported:
+                            logger.info(
+                                f'[{self}] Waiting for exact executor boundary '
+                                f'shutdown: {common_utils.format_exception(e)}')
+                            pending_reported = True
+                        time.sleep(_QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS)
+                        continue
+                    # The dispatcher thread must retain any shutdown proof
+                    # failure for the runtime supervisor.
+                    except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
+                        self._shutdown_error = e
+                        logger.error(
+                            f'[{self}] Executor shutdown did not prove every '
+                            f'child absent: {type(e).__name__}: {e}')
+                    break
 
 
 @annotations.lru_cache(scope='global', maxsize=None)
@@ -674,16 +1100,11 @@ _SILENT_WORKSPACE_RESOLUTION_SOURCES = {
 }
 
 
-def _should_apply_workspace_resolver(is_daemon: bool,
-                                     client_api_version: int | None) -> bool:
+def _should_apply_workspace_resolver(client_api_version: int | None) -> bool:
     """Returns True iff the per-user workspace resolver should run for
-    this request. Three gates, in order:
+    this request. Two gates, in order:
 
-      (a) skip daemons / system-user requests — the system user is admin
-          and would land on 'default' via the default-fallback step
-          anyway; the resolver would add a DB read + permission check per
-          daemon tick (thousands per hour) for zero behavioral change.
-      (b) skip when the client API version is below the version that
+      (a) skip when the client API version is below the version that
           added /users/me/workspace + WorkspaceAmbiguousError handling —
           old clients wouldn't know how to interpret the new error
           format, so preserve the legacy permission-denied path that
@@ -693,12 +1114,10 @@ def _should_apply_workspace_resolver(is_daemon: bool,
           None in workers because the underlying ContextVar set by
           APIVersionMiddleware does not propagate across process
           boundaries.
-      (c) skip when active_workspace was explicitly set on the wire
+      (b) skip when active_workspace was explicitly set on the wire
           (anywhere in the merged config) — respect explicit user intent;
           preferred MUST be ignored when the user names a workspace.
     """
-    if is_daemon:
-        return False
     if (client_api_version is None or client_api_version
             < server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION):
         return False
@@ -710,60 +1129,21 @@ def override_request_env_and_config(
         request_body: payloads.RequestBody, request_id: str,
         request_name: str) -> Generator[None, None, None]:
     """Override the environment and SkyPilot config for a request."""
-    # Daemons run AS the server, not as any client. Their persisted
-    # request_body.env_vars came from whichever pod first scheduled them,
-    # which may be a previous deployment generation with stale downward-API
-    # values (e.g. SKYPILOT_POD_MEMORY_BYTES_LIMIT, SKYPILOT_APISERVER_UUID).
-    # Overlaying those would clobber the current pod's actual values. So
-    # for daemons, skip the env overlay and use the current process's
-    # os.environ.
-    is_daemon = daemons.is_daemon_request_id(request_id)
     original_env = os.environ.copy()
     try:
-        if is_daemon:
-            # The SkyPilot system user is already upserted at scheduling
-            # time by prepare_request_async when is_skypilot_system=True,
-            # so no add_or_update_user round-trip is needed per tick.
-            user = models.User(id=constants.SKYPILOT_SYSTEM_USER_ID,
-                               name=constants.SKYPILOT_SYSTEM_USER_ID,
-                               user_type=models.UserType.SYSTEM.value)
-            # Daemons always run in-process on the server, regardless of
-            # what the persisted body recorded.
-            using_remote_api_server = False
-        else:
-            # Unset SKYPILOT_DEBUG by default, to avoid the value set on the
-            # API server affecting client requests. If set on the client
-            # side, it will be overridden by the request body.
-            os.environ.pop('SKYPILOT_DEBUG', None)
-            # Remove the db connection uri from client supplied env vars, as
-            # the client should not set the db string on server side.
-            request_body.env_vars.pop(constants.ENV_VAR_DB_CONNECTION_URI, None)
-            # Remove the in-cluster context name from client supplied env
-            # vars. When a client runs inside a Kubernetes pod (e.g., a
-            # managed job with api_server_access), its env has
-            # SKYPILOT_IN_CLUSTER_CONTEXT_NAME set pod template. If this
-            # leaks into the server's os.environ, it causes the server to
-            # attempt in-cluster auth (load_incluster_config) instead of
-            # using its own kubeconfig, which fails when the server is not
-            # running in a Kubernetes pod.
-            request_body.env_vars.pop(
-                kubernetes_adaptor.IN_CLUSTER_CONTEXT_NAME_ENV_VAR, None)
-            # Treat request bodies as untrusted even if the normal client
-            # serializer already omits deployment-owned environment variables.
-            # This prevents a hand-crafted body from changing platform
-            # capabilities for one request.
-            payloads.remove_server_owned_env_vars(request_body.env_vars)
-            os.environ.update(request_body.env_vars)
-            # Note: may be overridden by AuthProxyMiddleware.
-            # TODO(zhwu): we need to make the entire request a context
-            # available to the entire request execution, so that we can
-            # access info like user through the execution.
-            user = models.User(
-                id=request_body.env_vars[constants.USER_ID_ENV_VAR],
-                name=request_body.env_vars[constants.USER_ENV_VAR])
-            _, user = global_user_state.add_or_update_user(user,
-                                                           return_user=True)
-            using_remote_api_server = request_body.using_remote_api_server
+        # Unset SKYPILOT_DEBUG by default, to avoid the value set on the API
+        # server affecting client requests. If set on the client side, it is
+        # restored from the request body below.
+        os.environ.pop('SKYPILOT_DEBUG', None)
+        request_body.env_vars.pop(constants.ENV_VAR_DB_CONNECTION_URI, None)
+        request_body.env_vars.pop(
+            kubernetes_adaptor.IN_CLUSTER_CONTEXT_NAME_ENV_VAR, None)
+        payloads.remove_server_owned_env_vars(request_body.env_vars)
+        os.environ.update(request_body.env_vars)
+        user = models.User(id=request_body.env_vars[constants.USER_ID_ENV_VAR],
+                           name=request_body.env_vars[constants.USER_ENV_VAR])
+        _, user = global_user_state.add_or_update_user(user, return_user=True)
+        using_remote_api_server = request_body.using_remote_api_server
 
         # Force color to be enabled.
         os.environ['CLICOLOR_FORCE'] = '1'
@@ -792,7 +1172,7 @@ def override_request_env_and_config(
                 # always landing on the bare 'default' literal. Explicit
                 # intent (any value, including 'default') is passed through
                 # unchanged. See _should_apply_workspace_resolver for the
-                # exact gate conditions (daemon skip, client API version,
+                # exact gate conditions (client API version and
                 # explicit-intent respect).
                 workspace_ctx: contextlib.AbstractContextManager = (
                     contextlib.nullcontext())
@@ -803,8 +1183,7 @@ def override_request_env_and_config(
                 # processes (BurstableExecutor = ProcessPoolExecutor).
                 client_api_version = getattr(request_body, 'client_api_version',
                                              None)
-                if _should_apply_workspace_resolver(is_daemon,
-                                                    client_api_version):
+                if _should_apply_workspace_resolver(client_api_version):
                     resolution = workspaces_core.resolve_workspace_for_user(
                         user)
                     workspace_ctx = (skypilot_config.local_active_workspace_ctx(
@@ -857,11 +1236,7 @@ def override_request_env_and_config(
         # Restore the original environment variables, so that a new request
         # won't be affected by the previous request, e.g. SKYPILOT_DEBUG
         # setting, etc. This is necessary as our executor is reusing the
-        # same process for multiple requests. The daemon path also relies
-        # on this: daemons mutate os.environ from inside the with block
-        # (e.g. setting SKYPILOT_DISABLE_LOGGING in
-        # InternalRequestDaemon.run_event), and that mutation must not
-        # leak to whichever request the worker handles next.
+        # same process for multiple requests.
         os.environ.clear()
         os.environ.update(original_env)
 
@@ -907,50 +1282,21 @@ def _sigterm_handler(signum: int, frame: Optional['types.FrameType']) -> None:
 
 # Set by _request_execution_wrapper; read by _gated_sigterm_handler.
 _in_request_execution: bool = False
-_execution_cancellation_marker: pathlib.Path | None = None
 
 
 def _gated_sigterm_handler(signum: int,
                            frame: Optional['types.FrameType']) -> None:
     """Raise KeyboardInterrupt only while actively executing a request.
 
-    SIGTERM landing on an idle worker (blocked in
-    concurrent.futures._process_worker's call_queue.get) would escape
-    _process_worker unhandled and break the entire pool. Swallow it; the
-    cancellation path already targets the worker by pid, so a stray SIGTERM
-    on an idle worker just means we lost the race with the request finishing.
+    The process is disposable, but a duplicate signal can arrive while the
+    wrapper is already unwinding.  Raise only once and let the invocation
+    warden own complete descendant termination and reaping.
     """
     del signum, frame
     global _in_request_execution  # pylint: disable=global-statement
     if _in_request_execution:
-        marker = _execution_cancellation_marker
-        if marker is not None:
-            try:
-                armed = request_storage.consume_execution_cancellation(marker)
-            except OSError:
-                # Marker I/O uncertainty cannot fall through the wrapper's
-                # ordinary Exception path: that would skip child cleanup and
-                # could publish a false receipt. Treat it as cancellation and
-                # run the same mandatory cleanup path.
-                armed = True
-            if not armed:
-                # This PID has already moved to a different exact invocation,
-                # or the signal arrived without its token-addressed marker. It
-                # must not interrupt the current request.
-                return
-        # One cancellation interrupt per invocation. A duplicate SIGTERM can
-        # arrive from the API kill path and the executor heartbeat; allowing it
-        # to raise while the first interrupt is synchronously cleaning child
-        # processes would skip that cleanup and publish a false quiescence
-        # receipt from the wrapper's finally block. The next invocation rearms
-        # this gate immediately before executing its handler.
         _in_request_execution = False
         raise KeyboardInterrupt
-    # logger isn't async-signal-safe (re-entrant lock); use os.write.
-    try:
-        os.write(2, b'SIGTERM received while worker idle; ignored.\n')
-    except Exception:  # pylint: disable=broad-except
-        pass
 
 
 def _enrich_event_target_id(request_id: str, cluster_name: str | None) -> None:
@@ -990,12 +1336,63 @@ def _capture_event_target(
         _enrich_event_target_id(request_id, cluster_name)
 
 
-def _request_execution_wrapper(request_id: str,
-                               ignore_return_value: bool,
-                               num_db_connections_per_worker: int = 0,
-                               execution_generation: int = 0,
-                               claim_token: str | None = None,
-                               worker_instance_id: str | None = None) -> None:
+def _durable_managed_job_origin(
+    request_task: api_requests.Request,
+) -> tuple[int, str, int, int, str] | None:
+    """Decode a complete canonical origin from one durable request row."""
+    raw = (request_task.managed_job_id,
+           request_task.managed_job_controller_instance_id,
+           request_task.managed_job_controller_generation,
+           request_task.managed_job_controller_slot_id,
+           request_task.managed_job_controller_slot_attempt)
+    if all(value is None for value in raw):
+        return None
+    if any(value is None for value in raw):
+        raise RuntimeError('Managed-job request origin is incomplete.')
+    job_id, instance_id, generation, slot_id, attempt = raw
+    if (isinstance(job_id, bool) or not isinstance(job_id, int) or
+            not isinstance(instance_id, str) or isinstance(generation, bool) or
+            not isinstance(generation, int) or isinstance(slot_id, bool) or
+            not isinstance(slot_id, int) or not isinstance(attempt, str)):
+        raise RuntimeError('Managed-job request origin is malformed.')
+    try:
+        canonical_instance_id = str(uuid.UUID(instance_id))
+        canonical_attempt = str(uuid.UUID(attempt))
+    except ValueError as e:
+        raise RuntimeError('Managed-job request origin is malformed.') from e
+    if (job_id <= 0 or generation <= 0 or slot_id < 0 or
+            canonical_instance_id != instance_id or
+            canonical_attempt != attempt):
+        raise RuntimeError('Managed-job request origin is not canonical.')
+    return job_id, instance_id, generation, slot_id, attempt
+
+
+@contextlib.contextmanager
+def _verified_managed_job_execution_origin(
+    request_task: api_requests.Request,
+    expected_origin: tuple[int, str, int, int, str] | None,
+) -> Generator[None, None, None]:
+    """Install only the exact queue-verified origin for this handler."""
+    durable_origin = _durable_managed_job_origin(request_task)
+    if durable_origin != expected_origin:
+        raise RuntimeError(
+            'Managed-job request origin changed after its verified claim.')
+    token = versions.set_managed_job_origin(durable_origin)
+    try:
+        yield
+    finally:
+        versions.reset_managed_job_origin(token)
+
+
+def _request_execution_wrapper(
+        request_id: str,
+        ignore_return_value: bool,
+        num_db_connections_per_worker: int = 0,
+        execution_generation: int = 0,
+        claim_token: str | None = None,
+        worker_instance_id: str | None = None,
+        managed_job_origin: tuple[int, str, int, int, str] | None = None
+) -> None:
     """Wrapper for a request execution.
 
     It wraps the execution of a request to:
@@ -1049,39 +1446,18 @@ def _request_execution_wrapper(request_id: str,
 
     request_name = None
     request_body: payloads.RequestBody | None = None
-    execution_quiescent = False
     # Set _in_request_execution inside the try so `finally` always clears it,
     # even if a SIGTERM lands before any wrapper code runs.
     global _in_request_execution  # pylint: disable=global-statement
-    global _execution_cancellation_marker  # pylint: disable=global-statement
-    cancellation_marker = None
-    if claim_token is not None:
-        cancellation_marker = request_storage.execution_cancellation_marker_path(
-            pid,
-            request_storage.ExecutionClaim(request_id, execution_generation,
-                                           claim_token))
     execution_claim_token = request_storage.activate_execution_claim(
         request_id, execution_generation, claim_token, worker_instance_id)
     try:
-        _execution_cancellation_marker = cancellation_marker
         _in_request_execution = True
         placement_history.reset_request_buffer()
-        # As soon as the request is updated with the executor PID, we can
-        # receive SIGTERM from cancellation. So, we update the request inside
-        # the try block to ensure we have the KeyboardInterrupt handling.
-        # The guarded UPDATE atomically checks the executable-status
-        # precondition (PENDING/WAITING) and flips the row to RUNNING with
-        # this worker's pid, clearing any leftover retry-backoff message,
-        # in a single statement without re-writing the full row. It still
-        # takes the per-request FileLock internally so it serializes with
-        # the remaining full-row read-modify-write writers (kill paths,
-        # interrupt_request_for_retry).
-        if not api_requests.try_mark_running(request_id, pid,
-                                             execution_generation, claim_token):
-            logger.warning(f'Request {request_id} is already finished or '
-                           'cancelled, skipping execution')
-            execution_quiescent = True
-            return
+        # The dispatcher has already published the direct-child outer guardian
+        # PID/birth identity and atomically crossed RUNNING before admitting
+        # this handler.  The handler must never replace that durable identity
+        # with its own PID.
         request_task = api_requests.get_request(request_id)
         assert request_task is not None, request_id
         log_path = request_task.log_path
@@ -1091,7 +1467,6 @@ def _request_execution_wrapper(request_id: str,
         request_cluster_name = request_task.cluster_name
         controller_generation = request_task.controller_generation
         controller_instance_id = request_task.worker_instance_id
-        del request_task
 
         # Store copies of the original stdout and stderr file descriptors
         # We do this in two steps because we should make sure to restore the
@@ -1106,13 +1481,9 @@ def _request_execution_wrapper(request_id: str,
             # captured in the log file.
             _redirect_output(f)
 
-            # Skip debug logging for daemon requests since the daemon
-            # requests has its own log level config and we don't want to
-            # duplicate the daemon logs.
-            debug_log_ctx = (contextlib.nullcontext()
-                             if daemons.is_daemon_request_id(request_id) else
-                             sky_logging.add_debug_log_handler(request_id))
-            with debug_log_ctx, \
+            with sky_logging.add_debug_log_handler(request_id), \
+                _verified_managed_job_execution_origin(
+                    request_task, managed_job_origin), \
                 override_request_env_and_config(
                     request_body, request_id, request_name), \
                 _controller_execution_environment(
@@ -1131,18 +1502,14 @@ def _request_execution_wrapper(request_id: str,
                             request_id, request_name, request_cluster_name):
                     return_value = func(**request_body.to_kwargs())
                 f.flush()
+        del request_task
     except KeyboardInterrupt:
         logger.info(f'Request {request_id} cancelled by user')
-        # Kill all children processes related to this request.
-        # Each executor handles a single request, so we can safely kill all
-        # children processes related to this request.
-        # This is required as python does not pass the KeyboardInterrupt to the
-        # threads that are not main thread.
-        subprocess_utils.kill_children_processes()
-        execution_quiescent = True
+        # The per-invocation warden owns descendant termination and reaping.
+        # Returning here reports the handler outcome; it is not process-family
+        # quiescence proof.
         return
     except exceptions.ExecutionRetryableError as e:
-        execution_quiescent = True
         safe_retry_error = api_requests.sanitize_request_error(
             request_name, e, request_body)
         logger.error(safe_retry_error)
@@ -1152,9 +1519,14 @@ def _request_execution_wrapper(request_id: str,
         with api_requests.update_request(request_id) as request_task:
             if (request_task is not None and
                     request_task.status == api_requests.RequestStatus.RUNNING):
-                # Retried request will undergo rescheduling and a new execution,
-                # clear the pid of the request.
-                request_task.pid = None
+                # PostgreSQL claims retain PID + process birth identity until
+                # this wrapper has published quiescence and the parent-side
+                # queue handoff atomically clears the exact claim. If this
+                # process hard-dies between retry intent and ``finally``, the
+                # role-local owner-death observer still has a complete address.
+                # Legacy unclaimed backends keep their historical PID cleanup.
+                if claim_token is None:
+                    request_task.pid = None
                 should_retry = True
         # Yield control to the scheduler for uniform handling of retries.
         _restore_output()
@@ -1164,7 +1536,6 @@ def _request_execution_wrapper(request_id: str,
                     'or no longer running')
         return
     except (Exception, SystemExit) as e:  # pylint: disable=broad-except
-        execution_quiescent = True
         safe_failure_error = api_requests.sanitize_request_error(
             request_name, e, request_body)
         api_requests.set_request_failed(request_id, e)
@@ -1176,7 +1547,6 @@ def _request_execution_wrapper(request_id: str,
                      f'{common_utils.format_exception(safe_failure_error)}')
         return
     else:
-        execution_quiescent = True
         api_requests.set_request_succeeded(
             request_id, return_value if not ignore_return_value else None)
         # Manually reset the original stdout and stderr file descriptors early
@@ -1186,8 +1556,6 @@ def _request_execution_wrapper(request_id: str,
         logger.info(f'Request {request_id} finished')
     finally:
         _in_request_execution = False
-        _execution_cancellation_marker = None
-        request_storage.clear_execution_cancellation(cancellation_marker)
         request_storage.deactivate_execution_claim(execution_claim_token)
         _restore_output()
         try:
@@ -1210,15 +1578,6 @@ def _request_execution_wrapper(request_id: str,
         except Exception as e:  # pylint: disable=broad-except
             logger.error(f'Failed to record memory metrics: '
                          f'{common_utils.format_exception(e)}')
-        if execution_quiescent and claim_token is not None:
-            # This is deliberately last: the receipt means this exact
-            # generation has stopped effect-bearing handler code and completed
-            # the wrapper's cleanup. The monitor repeats the write only after
-            # a normal Future completion as a DB-failure fallback; ambiguous
-            # exceptional Futures must never publish a receipt.
-            _acknowledge_execution_quiescence(
-                request_storage.ExecutionClaim(request_id, execution_generation,
-                                               claim_token))
 
 
 _first_request = True
@@ -1447,6 +1806,7 @@ async def build_request_async(
     retryable: bool = False,
     should_enqueue: bool = False,
     precondition: preconditions.Precondition | None = None,
+    managed_job_origin: tuple[int, str, int, int, str] | None = None,
 ) -> api_requests.Request:
     """Build a complete request without persisting or publishing it.
 
@@ -1456,6 +1816,12 @@ async def build_request_async(
     (see reenqueue_recovered_requests).
     """
     role_filter.reject_non_admin_pod_config(auth_user, request_body)
+    authenticated_managed_job_origin = versions.get_managed_job_origin()
+    if (managed_job_origin is not None and
+            managed_job_origin != authenticated_managed_job_origin):
+        raise ValueError(
+            'Managed-job request origin is server-authenticated metadata.')
+    managed_job_origin = authenticated_managed_job_origin
     if auth_user is not None:
         # Authenticated requests historically did not require either submitted
         # identity field because both are replaced below.
@@ -1527,6 +1893,16 @@ async def build_request_async(
             actor_type=actor_type,
             cluster_name=request_cluster_name,
         ),
+        managed_job_id=(managed_job_origin[0]
+                        if managed_job_origin is not None else None),
+        managed_job_controller_instance_id=(
+            managed_job_origin[1] if managed_job_origin is not None else None),
+        managed_job_controller_generation=(
+            managed_job_origin[2] if managed_job_origin is not None else None),
+        managed_job_controller_slot_id=(
+            managed_job_origin[3] if managed_job_origin is not None else None),
+        managed_job_controller_slot_attempt=(
+            managed_job_origin[4] if managed_job_origin is not None else None),
     )
 
     return request
@@ -1545,6 +1921,7 @@ async def prepare_request_async(
     retryable: bool = False,
     should_enqueue: bool = False,
     precondition: preconditions.Precondition | None = None,
+    managed_job_origin: tuple[int, str, int, int, str] | None = None,
 ) -> api_requests.Request:
     """Build and persist one ordinary request through the selected backend."""
     request = await build_request_async(request_id,
@@ -1558,7 +1935,8 @@ async def prepare_request_async(
                                         ignore_return_value=ignore_return_value,
                                         retryable=retryable,
                                         should_enqueue=should_enqueue,
-                                        precondition=precondition)
+                                        precondition=precondition,
+                                        managed_job_origin=managed_job_origin)
     if not await api_requests.create_if_not_exists_async(request):
         raise exceptions.RequestAlreadyExistsError(
             f'Request {request_id} already exists.')
@@ -1567,19 +1945,21 @@ async def prepare_request_async(
     return request
 
 
-async def schedule_request_async(request_id: str,
-                                 request_name: request_names.RequestName,
-                                 request_body: payloads.RequestBody,
-                                 func: Callable[P, Any],
-                                 request_cluster_name: str | None = None,
-                                 ignore_return_value: bool = False,
-                                 schedule_type: api_requests.ScheduleType = (
-                                     api_requests.ScheduleType.LONG),
-                                 is_skypilot_system: bool = False,
-                                 precondition: preconditions.Precondition |
-                                 None = None,
-                                 retryable: bool = False,
-                                 auth_user: models.User | None = None) -> None:
+async def schedule_request_async(
+        request_id: str,
+        request_name: request_names.RequestName,
+        request_body: payloads.RequestBody,
+        func: Callable[P, Any],
+        request_cluster_name: str | None = None,
+        ignore_return_value: bool = False,
+        schedule_type: api_requests.ScheduleType = (
+            api_requests.ScheduleType.LONG),
+        is_skypilot_system: bool = False,
+        precondition: preconditions.Precondition | None = None,
+        retryable: bool = False,
+        auth_user: models.User | None = None,
+        managed_job_origin: tuple[int, str, int, int, str] | None = None
+) -> None:
     """Enqueue a request to the request queue.
 
     Args:
@@ -1612,41 +1992,10 @@ async def schedule_request_async(request_id: str,
         ignore_return_value=ignore_return_value,
         retryable=retryable,
         should_enqueue=True,
-        precondition=precondition)
+        precondition=precondition,
+        managed_job_origin=managed_job_origin)
     await schedule_prepared_request(request_task, ignore_return_value,
                                     precondition, retryable)
-
-
-async def schedule_internal_daemon_async(
-        daemon: 'daemons.InternalRequestDaemon') -> None:
-    """Submit an internal daemon's request to the executor.
-
-    Idempotent under concurrent callers (multiple uvicorn workers in the
-    same process; multiple replicas sharing a PG-backed request store):
-
-    - First caller inserts a fresh PENDING row + enqueues onto the task
-      queue.
-    - Subsequent callers UPDATE `request_body` / `name` /
-      `schedule_type` on the existing row (so the persisted env_vars
-      reflect *this* process's `os.environ` rather than whatever the
-      original creator captured) and skip the enqueue (the existing
-      task_queue entry from the original creator remains in place).
-
-    This replaces the previous "schedule_request_async → catch
-    RequestAlreadyExistsError → log debug" pattern for daemon
-    requests: the dedup contract is identical (exactly one concurrent
-    caller wins the insert race and enqueues), but losing callers now
-    actively refresh env-bearing columns on the existing row instead
-    of leaving stale state in place.
-    """
-    request = api_requests.build_internal_daemon_request(daemon)
-    inserted = await api_requests.create_or_refresh_internal_daemon_async(
-        request)
-    if inserted:
-        await schedule_prepared_request(request, retryable=True)
-    else:
-        logger.debug(f'Internal daemon {daemon.id} row refreshed (existed); '
-                     'enqueue skipped.')
 
 
 async def schedule_prepared_request(request_task: api_requests.Request,
@@ -1790,20 +2139,12 @@ def reenqueue_recovered_requests() -> None:
                                            api_requests.COL_IGNORE_RETURN_VALUE,
                                            api_requests.COL_RETRYABLE
                                        ]))
-    # Daemon rows are deleted by startup recovery and re-created via
-    # schedule_internal_daemon_async; skip anything matching the daemon-id
-    # pattern in case any slipped through. is_daemon_request_id matches by
-    # naming pattern, so this also covers a PENDING row of a daemon id that
-    # was removed from the current build -- which recovery keeps (its id is
-    # no longer in INTERNAL_REQUEST_DAEMONS) and the FastAPI-lifespan
-    # orphan-daemon cleanup only reaps after we run.
-    # Likewise, only replay WAITING rows explicitly marked retryable:
+    # Only replay WAITING rows explicitly marked retryable:
     # recovery flips non-retryable WAITING rows to CANCELLED+should_retry,
     # but re-check here rather than trusting that recovery ran and agreed.
     reqs = [
         req for req in reqs
-        if not daemons.is_daemon_request_id(req.request_id) and
-        (req.status == api_requests.RequestStatus.PENDING or req.retryable)
+        if req.status == api_requests.RequestStatus.PENDING or req.retryable
     ]
     if not reqs:
         return

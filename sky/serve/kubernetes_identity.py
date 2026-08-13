@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 import copy
+import hashlib
 import json
 import re
 from typing import Any
@@ -12,11 +13,12 @@ from sky import skypilot_config
 from sky import task as task_lib
 from sky.clouds import kubernetes as kubernetes_cloud
 from sky.models import VolumeConfig
+from sky.provision.kubernetes import constants as kubernetes_constants
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.serve import spot_placer
 from sky.utils import volume as volume_utils
 
-PLACEMENT_PROJECTION_PROTOCOL_VERSION = 1
+PLACEMENT_PROJECTION_PROTOCOL_VERSION = 2
 
 _AWS_ROLE_ARN_PATTERN = re.compile(
     r'^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
@@ -34,7 +36,7 @@ _CONTROLLER_LB_DATA_PLANE_AUTH_KEYS = frozenset(
     {'secret_name', 'secret_key', 'mount_path'})
 CONTROLLER_LB_DATA_PLANE_AUTH_MOUNT_PATH = (
     '/etc/skypilot/serve-auth/lb-data-plane/tokens')
-_WORKER_KEYS = frozenset({
+_WORKER_V1_KEYS = frozenset({
     'candidate_id',
     'kubernetes_context',
     'namespace',
@@ -48,6 +50,10 @@ _WORKER_KEYS = frozenset({
     'accelerator_scheduling',
     'cache',
 })
+_WORKER_KUEUE_ADMISSION_KEYS = frozenset(
+    {'local_queue_name', 'workload_priority_class_name'})
+_WORKER_V2_KEYS = (_WORKER_V1_KEYS | frozenset(
+    {'projection_version', 'kueue_admission', 'scheduler_name'}))
 _ACCELERATOR_SCHEDULING_KEYS = frozenset(
     {'label_key', 'label_values', 'resource_key'})
 _MAX_ACCELERATOR_LABEL_VALUES = 16
@@ -390,12 +396,68 @@ def validate_controller_work_cache_projection(
     }
 
 
+def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
+    """Return the protocol version encoded by one exact worker projection.
+
+    Protocol v1 intentionally has no discriminator.  Its old exact key set is
+    the only implicit-v1 shape accepted during the ordinary-launch transition.
+    New rows must carry the explicit v2 discriminator and closed v2 key set.
+    """
+    if not isinstance(projection, Mapping):
+        raise ValueError('Worker placement projection must be a mapping.')
+    keys = set(projection)
+    if keys == _WORKER_V1_KEYS:
+        return 1
+    if keys == _WORKER_V2_KEYS:
+        if (type(projection['projection_version']) is not int or
+                projection['projection_version']
+                != PLACEMENT_PROJECTION_PROTOCOL_VERSION):
+            raise ValueError('Worker placement projection_version must be '
+                             f'exactly '
+                             f'{PLACEMENT_PROJECTION_PROTOCOL_VERSION}.')
+        return PLACEMENT_PROJECTION_PROTOCOL_VERSION
+    raise ValueError(
+        'Worker placement projection must contain exactly the protocol-v1 '
+        f'keys {sorted(_WORKER_V1_KEYS)!r} or protocol-v2 keys '
+        f'{sorted(_WORKER_V2_KEYS)!r}.')
+
+
+def _validate_worker_kueue_admission(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or
+            set(value) != _WORKER_KUEUE_ADMISSION_KEYS):
+        raise ValueError('Worker placement kueue_admission must be null or '
+                         'contain exactly '
+                         f'{sorted(_WORKER_KUEUE_ADMISSION_KEYS)!r}.')
+    return {
+        'local_queue_name': _strict_nonempty_string(
+            value['local_queue_name'],
+            'Worker placement Kueue LocalQueue name'),
+        'workload_priority_class_name': _strict_nonempty_string(
+            value['workload_priority_class_name'],
+            'Worker placement Kueue WorkloadPriorityClass name'),
+    }
+
+
 def validate_worker_placement_projections(
     value: Any,
     *,
     allow_none: bool = True,
+    require_protocol_version: int | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Strictly validate and copy worker candidate projections."""
+    """Strictly validate and copy homogeneous worker projections.
+
+    V1 is an isolated compatibility decoder for ordinary historical launches.
+    Callers that authorize a v2-only behavior must set
+    ``require_protocol_version=2`` rather than accepting the implicit-v1
+    shape.
+    """
+    if (require_protocol_version is not None and
+        (type(require_protocol_version) is not int or require_protocol_version
+         not in (1, PLACEMENT_PROJECTION_PROTOCOL_VERSION))):
+        raise ValueError('Required worker projection protocol version must be '
+                         '1 or 2.')
     if value is None:
         if allow_none:
             return None
@@ -408,11 +470,22 @@ def validate_worker_placement_projections(
     selection_keys = set()
     scheduling_by_accelerator: dict[tuple[str, str], dict[str, Any]] = {}
     accelerator_by_scheduling_label: dict[tuple[str, str, str, str], str] = {}
+    protocol_version: int | None = None
     for projection in value:
-        if (not isinstance(projection, dict) or
-                set(projection) != _WORKER_KEYS):
-            raise ValueError('Worker placement projection must contain '
-                             f'exactly {sorted(_WORKER_KEYS)!r}.')
+        if not isinstance(projection, dict):
+            raise ValueError('Worker placement projection must be a mapping.')
+        candidate_protocol_version = worker_projection_protocol_version(
+            projection)
+        if protocol_version is None:
+            protocol_version = candidate_protocol_version
+        elif protocol_version != candidate_protocol_version:
+            raise ValueError('Worker placement projection lists must not mix '
+                             'protocol versions.')
+        if (require_protocol_version is not None and
+                candidate_protocol_version != require_protocol_version):
+            raise ValueError('Worker placement projection protocol version '
+                             f'{candidate_protocol_version} does not satisfy '
+                             f'required version {require_protocol_version}.')
         candidate_id = _strict_nonempty_string(projection['candidate_id'],
                                                'Worker candidate_id')
         if not re.fullmatch(r'kubernetes-[0-9]{4}', candidate_id):
@@ -422,12 +495,19 @@ def validate_worker_placement_projections(
             raise ValueError('Worker candidate IDs must be unique.')
         candidate_ids.add(candidate_id)
         for key in ('kubernetes_context', 'namespace', 'service_account_name',
-                    'accelerator_name', 'pod_identity_role_arn'):
+                    'accelerator_name'):
             _strict_nonempty_string(projection[key], f'Worker placement {key}')
-        if _AWS_ROLE_ARN_PATTERN.fullmatch(
-                projection['pod_identity_role_arn']) is None:
+        role_arn = projection['pod_identity_role_arn']
+        if candidate_protocol_version == 1:
+            role_arn = _strict_nonempty_string(
+                role_arn, 'Worker placement pod_identity_role_arn')
+        elif role_arn is not None:
+            role_arn = _strict_nonempty_string(
+                role_arn, 'Worker placement pod_identity_role_arn')
+        if (role_arn is not None and
+                _AWS_ROLE_ARN_PATTERN.fullmatch(role_arn) is None):
             raise ValueError('Worker placement pod_identity_role_arn must be '
-                             'an AWS IAM role ARN.')
+                             'null or an AWS IAM role ARN.')
         priority = projection['priority_class_name']
         if priority is not None:
             _strict_nonempty_string(priority,
@@ -483,7 +563,7 @@ def validate_worker_placement_projections(
                                  'logical accelerators.')
             accelerator_by_scheduling_label[scheduling_label] = projection[
                 'accelerator_name'].lower()
-        validated.append({
+        validated_projection = {
             'candidate_id': candidate_id,
             'kubernetes_context': projection['kubernetes_context'],
             'namespace': projection['namespace'],
@@ -491,13 +571,36 @@ def validate_worker_placement_projections(
             'priority_class_name': priority,
             'priority_value': priority_value,
             'preemption_policy': preemption_policy,
-            'pod_identity_role_arn': projection['pod_identity_role_arn'],
+            'pod_identity_role_arn': role_arn,
             'accelerator_name': projection['accelerator_name'],
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': scheduling,
             'cache': validate_cache_projection(projection['cache']),
-        })
+        }
+        if candidate_protocol_version == PLACEMENT_PROJECTION_PROTOCOL_VERSION:
+            validated_projection['scheduler_name'] = _strict_nonempty_string(
+                projection['scheduler_name'], 'Worker placement scheduler_name')
+            validated_projection['projection_version'] = (
+                PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+            validated_projection['kueue_admission'] = (
+                _validate_worker_kueue_admission(projection['kueue_admission']))
+        validated.append(validated_projection)
     return validated
+
+
+def worker_projection_sha256(projection: Mapping[str, Any]) -> str:
+    """Return the canonical SHA-256 digest of one complete v2 candidate."""
+    validated = validate_worker_placement_projections(
+        [dict(projection)],
+        allow_none=False,
+        require_protocol_version=PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+    assert validated is not None and len(validated) == 1
+    canonical_json = json.dumps(validated[0],
+                                sort_keys=True,
+                                separators=(',', ':'),
+                                ensure_ascii=False,
+                                allow_nan=False)
+    return hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()
 
 
 def _effective_pod_config(context: str, cluster_config_overrides: dict[str,
@@ -545,8 +648,19 @@ def _project_location(context: str, cluster_config_overrides: dict[str, Any],
 def _project_worker_location(context: str, cluster_config_overrides: dict[str,
                                                                           Any],
                              workspace: str | None) -> dict[str, Any]:
-    """Resolve worker identity plus the narrow expected priority contract."""
+    """Resolve worker identity plus immutable scheduling/admission inputs."""
     projection = _project_location(context, cluster_config_overrides, workspace)
+    effective_pod_config = _effective_pod_config(context,
+                                                 cluster_config_overrides,
+                                                 workspace)
+    pod_spec = effective_pod_config.get('spec', {})
+    if not isinstance(pod_spec, dict):
+        raise ValueError('Effective Kubernetes pod_config.spec must be a '
+                         'mapping.')
+    projection['scheduler_name'] = _strict_nonempty_string(
+        pod_spec.get('schedulerName',
+                     kubernetes_constants.DEFAULT_SCHEDULER_NAME),
+        'Kubernetes Serve worker scheduler name')
     # Worker priority is intentionally not inferred from pod_config. Inference
     # clusters may assign it in an admission mutation, so the API server needs
     # a narrow server-owned expectation it can freeze before the Pod exists.
@@ -606,6 +720,86 @@ def _project_worker_location(context: str, cluster_config_overrides: dict[str,
     return projection
 
 
+def _project_worker_kueue_admission(
+    context: str,
+    workspace: str | None,
+) -> dict[str, str] | None:
+    """Freeze one server/workspace-owned Kueue admission pair."""
+    local_queue_name = skypilot_config.get_effective_queue_name(
+        cloud='kubernetes',
+        region=context,
+        workspace=workspace,
+        override_configs=None)
+    workload_priority_class_name = (
+        skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            region=context,
+            keys=('serve_worker_kueue_workload_priority_class_name',),
+            workspace=workspace,
+            default_value=None))
+    require_managed = skypilot_config.get_effective_kueue_require_managed(
+        cloud='kubernetes',
+        region=context,
+        workspace=workspace,
+        override_configs=None)
+    if require_managed and local_queue_name is None:
+        raise ValueError('Kubernetes Serve worker Kueue management requires '
+                         'an effective server-owned LocalQueue.')
+    if local_queue_name is None and workload_priority_class_name is None:
+        return None
+    if local_queue_name is None or workload_priority_class_name is None:
+        raise ValueError('Kubernetes Serve worker LocalQueue and '
+                         'WorkloadPriorityClass must be both configured or '
+                         'both absent.')
+    return {
+        'local_queue_name': _strict_nonempty_string(
+            local_queue_name, 'Kubernetes Serve worker Kueue LocalQueue'),
+        'workload_priority_class_name': _strict_nonempty_string(
+            workload_priority_class_name,
+            'Kubernetes Serve worker Kueue WorkloadPriorityClass'),
+    }
+
+
+def _has_worker_admission_override(overrides: Mapping[str, Any]) -> bool:
+    """Whether request-scoped config tries to own projected admission."""
+    kubernetes_config = overrides.get('kubernetes')
+    if kubernetes_config is None and any(
+            key in overrides for key in ('kueue', 'quota', 'context_configs')):
+        # Accept the cloud-relative shape defensively for internal callers.
+        kubernetes_config = overrides
+    if not isinstance(kubernetes_config, Mapping):
+        return False
+
+    def _scope_has_override(scope: Any) -> bool:
+        if not isinstance(scope, Mapping):
+            return False
+        if 'kueue' in scope:
+            return True
+        quota = scope.get('quota')
+        return isinstance(quota, Mapping) and 'queue' in quota
+
+    if _scope_has_override(kubernetes_config):
+        return True
+    context_configs = kubernetes_config.get('context_configs')
+    return (isinstance(context_configs, Mapping) and any(
+        _scope_has_override(context_config)
+        for context_config in context_configs.values()))
+
+
+def validate_no_task_worker_admission_overrides(task: 'task_lib.Task') -> None:
+    """Reject task-owned inputs that compete with a v2 projection."""
+    for resource in task.resources or []:
+        if not _is_exact_kubernetes_cloud(resource.cloud):
+            continue
+        if resource.priority_class is not None:
+            raise ValueError('Projected SkyServe Kubernetes workers cannot '
+                             'set task resource priority_class.')
+        if _has_worker_admission_override(resource.cluster_config_overrides):
+            raise ValueError('Projected SkyServe Kubernetes workers cannot '
+                             'set task-owned kubernetes.kueue or '
+                             'kubernetes.quota.queue overrides.')
+
+
 def _is_exact_kubernetes_cloud(cloud: clouds.Cloud | None) -> bool:
     return (isinstance(cloud, clouds.Kubernetes) and
             not isinstance(cloud, clouds.SSH))
@@ -655,7 +849,7 @@ def _controller_location(
 
 
 def build_controller_job_projection(
-    task: task_lib.Task,
+    task: 'task_lib.Task',
     *,
     workspace: str | None,
 ) -> dict[str, Any] | None:
@@ -702,7 +896,7 @@ def build_controller_job_projection(
 
 
 def build_controller_work_cache_projection(
-    task: task_lib.Task,
+    task: 'task_lib.Task',
     *,
     workspace: str | None,
 ) -> dict[str, Any] | None:
@@ -829,7 +1023,7 @@ def _project_accelerator_scheduling(
 
 
 def _catalog_candidates(
-    task: task_lib.Task,
+    task: 'task_lib.Task',
     placement_catalog: dict[str, Any] | None,
 ) -> list[tuple[int, clouds.Cloud | None, str | None,
                 Mapping[str, int | float] | None, dict[str, Any]]]:
@@ -857,7 +1051,7 @@ def _catalog_candidates(
 
 
 def catalog_missing_task_shapes(
-    task: task_lib.Task,
+    task: 'task_lib.Task',
     placement_catalog: dict[str, Any],
 ) -> set[tuple[str, str, int]]:
     """Return exact Kubernetes task shapes absent from a persisted catalog.
@@ -913,7 +1107,7 @@ def catalog_missing_task_shapes(
 
 
 def build_worker_placement_projections(
-    task: task_lib.Task,
+    task: 'task_lib.Task',
     *,
     workspace: str | None,
     placement_catalog: dict[str, Any] | None = None,
@@ -925,6 +1119,7 @@ def build_worker_placement_projections(
     # which candidates are eligible for platform-owned identity.
     if any(resource.cloud is None for resource in (task.resources or [])):
         return None
+    validate_no_task_worker_admission_overrides(task)
     candidates = _catalog_candidates(task, placement_catalog)
     if not candidates or any(cloud is None for _, cloud, _, _, _ in candidates):
         return None
@@ -941,11 +1136,12 @@ def build_worker_placement_projections(
                 type(accelerator_count) is not int or accelerator_count < 1):
             return None
         identity = _project_worker_location(context, overrides, workspace)
-        if identity['pod_identity_role_arn'] is None:
-            return None
         projections.append({
+            'projection_version': PLACEMENT_PROJECTION_PROTOCOL_VERSION,
             'candidate_id': f'kubernetes-{index:04d}',
             **identity,
+            'kueue_admission': _project_worker_kueue_admission(
+                context, workspace),
             'accelerator_name': accelerator_name,
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': _project_accelerator_scheduling(
@@ -954,16 +1150,22 @@ def build_worker_placement_projections(
         })
     if not projections:
         return None
-    return validate_worker_placement_projections(projections, allow_none=False)
+    return validate_worker_placement_projections(
+        projections,
+        allow_none=False,
+        require_protocol_version=PLACEMENT_PROJECTION_PROTOCOL_VERSION)
 
 
 def worker_projection_for_context(
     projections: list[dict[str, Any]] | None,
     context: str,
     accelerators: dict[str, int | float] | None,
+    *,
+    require_protocol_version: int | None = None,
 ) -> dict[str, Any] | None:
     """Select one frozen worker projection for an exact launch candidate."""
-    validated = validate_worker_placement_projections(projections)
+    validated = validate_worker_placement_projections(
+        projections, require_protocol_version=require_protocol_version)
     if validated is None or not isinstance(accelerators,
                                            dict) or len(accelerators) != 1:
         return None

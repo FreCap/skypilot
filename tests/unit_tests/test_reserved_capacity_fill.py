@@ -1444,8 +1444,8 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
                 snapshot_time=time.time(),
                 protocol_version=2,
                 service_generation=1,
-                observed_free=4,
-                observed_free_by_accelerator={'a100': 4},
+                observed_free_slots=4,
+                observed_free_slots_by_accelerator={'a100': 4},
                 observed_at=time.time()),
             reserved_capacity_broker.Allocation(
                 grant=1,
@@ -1455,8 +1455,8 @@ class TestMultiPoolBrokerCycle(unittest.TestCase):
                 snapshot_time=time.time(),
                 protocol_version=2,
                 service_generation=1,
-                observed_free=7,
-                observed_free_by_accelerator={'h200': 7},
+                observed_free_slots=7,
+                observed_free_slots_by_accelerator={'h200': 7},
                 observed_at=time.time()),
         ]
         pending_allocations = iter(allocations)
@@ -3364,6 +3364,7 @@ class TestProtocolV2DurableLaunchFence(unittest.TestCase):
         return reserved_capacity.make_protocol_v2_launch_fence(
             pool_key=self.pool_key,
             service_generation=7,
+            service_version=3,
             physical_cluster_uid='physical-uid',
             kubernetes_context='phx-context',
             accelerator='H200',
@@ -3377,6 +3378,7 @@ class TestProtocolV2DurableLaunchFence(unittest.TestCase):
         self.assertEqual(fence.protocol_version, 2)
         self.assertEqual(fence.pool_key, self.pool_key)
         self.assertEqual(fence.service_generation, 7)
+        self.assertEqual(fence.service_version, 3)
         self.assertEqual(fence.physical_cluster_uid, 'physical-uid')
         self.assertEqual(fence.kubernetes_context, 'phx-context')
         self.assertEqual(fence.accelerator, 'h200')
@@ -3422,7 +3424,12 @@ class TestFillLaunchPath(unittest.TestCase):
     """Sentinel launches pin zero-cost-only; aborts leak nothing."""
 
     @staticmethod
-    def _v2_override(location, *, epoch=3, gpu='H200', exact_shape=None):
+    def _v2_override(location,
+                     *,
+                     epoch=3,
+                     gpu='H200',
+                     exact_shape=None,
+                     attributed=False):
         pool = reserved_capacity_broker.make_pool_key(
             location.region,
             gpu,
@@ -3441,6 +3448,27 @@ class TestFillLaunchPath(unittest.TestCase):
         }
         if exact_shape is not None:
             override['accelerators'] = exact_shape
+        if attributed:
+            override.update({
+                constants.RESERVED_FILL_ALLOCATION_GENERATION_OVERRIDE_KEY: 5,
+                constants.RESERVED_FILL_ALLOCATION_INPUT_SHA256_OVERRIDE_KEY:
+                    'a' * 64,
+                constants.RESERVED_FILL_ALLOCATION_CLAIM_GENERATION_OVERRIDE_KEY: 11,
+                constants.RESERVED_FILL_SERVICE_VERSION_OVERRIDE_KEY: 1,
+                constants.RESERVED_FILL_GATE_GENERATION_OVERRIDE_KEY: 2,
+                constants.RESERVED_FILL_RECLAIM_FLEET_BUNDLE_SHA256_OVERRIDE_KEY:
+                    'c' * 64,
+                constants.RESERVED_FILL_RECLAIM_POLICY_REVISION_OVERRIDE_KEY: 'policy-v1',
+                constants.RESERVED_FILL_RECLAIM_PROVIDER_INVENTORY_SHA256_OVERRIDE_KEY:
+                    'd' * 64,
+                constants.RESERVED_FILL_WORKER_PROJECTION_SHA256_OVERRIDE_KEY:
+                    'e' * 64,
+                constants.RESERVED_FILL_OBSERVATION_GENERATION_OVERRIDE_KEY: 13,
+                constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY: 17,
+                constants.RESERVED_FILL_ORDINARY_ADMISSION_SEQUENCE_OVERRIDE_KEY: 17,
+                constants.RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY:
+                    'b' * 64,
+            })
         return override
 
     @staticmethod
@@ -3966,7 +3994,9 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.active_locations.return_value = [location]
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
-        override = self._v2_override(location, exact_shape={'H200': 1})
+        override = self._v2_override(location,
+                                     exact_shape={'H200': 1},
+                                     attributed=True)
         with mock.patch.object(replica_managers,
                                '_should_use_spot',
                                return_value=False), \
@@ -3989,10 +4019,53 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(info.reserved_fill_service_generation, 7)
         self.assertEqual(info.reserved_fill_physical_cluster_uid,
                          'physical-uid')
+        self.assertEqual(info.reserved_fill_allocation_generation, 5)
+        self.assertEqual(info.reserved_fill_allocation_input_sha256, 'a' * 64)
+        self.assertEqual(info.reserved_fill_allocation_claim_generation, 11)
+        self.assertEqual(info.reserved_fill_reconciliation_gate_generation, 2)
+        self.assertEqual(info.reserved_fill_reclaim_fleet_bundle_sha256,
+                         'c' * 64)
+        self.assertEqual(info.reserved_fill_reclaim_policy_revision,
+                         'policy-v1')
+        self.assertEqual(info.reserved_fill_reclaim_provider_inventory_sha256,
+                         'd' * 64)
+        self.assertEqual(info.reserved_fill_worker_projection_sha256, 'e' * 64)
+        self.assertEqual(info.reserved_fill_observation_generation, 13)
+        self.assertEqual(info.reserved_fill_observation_sequence, 17)
+        self.assertEqual(info.reserved_fill_intent_idempotency_key, 'b' * 64)
+        self.assertIsNone(info.zero_cost_admission_sequence)
         self.assertEqual(info.resources_override['accelerators'], {'H200': 1})
         self.assertEqual(persist.call_args.kwargs['expected_epoch'], 3)
         self.assertEqual(
             persist.call_args.kwargs['expected_service_generation'], 7)
+        self.assertEqual(
+            persist.call_args.
+            kwargs['expected_ordinary_zero_cost_admission_sequence'], 17)
+
+    def test_v2_partial_typed_attribution_fails_before_persistence(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        override = self._v2_override(location,
+                                     exact_shape={'H200': 1},
+                                     attributed=True)
+        override.pop(constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY)
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica') as persist:
+            self.assertFalse(self._launch_v2(manager, override))
+        persist.assert_not_called()
+        placer.select_next_zero_cost_location.assert_not_called()
 
     def test_v2_stale_epoch_fails_closed_before_authority_read(self):
         location = make_location('phx-context',
@@ -4404,13 +4477,41 @@ class TestQueryFreeSlots(unittest.TestCase):
         ])
         self.assertEqual([group.gpus_per_replica for group in groups], [1, 8])
 
-    def test_context_group_rejects_mixed_widths(self):
+    def test_context_group_preserves_width_per_exact_card(self):
+        groups = reserved_capacity.group_zero_cost_fill_pools([
+            self._k8s_location(region='ctx-a', gpu='A100', count=1),
+            self._k8s_location(region='ctx-a', gpu='H100', count=2),
+        ])
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].shapes, (('a100', 1), ('h100', 2)))
+        self.assertEqual(groups[0].accelerator_positions,
+                         (('a100', 0), ('h100', 1)))
+
+    def test_context_group_rejects_conflicting_width_for_same_card(self):
         with self.assertRaisesRegex(ValueError,
-                                    'one GPU count within each Kubernetes'):
+                                    'one GPU count for each accelerator'):
             reserved_capacity.group_zero_cost_fill_pools([
                 self._k8s_location(region='ctx-a', gpu='A100', count=1),
-                self._k8s_location(region='ctx-a', gpu='H100', count=2),
+                self._k8s_location(region='ctx-a', gpu='a100', count=2),
             ])
+
+    def test_context_groups_reject_more_than_bounded_observation_cohort(self):
+        limit = (reserved_capacity.pool_capacity_observation.
+                 MAX_OBSERVATION_COHORT_POOLS)
+        locations = [
+            self._k8s_location(region=f'ctx-{index}', gpu='A100')
+            for index in range(limit + 1)
+        ]
+        with self.assertRaisesRegex(ValueError, 'bounded Kubernetes pool'):
+            reserved_capacity.group_zero_cost_fill_pools(locations)
+
+        same_context = [
+            self._k8s_location(region='ctx', gpu=f'GPU-{index}')
+            for index in range(limit + 1)
+        ]
+        with self.assertRaisesRegex(ValueError, 'bounded Kubernetes pool'):
+            reserved_capacity.group_zero_cost_fill_pools(same_context)
 
     def test_physical_uid_is_cached_for_at_most_one_poll_interval(self):
         core_api = mock.Mock()
@@ -4602,6 +4703,27 @@ class TestQueryFreeSlots(unittest.TestCase):
                 protocol_version=reserved_capacity_broker.PROTOCOL_V2,
                 physical_cluster_uid='physical-uid'))
 
+    def test_pool_discovery_splits_same_context_cards_with_contiguous_order(
+            self):
+        locations = [
+            self._k8s_location(region='ctx-mixed', gpu='H200', count=8),
+            self._k8s_location(region='ctx-mixed', gpu='A100', count=1),
+        ]
+        with mock.patch.object(reserved_capacity,
+                               'get_kubernetes_physical_cluster_uid',
+                               return_value='physical-uid') as resolve_uid:
+            pools = reserved_capacity.discover_fill_pool_specs(locations)
+
+        resolve_uid.assert_called_once_with('ctx-mixed')
+        self.assertEqual([pool.position for pool in pools], [0, 1])
+        self.assertEqual([pool.context for pool in pools],
+                         ['ctx-mixed', 'ctx-mixed'])
+        self.assertEqual([pool.shapes for pool in pools], [(('h200', 8),),
+                                                           (('a100', 1),)])
+        self.assertEqual([pool.gpus_per_replica for pool in pools], [8, 1])
+        self.assertEqual([pool.locations for pool in pools], [(locations[0],),
+                                                              (locations[1],)])
+
     def test_pool_discovery_isolates_failed_identity_lookup(self):
         locations = [
             self._k8s_location(region='ctx-failed', gpu='A100'),
@@ -4612,6 +4734,27 @@ class TestQueryFreeSlots(unittest.TestCase):
                                side_effect=[None, 'healthy-uid']):
             pools = reserved_capacity.discover_fill_pool_specs(locations)
         self.assertEqual([pool.context for pool in pools], ['ctx-healthy'])
+
+    def test_pool_discovery_initializes_independent_clusters_concurrently(self):
+        locations = [
+            self._k8s_location(region='ctx-east', gpu='A100'),
+            self._k8s_location(region='ctx-west', gpu='H200'),
+        ]
+        both_started = threading.Barrier(2)
+
+        def resolve(context):
+            both_started.wait(timeout=1)
+            return f'{context}-uid'
+
+        with mock.patch.object(reserved_capacity,
+                               'get_kubernetes_physical_cluster_uid',
+                               side_effect=resolve):
+            pools = reserved_capacity.discover_fill_pool_specs(locations)
+
+        self.assertEqual([pool.context for pool in pools],
+                         ['ctx-east', 'ctx-west'])
+        self.assertEqual([pool.physical_cluster_uid for pool in pools],
+                         ['ctx-east-uid', 'ctx-west-uid'])
 
     def test_free_gpus_divided_by_replica_size(self):
         with mock.patch.object(reserved_capacity.kubernetes_catalog,
@@ -5587,8 +5730,8 @@ class TestBrokerPollerCycle(unittest.TestCase):
             round_id=1,
             epoch=4,
             snapshot_time=1.0,
-            observed_free=7,
-            observed_free_by_accelerator={'a100': 7},
+            observed_free_slots=7,
+            observed_free_slots_by_accelerator={'a100': 7},
             observed_at=1.0)
         with mock.patch.object(
                 reserved_capacity,

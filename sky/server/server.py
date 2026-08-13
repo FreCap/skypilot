@@ -63,7 +63,6 @@ from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import core_middleware
 from sky.server import csp_utils
-from sky.server import daemons
 from sky.server import dashboard as dashboard_app
 from sky.server import file_mount_uploads
 from sky.server import metrics
@@ -2007,10 +2006,6 @@ async def api_get(request: fastapi.Request,
             print(f'No task with request ID {request_id}', flush=True)
             raise fastapi.HTTPException(
                 status_code=404, detail=f'Request {request_id!r} not found')
-        if (req_status.status == requests_lib.RequestStatus.RUNNING and
-                daemons.is_daemon_request_id(request_id)):
-            # Daemon requests run forever, break without waiting for complete.
-            break
         if req_status.status > requests_lib.RequestStatus.RUNNING:
             break
         await asyncio.sleep(poll_interval)
@@ -2346,11 +2341,7 @@ async def _api_status(
                 status=statuses,
                 cluster_names=(cluster_names if cluster_names is not None else
                                [cluster_name] if cluster_name else None),
-                exclude_request_names=(
-                    None if include_request_names is not None else [
-                        server_constants.REQUEST_NAME_PREFIX + d.value
-                        for d in daemons.HIDDEN_REQUEST_NAMES
-                    ]),
+                exclude_request_names=None,
                 include_request_names=include_request_names,
                 limit=limit,
                 fields=fields,

@@ -162,6 +162,7 @@ def _list_accelerators(
     if not sky_clouds.cloud_in_iterable(sky_clouds.Kubernetes(),
                                         enabled_clouds):
         return {}, {}, {}
+    kubernetes.raise_if_api_call_deadline_exceeded()
 
     # TODO(zhwu): this should return all accelerators in multiple kubernetes
     # clusters defined by allowed_contexts.
@@ -179,22 +180,27 @@ def _list_accelerators(
     # Verify that the credentials are still valid.
     if not kubernetes_utils.check_credentials(context, cloud='kubernetes')[0]:
         return {}, {}, {}
+    kubernetes.raise_if_api_call_deadline_exceeded()
 
     has_gpu = kubernetes_utils.detect_accelerator_resource(context)
     if not has_gpu:
         return {}, {}, {}
+    kubernetes.raise_if_api_call_deadline_exceeded()
 
     lf, _ = kubernetes_utils.detect_gpu_label_formatter(context)
     if not lf:
         return {}, {}, {}
+    kubernetes.raise_if_api_call_deadline_exceeded()
 
     accelerators_qtys: set[tuple[str, int]] = set()
     keys = lf.get_label_keys()
     nodes = kubernetes_utils.get_kubernetes_nodes(context=context)
+    kubernetes.raise_if_api_call_deadline_exceeded()
 
     # Check if any nodes have accelerators before fetching pods
     has_accelerator_nodes = False
     for node in nodes:
+        kubernetes.raise_if_api_call_deadline_exceeded()
         for key in keys:
             if key in node.metadata.labels:
                 has_accelerator_nodes = True
@@ -210,6 +216,7 @@ def _list_accelerators(
         try:
             allocated_qty_by_node = (
                 kubernetes_utils.get_allocated_gpu_qty_by_node(context=context))
+            kubernetes.raise_if_api_call_deadline_exceeded()
         except kubernetes.api_exception() as e:
             if e.status == 403:
                 logger.warning(
@@ -230,6 +237,7 @@ def _list_accelerators(
         context)
 
     for node in nodes:
+        kubernetes.raise_if_api_call_deadline_exceeded()
         # Check if node is ready
         node_is_ready = node.is_ready()
         node_is_cordoned = node.is_cordoned()

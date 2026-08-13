@@ -120,7 +120,10 @@ def _validate_service_replica_launch_fence(
             f'{service_name!r}/{service_hash!r}.')
 
 
-def _load_service_worker_projections(launch_context: dict[str, Any]) -> None:
+def _load_service_worker_projections(
+    launch_context: dict[str, Any],
+    reserved_fill_fence: reserved_capacity.ProtocolV2LaunchFence | None,
+) -> None:
     """Replace caller data with immutable per-version worker projections."""
     key = serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY
     launch_context.pop(key, None)
@@ -140,13 +143,22 @@ def _load_service_worker_projections(launch_context: dict[str, Any]) -> None:
             f'SkyServe version {service_name!r}/{service_version} is no '
             'longer committed.')
     try:
-        projections = (
-            kubernetes_identity.validate_worker_placement_projections(
-                stored_projections))
+        required_protocol_version = None
+        if (reserved_fill_fence is not None and
+                reserved_fill_fence.policy_bound):
+            required_protocol_version = (
+                kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+        projections = kubernetes_identity.validate_worker_placement_projections(
+            stored_projections,
+            require_protocol_version=required_protocol_version)
+        if (reserved_fill_fence is not None and
+                reserved_fill_fence.policy_bound):
+            reserved_capacity.require_reclaim_worker_projection(
+                reserved_fill_fence, projections)
     except ValueError as e:
         raise exceptions.RequestCancelled(
             f'SkyServe version {service_name!r}/{service_version} has invalid '
-            'persisted worker placements.') from e
+            'or stale persisted worker admission.') from e
     if projections is not None:
         launch_context[key] = projections
 
@@ -156,9 +168,14 @@ def _validate_projected_service_task_inputs(
     launch_context: dict[str, Any],
 ) -> None:
     """Reject campaign-owned Pod and volume attachment surfaces."""
-    if launch_context.get(
-            serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY) is None:
+    projections = launch_context.get(
+        serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
+    if projections is None:
         return
+    is_protocol_v2 = bool(
+        projections and
+        kubernetes_identity.worker_projection_protocol_version(projections[0])
+        == kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
     server_owned_keys = frozenset(
         {'pod_config', 'namespace', 'remote_identity'})
 
@@ -173,6 +190,12 @@ def _validate_projected_service_task_inputs(
         return False
 
     for projected_task in dag.tasks:
+        if is_protocol_v2:
+            try:
+                (kubernetes_identity.validate_no_task_worker_admission_overrides
+                )(projected_task)
+            except ValueError as error:
+                raise exceptions.RequestCancelled(str(error)) from error
         if projected_task.volumes or projected_task.volume_mounts is not None:
             raise exceptions.RequestCancelled(
                 'Projected SkyServe worker launches cannot accept campaign '
@@ -483,7 +506,8 @@ def _execute(
          serve_utils.is_external_load_balancer_mode())):
         _validate_service_replica_launch_fence(_extra_launch_context)
     if (_is_launched_by_sky_serve_controller and has_launch_fence):
-        _load_service_worker_projections(_extra_launch_context)
+        _load_service_worker_projections(_extra_launch_context,
+                                         reserved_fill_launch_fence)
     dag = dag_utils.convert_entrypoint_to_dag(entrypoint)
     _validate_projected_service_task_inputs(dag, _extra_launch_context)
     for task in dag.tasks:
@@ -895,6 +919,7 @@ def _execute_dag_under_provider_fence(
         # Optimizer should eventually choose where to store bucket
         task.sync_storage_mounts()
 
+    reserved_fill_materialized = False
     try:
         provisioning_skipped = False
         if Stage.PROVISION in stages:
@@ -910,6 +935,8 @@ def _execute_dag_under_provider_fence(
                 cluster_name=cluster_name,
                 retry_until_up=retry_until_up,
                 skip_unnecessary_provisioning=skip_unnecessary_provisioning)
+            reserved_fill_materialized = (reserved_fill_launch_fence is not None
+                                          and handle is not None and not dryrun)
 
         if handle is None:
             assert dryrun, ('If not dryrun, handle must be set or '
@@ -932,6 +959,21 @@ def _execute_dag_under_provider_fence(
             _apply_service_worker_cache_to_task(task, _extra_launch_context,
                                                 handle.launched_resources)
 
+        def _materialized_effect_guard(
+                phase: str) -> typing.ContextManager[None]:
+            if not reserved_fill_materialized:
+                return contextlib.nullcontext()
+            effect_guard_factory = getattr(
+                backend, 'reserved_fill_materialized_effect_guard', None)
+            if not callable(effect_guard_factory):
+                raise exceptions.ReservedFillLaunchFenceError(
+                    'Reserved-fill backend cannot guard post-create '
+                    f'{phase}.')
+            typed_effect_guard_factory = typing.cast(
+                typing.Callable[[], typing.ContextManager[None]],
+                effect_guard_factory)
+            return typed_effect_guard_factory()
+
         do_workdir = (Stage.SYNC_WORKDIR in stages and not dryrun and
                       task.workdir is not None)
         do_file_mounts = (Stage.SYNC_FILE_MOUNTS in stages and not dryrun and
@@ -948,7 +990,8 @@ def _execute_dag_under_provider_fence(
                     global_user_state.ClusterEventType.STATUS_CHANGE)
             envs_and_secrets = task_lib.get_plaintext_envs_and_secrets(
                 task.envs_and_secrets)
-            backend.sync_workdir(handle, task.workdir, envs_and_secrets)
+            with _materialized_effect_guard('workdir synchronization'):
+                backend.sync_workdir(handle, task.workdir, envs_and_secrets)
 
         if do_file_mounts:
             if cluster_name is not None:
@@ -956,8 +999,9 @@ def _execute_dag_under_provider_fence(
                     cluster_name, status_lib.ClusterStatus.UP,
                     'Syncing file mounts',
                     global_user_state.ClusterEventType.STATUS_CHANGE)
-            backend.sync_file_mounts(handle, task.file_mounts,
-                                     task.storage_mounts)
+            with _materialized_effect_guard('file-mount synchronization'):
+                backend.sync_file_mounts(handle, task.file_mounts,
+                                         task.storage_mounts)
 
         if no_setup:
             job_logger.info('Setup commands skipped.')
@@ -966,14 +1010,33 @@ def _execute_dag_under_provider_fence(
                 job_logger.debug('Unnecessary provisioning was skipped, so '
                                  'skipping setup as well.')
             else:
+                if reserved_fill_materialized:
+                    checkpoint = getattr(
+                        backend,
+                        'checkpoint_reserved_fill_materialized_authority', None)
+                    if not callable(checkpoint):
+                        raise exceptions.ReservedFillLaunchFenceError(
+                            'Reserved-fill backend cannot revalidate '
+                            'post-create setup authority.')
+                    checkpoint()
                 if cluster_name is not None:
                     global_user_state.add_cluster_event(
                         cluster_name, status_lib.ClusterStatus.UP,
                         'Running setup commands to install dependencies',
                         global_user_state.ClusterEventType.STATUS_CHANGE)
-                backend.setup(handle, task, detach_setup=detach_setup)
+                with _materialized_effect_guard('setup'):
+                    backend.setup(handle, task, detach_setup=detach_setup)
 
         if Stage.PRE_EXEC in stages and not dryrun:
+            if reserved_fill_materialized:
+                checkpoint = getattr(
+                    backend, 'checkpoint_reserved_fill_materialized_authority',
+                    None)
+                if not callable(checkpoint):
+                    raise exceptions.ReservedFillLaunchFenceError(
+                        'Reserved-fill backend cannot revalidate post-create '
+                        'runtime authority.')
+                checkpoint()
             task_hooks = resources[0].hooks
             # Hooks payload sent to skylet:
             #   None  → "leave stored hooks alone" (first launch w/o hooks)
@@ -1001,20 +1064,22 @@ def _execute_dag_under_provider_fence(
             if idle_minutes_to_autostop is not None:
                 assert isinstance(backend, backends.CloudVmRayBackend)
                 assert isinstance(handle, backends.CloudVmRayResourceHandle)
-                apply_launch_autostop(
-                    backend,
-                    handle,
-                    idle_minutes_to_autostop,
-                    wait_for,
-                    down,
-                    hook=hook,
-                    hook_timeout=hook_timeout,
-                    hooks=hooks_payload,
-                    # A node that cannot execute the teardown only fails
-                    # the launch when the user is the one who asked for
-                    # it; SkyPilot's own leak backstops degrade instead.
-                    refusal_is_fatal=(not is_managed and controller is None),
-                    job_logger=job_logger)
+                with _materialized_effect_guard('autostop configuration'):
+                    apply_launch_autostop(
+                        backend,
+                        handle,
+                        idle_minutes_to_autostop,
+                        wait_for,
+                        down,
+                        hook=hook,
+                        hook_timeout=hook_timeout,
+                        hooks=hooks_payload,
+                        # A node that cannot execute the teardown only fails
+                        # the launch when the user is the one who asked for
+                        # it; SkyPilot's own leak backstops degrade instead.
+                        refusal_is_fatal=(not is_managed and
+                                          controller is None),
+                        job_logger=job_logger)
             elif hooks_payload is not None:
                 # Hooks can fire on preemption/down independent of
                 # autostop — persist them even when autostop is disabled.
@@ -1024,7 +1089,8 @@ def _execute_dag_under_provider_fence(
                 assert isinstance(handle, backends.CloudVmRayResourceHandle)
                 kwargs = _compute_set_autostop_args_for_hooks_only_relaunch(
                     handle.cluster_name, hooks_payload)
-                backend.set_autostop(handle, **kwargs)
+                with _materialized_effect_guard('hook configuration'):
+                    backend.set_autostop(handle, **kwargs)
 
         job_id = None
         if Stage.EXEC in stages:
@@ -1032,7 +1098,8 @@ def _execute_dag_under_provider_fence(
                 global_user_state.update_last_use(handle.get_cluster_name())
                 ordinary_launch_request._begin_service_job_io(  # pylint: disable=protected-access
                     _extra_launch_context)
-                job_id = backend.execute(handle, task, dryrun=dryrun)
+                with _materialized_effect_guard('service-job submission'):
+                    job_id = backend.execute(handle, task, dryrun=dryrun)
                 ordinary_launch_request._record_service_job(  # pylint: disable=protected-access
                     _extra_launch_context, job_id)
             finally:
@@ -1041,11 +1108,22 @@ def _execute_dag_under_provider_fence(
 
         if Stage.DOWN in stages and not dryrun:
             if down and idle_minutes_to_autostop is None:
-                backend.teardown_ephemeral_storage(task)
-                backend.teardown(handle, terminate=True)
+                with _materialized_effect_guard('ephemeral teardown'):
+                    backend.teardown_ephemeral_storage(task)
+                    backend.teardown(handle, terminate=True)
+    except Exception as error:  # pylint: disable=broad-except
+        if reserved_fill_materialized:
+            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                error, phase='post-create workload execution')
+        raise
     finally:
-        print()
-        print('\x1b[?25h', end='')  # Show cursor.
+        try:
+            print()
+            print('\x1b[?25h', end='')  # Show cursor.
+        except Exception as error:  # pylint: disable=broad-except
+            # Best-effort terminal restoration must not replace the typed
+            # launch result when stdout is already closed.
+            logger.debug('Failed to restore terminal cursor: %s', error)
     return job_id, handle
 
 

@@ -12,8 +12,10 @@ from sky.server import constants as server_constants
 from sky.server import middleware_utils
 from sky.server import state
 from sky.server import versions
+from sky.server.auth import loopback as auth_loopback
 from sky.server.requests import cutover as request_cutover
 from sky.server.requests import requests as requests_lib
+from sky.utils import controller_capability
 
 
 class RequestIDMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
@@ -137,57 +139,129 @@ class ControllerGenerationMiddleware(
             server_constants.CONTROLLER_INSTANCE_ID_HEADER)
         generation = request.headers.get(
             server_constants.CONTROLLER_GENERATION_HEADER)
-        if instance_id is None and generation is None:
+        capability = request.headers.get(
+            server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER)
+        managed_job_id = request.headers.get(
+            server_constants.MANAGED_JOB_ID_HEADER)
+        managed_slot_id = request.headers.get(
+            server_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_HEADER)
+        managed_slot_attempt = request.headers.get(
+            server_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_HEADER)
+        managed_fields = (managed_job_id, managed_slot_id, managed_slot_attempt)
+        controller_fields = (instance_id, generation, capability)
+        if all(value is None for value in controller_fields):
+            if any(value is not None for value in managed_fields):
+                return fastapi.responses.JSONResponse(
+                    status_code=400,
+                    content={
+                        'detail': 'Managed-job origin requires the complete '
+                                  'controller origin.'
+                    })
             return await call_next(request)
-        if instance_id is None or generation is None:
+        # Preserve the API server's existing authentication contract: remote
+        # callers need an authenticated user/service account; a same-host
+        # request without forwarding headers uses the normal loopback trust
+        # boundary.  The controller capability is additional authority, never
+        # a replacement for either path.
+        if (getattr(request.state, 'auth_user', None) is None and
+                not auth_loopback.is_loopback_request(request)):
+            return fastapi.responses.JSONResponse(
+                status_code=401,
+                content={
+                    'detail': 'Controller origin requires normal '
+                              'authentication.'
+                })
+        if any(value is None for value in controller_fields):
             return fastapi.responses.JSONResponse(
                 status_code=400,
                 content={
-                    'detail': 'Controller origin requires both instance and '
-                              'generation headers.'
+                    'detail': 'Controller origin requires instance, '
+                              'generation, and capability headers.'
                 })
+        assert instance_id is not None
+        assert generation is not None
+        assert capability is not None
         try:
-            uuid.UUID(instance_id)
+            canonical_instance_id = str(uuid.UUID(instance_id))
             parsed_generation = int(generation)
         except (TypeError, ValueError):
             return fastapi.responses.JSONResponse(
                 status_code=400,
                 content={'detail': 'Controller origin is malformed.'})
-        if parsed_generation <= 0:
+        if (canonical_instance_id != instance_id or parsed_generation <= 0 or
+                str(parsed_generation) != generation):
             return fastapi.responses.JSONResponse(
                 status_code=400,
-                content={'detail': 'Controller generation must be positive.'})
-        if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') != 'postgres':
-            return fastapi.responses.JSONResponse(
-                status_code=409,
-                content={
-                    'detail': 'Controller generation admission requires the '
-                              'PostgreSQL request backend.'
-                })
-
-        # Runtime import keeps the compatibility SQLite middleware path light.
-        # The synchronous SQL probe runs outside the serving event loop.
-        # pylint: disable=import-outside-toplevel
-        from sky.server.requests import postgres as request_postgres
+                content={'detail': 'Controller origin is not canonical.'})
+        managed_origin = None
+        if any(value is not None for value in managed_fields):
+            if any(value is None for value in managed_fields):
+                return fastapi.responses.JSONResponse(
+                    status_code=400,
+                    content={
+                        'detail': 'Managed-job origin requires job, slot, and '
+                                  'attempt headers.'
+                    })
+            try:
+                parsed_job_id = int(managed_job_id)
+                parsed_slot_id = int(managed_slot_id)
+                canonical_attempt = str(uuid.UUID(managed_slot_attempt))
+            except (TypeError, ValueError):
+                return fastapi.responses.JSONResponse(
+                    status_code=400,
+                    content={'detail': 'Managed-job origin is malformed.'})
+            if (parsed_job_id <= 0 or parsed_slot_id < 0 or
+                    str(parsed_job_id) != managed_job_id or
+                    str(parsed_slot_id) != managed_slot_id or
+                    canonical_attempt != managed_slot_attempt):
+                return fastapi.responses.JSONResponse(
+                    status_code=400,
+                    content={'detail': 'Managed-job origin is not canonical.'})
+            managed_origin = (parsed_job_id, parsed_slot_id, canonical_attempt)
         try:
-            is_current = await asyncio.to_thread(
-                request_postgres.controller_leadership_is_current, instance_id,
-                parsed_generation)
+            if os.environ.get('SKYPILOT_API_REQUEST_BACKEND') == 'postgres':
+                # Runtime import keeps the compatibility SQLite middleware
+                # path light.  The synchronous SQL probe runs outside the
+                # serving event loop.
+                # pylint: disable=import-outside-toplevel
+                from sky.server.requests import postgres as request_postgres
+                is_authenticated = await asyncio.to_thread(
+                    request_postgres.controller_origin_capability_is_current,
+                    instance_id, parsed_generation, capability)
+            else:
+                authority_path = os.environ.get(
+                    server_constants.
+                    CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR)
+                if authority_path is None:
+                    authority_path = controller_capability.local_authority_path(
+                        instance_id)
+                is_authenticated = (await asyncio.to_thread(
+                    controller_capability.verify_local_authority,
+                    authority_path, instance_id, parsed_generation, capability))
         except Exception as e:  # pylint: disable=broad-except
             return fastapi.responses.JSONResponse(
                 status_code=503,
                 content={
-                    'detail': 'Could not verify controller generation: '
+                    'detail': 'Could not verify controller origin: '
                               f'{type(e).__name__}.'
                 })
-        if not is_current:
+        if not is_authenticated:
             return fastapi.responses.JSONResponse(
-                status_code=409,
-                content={
-                    'detail': 'Controller generation is no longer current.'
-                })
+                status_code=401,
+                content={'detail': 'Controller origin is not authenticated.'})
         request.state.controller_origin = (instance_id, parsed_generation)
-        return await call_next(request)
+        request.state.managed_job_origin = None
+        if managed_origin is not None:
+            request.state.managed_job_origin = (managed_origin[0], instance_id,
+                                                parsed_generation,
+                                                managed_origin[1],
+                                                managed_origin[2])
+        origin_token = versions.set_managed_job_origin(
+            request.state.managed_job_origin)
+        try:
+            return await call_next(request)
+        finally:
+            versions.reset_managed_job_origin(origin_token)
 
 
 @middleware_utils.websocket_aware

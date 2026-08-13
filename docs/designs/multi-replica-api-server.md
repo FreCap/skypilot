@@ -11,7 +11,7 @@ production fleet rollout and M5 compatibility cleanup remain fleet-gated; the
 Review-29 operator-authorization correction is accepted and its implementation
 remains pending
 
-Last updated: 2026-08-08
+Last updated: 2026-08-13
 
 Canonical owner: this file. External plans and pull request descriptions must
 link here rather than restating a divergent contract.
@@ -2059,6 +2059,35 @@ generation remains recovery work, never evidence that the current leader's
 local controller crashed. This distinction is required because PIDs are
 meaningful only inside their owning pod.
 
+ControllerManager process replacement uses the same contract at a finer
+boundary. The runtime owns a fixed number of disposable slots. Before one dead
+slot attempt can be reset, its guardian proves the complete local process
+family absent, closes nested request admission for the exact
+`(instance, generation, slot, attempt)`, and proves every admitted request
+family quiescent. The reset sends every non-`INACTIVE`, non-`DONE` row owned by
+that exact attempt back to `WAITING`; it does not classify terminal rows as
+finished scheduler work merely because workload execution is finished.
+
+The single `WAITING` claim path locks the job row and all durable task-status
+rows in one transaction. It returns `cleanup_only=true` exactly when at least
+one task exists and every locked task is terminal. Ordinary claims preserve
+the existing priority order and execution path. A cleanup-only claim installs
+the same per-job controller context, invokes the canonical cluster/pool,
+ephemeral-storage, and local-file cleanup, and revokes the shared API token. It
+does not construct `JobController`, invoke workload callbacks, or relaunch a
+task. Final `DONE` is a compare-and-set requiring the same exact slot attempt,
+`LAUNCHING`, admission still open, and all tasks still terminal.
+
+Ordinary final `DONE` writes made inside a disposable slot also require
+`controller_slot_quiescing=false`. Transient provider, token, or database
+failures retain the cleanup-only claim and retry with capped exponential
+backoff, without replaying an already-completed cleanup phase. Exact ownership
+loss exits immediately so the guardian can drain and reset the row; a
+replacement attempt then classifies the still-terminal task family as
+cleanup-only again. `DONE` is never reset. This gives manager death one
+canonical adoption path and keeps workload recovery and terminal resource
+reconciliation disjoint.
+
 After a scheduler reclaims a job whose durable task status is already
 `RUNNING`, the resumed controller changes the schedule state from `LAUNCHING`
 to `ALIVE` before monitoring. This is an ownership-state correction, not a new
@@ -2437,6 +2466,14 @@ by HA mode.
   `FAILED_CONTROLLER`. They also prove terminalization commits before provider
   cleanup, a stale owner cannot terminalize, and a replacement generation can
   finish cleanup for a terminal job without resetting it for recovery.
+- Disposable-slot tests prove exact local-family and nested-request quiescence
+  precede reset; terminal rows return through the ordinary `WAITING` claim as
+  cleanup-only work; `DONE` never resets; manager death permits exact
+  re-adoption without workload relaunch; and a quiescing or replaced attempt
+  cannot publish final `DONE`. Controller tests prove cleanup-only adoption
+  reuses pool cancel, non-pool down/status, ephemeral-storage deletion, local
+  file cleanup, and token revocation while constructing no `JobController` and
+  invoking no workload callback.
 - Nested controller admission tests prove current controller metadata is
   attached to authenticated SDK requests, partial or malformed metadata is
   rejected, and a generation whose advisory-lock proof is gone cannot submit
@@ -3714,3 +3751,25 @@ infrastructure applies. The two ownership domains remain disjoint, and an
 ordinary SkyPilot rollout still neither waits for nor modifies
 `boltz-platform`. Exact review accepted this operator-boundary correction with
 no remaining blocker.
+
+### Review 30: disposable managed-job terminal-cleanup adoption
+
+Implementation review of fixed ControllerManager slots found that outer-
+generation recovery alone did not define what happens when a disposable
+manager dies after workload terminalization but before provider cleanup and
+`DONE`. Preserving the terminal row under a dead attempt stranded cleanup;
+resetting it through the ordinary workload controller risked relaunching a
+finished task. A refresh-thread provider fallback would add a second cleanup
+happy path with different context and fencing.
+
+The accepted correction keeps one reset queue and one canonical cleanup
+implementation. Exact local and nested-request quiescence precede reset, the
+atomic claim classifies the locked task family, and a terminal family enters a
+cleanup-only controller coroutine. The coroutine reuses the normal cleanup
+effects but cannot instantiate workload execution. Exact-attempt,
+non-quiescing, all-terminal `DONE` closes the final stale-write window; claim
+loss exits for guardian-managed re-adoption. Focused adversarial tests cover
+pool and non-pool effects, ephemeral storage, callback/relaunch exclusion,
+phase-aware retry, exact finalization, and death between claim and completion.
+No compatibility branch or refresh-owned provider fallback remains in the
+steady-state contract.

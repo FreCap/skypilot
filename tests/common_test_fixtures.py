@@ -585,11 +585,15 @@ def mock_aws_backend(monkeypatch):
         # Always return successfully without waiting
         return
 
-    def mock_post_provision_runtime_setup(cloud_name, cluster_name,
-                                          cluster_yaml, provision_record,
-                                          custom_resource, log_dir,
-                                          existing_cluster_hash):
-        del existing_cluster_hash
+    def mock_post_provision_runtime_setup(cloud_name,
+                                          cluster_name,
+                                          cluster_yaml,
+                                          provision_record,
+                                          custom_resource,
+                                          log_dir,
+                                          existing_cluster_hash,
+                                          provider_effect_guard_factory=None):
+        del existing_cluster_hash, provider_effect_guard_factory
         # Get region from the provision record
         region = provision_record.region
 

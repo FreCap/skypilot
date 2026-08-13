@@ -1,6 +1,7 @@
 """Versioned state and behavior for one SkyServe replica."""
 import dataclasses
 import math
+import re
 import time
 import typing
 from typing import Any
@@ -50,7 +51,8 @@ SYSTEM_RECOVERY_STORAGE_FIELDS = (
 # key, including a completely absent bundle, is quarantined.
 V13_ADDITIVE_STORAGE_FIELDS = ('replica_record_id',
                                *SYSTEM_RECOVERY_STORAGE_FIELDS)
-_REPLICA_INFO_VERSION = 14
+_REPLICA_INFO_VERSION = 17
+_SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
 
 # A fixed namespace makes the v12 transition identity
 # reproducible across processes and across JSON/pickle readers.  New v13 rows
@@ -392,6 +394,19 @@ _REPLICA_INFO_OWNED_FIELDS = (
     'reserved_fill_service_generation',
     'reserved_fill_physical_cluster_uid',
     'reserved_fill_kubernetes_context',
+    'reserved_fill_allocation_generation',
+    'reserved_fill_allocation_input_sha256',
+    'reserved_fill_allocation_claim_generation',
+    'reserved_fill_reconciliation_gate_generation',
+    'reserved_fill_reclaim_fleet_bundle_sha256',
+    'reserved_fill_reclaim_policy_revision',
+    'reserved_fill_reclaim_provider_inventory_sha256',
+    'reserved_fill_worker_projection_sha256',
+    'reserved_fill_observation_generation',
+    'reserved_fill_observation_sequence',
+    'reserved_fill_intent_idempotency_key',
+    'zero_cost_admission_sequence',
+    'zero_cost_materialization_sequence',
     'is_zero_cost',
     'cost_rebalance_for_replica_id',
     'paid_capacity_pool_key',
@@ -422,6 +437,19 @@ _REPLICA_INFO_LEGACY_DEFAULTS = {
     'reserved_fill_service_generation': None,
     'reserved_fill_physical_cluster_uid': None,
     'reserved_fill_kubernetes_context': None,
+    'reserved_fill_allocation_generation': None,
+    'reserved_fill_allocation_input_sha256': None,
+    'reserved_fill_allocation_claim_generation': None,
+    'reserved_fill_reconciliation_gate_generation': None,
+    'reserved_fill_reclaim_fleet_bundle_sha256': None,
+    'reserved_fill_reclaim_policy_revision': None,
+    'reserved_fill_reclaim_provider_inventory_sha256': None,
+    'reserved_fill_worker_projection_sha256': None,
+    'reserved_fill_observation_generation': None,
+    'reserved_fill_observation_sequence': None,
+    'reserved_fill_intent_idempotency_key': None,
+    'zero_cost_admission_sequence': None,
+    'zero_cost_materialization_sequence': None,
     'is_zero_cost': False,
     'cost_rebalance_for_replica_id': None,
     'paid_capacity_pool_key': None,
@@ -429,7 +457,7 @@ _REPLICA_INFO_LEGACY_DEFAULTS = {
 
 
 def _materialize_legacy_replica_info_fields(replica: Any) -> None:
-    """Own additive ReplicaInfo fields after decoding a pre-v14 record."""
+    """Own additive ReplicaInfo fields after decoding a pre-v17 record."""
     replica_state = vars(replica)
     for field, default in _REPLICA_INFO_LEGACY_DEFAULTS.items():
         replica_state.setdefault(field, default)
@@ -451,7 +479,7 @@ def _require_replica_info_fields(replica: Any, *, owner: str) -> None:
 
 
 def _require_current_storage_fields(state: dict[str, Any]) -> None:
-    """Reject a v14 JSON record with missing owned-interface fields."""
+    """Reject a v17 JSON record with missing owned-interface fields."""
     missing = [
         field for field in _REPLICA_INFO_STORAGE_FIELDS if field not in state
     ]
@@ -472,7 +500,7 @@ def _require_current_storage_fields(state: dict[str, Any]) -> None:
 
 
 def _require_current_pickle_fields(state: dict[str, Any], version: int) -> None:
-    """Reject a v14+ pickle whose owned in-memory interface is partial."""
+    """Reject a v17+ pickle whose owned in-memory interface is partial."""
     missing = [
         field for field in _REPLICA_INFO_OWNED_FIELDS if field not in state
     ]
@@ -535,6 +563,184 @@ def _exact_reserved_fill_marker(value: Any) -> bool:
         raise exceptions.KubernetesPhysicalClusterIdentityError(
             'Stored reserved_fill marker must be a boolean.')
     return value
+
+
+_LEGACY_RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS = (
+    'reserved_fill_allocation_generation',
+    'reserved_fill_allocation_input_sha256',
+    'reserved_fill_allocation_claim_generation',
+    'reserved_fill_observation_generation',
+    'reserved_fill_observation_sequence',
+    'reserved_fill_intent_idempotency_key',
+)
+_RESERVED_FILL_RECLAIM_POLICY_ATTRIBUTION_FIELDS = (
+    'reserved_fill_reconciliation_gate_generation',
+    'reserved_fill_reclaim_fleet_bundle_sha256',
+    'reserved_fill_reclaim_policy_revision',
+    'reserved_fill_reclaim_provider_inventory_sha256',
+    'reserved_fill_worker_projection_sha256',
+)
+_RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS = (
+    *_LEGACY_RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS,
+    *_RESERVED_FILL_RECLAIM_POLICY_ATTRIBUTION_FIELDS,
+)
+
+
+def validate_reserved_fill_allocation_attribution(
+    replica: Any,
+    *,
+    require_policy_bound_admission: bool = False,
+) -> None:
+    """Validate one complete typed allocation identity or its legacy absence.
+
+    Protocol-v2 rows written before the typed planner legitimately have no
+    allocation attribution.  Serve044 rows may carry the complete historical
+    allocation tuple without the Serve045 policy identity.  Both remain
+    readable, but neither can pass the identity-bound launch fence after the
+    one-way gate activates.  New typed rows persist the complete tuple;
+    accepting a partial tuple would let unrelated authorities be conflated.
+    """
+    state = vars(replica)
+    if type(state.get('is_zero_cost')) is not bool:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'is_zero_cost must be an exact boolean.')
+    values = {
+        field: state.get(field)
+        for field in _RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS
+    }
+    admission_sequence = state.get('zero_cost_admission_sequence')
+    if admission_sequence is not None:
+        if (type(admission_sequence) is not int or  # pylint: disable=unidiomatic-typecheck
+                admission_sequence < 1):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'zero_cost_admission_sequence must be a positive integer.')
+        if state.get('is_zero_cost') is not True:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'zero_cost_admission_sequence requires a zero-cost row.')
+    materialization_sequence = state.get('zero_cost_materialization_sequence')
+    if materialization_sequence is not None:
+        if (type(materialization_sequence) is not int or  # pylint: disable=unidiomatic-typecheck
+                materialization_sequence < 1):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'zero_cost_materialization_sequence must be a positive '
+                'integer.')
+        if state.get('is_zero_cost') is not True:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'zero_cost_materialization_sequence requires a zero-cost '
+                'row.')
+        # This marker is immutable historical evidence of first successful
+        # materialization. Teardown and cleanup legitimately move the current
+        # process status to INTERRUPTED or FAILED after that success; first
+        # assignment is guarded by the transactional Serve state writer.
+    legacy_values = {
+        field: values[field]
+        for field in _LEGACY_RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS
+    }
+    policy_values = {
+        field: values[field]
+        for field in _RESERVED_FILL_RECLAIM_POLICY_ATTRIBUTION_FIELDS
+    }
+    if all(value is None for value in legacy_values.values()):
+        if any(value is not None for value in policy_values.values()):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Reserved-fill reclaim policy attribution requires legacy '
+                'allocation attribution.')
+        # Ordinary zero-cost rows intentionally carry only the global commit
+        # sequence. The independent ordinary admission high-water invalidates
+        # stale allocation maps; this total sequence remains durable row
+        # attribution without pretending the row was fill-authorized.
+        if admission_sequence is not None and replica.reserved_fill is True:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'A sequenced reserved-fill row requires complete allocation '
+                'attribution.')
+        if require_policy_bound_admission:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Policy-bound reserved-fill launch requires complete '
+                'allocation and reclaim-policy attribution.')
+        return
+    if any(value is None for value in legacy_values.values()):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill allocation attribution must be complete.')
+    if (any(value is not None for value in policy_values.values()) and
+            any(value is None for value in policy_values.values())):
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill reclaim policy attribution must be complete.')
+    if replica.reserved_fill is not True:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill allocation attribution requires a fill row.')
+
+    for field in ('reserved_fill_pool_key',
+                  'reserved_fill_physical_cluster_uid',
+                  'reserved_fill_kubernetes_context'):
+        value = state.get(field)
+        if type(value) is not str or not value:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Reserved-fill allocation attribution requires a complete '
+                'protocol-v2 pool identity.')
+    service_generation = state.get('reserved_fill_service_generation')
+    if type(service_generation) is not int or service_generation < 1:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'Reserved-fill allocation attribution requires a positive '
+            'service generation.')
+
+    for field in ('reserved_fill_allocation_generation',
+                  'reserved_fill_allocation_claim_generation',
+                  'reserved_fill_observation_generation'):
+        value = values[field]
+        if type(value) is not int or value < 1:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'{field} must be a positive integer.')
+    observation_sequence = values['reserved_fill_observation_sequence']
+    if type(observation_sequence) is not int or observation_sequence < 0:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'reserved_fill_observation_sequence must be a nonnegative '
+            'integer.')
+    for field in ('reserved_fill_allocation_input_sha256',
+                  'reserved_fill_intent_idempotency_key'):
+        value = values[field]
+        if (type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'{field} must be a lowercase SHA-256 digest.')
+    if all(value is None for value in policy_values.values()):
+        if require_policy_bound_admission:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Policy-bound reserved-fill launch requires complete '
+                'reclaim-policy attribution.')
+        return
+    gate_generation = values['reserved_fill_reconciliation_gate_generation']
+    if type(gate_generation) is not int or gate_generation < 1:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'reserved_fill_reconciliation_gate_generation must be a positive '
+            'integer.')
+    for field in ('reserved_fill_reclaim_fleet_bundle_sha256',
+                  'reserved_fill_reclaim_provider_inventory_sha256',
+                  'reserved_fill_worker_projection_sha256'):
+        value = values[field]
+        if (type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                f'{field} must be a lowercase SHA-256 digest.')
+    policy_revision = values['reserved_fill_reclaim_policy_revision']
+    if type(policy_revision) is not str or not policy_revision:
+        raise exceptions.KubernetesPhysicalClusterIdentityError(
+            'reserved_fill_reclaim_policy_revision must be nonempty text.')
+    if require_policy_bound_admission:
+        if (getattr(replica, '_version', None) != _REPLICA_INFO_VERSION or
+                getattr(replica, '_VERSION', None) != _REPLICA_INFO_VERSION):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Policy-bound reserved-fill launch requires a current '
+                f'ReplicaInfo v{_REPLICA_INFO_VERSION} row.')
+        if (admission_sequence is None or
+                values['reserved_fill_allocation_claim_generation']
+                != service_generation):
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Policy-bound reserved-fill launch requires complete admitted '
+                'allocation provenance.')
+
+
+# Historical private import identity retained while the public validator is
+# the single serialization, decoding, and terminal-launch contract.
+_validate_reserved_fill_allocation_attribution = (
+    validate_reserved_fill_allocation_attribution)
 
 
 def _set_ordinary_system_recovery_defaults(replica: Any) -> None:
@@ -731,6 +937,11 @@ class ReplicaInfo:
     # anchors, monotonic subdocument revision, nested state, and quarantine.
     # Version 14 makes every field owned by ReplicaInfo and
     # ReplicaStatusProperty explicit after the storage/pickle decode boundary.
+    # Version 15 persists the exact typed allocation publication, observation,
+    # intent, and database-assigned admission identities for replay-safe
+    # reserved-fill debits.
+    # Version 16 binds reserved-fill attribution to the reconciliation-gate
+    # generation and immutable deployment reclaim-policy identity.
     _VERSION = _REPLICA_INFO_VERSION
 
     def __init__(self,
@@ -794,6 +1005,27 @@ class ReplicaInfo:
         self.reserved_fill_service_generation: int | None = None
         self.reserved_fill_physical_cluster_uid: str | None = None
         self.reserved_fill_kubernetes_context: str | None = None
+        # Exact publication identity for typed protocol-v2 admission. Legacy
+        # fill rows keep the complete tuple absent and are not replay debits.
+        self.reserved_fill_allocation_generation: int | None = None
+        self.reserved_fill_allocation_input_sha256: str | None = None
+        self.reserved_fill_allocation_claim_generation: int | None = None
+        self.reserved_fill_reconciliation_gate_generation: int | None = None
+        self.reserved_fill_reclaim_fleet_bundle_sha256: str | None = None
+        self.reserved_fill_reclaim_policy_revision: str | None = None
+        self.reserved_fill_reclaim_provider_inventory_sha256: str | None = None
+        self.reserved_fill_worker_projection_sha256: str | None = None
+        self.reserved_fill_observation_generation: int | None = None
+        self.reserved_fill_observation_sequence: int | None = None
+        self.reserved_fill_intent_idempotency_key: str | None = None
+        # Assigned in the same database transaction that increments the
+        # protocol's global zero-cost admission sequence. It is intentionally
+        # not trusted from the planner or transitional override.
+        self.zero_cost_admission_sequence: int | None = None
+        # Assigned atomically with the first persisted successful sky.launch
+        # transition. It orders provider-visible materialization independently
+        # from row admission, closing the observe-while-binding race.
+        self.zero_cost_materialization_sequence: int | None = None
         # Placement-cost provenance, not launch intent. True means the
         # replica occupies capacity the placer classifies as zero cost.
         self.is_zero_cost: bool = False
@@ -833,7 +1065,7 @@ class ReplicaInfo:
 
         # Pre-v13 pickles have no recovery fields and are ordinary by
         # contract. Every v13 recovery bundle must be complete; a partial or
-        # completely absent bundle is quarantined. Current v14 objects were
+        # completely absent bundle is quarantined. Current v17 objects were
         # checked above and can never enter either path.
         present_recovery_fields = {
             field for field in V13_ADDITIVE_STORAGE_FIELDS
@@ -875,6 +1107,7 @@ class ReplicaInfo:
         recovery = self.system_recovery
         quarantine = self.system_recovery_quarantine
         reserved_fill = _exact_reserved_fill_marker(self.reserved_fill)
+        _validate_reserved_fill_allocation_attribution(self)
 
         def _process_status_value(
             status: common_utils.ProcessStatus | None,) -> str | None:
@@ -906,6 +1139,31 @@ class ReplicaInfo:
                 self.reserved_fill_physical_cluster_uid,
             'reserved_fill_kubernetes_context':
                 self.reserved_fill_kubernetes_context,
+            'reserved_fill_allocation_generation':
+                self.reserved_fill_allocation_generation,
+            'reserved_fill_allocation_input_sha256':
+                self.reserved_fill_allocation_input_sha256,
+            'reserved_fill_allocation_claim_generation':
+                self.reserved_fill_allocation_claim_generation,
+            'reserved_fill_reconciliation_gate_generation':
+                self.reserved_fill_reconciliation_gate_generation,
+            'reserved_fill_reclaim_fleet_bundle_sha256':
+                self.reserved_fill_reclaim_fleet_bundle_sha256,
+            'reserved_fill_reclaim_policy_revision':
+                self.reserved_fill_reclaim_policy_revision,
+            'reserved_fill_reclaim_provider_inventory_sha256':
+                self.reserved_fill_reclaim_provider_inventory_sha256,
+            'reserved_fill_worker_projection_sha256':
+                self.reserved_fill_worker_projection_sha256,
+            'reserved_fill_observation_generation':
+                self.reserved_fill_observation_generation,
+            'reserved_fill_observation_sequence':
+                self.reserved_fill_observation_sequence,
+            'reserved_fill_intent_idempotency_key':
+                self.reserved_fill_intent_idempotency_key,
+            'zero_cost_admission_sequence': self.zero_cost_admission_sequence,
+            'zero_cost_materialization_sequence':
+                self.zero_cost_materialization_sequence,
             'is_zero_cost': self.is_zero_cost,
             'cost_rebalance_for_replica_id': self.cost_rebalance_for_replica_id,
             'paid_capacity_pool_key': self.paid_capacity_pool_key,
@@ -1011,7 +1269,37 @@ class ReplicaInfo:
             'reserved_fill_physical_cluster_uid')
         replica.reserved_fill_kubernetes_context = state.get(
             'reserved_fill_kubernetes_context')
-        replica.is_zero_cost = bool(state.get('is_zero_cost', False))
+        replica.reserved_fill_allocation_generation = state.get(
+            'reserved_fill_allocation_generation')
+        replica.reserved_fill_allocation_input_sha256 = state.get(
+            'reserved_fill_allocation_input_sha256')
+        replica.reserved_fill_allocation_claim_generation = state.get(
+            'reserved_fill_allocation_claim_generation')
+        replica.reserved_fill_reconciliation_gate_generation = state.get(
+            'reserved_fill_reconciliation_gate_generation')
+        replica.reserved_fill_reclaim_fleet_bundle_sha256 = state.get(
+            'reserved_fill_reclaim_fleet_bundle_sha256')
+        replica.reserved_fill_reclaim_policy_revision = state.get(
+            'reserved_fill_reclaim_policy_revision')
+        replica.reserved_fill_reclaim_provider_inventory_sha256 = state.get(
+            'reserved_fill_reclaim_provider_inventory_sha256')
+        replica.reserved_fill_worker_projection_sha256 = state.get(
+            'reserved_fill_worker_projection_sha256')
+        replica.reserved_fill_observation_generation = state.get(
+            'reserved_fill_observation_generation')
+        replica.reserved_fill_observation_sequence = state.get(
+            'reserved_fill_observation_sequence')
+        replica.reserved_fill_intent_idempotency_key = state.get(
+            'reserved_fill_intent_idempotency_key')
+        replica.zero_cost_admission_sequence = state.get(
+            'zero_cost_admission_sequence')
+        replica.zero_cost_materialization_sequence = state.get(
+            'zero_cost_materialization_sequence')
+        raw_is_zero_cost = state.get('is_zero_cost', False)
+        if type(raw_is_zero_cost) is not bool:
+            raise exceptions.KubernetesPhysicalClusterIdentityError(
+                'Stored is_zero_cost must be an exact boolean.')
+        replica.is_zero_cost = raw_is_zero_cost
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
         replica.paid_capacity_pool_key = state.get('paid_capacity_pool_key')
@@ -1124,6 +1412,7 @@ class ReplicaInfo:
                 replica.replica_id, quarantine.reason.value)
         _require_replica_info_fields(
             replica, owner=f'decoded ReplicaInfo v{record_version}')
+        _validate_reserved_fill_allocation_attribution(replica)
         return replica
 
     def get_spot_location(self) -> spot_placer.Location | None:
@@ -1593,6 +1882,21 @@ class ReplicaInfo:
             state.setdefault('reserved_fill_service_generation', None)
             state.setdefault('reserved_fill_physical_cluster_uid', None)
             state.setdefault('reserved_fill_kubernetes_context', None)
+            state.setdefault('reserved_fill_allocation_generation', None)
+            state.setdefault('reserved_fill_allocation_input_sha256', None)
+            state.setdefault('reserved_fill_allocation_claim_generation', None)
+            state.setdefault('reserved_fill_reconciliation_gate_generation',
+                             None)
+            state.setdefault('reserved_fill_reclaim_fleet_bundle_sha256', None)
+            state.setdefault('reserved_fill_reclaim_policy_revision', None)
+            state.setdefault('reserved_fill_reclaim_provider_inventory_sha256',
+                             None)
+            state.setdefault('reserved_fill_worker_projection_sha256', None)
+            state.setdefault('reserved_fill_observation_generation', None)
+            state.setdefault('reserved_fill_observation_sequence', None)
+            state.setdefault('reserved_fill_intent_idempotency_key', None)
+            state.setdefault('zero_cost_admission_sequence', None)
+            state.setdefault('zero_cost_materialization_sequence', None)
 
         if version < 7:
             # Rows written before version 7 carry the full list of failed
@@ -1639,6 +1943,7 @@ class ReplicaInfo:
                     INCONSISTENT_V13_BUNDLE)
         _require_replica_info_fields(
             self, owner=f'decoded ReplicaInfo v{version} pickle')
+        _validate_reserved_fill_allocation_attribution(self)
         if self.system_recovery_quarantine is not None:
             self.status_property.service_ready_now = False
             self.first_consecutive_failure_time = None

@@ -460,9 +460,15 @@ resource "helm_release" "skypilot" {
   devel            = true # chart is published as a pre-release (-dev) version
   timeout          = local.api_server_rollout_timeout_seconds
   replace          = true # Required to recover from failed releases (house convention)
-  wait             = true # Host cluster has nodes; surface install failures at apply time
+  # Existing releases carry user values that may predate this module. A
+  # reviewed immutable capture is repeated as the first explicit values layer,
+  # while reuse_values keeps Helm's native in-place upgrade semantics. Later
+  # layers remain authoritative in the same order as `helm upgrade`.
+  reuse_values = var.prior_helm_release_values != null
+  wait         = true # Host cluster has nodes; surface install failures at apply time
 
   values = compact([
+    try(var.prior_helm_release_values.yaml, ""),
     yamlencode(local.helm_values),
     var.extra_helm_values,
   ])

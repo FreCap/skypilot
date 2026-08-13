@@ -804,6 +804,13 @@ class Kubernetes(clouds.Cloud):
                     != acc_count):
                 raise ValueError('Worker placement projection does not match '
                                  'the Kubernetes deployment candidate.')
+        projection_version = (
+            worker_placement_projection.get('projection_version')
+            if worker_placement_projection is not None else None)
+        if projection_version is not None and projection_version != 2:
+            raise ValueError('Unsupported worker placement projection '
+                             f'version {projection_version!r}.')
+        is_v2_worker_projection = projection_version == 2
 
         def _get_image_id(resources: 'resources_lib.Resources') -> str:
             container_image = resources.extract_docker_image()
@@ -871,8 +878,12 @@ class Kubernetes(clouds.Cloud):
         port_mode = network_utils.get_port_mode(None, context)
 
         # TODO(kyuds): Support SSH node pools as well.
-        k8s_service_account_name = get_service_account_name(
-            context, resources.cluster_config_overrides)
+        if worker_placement_projection is None:
+            k8s_service_account_name = get_service_account_name(
+                context, resources.cluster_config_overrides)
+        else:
+            k8s_service_account_name = worker_placement_projection[
+                'service_account_name']
 
         fuse_device_required = bool(resources.requires_fuse)
 
@@ -927,37 +938,56 @@ class Kubernetes(clouds.Cloud):
                 keys=('high_availability', 'storage_class_name'),
                 default_value=None))
 
-        # An API-server-configured queue is an operator-owned admission
-        # boundary, so request overrides cannot redirect it.  A legacy
-        # request-provided queue on an otherwise queue-less server is still
-        # accepted, but it also activates strict management below.
-        k8s_kueue_require_managed = (
-            skypilot_config.get_effective_kueue_require_managed(
-                # TODO(kyuds): Support SSH node pools as well.
-                cloud='kubernetes',
-                region=context))
-        queue_override_configs = (None if k8s_kueue_require_managed else
-                                  resources.cluster_config_overrides)
-        k8s_kueue_local_queue_name = (skypilot_config.get_effective_queue_name(
-            cloud='kubernetes',
-            region=context,
-            override_configs=queue_override_configs))
-        # Defense in depth for request-provided queues and older config
-        # resolvers: no effective queue is ever allowed to remain best effort.
-        k8s_kueue_require_managed = (k8s_kueue_require_managed or
-                                     bool(k8s_kueue_local_queue_name))
-        if (k8s_kueue_require_managed and not k8s_kueue_local_queue_name):
-            raise ValueError(
-                'kubernetes.kueue.require_managed is true for context '
-                f'{context!r}, but no Kueue LocalQueue is configured. Set '
-                'kubernetes.kueue.local_queue_name (or '
-                'kubernetes.quota.queue) in the API server config.')
+        if is_v2_worker_projection:
+            # V2 freezes the complete Kueue admission pair at version commit.
+            # Never consult mutable server or request configuration here.
+            assert worker_placement_projection is not None
+            kueue_admission = worker_placement_projection['kueue_admission']
+            if kueue_admission is None:
+                k8s_kueue_local_queue_name = None
+                k8s_kueue_workload_priority_class_name = None
+                k8s_kueue_require_managed = False
+            else:
+                k8s_kueue_local_queue_name = kueue_admission['local_queue_name']
+                k8s_kueue_workload_priority_class_name = kueue_admission[
+                    'workload_priority_class_name']
+                k8s_kueue_require_managed = True
+        else:
+            # An API-server-configured queue is an operator-owned admission
+            # boundary, so request overrides cannot redirect it.  A legacy
+            # request-provided queue on an otherwise queue-less server is
+            # still accepted, but it also activates strict management below.
+            k8s_kueue_require_managed = (
+                skypilot_config.get_effective_kueue_require_managed(
+                    # TODO(kyuds): Support SSH node pools as well.
+                    cloud='kubernetes',
+                    region=context))
+            queue_override_configs = (None if k8s_kueue_require_managed else
+                                      resources.cluster_config_overrides)
+            k8s_kueue_local_queue_name = (
+                skypilot_config.get_effective_queue_name(
+                    cloud='kubernetes',
+                    region=context,
+                    override_configs=queue_override_configs))
+            # Defense in depth for request-provided queues and older config
+            # resolvers: no effective queue is ever allowed to remain best
+            # effort.
+            k8s_kueue_require_managed = (k8s_kueue_require_managed or
+                                         bool(k8s_kueue_local_queue_name))
+            if (k8s_kueue_require_managed and not k8s_kueue_local_queue_name):
+                raise ValueError(
+                    'kubernetes.kueue.require_managed is true for context '
+                    f'{context!r}, but no Kueue LocalQueue is configured. Set '
+                    'kubernetes.kueue.local_queue_name (or '
+                    'kubernetes.quota.queue) in the API server config.')
+            k8s_kueue_workload_priority_class_name = (
+                resources.priority_class if k8s_kueue_require_managed else None)
 
         # Check DWS configuration for GKE.
         (enable_flex_start, enable_flex_start_queued_provisioning,
          max_run_duration_seconds) = gcp_utils.get_dws_config(
-             context, k8s_kueue_local_queue_name,
-             resources.cluster_config_overrides)
+             context, k8s_kueue_local_queue_name, None
+             if is_v2_worker_projection else resources.cluster_config_overrides)
         if enable_flex_start_queued_provisioning or enable_flex_start:
             # DWS is only supported in GKE, check the autoscaler type.
             autoscaler_type = skypilot_config.get_effective_region_config(
@@ -996,11 +1026,14 @@ class Kubernetes(clouds.Cloud):
             default_value=timeout,
             override_configs=resources.cluster_config_overrides)
 
-        namespace = kubernetes_utils.get_namespace(
-            context=context,
-            override_configs=resources.cluster_config_overrides,
-            cloud=cloud_config_str,
-        )
+        if worker_placement_projection is None:
+            namespace = kubernetes_utils.get_namespace(
+                context=context,
+                override_configs=resources.cluster_config_overrides,
+                cloud=cloud_config_str,
+            )
+        else:
+            namespace = worker_placement_projection['namespace']
 
         # Detect hostNetwork before the template is rendered so the probe
         # env vars can be wired into deploy_vars. Two independent paths put
@@ -1046,9 +1079,7 @@ class Kubernetes(clouds.Cloud):
             'k8s_fuse_device_required': fuse_device_required,
             'k8s_kueue_local_queue_name': k8s_kueue_local_queue_name,
             'k8s_kueue_require_managed': k8s_kueue_require_managed,
-            'k8s_kueue_workload_priority_class_name':
-                (resources.priority_class if k8s_kueue_require_managed else None
-                ),
+            'k8s_kueue_workload_priority_class_name': k8s_kueue_workload_priority_class_name,
             # Namespace to run the fusermount-server daemonset in
             'k8s_skypilot_system_namespace': _SKYPILOT_SYSTEM_NAMESPACE,
             'k8s_fusermount_shared_dir': kubernetes_fuse.FUSERMOUNT_SHARED_DIR,

@@ -53,7 +53,9 @@ from typing import Any, TypeGuard
 from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.serve import constants
+from sky.serve import pool_capacity_observation
 from sky.serve import reserved_capacity_allocation
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.server.requests import postgres as request_postgres
 from sky.utils import common_utils
@@ -80,9 +82,14 @@ PROTOCOL_V1 = 1
 PROTOCOL_V2 = 2
 _SUPPORTED_PROTOCOLS = frozenset((PROTOCOL_V1, PROTOCOL_V2))
 # Additive metadata inside the existing per-service exact-card JSON.  `$`
-# cannot begin a valid SkyServe service name, so old readers safely ignore it
-# while continuing to find their own service entry.
-_OBSERVED_FREE_BY_ACCELERATOR_KEY = '$skypilot-observed-free-v1'
+# cannot begin a valid SkyServe service name. The slot-width key is emitted
+# only by committed-observation rounds after the fleet convergence gate, so a
+# legacy mixed-binary writer never observes a key its epoch canonicalizer does
+# not understand.
+OBSERVED_FREE_BY_ACCELERATOR_KEY = '$skypilot-observed-free-v1'
+_OBSERVED_FREE_BY_ACCELERATOR_KEY = OBSERVED_FREE_BY_ACCELERATOR_KEY
+BROKER_SLOT_WIDTH_KEY = '$skypilot-slot-width-v1'
+_BROKER_SLOT_WIDTH_KEY = BROKER_SLOT_WIDTH_KEY
 
 # This is the fixed container name emitted by the SkyPilot Helm chart.  The
 # activation gate deliberately does not accept an operator-selected container:
@@ -98,7 +105,7 @@ _QUIESCENCE_BACKEND_GUARD_ENV_VAR = (
     'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
 _IMAGE_ID_DIGEST_PATTERN = re.compile(r'(?:@|//)(sha256:[0-9a-fA-F]{64})$')
 _PROTOCOL_V2_SCHEMA_REVISIONS = frozenset({'035', '036', '037'})
-_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '008'
+_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '010'
 _MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 64 * 1024
 # Keep this equal to the API request server-instance lease's stale horizon.
 # Recently draining/unready rows remain relevant: their controller children may
@@ -420,12 +427,90 @@ class Allocation:
     # no shaped launch.  The aggregate feed is always clamped to this mapping
     # when present.
     feed_by_accelerator: dict[str, int] | None = None
-    # Raw provider observation from the successfully published round.  These
-    # fields are all absent for old, blackout, rejected, or corrupt rounds.
-    # They are placement evidence only; feed/grant remain launch authority.
-    observed_free: int | None = None
-    observed_free_by_accelerator: dict[str, int] | None = None
+    # Provider observation converted to replica slots by the successfully
+    # published round. These fields are absent for old, blackout, rejected, or
+    # corrupt rounds. They are placement evidence only; feed/grant remain
+    # launch authority. Raw GPU evidence stays in the observation ledger.
+    observed_free_slots: int | None = None
+    observed_free_slots_by_accelerator: dict[str, int] | None = None
     observed_at: float | None = None
+    broker_slot_width: int = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class RoundObservationProvenance:
+    """Immutable observation authority attached to one round publication.
+
+    A sequenced round publisher must persist this in the same transaction as
+    the allocation.  Keeping the complete physical identity here lets that
+    boundary reject a confused-deputy publication instead of trusting only a
+    generation number and digest.  ``access_context`` identifies the alias
+    used to acquire the observation; placement access is attested separately
+    by each service claim edge and may use another alias of the same UID.
+    """
+
+    pool_key: str
+    physical_cluster_uid: str
+    accelerator_names: tuple[str, ...]
+    access_context: str
+    observation_generation: int
+    observation_sequence: int
+    materialization_sequence: int
+    payload_sha256: str
+    observed_at: float
+    valid_until: float
+
+
+@dataclasses.dataclass(frozen=True)
+class ReservedFillRoundPublication:
+    """Typed input to the durable round-publication boundary."""
+
+    pool_key: str
+    round_id: int
+    snapshot_time: float
+    epoch: int
+    grants: str
+    feeds: str
+    feed_by_accelerator: str | None
+    raw_grants: str
+    feed_state: str
+    sum_holdings: int
+    last_observed_free: int | None
+    last_observed_free_ts: float | None
+    phantom_streak: int
+    shrink_baseline: int | None
+    lease_token: int
+    lease_expires_at: float
+    protocol_version: int
+    claim_generations: str
+    utilization_state: str | None
+    observation_provenance: RoundObservationProvenance | None = None
+
+
+class RoundPublisher(typing.Protocol):
+    """Persists one allocation publication, including its provenance."""
+
+    def __call__(self, publication: ReservedFillRoundPublication, /) -> bool:
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _CommittedRoundObservation:
+    """Validated provider-free input consumed while the broker lock is held."""
+
+    payload: pool_capacity_observation.PoolCapacitySuccess
+    provenance: RoundObservationProvenance
+
+    def is_authoritative_at(self, now: float) -> bool:
+        return self.provenance.observed_at <= now <= self.provenance.valid_until
+
+    def to_slot_observation(self, gpus_per_replica: int) -> PoolObservation:
+        """Convert raw physical evidence under one authenticated claim width."""
+        slots_by_accelerator = self.payload.slot_counts(gpus_per_replica)
+        return PoolObservation(free_slots=sum(
+            count for _, count in slots_by_accelerator),
+                               gpu_names=self.payload.present_accelerator_names,
+                               free_slots_by_accelerator=slots_by_accelerator)
 
 
 # Keep the historical broker import and pickle identities as a direct facade.
@@ -1582,6 +1667,7 @@ def persist_fill_replica(
     expected_protocol_version: int = PROTOCOL_V1,
     expected_service_generation: int = 0,
     expected_physical_cluster_uid: str | None = None,
+    expected_ordinary_zero_cost_admission_sequence: int | None = None,
     expected_service_hash: str | None = None,
     expected_controller_owner: tuple[int | None, str | None] | None = None
 ) -> bool:
@@ -1643,6 +1729,8 @@ def persist_fill_replica(
                 expected_protocol_version=expected_protocol_version,
                 expected_service_generation=expected_service_generation,
                 expected_physical_cluster_uid=(expected_physical_cluster_uid),
+                expected_ordinary_zero_cost_admission_sequence=(
+                    expected_ordinary_zero_cost_admission_sequence),
                 expected_lease_token=lease_token,
                 expected_service_hash=expected_service_hash,
                 expected_controller_owner=expected_controller_owner)
@@ -1797,7 +1885,7 @@ def replace_claim_set(
         raise ValueError('Protocol-v2 global budgets must be nonnegative.')
     normalized_edges: list[dict[str, Any]] = []
     pool_keys: set[str] = set()
-    access_contexts: set[str] = set()
+    physical_uid_by_access_context: dict[str, str] = {}
     identities: list[tuple[str, PoolIdentity]] = []
     for raw_edge in edges:
         edge = dict(raw_edge)
@@ -1813,18 +1901,20 @@ def replace_claim_set(
                              f'duplicate pool edge {pool_key!r}.')
         pool_keys.add(pool_key)
         physical_uid = edge.get('physical_cluster_uid')
-        if physical_uid != identity.physical_cluster_uid:
+        if (not isinstance(physical_uid, str) or not physical_uid or
+                physical_uid != identity.physical_cluster_uid):
             raise ValueError('Protocol-v2 edge physical UID does not match '
                              f'its pool key: {pool_key!r}.')
         access_context = edge.get('access_context')
         if not isinstance(access_context, str) or not access_context:
             raise ValueError('Every protocol-v2 edge requires an access '
                              f'context: {pool_key!r}.')
-        if access_context in access_contexts:
-            raise ValueError(
-                'A protocol-v2 complete set may contain at most '
-                f'one edge per access context: {access_context!r}.')
-        access_contexts.add(access_context)
+        context_uid = physical_uid_by_access_context.setdefault(
+            access_context, physical_uid)
+        if context_uid != physical_uid:
+            raise ValueError('One protocol-v2 access context cannot identify '
+                             'multiple physical clusters: '
+                             f'{access_context!r}.')
         for prior_key, prior_identity in identities:
             if (prior_identity.physical_cluster_uid
                     == identity.physical_cluster_uid and
@@ -1845,6 +1935,107 @@ def replace_claim_set(
                              f'{pool_key!r}.')
         edge['effective_cap'] = effective_cap
         normalized_edges.append(edge)
+
+    claim_scope = None
+    claim_authorization = None
+    service_version = None
+    try:
+        gate = (pool_capacity_observation.PoolCapacityObservationRepository().
+                read_reconciliation_gate())
+        if gate.sequenced_active:
+            service = serve_state.get_service_status_snapshot(service_name)
+            if (service is None or
+                    service.get('hash') != expected_service_hash or
+                (service.get('controller_pid'), service.get('controller_ip'))
+                    != expected_controller_owner):
+                raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                    'Sequenced claim owner or incarnation is not current.')
+            raw_version = service.get('version')
+            if type(raw_version) is not int or raw_version < 1:
+                raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                    'Sequenced claim has no current committed service version.')
+            service_version = raw_version
+            (found, _, _,
+             worker_projections) = (serve_state.get_placement_projection_record(
+                 service_name, service_version))
+            if not found:
+                raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                    'Sequenced claim service version is not committed.')
+            claim_edges = []
+            for edge in normalized_edges:
+                identity = parse_pool_identity(str(edge['pool_key']))
+                projected_admissions = (
+                    serve_state.reserved_fill_reclaim_projected_admissions(
+                        worker_projections,
+                        access_context=str(edge['access_context']),
+                        accelerator_names=identity.gpu_names,
+                        accelerator_count=int(edge['gpus_per_replica'])))
+                edge['worker_projection_sha256_by_accelerator'] = {
+                    admission.accelerator: admission.worker_projection_sha256
+                    for admission in projected_admissions
+                }
+                claim_edges.append(
+                    reserved_fill_reclaim_attestation.ReclaimClaimEdge(
+                        pool_key=str(edge['pool_key']),
+                        access_context=str(edge['access_context']),
+                        physical_cluster_uid=str(edge['physical_cluster_uid']),
+                        accelerator_names=tuple(sorted(identity.gpu_names)),
+                        projected_admissions=projected_admissions))
+            # The broker is the sole point that combines caller-owned pool
+            # semantics with the exact immutable version/projection authority.
+            # Hash that completed payload so either a version or one candidate
+            # projection advances the durable claim generation.
+            semantic_hash = hashlib.sha256(
+                json.dumps(
+                    {
+                        'base_semantic_hash': semantic_hash,
+                        'service_version': service_version,
+                        'worker_projection_sha256_by_pool': {
+                            str(edge['pool_key']):
+                                edge['worker_projection_sha256_by_accelerator']
+                            for edge in sorted(
+                                normalized_edges,
+                                key=lambda item: str(item['pool_key']))
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(',', ':'),
+                    allow_nan=False).encode('utf-8')).hexdigest()
+            claim_scope = (
+                reserved_fill_reclaim_attestation.ReclaimClaimSetScope(
+                    service_name=service_name,
+                    service_incarnation=expected_service_hash,
+                    service_version=service_version,
+                    semantic_hash=semantic_hash,
+                    edges=tuple(sorted(claim_edges))))
+            reclaim_identity = gate.reclaim_policy_identity
+            if reclaim_identity is None:
+                raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                    'Sequenced reconciliation has no reclaim-policy identity.')
+            policy = reserved_fill_reclaim_attestation.require_unique_policy()
+            (reserved_fill_reclaim_attestation.require_exact_policy_identity)(
+                policy, reclaim_identity)
+            policy_deadline = (reserved_fill_reclaim_attestation.
+                               new_policy_operation_deadline())
+            claim_authorization = policy.authorize_claim_set(
+                claim_scope,
+                expected_identity=reclaim_identity,
+                expected_gate_generation=gate.generation,
+                deadline_monotonic=policy_deadline)
+            (reserved_fill_reclaim_attestation.
+             require_policy_operation_completed)(policy_deadline)
+            (reserved_fill_reclaim_attestation.require_exact_claim_authorization
+            )(claim_authorization,
+              expected_identity=reclaim_identity,
+              expected_gate_generation=gate.generation,
+              expected_scope=claim_scope)
+    except Exception as error:  # pylint: disable=broad-except
+        _clear_service_cache(service_name)
+        logger.error(
+            'Reserved-fill broker: reclaim policy refused the '
+            'complete claim set for %r: %s', service_name,
+            common_utils.format_exception(error))
+        return None
 
     lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
     with lock.acquire(blocking=True):
@@ -1882,7 +2073,10 @@ def replace_claim_set(
             edges=normalized_edges,
             heartbeat_ts=heartbeat_ts,
             expected_service_hash=expected_service_hash,
-            expected_controller_owner=expected_controller_owner)
+            expected_controller_owner=expected_controller_owner,
+            service_version=service_version,
+            reclaim_claim_scope=claim_scope,
+            reclaim_claim_authorization=claim_authorization)
         if generation is None:
             _clear_service_cache(service_name)
             return None
@@ -2065,11 +2259,12 @@ def _activity_input(row: dict[str, Any]) -> ActivityInput:
 
 
 def _apply_utilization_gate(
-    claims: dict[str, ClaimInput],
+    claims: dict[str, reserved_capacity_allocation.ClaimInput],
     activity: dict[str, 'ActivityInput'],
     prev_state: dict[str, dict[str, Any]],
     now: float,
-) -> tuple[dict[str, ClaimInput], dict[str, dict[str, Any]]]:
+) -> tuple[dict[str, reserved_capacity_allocation.ClaimInput], dict[str, dict[
+        str, Any]]]:
     """Advance every claimant's release target and attach it as a cap.
 
     Returns the claims with utilization_cap set and the new state to persist
@@ -2094,7 +2289,7 @@ def _apply_utilization_gate(
         # clear the state" requires, so re-enabling re-arms from current
         # holdings rather than resuming a half-finished decay.
         return claims, {}
-    gated: dict[str, ClaimInput] = {}
+    gated: dict[str, reserved_capacity_allocation.ClaimInput] = {}
     state: dict[str, dict[str, Any]] = {}
     for name, claim in claims.items():
         signal = activity[name]
@@ -2137,7 +2332,8 @@ def _apply_utilization_gate(
     return gated, state
 
 
-def _claim_input(row: dict[str, Any]) -> ClaimInput:
+def _claim_input(
+        row: dict[str, Any]) -> reserved_capacity_allocation.ClaimInput:
     effective_cap = row.get('effective_cap')
     weight = float(row['weight'] or 1.0)
     if not math.isfinite(weight):
@@ -2168,8 +2364,11 @@ def _claim_input(row: dict[str, Any]) -> ClaimInput:
                                      if effective_cap is not None else None))
 
 
-def _clamp_v2_grants(grants: dict[str, int], claims: dict[str, ClaimInput],
-                     protocol_version: int) -> dict[str, int]:
+def _clamp_v2_grants(
+    grants: dict[str, int],
+    claims: dict[str, reserved_capacity_allocation.ClaimInput],
+    protocol_version: int,
+) -> dict[str, int]:
     """Enforce partitioned edge caps even across damping/blackout carries."""
     if protocol_version != PROTOCOL_V2:
         return grants
@@ -2261,6 +2460,29 @@ def _allocate_feed_by_accelerator(
     return result
 
 
+def _apply_occupancy_to_exact_card_observation(
+    measured_by_accelerator: dict[str, int] | None,
+    aggregate_after_debit: int,
+    debit_by_accelerator: Mapping[str, int],
+) -> tuple[int, dict[str, int] | None]:
+    """Apply row occupancy without moving a debit to a different card."""
+    aggregate = max(0, int(aggregate_after_debit))
+    if measured_by_accelerator is None:
+        return aggregate, None
+    spendable = {
+        card: max(0,
+                  int(card_free) - int(debit_by_accelerator.get(card, 0)))
+        for card, card_free in measured_by_accelerator.items()
+    }
+    # The shaped measurement is authoritative when available.  Clamping its
+    # sum by the unshaped debit would move any unsatisfied debit onto a
+    # different card (for example, an A100 debit with zero measured A100 free
+    # would incorrectly suppress H200).  Ambiguous rows instead carry a debit
+    # for every plausible card, so their conservative underfill stays local to
+    # those cards too.
+    return sum(spendable.values()), spendable
+
+
 def _normalize_persisted_accelerator_counts(
     raw_counts: Any,
     pool_key: str,
@@ -2306,6 +2528,7 @@ def _service_feed_payload_for_epoch(raw_payload: str | None) -> str | None:
     if not isinstance(decoded, dict):
         return raw_payload
     decoded.pop(_OBSERVED_FREE_BY_ACCELERATOR_KEY, None)
+    decoded.pop(_BROKER_SLOT_WIDTH_KEY, None)
     return json.dumps(decoded, sort_keys=True)
 
 
@@ -2386,6 +2609,15 @@ def _zero_v2_mixed_width_allocation(
     result so its autoscaler withdraws both launch and shelter authority while
     a winning peer drives the next durable round.
     """
+    if round_row is not None:
+        durable = _allocation_from_round(service_name,
+                                         pool_key,
+                                         round_row,
+                                         protocol_version=PROTOCOL_V2,
+                                         service_generation=service_generation,
+                                         claim_row=claim_row)
+        if durable is not None:
+            return durable
     identity = parse_pool_identity(pool_key)
     allocation = Allocation(
         grant=0,
@@ -2400,6 +2632,7 @@ def _zero_v2_mixed_width_allocation(
         edge_cap=0,
         pool_key=pool_key,
         feed_by_accelerator={},
+        broker_slot_width=int(claim_row.get('gpus_per_replica') or 1),
     )
     _cache_allocation(service_name, allocation, claim_row)
     return allocation
@@ -2412,21 +2645,16 @@ def _replica_row_on_pool(
     *,
     pool_key: str | None = None,
     physical_cluster_uid: str | None = None,
-    current_service_generation: int | None = None,
-    pool_gpus_per_replica: int | None = None,
 ) -> bool:
     """Whether a replica row's persisted location sits on the pool.
 
-    Protocol-v2 launch provenance is one indivisible authority tuple: pool
-    key, immutable launch generation, physical cluster UID, and persisted
-    placement must all agree.  A partial or contradictory tuple fails closed;
-    it must not be re-attributed through a coincidentally matching context.
-
-    Only a row with all three origin fields absent is genuinely legacy and may
-    use the relaxed #108 placement identity: Kubernetes + same context; a
-    shape-carrying row must name the pool's GPU (case-insensitive), while a
-    legacy shape-less row matches on context alone (its bound pod still
-    occupies the pool).
+    Complete, internally consistent protocol-v2 pool-key and physical-UID
+    provenance dominates mutable aliases and widths. Otherwise exact current
+    Kubernetes placement is physical occupancy regardless of economic
+    classification. Partial, malformed, contradictory, or unattributed
+    zero-cost provenance falls back to every plausible pool indicated by a
+    trustworthy key, UID, or accelerator hint. Ambiguity may underfill
+    multiple pools, but must never authorize the same physical slot twice.
     """
     identity: PoolIdentity | None = None
     if pool_key is not None:
@@ -2434,6 +2662,7 @@ def _replica_row_on_pool(
             identity = parse_pool_identity(pool_key)
         except (TypeError, ValueError, json.JSONDecodeError):
             return False
+    contexts = (context,) if isinstance(context, str) else context
     if identity is None or identity.protocol_version == PROTOCOL_V1:
         # Preserve protocol-v1 attribution exactly during the rollout window.
         # Its historical rows may carry only the v1 pool key, and pre-upgrade
@@ -2451,7 +2680,6 @@ def _replica_row_on_pool(
             return (not accelerators or any(
                 isinstance(name, str) and name.lower() in gpu_names
                 for name in accelerators))
-        contexts = (context,) if isinstance(context, str) else context
         location = info.location
         if not location:
             return False
@@ -2465,78 +2693,181 @@ def _replica_row_on_pool(
             for name in accelerators)
         return not accelerators or accelerator_matches
 
-    contexts = (context,) if isinstance(context, str) else context
-    location = info.location
-    if not isinstance(location, Mapping) or not location:
-        return False
-    if str(location.get('cloud', '')).lower() != 'kubernetes':
-        return False
-    if location.get('region') not in contexts:
-        return False
-    accelerators = location.get('accelerators') or {}
-    if not isinstance(accelerators, Mapping):
-        return False
-    exact_accelerator_shape = False
-    if (len(accelerators) == 1 and isinstance(pool_gpus_per_replica, int) and
-            not isinstance(pool_gpus_per_replica, bool) and
-            pool_gpus_per_replica > 0):
-        accelerator_name, accelerator_count = next(iter(accelerators.items()))
-        exact_accelerator_shape = (
-            isinstance(accelerator_name, str) and
-            accelerator_name.lower() in identity.gpu_names and
-            not isinstance(accelerator_count, bool) and
-            isinstance(accelerator_count, (int, float)) and
-            accelerator_count >= 1 and float(accelerator_count).is_integer() and
-            int(accelerator_count) == pool_gpus_per_replica)
-
     persisted_pool_key = info.reserved_fill_pool_key
     persisted_generation = info.reserved_fill_service_generation
     persisted_uid = info.reserved_fill_physical_cluster_uid
-    provenance = (persisted_pool_key, persisted_generation, persisted_uid)
-    if any(value is not None for value in provenance):
-        if (not isinstance(persisted_pool_key, str) or not persisted_pool_key or
-                persisted_pool_key != pool_key or
-                isinstance(persisted_generation, bool) or
-                not isinstance(persisted_generation, int) or
-                persisted_generation < 1 or
-                not isinstance(persisted_uid, str) or not persisted_uid or
-                physical_cluster_uid is None or
-                physical_cluster_uid != identity.physical_cluster_uid or
-                persisted_uid != physical_cluster_uid):
-            return False
-        if (current_service_generation is not None and
-            (isinstance(current_service_generation, bool) or
-             not isinstance(current_service_generation, int) or
-             current_service_generation < 1 or
-             persisted_generation > current_service_generation)):
-            return False
-        # Explicit provenance and placement form one authority tuple. Unlike a
-        # genuinely legacy row, a v2 row must prove its exact accelerator card
-        # and per-replica width too.
-        return exact_accelerator_shape
+    complete_provenance = (isinstance(persisted_pool_key, str) and
+                           bool(persisted_pool_key) and
+                           type(persisted_generation) is int and
+                           persisted_generation > 0 and
+                           isinstance(persisted_uid, str) and
+                           bool(persisted_uid))
+    if complete_provenance:
+        assert isinstance(persisted_pool_key, str)
+        try:
+            persisted_identity = parse_pool_identity(persisted_pool_key)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            persisted_identity = None
+        if (persisted_identity is not None and
+                persisted_identity.protocol_version == PROTOCOL_V2 and
+                persisted_identity.physical_cluster_uid == persisted_uid):
+            # Only this self-consistent immutable tuple proves exact membership
+            # or exact absence. Alias, generation, and width changes do not
+            # move an existing pod.
+            return (persisted_pool_key == pool_key and
+                    persisted_uid == identity.physical_cluster_uid and
+                    (physical_cluster_uid is None or
+                     persisted_uid == physical_cluster_uid))
 
-    # Genuinely legacy rows retain the relaxed location fallback while the v1
-    # compatibility window is open.
-    return (not accelerators or any(
-        isinstance(name, str) and name.lower() in identity.gpu_names
-        for name in accelerators))
+    target_hint = (persisted_pool_key == pool_key or
+                   persisted_uid == identity.physical_cluster_uid)
+    location = info.location
+    if isinstance(location, Mapping) and location:
+        cloud = location.get('cloud')
+        if (isinstance(cloud, str) and cloud and
+                cloud.casefold() != 'kubernetes'):
+            return target_hint
+        accelerators = location.get('accelerators')
+        accelerator_matches = False
+        if isinstance(accelerators, Mapping) and accelerators:
+            accelerator_names = {
+                name.casefold()
+                for name in accelerators
+                if isinstance(name, str) and name
+            }
+            if accelerator_names:
+                accelerator_matches = bool(
+                    accelerator_names.intersection(identity.gpu_names))
+
+        # A row located in a current access context physically occupies that
+        # Kubernetes cluster.  Cost provenance cannot override placement:
+        # old rows are rewritten to the latest record version without gaining
+        # historical is_zero_cost truth, and skipping such a row can feed its
+        # slot to a peer while its launch binds.  Exact context matching makes
+        # this rule durable without pessimistically coupling unrelated
+        # clusters that happen to use the same accelerator.
+        region = location.get('region')
+        if region in contexts:
+            return not accelerators or accelerator_matches or target_hint
+
+        # Rows can retain a retired alias.  Without complete immutable
+        # provenance, same-card Kubernetes placement remains plausible on
+        # every compatible v2 pool.  This includes old ordinary rows whose
+        # false is_zero_cost value is only a compatibility default and remains
+        # false after a record-version rewrite.  A non-Kubernetes row was
+        # already excluded above.
+        if (accelerator_matches or info.reserved_fill is True or
+                info.is_zero_cost is True):
+            return accelerator_matches or target_hint
+        return target_hint
+    # A shapeless malformed/fill row remains plausible on any v2 pool until
+    # its lifecycle row disappears. This is conservative underfill, never
+    # oversubscription.
+    return bool(target_hint or info.reserved_fill is True or
+                info.is_zero_cost is True)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReplicaPoolOccupancy:
+    """Current-width slot debit and every plausible exact-card debit."""
+
+    slots: int
+    by_accelerator: tuple[tuple[str, int], ...]
+
+
+def _replica_pool_occupancy(
+    info: 'replica_managers.ReplicaInfo',
+    contexts: tuple[str, ...],
+    identity: PoolIdentity,
+    *,
+    pool_key: str,
+    physical_cluster_uid: str | None,
+    current_service_generation: int | None,
+    pool_gpus_per_replica: int | None,
+) -> _ReplicaPoolOccupancy | None:
+    """Return conservative pool/card occupancy in current replica slots."""
+    # Service generations fence new authority, but cannot relocate an already
+    # persisted physical occupant.
+    del current_service_generation
+    if not _replica_row_on_pool(info,
+                                contexts,
+                                identity.gpu_names,
+                                pool_key=pool_key,
+                                physical_cluster_uid=physical_cluster_uid):
+        return None
+    width = (pool_gpus_per_replica if type(pool_gpus_per_replica) is int and
+             pool_gpus_per_replica > 0 else 1)
+    location = info.location
+    accelerators = (location.get('accelerators') if isinstance(
+        location, Mapping) else None)
+    shaped: dict[str, int] = {}
+    if isinstance(accelerators, Mapping) and accelerators:
+        for raw_name, raw_count in accelerators.items():
+            if (not isinstance(raw_name, str) or
+                    raw_name.casefold() not in identity.gpu_names):
+                continue
+            card = raw_name.casefold()
+            if (isinstance(raw_count, bool) or
+                    not isinstance(raw_count, (int, float)) or
+                    not float(raw_count).is_integer() or raw_count <= 0):
+                slots = 1
+            else:
+                slots = max(1, math.ceil(int(raw_count) / width))
+            shaped[card] = max(shaped.get(card, 0), slots)
+    if shaped:
+        return _ReplicaPoolOccupancy(slots=sum(shaped.values()),
+                                     by_accelerator=tuple(sorted(
+                                         shaped.items())))
+    # Pool provenance or a shapeless/contradictory legacy row proves no exact
+    # card. One row can consume at least one slot on any compatible card, so
+    # withhold one from each card while subtracting one from aggregate free.
+    return _ReplicaPoolOccupancy(slots=1,
+                                 by_accelerator=tuple(
+                                     (card, 1) for card in identity.gpu_names))
 
 
 def _row_was_launched(info: 'replica_managers.ReplicaInfo') -> bool:
-    """Whether the row's sky.launch completed (a cluster was provisioned).
+    """Whether the row's current launch status proves materialization.
 
     SHUTTING_DOWN is broader than "bound graceful drainer": a
     launch-cancelled row (sky.launch INTERRUPTED mid-run) maps to
     SHUTTING_DOWN too, yet may never have bound a pod -- the measured
     free still counts its slot. Only sky_launch_status == SUCCEEDED
-    means a pod was actually provisioned and keeps occupying the pool
-    through the drain. Rows failing this signal are counted nowhere,
-    matching physical reality (no pod); an interrupted launch whose pod
-    DID partially bind reads as free-side undercount for its short
-    cleanup window -- the conservative direction (never over-grant).
+    means a pod was actually provisioned.  Sequenced callers additionally use
+    the immutable materialization marker because teardown may replace the
+    current process status after a successful launch.  This helper gates only
+    entitlement conservation; a sequenced cleanup-unproven row lacking both
+    signals still debits a possibly stale provider query until deletion proves
+    cleanup.
     """
     return (info.status_property.sky_launch_status ==
             common_utils.ProcessStatus.SUCCEEDED)
+
+
+class IncompleteReplicaOccupancySnapshotError(RuntimeError):
+    """A sequenced broker round could not prove complete row occupancy."""
+
+
+def _sequenced_row_occupies_observed_free(
+    info: 'replica_managers.ReplicaInfo',
+    observation_admission_sequence: int,
+    observation_materialization_sequence: int,
+) -> bool:
+    """Whether event order cannot prove the observation saw this row.
+
+    A row is safe to leave to the provider measurement only when both durable
+    markers are well-formed and no newer than their observation high-waters.
+    Missing/malformed legacy attribution is conservatively debited until that
+    row naturally churns; the legacy callback path continues using its
+    historical readiness/clock heuristic.
+    """
+    admission = info.zero_cost_admission_sequence
+    materialization = info.zero_cost_materialization_sequence
+    if (type(admission) is not int or admission < 1 or
+            type(materialization) is not int or materialization < 1):
+        return True
+    return (admission > observation_admission_sequence or
+            materialization > observation_materialization_sequence)
 
 
 def _occupying_debit(
@@ -2548,7 +2879,9 @@ def _occupying_debit(
     physical_cluster_uid: str | None = None,
     claim_generations: Mapping[str, int] | None = None,
     pool_gpus_per_replica: int | None = None,
-) -> tuple[int, int, dict[str, int], int]:
+    observation_admission_sequence: int | None = None,
+    observation_materialization_sequence: int | None = None,
+) -> tuple[int, int, dict[str, int], dict[str, int], int]:
     """Row-consistent scan of every service's replica rows on the pool.
 
     Mirrors the #108 occupied-slot subtraction at broker level. The scan
@@ -2559,25 +2892,20 @@ def _occupying_debit(
     pod riding out its lifetime. Scanning only claimants would feed those
     slots to a peer while the orphaned launch can still start. Rows are a
     local DB read, so the wider scan costs no cluster traffic. Returns
-    (feed_debit, entitlement_debit, live_fill, unclaimed_fill):
+    (feed_debit, entitlement_debit, feed_debit_by_accelerator, live_fill,
+    unclaimed_fill):
 
-    - feed_debit (rows not READY, or created after the snapshot): applied
-      to the observed free the FEED split spends. A launching pod may be
-      unbound and invisible to the query, and a demand launch binding
-      mid-query holds a slot the snapshot counted free; either way the
-      slot must not be fed again -- never over-launch. Each claimant's
-      local overlay additionally debits its OWN occupying rows from its
-      feed, so this under-fills a launching service by its in-flight
-      count for its whole bind->READY window; feeds only add NEW
-      launches, so the cost is a delayed launch, never a cull.
-    - entitlement_debit (ONLY rows created after the snapshot): applied to
-      the ENTITLEMENT total. Entitlements launch nothing, and a bound
-      not-READY pod is ALREADY excluded from the measured free (its node
-      capacity is taken); subtracting it here again would shrink the
-      whole-pool total for the entire bind->READY window, driving grants
-      below the owner's holdings and culling exactly the pods that are
-      booting (a broker-generated churn wave). Only the mid-query bind
-      race (created_at > snapshot) still needs the debit.
+    - feed_debit: applied to observed free before the FEED split. With a
+      sequenced observation, a compatible zero-cost row is debited when its
+      admission or first-success materialization is newer than the captured
+      high-water, or either marker is missing/malformed. Legacy callback
+      rounds preserve the historical not-READY-or-post-snapshot heuristic.
+    - entitlement_debit: applied to the ENTITLEMENT total. With a sequenced
+      observation it uses the same event-order rule as feed_debit, closing
+      both admission-after-query-start and materialization-during-query races.
+      A fully marked row materialized before query start is left to the
+      provider measurement, avoiding a persistent double debit. Legacy
+      callback rounds debit only rows whose created_at is post-snapshot.
     - live_fill (per-CLAIMANT CURRENT count of nonterminal pool-matched
       rows with reserved_fill=True; an entry for EVERY claimant whose
       rows were readable, 0 included): the row-consistent replacement for
@@ -2625,12 +2953,27 @@ def _occupying_debit(
       before or during its drain (the pre-existing steady-state
       undercount by live demand pods is by design; non-claimants'
       nonterminal DEMAND rows stay invisible for the same reason).
-      FAILED_CLEANUP rows are also left out on purpose: they persist
-      indefinitely, and counting them forever would over-count the pool
-      once the pod eventually dies (accepted: rare and launch-gated).
+      In sequenced rounds, FAILED_CLEANUP fill rows with materialization proof
+      are also conserved until cleanup is proven.  They may persist after the
+      pod eventually dies, but this can only withhold fill; treating unresolved
+      cleanup as free could oversubscribe a still-bound slot.
+
+    A sequenced round requires the grouped replica scan to succeed completely;
+    partial enumeration or decode is not spendable authority. It includes
+    ordinary zero-cost rows owned by nonclaimants. Until ordinary placement
+    persists a physical UID, such a row conservatively matches every v2 pool
+    with the same card and width, which can delay fill but cannot over-grant.
     """
     identity = parse_pool_identity(pool_key)
-    gpu_names = identity.gpu_names
+    has_sequence_boundary = (observation_admission_sequence is not None or
+                             observation_materialization_sequence is not None)
+    if has_sequence_boundary:
+        if (type(observation_admission_sequence) is not int or
+                observation_admission_sequence < 0 or
+                type(observation_materialization_sequence) is not int or
+                observation_materialization_sequence < 0):
+            raise ValueError('Sequenced occupancy debit requires complete '
+                             'nonnegative observation high-waters.')
     contexts: tuple[str, ...]
     if identity.protocol_version == PROTOCOL_V1:
         assert identity.access_context is not None
@@ -2647,9 +2990,19 @@ def _occupying_debit(
                          f'context for pool {pool_key}.')
     feed_debit = 0
     entitlement_debit = 0
+    feed_debit_by_accelerator: dict[str, int] = {}
     live_fill: dict[str, int] = {}
     unclaimed_fill = 0
     claimants = set(claim_names)
+
+    def debit_occupancy(occupancy: _ReplicaPoolOccupancy) -> None:
+        nonlocal feed_debit, entitlement_debit
+        feed_debit += occupancy.slots
+        entitlement_debit += occupancy.slots
+        for card, slots in occupancy.by_accelerator:
+            feed_debit_by_accelerator[card] = (
+                feed_debit_by_accelerator.get(card, 0) + slots)
+
     try:
         replica_infos_by_service = serve_state.get_replica_infos_grouped()
         # Claimants with no replica rows are still a successful zero-row read;
@@ -2657,6 +3010,11 @@ def _occupying_debit(
         for name in claimants:
             replica_infos_by_service.setdefault(name, [])
     except Exception as snapshot_error:  # pylint: disable=broad-except
+        if has_sequence_boundary:
+            raise IncompleteReplicaOccupancySnapshotError(
+                'Sequenced reserved-fill occupancy snapshot is incomplete: '
+                f'{common_utils.format_exception(snapshot_error)}') from (
+                    snapshot_error)
         logger.warning(
             'Reserved-fill broker: could not snapshot replica rows for the '
             'round debit; falling back to isolated service reads: '
@@ -2692,57 +3050,79 @@ def _occupying_debit(
         if is_claimant:
             live_fill[name] = 0
         for info in infos:
+            occupancy = _replica_pool_occupancy(
+                info,
+                contexts,
+                identity,
+                pool_key=pool_key,
+                physical_cluster_uid=physical_cluster_uid,
+                current_service_generation=(claim_generations or {}).get(name),
+                pool_gpus_per_replica=pool_gpus_per_replica)
             if info.is_terminal:
-                # Draining FILL rows still occupy their pool slot for the
-                # whole graceful drain; count them into the entitlement
-                # total (any service, SHUTTING_DOWN only, and only when
-                # the launch actually provisioned a pod -- see the
-                # unclaimed_fill docstring above for the demand-drain,
-                # FAILED_CLEANUP and unbound-launch reasoning).
-                if (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN and
-                        info.reserved_fill and _replica_row_on_pool(
-                            info,
-                            contexts,
-                            gpu_names,
-                            pool_key=pool_key,
-                            physical_cluster_uid=physical_cluster_uid,
-                            current_service_generation=(claim_generations or
-                                                        {}).get(name),
-                            pool_gpus_per_replica=pool_gpus_per_replica) and
-                        _row_was_launched(info)):
-                    unclaimed_fill += 1
+                cleanup_not_proven = (
+                    info.status == serve_state.ReplicaStatus.SHUTTING_DOWN or
+                    (has_sequence_boundary and
+                     info.status == serve_state.ReplicaStatus.FAILED_CLEANUP))
+                if occupancy is not None and cleanup_not_proven:
+                    materialization = (info.zero_cost_materialization_sequence)
+                    launch_was_materialized = (_row_was_launched(info) or
+                                               (type(materialization) is int and
+                                                materialization > 0))
+                    if launch_was_materialized and info.reserved_fill:
+                        unclaimed_fill += occupancy.slots
+                    if has_sequence_boundary:
+                        assert observation_admission_sequence is not None
+                        assert observation_materialization_sequence is not None
+                        # Cleanup-unproven terminal rows are not safe to infer
+                        # absent from an in-flight provider query.  A launch
+                        # may bind immediately before cancellation while its
+                        # success reducer loses the race, leaving INTERRUPTED
+                        # and no materialization marker.  Missing M is itself
+                        # conservative debit evidence until cleanup completes.
+                        if _sequenced_row_occupies_observed_free(
+                                info, observation_admission_sequence,
+                                observation_materialization_sequence):
+                            debit_occupancy(occupancy)
                 continue
-            if not _replica_row_on_pool(
-                    info,
-                    contexts,
-                    gpu_names,
-                    pool_key=pool_key,
-                    physical_cluster_uid=physical_cluster_uid,
-                    current_service_generation=(claim_generations or
-                                                {}).get(name),
-                    pool_gpus_per_replica=pool_gpus_per_replica):
+            if occupancy is None:
                 continue
             is_fill = info.reserved_fill
             if not is_claimant and not is_fill:
-                # Non-claimants' demand rows stay invisible by design
-                # (demand capacity is not fill-arbitrable); only their
-                # fill rows are the broker's business.
-                continue
+                if not has_sequence_boundary:
+                    # Preserve protocol-v1/legacy callback behavior exactly.
+                    # Sequenced observations, however, must include every row
+                    # physically matched to the pool, including ordinary rows
+                    # whose legacy cost provenance was lost during rewrite.
+                    continue
             if is_fill:
                 if is_claimant:
-                    live_fill[name] += 1
+                    live_fill[name] += occupancy.slots
                 else:
                     # Former claimant's fill row: unclaimed occupancy,
                     # conserved like a drainer (see docstring).
-                    unclaimed_fill += 1
-            created_at = info.created_at
-            post_snapshot = (created_at is not None and
-                             created_at > snapshot_time)
-            if (not info.is_ready) or post_snapshot:
-                feed_debit += 1
-            if post_snapshot:
-                entitlement_debit += 1
-    return feed_debit, entitlement_debit, live_fill, unclaimed_fill
+                    unclaimed_fill += occupancy.slots
+            if has_sequence_boundary:
+                assert observation_admission_sequence is not None
+                assert observation_materialization_sequence is not None
+                occupies_observed_free = _sequenced_row_occupies_observed_free(
+                    info, observation_admission_sequence,
+                    observation_materialization_sequence)
+                if occupies_observed_free:
+                    debit_occupancy(occupancy)
+            else:
+                created_at = info.created_at
+                post_snapshot = (created_at is not None and
+                                 created_at > snapshot_time)
+                if (not info.is_ready) or post_snapshot:
+                    feed_debit += occupancy.slots
+                    for card, slots in occupancy.by_accelerator:
+                        feed_debit_by_accelerator[card] = (
+                            feed_debit_by_accelerator.get(card, 0) + slots)
+                if post_snapshot:
+                    entitlement_debit += occupancy.slots
+    return (feed_debit, entitlement_debit,
+            dict(sorted(feed_debit_by_accelerator.items())), live_fill,
+            unclaimed_fill)
 
 
 def _demand_gate_grant(damped: int | None, raw: Any) -> int | None:
@@ -2859,9 +3239,10 @@ def _allocation_from_round(
     raw_grants = json.loads(round_row['raw_grants'] or '{}')
     raw_feed_by_accelerator = round_row.get('feed_by_accelerator')
     feed_by_accelerator: dict[str, int] | None = None
-    observed_free: int | None = None
-    observed_free_by_accelerator: dict[str, int] | None = None
+    observed_free_slots: int | None = None
+    observed_free_slots_by_accelerator: dict[str, int] | None = None
     observed_at: float | None = None
+    broker_slot_width = 1
     all_feed_by_accelerator: dict[str, Any] | None = None
     if raw_feed_by_accelerator is not None:
         try:
@@ -2894,6 +3275,14 @@ def _allocation_from_round(
                 _OBSERVED_FREE_BY_ACCELERATOR_KEY)
             if raw_observation is not None:
                 try:
+                    raw_slot_width = all_feed_by_accelerator.get(
+                        _BROKER_SLOT_WIDTH_KEY, (claim_row or
+                                                 {}).get('gpus_per_replica', 1))
+                    if (isinstance(raw_slot_width, bool) or
+                            not isinstance(raw_slot_width, int) or
+                            raw_slot_width <= 0):
+                        raise ValueError('invalid broker slot width')
+                    broker_slot_width = raw_slot_width
                     raw_observed_free = round_row.get('last_observed_free')
                     if (isinstance(raw_observed_free, bool) or
                             not isinstance(raw_observed_free, int) or
@@ -2908,20 +3297,20 @@ def _allocation_from_round(
                     if float(raw_observed_at) != snapshot_time:
                         raise ValueError('observation timestamp does not match '
                                          'the round snapshot')
-                    observed_free_by_accelerator = (
+                    observed_free_slots_by_accelerator = (
                         _normalize_persisted_accelerator_counts(
                             raw_observation,
                             pool_key,
                             expected_total=raw_observed_free))
-                    observed_free = raw_observed_free
+                    observed_free_slots = raw_observed_free
                     observed_at = float(raw_observed_at)
                 except (KeyError, TypeError, ValueError,
                         json.JSONDecodeError) as error:
                     logger.error(
                         'Reserved-fill round has malformed measured capacity '
                         f'for {pool_key}: {error}')
-                    observed_free = None
-                    observed_free_by_accelerator = None
+                    observed_free_slots = None
+                    observed_free_slots_by_accelerator = None
                     observed_at = None
     edge_cap = None
     physical_cluster_uid = None
@@ -2971,9 +3360,10 @@ def _allocation_from_round(
         edge_cap=edge_cap,
         pool_key=pool_key,
         feed_by_accelerator=feed_by_accelerator,
-        observed_free=observed_free,
-        observed_free_by_accelerator=(observed_free_by_accelerator),
-        observed_at=observed_at)
+        observed_free_slots=observed_free_slots,
+        observed_free_slots_by_accelerator=(observed_free_slots_by_accelerator),
+        observed_at=observed_at,
+        broker_slot_width=broker_slot_width)
     _cache_allocation(service_name, allocation, claim_row)
     return allocation
 
@@ -3026,6 +3416,210 @@ def get_my_allocation(service_name: str,
                                   protocol_version=protocol_version,
                                   service_generation=generation,
                                   claim_row=row)
+
+
+def _prepare_committed_round_observation(
+    pool_key: str,
+    observation: pool_capacity_observation.PoolCapacityObservation,
+    now: float,
+) -> _CommittedRoundObservation:
+    """Validate immutable observation authority before broker-lock admission."""
+    if not isinstance(observation,
+                      pool_capacity_observation.PoolCapacityObservation):
+        raise ValueError('A committed pool-capacity observation is required.')
+    if observation.pool_key != pool_key:
+        raise ValueError('Committed observation does not match the requested '
+                         'pool key.')
+    try:
+        identity = parse_pool_identity(pool_key)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError(
+            'Committed observation has an invalid pool key.') from error
+    if identity.protocol_version != PROTOCOL_V2:
+        raise ValueError('Committed observations require a protocol-v2 pool.')
+    assert identity.physical_cluster_uid is not None
+    canonical_pool_key = make_pool_key(
+        '',
+        identity.gpu_names,
+        protocol_version=PROTOCOL_V2,
+        physical_cluster_uid=identity.physical_cluster_uid)
+    if canonical_pool_key != pool_key:
+        raise ValueError('Committed observation pool key is not canonical.')
+    if (observation.physical_cluster_uid != identity.physical_cluster_uid or
+            observation.accelerator_names != identity.gpu_names):
+        raise ValueError('Committed observation physical identity does not '
+                         'match its pool key.')
+    if not observation.access_context:
+        raise ValueError('Committed observation has no access context.')
+    payload = observation.payload
+    if not isinstance(payload, pool_capacity_observation.PoolCapacitySuccess):
+        raise ValueError('Only a successful committed observation can drive '
+                         'a reserved-fill round.')
+    payload_names = tuple(name for name, _ in payload.free_gpus_by_accelerator)
+    if payload_names != identity.gpu_names:
+        raise ValueError('Committed observation exact-card split does not '
+                         'match its pool key.')
+    for value, field_name in (
+        (observation.observed_at, 'observed_at'),
+        (observation.completed_at, 'completed_at'),
+        (observation.published_at, 'published_at'),
+        (observation.valid_until, 'valid_until'),
+    ):
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
+                not math.isfinite(float(value))):
+            raise ValueError(f'Committed observation {field_name} is not '
+                             'finite.')
+    if not (observation.observed_at <= observation.completed_at <=
+            observation.published_at <= observation.valid_until):
+        raise ValueError('Committed observation timestamps are inconsistent.')
+    if (isinstance(observation.observation_generation, bool) or
+            not isinstance(observation.observation_generation, int) or
+            observation.observation_generation <= 0):
+        raise ValueError(
+            'Committed observation observation_generation is invalid.')
+    if (isinstance(observation.observation_sequence, bool) or
+            not isinstance(observation.observation_sequence, int) or
+            observation.observation_sequence < 0):
+        raise ValueError(
+            'Committed observation observation_sequence is invalid.')
+    if (isinstance(observation.materialization_sequence, bool) or
+            not isinstance(observation.materialization_sequence, int) or
+            observation.materialization_sequence < 0):
+        raise ValueError('Committed observation materialization_sequence is '
+                         'invalid.')
+    if (not isinstance(observation.payload_sha256, str) or
+            re.fullmatch(r'[0-9a-f]{64}', observation.payload_sha256) is None):
+        raise ValueError('Committed observation payload digest is invalid.')
+    if not observation.is_authoritative_at(now):
+        raise ValueError(
+            'Committed observation is not currently authoritative.')
+    provenance = RoundObservationProvenance(
+        pool_key=pool_key,
+        physical_cluster_uid=identity.physical_cluster_uid,
+        accelerator_names=identity.gpu_names,
+        access_context=observation.access_context,
+        observation_generation=observation.observation_generation,
+        observation_sequence=observation.observation_sequence,
+        materialization_sequence=observation.materialization_sequence,
+        payload_sha256=observation.payload_sha256,
+        observed_at=float(observation.observed_at),
+        valid_until=float(observation.valid_until))
+    return _CommittedRoundObservation(payload=payload, provenance=provenance)
+
+
+def _publish_legacy_round(publication: ReservedFillRoundPublication) -> bool:
+    """Preserve the historical state writer for legacy callback rounds."""
+    if publication.observation_provenance is not None:
+        raise ValueError('The legacy publisher cannot discard observation '
+                         'provenance.')
+    return serve_state.publish_reserved_fill_round(
+        publication.pool_key,
+        round_id=publication.round_id,
+        snapshot_time=publication.snapshot_time,
+        epoch=publication.epoch,
+        grants=publication.grants,
+        feeds=publication.feeds,
+        feed_by_accelerator=publication.feed_by_accelerator,
+        raw_grants=publication.raw_grants,
+        feed_state=publication.feed_state,
+        sum_holdings=publication.sum_holdings,
+        last_observed_free=publication.last_observed_free,
+        last_observed_free_ts=publication.last_observed_free_ts,
+        phantom_streak=publication.phantom_streak,
+        shrink_baseline=publication.shrink_baseline,
+        lease_token=publication.lease_token,
+        lease_expires_at=publication.lease_expires_at,
+        protocol_version=publication.protocol_version,
+        claim_generations=publication.claim_generations,
+        utilization_state=publication.utilization_state)
+
+
+def publish_committed_round(publication: ReservedFillRoundPublication) -> bool:
+    """Atomically persist one sequenced round and its exact provenance."""
+    provenance = publication.observation_provenance
+    if provenance is None:
+        raise ValueError('A committed round requires observation provenance.')
+    if (publication.protocol_version != PROTOCOL_V2 or
+            publication.pool_key != provenance.pool_key or
+            publication.snapshot_time != provenance.observed_at):
+        raise ValueError('Committed round publication does not match its '
+                         'observation authority.')
+    return serve_state.publish_reserved_fill_round(
+        publication.pool_key,
+        round_id=publication.round_id,
+        snapshot_time=publication.snapshot_time,
+        epoch=publication.epoch,
+        grants=publication.grants,
+        feeds=publication.feeds,
+        feed_by_accelerator=publication.feed_by_accelerator,
+        raw_grants=publication.raw_grants,
+        feed_state=publication.feed_state,
+        sum_holdings=publication.sum_holdings,
+        last_observed_free=publication.last_observed_free,
+        last_observed_free_ts=publication.last_observed_free_ts,
+        phantom_streak=publication.phantom_streak,
+        shrink_baseline=publication.shrink_baseline,
+        lease_token=publication.lease_token,
+        lease_expires_at=publication.lease_expires_at,
+        protocol_version=publication.protocol_version,
+        claim_generations=publication.claim_generations,
+        utilization_state=publication.utilization_state,
+        observation_generation=provenance.observation_generation,
+        observation_sequence=provenance.observation_sequence,
+        observation_materialization_sequence=(
+            provenance.materialization_sequence),
+        observation_payload_sha256=provenance.payload_sha256)
+
+
+def run_round_from_committed_observation(
+    service_name: str,
+    pool_key: str,
+    observation: pool_capacity_observation.PoolCapacityObservation,
+    poll_interval_seconds: float,
+    *,
+    expected_service_generation: int,
+    publish_round: RoundPublisher,
+    lock_timeout_seconds: float = (
+        constants.RESERVED_FILL_BROKER_LOCK_TIMEOUT_SECONDS),
+) -> Allocation | None:
+    """Drive a protocol-v2 round from already committed capacity evidence.
+
+    Validation and conversion happen before lock admission.  The broker lock
+    therefore contains no provider query or callback capable of performing
+    one.  ``publish_round`` is required (there is deliberately no fallback to
+    the legacy writer): its implementation must atomically persist the round
+    and ``publication.observation_provenance``, and may reject an observation
+    that expires before its database transaction commits.
+    """
+    try:
+        committed = _prepare_committed_round_observation(
+            pool_key, observation, time.time())
+    except (TypeError, ValueError) as error:
+        logger.warning('Reserved-fill broker: rejecting committed observation '
+                       f'for {service_name!r}/{pool_key}: {error}')
+        return None
+    try:
+        with locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID,
+                            timeout=lock_timeout_seconds):
+            if not committed.is_authoritative_at(time.time()):
+                logger.warning(
+                    'Reserved-fill broker: committed observation expired '
+                    f'before lock admission for {service_name!r}/{pool_key}.')
+                return None
+            return _run_round_locked(service_name,
+                                     pool_key,
+                                     None,
+                                     poll_interval_seconds,
+                                     PROTOCOL_V2,
+                                     expected_service_generation,
+                                     committed_observation=committed,
+                                     publish_round=publish_round)
+    except locks.LockTimeout:
+        logger.warning(
+            'Reserved-fill broker: timed out waiting for the round lock '
+            f'(service {service_name!r}, pool {pool_key}); skipping this '
+            'committed observation.')
+        return None
 
 
 def run_round_if_stale(
@@ -3083,11 +3677,34 @@ def run_round_if_stale(
 def _run_round_locked(
         service_name: str,
         pool_key: str,
-        query_fn: Callable[[], PoolObservation | None],
+        query_fn: Callable[[], PoolObservation | None] | None,
         poll_interval_seconds: float,
         expected_protocol_version: int = PROTOCOL_V1,
-        expected_service_generation: int = 0) -> Allocation | None:
+        expected_service_generation: int = 0,
+        *,
+        committed_observation: _CommittedRoundObservation | None = None,
+        publish_round: RoundPublisher | None = None) -> Allocation | None:
+    if committed_observation is None:
+        if query_fn is None:
+            raise ValueError('Legacy rounds require an observation callback.')
+        if publish_round is not None:
+            raise ValueError('Legacy rounds cannot replace their state writer.')
+        round_publisher: RoundPublisher = _publish_legacy_round
+    else:
+        if query_fn is not None:
+            raise ValueError('Committed rounds cannot invoke an observation '
+                             'callback.')
+        if publish_round is None:
+            raise ValueError('Committed rounds require a provenance-aware '
+                             'publisher.')
+        round_publisher = publish_round
     now = time.time()
+    if (committed_observation is not None and
+            not committed_observation.is_authoritative_at(now)):
+        logger.warning('Reserved-fill broker: committed observation expired '
+                       f'before round admission for {service_name!r}/'
+                       f'{pool_key}.')
+        return None
     protocol_version = get_protocol_version()
     if protocol_version != expected_protocol_version:
         logger.info('Reserved-fill broker protocol changed before round '
@@ -3134,7 +3751,8 @@ def _run_round_locked(
                                                service_generation,
                                                claim_rows[service_name],
                                                round_row, now)
-    if (round_row is not None and now - float(round_row['snapshot_time'])
+    if (committed_observation is None and round_row is not None and
+            now - float(round_row['snapshot_time'])
             < _ROUND_FRESH_FRACTION * poll_interval_seconds and
             _round_matches_claim_set(round_row, protocol_version,
                                      claim_generations)):
@@ -3167,6 +3785,12 @@ def _run_round_locked(
     # same transaction; see acquire_reserved_fill_lease_token for the
     # crash-window reasoning and the epoch computation below for the bump
     # it forces.
+    if (committed_observation is not None and
+            not committed_observation.is_authoritative_at(time.time())):
+        logger.warning('Reserved-fill broker: committed observation expired '
+                       f'before lease admission for {service_name!r}/'
+                       f'{pool_key}.')
+        return None
     acquired = serve_state.acquire_reserved_fill_lease_token(now=now,
                                                              expires_at=now +
                                                              lease_ttl_seconds)
@@ -3211,17 +3835,36 @@ def _run_round_locked(
                                                service_generation,
                                                claim_rows[service_name],
                                                round_row, now)
+    winning_widths = {
+        int(row['gpus_per_replica'] or 1)
+        for name, row in claim_rows.items()
+        if name not in mixed_width_losers
+    }
+    pool_gpus_per_replica = (next(iter(winning_widths))
+                             if len(winning_widths) == 1 else None)
+    if pool_gpus_per_replica is None:
+        logger.error('Reserved-fill broker could not establish one winning '
+                     f'replica width for physical pool {pool_key!r}.')
+        return None
     # Snapshot time BEFORE the slow cluster query: a zero-cost row created
     # while the query runs already occupies a slot the query may still have
     # counted free, and the created_at > snapshot_time debit only catches it
     # if the snapshot predates the row.
+    observation_provenance: RoundObservationProvenance | None = None
     snapshot_time = time.time()
     observation: PoolObservation | None = None
-    try:
-        observation = query_fn()
-    except Exception as e:  # pylint: disable=broad-except
-        logger.warning('Reserved-fill broker: pool query failed for '
-                       f'{pool_key}: {common_utils.format_exception(e)}')
+    if committed_observation is not None:
+        snapshot_time = committed_observation.provenance.observed_at
+        observation = committed_observation.to_slot_observation(
+            pool_gpus_per_replica)
+        observation_provenance = committed_observation.provenance
+    else:
+        assert query_fn is not None
+        try:
+            observation = query_fn()
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill broker: pool query failed for '
+                           f'{pool_key}: {common_utils.format_exception(e)}')
     query_ok = observation is not None and observation.free_slots is not None
     confirmed_phantom = False
     measured_by_accelerator: dict[str, int] | None = None
@@ -3299,13 +3942,6 @@ def _run_round_locked(
                     'blackout.')
             query_ok = False
 
-    winning_widths = {
-        int(row['gpus_per_replica'] or 1)
-        for name, row in claim_rows.items()
-        if name not in mixed_width_losers
-    }
-    pool_gpus_per_replica = (next(iter(winning_widths))
-                             if len(winning_widths) == 1 else None)
     claims = {name: _claim_input(row) for name, row in claim_rows.items()}
     activity = {name: _activity_input(row) for name, row in claim_rows.items()}
     names = sorted(claims)
@@ -3340,6 +3976,7 @@ def _run_round_locked(
 
     grants: dict[str, int | None]
     observed_free = 0
+    spendable_by_accelerator = measured_by_accelerator
     if len(claims) == 1 and protocol_version == PROTOCOL_V1:
         # SINGLE-CLAIMANT FAST PATH: #108 identity. No ceiling, feed = raw
         # measured free (a failed query reads 0 free, exactly like the
@@ -3392,15 +4029,31 @@ def _run_round_locked(
         # pool regardless of whether this round's measurement succeeded,
         # the live-holdings correction below must apply while blind, and
         # the conservation bookkeeping must not flip on a blackout.
-        (feed_debit, entitlement_debit, live_fill,
-         unclaimed_fill) = _occupying_debit(
-             names,
-             pool_key,
-             snapshot_time,
-             access_contexts=access_contexts,
-             physical_cluster_uid=physical_cluster_uid,
-             claim_generations=claim_generations,
-             pool_gpus_per_replica=pool_gpus_per_replica)
+        try:
+            (feed_debit, entitlement_debit, feed_debit_by_accelerator,
+             live_fill, unclaimed_fill) = _occupying_debit(
+                 names,
+                 pool_key,
+                 snapshot_time,
+                 access_contexts=access_contexts,
+                 physical_cluster_uid=physical_cluster_uid,
+                 claim_generations=claim_generations,
+                 pool_gpus_per_replica=pool_gpus_per_replica,
+                 observation_admission_sequence=(
+                     None if observation_provenance is None else
+                     observation_provenance.observation_sequence),
+                 observation_materialization_sequence=(
+                     None if observation_provenance is None else
+                     observation_provenance.materialization_sequence))
+        except IncompleteReplicaOccupancySnapshotError as error:
+            # A successful provider measurement without a complete row scan is
+            # not spendable authority: an unread row could materialize into a
+            # slot the query counted free. Leave the prior round untouched;
+            # its own freshness bounds remain the recovery ceiling.
+            logger.error('Reserved-fill broker: rejecting sequenced '
+                         f'observation because occupancy is incomplete: '
+                         f'{error}')
+            return None
         # One row-consistent view: a claim's holdings_fill is only as
         # fresh as its owner's last heartbeat, while unclaimed_fill comes
         # from the live row scan above -- summing the two double-counts
@@ -3468,6 +4121,10 @@ def _run_round_locked(
             measured = max(0, int(observation.free_slots))
             last_free, last_free_ts = measured, snapshot_time
             observed_free = max(0, measured - feed_debit)
+            (observed_free, spendable_by_accelerator) = (
+                _apply_occupancy_to_exact_card_observation(
+                    measured_by_accelerator, observed_free,
+                    feed_debit_by_accelerator))
             # The entitlement total only debits the mid-query bind race:
             # bound not-READY pods are already excluded from the measured
             # free AND counted in their owner's fill holdings, so the full
@@ -3603,18 +4260,26 @@ def _run_round_locked(
                                    prev_shrink_baseline is not None else None)
         grants = dict(damped)
 
+    if not query_ok:
+        spendable_by_accelerator = None
     feed_by_accelerator = (_allocate_feed_by_accelerator(
-        feeds, measured_by_accelerator, observed_free) if query_ok else None)
+        feeds, spendable_by_accelerator, observed_free) if query_ok else None)
     service_feed_by_accelerator = (json.dumps(feed_by_accelerator,
                                               sort_keys=True)
                                    if feed_by_accelerator is not None else None)
-    if feed_by_accelerator is not None:
+    feed_envelope: dict[str, Any] | None = feed_by_accelerator
+    if feed_envelope is not None:
         assert measured_by_accelerator is not None
-        feed_by_accelerator[_OBSERVED_FREE_BY_ACCELERATOR_KEY] = dict(
+        feed_envelope[_OBSERVED_FREE_BY_ACCELERATOR_KEY] = dict(
             measured_by_accelerator)
-    serialized_feed_by_accelerator = (json.dumps(feed_by_accelerator,
-                                                 sort_keys=True) if
-                                      feed_by_accelerator is not None else None)
+        if committed_observation is not None:
+            # This key first appears after SEQUENCED_ACTIVE's exact writer
+            # convergence proof. Keeping legacy rounds byte-compatible avoids
+            # mixed-binary epoch churn during the feature-image rollout.
+            assert pool_gpus_per_replica is not None
+            feed_envelope[_BROKER_SLOT_WIDTH_KEY] = pool_gpus_per_replica
+    serialized_feed_by_accelerator = (json.dumps(feed_envelope, sort_keys=True)
+                                      if feed_envelope is not None else None)
 
     grants_changed = round_row is None or prev_grants_json != grants
     # Feeds are part of the allocation the fence protects: a feed-only
@@ -3669,8 +4334,8 @@ def _run_round_locked(
             metadata_changed or lease_expired or fence_pending):
         new_epoch += 1
     round_id = int(round_row['round_id']) + 1 if round_row is not None else 1
-    published = serve_state.publish_reserved_fill_round(
-        pool_key,
+    publication = ReservedFillRoundPublication(
+        pool_key=pool_key,
         round_id=round_id,
         snapshot_time=snapshot_time,
         epoch=new_epoch,
@@ -3690,7 +4355,9 @@ def _run_round_locked(
         claim_generations=json.dumps(published_claim_generations,
                                      sort_keys=True),
         utilization_state=(json.dumps(utilization_state, sort_keys=True)
-                           if utilization_state else None))
+                           if utilization_state else None),
+        observation_provenance=observation_provenance)
+    published = round_publisher(publication)
     if not published:
         logger.error(
             'Reserved-fill broker: lease token superseded while publishing '

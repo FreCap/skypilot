@@ -613,8 +613,8 @@ class TestPrepareRequestAsyncStampsClientApiVersion(
 
 class TestExecutorResolverGate(unittest.TestCase):
     """Verify _should_apply_workspace_resolver() gates the per-user
-    resolver correctly for the three skip-cases (daemon / old client /
-    explicit active_workspace) AND fires for the normal case.
+    resolver correctly for old clients and explicit workspaces, and fires for
+    the normal case.
 
     The client API version is now passed in as a parameter (read from
     the RequestBody by the caller in `override_request_env_and_config`)
@@ -627,54 +627,39 @@ class TestExecutorResolverGate(unittest.TestCase):
         from sky.server.requests import executor
         self.executor = executor
 
-    def _call(self, is_daemon: bool, api_version, active_workspace_set: bool):
+    def _call(self, api_version, active_workspace_set: bool):
         from sky import skypilot_config
         with mock.patch.object(skypilot_config,
                                'is_active_workspace_set',
                                return_value=active_workspace_set):
-            return self.executor._should_apply_workspace_resolver(
-                is_daemon, api_version)
-
-    def test_daemon_request_skips_resolver(self):
-        """Daemon = system user = admin = would always AMBIGUOUS on
-        multi-workspace servers. Skipping is correctness AND a perf win."""
-        self.assertFalse(
-            self._call(is_daemon=True,
-                       api_version=server_constants.API_VERSION,
-                       active_workspace_set=False))
+            return self.executor._should_apply_workspace_resolver(api_version)
 
     def test_old_client_skips_resolver(self):
         """API version below the introducing version → preserve legacy
         behavior. Old clients wouldn't know how to format the new error."""
         old_version = (server_constants.MIN_PREFERRED_WORKSPACE_API_VERSION - 1)
         self.assertFalse(
-            self._call(is_daemon=False,
-                       api_version=old_version,
-                       active_workspace_set=False))
+            self._call(api_version=old_version, active_workspace_set=False))
 
     def test_unknown_client_version_skips_resolver(self):
         """If RequestBody.client_api_version is None (older client that
         constructed the body before the field existed), be conservative
         — don't run the resolver."""
         self.assertFalse(
-            self._call(is_daemon=False,
-                       api_version=None,
-                       active_workspace_set=False))
+            self._call(api_version=None, active_workspace_set=False))
 
     def test_explicit_active_workspace_skips_resolver(self):
         """User explicitly named a workspace → respect it; preferred MUST
         be ignored."""
         self.assertFalse(
-            self._call(is_daemon=False,
-                       api_version=server_constants.API_VERSION,
+            self._call(api_version=server_constants.API_VERSION,
                        active_workspace_set=True))
 
     def test_new_client_no_explicit_runs_resolver(self):
         """The happy path: non-daemon + new client + nothing explicit set
         → the resolver runs."""
         self.assertTrue(
-            self._call(is_daemon=False,
-                       api_version=server_constants.API_VERSION,
+            self._call(api_version=server_constants.API_VERSION,
                        active_workspace_set=False))
 
 

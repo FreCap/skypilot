@@ -1,5 +1,6 @@
 # pyright: reportOptionalMemberAccess=error
 """Cloud-neutral VM provision utils."""
+import contextlib
 import dataclasses
 import json
 import time
@@ -46,6 +47,17 @@ _MAX_RETRY = 3
 _TITLE = '\n\n' + '=' * 20 + ' {} ' + '=' * 20 + '\n'
 
 
+@contextlib.contextmanager
+def _runtime_effect_guard(factory: provision_common.ProviderEffectGuardFactory |
+                          None,):
+    """Hold one fresh authorization around a bounded runtime mutation."""
+    if factory is None:
+        yield
+        return
+    with factory():
+        yield
+
+
 def _bulk_provision(
     cloud: clouds.Cloud,
     region: clouds.Region,
@@ -57,6 +69,9 @@ def _bulk_provision(
 
     start = time.time()
 
+    # Auxiliary setup cannot occupy an accelerator reservation. It remains
+    # outside the reclaim mutation guard; the exact Pod-create boundary below
+    # revalidates authority after setup and before any compute can exist.
     provision_volume.provision_ephemeral_volumes(cloud, region_name,
                                                  cluster_name.name_on_cloud,
                                                  bootstrap_config)
@@ -69,6 +84,11 @@ def _bulk_provision(
     config = provision.bootstrap_instances(provider_name, region_name,
                                            cluster_name.name_on_cloud,
                                            bootstrap_config)
+    if (bootstrap_config.provider_effect_guard_factory is not None and
+            getattr(config, 'provider_effect_guard_factory', None)
+            is not bootstrap_config.provider_effect_guard_factory):
+        raise RuntimeError('Provider bootstrap discarded its runtime effect '
+                           'authorization boundary.')
 
     provision_record = provision.run_instances(provider_name,
                                                region_name,
@@ -132,6 +152,8 @@ def bulk_provision(
     ports_to_open_on_launch: list[int] | None = None,
     *,
     cluster_incarnation: str | None = None,
+    provider_effect_guard_factory: (provision_common.ProviderEffectGuardFactory
+                                    | None) = None,
 ) -> provision_common.ProvisionRecord:
     """Provisions a cluster and wait until fully provisioned.
 
@@ -155,7 +177,8 @@ def bulk_provision(
         tags={},
         resume_stopped_nodes=True,
         ports_to_open_on_launch=ports_to_open_on_launch,
-        cluster_incarnation=cluster_incarnation)
+        cluster_incarnation=cluster_incarnation,
+        provider_effect_guard_factory=provider_effect_guard_factory)
 
     with provision_logging.setup_provision_logging(log_dir):
         try:
@@ -189,7 +212,21 @@ def bulk_provision(
             # through that alias could mutate the replacement cluster, so
             # propagate the fail-closed signal without provider teardown.
             raise
+        except (exceptions.ServeReplicaLaunchFenceError,
+                exceptions.ReservedFillLaunchFenceError):
+            # A stale or indeterminate terminal authority must never drive
+            # destructive cleanup from this request. The current durable
+            # service owner reconciles any already-created object.
+            raise
         except Exception as exc:  # pylint: disable=broad-except
+            if provider_effect_guard_factory is not None:
+                # The instrumented path is Kubernetes reserved fill. Its
+                # durable replica owner is the one cleanup authority; this
+                # stale/failed request must not run an opaque destructive
+                # teardown after leaving a bounded compute mutation epoch.
+                raise exceptions.ReservedFillLaunchFenceError(
+                    'Reserved-fill Kubernetes provisioning stopped; durable '
+                    'reserved-fill reconciliation owns exact cleanup.') from exc
             zone_str = 'all zones'
             if zones:
                 zone_str = ','.join(zone.name for zone in zones)
@@ -325,11 +362,13 @@ def wait_for_ssh(cluster_info: provision_common.ClusterInfo,
 
 
 def _post_provision_setup(
-        launched_resources: resources_lib.Resources,
-        cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
-        provision_record: provision_common.ProvisionRecord,
-        custom_resource: str | None,
-        existing_cluster_hash: str | None) -> provision_common.ClusterInfo:
+    launched_resources: resources_lib.Resources,
+    cluster_name: resources_utils.ClusterName, handle_cluster_yaml: str,
+    provision_record: provision_common.ProvisionRecord,
+    custom_resource: str | None, existing_cluster_hash: str | None,
+    provider_effect_guard_factory: provision_common.ProviderEffectGuardFactory |
+    None
+) -> provision_common.ClusterInfo:
     config_from_yaml = global_user_state.get_cluster_yaml_dict(
         handle_cluster_yaml)
     provider_config = config_from_yaml.get('provider')
@@ -418,11 +457,12 @@ def _post_provision_setup(
                     'Launching - Initializing docker container',
                     provision_logging.config.log_path,
                     cluster_name=str(cluster_name)))
-            docker_user = instance_setup.initialize_docker(
-                cluster_name.name_on_cloud,
-                docker_config=docker_config,
-                cluster_info=cluster_info,
-                ssh_credentials=ssh_credentials)
+            with _runtime_effect_guard(provider_effect_guard_factory):
+                docker_user = instance_setup.initialize_docker(
+                    cluster_name.name_on_cloud,
+                    docker_config=docker_config,
+                    cluster_info=cluster_info,
+                    ssh_credentials=ssh_credentials)
             if docker_user is None:
                 raise RuntimeError(
                     f'Failed to retrieve docker user for {cluster_name!r}. '
@@ -470,15 +510,17 @@ def _post_provision_setup(
             cluster_name=str(cluster_name)))
         status.update(
             runtime_preparation_str.format(step=1, step_name='initializing'))
-        instance_setup.internal_file_mounts(cluster_name.name_on_cloud,
-                                            file_mounts, cluster_info,
-                                            ssh_credentials)
+        with _runtime_effect_guard(provider_effect_guard_factory):
+            instance_setup.internal_file_mounts(cluster_name.name_on_cloud,
+                                                file_mounts, cluster_info,
+                                                ssh_credentials)
 
         status.update(
             runtime_preparation_str.format(step=2, step_name='dependencies'))
-        instance_setup.setup_runtime_on_cluster(
-            cluster_name.name_on_cloud, config_from_yaml['setup_commands'],
-            cluster_info, ssh_credentials)
+        with _runtime_effect_guard(provider_effect_guard_factory):
+            instance_setup.setup_runtime_on_cluster(
+                cluster_name.name_on_cloud, config_from_yaml['setup_commands'],
+                cluster_info, ssh_credentials)
 
         runners = provision.get_command_runners(cloud_name, cluster_info,
                                                 **ssh_credentials)
@@ -571,11 +613,12 @@ def _post_provision_setup(
             logger.debug('Skip Ray cluster setup on the head node.')
         elif head_ray_needs_restart:
             logger.debug('Starting Ray on the entire cluster.')
-            instance_setup.start_ray_on_head_node(
-                cluster_name.name_on_cloud,
-                custom_resource=custom_resource,
-                cluster_info=cluster_info,
-                ssh_credentials=ssh_credentials)
+            with _runtime_effect_guard(provider_effect_guard_factory):
+                instance_setup.start_ray_on_head_node(
+                    cluster_name.name_on_cloud,
+                    custom_resource=custom_resource,
+                    cluster_info=cluster_info,
+                    ssh_credentials=ssh_credentials)
         else:
             logger.debug('Ray cluster on head is ready. Skip starting ray '
                          'cluster on head node.')
@@ -595,17 +638,17 @@ def _post_provision_setup(
         if skip_ray_setup:
             logger.debug('Skip Ray cluster setup on the worker nodes.')
         elif cluster_info.num_instances > 1 and not ray_cluster_healthy:
-            instance_setup.start_ray_on_worker_nodes(
-                cluster_name.name_on_cloud,
-                no_restart=not head_ray_needs_restart,
-                custom_resource=custom_resource,
-                # Pass the ray_port to worker nodes for backward compatibility
-                # as in some existing clusters the ray_port is not dumped with
-                # instance_setup._DUMP_RAY_PORTS. We should use the ray_port
-                # from the head node for worker nodes.
-                ray_port=ray_port,
-                cluster_info=cluster_info,
-                ssh_credentials=ssh_credentials)
+            with _runtime_effect_guard(provider_effect_guard_factory):
+                instance_setup.start_ray_on_worker_nodes(
+                    cluster_name.name_on_cloud,
+                    no_restart=not head_ray_needs_restart,
+                    custom_resource=custom_resource,
+                    # Pass the ray_port to worker nodes for backward
+                    # compatibility as in some existing clusters the ray_port
+                    # is not dumped with instance_setup._DUMP_RAY_PORTS.
+                    ray_port=ray_port,
+                    cluster_info=cluster_info,
+                    ssh_credentials=ssh_credentials)
         elif ray_cluster_healthy:
             logger.debug('Ray cluster is ready. Skip starting ray cluster on '
                          'worker nodes.')
@@ -616,13 +659,16 @@ def _post_provision_setup(
                 ux_utils.spinner_message('Setting up logging agent',
                                          provision_logging.config.log_path,
                                          cluster_name=str(cluster_name)))
-            instance_setup.setup_logging_on_cluster(logging_agent, cluster_name,
-                                                    cluster_info,
-                                                    ssh_credentials)
+            with _runtime_effect_guard(provider_effect_guard_factory):
+                instance_setup.setup_logging_on_cluster(logging_agent,
+                                                        cluster_name,
+                                                        cluster_info,
+                                                        ssh_credentials)
 
-        instance_setup.start_skylet_on_head_node(cluster_name, cluster_info,
-                                                 ssh_credentials,
-                                                 launched_resources)
+        with _runtime_effect_guard(provider_effect_guard_factory):
+            instance_setup.start_skylet_on_head_node(cluster_name, cluster_info,
+                                                     ssh_credentials,
+                                                     launched_resources)
 
     logger.info(
         ux_utils.finishing_message(f'Cluster launched: {cluster_name}.',
@@ -633,13 +679,15 @@ def _post_provision_setup(
 
 @timeline.event
 def post_provision_runtime_setup(
-        launched_resources: resources_lib.Resources,
-        cluster_name: resources_utils.ClusterName,
-        handle_cluster_yaml: str,
-        provision_record: provision_common.ProvisionRecord,
-        custom_resource: str | None,
-        log_dir: str,
-        existing_cluster_hash: str | None = None
+    launched_resources: resources_lib.Resources,
+    cluster_name: resources_utils.ClusterName,
+    handle_cluster_yaml: str,
+    provision_record: provision_common.ProvisionRecord,
+    custom_resource: str | None,
+    log_dir: str,
+    existing_cluster_hash: str | None = None,
+    provider_effect_guard_factory: provision_common.ProviderEffectGuardFactory |
+    None = None,
 ) -> provision_common.ClusterInfo:
     """Run internal setup commands after provisioning and before user setup.
 
@@ -663,7 +711,8 @@ def post_provision_runtime_setup(
                 handle_cluster_yaml=handle_cluster_yaml,
                 provision_record=provision_record,
                 custom_resource=custom_resource,
-                existing_cluster_hash=existing_cluster_hash)
+                existing_cluster_hash=existing_cluster_hash,
+                provider_effect_guard_factory=provider_effect_guard_factory)
         except Exception:  # pylint: disable=broad-except
             logger.error(
                 ux_utils.error_message(

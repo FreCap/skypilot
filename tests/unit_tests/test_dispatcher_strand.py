@@ -10,6 +10,7 @@ the dispatcher thread, and that an already-terminal row (e.g. cancelled by a
 concurrent kill) is left untouched.
 """
 # pylint: disable=protected-access,redefined-outer-name,unused-argument
+import asyncio
 import unittest.mock as mock
 
 import pytest
@@ -34,9 +35,9 @@ def isolated_database(tmp_path):
                     str(temp_db_path)):
         with mock.patch('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
                         str(temp_log_path)):
-            requests_lib._DB = None
+            asyncio.run(requests_lib.close_db_async())
             yield
-            requests_lib._DB = None
+            asyncio.run(requests_lib.close_db_async())
 
 
 def _make_request(request_id: str,
@@ -76,9 +77,22 @@ class _FailingExecutor:
     def __init__(self, side_effect=None):
         self.side_effect = side_effect
         self.submit_calls = 0
+        self._reservation = None
 
-    def submit_until_success(self, *args, **kwargs):
+    def try_reserve_idle_worker(self):
+        assert self._reservation is None
+        self._reservation = object()
+        return self._reservation
+
+    def release_idle_worker_reservation(self, reservation):
+        if reservation is not self._reservation:
+            raise ValueError('reservation already consumed')
+        self._reservation = None
+
+    def submit_reserved(self, reservation, *args, **kwargs):
         del args, kwargs
+        assert reservation is self._reservation
+        self._reservation = None
         self.submit_calls += 1
         if self.side_effect is not None:
             self.side_effect()
@@ -90,9 +104,22 @@ class _SucceedingExecutor:
 
     def __init__(self):
         self.submit_calls = 0
+        self._reservation = None
 
-    def submit_until_success(self, *args, **kwargs):
+    def try_reserve_idle_worker(self):
+        assert self._reservation is None
+        self._reservation = object()
+        return self._reservation
+
+    def release_idle_worker_reservation(self, reservation):
+        if reservation is not self._reservation:
+            raise ValueError('reservation already consumed')
+        self._reservation = None
+
+    def submit_reserved(self, reservation, *args, **kwargs):
         del args, kwargs
+        assert reservation is self._reservation
+        self._reservation = None
         self.submit_calls += 1
         return mock.MagicMock()
 
@@ -158,7 +185,7 @@ async def test_post_submit_failure_leaves_request_untouched(
         raise RuntimeError('post-submit bookkeeping broken')
 
     # Inject a failure in the post-submit bookkeeping (the monitor thread
-    # creation), i.e. after submit_until_success returned a future.
+    # creation), i.e. after submit_reserved returned a future.
     monkeypatch.setattr(executor.threading, 'Thread', _raise_on_thread)
 
     worker = _worker()

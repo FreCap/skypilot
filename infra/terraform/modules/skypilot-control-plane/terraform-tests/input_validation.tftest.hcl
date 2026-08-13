@@ -194,6 +194,35 @@ run "rejects_fullname_override_from_escape_hatch" {
   expect_failures = [helm_release.skypilot]
 }
 
+run "rejects_prior_helm_values_digest_mismatch" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        databaseConnection:
+          retainedSecretName: live-postgres
+      EOT
+      sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+
+  expect_failures = [var.prior_helm_release_values]
+}
+
+run "rejects_prior_helm_values_non_map" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = "- not-a-map\n"
+      sha256 = "f058b49087222c604bb2024ecbb2c8a9b090a94c960fc496dad101f156f0b757"
+    }
+  }
+
+  expect_failures = [var.prior_helm_release_values]
+}
+
 run "rejects_noncanonical_rwx_authority_digest" {
   command = plan
 

@@ -1,6 +1,7 @@
 """Util constants/functions for the backends."""
 import asyncio
 from collections.abc import Callable
+from collections.abc import Mapping
 from collections.abc import Sequence
 import copy
 from datetime import datetime
@@ -42,12 +43,12 @@ from sky.adaptors import common as adaptors_common
 from sky.backends import skylet_rpc
 from sky.backends import ssh_tunnel
 from sky.backends import ssm_proxy
-from sky.jobs import utils as managed_job_utils
 from sky.provision import common as provision_common
 from sky.provision import instance_setup
+from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import instance as k8s_instance
+from sky.provision.kubernetes import pod_spec as k8s_pod_spec
 from sky.provision.kubernetes import utils as kubernetes_utils
-from sky.serve import serve_utils
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.usage import usage_lib
@@ -90,11 +91,15 @@ if typing.TYPE_CHECKING:
     from sky import task as task_lib
     from sky.backends import cloud_vm_ray_backend
     from sky.backends import local_docker_backend
+    from sky.jobs import utils as managed_job_utils
     from sky.provision.kubernetes.instance import NodeHealthInfo
     from sky.schemas.generated import healthv1_pb2
+    from sky.serve import serve_utils
 else:
     yaml = adaptors_common.LazyImport('yaml')
     requests = adaptors_common.LazyImport('requests')
+    managed_job_utils = adaptors_common.LazyImport('sky.jobs.utils')
+    serve_utils = adaptors_common.LazyImport('sky.serve.serve_utils')
     rich_progress = adaptors_common.LazyImport('rich.progress')
     adapters = adaptors_common.LazyImport('requests.adapters')
     retry_lib = adaptors_common.LazyImport(
@@ -911,6 +916,40 @@ def _select_worker_projection(
             'SkyServe Kubernetes placement has no exact immutable worker '
             f'projection for context {region.name!r} and accelerator '
             f'{to_provision.accelerators!r}.')
+    if kubernetes_identity.worker_projection_protocol_version(projection) == 2:
+        if to_provision.priority_class is not None:
+            raise exceptions.InvalidCloudConfigs(
+                'Projected SkyServe Kubernetes workers cannot set task '
+                'resource priority_class.')
+        overrides = to_provision.cluster_config_overrides
+        kubernetes_config = overrides.get('kubernetes')
+        if kubernetes_config is None and any(
+                key in overrides
+                for key in ('kueue', 'quota', 'context_configs')):
+            kubernetes_config = overrides
+
+        def _scope_has_admission_override(scope: Any) -> bool:
+            if not isinstance(scope, Mapping):
+                return False
+            if 'kueue' in scope:
+                return True
+            quota = scope.get('quota')
+            return isinstance(quota, Mapping) and 'queue' in quota
+
+        has_admission_override = _scope_has_admission_override(
+            kubernetes_config)
+        if isinstance(kubernetes_config, Mapping):
+            context_configs = kubernetes_config.get('context_configs')
+            has_admission_override = (
+                has_admission_override or
+                isinstance(context_configs, Mapping) and any(
+                    _scope_has_admission_override(context_config)
+                    for context_config in context_configs.values()))
+        if has_admission_override:
+            raise exceptions.InvalidCloudConfigs(
+                'Projected SkyServe Kubernetes workers cannot set '
+                'task-owned kubernetes.kueue or kubernetes.quota.queue '
+                'overrides.')
     return projection
 
 
@@ -921,6 +960,23 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     """Apply server-owned identity and cache after all user config merging."""
     cluster_yaml['provider']['context'] = projection['kubernetes_context']
     cluster_yaml['provider']['namespace'] = projection['namespace']
+    projection_version = (
+        kubernetes_identity.worker_projection_protocol_version(projection))
+    cluster_yaml['provider']['serve_worker_projection_protocol_version'] = (
+        projection_version)
+    kueue_admission = None
+    if projection_version == 2:
+        kueue_admission = projection['kueue_admission']
+        cluster_yaml['provider']['serve_worker_expected_scheduler_name'] = (
+            projection['scheduler_name'])
+        cluster_yaml['provider']['kueue_local_queue_name'] = (
+            None
+            if kueue_admission is None else kueue_admission['local_queue_name'])
+        cluster_yaml['provider']['kueue_require_managed'] = (kueue_admission
+                                                             is not None)
+        cluster_yaml['provider']['kueue_workload_priority_class_name'] = (
+            None if kueue_admission is None else
+            kueue_admission['workload_priority_class_name'])
     # Persist the frozen expectation through the provisioner boundary. The
     # Kubernetes API response is checked after admission below, which catches a
     # missing or changed platform mutation before the workload can run.
@@ -951,15 +1007,59 @@ def _enforce_worker_projection_on_kubernetes_yaml(
         'operator': 'In',
         'values': list(scheduling['label_values']),
     }
-    accelerator_resource_keys = {
-        *kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS.values(),
-        kubernetes_utils.TPU_RESOURCE_KEY,
-        scheduling['resource_key'],
-    }
     cache = projection['cache']
     cache_env = kubernetes_identity.cache_environment(projection)
     for node_type in cluster_yaml['available_node_types'].values():
-        pod_spec = node_type['node_config']['spec']
+        node_config = node_type['node_config']
+        if projection_version == 2:
+            metadata = node_config.setdefault('metadata', {})
+            if not isinstance(metadata, dict):
+                raise exceptions.InvalidCloudConfigs(
+                    'Projected SkyServe Kubernetes Pod metadata must be a '
+                    'mapping.')
+            labels = metadata.setdefault('labels', {})
+            if not isinstance(labels, dict):
+                raise exceptions.InvalidCloudConfigs(
+                    'Projected SkyServe Kubernetes Pod labels must be a '
+                    'mapping.')
+            # Projected workers own one closed Kueue input contract. Remove
+            # every caller-supplied Kueue semantic before installing the
+            # server-owned queue identity below; the provisioner repeats this
+            # sanitizer at its final Pod boundary.
+            for key in list(labels):
+                if key.startswith(k8s_constants.KUEUE_METADATA_PREFIX):
+                    labels.pop(key)
+            annotations = metadata.setdefault('annotations', {})
+            if not isinstance(annotations, dict):
+                raise exceptions.InvalidCloudConfigs(
+                    'Projected SkyServe Kubernetes Pod annotations must be a '
+                    'mapping.')
+            for key in list(annotations):
+                if key.startswith(k8s_constants.KUEUE_METADATA_PREFIX):
+                    annotations.pop(key)
+            if kueue_admission is None:
+                labels.pop(k8s_constants.KUEUE_QUEUE_LABEL, None)
+                labels.pop(k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL,
+                           None)
+            else:
+                labels[k8s_constants.
+                       KUEUE_QUEUE_LABEL] = kueue_admission['local_queue_name']
+                labels[k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL] = (
+                    kueue_admission['workload_priority_class_name'])
+        pod_spec = node_config['spec']
+        if projection_version == 2:
+            # This is the final post-merge/restoration owner.  A caller-selected
+            # node bypasses every scheduler, while an alternate scheduler is
+            # outside the persisted placement proof.
+            pod_spec.pop('nodeName', None)
+            pod_spec['schedulerName'] = projection['scheduler_name']
+            scheduling_gates = pod_spec.get('schedulingGates')
+            if scheduling_gates is not None and not isinstance(
+                    scheduling_gates, list):
+                raise exceptions.InvalidCloudConfigs(
+                    'Projected SkyServe Kubernetes schedulingGates must be a '
+                    'list.')
+            pod_spec['schedulingGates'] = []
         pod_spec['serviceAccountName'] = projection['service_account_name']
         priority = projection['priority_class_name']
         if priority is None:
@@ -1012,22 +1112,26 @@ def _enforce_worker_projection_on_kubernetes_yaml(
             term['matchExpressions'].append(
                 copy.deepcopy(accelerator_label_expression))
         required['nodeSelectorTerms'] = terms
-        containers = pod_spec.get('containers', [])
-        ray_node_containers = 0
-        for container in containers:
-            resources = container.setdefault('resources', {})
-            if not isinstance(resources, dict):
+        try:
+            accelerator_contract = (
+                k8s_pod_spec.enforce_projected_accelerator_contract(
+                    pod_spec,
+                    scheduling['resource_key'],
+                    projection['accelerator_count'],
+                    rewrite=True))
+        except k8s_pod_spec.ProjectedAcceleratorContractError as error:
+            raise exceptions.InvalidCloudConfigs(str(error)) from error
+        if not accelerator_contract.matches:
+            if accelerator_contract.dynamic_resource_claims:
                 raise exceptions.InvalidCloudConfigs(
-                    'Projected SkyServe Kubernetes container resources must '
-                    'be a mapping.')
-            for resource_section in ('requests', 'limits'):
-                resource_values = resources.setdefault(resource_section, {})
-                if not isinstance(resource_values, dict):
-                    raise exceptions.InvalidCloudConfigs(
-                        'Projected SkyServe Kubernetes container resource '
-                        'requests and limits must be mappings.')
-                for resource_key in accelerator_resource_keys:
-                    resource_values.pop(resource_key, None)
+                    'Projected SkyServe Kubernetes pods cannot use Dynamic '
+                    'Resource Allocation claims.')
+            raise exceptions.InvalidCloudConfigs(
+                'Projected SkyServe Kubernetes pods must contain exactly one '
+                'ray-node container.')
+
+        containers = pod_spec['containers']
+        for container in containers:
             env = [
                 entry for entry in container.setdefault('env', [])
                 if entry.get('name') != kubernetes_identity.CACHE_ENV_VAR and
@@ -1037,11 +1141,6 @@ def _enforce_worker_projection_on_kubernetes_yaml(
             container['env'] = env
             if container.get('name') != 'ray-node':
                 continue
-            ray_node_containers += 1
-            resources['requests'][
-                scheduling['resource_key']] = projection['accelerator_count']
-            resources['limits'][
-                scheduling['resource_key']] = projection['accelerator_count']
             env.extend({
                 'name': key,
                 'value': value
@@ -1057,10 +1156,6 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                     'mountPath': cache['mount_path'],
                 })
                 container['volumeMounts'] = mounts
-        if ray_node_containers != 1:
-            raise exceptions.InvalidCloudConfigs(
-                'Projected SkyServe Kubernetes pods must contain exactly one '
-                'ray-node container.')
         if cache['kind'] == 'node_local':
             volumes = [
                 volume for volume in pod_spec.setdefault('volumes', [])
@@ -1199,6 +1294,14 @@ def write_cluster_config(
         resources_vars['k8s_namespace'] = worker_projection['namespace']
         resources_vars['k8s_service_account_name'] = worker_projection[
             'service_account_name']
+    rendered_priority_class = to_provision.priority_class
+    if (worker_projection is not None and
+            kubernetes_identity.worker_projection_protocol_version(
+                worker_projection) == 2):
+        projected_kueue_admission = worker_projection['kueue_admission']
+        rendered_priority_class = (
+            None if projected_kueue_admission is None else
+            projected_kueue_admission['workload_priority_class_name'])
     config_dict = {}
 
     specific_reservations = set(
@@ -1720,7 +1823,7 @@ def write_cluster_config(
             'runcmd': runcmd,
 
             # Priority class
-            'priority_class': to_provision.priority_class,
+            'priority_class': rendered_priority_class,
         },
     )
     if cloud_specific_failover_overrides is not None:

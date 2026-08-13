@@ -110,6 +110,7 @@ class _ThreadLease:
     phase_epoch: int
     is_root: bool
     depth: int = 1
+    child_drain_timeout_seconds: float | None = None
 
 
 class _ProviderPhaseGate:
@@ -306,13 +307,25 @@ class _ProviderPhaseGate:
             return _ThreadLease(admission, admission._mode,
                                 admission._phase_epoch, False)
 
-    def _close_root_locked(self, admission: ProviderPhaseAdmission) -> None:
+    def _close_root_locked(
+            self,
+            admission: ProviderPhaseAdmission,
+            child_drain_timeout_seconds: float | None = None) -> None:
         record = self._joinable_record_for_locked(admission)
         record.root_open = False
         self._release_user_locked(admission)
+        drain_deadline = (None if child_drain_timeout_seconds is None else
+                          time.monotonic() + child_drain_timeout_seconds)
         try:
             while record.child_users:
-                self._condition.wait()
+                if drain_deadline is None:
+                    self._condition.wait()
+                    continue
+                remaining = drain_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise exceptions.ProviderPhaseTimeoutError(
+                        'Timed out draining provider phase child users.')
+                self._condition.wait(timeout=remaining)
         finally:
             # If an interrupted root stops waiting, the final child performs
             # this deletion.  Either way, closed admission can never be used
@@ -345,7 +358,8 @@ class _ProviderPhaseGate:
     def _release(self, lease: _ThreadLease) -> None:
         with self._condition:
             if lease.is_root:
-                self._close_root_locked(lease.admission)
+                self._close_root_locked(lease.admission,
+                                        lease.child_drain_timeout_seconds)
             else:
                 self._release_child_locked(lease.admission)
 
@@ -371,6 +385,7 @@ class _ProviderPhaseGate:
         mode: ProviderPhaseMode,
         *,
         timeout_seconds: float = DEFAULT_PROVIDER_PHASE_TIMEOUT_SECONDS,
+        child_drain_timeout_seconds: float | None = None,
     ) -> typing.Iterator[ProviderPhaseAdmission]:
         """Enter a fresh provider round or reenter this thread's round."""
         if not isinstance(mode, ProviderPhaseMode):
@@ -378,8 +393,16 @@ class _ProviderPhaseGate:
                 f'Invalid provider phase mode: {mode!r}.')
         self._ensure_process()
         deadline = self._deadline(timeout_seconds)
+        if child_drain_timeout_seconds is not None:
+            # Reuse the timeout validator without coupling the child-drain
+            # window to the admission deadline.
+            self._deadline(child_drain_timeout_seconds)
         current = self._current_lease()
         if current is not None:
+            if child_drain_timeout_seconds is not None:
+                raise exceptions.ProviderPhaseMisuseError(
+                    'A reentrant provider phase cannot change its child-drain '
+                    'timeout.')
             admission = self._enter_reentrant(current, mode)
             try:
                 yield admission
@@ -391,6 +414,7 @@ class _ProviderPhaseGate:
             lease = self._try_acquire_root(mode)
         else:
             lease = self._acquire_root(mode, deadline)
+        lease.child_drain_timeout_seconds = child_drain_timeout_seconds
         self._local.lease = lease
         try:
             yield lease.admission
@@ -438,10 +462,16 @@ class _ProviderPhaseGate:
                 self._release(lease)
 
     def try_phase(
-        self, mode: ProviderPhaseMode
+        self,
+        mode: ProviderPhaseMode,
+        *,
+        child_drain_timeout_seconds: float | None = None,
     ) -> contextlib.AbstractContextManager[ProviderPhaseAdmission]:
         """Try to enter immediately without joining or mutating the queue."""
-        return self.phase(mode, timeout_seconds=0)
+        return self.phase(
+            mode,
+            timeout_seconds=0,
+            child_drain_timeout_seconds=child_drain_timeout_seconds)
 
 
 _PROVIDER_PHASE_GATE = _ProviderPhaseGate(register_at_fork=True)
@@ -451,9 +481,13 @@ def provider_phase(
     mode: ProviderPhaseMode,
     *,
     timeout_seconds: float = DEFAULT_PROVIDER_PHASE_TIMEOUT_SECONDS,
+    child_drain_timeout_seconds: float | None = None,
 ) -> contextlib.AbstractContextManager[ProviderPhaseAdmission]:
     """Return a bounded context manager for one provider authority round."""
-    return _PROVIDER_PHASE_GATE.phase(mode, timeout_seconds=timeout_seconds)
+    return _PROVIDER_PHASE_GATE.phase(
+        mode,
+        timeout_seconds=timeout_seconds,
+        child_drain_timeout_seconds=child_drain_timeout_seconds)
 
 
 def join_provider_phase(
@@ -467,6 +501,9 @@ def join_provider_phase(
 
 def try_provider_phase(
     mode: ProviderPhaseMode,
+    *,
+    child_drain_timeout_seconds: float | None = None,
 ) -> contextlib.AbstractContextManager[ProviderPhaseAdmission]:
     """Try provider admission without queueing, sleeping, or barging."""
-    return _PROVIDER_PHASE_GATE.try_phase(mode)
+    return _PROVIDER_PHASE_GATE.try_phase(
+        mode, child_drain_timeout_seconds=child_drain_timeout_seconds)

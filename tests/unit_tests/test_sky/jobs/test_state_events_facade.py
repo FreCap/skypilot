@@ -70,14 +70,14 @@ def test_job_event_timestamp_normalization_is_utc_aware():
     assert before <= generated <= after
 
 
-def test_lifecycle_transition_resolves_event_writer_from_facade():
+def test_pending_transition_uses_canonical_event_statement_atomically():
     tree = ast.parse(inspect.getsource(state.set_pending))
-    called_names = {
-        node.func.id
+    called_attributes = {
+        node.func.attr
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
-    assert 'add_job_event' in called_names
+    assert 'job_event_insert_statement' in called_attributes
 
 
 def test_event_retention_daemon_propagates_cancellation(monkeypatch):

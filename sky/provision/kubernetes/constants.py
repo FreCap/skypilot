@@ -24,6 +24,11 @@ TAG_SKYPILOT_DEPLOYMENT_NAME = 'skypilot-deployment-name'
 # Default name of the primary workload container in SkyPilot Ray pods.
 RAY_NODE_CONTAINER_NAME = 'ray-node'
 
+# Kubernetes uses this scheduler when PodSpec.schedulerName is omitted.  Serve
+# projection protocol v2 persists the effective value explicitly so rendering
+# and provider attestation share one immutable scheduling seam.
+DEFAULT_SCHEDULER_NAME = 'default-scheduler'
+
 # Kueue plain-Pod protocol metadata.  The finalizer and managed-label key share
 # the same qualified name but live in different metadata collections.
 KUEUE_MANAGED_KEY = 'kueue.x-k8s.io/managed'
@@ -36,6 +41,13 @@ KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION = (
     'kueue.x-k8s.io/pod-group-total-count')
 KUEUE_RETRIABLE_IN_GROUP_ANNOTATION = 'kueue.x-k8s.io/retriable-in-group'
 KUEUE_ADMISSION_SCHEDULING_GATE = 'kueue.x-k8s.io/admission'
+KUEUE_TOPOLOGY_SCHEDULING_GATE = 'kueue.x-k8s.io/topology'
+KUEUE_METADATA_PREFIX = 'kueue.x-k8s.io/'
+KUEUE_CLUSTER_QUEUE_LABEL = 'kueue.x-k8s.io/cluster-queue-name'
+KUEUE_LOCAL_QUEUE_LABEL = 'kueue.x-k8s.io/local-queue-name'
+KUEUE_PODSET_LABEL = 'kueue.x-k8s.io/podset'
+KUEUE_ROLE_HASH_ANNOTATION = 'kueue.x-k8s.io/role-hash'
+KUEUE_WORKLOAD_ANNOTATION = 'kueue.x-k8s.io/workload'
 KUEUE_API_GROUP = 'kueue.x-k8s.io'
 KUEUE_API_VERSIONS = ('v1beta2', 'v1beta1')
 KUEUE_LOCAL_QUEUE_PLURAL = 'localqueues'

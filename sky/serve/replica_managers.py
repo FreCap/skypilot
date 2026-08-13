@@ -40,11 +40,13 @@ from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
 from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
+from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_tls
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -153,10 +155,33 @@ _CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR = (
 # measurement blackout, keep only a few probes per ACTIVE zero-cost shape.
 # Four matches SkyServe's historical per-service launch parallelism.
 _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
+# Physical-cluster capture has its own bounded 30-second provider deadline.
+# This slightly larger coordination bound is one absolute deadline for the
+# complete parallel batch, not a fresh allowance for every context.  Provider
+# I/O remains outside the manager mutex.
+_RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS = 45
+_RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS = 1
 # Sentinel for drain registration's optional pre-resolved replica URL. ``None``
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
 _REPLICA_URL_NOT_PROVIDED: Any = object()
+
+
+def replica_may_consume_physical_capacity(info: Any) -> bool:
+    """Whether a durable row may still own its provider capacity.
+
+    Terminal status is a routing/lifecycle property, not cleanup evidence.
+    Keep every row in capacity accounting until teardown has durably
+    succeeded; deleting the row is the other proof and naturally removes it
+    from the caller's snapshot.  Missing or malformed teardown state therefore
+    fails closed.
+    """
+    if not info.is_terminal:
+        return True
+    status_property = getattr(info, 'status_property', None)
+    return (status_property is None or
+            getattr(status_property, 'sky_down_status',
+                    None) != common_utils.ProcessStatus.SUCCEEDED)
 
 
 def _changed_only_readiness_persistence_enabled() -> bool:
@@ -218,6 +243,29 @@ class _ReplicaLaunchResult:
     replica_id: int
     planned_capacity: int
     funding: _ReplicaLaunchFunding
+
+
+@dataclasses.dataclass
+class _ReservedFillPhysicalPreflight:
+    """One concurrently initialized physical-identity capture."""
+
+    kubernetes_context: str
+    physical_cluster_uid: str
+    ready: threading.Event = dataclasses.field(default_factory=threading.Event)
+    release: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    cancellation: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    error: BaseException | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReservedFillPhysicalPreflightBatch:
+    """Shared deadline and independently cancelable preflight holders."""
+
+    preflights: dict[tuple[str, str], _ReservedFillPhysicalPreflight]
+    threads: tuple[threading.Thread, ...]
+    deadline_monotonic: float
 
 
 class _ReplicaLaunchThread(thread_utils.SafeThread):
@@ -2241,6 +2289,11 @@ def _is_protocol_v2_fill_override(
             protocol == reserved_capacity_broker.PROTOCOL_V2)
 
 
+def _is_lowercase_sha256(value: Any) -> bool:
+    return (type(value) is str and len(value) == 64 and
+            all(character in '0123456789abcdef' for character in value))
+
+
 def _conflicting_protocol_v2_fill_override_indexes(
     resources_overrides: typing.Sequence[Mapping[str, Any] | None],
 ) -> set[int]:
@@ -2824,6 +2877,13 @@ class ReplicaManager:
             return
         for resources_override in resources_overrides:
             self.scale_up(resources_override)
+
+    def accept_reserved_fill(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Durably admit a typed protocol-v2 reserved-fill plan."""
+        del plan
+        raise NotImplementedError
 
     def scale_up_to_logical_capacity(
         self,
@@ -3702,6 +3762,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.replica_record_id,
             projection.context.association_id,
             info,
+            provider_launch_succeeded=(not projection.pre_effect_terminal and
+                                       status == 'SUCCEEDED'),
             paid_capacity_pool_key=projection.paid_capacity_pool_key,
             paid_capacity_outcome=paid_outcome)
 
@@ -5628,6 +5690,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
         try_provider_phase_admission: bool = False,
+        require_preinitialized_physical_fence: bool = False,
     ) -> _ReplicaLaunchResult | None:
         """Enqueue one replica launch.
 
@@ -5688,6 +5751,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         try_provider_phase_admission: batch-only mode that takes a zero-wait
         v2 admission at the exact physical-capture/persist seam. Contention
         defers this one launch without writing a row or registering a thread.
+
+        require_preinitialized_physical_fence: join a physical-identity
+        capture prepared outside the manager lock and never initialize one at
+        the persistence seam.
         """
         if self._update_recovery_required:
             logger.info(
@@ -5700,6 +5767,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise exceptions.ProviderPhaseMisuseError(
                 'Try-only provider admission requires one protocol-v2 fill '
                 'without an existing admission.')
+        if require_preinitialized_physical_fence and (
+                not protocol_v2_fill or try_provider_phase_admission or
+                provider_phase_admission is None):
+            raise exceptions.ProviderPhaseMisuseError(
+                'A preinitialized physical fence requires one protocol-v2 '
+                'fill with an existing provider admission.')
         if (protocol_v2_fill and not try_provider_phase_admission and
             (provider_phase_admission is None or provider_phase_admission.mode
              != provider_phase.ProviderPhaseMode.V2_FENCED)):
@@ -5722,8 +5795,21 @@ class SkyPilotReplicaManager(ReplicaManager):
         fill_pool_key: str | None = None
         fill_protocol_version: int | None = None
         fill_service_generation: int | None = None
+        fill_service_version: int | None = None
         fill_physical_cluster_uid: str | None = None
         fill_allowed_location_keys: list[dict[str, Any]] | None = None
+        fill_allocation_generation: int | None = None
+        fill_allocation_input_sha256: str | None = None
+        fill_allocation_claim_generation: int | None = None
+        fill_gate_generation: int | None = None
+        fill_reclaim_fleet_bundle_sha256: str | None = None
+        fill_reclaim_policy_revision: str | None = None
+        fill_reclaim_provider_inventory_sha256: str | None = None
+        fill_worker_projection_sha256: str | None = None
+        fill_observation_generation: int | None = None
+        fill_observation_sequence: int | None = None
+        fill_ordinary_admission_sequence: int | None = None
+        fill_intent_idempotency_key: str | None = None
         fill_pool_identity: reserved_capacity_broker.PoolIdentity | None = None
         fill_exact_accelerator_shape: tuple[str, int] | None = None
         fill_launch_context: str | None = None
@@ -5747,12 +5833,52 @@ class SkyPilotReplicaManager(ReplicaManager):
             fill_service_generation = resources_override.pop(
                 serve_constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY,
                 None)
+            fill_service_version = resources_override.pop(
+                serve_constants.RESERVED_FILL_SERVICE_VERSION_OVERRIDE_KEY,
+                None)
             fill_physical_cluster_uid = resources_override.pop(
                 serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY,
                 None)
             raw_allowed_locations = resources_override.pop(
                 serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY,
                 None)
+            fill_allocation_generation = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ALLOCATION_GENERATION_OVERRIDE_KEY, None)
+            fill_allocation_input_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ALLOCATION_INPUT_SHA256_OVERRIDE_KEY, None)
+            fill_allocation_claim_generation = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ALLOCATION_CLAIM_GENERATION_OVERRIDE_KEY, None)
+            fill_gate_generation = resources_override.pop(
+                serve_constants.RESERVED_FILL_GATE_GENERATION_OVERRIDE_KEY,
+                None)
+            fill_reclaim_fleet_bundle_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_RECLAIM_FLEET_BUNDLE_SHA256_OVERRIDE_KEY, None)
+            fill_reclaim_policy_revision = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_RECLAIM_POLICY_REVISION_OVERRIDE_KEY, None)
+            fill_reclaim_provider_inventory_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_RECLAIM_PROVIDER_INVENTORY_SHA256_OVERRIDE_KEY,
+                None)
+            fill_worker_projection_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_WORKER_PROJECTION_SHA256_OVERRIDE_KEY, None)
+            fill_observation_generation = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_OBSERVATION_GENERATION_OVERRIDE_KEY, None)
+            fill_observation_sequence = resources_override.pop(
+                serve_constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY,
+                None)
+            fill_ordinary_admission_sequence = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ORDINARY_ADMISSION_SEQUENCE_OVERRIDE_KEY, None)
+            fill_intent_idempotency_key = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY, None)
             if raw_allowed_locations is not None:
                 if not isinstance(raw_allowed_locations, list):
                     self._log_fill_skip('malformed pool location fence')
@@ -6000,6 +6126,58 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip('incomplete protocol-v2 pool '
                                             'fence')
                         return None
+                    allocation_attribution = (
+                        fill_allocation_generation,
+                        fill_allocation_input_sha256,
+                        fill_allocation_claim_generation,
+                        fill_service_version,
+                        fill_gate_generation,
+                        fill_reclaim_fleet_bundle_sha256,
+                        fill_reclaim_policy_revision,
+                        fill_reclaim_provider_inventory_sha256,
+                        fill_worker_projection_sha256,
+                        fill_observation_generation,
+                        fill_observation_sequence,
+                        fill_ordinary_admission_sequence,
+                        fill_intent_idempotency_key,
+                    )
+                    if any(value is not None
+                           for value in allocation_attribution):
+                        if (type(fill_allocation_generation) is not int or
+                                fill_allocation_generation < 1 or
+                                not _is_lowercase_sha256(
+                                    fill_allocation_input_sha256) or
+                                type(fill_allocation_claim_generation)
+                                is not int or
+                                fill_allocation_claim_generation < 1 or
+                                type(fill_service_version) is not int or
+                                fill_service_version < 1 or
+                                fill_service_version != launch_version or
+                                type(fill_gate_generation) is not int or
+                                fill_gate_generation < 1 or
+                                not _is_lowercase_sha256(
+                                    fill_reclaim_fleet_bundle_sha256) or
+                                not isinstance(fill_reclaim_policy_revision,
+                                               str) or
+                                not fill_reclaim_policy_revision or
+                                not _is_lowercase_sha256(
+                                    fill_reclaim_provider_inventory_sha256) or
+                                not _is_lowercase_sha256(
+                                    fill_worker_projection_sha256) or
+                                type(fill_observation_generation) is not int or
+                                fill_observation_generation < 1 or
+                                type(fill_observation_sequence) is not int or
+                                fill_observation_sequence < 0 or
+                                type(fill_ordinary_admission_sequence)
+                                is not int or
+                                fill_ordinary_admission_sequence < 0 or
+                                fill_ordinary_admission_sequence
+                                > fill_observation_sequence or
+                                not _is_lowercase_sha256(
+                                    fill_intent_idempotency_key)):
+                            self._log_fill_skip(
+                                'incomplete typed allocation attribution')
+                            return None
                     assert isinstance(fill_pool_key, str)
                     try:
                         fill_pool_identity = (
@@ -6338,10 +6516,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 reserved_capacity.make_protocol_v2_launch_fence(
                     pool_key=fill_pool_key,
                     service_generation=fill_service_generation,
+                    service_version=launch_version,
                     physical_cluster_uid=fill_physical_cluster_uid,
                     kubernetes_context=fill_launch_context,
                     accelerator=fill_card,
-                    accelerator_count=fill_count))
+                    accelerator_count=fill_count,
+                    reconciliation_gate_generation=fill_gate_generation,
+                    reclaim_fleet_bundle_sha256=(
+                        fill_reclaim_fleet_bundle_sha256),
+                    reclaim_policy_revision=fill_reclaim_policy_revision,
+                    reclaim_provider_inventory_sha256=(
+                        fill_reclaim_provider_inventory_sha256),
+                    worker_projection_sha256=(fill_worker_projection_sha256)))
         recovery_intent: (system_recovery_state.SystemRecoveryLaunchIntent |
                           None) = None
         recovery_launch_context: dict[str, Any] | None = None
@@ -6479,6 +6665,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                    if zero_cost_only else None)
         info.reserved_fill_kubernetes_context = (fill_launch_context
                                                  if zero_cost_only else None)
+        info.reserved_fill_allocation_generation = (fill_allocation_generation
+                                                    if zero_cost_only else None)
+        info.reserved_fill_allocation_input_sha256 = (
+            fill_allocation_input_sha256 if zero_cost_only else None)
+        info.reserved_fill_allocation_claim_generation = (
+            fill_allocation_claim_generation if zero_cost_only else None)
+        info.reserved_fill_reconciliation_gate_generation = (
+            fill_gate_generation if zero_cost_only else None)
+        info.reserved_fill_reclaim_fleet_bundle_sha256 = (
+            fill_reclaim_fleet_bundle_sha256 if zero_cost_only else None)
+        info.reserved_fill_reclaim_policy_revision = (
+            fill_reclaim_policy_revision if zero_cost_only else None)
+        info.reserved_fill_reclaim_provider_inventory_sha256 = (
+            fill_reclaim_provider_inventory_sha256 if zero_cost_only else None)
+        info.reserved_fill_worker_projection_sha256 = (
+            fill_worker_projection_sha256 if zero_cost_only else None)
+        info.reserved_fill_observation_generation = (
+            fill_observation_generation if zero_cost_only else None)
+        info.reserved_fill_observation_sequence = (fill_observation_sequence
+                                                   if zero_cost_only else None)
+        info.reserved_fill_intent_idempotency_key = (
+            fill_intent_idempotency_key if zero_cost_only else None)
         is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
         if not is_zero_cost and self._spot_placer is not None:
             is_zero_cost = self._spot_placer.is_zero_cost_location(location)
@@ -6626,14 +6834,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 with phase_context as effective_admission:
                     with provider_phase.join_provider_phase(
                             effective_admission):
-                        physical_context = (
-                            kubernetes_adaptor.physical_cluster_uid_fence(
-                                fill_launch_context,
-                                fill_physical_cluster_uid,
-                                wait_for_initializer=False)
-                            if try_provider_phase_admission else
-                            kubernetes_adaptor.physical_cluster_uid_fence(
-                                fill_launch_context, fill_physical_cluster_uid))
+                        if try_provider_phase_admission:
+                            physical_context = (
+                                kubernetes_adaptor.physical_cluster_uid_fence(
+                                    fill_launch_context,
+                                    fill_physical_cluster_uid,
+                                    wait_for_initializer=False))
+                        elif require_preinitialized_physical_fence:
+                            physical_context = (
+                                kubernetes_adaptor.physical_cluster_uid_fence(
+                                    fill_launch_context,
+                                    fill_physical_cluster_uid,
+                                    require_existing=True))
+                        else:
+                            physical_context = (
+                                kubernetes_adaptor.physical_cluster_uid_fence(
+                                    fill_launch_context,
+                                    fill_physical_cluster_uid))
                         with physical_context:
                             # Freeze the complete request tuple before its
                             # durable reservation. Construction is side-effect
@@ -6645,11 +6862,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                             except BaseException:
                                 self._release_unstarted_location_retry(location)
                                 raise
+                            needs_logical_state_guard = (
+                                logical_reconcile_fence is not None or
+                                require_preinitialized_physical_fence)
                             logical_state_guard = (self._logical_state_lock
-                                                   if logical_reconcile_fence
-                                                   is not None else
+                                                   if needs_logical_state_guard
+                                                   else
                                                    contextlib.nullcontext())
                             with logical_state_guard:
+                                pending_version = self._pending_version
+                                if (require_preinitialized_physical_fence and
+                                        pending_version is not None and
+                                        pending_version > launch_version):
+                                    self._release_unstarted_location_retry(
+                                        location)
+                                    logger.info(
+                                        'Reserved-fill launch was superseded '
+                                        'by a pending service version at its '
+                                        'final row-persistence fence.')
+                                    return None
                                 if (logical_reconcile_fence is not None and
                                         not self._logical_reconcile_fence_holds(
                                             logical_reconcile_fence,
@@ -6675,6 +6906,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             fill_service_generation),
                                         expected_physical_cluster_uid=(
                                             fill_physical_cluster_uid),
+                                        expected_ordinary_zero_cost_admission_sequence
+                                        =(fill_ordinary_admission_sequence),
                                         **self._db_fence_kwargs()):
                                     self._release_unstarted_location_retry(
                                         location)
@@ -6698,6 +6931,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # A batch holds the manager lock. Continuing to churn later
                 # items after an opposite root is admitted would retain the
                 # lock that root needs and recreate phase-to-manager HOL.
+                if require_preinitialized_physical_fence:
+                    raise
                 assert try_provider_phase_admission
                 raise exceptions.ProviderPhaseBusyError(
                     'Protocol-v2 batch item deferred at its persist seam.'
@@ -6707,6 +6942,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._log_fill_skip(
                     'selected protocol-v2 pool physical identity could not be '
                     f'proved: {common_utils.format_exception(error)}')
+                if require_preinitialized_physical_fence:
+                    raise
                 return None
 
         logical_state_guard = (self._logical_state_lock
@@ -6741,6 +6978,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             fill_service_generation),
                         expected_physical_cluster_uid=(
                             fill_physical_cluster_uid),
+                        expected_ordinary_zero_cost_admission_sequence=(
+                            fill_ordinary_admission_sequence),
                         **self._db_fence_kwargs()):
                     # No row was written and the launch thread was never
                     # registered/started: same leak-nothing contract as the
@@ -7240,6 +7479,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         paid_launch_allowed: bool = True,
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
+        require_preinitialized_physical_fence: bool = False,
     ) -> _ReplicaLaunchResult | None:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
@@ -7272,6 +7512,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if provider_phase_admission is not None:
                 direct_launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
+                if require_preinitialized_physical_fence:
+                    direct_launch_kwargs[
+                        'require_preinitialized_physical_fence'] = True
             elif _is_protocol_v2_fill_override(resources_override):
                 direct_launch_kwargs['try_provider_phase_admission'] = True
             launch_result = self._launch_replica(self._next_replica_id,
@@ -7302,6 +7545,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if provider_phase_admission is not None:
                 launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
+                if require_preinitialized_physical_fence:
+                    launch_kwargs[
+                        'require_preinitialized_physical_fence'] = True
             elif _is_protocol_v2_fill_override(resources_override):
                 launch_kwargs['try_provider_phase_admission'] = True
             launch_result = self._launch_replica(self._next_replica_id,
@@ -7312,31 +7558,703 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._next_replica_id += 1
         return launch_result
 
+    @staticmethod
+    def _reserved_fill_commit_result(
+        plan: reserved_fill_planner.FillPlan,
+        accepted: list[reserved_fill_planner.AcceptedFillIntent],
+        deferred: list[reserved_fill_planner.DeferredFillIntent],
+        *,
+        authority_current: bool,
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Build and self-check one complete, potentially sparse receipt."""
+        receipt = reserved_fill_planner.FillCommitResult(
+            accepted=tuple(accepted),
+            deferred=tuple(deferred),
+            authority_current=authority_current)
+        receipt.validate_for_plan(plan)
+        return receipt
+
+    @staticmethod
+    def _reserved_fill_deferred_tail(
+        plan: reserved_fill_planner.FillPlan,
+        deferred_from: int,
+        reason: reserved_fill_planner.DeferredFillReason,
+        detail: str,
+    ) -> list[reserved_fill_planner.DeferredFillIntent]:
+        """Build one typed tail for a batch-global admission failure."""
+        return [
+            reserved_fill_planner.DeferredFillIntent(intent, reason, detail)
+            for intent in plan.intents[deferred_from:]
+        ]
+
+    def _reserved_fill_manager_authority_failure(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> tuple[reserved_fill_planner.DeferredFillReason, str] | None:
+        """Check the manager-local and durable owner fence without providers."""
+        if not plan.intents:
+            return None
+        first = plan.intents[0]
+        expected_capacity_unit = (
+            reserved_fill_planner.FillCapacityUnit.LOGICAL
+            if self._uses_logical_replicas else
+            reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+        if plan.capacity_unit is not expected_capacity_unit:
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'the manager replica unit no longer matches the plan')
+        if self._is_pool:
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'worker pools cannot accept service reserved-fill plans')
+        if self._reserved_fill_has_newer_pending_version(plan):
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'a newer service version is pending application')
+        if (self._update_recovery_required or
+                first.service_version != self.latest_version):
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'the manager service version no longer matches the plan')
+        service_hash = self._service_hash
+        controller_owner = self._controller_owner
+        if (not isinstance(service_hash, str) or not service_hash or
+                self._resource_scope != service_hash or
+                first.service_incarnation != service_hash or
+                controller_owner is None or not self._enforce_launch_fence or
+                self._ownership_lost.is_set()):
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the manager does not hold the plan service incarnation')
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admission could not read controller '
+                           'ownership: '
+                           f'{common_utils.format_exception(error)}')
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'controller ownership could not be proven')
+        if (owner is None or owner.get('hash') != service_hash or
+            (owner.get('controller_pid'), owner.get('controller_ip'))
+                != controller_owner or owner.get('status') in
+                serve_state.ServiceStatus.replica_launch_blocking_statuses()):
+            return (
+                reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                'the durable controller owner no longer matches the manager')
+        try:
+            owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
+                service_hash, owner.get('controller_pid'),
+                owner.get('controller_ip'), owner.get('controller_port'))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admission found an invalid durable '
+                           'controller owner: '
+                           f'{common_utils.format_exception(error)}')
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the durable controller owner is incomplete')
+        if first.controller_owner != owner_fingerprint:
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the plan controller owner is no longer current')
+
+        uids_by_context: dict[str, set[str]] = {}
+        for intent in plan.intents:
+            context_name = intent.allowed_locations[0].region
+            uids_by_context.setdefault(context_name,
+                                       set()).add(intent.physical_cluster_uid)
+        if any(len(uids) != 1 for uids in uids_by_context.values()):
+            return (reserved_fill_planner.DeferredFillReason.
+                    PHYSICAL_CLUSTER_UID_MISMATCH,
+                    'one Kubernetes context carries conflicting physical UIDs')
+        return None
+
+    def _reserved_fill_has_newer_pending_version(
+            self, plan: reserved_fill_planner.FillPlan) -> bool:
+        """Return the lock-free version signal checked at each persist seam."""
+        if not plan.intents:
+            return False
+        pending_version = self._pending_version
+        return (pending_version is not None and
+                pending_version > plan.intents[0].service_version)
+
+    def _reserved_fill_fleet_headroom_locked(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> tuple[int, list['ReplicaInfo'], set[int]]:
+        """Read the current fleet once and return exact remaining capacity."""
+        spec = self._version_specs.get(self.latest_version)
+        if spec is None:
+            spec = serve_state.get_spec(self._service_name, self.latest_version)
+        if spec is None:
+            raise ValueError('the current service specification is missing')
+        maximum = (spec.max_replicas
+                   if spec.max_replicas is not None else spec.min_replicas)
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError('the current service maximum is malformed')
+        infos = serve_state.get_replica_infos(self._service_name)
+        used_replica_ids = {info.replica_id for info in infos}
+        current_capacity = 0
+        for info in infos:
+            if not replica_may_consume_physical_capacity(info):
+                continue
+            if plan.capacity_unit is (
+                    reserved_fill_planner.FillCapacityUnit.PHYSICAL):
+                current_capacity += 1
+                continue
+            planned_capacity = info.planned_capacity
+            if (type(planned_capacity) is not int or planned_capacity < 1):
+                raise ValueError(
+                    'a nonterminal logical replica has malformed capacity')
+            current_capacity += planned_capacity
+        return max(0, maximum - current_capacity), infos, used_replica_ids
+
+    @staticmethod
+    def _reserved_fill_override(
+            intent: reserved_fill_planner.FillIntent) -> dict[str, Any]:
+        """Translate one typed intent into the sole transitional v2 seam."""
+        return {
+            serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True,
+            serve_constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY:
+                intent.pool_epoch,
+            serve_constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY:
+                intent.pool_key,
+            serve_constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY:
+                intent.protocol_version,
+            serve_constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY:
+                intent.service_generation,
+            serve_constants.RESERVED_FILL_SERVICE_VERSION_OVERRIDE_KEY:
+                intent.service_version,
+            serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY:
+                intent.physical_cluster_uid,
+            serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY: list(
+                intent.allowed_location_keys()),
+            serve_constants.RESERVED_FILL_ALLOCATION_GENERATION_OVERRIDE_KEY:
+                intent.allocation_generation,
+            serve_constants.RESERVED_FILL_ALLOCATION_INPUT_SHA256_OVERRIDE_KEY:
+                intent.allocation_input_sha256,
+            serve_constants.RESERVED_FILL_ALLOCATION_CLAIM_GENERATION_OVERRIDE_KEY:
+                intent.allocation_claim_generation,
+            serve_constants.RESERVED_FILL_GATE_GENERATION_OVERRIDE_KEY:
+                intent.reconciliation_gate_generation,
+            serve_constants.RESERVED_FILL_RECLAIM_FLEET_BUNDLE_SHA256_OVERRIDE_KEY:
+                intent.reclaim_fleet_bundle_sha256,
+            serve_constants.RESERVED_FILL_RECLAIM_POLICY_REVISION_OVERRIDE_KEY:
+                intent.reclaim_policy_revision,
+            serve_constants.RESERVED_FILL_RECLAIM_PROVIDER_INVENTORY_SHA256_OVERRIDE_KEY:
+                intent.reclaim_provider_inventory_sha256,
+            serve_constants.RESERVED_FILL_WORKER_PROJECTION_SHA256_OVERRIDE_KEY:
+                intent.worker_projection_sha256,
+            serve_constants.RESERVED_FILL_OBSERVATION_GENERATION_OVERRIDE_KEY:
+                intent.observation_generation,
+            serve_constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY:
+                intent.observation_sequence,
+            serve_constants.RESERVED_FILL_ORDINARY_ADMISSION_SEQUENCE_OVERRIDE_KEY:
+                intent.ordinary_zero_cost_admission_sequence,
+            serve_constants.RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY:
+                intent.idempotency_key,
+            'accelerators': {
+                intent.accelerator: intent.accelerator_count
+            },
+        }
+
+    @staticmethod
+    def _start_reserved_fill_physical_preflights(
+        intents: tuple[reserved_fill_planner.FillIntent, ...],
+        admission: provider_phase.ProviderPhaseAdmission,
+        workspace: str,
+    ) -> _ReservedFillPhysicalPreflightBatch:
+        """Initialize every distinct pool capture under one batch deadline."""
+        preflights: dict[tuple[str, str], _ReservedFillPhysicalPreflight] = {}
+        for intent in intents:
+            target_key = (intent.allowed_locations[0].region,
+                          intent.physical_cluster_uid)
+            preflights.setdefault(target_key,
+                                  _ReservedFillPhysicalPreflight(*target_key))
+        deadline = (time.monotonic() +
+                    _RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS)
+
+        def _hold_preflight(preflight: _ReservedFillPhysicalPreflight) -> None:
+            physical_context: contextlib.AbstractContextManager[None] | None = (
+                None)
+            physical_context_entered = False
+            try:
+                with kubernetes_adaptor.api_call_deadline(
+                        deadline, preflight.cancellation):
+                    with skypilot_config.local_active_workspace_ctx(
+                            workspace), provider_phase.join_provider_phase(
+                                admission,
+                                timeout_seconds=max(0.0, deadline -
+                                                    time.monotonic())):
+                        physical_context = (
+                            kubernetes_adaptor.physical_cluster_uid_fence(
+                                preflight.kubernetes_context,
+                                preflight.physical_cluster_uid,
+                                wait_for_initializer=False))
+                        physical_context.__enter__()
+                        physical_context_entered = True
+                # The absolute deadline bounds provider initialization, not
+                # ownership of a verified capture. Keep that capture alive
+                # until the manager has completed every in-lock join.
+                preflight.ready.set()
+                preflight.release.wait()
+            # This closure runs only in a dedicated synchronous preflight
+            # thread, where every provider/context failure is result data.
+            except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
+                if preflight.error is None:
+                    preflight.error = error
+                preflight.ready.set()
+            finally:
+                if physical_context_entered:
+                    assert physical_context is not None
+                    try:
+                        physical_context.__exit__(None, None, None)
+                    except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
+                        if preflight.error is None:
+                            preflight.error = error
+                        preflight.ready.set()
+
+        threads: list[threading.Thread] = []
+        for index, preflight in enumerate(preflights.values()):
+            worker = threading.Thread(
+                target=_hold_preflight,
+                args=(preflight,),
+                name=f'skyserve-fill-physical-preflight-{index}',
+                daemon=True)
+            worker.start()
+            threads.append(worker)
+        for preflight in preflights.values():
+            remaining = max(0.0, deadline - time.monotonic())
+            if not preflight.ready.wait(remaining):
+                preflight.cancellation.set()
+                preflight.release.set()
+                if preflight.error is None:
+                    preflight.error = TimeoutError(
+                        'physical-cluster preflight exceeded its deadline')
+        return _ReservedFillPhysicalPreflightBatch(preflights=preflights,
+                                                   threads=tuple(threads),
+                                                   deadline_monotonic=deadline)
+
+    @staticmethod
+    def _release_reserved_fill_physical_preflights(
+        batch: _ReservedFillPhysicalPreflightBatch,) -> None:
+        """Release every capture holder without waiting on a late provider."""
+        for preflight in batch.preflights.values():
+            preflight.cancellation.set()
+            preflight.release.set()
+        deadline = (time.monotonic() +
+                    _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS)
+        for worker in batch.threads:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    @staticmethod
+    def _reserved_fill_preflight_failure(
+        error: BaseException,
+    ) -> tuple[reserved_fill_planner.DeferredFillReason, str, bool]:
+        """Map physical/provider preflight failures onto the closed receipt."""
+        if isinstance(
+                error,
+            (exceptions.ProviderPhaseBusyError,
+             exceptions.ProviderPhaseTimeoutError,
+             exceptions.KubernetesPhysicalClusterFenceBusyError, TimeoutError)):
+            return (reserved_fill_planner.DeferredFillReason.
+                    PROVIDER_QUEUE_BACKPRESSURE,
+                    'provider or physical-cluster admission is busy', True)
+        if isinstance(error, exceptions.KubernetesPhysicalClusterIdentityError):
+            return (reserved_fill_planner.DeferredFillReason.
+                    PHYSICAL_CLUSTER_UID_MISMATCH,
+                    'the physical Kubernetes cluster UID could not be proved',
+                    False)
+        logger.warning('Reserved-fill physical preflight failed closed: '
+                       f'{type(error).__name__}: {error}')
+        return (reserved_fill_planner.DeferredFillReason.
+                PHYSICAL_CLUSTER_UID_MISMATCH,
+                'the physical Kubernetes cluster identity preflight failed',
+                False)
+
+    def accept_reserved_fill(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Persist a typed v2 fill plan and return an exact row receipt.
+
+        Physical identity captures for independent Kubernetes contexts start in
+        parallel before the manager mutex is acquired. The existing v2
+        transaction remains the only row-admission path; its non-None return is
+        therefore the receipt boundary. Pool-local failures produce a sparse
+        receipt so one unhealthy context cannot starve independent capacity.
+        """
+        if not isinstance(plan, reserved_fill_planner.FillPlan):
+            raise ValueError('Reserved-fill admission requires a FillPlan.')
+        # Frozen dataclasses prevent ordinary mutation. Re-run their validators
+        # at this trust boundary as defense against object.__setattr__ callers.
+        for intent in plan.intents:
+            intent.__post_init__()
+        plan.__post_init__()
+        if not plan.intents:
+            return reserved_fill_planner.FillCommitResult(
+                accepted=(), deferred=(), authority_current=True)
+
+        with self.lock:
+            authority_failure = self._reserved_fill_manager_authority_failure(
+                plan)
+            if authority_failure is not None:
+                reason, detail = authority_failure
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(plan, 0, reason, detail),
+                    authority_current=False)
+            try:
+                headroom, _, _ = self._reserved_fill_fleet_headroom_locked(plan)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill admission could not establish '
+                               'service headroom: '
+                               f'{common_utils.format_exception(error)}')
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(
+                        plan, 0, reserved_fill_planner.DeferredFillReason.
+                        SUPERSEDED_POLICY,
+                        'current service headroom could not be established'),
+                    authority_current=False)
+            if headroom == 0:
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(
+                        plan, 0, reserved_fill_planner.DeferredFillReason.
+                        MAX_REPLICAS_EXHAUSTED,
+                        'the service-global replica ceiling has no remaining '
+                        'headroom'),
+                    authority_current=True)
+            if self._spot_placer is not None:
+                self._spot_placer.refresh_workspace_policy()
+
+        # A failed early context must not consume speculative headroom or keep
+        # a later healthy context from being initialized. The locked commit
+        # loop spends the exact ceiling only for durably accepted rows.
+        accepted: list[reserved_fill_planner.AcceptedFillIntent] = []
+        deferred: list[reserved_fill_planner.DeferredFillIntent] = []
+        try:
+            phase_context = provider_phase.try_provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED,
+                child_drain_timeout_seconds=(
+                    _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS))
+            with phase_context as phase_admission:
+                preflight_batch = (
+                    self._start_reserved_fill_physical_preflights(
+                        plan.intents, phase_admission, self._workspace))
+                try:
+                    with self.lock:
+                        try:
+                            demand_lock = locks.get_lock(
+                                serve_constants.
+                                DEMAND_CAPACITY_RESERVATION_LOCK_ID)
+                            with demand_lock.acquire(blocking=False):
+                                return self._accept_reserved_fill_locked(
+                                    plan, accepted, deferred, phase_admission,
+                                    preflight_batch)
+                        except locks.LockTimeout:
+                            return self._reserved_fill_commit_result(
+                                plan,
+                                accepted,
+                                self._reserved_fill_deferred_tail(
+                                    plan, 0,
+                                    reserved_fill_planner.DeferredFillReason.
+                                    ADMISSION_SEQUENCE_CHANGED,
+                                    'ordinary zero-cost demand is reserving '
+                                    'shared capacity'),
+                                authority_current=False)
+                finally:
+                    self._release_reserved_fill_physical_preflights(
+                        preflight_batch)
+        except (exceptions.ProviderPhaseBusyError,
+                exceptions.ProviderPhaseTimeoutError):
+            accounted_keys = {
+                item.intent_idempotency_key for item in accepted
+            }.union(item.intent.idempotency_key for item in deferred)
+            deferred.extend(
+                reserved_fill_planner.DeferredFillIntent(
+                    intent, reserved_fill_planner.DeferredFillReason.
+                    PROVIDER_QUEUE_BACKPRESSURE,
+                    'the provider admission queue is busy')
+                for intent in plan.intents
+                if intent.idempotency_key not in accounted_keys)
+            stale_authority_reasons = {
+                reserved_fill_planner.DeferredFillReason.STALE_OBSERVATION,
+                reserved_fill_planner.DeferredFillReason.
+                ADMISSION_SEQUENCE_CHANGED,
+                reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH,
+                reserved_fill_planner.DeferredFillReason.
+                PHYSICAL_CLUSTER_UID_MISMATCH,
+            }
+            return self._reserved_fill_commit_result(
+                plan,
+                accepted,
+                deferred,
+                authority_current=not any(item.reason in stale_authority_reasons
+                                          for item in deferred))
+
+    def _accept_reserved_fill_locked(
+        self,
+        plan: reserved_fill_planner.FillPlan,
+        accepted: list[reserved_fill_planner.AcceptedFillIntent],
+        deferred: list[reserved_fill_planner.DeferredFillIntent],
+        phase_admission: provider_phase.ProviderPhaseAdmission,
+        preflight_batch: _ReservedFillPhysicalPreflightBatch,
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Commit independent healthy intents under the exact global fences."""
+        authority_failure = self._reserved_fill_manager_authority_failure(plan)
+        if authority_failure is not None:
+            reason, detail = authority_failure
+            deferred.extend(
+                self._reserved_fill_deferred_tail(plan, 0, reason, detail))
+            return self._reserved_fill_commit_result(plan,
+                                                     accepted,
+                                                     deferred,
+                                                     authority_current=False)
+        try:
+            (remaining_headroom, existing_replica_infos,
+             used_replica_ids) = self._reserved_fill_fleet_headroom_locked(plan)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admission lost its service headroom '
+                           'fence: '
+                           f'{common_utils.format_exception(error)}')
+            deferred.extend(
+                self._reserved_fill_deferred_tail(
+                    plan, 0,
+                    reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'current service headroom could not be revalidated'))
+            return self._reserved_fill_commit_result(plan,
+                                                     accepted,
+                                                     deferred,
+                                                     authority_current=False)
+
+        current_epochs: dict[str, int | None] = {}
+        epoch_read_errors: dict[str, Exception] = {}
+        for candidate in plan.intents:
+            if candidate.pool_key not in current_epochs:
+                try:
+                    current_epochs[candidate.pool_key] = (
+                        reserved_capacity_broker.current_epoch(
+                            candidate.pool_key))
+                except Exception as error:  # pylint: disable=broad-except
+                    current_epochs[candidate.pool_key] = None
+                    epoch_read_errors[candidate.pool_key] = error
+
+        authority_current = True
+        for index, intent in enumerate(plan.intents):
+            authority_failure = self._reserved_fill_manager_authority_failure(
+                plan)
+            if authority_failure is not None:
+                reason, detail = authority_failure
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(plan, index, reason,
+                                                      detail))
+                return self._reserved_fill_commit_result(
+                    plan, accepted, deferred, authority_current=False)
+            if time.time() >= intent.valid_until:
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent, reserved_fill_planner.DeferredFillReason.
+                        STALE_OBSERVATION,
+                        'the carried capacity observation expired before row '
+                        'admission'))
+                authority_current = False
+                continue
+            if intent.pool_key in epoch_read_errors:
+                logger.warning(
+                    'Reserved-fill pool epoch could not be read: %s',
+                    common_utils.format_exception(
+                        epoch_read_errors[intent.pool_key]))
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent,
+                        reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH,
+                        'the pool epoch could not be revalidated before row '
+                        'admission'))
+                authority_current = False
+                continue
+            if current_epochs[intent.pool_key] != intent.pool_epoch:
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent,
+                        reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH,
+                        'the pool epoch changed before row admission'))
+                authority_current = False
+                continue
+            intent_cost = plan.capacity_unit.intent_cost(
+                intent.accelerator_count)
+            if intent_cost > remaining_headroom:
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        MAX_REPLICAS_EXHAUSTED,
+                        'the service-global replica ceiling was consumed '
+                        'before row admission'))
+                return self._reserved_fill_commit_result(
+                    plan,
+                    accepted,
+                    deferred,
+                    authority_current=authority_current)
+            target_key = (intent.allowed_locations[0].region,
+                          intent.physical_cluster_uid)
+            preflight_error = preflight_batch.preflights[target_key].error
+            if preflight_error is not None:
+                reason, detail, preflight_authority_current = (
+                    self._reserved_fill_preflight_failure(preflight_error))
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent, reason, detail))
+                authority_current = (authority_current and
+                                     preflight_authority_current)
+                continue
+            # Version notification does not take the manager lock, so check
+            # its lock-free signal again immediately before every durable
+            # persistence attempt. The launch seam then rechecks it under the
+            # notification lock around the transaction.
+            if self._reserved_fill_has_newer_pending_version(plan):
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        SUPERSEDED_POLICY,
+                        'a newer service version is pending application'))
+                return self._reserved_fill_commit_result(
+                    plan, accepted, deferred, authority_current=False)
+            try:
+                launch_result = self._scale_up_one_locked(
+                    self._reserved_fill_override(intent),
+                    used_replica_ids,
+                    existing_replica_infos,
+                    provider_phase_admission=phase_admission,
+                    require_preinitialized_physical_fence=True)
+            except (exceptions.ProviderPhaseBusyError,
+                    exceptions.ProviderPhaseTimeoutError):
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        PROVIDER_QUEUE_BACKPRESSURE,
+                        'provider admission became busy before row '
+                        'persistence'))
+                return self._reserved_fill_commit_result(
+                    plan,
+                    accepted,
+                    deferred,
+                    authority_current=authority_current)
+            except (exceptions.KubernetesPhysicalClusterFenceBusyError,
+                    exceptions.KubernetesPhysicalClusterIdentityError) as error:
+                reason, detail, target_authority_current = (
+                    self._reserved_fill_preflight_failure(error))
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent, reason, detail))
+                authority_current = (authority_current and
+                                     target_authority_current)
+                continue
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill row admission failed closed: '
+                               f'{common_utils.format_exception(error)}')
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        PROVIDER_QUEUE_BACKPRESSURE,
+                        'the durable launch seam was temporarily unavailable'))
+                return self._reserved_fill_commit_result(
+                    plan,
+                    accepted,
+                    deferred,
+                    authority_current=authority_current)
+            if launch_result is None:
+                authority_failure = (
+                    self._reserved_fill_manager_authority_failure(plan))
+                if authority_failure is not None:
+                    reason, detail = authority_failure
+                    deferred.extend(
+                        self._reserved_fill_deferred_tail(
+                            plan, index, reason, detail))
+                    return self._reserved_fill_commit_result(
+                        plan, accepted, deferred, authority_current=False)
+                elif time.time() >= intent.valid_until:
+                    reason = (reserved_fill_planner.DeferredFillReason.
+                              STALE_OBSERVATION)
+                    detail = ('the carried capacity observation expired at '
+                              'row persistence')
+                    deferred.append(
+                        reserved_fill_planner.DeferredFillIntent(
+                            intent, reason, detail))
+                    authority_current = False
+                    continue
+                else:
+                    try:
+                        current_epoch = reserved_capacity_broker.current_epoch(
+                            intent.pool_key)
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Reserved-fill pool epoch could not be read after '
+                            'row rejection: %s',
+                            common_utils.format_exception(error))
+                        deferred.append(
+                            reserved_fill_planner.DeferredFillIntent(
+                                intent, reserved_fill_planner.
+                                DeferredFillReason.CHANGED_EPOCH,
+                                'the pool epoch could not be revalidated at '
+                                'row persistence'))
+                        authority_current = False
+                        continue
+                    if current_epoch != intent.pool_epoch:
+                        deferred.append(
+                            reserved_fill_planner.DeferredFillIntent(
+                                intent, reserved_fill_planner.
+                                DeferredFillReason.CHANGED_EPOCH,
+                                'the pool epoch changed at row persistence'))
+                        authority_current = False
+                        continue
+                    try:
+                        ordinary_sequence = (
+                            pool_capacity_observation.
+                            PoolCapacityObservationRepository(
+                            ).read_ordinary_admission_sequence())
+                    except Exception as error:  # pylint: disable=broad-except
+                        reason = (reserved_fill_planner.DeferredFillReason.
+                                  ADMISSION_SEQUENCE_CHANGED)
+                        detail = ('ordinary zero-cost admission authority '
+                                  'could not be verified after row rejection: '
+                                  f'{common_utils.format_exception(error)}')
+                        deferred.extend(
+                            self._reserved_fill_deferred_tail(
+                                plan, index, reason, detail))
+                        return self._reserved_fill_commit_result(
+                            plan, accepted, deferred, authority_current=False)
+                    else:
+                        if ordinary_sequence != (
+                                intent.ordinary_zero_cost_admission_sequence):
+                            reason = (reserved_fill_planner.DeferredFillReason.
+                                      ADMISSION_SEQUENCE_CHANGED)
+                            detail = ('ordinary zero-cost admission advanced '
+                                      'before the row transaction')
+                            deferred.extend(
+                                self._reserved_fill_deferred_tail(
+                                    plan, index, reason, detail))
+                            return self._reserved_fill_commit_result(
+                                plan,
+                                accepted,
+                                deferred,
+                                authority_current=False)
+                        else:
+                            reason = (reserved_fill_planner.DeferredFillReason.
+                                      PROVIDER_QUEUE_BACKPRESSURE)
+                            detail = ('the v2 durable launch seam did not '
+                                      'accept a replica row')
+                            deferred.append(
+                                reserved_fill_planner.DeferredFillIntent(
+                                    intent, reason, detail))
+                            continue
+            accepted.append(
+                reserved_fill_planner.AcceptedFillIntent(
+                    intent.idempotency_key, launch_result.replica_id))
+            remaining_headroom -= intent_cost
+        return self._reserved_fill_commit_result(
+            plan, accepted, deferred, authority_current=authority_current)
+
     def scale_up(self,
                  resources_override: dict[str, Any] | None = None) -> None:
-        phase_context: contextlib.AbstractContextManager[
-            provider_phase.ProviderPhaseAdmission | None]
         if _is_protocol_v2_fill_override(resources_override):
-            phase_context = provider_phase.provider_phase(
-                provider_phase.ProviderPhaseMode.V2_FENCED)
-        else:
-            phase_context = contextlib.nullcontext(None)
-        # Blocking provider admission must precede the manager mutex. The
-        # selected exact physical capture is lower in this hierarchy and is
-        # acquired only after the v2 location has been chosen.
-        with phase_context as phase_admission:
-            with self.lock:
-                if self._update_recovery_required:
-                    return
-                if self._spot_placer is not None:
-                    self._spot_placer.refresh_workspace_policy()
-                launch_kwargs: dict[str, Any] = {}
-                if phase_admission is not None:
-                    launch_kwargs['provider_phase_admission'] = phase_admission
-                self._scale_up_one_locked(
-                    resources_override,
-                    serve_state.get_replica_ids(self._service_name),
-                    **launch_kwargs)
+            # Typed protocol-v2 fills are admitted only through
+            # ``accept_reserved_fill()``.  Keeping their complete plan and
+            # receipt boundary intact prevents this compatibility method from
+            # bypassing ordinary-demand serialization.
+            raise ValueError('Protocol-v2 fill requires typed plan admission.')
+        self.scale_up_batch([resources_override])
 
     def scale_up_batch(
         self,

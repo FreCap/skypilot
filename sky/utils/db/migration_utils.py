@@ -48,11 +48,11 @@ GLOBAL_USER_STATE_JOB_MINIMUM_REVISION = '023'
 GLOBAL_USER_STATE_LOCK_PATH = f'~/.sky/locks/.{GLOBAL_USER_STATE_DB_NAME}.lock'
 
 SPOT_JOBS_DB_NAME = 'spot_jobs_db'
-SPOT_JOBS_VERSION = '027'  # ordered managed-job scheduler lookup
+SPOT_JOBS_VERSION = '028'  # runtime-owned managed-job controller slots
 SPOT_JOBS_LOCK_PATH = f'~/.sky/locks/.{SPOT_JOBS_DB_NAME}.lock'
 
 SERVE_DB_NAME = 'serve_db'
-SERVE_VERSION = '043'  # immutable Serve controller/worker projections
+SERVE_VERSION = '046'  # immutable reserved-fill worker projection authority
 SERVE_NON_POSTGRES_VERSION = '037'  # retained local/controller SQLite head
 SERVE_LOCK_PATH = f'~/.sky/locks/.{SERVE_DB_NAME}.lock'
 SERVE_MIGRATION_CEILING_ENV_VAR = (
@@ -124,7 +124,7 @@ RECIPES_VERSION = '001'
 RECIPES_LOCK_PATH = f'~/.sky/locks/.{RECIPES_DB_NAME}.lock'
 
 API_REQUESTS_DB_NAME = 'api_requests_db'
-API_REQUESTS_VERSION = '009'
+API_REQUESTS_VERSION = '010'
 API_REQUESTS_LOCK_PATH = f'~/.sky/locks/.{API_REQUESTS_DB_NAME}.lock'
 
 LIFECYCLE_ACTIONS_DB_NAME = 'lifecycle_actions_db'

@@ -29,13 +29,11 @@ import typing
 from typing import Any
 
 from sky import admin_policy
-from sky import serve
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.container_images import models as container_image_models
-from sky.serve import constants as serve_constants
 from sky.server import common
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -47,12 +45,15 @@ from sky.utils import common_utils
 from sky.utils import config_utils
 from sky.utils import infra_utils
 from sky.utils import registry
+from sky.utils import serve_types
 from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import pydantic
 else:
     pydantic = adaptors_common.LazyImport('pydantic')
+
+serve_service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -178,7 +179,7 @@ _SERVER_OWNED_ENV_VARS = frozenset({
     'SKYPILOT_STATE_DB_MIGRATION_MODE',
     constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR,
     constants.SKY_API_SERVER_URL_ENV_VAR,
-    serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+    serve_types.EXTERNAL_LB_ENABLED_ENV_VAR,
 })
 
 
@@ -660,7 +661,7 @@ def _serve_body_uses_placement_projection(body: 'RequestBody') -> bool:
                 service_config = {'pool': pool_config}
         if not isinstance(service_config, dict):
             return False
-        return serve.SkyServiceSpec.from_yaml_config(
+        return serve_service_spec.SkyServiceSpec.from_yaml_config(
             service_config).placement_contract.enabled
     except (TypeError, ValueError):
         # The ordinary task validator owns the eventual user-facing error.
@@ -1285,7 +1286,7 @@ class ServeUpdateBody(RequestBody):
 
     task: str
     service_name: str
-    mode: serve.UpdateMode
+    mode: serve_types.UpdateMode
 
     _validate_container_images = pydantic.field_validator('task')(
         _validate_serialized_task_container_images)
@@ -1340,7 +1341,7 @@ class ServeDownBody(RequestBody):
 class ServeLogsBody(RequestBody):
     """The request body for the serve logs endpoint."""
     service_name: str
-    target: str | serve.ServiceComponent
+    target: str | serve_types.ServiceComponent
     replica_id: int | None = None
     follow: bool = True
     tail: int | None = None
@@ -1350,8 +1351,8 @@ class ServeDownloadLogsBody(RequestBody):
     """The request body for the serve download logs endpoint."""
     service_name: str
     local_dir: str
-    targets: str | serve.ServiceComponent | list[str |
-                                                 serve.ServiceComponent] | None
+    targets: str | serve_types.ServiceComponent | list[str | serve_types.
+                                                       ServiceComponent] | None
     replica_ids: list[int] | None = None
     tail: int | None = None
 
@@ -1480,7 +1481,7 @@ class JobsPoolApplyBody(RequestBody):
     task: str | None = None
     workers: int | None = None
     pool_name: str
-    mode: serve.UpdateMode
+    mode: serve_types.UpdateMode
 
     _validate_container_images = pydantic.field_validator('task')(
         _validate_serialized_task_container_images)
@@ -1517,7 +1518,7 @@ class JobsPoolStatusBody(RequestBody):
 class JobsPoolLogsBody(RequestBody):
     """The request body for the jobs pool logs endpoint."""
     pool_name: str
-    target: str | serve.ServiceComponent
+    target: str | serve_types.ServiceComponent
     worker_id: int | None = None
     follow: bool = True
     tail: int | None = None
@@ -1527,8 +1528,8 @@ class JobsPoolDownloadLogsBody(RequestBody):
     """The request body for the jobs pool download logs endpoint."""
     pool_name: str
     local_dir: str
-    targets: str | serve.ServiceComponent | list[str |
-                                                 serve.ServiceComponent] | None
+    targets: str | serve_types.ServiceComponent | list[str | serve_types.
+                                                       ServiceComponent] | None
     worker_ids: list[int] | None = None
     tail: int | None = None
 

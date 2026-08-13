@@ -45,7 +45,8 @@ def test_post_provision_setup_reports_removed_cluster(monkeypatch):
             '/tmp/cluster.yaml',
             provision_record,
             custom_resource=None,
-            existing_cluster_hash='stale-hash')
+            existing_cluster_hash='stale-hash',
+            provider_effect_guard_factory=None)
 
 
 def test_provisioner_facade_owns_ssh_wait_callables():

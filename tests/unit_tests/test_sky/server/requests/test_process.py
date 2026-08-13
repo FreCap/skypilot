@@ -1,8 +1,11 @@
-"""Unit tests for sky/server/requests/process.py."""
-from concurrent.futures import Future
-import concurrent.futures.process
-import multiprocessing
+"""Unit tests for the one-shot request invocation boundary."""
+# pylint: disable=protected-access
+import concurrent.futures
+import dataclasses
 import os
+import pathlib
+import signal
+import subprocess
 import threading
 import time
 import unittest.mock
@@ -10,549 +13,776 @@ import unittest.mock
 import pytest
 
 from sky import exceptions
+from sky.server.requests import process
 from sky.server.requests.process import BurstableExecutor
 from sky.server.requests.process import DisposableExecutor
-from sky.server.requests.process import PoolExecutor
+from sky.utils import controller_capability
 
 
-def dummy_task(sleep_time=0.1):
-    """A dummy task that sleeps for a given time."""
+def _wait_until(predicate, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _identity_exists(identity):
+    return process._identity_matches(identity)
+
+
+def _wait_for_direct_child(parent, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for pid in process._direct_child_pids(parent.pid):
+            try:
+                return process.ProcessIdentity(
+                    pid, process._read_process_start_time_ticks(pid))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        time.sleep(0.02)
+    raise TimeoutError(f'PID {parent.pid} did not publish a direct child')
+
+
+def dummy_task(sleep_time=0.01):
     time.sleep(sleep_time)
     return True
 
 
 def failing_task():
-    """A task that raises an exception."""
     raise ValueError('Task failed')
 
 
-def exception_result_task():
-    """Return an exception object as ordinary task data."""
-    return ValueError('task data')
-
-
-def abruptly_exiting_task():
-    """A task that exits its disposable worker before returning a result."""
-    os._exit(7)
+def retryable_task():
+    raise exceptions.ExecutionRetryableError('retry',
+                                             hint='retry',
+                                             retry_wait_seconds=0)
 
 
 def terminating_task():
-    """A task that raises a process-terminating exception."""
     raise SystemExit(3)
 
 
-class UnserializableResult:
-    """A result whose serialization fails synchronously."""
-
-    def __reduce__(self):
-        raise TypeError('cannot serialize disposable result')
+def abruptly_exiting_task():
+    os._exit(7)
 
 
-def unserializable_result_task():
-    """Return a result that cannot cross the process boundary."""
-    return UnserializableResult()
+def hanging_inner_warden(*_args):
+    os.setsid()
+    while True:
+        time.sleep(1)
 
 
-def large_result_task():
-    """Return a result larger than a typical OS pipe buffer."""
-    return b'x' * 1024 * 1024
+def guardian_identity_task():
+    return os.getpid(), os.getppid()
 
 
-def verify_workers_cleanup(executor):
-    """Verify workers to be cleaned up.
-
-    Args:
-        executor: The DisposableExecutor instance
-
-    Returns:
-        bool: True if workers are cleaned up, False if timeout
-    """
-    with executor._lock:
-        if len(executor.workers) == 0:
-            return True
+def capability_owner_proof(expected_capability):
+    return {
+        'pid': os.getpid(),
+        'authorized':
+            (controller_capability.get_process_local() == expected_capability),
+    }
 
 
-def wait_for_futures(futures, timeout=20):
-    """Wait for futures to complete.
-
-    Args:
-        futures: List of futures to wait for
-        timeout: Maximum time to wait in seconds
-
-    Returns:
-        bool: True if all futures completed, False if timeout
-    """
-    start_time = time.time()
-    try:
-        for future in futures:
-            remaining = max(0, timeout - (time.time() - start_time))
-            future.result(timeout=remaining)
-        return True
-    except TimeoutError:
-        return False
+def touch_task(path):
+    pathlib.Path(path).touch()
+    return True
 
 
-def test_pool_executor():
-    """Test PoolExecutor functionality."""
-    executor = PoolExecutor(max_workers=2)
-    futures = []
-    try:
-        # Test submit and has_idle_workers
-        assert executor.has_idle_workers()
-        future = executor.submit(dummy_task, sleep_time=0.1)
-        futures.append(future)
-        assert isinstance(future, Future)
-
-        # Test multiple tasks
-        for _ in range(2):
-            futures.append(executor.submit(dummy_task, sleep_time=0.1))
-        # Should have no idle workers when both are running
-        assert not executor.has_idle_workers()
-
-        # Wait for all futures to complete before shutdown
-        assert wait_for_futures(futures), "Tasks did not complete in time"
-        assert all(f.done() for f in futures), "Not all tasks completed"
-        assert all(f.result() for f in futures), "Some tasks failed"
-
-        # Should have idle workers after completion
-        assert executor.has_idle_workers()
-    finally:
-        # Wait a bit to ensure all tasks are truly done
-        time.sleep(0.1)
-        executor.shutdown()
+def blocking_task(ready_path):
+    pathlib.Path(ready_path).touch()
+    while True:
+        time.sleep(1)
 
 
-def test_pool_executor_releases_capacity_when_submit_fails(monkeypatch):
-    """A rejected task must not consume reusable-pool capacity."""
-    executor = PoolExecutor(max_workers=1)
-    original_submit = concurrent.futures.ProcessPoolExecutor.submit
-
-    def fail_submit(*_args, **_kwargs):
-        raise concurrent.futures.process.BrokenProcessPool('submit failed')
-
-    try:
-        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'submit',
-                            fail_submit)
-        with pytest.raises(concurrent.futures.process.BrokenProcessPool,
-                           match='submit failed'):
-            executor.submit(dummy_task)
-        assert executor.running.get() == 0
-        assert executor.has_idle_workers()
-
-        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'submit',
-                            original_submit)
-        assert executor.submit(dummy_task).result(timeout=20)
-    finally:
-        executor.shutdown()
+def spawn_session_child_then_wait(handler_path, child_path):
+    child = subprocess.Popen(  # pylint: disable=consider-using-with
+        [
+            '/bin/bash', '-c',
+            f'trap "" TERM; echo $$ > {child_path}; while true; do sleep 1; done'
+        ],
+        start_new_session=True)
+    del child
+    pathlib.Path(handler_path).touch()
+    while True:
+        time.sleep(1)
 
 
-def test_pool_executor_shutdown_is_idempotent():
-    """Repeated shutdown calls must remain safe."""
-    executor = PoolExecutor(max_workers=1)
-    executor.shutdown()
-    executor.shutdown()
+def spawn_unregistered_child_and_succeed(child_path):
+    child = subprocess.Popen(  # pylint: disable=consider-using-with
+        [
+            '/bin/bash', '-c',
+            f'trap "" TERM; echo $$ > {child_path}; while true; do sleep 1; done'
+        ],
+        start_new_session=True)
+    deadline = time.monotonic() + 10
+    while not pathlib.Path(child_path).exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError('child did not publish its PID')
+        time.sleep(0.01)
+    del child
+    return 'success'
 
 
-def test_pool_executor_forwards_cancel_futures(monkeypatch):
-    """The custom shutdown must preserve the standard cancellation option."""
-    executor = PoolExecutor(max_workers=1)
-    shutdown_calls = []
-    original_shutdown = concurrent.futures.ProcessPoolExecutor.shutdown
+def spawn_child_from_background_thread_and_succeed(child_path):
+    ready = threading.Event()
+    errors = []
 
-    def record_shutdown(_executor, wait=True, *, cancel_futures=False):
-        shutdown_calls.append((wait, cancel_futures))
-
-    try:
-        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'shutdown',
-                            record_shutdown)
-        executor.shutdown(cancel_futures=True)
-    finally:
-        monkeypatch.setattr(concurrent.futures.ProcessPoolExecutor, 'shutdown',
-                            original_shutdown)
-        executor.shutdown()
-
-    assert shutdown_calls == [(False, True)]
-
-
-def test_pool_executor_shutdown_includes_concurrent_submission(monkeypatch):
-    """Shutdown must terminate a process created by an accepted submit."""
-    executor = PoolExecutor(max_workers=1)
-    original_adjust = executor._adjust_process_count
-    adjust_entered = threading.Event()
-    release_adjust = threading.Event()
-    shutdown_started = threading.Event()
-    snapshot_attempted = threading.Event()
-    submitted_futures = []
-    submit_errors = []
-
-    class RecordingProcessMap(dict):
-
-        def values(self):
-            snapshot_attempted.set()
-            return super().values()
-
-    executor._processes = RecordingProcessMap()
-
-    def block_process_start():
-        adjust_entered.set()
-        assert release_adjust.wait(timeout=20)
-        original_adjust()
-
-    monkeypatch.setattr(executor, '_adjust_process_count', block_process_start)
-
-    def submit_worker():
+    def spawn_and_remain_alive():
         try:
-            submitted_futures.append(executor.submit(dummy_task, sleep_time=2))
-        except BaseException as e:  # pylint: disable=broad-except
-            submit_errors.append(e)
+            child = subprocess.Popen(  # pylint: disable=consider-using-with
+                [
+                    '/bin/bash', '-c', f'trap "" TERM; echo $$ > {child_path}; '
+                    'while true; do sleep 1; done'
+                ],
+                start_new_session=True)
+            del child
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    int(pathlib.Path(child_path).read_text(encoding='utf-8'))
+                    break
+                except (FileNotFoundError, ValueError) as error:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'child did not publish its PID') from error
+                    time.sleep(0.01)
+            ready.set()
+            while True:
+                time.sleep(1)
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+            ready.set()
 
-    def shutdown_executor():
-        shutdown_started.set()
-        executor.shutdown()
-
-    submit_thread = threading.Thread(target=submit_worker)
-    shutdown_thread = threading.Thread(target=shutdown_executor)
-    try:
-        submit_thread.start()
-        assert adjust_entered.wait(timeout=20)
-        shutdown_thread.start()
-        assert shutdown_started.wait(timeout=20)
-        # The custom lifecycle lock must keep shutdown away from the worker
-        # snapshot until the accepted submission has registered its process.
-        assert not snapshot_attempted.wait(timeout=0.5)
-    finally:
-        release_adjust.set()
-        submit_thread.join(timeout=20)
-        shutdown_thread.join(timeout=20)
-        executor.shutdown()
-
-    assert not submit_thread.is_alive()
-    assert not shutdown_thread.is_alive()
-    assert not submit_errors
-    assert len(submitted_futures) == 1
-    assert snapshot_attempted.is_set()
-    with pytest.raises(concurrent.futures.process.BrokenProcessPool):
-        submitted_futures[0].result(timeout=20)
-
-
-def test_disposable_executor():
-    """Test DisposableExecutor functionality."""
-    executor = DisposableExecutor(max_workers=2)
-    try:
-        futs = []
-        # Test submit and has_idle_workers
-        assert executor.has_idle_workers()
-        futs.append(executor.submit(dummy_task))
-
-        # Test multiple tasks
-        futs.append(executor.submit(dummy_task))
-        assert not executor.has_idle_workers()  # No idle workers when full
-
-        concurrent.futures.wait(futs)
-        assert verify_workers_cleanup(executor), "Workers not cleaned up"
-        assert executor.has_idle_workers()  # Should have idle workers now
-
-        # Test with failing task
-        failed_fut = executor.submit(failing_task)
-        concurrent.futures.wait([failed_fut])
-        with pytest.raises(ValueError, match='Task failed'):
-            failed_fut.result()
-        assert verify_workers_cleanup(
-            executor), "Failed task worker not cleaned up"
-        assert executor.has_idle_workers()  # Worker should be cleaned up
-    finally:
-        executor.shutdown()
+    thread = threading.Thread(target=spawn_and_remain_alive, daemon=True)
+    thread.start()
+    if not ready.wait(timeout=10):
+        raise TimeoutError('background thread did not spawn its child')
+    if errors:
+        raise errors[0]
+    return 'success'
 
 
-def test_disposable_executor_reports_worker_exit():
-    """A worker exit must fail its future instead of returning None."""
+def test_guardian_identity_is_published_before_explicit_admission(tmp_path):
     executor = DisposableExecutor(max_workers=1)
+    touched = tmp_path / 'admitted'
     try:
-        future = executor.submit(abruptly_exiting_task)
-        with pytest.raises(concurrent.futures.process.BrokenProcessPool,
-                           match='exit code 7'):
+        future = executor.submit(touch_task,
+                                 str(touched),
+                                 admission_gated=True,
+                                 receipt_required=True)
+        guardian = future.guardian_identity
+        assert guardian.pid in executor.workers
+        assert process._read_process_start_time_ticks(
+            guardian.pid) == guardian.start_time_ticks
+        assert not touched.exists()
+
+        future.admit()
+        assert future.result(timeout=20) is True
+        assert future.boundary_result is not None
+        # Durable convergence owns guardian lifetime, not Future visibility.
+        assert _identity_exists(guardian)
+        future.acknowledge_receipt()
+        assert _wait_until(lambda: not _identity_exists(guardian))
+    finally:
+        executor.shutdown()
+
+
+def test_cancel_before_admission_is_typed_pre_effect(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    touched = tmp_path / 'not-run'
+    try:
+        future = executor.submit(touch_task,
+                                 str(touched),
+                                 admission_gated=True,
+                                 receipt_required=True)
+        future.request_cancel()
+        with pytest.raises(concurrent.futures.CancelledError):
             future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert (future.boundary_result.outcome.kind
+                is process.InvocationOutcomeKind.PRE_EFFECT)
+        assert not touched.exists()
+        # Cancellation requests drain; they do not waive durable receipt.
+        time.sleep(0.2)
+        assert _identity_exists(future.guardian_identity)
+        future.acknowledge_receipt()
     finally:
         executor.shutdown()
 
 
-def test_disposable_executor_returns_exception_object():
-    """An exception-shaped return value must not become a task failure."""
+def test_capability_transfer_cancel_before_admission_is_pre_effect(tmp_path):
+    """Early cancellation closes the redeemed one-shot authority transport."""
     executor = DisposableExecutor(max_workers=1)
+    touched = tmp_path / 'not-run-with-capability'
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b'A' * 43)
+    os.close(write_fd)
     try:
-        result = executor.submit(exception_result_task).result(timeout=20)
-        assert isinstance(result, ValueError)
-        assert str(result) == 'task data'
-    finally:
-        executor.shutdown()
-
-
-def test_disposable_executor_marks_started_future_running():
-    """A started process must not expose a cancellable pending future."""
-    executor = DisposableExecutor(max_workers=1)
-    try:
-        future = executor.submit(dummy_task, sleep_time=1)
-        assert future.running()
-        assert not future.cancel()
-        assert future.result(timeout=20)
-    finally:
-        executor.shutdown()
-
-
-def test_disposable_executor_contains_terminating_exception():
-    """A child BaseException must not terminate the future's caller."""
-    executor = DisposableExecutor(max_workers=1)
-    try:
-        future = executor.submit(terminating_task)
-        with pytest.raises(RuntimeError, match='SystemExit: 3') as exc_info:
+        future = executor.submit(touch_task,
+                                 str(touched),
+                                 admission_gated=True,
+                                 receipt_required=True,
+                                 capability_fd=read_fd)
+        os.close(read_fd)
+        read_fd = -1
+        future.request_cancel()
+        with pytest.raises(concurrent.futures.CancelledError):
             future.result(timeout=20)
-        assert isinstance(exc_info.value.__cause__, SystemExit)
+        assert future.boundary_result is not None
+        assert (future.boundary_result.outcome.kind
+                is process.InvocationOutcomeKind.PRE_EFFECT)
+        assert not touched.exists()
+        future.acknowledge_receipt()
     finally:
+        if read_fd >= 0:
+            os.close(read_fd)
         executor.shutdown()
 
 
-def test_disposable_executor_reports_unserializable_result():
-    """An unserializable result must fail its future."""
+def test_capability_skips_setproctitle_until_exact_handler_install(monkeypatch):
+    """No outer/inner extension hook runs while their bearer FD is readable."""
+    capability = controller_capability.generate()
+    capability_fd_read, capability_fd_write = os.pipe()
+    os.write(capability_fd_write, capability.encode('ascii'))
+    os.close(capability_fd_write)
+    calls = []
+    real_setproctitle = process.setproctitle.setproctitle
+
+    def hostile_setproctitle(title):
+        calls.append((os.getpid(), controller_capability.get_process_local()))
+        real_setproctitle(title)
+
+    monkeypatch.setattr(process.setproctitle, 'setproctitle',
+                        hostile_setproctitle)
     executor = DisposableExecutor(max_workers=1)
     try:
-        future = executor.submit(unserializable_result_task)
-        with pytest.raises(TypeError,
-                           match='cannot serialize disposable result'):
+        future = executor.submit(capability_owner_proof,
+                                 capability,
+                                 capability_fd=capability_fd_read)
+        os.close(capability_fd_read)
+        capability_fd_read = -1
+        proof = future.result(timeout=20)
+    finally:
+        if capability_fd_read >= 0:
+            os.close(capability_fd_read)
+        executor.shutdown()
+    # Forked child writes to ``calls`` are copy-on-write, so the parent sees no
+    # hook. The callable independently proves only the exact handler is bound.
+    assert calls == []
+    assert proof['authorized'] is True
+    assert proof['pid'] != future.guardian_identity.pid
+
+
+def test_cancel_drains_term_ignoring_new_session_descendant(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    handler_ready = tmp_path / 'handler-ready'
+    child_pid_path = tmp_path / 'child-pid'
+    try:
+        future = executor.submit(spawn_session_child_then_wait,
+                                 str(handler_ready),
+                                 str(child_pid_path),
+                                 receipt_required=True)
+        assert _wait_until(handler_ready.exists)
+        assert _wait_until(child_pid_path.exists)
+        child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+        child_identity = process.ProcessIdentity(
+            child_pid, process._read_process_start_time_ticks(child_pid))
+
+        future.request_cancel()
+        with pytest.raises(concurrent.futures.CancelledError):
             future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert (future.boundary_result.outcome.kind
+                is process.InvocationOutcomeKind.CANCELLED)
+        assert not _identity_exists(child_identity)
+        future.acknowledge_receipt()
     finally:
         executor.shutdown()
 
 
-def test_disposable_executor_returns_large_result_without_deadlock():
-    """The monitor must drain a large result before joining its worker."""
+def test_success_drains_unregistered_descendant(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    child_pid_path = tmp_path / 'child-pid'
+    try:
+        future = executor.submit(spawn_unregistered_child_and_succeed,
+                                 str(child_pid_path),
+                                 receipt_required=True)
+        assert future.result(timeout=20) == 'success'
+        child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+        # The unregistered child is absent before the successful result becomes
+        # visible, so arbitrary detach cannot hide behind a success receipt.
+        with pytest.raises(FileNotFoundError):
+            process._read_process_start_time_ticks(child_pid)
+        future.acknowledge_receipt()
+    finally:
+        executor.shutdown()
+
+
+def test_success_drains_child_forked_by_non_main_handler_thread(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    child_pid_path = tmp_path / 'thread-child-pid'
+    try:
+        future = executor.submit(spawn_child_from_background_thread_and_succeed,
+                                 str(child_pid_path),
+                                 receipt_required=True)
+        assert future.result(timeout=20) == 'success'
+        child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+        with pytest.raises(FileNotFoundError):
+            process._read_process_start_time_ticks(child_pid)
+        future.acknowledge_receipt()
+    finally:
+        executor.shutdown()
+
+
+@pytest.mark.parametrize(('task', 'kind', 'error_type'), [
+    (failing_task, process.InvocationOutcomeKind.FAILED, ValueError),
+    (retryable_task, process.InvocationOutcomeKind.RETRYABLE,
+     exceptions.ExecutionRetryableError),
+    (terminating_task, process.InvocationOutcomeKind.FAILED,
+     process.BoundaryExecutionError),
+])
+def test_closed_typed_outcomes(task, kind, error_type):
     executor = DisposableExecutor(max_workers=1)
     try:
-        future = executor.submit(large_result_task)
-        assert future.result(timeout=20) == b'x' * 1024 * 1024
+        future = executor.submit(task, receipt_required=True)
+        with pytest.raises(error_type):
+            future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert future.boundary_result.outcome.kind is kind
+        future.acknowledge_receipt()
     finally:
         executor.shutdown()
 
 
-def test_disposable_executor_reserves_starting_worker(monkeypatch):
-    """A starting process must consume capacity before it has a PID."""
+def test_abrupt_handler_exit_is_failed_boundary():
     executor = DisposableExecutor(max_workers=1)
-    original_start = multiprocessing.Process.start
-    first_start_entered = threading.Event()
-    release_first_start = threading.Event()
-    start_count = 0
-    start_count_lock = threading.Lock()
+    try:
+        future = executor.submit(abruptly_exiting_task, receipt_required=True)
+        with pytest.raises(process.BoundaryExecutionError,
+                           match='without a typed outcome'):
+            future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert (future.boundary_result.outcome.kind
+                is process.InvocationOutcomeKind.FAILED)
+        future.acknowledge_receipt()
+    finally:
+        executor.shutdown()
 
-    def block_first_start(process):
-        nonlocal start_count
-        with start_count_lock:
-            start_count += 1
-            current_start = start_count
-        if current_start == 1:
-            first_start_entered.set()
-            assert release_first_start.wait(timeout=20)
-        return original_start(process)
 
-    monkeypatch.setattr(multiprocessing.Process, 'start', block_first_start)
-    first_futures = []
-    first_errors = []
+def test_monitor_start_failure_converges_boundary_synchronously(monkeypatch):
+    executor = DisposableExecutor(max_workers=1)
+    original_start = threading.Thread.start
+
+    def fail_boundary_monitor(thread):
+        if thread.name.startswith('invocation-boundary-monitor-'):
+            raise RuntimeError('monitor start failed')
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, 'start', fail_boundary_monitor)
+    with pytest.raises(RuntimeError, match='monitor start failed'):
+        executor.submit(dummy_task)
+    assert not executor.workers
+    executor.shutdown()
+
+
+def test_parent_rejects_guardian_self_reported_birth_tick(monkeypatch):
+    executor = DisposableExecutor(max_workers=1)
+    original_read = process._read_process_start_time_ticks
+
+    def return_wrong_parent_observation(pid):
+        return original_read(pid) + 1
+
+    monkeypatch.setattr(process, '_read_process_start_time_ticks',
+                        return_wrong_parent_observation)
+    with pytest.raises(process.AmbiguousBoundaryError,
+                       match='without an authenticated family-drain'):
+        executor.submit(dummy_task)
+    assert executor.poisoned
+    assert not executor.workers
+    with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
+        executor.shutdown()
+
+
+def test_pre_ready_inner_hang_is_cancelled_and_reaped_boundedly(monkeypatch):
+    executor = DisposableExecutor(max_workers=1)
+    monkeypatch.setattr(process, '_SPAWN_CONTEXT',
+                        process.multiprocessing.get_context('fork'))
+    monkeypatch.setattr(process, '_inner_warden_main', hanging_inner_warden)
+    monkeypatch.setattr(process, '_BOUNDARY_START_TIMEOUT_SECONDS', 0.2)
+    monkeypatch.setattr(process, '_BOUNDARY_START_CLEANUP_TIMEOUT_SECONDS', 2)
+
+    started_at = time.monotonic()
+    with pytest.raises(TimeoutError, match='did not become ready'):
+        executor.submit(dummy_task)
+    assert time.monotonic() - started_at < 5
+    assert not executor.poisoned
+    assert not executor.workers
+    assert executor.available_slots() == 1
+    executor.shutdown()
+
+
+def test_starting_guardian_consumes_capacity(monkeypatch):
+    executor = DisposableExecutor(max_workers=1)
+    spawn_process_type = type(process._SPAWN_CONTEXT.Process())
+    original_start = spawn_process_type.start
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_start(child):
+        entered.set()
+        assert release.wait(timeout=20)
+        return original_start(child)
+
+    monkeypatch.setattr(spawn_process_type, 'start', blocked_start)
+    futures = []
+    errors = []
 
     def submit_first():
         try:
-            first_futures.append(executor.submit(dummy_task))
-        except BaseException as e:  # pylint: disable=broad-except
-            first_errors.append(e)
+            futures.append(executor.submit(dummy_task))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
 
-    submit_thread = threading.Thread(target=submit_first)
+    thread = threading.Thread(target=submit_first)
+    thread.start()
     try:
-        submit_thread.start()
-        assert first_start_entered.wait(timeout=20)
+        assert entered.wait(timeout=20)
         with pytest.raises(exceptions.ExecutionPoolFullError):
             executor.submit(dummy_task)
     finally:
-        release_first_start.set()
-        submit_thread.join(timeout=20)
+        release.set()
+        thread.join(timeout=20)
         executor.shutdown()
-
-    assert not submit_thread.is_alive()
-    assert not first_errors
-    assert len(first_futures) == 1
+    assert not errors
+    assert len(futures) == 1
 
 
-def test_disposable_executor_releases_failed_start_reservation(monkeypatch):
-    """A failed process start must restore disposable capacity."""
-    executor = DisposableExecutor(max_workers=1)
-    original_start = multiprocessing.Process.start
-
-    def fail_start(_):
-        raise OSError('process start failed')
-
-    try:
-        monkeypatch.setattr(multiprocessing.Process, 'start', fail_start)
-        with pytest.raises(OSError, match='process start failed'):
-            executor.submit(dummy_task)
-        assert executor.has_idle_workers()
-
-        monkeypatch.setattr(multiprocessing.Process, 'start', original_start)
-        assert executor.submit(dummy_task).result(timeout=20)
-    finally:
-        executor.shutdown()
-
-
-def test_disposable_executor_cleans_up_failed_monitor_start(monkeypatch):
-    """A monitor-thread failure must not strand its child process."""
-    executor = DisposableExecutor(max_workers=1)
-    original_thread_start = threading.Thread.start
-
-    def fail_monitor_start(thread):
-        if thread._target == executor._monitor_worker:
-            raise RuntimeError('monitor start failed')
-        return original_thread_start(thread)
-
-    try:
-        monkeypatch.setattr(threading.Thread, 'start', fail_monitor_start)
-        with pytest.raises(RuntimeError, match='monitor start failed'):
-            executor.submit(dummy_task, sleep_time=30)
-        assert executor.has_idle_workers()
-        with executor._lock:
-            assert not executor.workers
-    finally:
-        executor.shutdown()
-
-
-def test_disposable_executor_shutdown_waits_for_starting_worker(monkeypatch):
-    """Shutdown must include an accepted worker that has no PID yet."""
-    executor = DisposableExecutor(max_workers=1)
-    original_start = multiprocessing.Process.start
-    start_entered = threading.Event()
-    release_start = threading.Event()
-    shutdown_started = threading.Event()
-    shutdown_returned = threading.Event()
-    submitted_futures = []
-    submit_errors = []
-
-    def block_start(process):
-        start_entered.set()
-        assert release_start.wait(timeout=20)
-        return original_start(process)
-
-    monkeypatch.setattr(multiprocessing.Process, 'start', block_start)
-
-    def submit_worker():
-        try:
-            submitted_futures.append(executor.submit(dummy_task, sleep_time=30))
-        except BaseException as e:  # pylint: disable=broad-except
-            submit_errors.append(e)
-
-    def shutdown_executor():
-        shutdown_started.set()
-        executor.shutdown()
-        shutdown_returned.set()
-
-    submit_thread = threading.Thread(target=submit_worker)
-    shutdown_thread = threading.Thread(target=shutdown_executor)
-    try:
-        submit_thread.start()
-        assert start_entered.wait(timeout=20)
-        shutdown_thread.start()
-        assert shutdown_started.wait(timeout=20)
-        assert not shutdown_returned.wait(timeout=0.5)
-    finally:
-        release_start.set()
-        submit_thread.join(timeout=20)
-        shutdown_thread.join(timeout=20)
-        executor.shutdown()
-
-    assert not submit_thread.is_alive()
-    assert not shutdown_thread.is_alive()
-    assert not submit_errors
-    assert len(submitted_futures) == 1
-    with pytest.raises(concurrent.futures.process.BrokenProcessPool):
-        submitted_futures[0].result(timeout=20)
-
-
-def test_burstable_executor():
-    """Test BurstableExecutor functionality."""
+def test_burstable_has_no_reusable_pool_and_both_lanes_are_disposable():
     executor = BurstableExecutor(garanteed_workers=1, burst_workers=1)
     try:
-        # Submit tasks that should go to guaranteed pool first
-        executor.submit_until_success(dummy_task)
-        # Submit another task that should go to burst pool
-        executor.submit_until_success(dummy_task)
-        # Submit one more task that should wait and go to guaranteed pool
-        executor.submit_until_success(dummy_task)
-        # Wait for tasks to complete
-        time.sleep(0.3)
+        assert isinstance(executor._executor, DisposableExecutor)
+        assert isinstance(executor._burst_executor, DisposableExecutor)
+        first = executor.try_reserve_idle_worker()
+        second = executor.try_reserve_idle_worker()
+        assert first is not None
+        assert second is not None
+        assert first.lane is process._ExecutorLane.GUARANTEED
+        assert second.lane is process._ExecutorLane.BURST
+        assert executor.try_reserve_idle_worker() is None
+        assert executor.submit_reserved(first, dummy_task).result(timeout=20)
+        assert executor.submit_reserved(second, dummy_task).result(timeout=20)
     finally:
         executor.shutdown()
 
 
-def test_burstable_executor_no_guaranteed():
-    """Test BurstableExecutor with only burst workers."""
-    executor = BurstableExecutor(garanteed_workers=0, burst_workers=1)
+def test_reservation_is_owner_bound_and_one_use():
+    first = BurstableExecutor(garanteed_workers=1)
+    second = BurstableExecutor(garanteed_workers=1)
     try:
-        # Should use burst pool
-        executor.submit_until_success(dummy_task)
-        time.sleep(0.2)
-        # Should be able to submit another task after first one completes
-        executor.submit_until_success(dummy_task)
+        reservation = first.try_reserve_idle_worker()
+        assert reservation is not None
+        with pytest.raises(ValueError, match='another executor'):
+            second.submit_reserved(reservation, dummy_task)
+        forged = dataclasses.replace(reservation)
+        with pytest.raises(ValueError, match='stale or consumed'):
+            first.submit_reserved(forged, dummy_task)
+        future = first.submit_reserved(reservation, dummy_task)
+        assert future.result(timeout=20)
+        with pytest.raises(ValueError, match='stale or consumed'):
+            first.submit_reserved(reservation, dummy_task)
     finally:
-        executor.shutdown()
+        first.shutdown()
+        second.shutdown()
 
 
-def test_burstable_executor_no_burst():
-    """Test BurstableExecutor with only guaranteed workers."""
-    executor = BurstableExecutor(garanteed_workers=1, burst_workers=0)
+def test_reserved_submit_releases_lock_before_process_start(monkeypatch):
+    executor = BurstableExecutor(garanteed_workers=1)
+    reservation = executor.try_reserve_idle_worker()
+    assert reservation is not None
+    sentinel = object()
+
+    def submit_without_reservation_lock(*_args, **_kwargs):
+        assert executor._reservation_lock.acquire(blocking=False)
+        executor._reservation_lock.release()
+        return sentinel
+
+    monkeypatch.setattr(executor._executor, '_submit_claimed',
+                        submit_without_reservation_lock)
+    assert executor.submit_reserved(reservation, dummy_task) is sentinel
+    # The stub replaces startup, so release its synthetic starting claim.
+    with executor._executor._start_condition:
+        executor._executor._starting_workers -= 1
+        executor._executor._start_condition.notify_all()
+    executor.shutdown()
+
+
+def test_surviving_inner_reports_pre_effect_after_outer_hard_death():
+    executor = DisposableExecutor(max_workers=1)
+    future = executor.submit(dummy_task,
+                             admission_gated=True,
+                             receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
     try:
-        # Should use guaranteed pool
-        executor.submit_until_success(dummy_task)
-        # Should queue to guaranteed pool even when busy
-        executor.submit_until_success(dummy_task)
+        process._send_exact_signal(guardian, signal.SIGKILL)
+        with pytest.raises(concurrent.futures.CancelledError):
+            future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert (future.boundary_result.outcome.kind
+                is process.InvocationOutcomeKind.PRE_EFFECT)
+        assert future.boundary_result.family_drained
+        future.acknowledge_receipt()
+        assert _wait_until(lambda: not _identity_exists(inner))
     finally:
         executor.shutdown()
 
 
-def test_burstable_executor_pool_recovery():
-    """Test BurstableExecutor recovery from BrokenProcessPool exception."""
-
-    executor = BurstableExecutor(garanteed_workers=1, burst_workers=0)
-
+def test_surviving_inner_drains_active_effects_after_outer_hard_death(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    handler_ready = tmp_path / 'handler-ready'
+    child_pid_path = tmp_path / 'child-pid'
+    future = executor.submit(spawn_session_child_then_wait,
+                             str(handler_ready),
+                             str(child_pid_path),
+                             receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
     try:
-        # Store reference to original executor
-        original_executor = executor._executor
-        submit_call_count = 0
+        assert _wait_until(handler_ready.exists)
+        assert _wait_until(child_pid_path.exists)
+        child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+        child = process.ProcessIdentity(
+            child_pid, process._read_process_start_time_ticks(child_pid))
 
-        # Mock the PoolExecutor.submit method at class level to control
-        # behavior across all instances.
-        original_submit = PoolExecutor.submit
-
-        def mock_submit(self, fn, *args, **kwargs):
-            nonlocal submit_call_count
-            submit_call_count += 1
-            if submit_call_count == 1:
-                # First call raises BrokenProcessPool to simulate pool failure
-                raise concurrent.futures.process.BrokenProcessPool(
-                    "Simulated process pool failure")
-            # Subsequent calls exercise the replacement process pool.
-            return original_submit(self, fn, *args, **kwargs)
-
-        with unittest.mock.patch.object(PoolExecutor, 'submit',
-                                        new=mock_submit):
-            # This should trigger the pool recovery logic in
-            # _submit_to_guaranteed_pool
-            future = executor.submit_until_success(dummy_task)
-            # Process startup can be slow under the full xdist suite, but a
-            # bounded timeout still detects a hung replacement pool.
-            result = future.result(timeout=60.0)
-
-            # Verify the task completed successfully despite initial failure
-            assert result is True
-
-            # Verify that submit was called exactly twice
-            # (initial failure + successful retry)
-            assert submit_call_count == 2
-
-            # Verify that a new executor was created after the failure
-            assert executor._executor is not original_executor
-
+        process._send_exact_signal(guardian, signal.SIGKILL)
+        with pytest.raises(concurrent.futures.CancelledError):
+            future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert (future.boundary_result.outcome.kind
+                is process.InvocationOutcomeKind.CANCELLED)
+        assert future.boundary_result.family_drained
+        assert not _identity_exists(child)
+        future.acknowledge_receipt()
+        assert _wait_until(lambda: not _identity_exists(inner))
+        assert not executor.poisoned
     finally:
         executor.shutdown()
+
+
+def test_outer_drains_family_after_inner_hard_death(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    handler_ready = tmp_path / 'handler-ready'
+    child_pid_path = tmp_path / 'child-pid'
+    future = executor.submit(spawn_session_child_then_wait,
+                             str(handler_ready),
+                             str(child_pid_path),
+                             receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    try:
+        assert _wait_until(handler_ready.exists)
+        assert _wait_until(child_pid_path.exists)
+        child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+        child = process.ProcessIdentity(
+            child_pid, process._read_process_start_time_ticks(child_pid))
+
+        process._send_exact_signal(inner, signal.SIGKILL)
+        with pytest.raises(process.BoundaryExecutionError,
+                           match='Inner warden exited'):
+            future.result(timeout=20)
+        assert future.boundary_result is not None
+        assert future.boundary_result.family_drained
+        assert not _identity_exists(child)
+        future.acknowledge_receipt()
+    finally:
+        executor.shutdown()
+
+
+def test_both_boundary_owners_hard_dead_is_ambiguous_not_terminal():
+    executor = DisposableExecutor(max_workers=1)
+    future = executor.submit(dummy_task,
+                             admission_gated=True,
+                             receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    try:
+        process._send_exact_signal(guardian, signal.SIGSTOP)
+        process._send_exact_signal(inner, signal.SIGSTOP)
+        process._send_exact_signal(inner, signal.SIGKILL)
+        process._send_exact_signal(guardian, signal.SIGKILL)
+        with pytest.raises(process.AmbiguousBoundaryError,
+                           match='without boundary proof'):
+            future.result(timeout=20)
+        assert future.boundary_result is None
+    finally:
+        with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
+            executor.shutdown()
+
+
+def test_both_owners_hard_dead_with_active_effects_reports_ambiguous(tmp_path):
+    poison_errors = []
+    executor = DisposableExecutor(max_workers=1,
+                                  on_ambiguous_boundary=poison_errors.append)
+    handler_ready = tmp_path / 'handler-ready'
+    child_pid_path = tmp_path / 'child-pid'
+    future = executor.submit(spawn_session_child_then_wait,
+                             str(handler_ready),
+                             str(child_pid_path),
+                             receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    assert _wait_until(handler_ready.exists)
+    assert _wait_until(child_pid_path.exists)
+    handler = _wait_for_direct_child(inner)
+    child_pid = int(child_pid_path.read_text(encoding='utf-8'))
+    child = process.ProcessIdentity(
+        child_pid, process._read_process_start_time_ticks(child_pid))
+    try:
+        # Freeze both owners so neither can author a result while the other is
+        # killed, then hard-kill them.  The live orphan effects must not retain
+        # the spawn sentinel or result endpoint and hide this ambiguity.
+        process._send_exact_signal(guardian, signal.SIGSTOP)
+        process._send_exact_signal(inner, signal.SIGSTOP)
+        process._send_exact_signal(inner, signal.SIGKILL)
+        process._send_exact_signal(guardian, signal.SIGKILL)
+        with pytest.raises(process.AmbiguousBoundaryError,
+                           match='without boundary proof'):
+            future.result(timeout=20)
+        assert future.boundary_result is None
+        assert _identity_exists(handler)
+        assert _identity_exists(child)
+        assert executor.poisoned
+        assert executor.available_slots() == 0
+        assert not executor.has_idle_workers()
+        with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
+            executor.submit(dummy_task)
+        with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
+            executor.shutdown(timeout=0)
+        assert poison_errors
+    finally:
+        if _identity_exists(handler):
+            process._send_exact_signal(handler, signal.SIGKILL)
+        if _identity_exists(child):
+            process._send_exact_signal(child, signal.SIGKILL)
+        with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
+            executor.shutdown()
+
+
+def test_ambiguity_poisons_entire_burstable_facade():
+    poison_errors = []
+    executor = BurstableExecutor(garanteed_workers=1,
+                                 burst_workers=1,
+                                 on_ambiguous_boundary=poison_errors.append)
+    reservation = executor.try_reserve_idle_worker()
+    assert reservation is not None
+    future = executor.submit_reserved(reservation,
+                                      dummy_task,
+                                      admission_gated=True,
+                                      receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    process._send_exact_signal(guardian, signal.SIGSTOP)
+    process._send_exact_signal(inner, signal.SIGSTOP)
+    process._send_exact_signal(inner, signal.SIGKILL)
+    process._send_exact_signal(guardian, signal.SIGKILL)
+    with pytest.raises(process.AmbiguousBoundaryError):
+        future.result(timeout=20)
+    assert executor.try_reserve_idle_worker() is None
+    with pytest.raises(process.AmbiguousBoundaryError, match='shutdown'):
+        executor.shutdown(timeout=0)
+    assert poison_errors
+
+
+def test_boundary_result_envelope_rejects_wrong_authentication_token():
+    executor = DisposableExecutor(max_workers=1)
+    monitor_connection, sender_connection = process.multiprocessing.Pipe(
+        duplex=True)
+    identity = process.ProcessIdentity(424242, 101)
+    future = process.InvocationFuture(identity, monitor_connection, False,
+                                      'expected-token')
+    assert future.set_running_or_notify_cancel()
+    guardian = unittest.mock.Mock(pid=identity.pid, exitcode=0)
+    record = process._InvocationRecord(guardian, future)
+    monitor = threading.Thread(target=executor._monitor_boundary,
+                               args=(record, monitor_connection))
+    record.monitor = monitor
+    monitor.start()
+    result = process.BoundaryResult(
+        identity,
+        process.InvocationOutcome(process.InvocationOutcomeKind.SUCCEEDED,
+                                  value='authenticated'))
+    try:
+        sender_connection.send(
+            process._BoundaryEnvelope('forged-token', process._Event.RESULT,
+                                      result))
+        time.sleep(0.1)
+        assert not future.done()
+        sender_connection.send(
+            process._BoundaryEnvelope('expected-token', process._Event.RESULT,
+                                      result))
+        assert future.result(timeout=2) == 'authenticated'
+        assert sender_connection.recv() is process._Command.RECEIPT
+    finally:
+        sender_connection.close()
+        monitor.join(timeout=2)
+    assert not monitor.is_alive()
+
+
+def test_shutdown_is_bounded_and_retryable_until_receipt_acknowledged():
+    executor = DisposableExecutor(max_workers=1)
+    future = executor.submit(dummy_task, receipt_required=True)
+    assert future.result(timeout=20)
+    guardian = future.guardian_identity
+
+    with pytest.raises(process.BoundaryShutdownPendingError) as error:
+        executor.shutdown(timeout=0.1)
+    assert error.value.guardians == (guardian,)
+    assert _identity_exists(guardian)
+
+    future.acknowledge_receipt()
+    executor.shutdown(timeout=5)
+    assert not _identity_exists(guardian)
+
+
+def test_receipt_ack_pipe_loss_after_proven_result_does_not_wedge():
+    executor = DisposableExecutor(max_workers=1)
+    future = executor.submit(dummy_task, receipt_required=True)
+    guardian = future.guardian_identity
+    inner = _wait_for_direct_child(guardian)
+    assert future.result(timeout=20)
+    try:
+        process._send_exact_signal(guardian, signal.SIGSTOP)
+        process._send_exact_signal(inner, signal.SIGSTOP)
+        process._send_exact_signal(inner, signal.SIGKILL)
+        process._send_exact_signal(guardian, signal.SIGKILL)
+        assert _wait_until(lambda: not _identity_exists(guardian))
+        # The peer endpoint is gone, but the already-proven result remains
+        # authoritative and acknowledgement is idempotent/non-wedging.
+        future.acknowledge_receipt()
+        future.acknowledge_receipt()
+    finally:
+        executor.shutdown()
+
+
+def test_shutdown_cancels_and_reaps_exact_guardian(tmp_path):
+    executor = DisposableExecutor(max_workers=1)
+    ready = tmp_path / 'ready'
+    future = executor.submit(blocking_task, str(ready), receipt_required=False)
+    assert _wait_until(ready.exists)
+    guardian = future.guardian_identity
+    executor.shutdown()
+    assert not _identity_exists(guardian)
+    with pytest.raises(concurrent.futures.CancelledError):
+        future.result(timeout=1)
+
+
+def test_process_reap_proof_rejects_alive_child():
+    child = unittest.mock.Mock(pid=54321, exitcode=None)
+    child.is_alive.return_value = True
+    with pytest.raises(RuntimeError, match='54321'):
+        process._require_processes_reaped([child])
+    child.join.assert_called_once_with(
+        timeout=process._PROCESS_REAP_PROOF_TIMEOUT_SECONDS)

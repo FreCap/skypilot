@@ -15,6 +15,7 @@ from unittest import mock
 
 import fastapi
 import pytest
+import pytest_asyncio
 
 from sky import exceptions
 from sky import models
@@ -23,7 +24,7 @@ from sky.container_images import errors as container_image_errors
 from sky.serve import constants as serve_constants
 from sky.server import config as server_config
 from sky.server import constants as server_constants
-from sky.server import daemons as server_daemons
+from sky.server import versions
 from sky.server.requests import continue_condition as continue_condition_lib
 from sky.server.requests import executor
 from sky.server.requests import payloads
@@ -33,6 +34,7 @@ from sky.server.requests import requests as requests_lib
 from sky.server.requests import role_filter
 from sky.skylet import constants
 from sky.utils import context_utils
+from sky.utils import controller_capability
 
 
 def _make_server_config(
@@ -74,6 +76,401 @@ def test_spawned_process_resolves_postgres_queue_from_environment(monkeypatch):
     factory = executor.queue_base.get_queue_backend_factory()
 
     assert isinstance(factory, request_postgres.PostgresQueueFactory)
+
+
+def _provider_test_worker() -> executor.RequestWorker:
+    return executor.RequestWorker(schedule_type=requests_lib.ScheduleType.LONG,
+                                  config=server_config.WorkerConfig(
+                                      garanteed_parallelism=1,
+                                      burstable_parallelism=0,
+                                      num_db_connections_per_worker=0))
+
+
+def _provider_candidate() -> executor.queue_base.ProviderMutationCandidate:
+    return executor.queue_base.ProviderMutationCandidate(
+        request_id='bound-provider-request',
+        kind=(executor.queue_base.ProviderMutationRequestKind.
+              BOUND_ORDINARY_LAUNCH))
+
+
+def test_provider_request_is_not_claimed_without_idle_worker(monkeypatch):
+    queue = mock.Mock()
+    queue.peek_provider_mutation.return_value = _provider_candidate()
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = None
+    executor_time = mock.Mock(wraps=time)
+    monkeypatch.setattr(executor, 'time', executor_time)
+
+    _provider_test_worker().process_request(proc_executor, queue)
+
+    proc_executor.try_reserve_idle_worker.assert_called_once_with()
+    queue.claim_provider_mutation.assert_not_called()
+    queue.get.assert_not_called()
+    proc_executor.submit_reserved.assert_not_called()
+    executor_time.sleep.assert_called_once_with(0.1)
+
+
+def test_provider_claim_loss_releases_idle_worker_reservation(monkeypatch):
+    queue = mock.Mock()
+    candidate = _provider_candidate()
+    queue.peek_provider_mutation.return_value = candidate
+    queue.claim_provider_mutation.return_value = None
+    reservation = mock.sentinel.reservation
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    executor_time = mock.Mock(wraps=time)
+    monkeypatch.setattr(executor, 'time', executor_time)
+
+    _provider_test_worker().process_request(proc_executor, queue)
+
+    queue.claim_provider_mutation.assert_called_once_with(candidate)
+    proc_executor.release_idle_worker_reservation.assert_called_once_with(
+        reservation)
+    queue.get.assert_not_called()
+    proc_executor.submit_reserved.assert_not_called()
+
+
+def test_cancelled_provider_claim_releases_reservation_and_quiesces(
+        monkeypatch):
+    queue = mock.Mock()
+    queue.peek_provider_mutation.return_value = _provider_candidate()
+    claimed = executor.queue_base.QueueItem(
+        request_id='bound-provider-request',
+        ignore_return_value=False,
+        retryable=False,
+        execution_generation=3,
+        claim_token='claim-token',
+        worker_instance_id='worker-instance')
+    queue.claim_provider_mutation.return_value = claimed
+    reservation = mock.sentinel.reservation
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    monkeypatch.setattr(
+        executor.api_requests, 'get_request', lambda *_args, **_kwargs: mock.
+        Mock(status=requests_lib.RequestStatus.CANCELLED,
+             created_at=time.time()))
+    worker = _provider_test_worker()
+    converge = mock.Mock(return_value=True)
+    monkeypatch.setattr(worker, '_converge_execution_completion', converge)
+
+    worker.process_request(proc_executor, queue)
+
+    proc_executor.release_idle_worker_reservation.assert_called_once_with(
+        reservation)
+    call = converge.call_args
+    assert call.args == (executor.request_storage.ExecutionClaim(
+        'bound-provider-request', 3, 'claim-token', 'worker-instance'),)
+    assert isinstance(call.kwargs['error'], concurrent.futures.CancelledError)
+    assert call.kwargs['terminal_cause'] == 'dispatcher_submit_failed'
+    proc_executor.submit_reserved.assert_not_called()
+
+
+def test_provider_claim_submits_only_through_reserved_worker(monkeypatch):
+    queue = mock.Mock()
+    queue.peek_provider_mutation.return_value = _provider_candidate()
+    claimed = executor.queue_base.QueueItem(
+        request_id='bound-provider-request',
+        ignore_return_value=False,
+        retryable=False,
+        execution_generation=3,
+        claim_token='claim-token',
+        worker_instance_id='worker-instance')
+    queue.claim_provider_mutation.return_value = claimed
+    reservation = mock.sentinel.reservation
+    guardian_pid = os.getpid()
+    submitted_future = mock.Mock(guardian_identity=process.ProcessIdentity(
+        guardian_pid,
+        executor.request_storage.read_linux_process_start_time_ticks(
+            guardian_pid)))
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.return_value = submitted_future
+    monkeypatch.setattr(
+        executor.api_requests, 'get_request', lambda *_args, **_kwargs: mock.
+        Mock(status=requests_lib.RequestStatus.PENDING, created_at=time.time()))
+    admission = mock.Mock(return_value=True)
+    monkeypatch.setattr(executor.api_requests, 'try_mark_running', admission)
+    worker = _provider_test_worker()
+    start_monitor = mock.Mock(return_value=True)
+    monkeypatch.setattr(worker, '_start_task_monitor', start_monitor)
+
+    worker.process_request(proc_executor, queue)
+
+    proc_executor.submit_reserved.assert_called_once()
+    submit_args = proc_executor.submit_reserved.call_args.args
+    assert submit_args[:3] == (
+        reservation,
+        executor._request_execution_wrapper,
+        'bound-provider-request',
+    )
+    assert proc_executor.submit_reserved.call_args.kwargs == {
+        'admission_gated': True,
+        'receipt_required': True,
+        'capability_fd': None,
+    }
+    proc_executor.release_idle_worker_reservation.assert_not_called()
+    start_monitor.assert_called_once_with(submitted_future, claimed)
+    admission.assert_called_once_with(
+        'bound-provider-request', guardian_pid, 3, 'claim-token',
+        submitted_future.guardian_identity.start_time_ticks)
+    submitted_future.admit.assert_called_once_with()
+
+
+def test_nested_controller_claim_gets_one_shot_capability(monkeypatch):
+    """Only a complete authenticated managed-job origin receives authority."""
+    capability = controller_capability.generate()
+    controller_capability.install_process_local(capability)
+    origin = (1, '12345678-1234-4abc-9234-56789abcdef0', 7, 0,
+              '00000000-0000-0000-0000-000000000001')
+    queued = executor.queue_base.QueueItem(
+        request_id='nested-controller-request',
+        ignore_return_value=False,
+        retryable=False,
+        execution_generation=3,
+        claim_token='claim-token',
+        worker_instance_id=origin[1],
+        managed_job_origin=origin)
+    queue = mock.Mock()
+    queue.peek_provider_mutation.return_value = None
+    queue.get.return_value = queued
+    reservation = mock.sentinel.reservation
+    guardian_pid = os.getpid()
+    submitted_future = mock.Mock(guardian_identity=process.ProcessIdentity(
+        guardian_pid,
+        executor.request_storage.read_linux_process_start_time_ticks(
+            guardian_pid)))
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.return_value = submitted_future
+    monkeypatch.setattr(
+        executor.api_requests, 'get_request', lambda *_args, **_kwargs: mock.
+        Mock(status=requests_lib.RequestStatus.PENDING, created_at=time.time()))
+    monkeypatch.setattr(executor.api_requests, 'try_mark_running',
+                        mock.Mock(return_value=True))
+    worker = _provider_test_worker()
+    monkeypatch.setattr(worker, '_start_task_monitor',
+                        mock.Mock(return_value=True))
+    try:
+        worker.process_request(proc_executor, queue)
+    finally:
+        controller_capability.clear_process_local()
+
+    capability_fd = proc_executor.submit_reserved.call_args.kwargs[
+        'capability_fd']
+    assert isinstance(capability_fd, int)
+    with pytest.raises(OSError):
+        os.fstat(capability_fd)
+
+
+def test_controller_class_claim_without_nested_origin_gets_no_capability(
+        monkeypatch):
+    """Execution class alone never grants raw controller authority."""
+    capability = controller_capability.generate()
+    controller_capability.install_process_local(capability)
+    queued = executor.queue_base.QueueItem(
+        request_id='user-controller-request',
+        ignore_return_value=False,
+        retryable=False,
+        execution_generation=3,
+        claim_token='claim-token',
+        worker_instance_id='12345678-1234-4abc-9234-56789abcdef0')
+    queue = mock.Mock()
+    queue.peek_provider_mutation.return_value = None
+    queue.get.return_value = queued
+    reservation = mock.sentinel.reservation
+    guardian_pid = os.getpid()
+    submitted_future = mock.Mock(guardian_identity=process.ProcessIdentity(
+        guardian_pid,
+        executor.request_storage.read_linux_process_start_time_ticks(
+            guardian_pid)))
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.return_value = submitted_future
+    monkeypatch.setattr(
+        executor.api_requests, 'get_request', lambda *_args, **_kwargs: mock.
+        Mock(status=requests_lib.RequestStatus.PENDING, created_at=time.time()))
+    monkeypatch.setattr(executor.api_requests, 'try_mark_running',
+                        mock.Mock(return_value=True))
+    worker = _provider_test_worker()
+    monkeypatch.setattr(worker, '_start_task_monitor',
+                        mock.Mock(return_value=True))
+    try:
+        worker.process_request(proc_executor, queue)
+    finally:
+        controller_capability.clear_process_local()
+
+    assert (proc_executor.submit_reserved.call_args.kwargs['capability_fd']
+            is None)
+
+
+def _nested_header_proof() -> dict:
+    from sky.client import service_account_auth
+    headers = service_account_auth.get_service_account_headers()
+    capability = headers[server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER]
+    return {
+        'capability': capability,
+        'env_has_raw': capability in os.environ.values(),
+        'argv_has_raw': capability in __import__('sys').argv,
+    }
+
+
+def _nested_origin_header_entrypoint() -> dict:
+    from sky.client import service_account_auth
+    headers = service_account_auth.get_service_account_headers()
+    capability = headers[server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER]
+    return {
+        'headers': headers,
+        'env_has_raw': capability in os.environ.values(),
+        'argv_has_raw': capability in __import__('sys').argv,
+    }
+
+
+def test_disposable_controller_handler_receives_capability_only_in_registry(
+        monkeypatch):
+    """The real guardian/warden path relays authority only to its handler."""
+    capability = controller_capability.generate()
+    monkeypatch.setenv(server_constants.CONTROLLER_INSTANCE_ID_ENV_VAR,
+                       '12345678-1234-4abc-9234-56789abcdef0')
+    monkeypatch.setenv(server_constants.CONTROLLER_GENERATION_ENV_VAR, '7')
+    capability_fd = executor._open_controller_capability_transport(capability)
+    boundary = process.DisposableExecutor(max_workers=1)
+    try:
+        future = boundary.submit(_nested_header_proof,
+                                 capability_fd=capability_fd)
+        proof = future.result(timeout=20)
+    finally:
+        os.close(capability_fd)
+        boundary.shutdown()
+    assert proof == {
+        'capability': capability,
+        'env_has_raw': False,
+        'argv_has_raw': False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_request_wrapper_scopes_verified_managed_job_origin(
+        isolated_database, mock_fd_operations):
+    """Nested SDK headers use only the durable queue-verified origin."""
+    del mock_fd_operations
+    capability = controller_capability.generate()
+    origin = (1, '12345678-1234-4abc-9234-56789abcdef0', 7, 0,
+              '00000000-0000-0000-0000-000000000001')
+    request_id = 'verified-managed-origin'
+    request = requests_lib.Request(request_id=request_id,
+                                   name='test',
+                                   entrypoint=_nested_origin_header_entrypoint,
+                                   request_body=payloads.RequestBody(),
+                                   status=requests_lib.RequestStatus.PENDING,
+                                   created_at=0.0,
+                                   user_id='test-user')
+    assert await requests_lib.create_if_not_exists_async(request)
+    # This test exercises the bounded handler after the PostgreSQL queue has
+    # already transactionally verified and claimed the origin.  Populate the
+    # local fixture row after creation to avoid invoking SQLite's independent
+    # managed-job admission protocol.
+    with requests_lib.update_request(request_id) as stored:
+        assert stored is not None
+        stored.managed_job_id = origin[0]
+        stored.managed_job_controller_instance_id = origin[1]
+        stored.managed_job_controller_generation = origin[2]
+        stored.managed_job_controller_slot_id = origin[3]
+        stored.managed_job_controller_slot_attempt = origin[4]
+    controller_capability.install_process_local(capability)
+    try:
+        executor._request_execution_wrapper(request_id,
+                                            ignore_return_value=False,
+                                            managed_job_origin=origin)
+    finally:
+        controller_capability.clear_process_local()
+    assert versions.get_managed_job_origin() is None
+    updated = requests_lib.get_request(request_id)
+    assert updated is not None
+    proof = updated.return_value
+    headers = proof['headers']
+    assert headers[server_constants.CONTROLLER_INSTANCE_ID_HEADER] == origin[1]
+    assert headers[server_constants.CONTROLLER_GENERATION_HEADER] == str(
+        origin[2])
+    assert headers[server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER] == (
+        capability)
+    assert headers[server_constants.MANAGED_JOB_ID_HEADER] == str(origin[0])
+    assert headers[server_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_HEADER] == (
+        str(origin[3]))
+    assert headers[server_constants.
+                   MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_HEADER] == origin[4]
+    assert proof['env_has_raw'] is False
+    assert proof['argv_has_raw'] is False
+
+
+def test_transient_running_admission_retains_effect_gate(monkeypatch):
+    """A backend outage is not a definitive stale-attempt decision."""
+    queue = mock.Mock()
+    queue.peek_provider_mutation.return_value = None
+    queued = executor.queue_base.QueueItem(request_id='transient-admission',
+                                           ignore_return_value=False,
+                                           retryable=False,
+                                           execution_generation=4,
+                                           claim_token='claim-token',
+                                           worker_instance_id='worker-instance')
+    queue.get.return_value = queued
+    reservation = mock.sentinel.reservation
+    guardian_pid = os.getpid()
+    guardian = process.ProcessIdentity(
+        guardian_pid,
+        executor.request_storage.read_linux_process_start_time_ticks(
+            guardian_pid))
+    submitted_future = mock.Mock(guardian_identity=guardian)
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.return_value = submitted_future
+    monkeypatch.setattr(
+        executor.api_requests, 'get_request', lambda *_args, **_kwargs: mock.
+        Mock(status=requests_lib.RequestStatus.PENDING, created_at=time.time()))
+    admission = mock.Mock(
+        side_effect=[RuntimeError('database unavailable'), True])
+    monkeypatch.setattr(executor.api_requests, 'try_mark_running', admission)
+    worker = _provider_test_worker()
+    monkeypatch.setattr(worker, '_start_task_monitor',
+                        mock.Mock(return_value=True))
+    cancel_event = mock.Mock()
+    cancel_event.wait.return_value = False
+    monkeypatch.setattr(worker, '_cancel_event', cancel_event)
+
+    worker.process_request(proc_executor, queue)
+
+    assert admission.call_count == 2
+    assert admission.call_args_list == [
+        mock.call('transient-admission', guardian_pid, 4, 'claim-token',
+                  guardian.start_time_ticks),
+        mock.call('transient-admission', guardian_pid, 4, 'claim-token',
+                  guardian.start_time_ticks),
+    ]
+    cancel_event.wait.assert_called_once_with(0.1)
+    submitted_future.request_cancel.assert_not_called()
+    submitted_future.admit.assert_called_once_with()
+
+
+def test_claimed_dispatcher_failure_uses_durable_completion_protocol(
+        monkeypatch):
+    worker = _provider_test_worker()
+    converge = mock.Mock(return_value=True)
+    monkeypatch.setattr(worker, '_converge_execution_completion', converge)
+    monkeypatch.setattr(executor.api_requests, 'set_exception_stacktrace',
+                        mock.Mock())
+    item = executor.queue_base.QueueItem(request_id='dispatcher-failure',
+                                         ignore_return_value=False,
+                                         retryable=False,
+                                         execution_generation=12,
+                                         claim_token='exact-claim',
+                                         worker_instance_id='worker-id')
+    failure = RuntimeError('submit failed')
+
+    worker._fail_stranded_request(item.request_id, failure, item)
+
+    converge.assert_called_once_with(executor.request_storage.ExecutionClaim(
+        'dispatcher-failure', 12, 'exact-claim', 'worker-id'),
+                                     error=failure,
+                                     terminal_cause='dispatcher_submit_failed')
 
 
 @pytest.mark.asyncio
@@ -175,6 +572,101 @@ def test_worker_preserves_executor_construction_error(monkeypatch):
         worker.run()
 
 
+def test_worker_ambiguity_drains_role_and_poison_capacity(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=2,
+                                          burstable_parallelism=1,
+                                          num_db_connections_per_worker=0))
+    role_shutdown = mock.Mock()
+    gauge = mock.Mock()
+    monkeypatch.setattr(executor,
+                        '_request_role_shutdown_after_boundary_ambiguity',
+                        role_shutdown)
+    monkeypatch.setattr(executor.metrics_utils, 'METRICS_ENABLED', True)
+    monkeypatch.setattr(executor.metrics_utils, 'SKY_APISERVER_LONG_EXECUTORS',
+                        gauge)
+    ambiguity = process.AmbiguousBoundaryError('family proof lost')
+
+    worker._handle_ambiguous_boundary(ambiguity)
+    # A duplicate report from the Future monitor must not signal the role or
+    # mutate the process-local gauge twice.
+    worker._handle_ambiguous_boundary(
+        process.AmbiguousBoundaryError('duplicate report'))
+
+    assert worker._cancel_event.is_set()
+    assert worker._boundary_ambiguity_error is ambiguity
+    gauge.set.assert_called_once_with(0)
+    role_shutdown.assert_called_once_with(ambiguity)
+    with pytest.raises(RuntimeError,
+                       match='could not prove executor child shutdown') as exc:
+        worker.wait_for_shutdown()
+    assert exc.value.__cause__ is ambiguity
+
+
+def test_boundary_ambiguity_requests_role_sigterm(monkeypatch):
+    kill = mock.Mock()
+    monkeypatch.setattr(executor.os, 'kill', kill)
+
+    ambiguity = process.AmbiguousBoundaryError('family proof lost')
+    executor._request_role_shutdown_after_boundary_ambiguity(ambiguity)
+
+    kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+
+def test_ambiguous_result_neither_acks_nor_advertises_free_slot(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    role_shutdown = mock.Mock()
+    mark_free = mock.Mock()
+    acknowledge = mock.Mock()
+    monkeypatch.setattr(executor,
+                        '_request_role_shutdown_after_boundary_ambiguity',
+                        role_shutdown)
+    monkeypatch.setattr(worker, '_mark_executor_free', mark_free)
+    monkeypatch.setattr(worker, '_acknowledge_boundary_receipt', acknowledge)
+    ambiguity = process.AmbiguousBoundaryError('both owners disappeared')
+    future = concurrent.futures.Future()
+    future.set_exception(ambiguity)
+
+    worker._handle_task_result(future, ('ambiguous-request', False, False))
+
+    acknowledge.assert_not_called()
+    mark_free.assert_not_called()
+    role_shutdown.assert_called_once_with(ambiguity)
+
+
+def test_worker_wires_ambiguity_callback_into_executor(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    proc_executor = mock.Mock()
+    constructor = mock.Mock(return_value=proc_executor)
+    ambiguity_callback = mock.Mock()
+    monkeypatch.setattr(worker, '_handle_ambiguous_boundary',
+                        ambiguity_callback)
+    monkeypatch.setattr(executor.process, 'BurstableExecutor', constructor)
+    monkeypatch.setattr(executor, '_get_queue', mock.Mock())
+    monkeypatch.setattr(executor.clean_env_module, 'get_clean_server_env',
+                        lambda: {})
+    monkeypatch.setattr(executor.metrics_utils, 'METRICS_ENABLED', False)
+    worker.request_shutdown()
+
+    dispatcher = threading.Thread(target=worker.run)
+    dispatcher.start()
+    dispatcher.join(timeout=2)
+
+    assert not dispatcher.is_alive()
+    callback = constructor.call_args.kwargs['on_ambiguous_boundary']
+    assert callback is ambiguity_callback
+    proc_executor.shutdown.assert_called_once_with()
+
+
 def test_task_monitor_heartbeats_durable_claim(monkeypatch):
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.SHORT,
@@ -192,23 +684,78 @@ def test_task_monitor_heartbeats_durable_claim(monkeypatch):
     backend.heartbeat_claim.side_effect = heartbeat
     monkeypatch.setattr(executor.request_storage, 'get_request_backend',
                         lambda: backend)
-    monkeypatch.setattr(worker, '_handle_task_result',
-                        lambda *_args: heartbeat_seen.wait(timeout=1))
     future = concurrent.futures.Future()
-    future.set_result(None)
     item = executor.queue_base.QueueItem('heartbeat-request',
                                          False,
                                          False,
                                          execution_generation=7,
                                          claim_token='claim-token')
 
-    worker.handle_task_result(future, item)
+    monitor = threading.Thread(target=worker.handle_task_result,
+                               args=(future, item))
+    monitor.start()
+    assert heartbeat_seen.wait(timeout=1)
+    future.set_result(None)
+    monitor.join(timeout=2)
 
+    assert not monitor.is_alive()
     backend.heartbeat_claim.assert_called()
     claim = backend.heartbeat_claim.call_args.args[0]
     assert claim.request_id == item.request_id
     assert claim.execution_generation == item.execution_generation
     assert claim.claim_token == item.claim_token
+    assert executor.request_storage.active_execution_claim() is None
+
+
+def test_task_monitor_retries_revocation_after_heartbeat_wins_reaper_race(
+        monkeypatch):
+    """A stale heartbeat must keep trying until durable cancel is visible."""
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    second_interrupt = threading.Event()
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = 0.01
+    backend.heartbeat_claim.return_value = False
+    interrupt_attempts = 0
+
+    def interrupt(_claim):
+        nonlocal interrupt_attempts
+        interrupt_attempts += 1
+        if interrupt_attempts < 2:
+            # Model heartbeat observing expiry before the reaper/reducer has
+            # made the exact invocation interruptible in durable state.
+            return False
+        second_interrupt.set()
+        return True
+
+    backend.interrupt_cancelled_claim.side_effect = interrupt
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+
+    future = concurrent.futures.Future()
+    item = executor.queue_base.QueueItem('heartbeat-before-reaper',
+                                         False,
+                                         False,
+                                         execution_generation=11,
+                                         claim_token='exact-claim')
+
+    monitor = threading.Thread(target=worker.handle_task_result,
+                               args=(future, item))
+    monitor.start()
+    assert second_interrupt.wait(timeout=1)
+    future.set_result(None)
+    monitor.join(timeout=2)
+
+    assert not monitor.is_alive()
+    assert backend.heartbeat_claim.call_count >= 2
+    assert backend.interrupt_cancelled_claim.call_count >= 2
+    expected = executor.request_storage.ExecutionClaim(
+        item.request_id, item.execution_generation, item.claim_token)
+    assert all(call.args == (expected,)
+               for call in backend.interrupt_cancelled_claim.call_args_list)
     assert executor.request_storage.active_execution_claim() is None
 
 
@@ -241,17 +788,19 @@ def test_task_monitor_waits_for_normal_future_before_quiescence(monkeypatch):
                                args=(BlockingFuture(), item))
     monitor.start()
     assert future_started.wait(timeout=1)
-    backend.acknowledge_execution_quiescence.assert_not_called()
+    backend.converge_execution_completion.assert_not_called()
 
     future_release.set()
     monitor.join(timeout=2)
     assert not monitor.is_alive()
-    backend.acknowledge_execution_quiescence.assert_called_once_with(
+    backend.converge_execution_completion.assert_called_once_with(
         executor.request_storage.ExecutionClaim('blocked-future', 7,
-                                                'claim-token'))
+                                                'claim-token', None),
+        error=None,
+        terminal_cause='handler_failed')
 
 
-def test_task_monitor_does_not_quiesce_broken_process_pool(monkeypatch):
+def test_plain_future_failure_has_no_local_boundary_receipt(monkeypatch):
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.SHORT,
         config=server_config.WorkerConfig(garanteed_parallelism=1,
@@ -265,8 +814,7 @@ def test_task_monitor_does_not_quiesce_broken_process_pool(monkeypatch):
                         mock.Mock())
     monkeypatch.setattr(worker, '_mark_executor_free', mock.Mock())
     future = concurrent.futures.Future()
-    future.set_exception(
-        concurrent.futures.process.BrokenProcessPool('pool failed'))
+    future.set_exception(process.BoundaryExecutionError('boundary failed'))
     item = executor.queue_base.QueueItem('broken-future',
                                          False,
                                          False,
@@ -275,11 +823,125 @@ def test_task_monitor_does_not_quiesce_broken_process_pool(monkeypatch):
 
     worker.handle_task_result(future, item)
 
-    backend.acknowledge_execution_quiescence.assert_not_called()
+    backend.converge_execution_completion.assert_called_once_with(
+        executor.request_storage.ExecutionClaim('broken-future', 8,
+                                                'claim-token', None),
+        error=future.exception(),
+        terminal_cause='handler_failed')
+    backend.acknowledge_local_execution_quiescence.assert_not_called()
 
 
-@pytest.fixture()
-def isolated_database(tmp_path):
+def test_task_monitor_start_failure_keeps_synchronous_owner(monkeypatch):
+    """An accepted Future cannot be orphaned by thread creation failure."""
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = None
+    backend.converge_execution_completion.return_value = True
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(executor.threading.Thread, 'start',
+                        mock.Mock(side_effect=RuntimeError('thread limit')))
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    item = executor.queue_base.QueueItem('monitor-start-failure',
+                                         False,
+                                         False,
+                                         execution_generation=3,
+                                         claim_token='exact-claim',
+                                         worker_instance_id='worker-id')
+
+    worker._start_task_monitor(future, item)
+
+    backend.converge_execution_completion.assert_called_once_with(
+        executor.request_storage.ExecutionClaim('monitor-start-failure', 3,
+                                                'exact-claim', 'worker-id'),
+        error=None,
+        terminal_cause='handler_failed')
+    assert not worker._monitor_threads
+
+
+def test_task_monitor_is_registered_before_start(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = None
+    backend.converge_execution_completion.return_value = True
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    original_start = threading.Thread.start
+    observed_registered = []
+
+    def assert_registered(thread):
+        with worker._monitor_condition:
+            observed_registered.append(thread in worker._monitor_threads)
+        return original_start(thread)
+
+    monkeypatch.setattr(executor.threading.Thread, 'start', assert_registered)
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    item = executor.queue_base.QueueItem('registered-before-start',
+                                         False,
+                                         False,
+                                         execution_generation=5,
+                                         claim_token='exact-claim')
+
+    worker._start_task_monitor(future, item)
+    worker.wait_for_shutdown()
+
+    assert observed_registered == [True]
+    assert not worker._monitor_threads
+
+
+def test_worker_shutdown_waits_for_receipt_monitor(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.SHORT,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    convergence_entered = threading.Event()
+    convergence_release = threading.Event()
+    shutdown_returned = threading.Event()
+    backend = mock.Mock()
+    backend.claim_heartbeat_interval_seconds = None
+
+    def converge(*_args, **_kwargs):
+        convergence_entered.set()
+        assert convergence_release.wait(timeout=2)
+        return True
+
+    backend.converge_execution_completion.side_effect = converge
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    future = concurrent.futures.Future()
+    future.set_result(None)
+    item = executor.queue_base.QueueItem('shutdown-monitor',
+                                         False,
+                                         False,
+                                         execution_generation=4,
+                                         claim_token='exact-claim')
+    worker._start_task_monitor(future, item)
+    assert convergence_entered.wait(timeout=1)
+
+    waiter = threading.Thread(
+        target=lambda: (worker.wait_for_shutdown(), shutdown_returned.set()))
+    waiter.start()
+    assert not shutdown_returned.wait(timeout=0.1)
+    convergence_release.set()
+    waiter.join(timeout=2)
+
+    assert not waiter.is_alive()
+    assert shutdown_returned.is_set()
+
+
+@pytest_asyncio.fixture()
+async def isolated_database(tmp_path):
     """Create an isolated DB and logs directory per-test."""
     temp_db_path = tmp_path / 'requests.db'
     temp_log_path = tmp_path / 'logs'
@@ -289,10 +951,9 @@ def isolated_database(tmp_path):
                     str(temp_db_path)):
         with mock.patch('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
                         str(temp_log_path)):
-            requests_lib._DB = None
+            await requests_lib.close_db_async()
             yield
-            if requests_lib._DB is not None:
-                asyncio.run(requests_lib.close_db_async())
+            await requests_lib.close_db_async()
 
 
 @pytest.mark.asyncio
@@ -941,7 +1602,7 @@ def flag_entrypoint():
 
 @pytest.mark.asyncio
 async def test_api_cancel_race_condition(isolated_database):
-    """Cancel before execution: wrapper must no-op and not run entrypoint."""
+    """Cancel before dispatch: no disposable boundary may be admitted."""
     CALLED_FLAG[0] = False
     req = requests_lib.Request(request_id='race-cancel-before',
                                name='test-request',
@@ -957,12 +1618,21 @@ async def test_api_cancel_race_condition(isolated_database):
     cancelled = await requests_lib.kill_request_async('race-cancel-before')
     assert cancelled is True
 
-    # Execute wrapper should detect CANCELLED and return immediately.
-    executor._request_execution_wrapper('race-cancel-before',
-                                        ignore_return_value=False)
+    request_queue = mock.Mock()
+    request_queue.peek_provider_mutation.return_value = None
+    request_queue.get.return_value = ('race-cancel-before', False, False)
+    reservation = mock.sentinel.reservation
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    worker = _provider_test_worker()
+    worker.process_request(proc_executor, request_queue)
 
-    # Verify entrypoint was not invoked and status remains CANCELLED.
+    # Cancellation is consumed before submission, and the unused capacity
+    # reservation is returned without creating a process family.
     assert CALLED_FLAG[0] is False
+    proc_executor.submit_reserved.assert_not_called()
+    proc_executor.release_idle_worker_reservation.assert_called_once_with(
+        reservation)
     updated = requests_lib.get_request('race-cancel-before')
     assert updated is not None
     assert updated.status == requests_lib.RequestStatus.CANCELLED
@@ -1113,9 +1783,23 @@ async def test_execute_with_isolated_env_and_config(isolated_database,
             task = executor.execute_request_in_coroutine(request)
             await task.task
         else:
-            # Submit to shared executor like production code
-            fut = proc_executor.submit_until_success(
-                executor._request_execution_wrapper, request_id, False)
+            # Mirror the production disposable-boundary admission order:
+            # reserve finite capacity, create a gated guardian, durably publish
+            # its exact PID/birth identity, then admit handler effects.
+            reservation = proc_executor.try_reserve_idle_worker()
+            assert reservation is not None
+            fut = proc_executor.submit_reserved(
+                reservation,
+                executor._request_execution_wrapper,
+                request_id,
+                False,
+                admission_gated=True)
+            guardian = fut.guardian_identity
+            assert requests_lib.try_mark_running(
+                request_id,
+                guardian.pid,
+                process_start_time_ticks=guardian.start_time_ticks)
+            fut.admit()
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, fut.result)
 
@@ -1248,10 +1932,6 @@ def mock_fd_operations(isolated_database, monkeypatch):
     monkeypatch.setattr(pathlib.Path, 'open',
                         lambda self, *args, **kwargs: MockFile())
 
-    monkeypatch.setattr(
-        'sky.server.requests.executor.subprocess_utils.kill_children_processes',
-        lambda: None)
-
     return {
         'dup_calls': dup_calls,
         'dup2_calls': dup2_calls,
@@ -1369,7 +2049,7 @@ async def test_stdout_stderr_restoration(mock_fd_operations, test_case):
                                name='test',
                                entrypoint=test_case['entrypoint'],
                                request_body=payloads.RequestBody(),
-                               status=requests_lib.RequestStatus.PENDING,
+                               status=requests_lib.RequestStatus.RUNNING,
                                created_at=0.0,
                                user_id='test-user')
     await requests_lib.create_if_not_exists_async(req)
@@ -1405,9 +2085,9 @@ async def test_stdout_stderr_restoration(mock_fd_operations, test_case):
     requests_lib.RequestStatus.PENDING,
     requests_lib.RequestStatus.RUNNING,
 ])
-async def test_request_worker_retries_after_broken_process_pool(
+async def test_proven_boundary_failure_is_terminal_even_when_retryable(
         isolated_database, monkeypatch, initial_status):
-    """A retryable pool crash must leave the request executable."""
+    """A typed boundary failure is not an unproven pooled-worker crash."""
     request_id = f'test-broken-pool-retry-{initial_status.value.lower()}'
     request = requests_lib.Request(
         request_id=request_id,
@@ -1432,7 +2112,7 @@ async def test_request_worker_retries_after_broken_process_pool(
         config=server_config.WorkerConfig(garanteed_parallelism=1,
                                           burstable_parallelism=0,
                                           num_db_connections_per_worker=0))
-    pool_error = concurrent.futures.process.BrokenProcessPool('worker died')
+    pool_error = process.BoundaryExecutionError('boundary failed')
     fut = concurrent.futures.Future()
     fut.set_exception(pool_error)
     request_element = (request_id, False, True)
@@ -1442,13 +2122,9 @@ async def test_request_worker_retries_after_broken_process_pool(
     updated = requests_lib.get_request(request_id,
                                        fields=['status', 'pid', 'status_msg'])
     assert updated is not None
-    assert updated.status == requests_lib.RequestStatus.WAITING
-    assert updated.pid is None
-    assert updated.status_msg is not None
-    assert queue_items == [request_element]
-    # Model the next worker dequeue. The retry must pass the same atomic gate
-    # used by _request_execution_wrapper instead of being rejected as terminal.
-    assert requests_lib.try_mark_running(request_id, pid=456)
+    assert updated.status == requests_lib.RequestStatus.FAILED
+    assert queue_items == []
+    assert not requests_lib.try_mark_running(request_id, pid=456)
 
 
 @pytest.mark.asyncio
@@ -1475,8 +2151,7 @@ async def test_request_worker_fails_nonretryable_broken_pool_request(
                                           burstable_parallelism=0,
                                           num_db_connections_per_worker=0))
     fut = concurrent.futures.Future()
-    fut.set_exception(
-        concurrent.futures.process.BrokenProcessPool('worker died'))
+    fut.set_exception(process.BoundaryExecutionError('boundary failed'))
 
     worker.handle_task_result(fut, (request_id, False, False))
 
@@ -1512,8 +2187,7 @@ async def test_durable_claim_is_not_requeued_after_broken_process_pool(
                                           burstable_parallelism=0,
                                           num_db_connections_per_worker=0))
     fut = concurrent.futures.Future()
-    fut.set_exception(
-        concurrent.futures.process.BrokenProcessPool('worker died'))
+    fut.set_exception(process.BoundaryExecutionError('boundary failed'))
     claimed = executor.queue_base.QueueItem(request_id,
                                             False,
                                             True,
@@ -1529,9 +2203,9 @@ async def test_durable_claim_is_not_requeued_after_broken_process_pool(
 
 
 @pytest.mark.asyncio
-async def test_durable_retry_parent_republishes_quiescence_before_waiting(
+async def test_durable_retry_uses_atomic_delayed_handoff(
         isolated_database, monkeypatch):
-    """A transient child receipt failure is repaired before retry handoff."""
+    """A durable retry releases its boundary without an in-memory wait."""
     request_id = 'test-durable-retry-quiescence-fallback'
     request = requests_lib.Request(
         request_id=request_id,
@@ -1546,26 +2220,20 @@ async def test_durable_retry_parent_republishes_quiescence_before_waiting(
     await requests_lib.create_if_not_exists_async(request)
     request_queue = mock.Mock()
     monkeypatch.setattr(executor, '_get_queue', lambda _: request_queue)
-    status_at_ack = []
-
-    def record_ack(_claim):
-        current = requests_lib.get_request(request_id, fields=['status'])
-        assert current is not None
-        status_at_ack.append(current.status)
-
-    acknowledge = mock.Mock(side_effect=record_ack)
-    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
-                        acknowledge)
     worker = executor.RequestWorker(
         schedule_type=requests_lib.ScheduleType.LONG,
         config=server_config.WorkerConfig(garanteed_parallelism=1,
                                           burstable_parallelism=0,
                                           num_db_connections_per_worker=0))
+    handoff = mock.Mock(return_value=True)
+    converge = mock.Mock(return_value=True)
+    monkeypatch.setattr(worker, '_handoff_execution_retry', handoff)
+    monkeypatch.setattr(worker, '_converge_execution_completion', converge)
     fut = concurrent.futures.Future()
     fut.set_exception(
         exceptions.ExecutionRetryableError('retry after child receipt failed',
                                            hint='retry safely',
-                                           retry_wait_seconds=0))
+                                           retry_wait_seconds=37))
     claimed = executor.queue_base.QueueItem(request_id,
                                             False,
                                             True,
@@ -1574,13 +2242,119 @@ async def test_durable_retry_parent_republishes_quiescence_before_waiting(
 
     worker.handle_task_result(fut, claimed)
 
-    acknowledge.assert_called_once_with(
-        executor.request_storage.ExecutionClaim(request_id, 7, 'exact-claim'))
-    assert status_at_ack == [requests_lib.RequestStatus.RUNNING]
+    claim = executor.request_storage.ExecutionClaim(request_id, 7,
+                                                    'exact-claim', None)
+    handoff.assert_called_once()
+    assert handoff.call_args.args[0] == claim
+    assert handoff.call_args.args[2] == 37
+    assert 'retrying in 37s' in handoff.call_args.args[1]
+    converge.assert_not_called()
     updated = requests_lib.get_request(request_id, fields=['status'])
     assert updated is not None
-    assert updated.status == requests_lib.RequestStatus.WAITING
-    request_queue.put.assert_called_once_with(claimed)
+    # The mock represents the PostgreSQL transaction; no local mutation or
+    # queue call is allowed to form a second handoff path.
+    assert updated.status == requests_lib.RequestStatus.RUNNING
+    request_queue.put.assert_not_called()
+
+
+def test_parent_completion_retries_until_receipt_is_durable(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    backend = mock.Mock()
+    backend.converge_execution_completion.side_effect = [
+        RuntimeError('postgres unavailable'),
+        RuntimeError('commit outcome unknown'),
+        True,
+    ]
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    sleep = mock.Mock()
+    monkeypatch.setattr(executor.time, 'sleep', sleep)
+    claim = executor.request_storage.ExecutionClaim('receipt-retry', 9,
+                                                    'exact-claim', 'worker-id')
+
+    assert worker._converge_execution_completion(claim)
+
+    assert backend.converge_execution_completion.call_count == 3
+    assert sleep.call_args_list == [mock.call(0.1), mock.call(0.2)]
+
+
+@pytest.mark.parametrize(
+    ('future_error', 'terminal_cause'),
+    [(RuntimeError('transported failure'), 'handler_failed'),
+     (concurrent.futures.CancelledError(), 'dispatcher_submit_failed')])
+def test_parent_completion_converges_transport_outcomes(monkeypatch,
+                                                        future_error,
+                                                        terminal_cause):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    converge = mock.Mock(return_value=True)
+    monkeypatch.setattr(worker, '_converge_execution_completion', converge)
+    monkeypatch.setattr(worker, '_mark_executor_free', mock.Mock())
+    future = concurrent.futures.Future()
+    if isinstance(future_error, concurrent.futures.CancelledError):
+        future.cancel()
+    else:
+        future.set_exception(future_error)
+    item = executor.queue_base.QueueItem('transport-outcome',
+                                         False,
+                                         False,
+                                         execution_generation=6,
+                                         claim_token='exact-claim',
+                                         worker_instance_id='worker-id')
+
+    worker._handle_task_result(future, item)
+
+    converge.assert_called_once()
+    call = converge.call_args
+    assert call.args == (executor.request_storage.ExecutionClaim(
+        'transport-outcome', 6, 'exact-claim', 'worker-id'),)
+    if isinstance(future_error, concurrent.futures.CancelledError):
+        assert isinstance(call.kwargs['error'],
+                          concurrent.futures.CancelledError)
+    else:
+        assert call.kwargs['error'] is future_error
+    if terminal_cause == 'handler_failed':
+        assert 'terminal_cause' not in call.kwargs
+    else:
+        assert call.kwargs['terminal_cause'] == terminal_cause
+
+
+def test_retry_drops_when_exact_completion_identity_is_obsolete(monkeypatch):
+    worker = executor.RequestWorker(
+        schedule_type=requests_lib.ScheduleType.LONG,
+        config=server_config.WorkerConfig(garanteed_parallelism=1,
+                                          burstable_parallelism=0,
+                                          num_db_connections_per_worker=0))
+    handoff = mock.Mock(return_value=False)
+    converge = mock.Mock(return_value=False)
+    monkeypatch.setattr(worker, '_handoff_execution_retry', handoff)
+    monkeypatch.setattr(worker, '_converge_execution_completion', converge)
+    monkeypatch.setattr(worker, '_mark_executor_free', mock.Mock())
+    queue = mock.Mock()
+    monkeypatch.setattr(executor, '_get_queue', lambda _schedule_type: queue)
+    future = concurrent.futures.Future()
+    future.set_exception(
+        exceptions.ExecutionRetryableError('retry',
+                                           hint='retry',
+                                           retry_wait_seconds=0))
+    item = executor.queue_base.QueueItem('obsolete-retry',
+                                         False,
+                                         True,
+                                         execution_generation=8,
+                                         claim_token='stale-claim')
+
+    worker._handle_task_result(future, item)
+
+    handoff.assert_called_once()
+    converge.assert_called_once()
+    queue.put.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1608,8 +2382,7 @@ async def test_request_worker_does_not_requeue_cancelled_broken_pool_request(
                                           burstable_parallelism=0,
                                           num_db_connections_per_worker=0))
     fut = concurrent.futures.Future()
-    fut.set_exception(
-        concurrent.futures.process.BrokenProcessPool('worker died'))
+    fut.set_exception(process.BoundaryExecutionError('boundary failed'))
 
     worker.handle_task_result(fut, (request_id, False, True))
 
@@ -1689,17 +2462,27 @@ async def test_request_worker_retry_execution_retryable_error(
     executor_time.sleep.side_effect = mock_sleep
     monkeypatch.setattr(executor, 'time', executor_time)
 
-    # Create a mock executor that tracks submit_until_success calls
+    # Create a mock executor that exposes the canonical reservation API.
     submit_calls = []
 
     class MockExecutor:
 
-        def submit_until_success(self, fn, *args, **kwargs):
+        def try_reserve_idle_worker(self):
+            return mock.sentinel.reservation
+
+        def submit_reserved(self, reservation, fn, *args, **kwargs):
+            assert reservation is mock.sentinel.reservation
             submit_calls.append((fn, args, kwargs))
-            # Return a future that immediately completes (does nothing)
-            fut = concurrent.futures.Future()
-            fut.set_result(None)
+            fut = mock.Mock()
+            pid = os.getpid()
+            fut.guardian_identity = process.ProcessIdentity(
+                pid,
+                executor.request_storage.read_linux_process_start_time_ticks(
+                    pid))
             return fut
+
+        def release_idle_worker_reservation(self, reservation):
+            del reservation
 
     mock_executor = MockExecutor()
 
@@ -1709,6 +2492,7 @@ async def test_request_worker_retry_execution_retryable_error(
         config=server_config.WorkerConfig(garanteed_parallelism=1,
                                           burstable_parallelism=0,
                                           num_db_connections_per_worker=0))
+    monkeypatch.setattr(worker, '_start_task_monitor', lambda *_args: True)
 
     # Create a future that raises ExecutionRetryableError
     retryable_error = exceptions.ExecutionRetryableError(
@@ -1766,12 +2550,12 @@ async def test_request_worker_retry_execution_retryable_error(
         f'Expected request status to be WAITING, got {updated_request.status}')
 
     # Call process_request - it should pick up the request from the queue
-    # and call submit_until_success
+    # and submit only through its consumed capacity reservation.
     worker.process_request(mock_executor, request_queue)
 
-    # Verify submit_until_success was called
+    # Verify canonical reserved submission was called.
     assert len(submit_calls) == 1, (
-        f'Expected submit_until_success to be called once, got {len(submit_calls)} calls'
+        f'Expected submit_reserved to be called once, got {len(submit_calls)} calls'
     )
 
 
@@ -2094,38 +2878,6 @@ def stub_override_request_env_deps(monkeypatch):
                         fake_add_or_update_user)
 
 
-def test_override_env_skipped_for_daemon_request(stub_override_request_env_deps,
-                                                 monkeypatch):
-    """Daemon request_ids must NOT have their persisted env_vars overlaid.
-
-    Reproduces SKY-5502: a daemon row in PG carrying stale downward-API
-    values from a previous deployment generation must not clobber the
-    current pod's os.environ.
-    """
-    # Seed the "current pod" env with realistic downward-API values.
-    monkeypatch.setenv('SKYPILOT_POD_MEMORY_BYTES_LIMIT', str(300 * 1024**3))
-    monkeypatch.setenv('SKYPILOT_APISERVER_UUID', 'current-pod-uuid')
-
-    # Persisted daemon body has STALE values from a now-dead pod.
-    body = payloads.RequestBody(
-        env_vars={
-            'SKYPILOT_POD_MEMORY_BYTES_LIMIT': str(100 * 1024 * 1024),
-            'SKYPILOT_APISERVER_UUID': 'stale-pod-uuid',
-            constants.USER_ID_ENV_VAR: 'irrelevant',
-            constants.USER_ENV_VAR: 'irrelevant',
-        })
-
-    # Pick a real daemon id so daemons.is_daemon_request_id returns True.
-    daemon_id = server_daemons.INTERNAL_REQUEST_DAEMONS[0].id
-
-    with executor.override_request_env_and_config(body,
-                                                  request_id=daemon_id,
-                                                  request_name='daemon'):
-        assert os.environ['SKYPILOT_POD_MEMORY_BYTES_LIMIT'] == str(
-            300 * 1024**3), ('daemon override clobbered the current pod env')
-        assert os.environ['SKYPILOT_APISERVER_UUID'] == 'current-pod-uuid'
-
-
 def test_override_env_applied_for_client_request(stub_override_request_env_deps,
                                                  monkeypatch):
     """Regression guard: client requests must still have env_vars applied."""
@@ -2240,14 +2992,9 @@ def test_controller_execution_environment_uses_claim_fence(monkeypatch):
     assert os.environ['SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'] == 'old-owner'
 
 
-def test_daemon_env_mutations_reverted_on_exit(stub_override_request_env_deps,
-                                               monkeypatch):
-    """Daemon env mutations inside the with block must be reverted on exit.
-
-    Daemons (e.g. InternalRequestDaemon.run_event) set
-    SKYPILOT_DISABLE_LOGGING from inside the with block. If that mutation
-    leaked, the next request handled by the same worker would inherit it.
-    """
+def test_request_env_mutations_reverted_on_exit(stub_override_request_env_deps,
+                                                monkeypatch):
+    """Request-local environment mutations are reverted on context exit."""
     monkeypatch.setenv('SKYPILOT_PRE_EXISTING', 'before')
     monkeypatch.delenv('SKYPILOT_NEW_VAR', raising=False)
 
@@ -2257,11 +3004,9 @@ def test_daemon_env_mutations_reverted_on_exit(stub_override_request_env_deps,
             constants.USER_ENV_VAR: 'irrelevant',
         })
 
-    daemon_id = server_daemons.INTERNAL_REQUEST_DAEMONS[0].id
-
     with executor.override_request_env_and_config(body,
-                                                  request_id=daemon_id,
-                                                  request_name='daemon'):
+                                                  request_id='request-id',
+                                                  request_name='sky.test'):
         os.environ['SKYPILOT_NEW_VAR'] = 'inside'
         del os.environ['SKYPILOT_PRE_EXISTING']
 
@@ -2290,10 +3035,8 @@ def reset_sigterm_gate():
     import signal as _signal
     original_handler = _signal.getsignal(_signal.SIGTERM)
     executor._in_request_execution = False
-    executor._execution_cancellation_marker = None
     yield
     executor._in_request_execution = False
-    executor._execution_cancellation_marker = None
     _signal.signal(_signal.SIGTERM, original_handler)
 
 
@@ -2332,259 +3075,113 @@ async def test_wrapper_clears_in_request_execution_after_success(
     assert executor._in_request_execution is False
 
 
-@pytest.mark.asyncio
-async def test_wrapper_records_quiescence_after_effect_cleanup(
-        isolated_database, reset_sigterm_gate, monkeypatch):
-    req = requests_lib.Request(request_id='wrapper-quiescence',
-                               name='test',
-                               entrypoint=_gate_clears_after_success_entrypoint,
-                               request_body=payloads.RequestBody(),
-                               status=requests_lib.RequestStatus.PENDING,
-                               created_at=0.0,
-                               user_id='test-user')
-    assert await requests_lib.create_if_not_exists_async(req) is True
+class _ObservedInvocationFuture(process.InvocationFuture):
+    """Invocation Future that exposes parent-side ordering to tests."""
+
+    def __init__(self, events, result_started=None):
+        self._events = events
+        self._result_started = result_started
+        super().__init__(process.ProcessIdentity(123, 456), mock.Mock(), True,
+                         'boundary-token')
+
+    def result(self, *args, **kwargs):
+        self._events.append('await-boundary')
+        if self._result_started is not None:
+            self._result_started.set()
+        return super().result(*args, **kwargs)
+
+    def acknowledge_receipt(self):
+        self._events.append('boundary-release')
+        return super().acknowledge_receipt()
+
+
+def test_local_receipt_follows_family_proof_and_precedes_boundary_release(
+        monkeypatch):
     events = []
-    monkeypatch.setattr(executor.placement_history, 'flush_request_buffer',
-                        lambda: events.append('effect-cleanup'))
+    future = _ObservedInvocationFuture(events)
+    future._publish_boundary_result(
+        process.BoundaryResult(
+            future.guardian_identity,
+            process.InvocationOutcome(process.InvocationOutcomeKind.SUCCEEDED)))
+    backend = mock.Mock(supports_local_execution_quiescence=True)
+    backend.acknowledge_local_execution_quiescence.side_effect = (
+        lambda *identity: events.append(('local-receipt', identity)))
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    worker = _provider_test_worker()
+    monkeypatch.setattr(worker, '_mark_executor_free',
+                        lambda: events.append('capacity-free'))
 
-    def acknowledge(claim):
-        events.append(('quiescence', claim))
-
-    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
-                        acknowledge)
-
-    executor._request_execution_wrapper('wrapper-quiescence',
-                                        ignore_return_value=False,
-                                        execution_generation=9,
-                                        claim_token='claim-token')
+    worker._handle_task_result(future, ('local-boundary-success', False, False))
 
     assert events == [
-        'effect-cleanup',
-        ('quiescence',
-         executor.request_storage.ExecutionClaim('wrapper-quiescence', 9,
-                                                 'claim-token')),
+        'await-boundary',
+        ('local-receipt', ('local-boundary-success', 123, 456)),
+        'boundary-release',
+        'capacity-free',
     ]
 
 
-@pytest.mark.asyncio
-async def test_cancelled_wrapper_waits_for_cleanup_before_quiescence(
-        mock_fd_operations, reset_sigterm_gate, monkeypatch):
-    del mock_fd_operations
-    req = requests_lib.Request(request_id='cancel-cleanup-quiescence',
-                               name='test',
-                               entrypoint=_gated_sigterm_entrypoint,
-                               request_body=payloads.RequestBody(),
-                               status=requests_lib.RequestStatus.PENDING,
-                               created_at=0.0,
-                               user_id='test-user')
-    assert await requests_lib.create_if_not_exists_async(req) is True
-    cleanup_started = threading.Event()
-    cleanup_release = threading.Event()
-    acknowledged = threading.Event()
-
-    def blocking_cleanup():
-        cleanup_started.set()
-        assert cleanup_release.wait(timeout=2)
-
-    monkeypatch.setattr(executor.subprocess_utils, 'kill_children_processes',
-                        blocking_cleanup)
-    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
-                        lambda _claim: acknowledged.set())
-    wrapper = threading.Thread(target=executor._request_execution_wrapper,
-                               args=('cancel-cleanup-quiescence', False, 0, 11,
-                                     'claim-token'))
-    wrapper.start()
-    assert cleanup_started.wait(timeout=1)
-    assert not acknowledged.is_set()
-    # A second cancellation signal while child cleanup is in progress must not
-    # interrupt cleanup and let the wrapper publish a false receipt.
-    executor._gated_sigterm_handler(signal.SIGTERM, None)
-    assert not acknowledged.is_set()
-
-    cleanup_release.set()
-    wrapper.join(timeout=2)
-    assert not wrapper.is_alive()
-    assert acknowledged.is_set()
-
-
-@pytest.mark.asyncio
-async def test_cancelled_wrapper_cleanup_failure_never_records_quiescence(
-        mock_fd_operations, reset_sigterm_gate, monkeypatch):
-    del mock_fd_operations
-    req = requests_lib.Request(request_id='cancel-cleanup-failed',
-                               name='test',
-                               entrypoint=_gated_sigterm_entrypoint,
-                               request_body=payloads.RequestBody(),
-                               status=requests_lib.RequestStatus.PENDING,
-                               created_at=0.0,
-                               user_id='test-user')
-    assert await requests_lib.create_if_not_exists_async(req) is True
-    monkeypatch.setattr(
-        executor.subprocess_utils, 'kill_children_processes',
-        mock.Mock(side_effect=RuntimeError('child cleanup failed')))
-    acknowledge = mock.Mock()
-    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
-                        acknowledge)
-
-    with pytest.raises(RuntimeError, match='child cleanup failed'):
-        executor._request_execution_wrapper('cancel-cleanup-failed', False, 0,
-                                            12, 'claim-token')
-
-    acknowledge.assert_not_called()
-    assert executor._in_request_execution is False
-
-
-@pytest.mark.asyncio
-async def test_marker_io_error_runs_cancellation_cleanup_before_receipt(
-        mock_fd_operations, reset_sigterm_gate, monkeypatch):
-    del mock_fd_operations
-    req = requests_lib.Request(request_id='cancel-marker-io-error',
-                               name='test',
-                               entrypoint=_gated_sigterm_entrypoint,
-                               request_body=payloads.RequestBody(),
-                               status=requests_lib.RequestStatus.PENDING,
-                               created_at=0.0,
-                               user_id='test-user')
-    assert await requests_lib.create_if_not_exists_async(req) is True
+def test_cancelled_local_boundary_retries_receipt_before_release(monkeypatch):
     events = []
-    monkeypatch.setattr(
-        executor.request_storage, 'consume_execution_cancellation',
-        mock.Mock(side_effect=PermissionError('marker unreadable')))
-    monkeypatch.setattr(executor.subprocess_utils, 'kill_children_processes',
-                        lambda: events.append('child-cleanup'))
-    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
-                        lambda _claim: events.append('receipt'))
+    result_started = threading.Event()
+    future = _ObservedInvocationFuture(events, result_started)
+    backend = mock.Mock(supports_local_execution_quiescence=True)
+    receipt_attempts = 0
 
-    executor._request_execution_wrapper('cancel-marker-io-error', False, 0, 13,
-                                        'claim-token')
+    def acknowledge(*identity):
+        nonlocal receipt_attempts
+        receipt_attempts += 1
+        events.append(('receipt-attempt', identity))
+        if receipt_attempts == 1:
+            raise RuntimeError('sqlite unavailable')
+        events.append('local-receipt')
+        return True
 
-    assert events == ['child-cleanup', 'receipt']
+    backend.acknowledge_local_execution_quiescence.side_effect = acknowledge
+    monkeypatch.setattr(executor.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(executor.time, 'sleep', lambda seconds: events.append(
+        ('retry-wait', seconds)))
+    monkeypatch.setattr(executor.api_requests, 'set_request_failed',
+                        lambda *_args, **_kwargs: events.append('terminalized'))
+    worker = _provider_test_worker()
+    monkeypatch.setattr(worker, '_mark_executor_free',
+                        lambda: events.append('capacity-free'))
+    monitor = threading.Thread(target=worker._handle_task_result,
+                               args=(future, ('local-boundary-cancel', False,
+                                              False)))
+    monitor.start()
+    assert result_started.wait(timeout=1)
+    assert not any(event == 'local-receipt' for event in events)
 
+    future._publish_boundary_result(
+        process.BoundaryResult(
+            future.guardian_identity,
+            process.InvocationOutcome(
+                process.InvocationOutcomeKind.CANCELLED,
+                error=concurrent.futures.CancelledError())))
+    monitor.join(timeout=2)
 
-@pytest.mark.asyncio
-async def test_marker_cleanup_error_does_not_suppress_quiescence_receipt(
-        isolated_database, reset_sigterm_gate, monkeypatch):
-    req = requests_lib.Request(request_id='marker-cleanup-error',
-                               name='test',
-                               entrypoint=_gate_clears_after_success_entrypoint,
-                               request_body=payloads.RequestBody(),
-                               status=requests_lib.RequestStatus.PENDING,
-                               created_at=0.0,
-                               user_id='test-user')
-    assert await requests_lib.create_if_not_exists_async(req) is True
-    marker = mock.Mock()
-    marker.unlink.side_effect = PermissionError('marker cannot be removed')
-    monkeypatch.setattr(executor.request_storage,
-                        'execution_cancellation_marker_path',
-                        lambda *_args, **_kwargs: marker)
-    acknowledge = mock.Mock()
-    monkeypatch.setattr(executor, '_acknowledge_execution_quiescence',
-                        acknowledge)
-
-    executor._request_execution_wrapper('marker-cleanup-error', False, 0, 14,
-                                        'claim-token')
-
-    marker.unlink.assert_called_once_with()
-    acknowledge.assert_called_once_with(
-        executor.request_storage.ExecutionClaim('marker-cleanup-error', 14,
-                                                'claim-token'))
+    assert not monitor.is_alive()
+    assert events == [
+        'await-boundary',
+        ('receipt-attempt', ('local-boundary-cancel', 123, 456)),
+        ('retry-wait', 0.1),
+        ('receipt-attempt', ('local-boundary-cancel', 123, 456)),
+        'local-receipt',
+        'terminalized',
+        'boundary-release',
+        'capacity-free',
+    ]
 
 
 def _gate_clears_after_success_entrypoint():
     return 'ok'
 
 
-def _gated_sigterm_entrypoint():
-    claim = executor.request_storage.active_execution_claim()
-    assert claim is not None
-    executor.request_storage.arm_execution_cancellation(os.getpid(), claim)
-    executor._gated_sigterm_handler(signal.SIGTERM, None)
-
-
-def _install_gated_handler_in_worker():
-    import signal as _signal
-
-    from sky.server.requests import executor as _executor
-    _signal.signal(_signal.SIGTERM, _executor._gated_sigterm_handler)
-    _executor._in_request_execution = False
-
-
-def _install_observed_gated_handler_in_worker(observed_path):
-    import signal as _signal
-
-    from sky.server.requests import executor as _executor
-
-    def observed_handler(signum, frame):
-        pathlib.Path(observed_path).touch()
-        _executor._gated_sigterm_handler(signum, frame)
-
-    _signal.signal(_signal.SIGTERM, observed_handler)
-    _executor._in_request_execution = False
-
-
 def _worker_pid():
     return os.getpid()
-
-
-def _identity(x):
-    return x
-
-
-def _run_token_gated_invocation(request_id, generation, token, ready_path,
-                                release_path):
-    from sky.server.requests import executor as _executor
-    from sky.server.requests import storage as _storage
-
-    claim = _storage.ExecutionClaim(request_id, generation, token)
-    _executor._execution_cancellation_marker = (
-        _storage.execution_cancellation_marker_path(os.getpid(), claim))
-    _executor._in_request_execution = True
-    pathlib.Path(ready_path).touch()
-    try:
-        deadline = time.time() + 10
-        while not pathlib.Path(release_path).exists():
-            if time.time() >= deadline:
-                raise TimeoutError('release marker was not created')
-            time.sleep(0.01)
-        return os.getpid()
-    finally:
-        _executor._in_request_execution = False
-        _executor._execution_cancellation_marker = None
-
-
-def test_delayed_signal_for_reused_pid_does_not_cancel_next_invocation(
-        tmp_path):
-    """A stale exact marker cannot authorize interruption of generation B."""
-    import signal as _signal
-
-    from sky.server.requests import storage as _storage
-
-    ready = tmp_path / 'ready'
-    release = tmp_path / 'release'
-    observed = tmp_path / 'signal-observed'
-    claim_a = _storage.ExecutionClaim('request-a', 1, 'claim-a')
-    with concurrent.futures.ProcessPoolExecutor(
-            max_workers=1,
-            initializer=_install_observed_gated_handler_in_worker,
-            initargs=(str(observed),)) as pool:
-        pid = pool.submit(_worker_pid).result(timeout=10)
-        stale_marker = _storage.arm_execution_cancellation(pid, claim_a)
-        future_b = pool.submit(_run_token_gated_invocation, 'request-b', 2,
-                               'claim-b', str(ready), str(release))
-        deadline = time.time() + 10
-        while not ready.exists():
-            assert time.time() < deadline
-            time.sleep(0.01)
-
-        os.kill(pid, _signal.SIGTERM)
-        deadline = time.time() + 10
-        while not observed.exists():
-            assert time.time() < deadline
-            time.sleep(0.01)
-        assert not future_b.done()
-        release.touch()
-        assert future_b.result(timeout=10) == pid
-        _storage.clear_execution_cancellation(stale_marker)
 
 
 def _install_executor_process_title():
@@ -2601,42 +3198,6 @@ def test_pid_owner_check_accepts_real_thread_dispatcher_topology():
             max_workers=1, initializer=_install_executor_process_title) as pool:
         pid = pool.submit(_worker_pid).result(timeout=10)
         assert request_postgres._is_owned_executor_process(pid)
-
-
-def test_idle_worker_survives_sigterm_with_gated_handler():
-    """Regression: SIGTERM to an idle worker must not break the pool.
-
-    With the bare _sigterm_handler (always raises KI), the post-SIGTERM
-    submit below fails with BrokenProcessPool.
-    """
-    import signal as _signal
-    with concurrent.futures.ProcessPoolExecutor(
-            max_workers=2,
-            initializer=_install_gated_handler_in_worker) as pool:
-        pid = pool.submit(_worker_pid).result(timeout=10)
-        os.kill(pid, _signal.SIGTERM)
-
-        # Poll-submit until signal delivers; bug surfaces on first attempt.
-        deadline = time.time() + 5
-        last_exc = None
-        while time.time() < deadline:
-            try:
-                result = pool.submit(_identity, 'alive').result(timeout=5)
-                assert result == 'alive'
-                last_exc = None
-                break
-            except concurrent.futures.process.BrokenProcessPool as e:
-                last_exc = e
-                break
-            except Exception as e:  # pylint: disable=broad-except
-                last_exc = e
-                time.sleep(0.1)
-        assert last_exc is None, (
-            f'Pool should remain usable after SIGTERM to an idle worker, '
-            f'but got: {type(last_exc).__name__}: {last_exc}')
-
-        for i in range(3):
-            assert pool.submit(_identity, i).result(timeout=5) == i
 
 
 # ---- Workspace resolution info log -------------------------------------
@@ -2664,7 +3225,7 @@ def resolver_log_deps(monkeypatch, stub_override_request_env_deps):
     """Pin the resolver gate to ON and stub the resolver itself."""
     monkeypatch.setattr(
         'sky.server.requests.executor._should_apply_workspace_resolver',
-        lambda is_daemon, client_api_version: True)
+        lambda client_api_version: True)
     return monkeypatch
 
 
