@@ -176,8 +176,25 @@
           "replicas": 1
         },
         "kueue_webhooks": {
-          "mutating": "kueue-mutating-webhook-configuration",
-          "validating": "kueue-validating-webhook-configuration"
+          "mutating": {
+            "configuration_name": "kueue-mutating-webhook-configuration",
+            "operations": [
+              "CREATE"
+            ],
+            "path": "/mutate--v1-pod",
+            "webhook_name": "mpod.kb.io"
+          },
+          "service_name": "kueue-webhook-service",
+          "service_port": 443,
+          "validating": {
+            "configuration_name": "kueue-validating-webhook-configuration",
+            "operations": [
+              "CREATE",
+              "UPDATE"
+            ],
+            "path": "/validate--v1-pod",
+            "webhook_name": "vpod.kb.io"
+          }
         },
         "namespace_uid": "9e0fd87d-3d6f-4a32-8ec8-83472df0f34a",
         "node_inventory": [
@@ -252,8 +269,25 @@
           "replicas": 1
         },
         "kueue_webhooks": {
-          "mutating": "kueue-mutating-webhook-configuration",
-          "validating": "kueue-validating-webhook-configuration"
+          "mutating": {
+            "configuration_name": "kueue-mutating-webhook-configuration",
+            "operations": [
+              "CREATE"
+            ],
+            "path": "/mutate--v1-pod",
+            "webhook_name": "mpod.kb.io"
+          },
+          "service_name": "kueue-webhook-service",
+          "service_port": 443,
+          "validating": {
+            "configuration_name": "kueue-validating-webhook-configuration",
+            "operations": [
+              "CREATE",
+              "UPDATE"
+            ],
+            "path": "/validate--v1-pod",
+            "webhook_name": "vpod.kb.io"
+          }
         },
         "namespace_uid": "f7eec6c5-6461-4d0c-83c5-85319854cf17",
         "node_inventory": [

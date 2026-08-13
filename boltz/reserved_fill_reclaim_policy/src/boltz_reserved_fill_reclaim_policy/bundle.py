@@ -306,9 +306,32 @@ def _validate_provider_context(value: object, path: str) -> None:
     for key, item in admission.items():
         _text(item, f'{path}.admission_policy.{key}')
     webhooks = _mapping(context['kueue_webhooks'], f'{path}.kueue_webhooks')
-    _exact_keys(webhooks, {'mutating', 'validating'}, f'{path}.kueue_webhooks')
-    for key, item in webhooks.items():
-        _text(item, f'{path}.kueue_webhooks.{key}')
+    _exact_keys(webhooks,
+                {'mutating', 'service_name', 'service_port', 'validating'},
+                f'{path}.kueue_webhooks')
+    _text(webhooks['service_name'], f'{path}.kueue_webhooks.service_name')
+    service_port = _integer(webhooks['service_port'],
+                            f'{path}.kueue_webhooks.service_port')
+    if service_port < 1 or service_port > 65535:
+        raise BundleValidationError(
+            f'{path}.kueue_webhooks.service_port is invalid.')
+    for kind, required_operations in (('mutating', ('CREATE',)),
+                                      ('validating', ('CREATE', 'UPDATE'))):
+        contract = _mapping(webhooks[kind], f'{path}.kueue_webhooks.{kind}')
+        _exact_keys(
+            contract,
+            {'configuration_name', 'operations', 'path', 'webhook_name'},
+            f'{path}.kueue_webhooks.{kind}')
+        for key in ('configuration_name', 'path', 'webhook_name'):
+            _text(contract[key], f'{path}.kueue_webhooks.{kind}.{key}')
+        operations = tuple(
+            _text(item, f'{path}.kueue_webhooks.{kind}.operations')
+            for item in _list(contract['operations'],
+                              f'{path}.kueue_webhooks.{kind}.operations'))
+        if operations != required_operations:
+            raise BundleValidationError(
+                f'{path}.kueue_webhooks.{kind} does not intercept the exact '
+                'reviewed Pod operations.')
 
     flavors = _list(context['resource_flavors'], f'{path}.resource_flavors')
     if not flavors:

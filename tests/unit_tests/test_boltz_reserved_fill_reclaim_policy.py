@@ -133,6 +133,13 @@ def test_bundle_requires_one_node_contract_per_provider_flavor():
                        match='selector is not owned'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
+    document = _bundle_document()
+    document['provider_inventory']['contexts'][0]['kueue_webhooks'][
+        'validating']['operations'] = ['CREATE']
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exact reviewed Pod operations'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
 
 def _admission(context: dict,
                accelerator: str) -> reclaim.ReclaimProjectedAdmission:
@@ -224,6 +231,56 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
             deadline_monotonic=time.monotonic() + 5)
         assert authorization.scope == scope
         assert authorization.identity == identity
+
+
+def test_one_context_can_claim_multiple_exact_card_edges(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    attest = mock.Mock(side_effect=_fake_attest(policy))
+    monkeypatch.setattr(policy, '_attest_contexts', attest)
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    edges = tuple(sorted((_edge(context, 'a100'), _edge(context, 'a100-80gb'))))
+    scope = reclaim.ReclaimClaimSetScope(
+        service_name='east-all-cards',
+        service_incarnation='incarnation-east-all-cards',
+        service_version=1,
+        semantic_hash='semantic-east-all-cards',
+        edges=edges)
+
+    authorization = policy.authorize_claim_set(
+        scope,
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=7,
+        deadline_monotonic=time.monotonic() + 5)
+
+    assert authorization.scope == scope
+    assert attest.call_args.args[0] == ('prod_research_cluster_eks',)
+
+
+def test_claim_set_rejects_duplicate_physical_card_atom(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    provider_calls = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    first = _edge(context, 'a100')
+    second_admission = dataclasses.replace(first.projected_admissions[0],
+                                           worker_projection_sha256='b' * 64)
+    second = dataclasses.replace(first,
+                                 projected_admissions=(second_admission,))
+    scope = reclaim.ReclaimClaimSetScope(
+        service_name='duplicate-east-card',
+        service_incarnation='incarnation-duplicate-east-card',
+        service_version=1,
+        semantic_hash='semantic-duplicate-east-card',
+        edges=tuple(sorted((first, second))))
+
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='same physical accelerator pool twice'):
+        policy.authorize_claim_set(scope,
+                                   expected_identity=policy.policy_identity(),
+                                   expected_gate_generation=7,
+                                   deadline_monotonic=time.monotonic() + 5)
+    provider_calls.assert_not_called()
 
 
 def test_static_admission_mismatch_makes_no_provider_calls(monkeypatch):
@@ -490,6 +547,51 @@ def _deployment(contract: dict, image_key: str) -> dict:
     }
 
 
+def _pod_webhook_configuration(contract: dict, controller: dict, *,
+                               mutating: bool) -> dict:
+    pod_contract = contract['mutating' if mutating else 'validating']
+    webhook = {
+        'admissionReviewVersions': ['v1'],
+        'clientConfig': {
+            'caBundle': 'reviewed-ca',
+            'service': {
+                'name': contract['service_name'],
+                'namespace': controller['namespace'],
+                'path': pod_contract['path'],
+                'port': contract['service_port'],
+            },
+        },
+        'failurePolicy': 'Fail',
+        'matchPolicy': 'Equivalent',
+        'name': pod_contract['webhook_name'],
+        'namespaceSelector': {
+            'matchExpressions': [{
+                'key': 'kubernetes.io/metadata.name',
+                'operator': 'NotIn',
+                'values': ['kube-system', controller['namespace']],
+            }],
+        },
+        'objectSelector': {},
+        'rules': [{
+            'apiGroups': [''],
+            'apiVersions': ['v1'],
+            'operations': copy.deepcopy(pod_contract['operations']),
+            'resources': ['pods'],
+            'scope': '*',
+        }],
+        'sideEffects': 'None',
+        'timeoutSeconds': 10,
+    }
+    if mutating:
+        webhook['reinvocationPolicy'] = 'Never'
+    return {
+        'metadata': {
+            'name': pod_contract['configuration_name'],
+        },
+        'webhooks': [webhook],
+    }
+
+
 def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     namespace = context['namespace']
     admission = provider['admission_policy']
@@ -647,32 +749,12 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                 },
             },
         },
-        'validating_webhook': {
-            'metadata': {
-                'name': webhooks['validating']
-            },
-            'webhooks': [{
-                'failurePolicy': 'Fail',
-                'clientConfig': {
-                    'service': {
-                        'namespace': controller['namespace']
-                    }
-                },
-            }],
-        },
-        'mutating_webhook': {
-            'metadata': {
-                'name': webhooks['mutating']
-            },
-            'webhooks': [{
-                'failurePolicy': 'Fail',
-                'clientConfig': {
-                    'service': {
-                        'namespace': controller['namespace']
-                    }
-                },
-            }],
-        },
+        'validating_webhook': _pod_webhook_configuration(webhooks,
+                                                         controller,
+                                                         mutating=False),
+        'mutating_webhook': _pod_webhook_configuration(webhooks,
+                                                       controller,
+                                                       mutating=True),
     }
 
 
@@ -722,6 +804,20 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
         'resourceRules'][0].__setitem__('operations', None), 'invalid'),
     (lambda snapshot: snapshot['research_cluster_queue']['spec']['preemption'].
      __setitem__('reclaimWithinCohort', 'Never'), 'reclaim contract'),
+    (lambda snapshot: snapshot['validating_webhook']['webhooks'][0].__setitem__(
+        'rules', []), 'Pod admission contract'),
+    (lambda snapshot: snapshot['validating_webhook']['webhooks'][0]['rules'][0].
+     __setitem__('operations', ['CREATE']), 'Pod admission contract'),
+    (lambda snapshot: snapshot['validating_webhook']['webhooks'][0][
+        'clientConfig']['service'].__setitem__('name', 'unrelated-webhook'),
+     'Pod admission contract'),
+    (lambda snapshot: snapshot['mutating_webhook']['webhooks'][0][
+        'clientConfig']['service'].__setitem__('path', '/unrelated'),
+     'Pod admission contract'),
+    (lambda snapshot: snapshot['mutating_webhook']['webhooks'][0][
+        'clientConfig'].__setitem__('caBundle', ''), 'Pod admission contract'),
+    (lambda snapshot: snapshot['mutating_webhook']['webhooks'][0].__setitem__(
+        'namespaceSelector', {}), 'Pod admission contract'),
 ])
 def test_kubernetes_snapshot_fails_closed_on_drift(mutation, match):
     bundle = bundle_lib.load_embedded_bundle()

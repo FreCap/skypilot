@@ -360,11 +360,19 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if not isinstance(scope, reclaim.ReclaimClaimSetScope):
             raise reclaim.ReclaimAttestationError(
                 'The claim authorization scope is not typed.')
-        context_names = tuple(self._require_edge(edge) for edge in scope.edges)
-        if len(context_names) != len(set(context_names)):
-            raise reclaim.ReclaimAttestationError(
-                'One service cannot claim the same physical context twice.')
-        proofs = self._attest_contexts(context_names, deadline_monotonic)
+        context_names: list[str] = []
+        physical_card_atoms: set[tuple[str, str]] = set()
+        for edge in scope.edges:
+            context_names.append(self._require_edge(edge))
+            edge_atoms = {(edge.physical_cluster_uid, accelerator)
+                          for accelerator in edge.accelerator_names}
+            if physical_card_atoms.intersection(edge_atoms):
+                raise reclaim.ReclaimAttestationError(
+                    'One service cannot claim the same physical accelerator '
+                    'pool twice.')
+            physical_card_atoms.update(edge_atoms)
+        proofs = self._attest_contexts(tuple(sorted(set(context_names))),
+                                       deadline_monotonic)
         completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimClaimAuthorization(

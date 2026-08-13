@@ -306,22 +306,64 @@ def _validate_admission_policy(policy: Mapping[str, Any], binding: Mapping[str,
             'The queue-name admission-policy binding is not exact and Deny.')
 
 
-def _validate_webhook(value: Mapping[str, Any], *, name: str,
-                      namespace: str) -> None:
-    _metadata(value, name=name)
-    webhooks = _list(value.get('webhooks'), f'{name} webhooks')
-    if not webhooks:
-        raise KubernetesAttestationError(
-            f'Webhook configuration {name!r} is empty.')
+def _validate_webhook(value: Mapping[str, Any], *, contract: Mapping[str, Any],
+                      service_name: str, service_port: int, namespace: str,
+                      mutating: bool) -> None:
+    configuration_name = contract['configuration_name']
+    _metadata(value, name=configuration_name)
+    webhooks = _list(value.get('webhooks'), f'{configuration_name} webhooks')
+    matching = []
     for webhook in webhooks:
-        webhook_mapping = _dict(webhook, f'{name} webhook')
-        client_config = _dict(webhook_mapping.get('clientConfig'),
-                              f'{name} webhook client')
-        service = _dict(client_config.get('service'), f'{name} webhook service')
-        if (webhook_mapping.get('failurePolicy') != 'Fail' or
-                service.get('namespace') != namespace):
-            raise KubernetesAttestationError(
-                f'Webhook configuration {name!r} is not fail closed.')
+        webhook_mapping = _dict(webhook, f'{configuration_name} webhook')
+        if webhook_mapping.get('name') == contract['webhook_name']:
+            matching.append(webhook_mapping)
+    if len(matching) != 1:
+        raise KubernetesAttestationError(
+            f'Webhook configuration {configuration_name!r} does not contain '
+            'one exact Kueue Pod admission webhook.')
+
+    webhook = matching[0]
+    client_config = _dict(webhook.get('clientConfig'),
+                          f'{configuration_name} Pod webhook client')
+    service = _dict(client_config.get('service'),
+                    f'{configuration_name} Pod webhook service')
+    expected_service = {
+        'name': service_name,
+        'namespace': namespace,
+        'path': contract['path'],
+        'port': service_port,
+    }
+    ca_bundle = client_config.get('caBundle')
+    expected_selector = {
+        'matchExpressions': [{
+            'key': 'kubernetes.io/metadata.name',
+            'operator': 'NotIn',
+            'values': ['kube-system', namespace],
+        }]
+    }
+    expected_rule = [{
+        'apiGroups': [''],
+        'apiVersions': ['v1'],
+        'operations': contract['operations'],
+        'resources': ['pods'],
+        'scope': '*',
+    }]
+    expected_reinvocation = 'Never' if mutating else None
+    if (service != expected_service or client_config.get('url') is not None or
+            type(ca_bundle) is not str or not ca_bundle or
+            webhook.get('failurePolicy') != 'Fail' or
+            webhook.get('matchPolicy') != 'Equivalent' or
+            webhook.get('sideEffects') != 'None' or
+            webhook.get('timeoutSeconds') != 10 or
+            webhook.get('admissionReviewVersions') != ['v1'] or
+            webhook.get('reinvocationPolicy') != expected_reinvocation or
+            webhook.get('namespaceSelector') != expected_selector or
+            webhook.get('objectSelector') != {} or
+            webhook.get('matchConditions') not in (None, []) or
+            webhook.get('rules') != expected_rule):
+        raise KubernetesAttestationError(
+            f'Webhook configuration {configuration_name!r} does not route '
+            'the exact fail-closed Pod admission contract to Kueue.')
 
 
 def _validate_node_inventory(
@@ -517,12 +559,18 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     webhooks = provider_context['kueue_webhooks']
     _validate_webhook(_dict(snapshot.get('validating_webhook'),
                             'validating webhook'),
-                      name=webhooks['validating'],
-                      namespace=controller['namespace'])
+                      contract=webhooks['validating'],
+                      service_name=webhooks['service_name'],
+                      service_port=webhooks['service_port'],
+                      namespace=controller['namespace'],
+                      mutating=False)
     _validate_webhook(_dict(snapshot.get('mutating_webhook'),
                             'mutating webhook'),
-                      name=webhooks['mutating'],
-                      namespace=controller['namespace'])
+                      contract=webhooks['mutating'],
+                      service_name=webhooks['service_name'],
+                      service_port=webhooks['service_port'],
+                      namespace=controller['namespace'],
+                      mutating=True)
     return KubernetesContextProof(
         kubernetes_context=fleet_context['kubernetes_context'],
         physical_cluster_uid=fleet_context['physical_cluster_uid'],
@@ -675,12 +723,12 @@ def attest_context(fleet_context: Mapping[str, Any],
                 'validating_webhook': _serialized(
                     client,
                     admission.read_validating_webhook_configuration(
-                        webhooks['validating'],
+                        webhooks['validating']['configuration_name'],
                         _request_timeout=kubernetes_adaptor.API_TIMEOUT)),
                 'mutating_webhook': _serialized(
                     client,
                     admission.read_mutating_webhook_configuration(
-                        webhooks['mutating'],
+                        webhooks['mutating']['configuration_name'],
                         _request_timeout=kubernetes_adaptor.API_TIMEOUT)),
             }
             proof = validate_snapshot(fleet_context, provider_context, snapshot)
