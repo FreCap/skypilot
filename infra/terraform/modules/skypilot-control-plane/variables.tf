@@ -597,6 +597,33 @@ variable "extra_helm_values" {
   default     = ""
 }
 
+variable "prior_helm_release_values" {
+  description = <<-EOT
+    Immutable capture of the existing Helm release's user-supplied values for
+    a reviewed in-place upgrade. When set, the module enables Helm
+    reuse_values and applies this capture before generated values and
+    extra_helm_values. The capture is therefore both the reproducible render
+    baseline and an explicit guard against silently dropping release-only
+    database, authentication, or operator settings. Capture with
+    `helm get values <release> --namespace <namespace> -o yaml`; never put
+    secret material in the values document.
+  EOT
+  type = object({
+    yaml   = string
+    sha256 = string
+  })
+  default = null
+
+  validation {
+    condition = var.prior_helm_release_values == null || (
+      can(regex("^[0-9a-f]{64}$", var.prior_helm_release_values.sha256)) &&
+      sha256(var.prior_helm_release_values.yaml) == var.prior_helm_release_values.sha256 &&
+      can(keys(yamldecode(var.prior_helm_release_values.yaml)))
+    )
+    error_message = "prior_helm_release_values must contain a top-level YAML map and its exact lowercase SHA-256 digest."
+  }
+}
+
 variable "oauth_secretsmanager_key" {
   description = "AWS Secrets Manager secret name holding the OIDC client (JSON with client_id and client_secret). ESO materializes it into oauth_client_secret_name."
   type        = string

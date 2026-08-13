@@ -182,6 +182,43 @@ run "postgres_request_store_is_rendered" {
   }
 }
 
+run "existing_release_values_are_reused_in_helm_order" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        databaseConnection:
+          retainedSecretName: live-postgres
+        auth:
+          retainedOAuthSecret: live-oauth
+      EOT
+      sha256 = "163ffc4cb6866bc8a91767abedf526fcbdce18ac28be8a6629f8fc8e84810708"
+    }
+    extra_helm_values = <<-EOT
+      apiService:
+        replicas: 2
+    EOT
+  }
+
+  assert {
+    condition     = helm_release.skypilot.reuse_values
+    error_message = "An immutable prior-values capture must enable Helm reuse_values."
+  }
+
+  assert {
+    condition = (
+      length(helm_release.skypilot.values) == 3 &&
+      yamldecode(helm_release.skypilot.values[0]).databaseConnection.retainedSecretName == "live-postgres" &&
+      yamldecode(helm_release.skypilot.values[0]).auth.retainedOAuthSecret == "live-oauth" &&
+      !contains(keys(yamldecode(helm_release.skypilot.values[1])), "databaseConnection") &&
+      !contains(keys(yamldecode(helm_release.skypilot.values[1]).auth), "retainedOAuthSecret") &&
+      yamldecode(helm_release.skypilot.values[2]).apiService.replicas == 2
+    )
+    error_message = "Helm values must preserve release-only database/auth settings in the first layer, followed by generated values and planned overrides."
+  }
+}
+
 run "rwx_authority_fence_is_typed_and_composed" {
   command = plan
 
