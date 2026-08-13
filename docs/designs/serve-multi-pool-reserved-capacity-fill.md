@@ -1,8 +1,9 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: implementation and the exact automated freeze are complete after the
-identity-free worker-partition correction; adversarial review round 1 passed
-and rounds 2-3 are pending; not merged, deployed, or activated
+Status: Serve046 implementation and its exact automated freeze are complete;
+the separate Boltz reclaim-policy plugin is implemented and corrected against
+the 2026-08-13 live provider topology; platform prerequisites and three
+restarted adversarial reviews remain; not merged, deployed, or activated
 
 Last updated: 2026-08-13
 
@@ -866,13 +867,22 @@ the research queue. Its per-flavor borrowing limits are bounded by research's
 nominal GPU quota, and it has no preemption permission of its own. The research
 queue must retain `reclaimWithinCohort: Any`. The policy proves the exact
 LocalQueue target, both current Active ClusterQueues, cohort, namespace
-selectors, GPU flavor quotas, preemption policies, ResourceFlavor instance and
-GPU-product labels, WorkloadPriorityClass, Pod PriorityClass, immutable custom
-scheduler deployment, current Kueue controller, Pod integration,
+selectors, GPU flavor quotas, preemption policies, provider-owned
+ResourceFlavor instance selectors, WorkloadPriorityClass, Pod PriorityClass,
+immutable custom scheduler deployment, current Kueue controller, Pod
+integration,
 `AssignQueueLabelsForPods: true`, fail-closed Kueue webhooks, and the Deny
-queue-name admission-policy binding. The inference namespace UID and physical
-cluster UID are immutable inventory; replace either only by shipping a new
-bundle and normal fix-forward reauthorization.
+queue-name admission-policy binding. HyperPod remains the sole owner of its
+ResourceFlavors: the attestor proves each flavor's exact provider-owned
+instance selector, then cross-binds that selector to the GPU product label and
+`nvidia.com/gpu` capacity on the current physical cluster's Nodes. It requires
+at least one non-deleting Node for every reviewed flavor and rejects every
+non-deleting Node of that shape whose product or GPU capacity differs. Node
+readiness and allocatable occupancy remain physical-observation inputs, so a
+temporarily
+initializing Node is not misclassified as policy drift. The inference
+namespace UID and physical cluster UID are immutable inventory; replace either
+only by shipping a new bundle and normal fix-forward reauthorization.
 
 AWS absence is a positive proof, not an omitted check. For each context the
 plugin uses the hub writer's Pod Identity session to assume the exact spoke
@@ -912,8 +922,9 @@ activation, claim, and launch log payloads use schema 1 with `operation`,
 one record per attested context. Each AWS record includes
 `association_count`, `expected_role_arn`, and the explicit boolean
 `identity_absence_proven`; each Kubernetes record includes the physical and
-namespace UIDs, exact queue names, IRSA-absence result, and
-`assign_queue_labels_for_pods`. Failed CLI preflight returns exit 1 and only
+namespace UIDs, exact queue names, IRSA-absence result,
+`assign_queue_labels_for_pods`, and per-flavor non-deleting Node counts plus
+reviewed product/capacity. Failed CLI preflight returns exit 1 and only
 `{"schema_version":1,"operation":"preflight","success":false,
 "error_code":"ATTESTATION_FAILED"}`. Runtime activation and authorization
 fail closed with `ReclaimAttestationError`.
@@ -1645,20 +1656,38 @@ Regression tests exist for corrections 1--21, including owner-death,
 request-liveness, legacy-row retirement, runtime-daemon supervision,
 scheduler/bound-Node admission, capability bootstrap, and fixed managed-job
 slot ownership. The complete non-PostgreSQL matrix, changed-source lint, and
-Terraform module tests pass. Final serial PostgreSQL evidence and three
-consecutive adversarial passes remain required before merge.
+Terraform module tests pass. The exact serial PostgreSQL freeze and corrected
+deployment-policy matrix pass; three restarted consecutive adversarial passes
+remain required before merge.
 
 The audit also proved that BCL reclaim is a deployment prerequisite rather
-than a Pod-priority property. The current east1 evidence recorded by the Kueue
-design found no inference LocalQueue and a research ClusterQueue that excludes
-the inference namespace. Phoenix has standalone Kueue with topology-aware
-scheduling disabled, but its checked-in queue policy likewise covers only the
-research namespace. The `mt_hybrid` workspace selects both contexts while the
-control-plane configuration supplies no inference `kueue.local_queue_name` for
-either. Those topologies are not activation-capable. Open platform PR #8211 is
-Phoenix-only, currently conflicting, and explicitly leaves east unchanged.
-This SkyPilot change intentionally does not duplicate cluster queue policy in
-core.
+than a Pod-priority property. A read-only production audit on 2026-08-13 found
+that both east and PHX lack the inference `default` LocalQueue,
+`skyserve-inference-borrowed` ClusterQueue, and
+`skyserve-inference-low` WorkloadPriorityClass. Both already have the exact
+Pod PriorityClass at value -1000 with `preemptionPolicy: Never`, and both
+research ClusterQueues are Active with `reclaimWithinCohort: Any`. East's
+research GPU quotas are nominal 64/264 with borrowing limits 0/0; PHX is
+nominal 512 with borrowing limit 512. The inference service accounts have no
+IRSA annotation. East has one Pod Identity association,
+`a-rsvzwdtaesxvxorkh` to `research-dropzone-irsa`, but it belongs to the
+separate research namespace/service account; PHX has no association. The
+plugin filters and paginates by the exact projected inference namespace and
+service account, so the unrelated east research identity is preserved while
+the inference identity-free absence proof still requires zero exact matches.
+
+HyperPod's live ResourceFlavors are provider-owned and intentionally omit GPU
+product labels. East exposes 8 non-deleting `ml.p4d.24xlarge` Nodes with 8
+A100-40GB GPUs each and 33 `ml.p4de.24xlarge` Nodes with 8 A100-80GB GPUs each;
+PHX exposes 64 `ml.p5e.48xlarge` Nodes with 8 H200 GPUs each. The east
+ResourceFlavor selectors are the live beta/stable/HyperPod labels for p4d and
+beta/HyperPod labels for p4de; PHX has beta/stable/HyperPod labels for p5e.
+The queue-name Deny policy and binding are absent in east and present in PHX;
+Kueue webhooks fail closed in both. The current hub writer is forbidden from
+reading the required Namespace, ServiceAccount, queue, priority, flavor, Node,
+scheduler, controller, and admission objects in both spokes. These are exact
+platform IAM/RBAC and object gates; SkyPilot core does not duplicate their
+ownership.
 
 ### Status actually exposed
 
@@ -1718,7 +1747,7 @@ either case.
 | 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze passes; review pending. |
 | 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze passes; review pending. |
 | 2a | Full-fleet feature-image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
-| 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | Core interface/enforcement is implemented; no Boltz plugin/bundle exists, and current east/Phoenix evidence does not pass. |
+| 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separate plugin, strict bundle, Node cross-attestation, and unique entry point are implemented at `9de8484f5`; all 95 focused tests pass. They are not merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
 | 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; intentionally impossible in the generic feature build. |
 | 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | The stale draft is not mergeable as written; it must be reauthored from the exact frozen feature revision and remains merge-gated below. |
 
@@ -2094,6 +2123,13 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   `/tmp/feature-pg-chunk4-688521ffd.Ax9kzJ.xml` (121 tests). Process audits
   proved one pytest owner throughout each chunk and no PostgreSQL pytest
   remained after the freeze.
+- The corrected separate Boltz plugin at
+  `9de8484f5516eafccbe4788c7ef21957ed728650` passes all 95 focused tests across
+  the policy, packaging, overlay-manifest, release-version, and generic-policy
+  suites. Ruff, targeted mypy, changed-source pylint at 10.00/10, JSON parsing,
+  Python compilation, and `git diff --check` also pass. New tests reject a
+  missing or mismatched Node inventory, selector/product/capacity drift, and a
+  deleting-only flavor while accepting a non-Ready initializing Node.
 - No merge commit, deployment revision, activation result, live GPU fill, or
   BCL preemption result is claimed in this document yet.
 
@@ -2105,7 +2141,7 @@ update this file before the next round.
 
 | Round | Revision reviewed | Result | Material findings/fixes |
 |---|---|---|---|
-| 1 | Documentation `1e8ddf09589b16b46156200bc6359447f1282c2d`; behavior `688521ffd6cce0838b55c98fbb1196584116fc70` | PASS | No material findings. Rechecked serial spend admission, stale-authority revalidation, sequenced-path isolation, no paid spill/failover, exact Kueue and priority projection, explicit identity-free v2 fields, and guard-free indefinite scheduling waits followed by guarded reattestation. Activation remains correctly fail-closed until the Boltz policy bundle, split-role writer topology, and live queue evidence pass. |
+| 1 | pending restart over behavior `688521ffd`, plugin `9de8484f5`, and this exact design | pending | The historical PASS at documentation `1e8ddf095` is superseded and does not count: exact live ResourceFlavor and research-quota evidence materially corrected the deployment-policy contract. |
 | 2 | pending | pending | pending |
 | 3 | pending | pending | pending |
 
@@ -2232,8 +2268,9 @@ legacy activation.
 
 ## Open gates
 
-- Freeze the reviewed documentation-only evidence commit over exact behavior
-  revision `688521ffd6cce0838b55c98fbb1196584116fc70`.
+- Freeze the reviewed canonical-design evidence commit over exact behavior
+  revision `688521ffd6cce0838b55c98fbb1196584116fc70` and corrected policy revision
+  `9de8484f5516eafccbe4788c7ef21957ed728650`.
 - Complete and record three consecutive adversarial review passes.
 - Restack cleanup PR #1452 as the Serve047 successor over the frozen Serve046
   feature, including protocol-v1 projection-decoder removal and the enumerated
