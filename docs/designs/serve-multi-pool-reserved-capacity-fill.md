@@ -1,8 +1,8 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: implementation complete and behavior-frozen; the final serial
-PostgreSQL matrix and three consecutive adversarial reviews are pending; not
-merged, deployed, or activated
+Status: implementation complete after the identity-free worker-partition
+correction; the final full test freeze and three consecutive adversarial
+reviews are pending; not merged, deployed, or activated
 
 Last updated: 2026-08-13
 
@@ -72,10 +72,20 @@ digest. That split ownership could attest Pod priority `-1000/Never` while
 submitting a differently prioritized Kueue Workload, and a service update could
 reuse the old claim generation. The steady-state correction is worker
 placement projection protocol v2: one immutable version record owns namespace,
-service account, Pod priority, accelerator scheduling, LocalQueue, and
-WorkloadPriorityClass. Its canonical digest and service version are fenced
-through every durable stage. No reserved-fill-specific parallel projection is
-introduced.
+service account, explicit Pod Identity role or explicit identity-free state,
+Pod priority, accelerator scheduling, LocalQueue, and WorkloadPriorityClass.
+Its canonical digest and service version are fenced through every durable
+stage. No reserved-fill-specific parallel projection is introduced.
+
+The production inference partition intentionally has no AWS Pod Identity
+association. Protocol v2 therefore treats `pod_identity_role_arn: null` as a
+closed, hash-bound negative identity contract, not as a missing projection.
+Protocol v1 retains its historical non-null role requirement. The deployment
+policy receives the nullable value in every typed projected admission and must
+attest either the exact role association or its absence for the projected
+namespace/service-account pair. This keeps identity-bearing and identity-free
+partitions on the same canonical projection path without inventing a sentinel
+role or a deployment-specific compatibility branch.
 
 ## Historical context and incident evidence
 
@@ -828,7 +838,9 @@ The one interface owns three operations:
    by the durable launch fence.
 
 The typed policy view is derived from the worker projection; it is not another
-persisted projection schema. A claim edge stores only its exact closed
+persisted projection schema. It includes the exact nullable Pod Identity role,
+so a policy must verify positive identity and identity-free admission with the
+same interface. A claim edge stores only its exact closed
 accelerator-to-digest map beside its existing normalized identity. The full
 source remains the immutable version row. Claim replacement locks that row and
 recomputes every edge map before commit. A version or admission-only change
@@ -1398,7 +1410,9 @@ before activation. If it does not, the new image may deploy but the gate stays
 - `reserved_fill_projection_authority.py` is the canonical adapter from one
   immutable worker projection to typed reclaim admission. New writes emit
   homogeneous explicit projection protocol v2; sequenced paths require
-  non-null typed Kueue admission. Protocol v1 remains only as the historical
+  non-null typed Kueue admission. Protocol v2 supports both an exact AWS role
+  ARN and an explicit null identity contract, and the value is hash-bound and
+  exposed to the deployment policy. Protocol v1 remains only as the historical
   ordinary-launch decoder pending cleanup PR #1452.
 - API capability 77 advertises projection protocol v2; allocation-map schema 5
   binds service version and the closed digest map; ReplicaInfo v17 persists the
@@ -1959,11 +1973,13 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   overload diagnostic present on `origin/improvements`; the repository mypy
   target reaches six unrelated baseline/environment diagnostics in unchanged
   files. No feature-owned typing diagnostic remains.
-- Terraform 1.15.8 validates both changed spoke modules. The EKS module passes
-  all 43 tests and the RBAC module passes all 20 tests from their explicit
-  `terraform-tests` directories.
-- The final aggregate serial PostgreSQL run, exact frozen revision, and its
-  counts and timing remain to be recorded.
+- On the exact formatted behavior tree `a909cd4cc`, Terraform 1.15.8 validates
+  both changed spoke modules. The EKS module passes all 43 tests and the RBAC
+  module passes all 20 tests from their explicit `terraform-tests`
+  directories.
+- The final serial real-PostgreSQL matrix on the corrected identity-free
+  projection revision, and its exact commit, counts, and timing remain to be
+  recorded.
 - No merge commit, deployment revision, activation result, live GPU fill, or
   BCL preemption result is claimed in this document yet.
 
@@ -2117,8 +2133,11 @@ legacy activation.
   contract for every reserved context; current east1 evidence does not pass.
 - Ship its code-owned `ReservedFillReclaimPolicy` and ongoing claim-admission
   and launch fence in a second immutable Boltz deployment bundle. The policy
-  must consume and authorize the projected `scheduler_name` together with the
-  existing namespace, identity, priority, Kueue, and accelerator fields.
+  must consume and authorize the projected `scheduler_name` and nullable Pod
+  Identity role together with the existing namespace, service-account,
+  priority, Kueue, and accelerator fields. For the identity-free inference
+  partition it must positively prove that no Pod Identity association exists;
+  null is not permission to skip the check.
   Converge the full split-role fleet on that digest and repeat the
   pre-activation proof; no generic assertion bypass exists.
 - Perform initial activation and non-compute manual verification; later policy

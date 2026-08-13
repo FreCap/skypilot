@@ -37,6 +37,9 @@ def _worker_role(context='east'):
     return f'arn:aws:iam::123456789012:role/skyserve-worker-{context}'
 
 
+_USE_DEFAULT_WORKER_ROLE = object()
+
+
 def _accelerator_scheduling(accelerator='H200'):
     return {
         'label_key': 'nvidia.com/gpu.product',
@@ -50,7 +53,10 @@ def _worker_projection(*,
                        accelerator='H200',
                        protocol_version=1,
                        kueue_admission=None,
-                       scheduler_name='default-scheduler'):
+                       scheduler_name='default-scheduler',
+                       pod_identity_role_arn=_USE_DEFAULT_WORKER_ROLE):
+    if pod_identity_role_arn is _USE_DEFAULT_WORKER_ROLE:
+        pod_identity_role_arn = _worker_role(context)
     projection = {
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': context,
@@ -59,7 +65,7 @@ def _worker_projection(*,
         'priority_class_name': 'preemptible-inference-low',
         'priority_value': -1000,
         'preemption_policy': 'Never',
-        'pod_identity_role_arn': _worker_role(context),
+        'pod_identity_role_arn': pod_identity_role_arn,
         'accelerator_name': accelerator,
         'accelerator_count': 1,
         'accelerator_scheduling': _accelerator_scheduling(accelerator),
@@ -112,6 +118,35 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         kubernetes_identity.worker_projection_protocol_version({
             **v2, 'unknown': True
         })
+
+
+def test_worker_projection_v2_hashes_explicit_identity_free_partition():
+    admission = {
+        'local_queue_name': 'inference',
+        'workload_priority_class_name': 'inference-low',
+    }
+    identity_free = _worker_projection(protocol_version=2,
+                                       kueue_admission=admission,
+                                       pod_identity_role_arn=None)
+    identity_bearing = _worker_projection(protocol_version=2,
+                                          kueue_admission=admission,
+                                          pod_identity_role_arn=_worker_role())
+
+    assert identity_free['pod_identity_role_arn'] is None
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [identity_free], require_protocol_version=2) == [identity_free]
+    assert (kubernetes_identity.worker_projection_sha256(identity_free)
+            != kubernetes_identity.worker_projection_sha256(identity_bearing))
+
+
+def test_worker_projection_v1_still_requires_pod_identity_role():
+    projection = _worker_projection()
+    projection['pod_identity_role_arn'] = None
+
+    with pytest.raises(ValueError,
+                       match='pod_identity_role_arn must be a non-empty'):
+        kubernetes_identity.validate_worker_placement_projections(
+            [projection], require_protocol_version=1)
 
 
 @pytest.mark.parametrize('kueue_admission', [{
@@ -807,6 +842,50 @@ run: echo hi
             'workload_priority_class_name': 'inference-low',
         } for item in projected)
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
+
+
+def test_worker_catalog_preserves_identity_free_v2_candidates(monkeypatch):
+    task = task_lib.Task.from_yaml_str('''
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+run: echo hi
+''')
+    monkeypatch.setattr(
+        kubernetes_identity, '_catalog_candidates', lambda *_args, **_kwargs: [(
+            0, kubernetes_identity.clouds.Kubernetes(), 'phx', {
+                'H200': 1
+            }, {})])
+    monkeypatch.setattr(
+        kubernetes_identity, '_project_worker_location',
+        lambda context, *_args: {
+            'kubernetes_context': context,
+            'namespace': 'identity-free-inference',
+            'service_account_name': 'identity-free-worker',
+            'scheduler_name': 'gpu-binpack',
+            'priority_class_name': 'preemptible-inference-low',
+            'priority_value': -1000,
+            'preemption_policy': 'Never',
+            'pod_identity_role_arn': None,
+        })
+    monkeypatch.setattr(kubernetes_identity, '_project_cache',
+                        lambda _context, _workspace: {'kind': 'none'})
+    monkeypatch.setattr(
+        kubernetes_identity, '_project_worker_kueue_admission',
+        lambda _context, _workspace: {
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        })
+    monkeypatch.setattr(
+        kubernetes_identity, '_project_accelerator_scheduling', lambda _context,
+        accelerator, _workspace: _accelerator_scheduling(accelerator))
+
+    projected = kubernetes_identity.build_worker_placement_projections(
+        task, workspace='inference', placement_catalog={})
+
+    assert projected is not None
+    assert projected[0]['projection_version'] == 2
+    assert projected[0]['pod_identity_role_arn'] is None
 
 
 @pytest.mark.parametrize('resource_config', [

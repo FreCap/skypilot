@@ -495,12 +495,19 @@ def validate_worker_placement_projections(
             raise ValueError('Worker candidate IDs must be unique.')
         candidate_ids.add(candidate_id)
         for key in ('kubernetes_context', 'namespace', 'service_account_name',
-                    'accelerator_name', 'pod_identity_role_arn'):
+                    'accelerator_name'):
             _strict_nonempty_string(projection[key], f'Worker placement {key}')
-        if _AWS_ROLE_ARN_PATTERN.fullmatch(
-                projection['pod_identity_role_arn']) is None:
+        role_arn = projection['pod_identity_role_arn']
+        if candidate_protocol_version == 1:
+            role_arn = _strict_nonempty_string(
+                role_arn, 'Worker placement pod_identity_role_arn')
+        elif role_arn is not None:
+            role_arn = _strict_nonempty_string(
+                role_arn, 'Worker placement pod_identity_role_arn')
+        if (role_arn is not None and
+                _AWS_ROLE_ARN_PATTERN.fullmatch(role_arn) is None):
             raise ValueError('Worker placement pod_identity_role_arn must be '
-                             'an AWS IAM role ARN.')
+                             'null or an AWS IAM role ARN.')
         priority = projection['priority_class_name']
         if priority is not None:
             _strict_nonempty_string(priority,
@@ -564,7 +571,7 @@ def validate_worker_placement_projections(
             'priority_class_name': priority,
             'priority_value': priority_value,
             'preemption_policy': preemption_policy,
-            'pod_identity_role_arn': projection['pod_identity_role_arn'],
+            'pod_identity_role_arn': role_arn,
             'accelerator_name': projection['accelerator_name'],
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': scheduling,
@@ -1129,8 +1136,6 @@ def build_worker_placement_projections(
                 type(accelerator_count) is not int or accelerator_count < 1):
             return None
         identity = _project_worker_location(context, overrides, workspace)
-        if identity['pod_identity_role_arn'] is None:
-            return None
         projections.append({
             'projection_version': PLACEMENT_PROJECTION_PROTOCOL_VERSION,
             'candidate_id': f'kubernetes-{index:04d}',

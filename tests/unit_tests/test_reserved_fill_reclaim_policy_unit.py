@@ -70,6 +70,22 @@ def test_projected_admission_exposes_frozen_scheduler() -> None:
     assert _projected_admission().scheduler_name == 'default-scheduler'
 
 
+def test_projected_admission_exposes_frozen_pod_identity_contract() -> None:
+    assert (_projected_admission().pod_identity_role_arn ==
+            'arn:aws:iam::123456789012:role/inference-worker')
+
+    identity_free_projection = {
+        **_WORKER_PROJECTION,
+        'pod_identity_role_arn': None,
+    }
+    identity_free_digest = kubernetes_identity.worker_projection_sha256(
+        identity_free_projection)
+    admission = reclaim.projected_admission_from_worker_projection(
+        identity_free_projection, worker_projection_sha256=identity_free_digest)
+
+    assert admission.pod_identity_role_arn is None
+
+
 @pytest.fixture(autouse=True)
 def _valid_reclaim_gate_guard(monkeypatch):
     monkeypatch.setattr(serve_state,

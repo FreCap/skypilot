@@ -1,6 +1,7 @@
 """Tests for the deployment-owned reserved-fill reclaim proof boundary."""
 
 import concurrent.futures
+import dataclasses
 import threading
 
 import pytest
@@ -73,6 +74,7 @@ def _admission(
         kubernetes_context=context,
         namespace='inference',
         service_account_name='inference-sa',
+        pod_identity_role_arn=None,
         scheduler_name='default-scheduler',
         priority_class_name='inference-low',
         priority_value=-1000,
@@ -95,6 +97,11 @@ def _claim(context: str = 'research') -> attestation.ReservedContextClaim:
         accelerator_names=('a100-80gb',),
         projected_admissions=(_admission(context),),
     )
+
+
+def test_projected_admission_rejects_invalid_pod_identity_role() -> None:
+    with pytest.raises(ValueError, match='AWS IAM role ARN'):
+        dataclasses.replace(_admission(), pod_identity_role_arn='not-an-arn')
 
 
 def _evidence(
@@ -249,9 +256,9 @@ def test_activation_receipt_projection_is_deterministic() -> None:
     assert first.identity == _evidence(claims).identity
     assert first.claim_scope_count == 2
     assert first.claim_scope_sha256 == (
-        '6bb599490fb6f3e7d2d17bf5b8914dcef2fd294b0ccf6f8ce8de8082729861c2')
+        'e82a3712b3338d5f51db381b8d2b6334f7531966ddb26fefa17fb56134647ed1')
     assert first.evidence_sha256 == (
-        'be219f65bb2566b279358deed8453a0c773d176840d07657c76f18b78f2aef59')
+        'e288e49eafc559c56bfaab8bb458c6fd67e4c3d8a838cebb099493720c709bcf')
 
 
 @pytest.mark.parametrize(

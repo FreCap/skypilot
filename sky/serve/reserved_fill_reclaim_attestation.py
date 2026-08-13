@@ -24,6 +24,9 @@ import typing
 from typing import Final
 
 _SHA256_RE: Final = re.compile(r'^[0-9a-f]{64}$')
+_AWS_ROLE_ARN_RE: Final = re.compile(
+    r'^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
+    r'role/[A-Za-z0-9+=,.@_/-]+$')
 POLICY_ENTRY_POINT_GROUP: Final = 'skypilot.reserved_fill_reclaim_policy'
 POLICY_REVISION_MAX_BYTES: Final = 1024
 AUTHORIZATION_MAX_AGE_SECONDS: Final = 5.0
@@ -92,6 +95,7 @@ class ReclaimProjectedAdmission:
     kubernetes_context: str
     namespace: str
     service_account_name: str
+    pod_identity_role_arn: str | None
     scheduler_name: str
     priority_class_name: str
     priority_value: int
@@ -116,6 +120,12 @@ class ReclaimProjectedAdmission:
             ('accelerator', self.accelerator),
         ):
             _require_nonempty_text(value, name)
+        if self.pod_identity_role_arn is not None:
+            _require_nonempty_text(self.pod_identity_role_arn,
+                                   'pod_identity_role_arn')
+            if (_AWS_ROLE_ARN_RE.fullmatch(self.pod_identity_role_arn) is None):
+                raise ValueError('pod_identity_role_arn must be null or an '
+                                 'AWS IAM role ARN.')
         if (type(self.priority_value) is not int or
                 self.priority_value < -2147483648 or
                 self.priority_value > 1000000000):
@@ -154,6 +164,8 @@ def projected_admission_from_worker_projection(
         namespace=typing.cast(str, projection.get('namespace')),
         service_account_name=typing.cast(
             str, projection.get('service_account_name')),
+        pod_identity_role_arn=typing.cast(
+            str | None, projection.get('pod_identity_role_arn')),
         scheduler_name=typing.cast(str, projection.get('scheduler_name')),
         priority_class_name=priority_class_name,
         priority_value=priority_value,
