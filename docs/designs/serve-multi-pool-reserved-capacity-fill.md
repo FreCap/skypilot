@@ -2136,11 +2136,16 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   `/tmp/feature-pg-chunk4-688521ffd.Ax9kzJ.xml` (121 tests). Process audits
   proved one pytest owner throughout each chunk and no PostgreSQL pytest
   remained after the freeze.
-- The corrected separate Boltz plugin and generic policy interface pass all
-  113 tests in the focused superset across policy, packaging,
+- On integrated implementation revision
+  `244cc34fbfb61ba719691b33c92f93d039ef610f`, the corrected separate Boltz
+  plugin and generic policy interface pass all 113 tests in the focused
+  superset across policy, packaging,
   overlay-manifest, release-version, attestation, and generic-interface
   suites. Ruff, targeted mypy, changed-source pylint at 10.00/10, JSON parsing,
-  Python compilation, and `git diff --check` also pass. New tests reject a
+  Python compilation, formatting, and `git diff --check` also pass. The
+  repository-wide mypy step reaches one unrelated baseline diagnostic in
+  unchanged `sky/server/common.py`; targeted feature mypy is clean. New tests
+  reject a
   missing or mismatched Node inventory, selector/product/capacity drift, and a
   deleting-only flavor while accepting a non-Ready initializing Node.
 - No merge commit, deployment revision, activation result, live GPU fill, or
