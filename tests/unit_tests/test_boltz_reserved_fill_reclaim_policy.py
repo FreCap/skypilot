@@ -195,9 +195,9 @@ def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
 
     def attest(names, _deadline):
         return {
-            name: _context_proof(policy._bundle.fleet_context(name),
-                                 policy._bundle.provider_context(name))
-            for name in names
+            name: _context_proof(
+                policy._bundle.fleet_context(name),
+                policy._bundle.provider_context(name)) for name in names
         }
 
     return attest

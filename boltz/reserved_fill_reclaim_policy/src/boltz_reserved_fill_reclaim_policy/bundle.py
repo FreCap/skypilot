@@ -364,8 +364,8 @@ def _validate_provider_context(value: object, path: str) -> None:
               f'{path}.node_inventory[{index}].product_label_value')
         _integer(node['capacity_per_node'],
                  f'{path}.node_inventory[{index}].capacity_per_node')
-        if (flavor_labels.get(inventory_flavor, {}).get(selector_key) !=
-                selector_value):
+        if (flavor_labels.get(inventory_flavor, {}).get(selector_key)
+                != selector_value):
             raise BundleValidationError(
                 f'{path}.node_inventory[{index}] selector is not owned by '
                 'its ResourceFlavor.')
@@ -528,10 +528,10 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
                 labels = flavor_labels.get(flavor)
                 node = node_inventory.get(flavor)
                 if (labels is None or node is None or
-                        labels.get(node['selector_label_key']) !=
-                        node['selector_label_value'] or
-                        node['product_label_key'] !=
-                        contract['product_label_key'] or
+                        labels.get(node['selector_label_key'])
+                        != node['selector_label_value'] or
+                        node['product_label_key']
+                        != contract['product_label_key'] or
                         node['product_label_value'] != product or
                         node['resource_name'] != contract['resource_name']):
                     raise BundleValidationError(

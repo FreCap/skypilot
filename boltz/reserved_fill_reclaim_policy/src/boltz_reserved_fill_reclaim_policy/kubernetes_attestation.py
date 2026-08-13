@@ -362,8 +362,8 @@ def _validate_node_inventory(
                 _dict(node.get('status'),
                       f'{name} Node status').get('capacity'),
                 f'{name} Node capacity')
-            if (labels.get(contract['product_label_key']) !=
-                    contract['product_label_value'] or
+            if (labels.get(contract['product_label_key'])
+                    != contract['product_label_value'] or
                     capacity.get(contract['resource_name']) != str(
                         contract['capacity_per_node'])):
                 raise KubernetesAttestationError(
@@ -392,9 +392,9 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     admission_contract = provider_context['admission_policy']
     labels = _dict(namespace_metadata.get('labels', {}), 'Namespace labels')
     if (namespace_metadata.get('uid') != provider_context['namespace_uid'] or
-            _dict(namespace.get('status'), 'Namespace status').get('phase') !=
-            'Active' or labels.get(admission_contract['namespace_label_key']) !=
-            admission_contract['namespace_label_value']):
+            _dict(namespace.get('status'), 'Namespace status').get('phase')
+            != 'Active' or labels.get(admission_contract['namespace_label_key'])
+            != admission_contract['namespace_label_value']):
         raise KubernetesAttestationError(
             'The inference Namespace identity or admission label is invalid.')
 
@@ -413,8 +413,8 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     _metadata(priority, name=fleet_context['priority_class']['name'])
     if (priority.get('value') != fleet_context['priority_class']['value'] or
             priority.get('globalDefault') is not False or
-            priority.get('preemptionPolicy') !=
-            fleet_context['priority_class']['preemption_policy']):
+            priority.get('preemptionPolicy')
+            != fleet_context['priority_class']['preemption_policy']):
         raise KubernetesAttestationError(
             'The Pod PriorityClass reclaim contract is invalid.')
     workload_priority = _dict(snapshot.get('workload_priority_class'),
@@ -432,8 +432,8 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
                     name=fleet_context['local_queue_name'],
                     namespace=namespace_name)
     local_queue_spec = _dict(local_queue.get('spec'), 'LocalQueue spec')
-    if (local_queue_spec.get('clusterQueue') !=
-            queue_contract['inference_cluster_queue'] or
+    if (local_queue_spec.get('clusterQueue')
+            != queue_contract['inference_cluster_queue'] or
             local_queue_spec.get('stopPolicy') not in (None, 'None')):
         raise KubernetesAttestationError(
             'The inference LocalQueue target is invalid.')
