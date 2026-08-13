@@ -1667,7 +1667,7 @@ def test_cleanup_retains_replica_when_teardown_identity_snapshot_changes():
     terminate.assert_not_called()
 
 
-def test_cleanup_retains_absent_protocol_v2_replica_as_failed_cleanup():
+def test_cleanup_retains_unproven_protocol_v2_replica_as_failed_cleanup():
     legacy = mock.Mock(replica_id=1,
                        replica_record_id='00000000-0000-4000-8000-000000000001',
                        cluster_name='svc-a-r1',
@@ -1702,6 +1702,11 @@ def test_cleanup_retains_absent_protocol_v2_replica_as_failed_cleanup():
          mock.patch.object(service.reserved_capacity,
                            'parse_protocol_v2_cleanup_fence',
                            side_effect=parse_cleanup_fence), \
+         mock.patch.object(
+             service.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(service.reserved_capacity.
+                           PhysicalReplicaPresence.UNPROVEN)), \
          mock.patch.object(serve_state,
                            'remove_replicas', return_value=True) as remove, \
          mock.patch.object(serve_state,
@@ -1734,6 +1739,67 @@ def test_cleanup_retains_absent_protocol_v2_replica_as_failed_cleanup():
                                     guard_launch_exclusion=False)
     assert (protocol_v2.status_property.sky_down_status ==
             service.common_utils.ProcessStatus.FAILED)
+    remove_one.assert_not_called()
+    terminate.assert_not_called()
+
+
+def test_cleanup_removes_provider_proven_absent_protocol_v2_replica():
+    protocol_v2 = mock.Mock(
+        replica_id=2,
+        replica_record_id='00000000-0000-4000-8000-000000000002',
+        cluster_name='svc-a-r2',
+        status_property=mock.Mock())
+    cleanup_fence = service.reserved_capacity.ProtocolV2CleanupFence(
+        kubernetes_context='phx-context', physical_cluster_uid='phx-uid')
+    lifecycle_lock = mock.Mock(epoch=31)
+    expected_owner = (4242, '10.4.7.7')
+
+    with mock.patch.object(serve_state,
+                           'get_replica_infos',
+                           return_value=[protocol_v2]), \
+         mock.patch.object(serve_state,
+                           'get_service_from_name', return_value=None), \
+         mock.patch.object(serve_state,
+                           'service_owner_matches', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'lifecycle_lock_is_valid', return_value=True), \
+         mock.patch.object(service.serve_utils,
+                           'get_service_lifecycle_epoch', return_value=31), \
+         mock.patch.object(service.serve_utils,
+                           'get_existing_replica_cluster_names',
+                           return_value=set()), \
+         mock.patch.object(service.reserved_capacity,
+                           'parse_protocol_v2_cleanup_fence',
+                           return_value=cleanup_fence), \
+         mock.patch.object(
+             service.reserved_capacity,
+             'probe_physical_replica_presence',
+             return_value=(service.reserved_capacity.
+                           PhysicalReplicaPresence.ABSENT)) as probe, \
+         mock.patch.object(serve_state,
+                           'remove_replicas', return_value=True) as remove, \
+         mock.patch.object(serve_state,
+                           'add_or_update_replica') as persist, \
+         mock.patch.object(serve_state, 'remove_replica') as remove_one, \
+         mock.patch.object(service,
+                           'cleanup_storage_intents', return_value=True), \
+         mock.patch.object(service.replica_managers,
+                           'terminate_cluster') as terminate:
+        failed = service._cleanup('svc', True, 'incarnation-a',
+                                  expected_owner[0], expected_owner[1],
+                                  lifecycle_lock)
+
+    assert not failed
+    probe.assert_called_once_with(cleanup_fence, protocol_v2.cluster_name)
+    remove.assert_called_once_with(
+        'svc', [protocol_v2.replica_id],
+        expected_service_hash='incarnation-a',
+        expected_lifecycle_epoch=31,
+        expected_controller_owner=expected_owner,
+        expected_replica_record_ids={
+            protocol_v2.replica_id: protocol_v2.replica_record_id
+        })
+    persist.assert_not_called()
     remove_one.assert_not_called()
     terminate.assert_not_called()
 

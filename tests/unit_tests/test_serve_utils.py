@@ -24,6 +24,7 @@ from sky.serve import constants
 from sky.serve import controller_transport
 from sky.serve import maintenance
 from sky.serve import ordinary_launch_binding
+from sky.serve import reserved_capacity
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -4916,7 +4917,7 @@ class TestTerminateFailedServices:
                                                expected_lifecycle_epoch=17)
         assert message is None
 
-    def test_protocol_v2_absent_cluster_retains_parent_and_history_barrier(
+    def test_protocol_v2_unproven_absence_retains_parent_and_history_barrier(
             self):
         info = self._replica(1, 'svc-1')
         cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
@@ -4924,7 +4925,12 @@ class TestTerminateFailedServices:
         with mock.patch(
                 'sky.serve.reserved_capacity.'
                 'parse_protocol_v2_cleanup_fence',
-                return_value=cleanup_fence):
+                return_value=cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.'
+                 'probe_physical_replica_presence',
+                 return_value=(reserved_capacity.
+                               PhysicalReplicaPresence.UNPROVEN)):
             (terminated, remove_service, _, message, set_owner_status,
              _) = self._run([info], exists=lambda _name: False)
 
@@ -4933,6 +4939,31 @@ class TestTerminateFailedServices:
         assert message is not None and 'could not be purged' in message
         assert set_owner_status.call_args.args[4] == (
             serve_state.ServiceStatus.FAILED_CLEANUP)
+        assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
+
+    def test_protocol_v2_provider_absence_removes_parent_and_rows(self):
+        info = self._replica(1, 'svc-1')
+        cleanup_fence = types.SimpleNamespace(kubernetes_context='phx-context',
+                                              physical_cluster_uid='phx-uid')
+        with mock.patch(
+                'sky.serve.reserved_capacity.'
+                'parse_protocol_v2_cleanup_fence',
+                return_value=cleanup_fence), \
+             mock.patch(
+                 'sky.serve.reserved_capacity.'
+                 'probe_physical_replica_presence',
+                 return_value=(reserved_capacity.
+                               PhysicalReplicaPresence.ABSENT)) as probe:
+            (terminated, remove_service, _, message, set_owner_status,
+             _) = self._run([info], exists=lambda _name: False)
+
+        assert not terminated
+        probe.assert_called_once_with(cleanup_fence, info.cluster_name)
+        remove_service.assert_called_once_with('svc',
+                                               'incarnation-a',
+                                               expected_lifecycle_epoch=17)
+        set_owner_status.assert_not_called()
+        assert message is None
         assert self.quiesce.call_args.kwargs['include_terminal_history'] is True
 
     def test_protocol_v2_present_cluster_forwards_exact_cleanup_fence(self):
