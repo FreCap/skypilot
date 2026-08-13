@@ -1,8 +1,8 @@
 # Multi-pool SkyServe reserved-capacity fill
 
 Status: implementation and the exact automated freeze are complete after the
-identity-free worker-partition correction; three consecutive adversarial
-reviews are pending; not merged, deployed, or activated
+identity-free worker-partition correction; adversarial review round 1 passed
+and rounds 2-3 are pending; not merged, deployed, or activated
 
 Last updated: 2026-08-13
 
@@ -2001,7 +2001,7 @@ update this file before the next round.
 
 | Round | Revision reviewed | Result | Material findings/fixes |
 |---|---|---|---|
-| 1 | pending | pending | pending |
+| 1 | Documentation `1e8ddf09589b16b46156200bc6359447f1282c2d`; behavior `688521ffd6cce0838b55c98fbb1196584116fc70` | PASS | No material findings. Rechecked serial spend admission, stale-authority revalidation, sequenced-path isolation, no paid spill/failover, exact Kueue and priority projection, explicit identity-free v2 fields, and guard-free indefinite scheduling waits followed by guarded reattestation. Activation remains correctly fail-closed until the Boltz policy bundle, split-role writer topology, and live queue evidence pass. |
 | 2 | pending | pending | pending |
 | 3 | pending | pending | pending |
 
