@@ -62,6 +62,10 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['accelerators']['h200']['product_label_values'] == [
         'NVIDIA-H200'
     ]
+    assert [
+        quota['borrowing_limit']
+        for quota in east['queues']['research_gpu_quotas']
+    ] == ['0', '0']
     assert all(quota['resource_name'] == 'nvidia.com/gpu'
                for context in (east, phx)
                for quota in context['queues']['inference_gpu_quotas'])
@@ -81,6 +85,7 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
             accelerator['product_label_values'].reverse()
     for context in reordered['provider_inventory']['contexts']:
         context['resource_flavors'].reverse()
+        context['node_inventory'].reverse()
     second = bundle_lib.parse_bundle_bytes(_encoded_bundle(reordered))
 
     assert first.fleet_bundle_sha256 == second.fleet_bundle_sha256
@@ -106,10 +111,26 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    document['provider_inventory']['contexts'][0]['resource_flavors'][0][
-        'node_labels']['nvidia.com/gpu.product'] = 'NVIDIA-H200'
+    document['provider_inventory']['contexts'][0]['node_inventory'][0][
+        'product_label_value'] = 'NVIDIA-H200'
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='reviewed flavor and product'):
+                       match='reviewed flavor, Node selector, and product'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+def test_bundle_requires_one_node_contract_per_provider_flavor():
+    document = _bundle_document()
+    document['provider_inventory']['contexts'][0]['node_inventory'].pop()
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='cover each ResourceFlavor once'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    document['provider_inventory']['contexts'][0]['node_inventory'][0][
+        'selector_label_value'] = 'ml.wrong'
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='selector is not owned'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
@@ -159,16 +180,24 @@ def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
             local_queue_name=context['local_queue_name'],
             cluster_queue_name=context['queues']['inference_cluster_queue'],
             pod_identity_irsa_annotation_absent=True,
-            assign_queue_labels_for_pods=True))
+            assign_queue_labels_for_pods=True,
+            node_flavors=tuple(
+                kubernetes_attestation.NodeFlavorProof(
+                    flavor=node['flavor'],
+                    non_deleting_node_count=1,
+                    product_label_value=node['product_label_value'],
+                    resource_name=node['resource_name'],
+                    capacity_per_node=node['capacity_per_node'])
+                for node in provider['node_inventory'])))
 
 
 def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
 
     def attest(names, _deadline):
         return {
-            name: _context_proof(
-                policy._bundle.fleet_context(name),
-                policy._bundle.provider_context(name)) for name in names
+            name: _context_proof(policy._bundle.fleet_context(name),
+                                 policy._bundle.provider_context(name))
+            for name in names
         }
 
     return attest
@@ -518,6 +547,31 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                 },
             } for flavor in provider['resource_flavors']
         },
+        'nodes': {
+            node['flavor']: {
+                'items': [{
+                    'metadata': {
+                        'name': f"initializing-{node['flavor']}",
+                        'labels': {
+                            node['selector_label_key']:
+                                node['selector_label_value'],
+                            node['product_label_key']:
+                                node['product_label_value'],
+                        },
+                    },
+                    'status': {
+                        'capacity': {
+                            node['resource_name']: str(node['capacity_per_node']
+                                                      )
+                        },
+                        'conditions': [{
+                            'type': 'Ready',
+                            'status': 'False',
+                        }],
+                    },
+                }]
+            } for node in provider['node_inventory']
+        },
         'scheduler': _deployment(provider['scheduler'], 'containers'),
         'kueue_controller': _deployment(controller, 'images'),
         'kueue_config': {
@@ -633,14 +687,25 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
     assert proof.cluster_queue_name == 'skyserve-inference-borrowed'
     assert proof.pod_identity_irsa_annotation_absent
     assert proof.assign_queue_labels_for_pods
+    assert proof.node_flavors == (kubernetes_attestation.NodeFlavorProof(
+        flavor='ml.p5e.48xlarge',
+        non_deleting_node_count=1,
+        product_label_value='NVIDIA-H200',
+        resource_name='nvidia.com/gpu',
+        capacity_per_node=8),)
 
 
 @pytest.mark.parametrize('mutation,match', [
     (lambda snapshot: snapshot['service_account']['metadata']['annotations'].
      update({'eks.amazonaws.com/role-arn': 'arn:unreviewed'}), 'IRSA'),
-    (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec'][
-        'nodeLabels'].__setitem__('nvidia.com/gpu.product', 'NVIDIA-A100'),
-     'reviewed GPU product'),
+    (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec']
+     ['nodeLabels'].__setitem__('beta.kubernetes.io/instance-type', 'ml.wrong'),
+     'instance selector'),
+    (lambda snapshot: snapshot['nodes'][
+        'ml.p5e.48xlarge']['items'][0]['metadata']['labels'].__setitem__(
+            'nvidia.com/gpu.product', 'NVIDIA-A100'), 'GPU product'),
+    (lambda snapshot: snapshot['nodes']['ml.p5e.48xlarge']['items'][0]['status']
+     ['capacity'].__setitem__('nvidia.com/gpu', '4'), 'GPU product'),
     (lambda snapshot: snapshot['local_queue']['spec'].__setitem__(
         'clusterQueue', 'wrong'), 'LocalQueue target'),
     (lambda snapshot: snapshot['kueue_config']['data'].__setitem__(
@@ -667,6 +732,43 @@ def test_kubernetes_snapshot_fails_closed_on_drift(mutation, match):
 
     with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
                        match=match):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+@pytest.mark.parametrize('nodes', [
+    [],
+    [{
+        'metadata': {
+            'name': 'terminating',
+            'deletionTimestamp': '2026-08-13T00:00:00Z',
+            'labels': {
+                'beta.kubernetes.io/instance-type': 'ml.p5e.48xlarge'
+            },
+        },
+    }],
+])
+def test_kubernetes_snapshot_requires_a_non_deleting_node(nodes):
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    snapshot['nodes']['ml.p5e.48xlarge']['items'] = nodes
+
+    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
+                       match='no non-deleting Node'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
+def test_kubernetes_snapshot_rejects_node_selector_mismatch():
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('phx_research_cluster_eks')
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    snapshot = _kubernetes_snapshot(context, provider)
+    snapshot['nodes']['ml.p5e.48xlarge']['items'][0]['metadata']['labels'][
+        'beta.kubernetes.io/instance-type'] = 'ml.wrong'
+
+    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
+                       match='instance selector'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 

@@ -237,7 +237,8 @@ def _validate_provider_context(value: object, path: str) -> None:
     _exact_keys(
         context, {
             'admission_policy', 'eks', 'kubernetes_context', 'kueue_controller',
-            'kueue_webhooks', 'namespace_uid', 'resource_flavors', 'scheduler'
+            'kueue_webhooks', 'namespace_uid', 'node_inventory',
+            'resource_flavors', 'scheduler'
         }, path)
     _text(context['kubernetes_context'], f'{path}.kubernetes_context')
     if _UUID_RE.fullmatch(
@@ -322,16 +323,61 @@ def _validate_provider_context(value: object, path: str) -> None:
             _text(flavor['name'], f'{path}.resource_flavors[{index}].name'))
         labels = _mapping(flavor['node_labels'],
                           f'{path}.resource_flavors[{index}].node_labels')
-        if (labels.get('node.kubernetes.io/instance-type') != flavor_names[-1]
-                or 'nvidia.com/gpu.product' not in labels):
+        if not labels:
             raise BundleValidationError(
-                f'{path}.resource_flavors[{index}] must bind its exact '
-                'instance type and GPU product.')
+                f'{path}.resource_flavors[{index}] must bind provider-owned '
+                'Node labels.')
         for key, item in labels.items():
             _text(key, f'{path}.resource_flavors[{index}] label key')
             _text(item, f'{path}.resource_flavors[{index}].{key}')
     if len(flavor_names) != len(set(flavor_names)):
         raise BundleValidationError(f'{path}.resource_flavors has duplicates.')
+
+    inventory = _list(context['node_inventory'], f'{path}.node_inventory')
+    if not inventory:
+        raise BundleValidationError(f'{path}.node_inventory must not be empty.')
+    inventory_flavors: list[str] = []
+    selectors: list[tuple[str, str]] = []
+    flavor_labels = {item['name']: item['node_labels'] for item in flavors}
+    for index, item in enumerate(inventory):
+        node = _mapping(item, f'{path}.node_inventory[{index}]')
+        _exact_keys(
+            node, {
+                'capacity_per_node', 'flavor', 'product_label_key',
+                'product_label_value', 'resource_name', 'selector_label_key',
+                'selector_label_value'
+            }, f'{path}.node_inventory[{index}]')
+        inventory_flavor = _text(node['flavor'],
+                                 f'{path}.node_inventory[{index}].flavor')
+        selector_key = _text(
+            node['selector_label_key'],
+            f'{path}.node_inventory[{index}].selector_label_key')
+        selector_value = _text(
+            node['selector_label_value'],
+            f'{path}.node_inventory[{index}].selector_label_value')
+        if (node['resource_name'] != 'nvidia.com/gpu' or
+                node['product_label_key'] != 'nvidia.com/gpu.product'):
+            raise BundleValidationError(
+                f'{path}.node_inventory[{index}] has an unsupported GPU '
+                'resource or product-label key.')
+        _text(node['product_label_value'],
+              f'{path}.node_inventory[{index}].product_label_value')
+        _integer(node['capacity_per_node'],
+                 f'{path}.node_inventory[{index}].capacity_per_node')
+        if (flavor_labels.get(inventory_flavor, {}).get(selector_key) !=
+                selector_value):
+            raise BundleValidationError(
+                f'{path}.node_inventory[{index}] selector is not owned by '
+                'its ResourceFlavor.')
+        inventory_flavors.append(inventory_flavor)
+        selectors.append((selector_key, selector_value))
+    if (len(inventory_flavors) != len(set(inventory_flavors)) or
+            set(inventory_flavors) != set(flavor_names)):
+        raise BundleValidationError(
+            f'{path}.node_inventory must cover each ResourceFlavor once.')
+    if len(selectors) != len(set(selectors)):
+        raise BundleValidationError(
+            f'{path}.node_inventory selectors must be unique.')
 
 
 def _canonical_bytes(value: object) -> bytes:
@@ -367,6 +413,9 @@ def _normalized_section(section: dict[str, Any]) -> dict[str, Any]:
         flavors = context.get('resource_flavors')
         if isinstance(flavors, list):
             flavors.sort(key=lambda item: item['name'])
+        node_inventory = context.get('node_inventory')
+        if isinstance(node_inventory, list):
+            node_inventory.sort(key=lambda item: item['flavor'])
     return normalized
 
 
@@ -455,11 +504,15 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
             item['name']: item['node_labels']
             for item in provider_context['resource_flavors']
         }
+        node_inventory = {
+            item['flavor']: item for item in provider_context['node_inventory']
+        }
         queue_flavors = {
             item['flavor']
             for item in fleet_context['queues']['inference_gpu_quotas']
         }
-        if queue_flavors != set(flavor_labels):
+        if (queue_flavors != set(flavor_labels) or
+                queue_flavors != set(node_inventory)):
             raise BundleValidationError(
                 f'{path} queue and provider flavor inventories disagree.')
         accelerator_flavors = {
@@ -473,11 +526,18 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
             for flavor, product in zip(contract['flavors'],
                                        contract['product_label_values']):
                 labels = flavor_labels.get(flavor)
-                if (labels is None or
-                        labels.get(contract['product_label_key']) != product):
+                node = node_inventory.get(flavor)
+                if (labels is None or node is None or
+                        labels.get(node['selector_label_key']) !=
+                        node['selector_label_value'] or
+                        node['product_label_key'] !=
+                        contract['product_label_key'] or
+                        node['product_label_value'] != product or
+                        node['resource_name'] != contract['resource_name']):
                     raise BundleValidationError(
                         f'{path} accelerator {accelerator!r} does not bind '
-                        'its reviewed flavor and product label.')
+                        'its reviewed flavor, Node selector, and product '
+                        'label.')
     normalized_fleet = _normalized_section(fleet)
     normalized_provider = _normalized_section(provider)
     fleet_sha = hashlib.sha256(_FLEET_HASH_DOMAIN +

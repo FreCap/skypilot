@@ -64,13 +64,13 @@
           "research_cluster_queue": "hyperpod-ns-research-clusterqueue",
           "research_gpu_quotas": [
             {
-              "borrowing_limit": "64",
+              "borrowing_limit": "0",
               "flavor": "ml.p4d.24xlarge",
               "nominal_quota": "64",
               "resource_name": "nvidia.com/gpu"
             },
             {
-              "borrowing_limit": "264",
+              "borrowing_limit": "0",
               "flavor": "ml.p4de.24xlarge",
               "nominal_quota": "264",
               "resource_name": "nvidia.com/gpu"
@@ -180,19 +180,40 @@
           "validating": "kueue-validating-webhook-configuration"
         },
         "namespace_uid": "9e0fd87d-3d6f-4a32-8ec8-83472df0f34a",
+        "node_inventory": [
+          {
+            "capacity_per_node": 8,
+            "flavor": "ml.p4d.24xlarge",
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_value": "NVIDIA-A100-SXM4-40GB",
+            "resource_name": "nvidia.com/gpu",
+            "selector_label_key": "beta.kubernetes.io/instance-type",
+            "selector_label_value": "ml.p4d.24xlarge"
+          },
+          {
+            "capacity_per_node": 8,
+            "flavor": "ml.p4de.24xlarge",
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_value": "NVIDIA-A100-SXM4-80GB",
+            "resource_name": "nvidia.com/gpu",
+            "selector_label_key": "beta.kubernetes.io/instance-type",
+            "selector_label_value": "ml.p4de.24xlarge"
+          }
+        ],
         "resource_flavors": [
           {
             "name": "ml.p4d.24xlarge",
             "node_labels": {
+              "beta.kubernetes.io/instance-type": "ml.p4d.24xlarge",
               "node.kubernetes.io/instance-type": "ml.p4d.24xlarge",
-              "nvidia.com/gpu.product": "NVIDIA-A100-SXM4-40GB"
+              "sagemaker.amazonaws.com/compute-type": "hyperpod"
             }
           },
           {
             "name": "ml.p4de.24xlarge",
             "node_labels": {
-              "node.kubernetes.io/instance-type": "ml.p4de.24xlarge",
-              "nvidia.com/gpu.product": "NVIDIA-A100-SXM4-80GB"
+              "beta.kubernetes.io/instance-type": "ml.p4de.24xlarge",
+              "sagemaker.amazonaws.com/compute-type": "hyperpod"
             }
           }
         ],
@@ -235,12 +256,24 @@
           "validating": "kueue-validating-webhook-configuration"
         },
         "namespace_uid": "f7eec6c5-6461-4d0c-83c5-85319854cf17",
+        "node_inventory": [
+          {
+            "capacity_per_node": 8,
+            "flavor": "ml.p5e.48xlarge",
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_value": "NVIDIA-H200",
+            "resource_name": "nvidia.com/gpu",
+            "selector_label_key": "beta.kubernetes.io/instance-type",
+            "selector_label_value": "ml.p5e.48xlarge"
+          }
+        ],
         "resource_flavors": [
           {
             "name": "ml.p5e.48xlarge",
             "node_labels": {
+              "beta.kubernetes.io/instance-type": "ml.p5e.48xlarge",
               "node.kubernetes.io/instance-type": "ml.p5e.48xlarge",
-              "nvidia.com/gpu.product": "NVIDIA-H200"
+              "sagemaker.amazonaws.com/compute-type": "hyperpod"
             }
           }
         ],

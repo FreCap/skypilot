@@ -34,6 +34,17 @@ class KubernetesAttestationError(RuntimeError):
 
 
 @dataclasses.dataclass(frozen=True)
+class NodeFlavorProof:
+    """Safe summary of one provider-owned flavor's current Nodes."""
+
+    flavor: str
+    non_deleting_node_count: int
+    product_label_value: str
+    resource_name: str
+    capacity_per_node: int
+
+
+@dataclasses.dataclass(frozen=True)
 class KubernetesContextProof:
     """Safe machine-readable result of one Kubernetes proof."""
 
@@ -44,6 +55,7 @@ class KubernetesContextProof:
     cluster_queue_name: str
     pod_identity_irsa_annotation_absent: bool
     assign_queue_labels_for_pods: bool
+    node_flavors: tuple[NodeFlavorProof, ...]
 
 
 def _dict(value: object, path: str) -> Mapping[str, Any]:
@@ -312,6 +324,64 @@ def _validate_webhook(value: Mapping[str, Any], *, name: str,
                 f'Webhook configuration {name!r} is not fail closed.')
 
 
+def _validate_node_inventory(
+        provider_context: Mapping[str, Any],
+        snapshot: Mapping[str, Any]) -> tuple[NodeFlavorProof, ...]:
+    observed_lists = _dict(snapshot.get('nodes'), 'Node inventory')
+    expected = {
+        item['flavor']: item for item in provider_context['node_inventory']
+    }
+    if set(observed_lists) != set(expected):
+        raise KubernetesAttestationError(
+            'The Node inventory does not cover every reviewed flavor.')
+    proofs: list[NodeFlavorProof] = []
+    for flavor in sorted(expected):
+        contract = expected[flavor]
+        node_list = _dict(observed_lists[flavor], f'{flavor} NodeList')
+        nodes = _list(node_list.get('items'), f'{flavor} Nodes')
+        names: set[str] = set()
+        non_deleting_count = 0
+        for raw_node in nodes:
+            node = _dict(raw_node, f'{flavor} Node')
+            metadata = _dict(node.get('metadata'), f'{flavor} Node metadata')
+            name = metadata.get('name')
+            if (not isinstance(name, str) or not name or name in names):
+                raise KubernetesAttestationError(
+                    f'The {flavor!r} Node inventory contains an invalid '
+                    'identity.')
+            names.add(name)
+            labels = _dict(metadata.get('labels'), f'{name} Node labels')
+            if labels.get(contract['selector_label_key']
+                         ) != contract['selector_label_value']:
+                raise KubernetesAttestationError(
+                    f'Node {name!r} does not match the reviewed instance '
+                    'selector.')
+            if metadata.get('deletionTimestamp') is not None:
+                continue
+            capacity = _dict(
+                _dict(node.get('status'),
+                      f'{name} Node status').get('capacity'),
+                f'{name} Node capacity')
+            if (labels.get(contract['product_label_key']) !=
+                    contract['product_label_value'] or
+                    capacity.get(contract['resource_name']) != str(
+                        contract['capacity_per_node'])):
+                raise KubernetesAttestationError(
+                    f'Node {name!r} does not match the reviewed GPU product '
+                    'and capacity contract.')
+            non_deleting_count += 1
+        if non_deleting_count == 0:
+            raise KubernetesAttestationError(
+                f'Flavor {flavor!r} has no non-deleting Node.')
+        proofs.append(
+            NodeFlavorProof(flavor=flavor,
+                            non_deleting_node_count=non_deleting_count,
+                            product_label_value=contract['product_label_value'],
+                            resource_name=contract['resource_name'],
+                            capacity_per_node=contract['capacity_per_node']))
+    return tuple(proofs)
+
+
 def validate_snapshot(fleet_context: Mapping[str, Any],
                       provider_context: Mapping[str, Any],
                       snapshot: Mapping[str, Any]) -> KubernetesContextProof:
@@ -322,9 +392,9 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     admission_contract = provider_context['admission_policy']
     labels = _dict(namespace_metadata.get('labels', {}), 'Namespace labels')
     if (namespace_metadata.get('uid') != provider_context['namespace_uid'] or
-            _dict(namespace.get('status'), 'Namespace status').get('phase')
-            != 'Active' or labels.get(admission_contract['namespace_label_key'])
-            != admission_contract['namespace_label_value']):
+            _dict(namespace.get('status'), 'Namespace status').get('phase') !=
+            'Active' or labels.get(admission_contract['namespace_label_key']) !=
+            admission_contract['namespace_label_value']):
         raise KubernetesAttestationError(
             'The inference Namespace identity or admission label is invalid.')
 
@@ -343,8 +413,8 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     _metadata(priority, name=fleet_context['priority_class']['name'])
     if (priority.get('value') != fleet_context['priority_class']['value'] or
             priority.get('globalDefault') is not False or
-            priority.get('preemptionPolicy')
-            != fleet_context['priority_class']['preemption_policy']):
+            priority.get('preemptionPolicy') !=
+            fleet_context['priority_class']['preemption_policy']):
         raise KubernetesAttestationError(
             'The Pod PriorityClass reclaim contract is invalid.')
     workload_priority = _dict(snapshot.get('workload_priority_class'),
@@ -362,8 +432,8 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
                     name=fleet_context['local_queue_name'],
                     namespace=namespace_name)
     local_queue_spec = _dict(local_queue.get('spec'), 'LocalQueue spec')
-    if (local_queue_spec.get('clusterQueue')
-            != queue_contract['inference_cluster_queue'] or
+    if (local_queue_spec.get('clusterQueue') !=
+            queue_contract['inference_cluster_queue'] or
             local_queue_spec.get('stopPolicy') not in (None, 'None')):
         raise KubernetesAttestationError(
             'The inference LocalQueue target is invalid.')
@@ -402,8 +472,9 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
                 labels.get(key) != value
                 for key, value in expected_labels.items()):
             raise KubernetesAttestationError(
-                f'ResourceFlavor {name!r} does not bind the reviewed GPU '
-                'product.')
+                f'ResourceFlavor {name!r} does not bind the reviewed '
+                'provider-owned instance selector.')
+    node_flavors = _validate_node_inventory(provider_context, snapshot)
 
     scheduler = provider_context['scheduler']
     _validate_deployment(_dict(snapshot.get('scheduler'),
@@ -459,7 +530,8 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
         local_queue_name=fleet_context['local_queue_name'],
         cluster_queue_name=queue_contract['inference_cluster_queue'],
         pod_identity_irsa_annotation_absent=True,
-        assign_queue_labels_for_pods=True)
+        assign_queue_labels_for_pods=True,
+        node_flavors=node_flavors)
 
 
 def _serialized(client: Any, value: object) -> Mapping[str, Any]:
@@ -562,6 +634,15 @@ def attest_context(fleet_context: Mapping[str, Any],
                                                       plural='resourceflavors',
                                                       name=flavor['name'])
                     for flavor in provider_context['resource_flavors']
+                },
+                'nodes': {
+                    node['flavor']: _serialized(
+                        client,
+                        core.list_node(
+                            label_selector=(f"{node['selector_label_key']}="
+                                            f"{node['selector_label_value']}"),
+                            _request_timeout=kubernetes_adaptor.API_TIMEOUT))
+                    for node in provider_context['node_inventory']
                 },
                 'scheduler': _serialized(
                     client,
