@@ -206,13 +206,12 @@ def _placement_projection_args() -> dict[str, object]:
             },
         }],
         'storage_broker': {
-            'endpoint': 'https://storage-broker.int.boltz.bio/v3/grants',
+            'endpoint': 'https://storage-broker.int.boltz.bio/v2/grants',
             'audience': 'boltz-skyserve-worker',
-            'api_version': 3,
+            'api_version': 2,
             'grant_uri_prefix': 's3://boltz-skyserve-grants/prod',
             'authenticated_worker_role_arns': [worker_role],
             'kms_key_id': 'alias/skyserve-grants',
-            'transfer_authorization_limit_bytes': 3_000_000_000_000,
         },
     }
 
@@ -1987,57 +1986,6 @@ def test_identical_projection_retry_is_idempotent_at_db_boundary(
         **copy.deepcopy(projections))
             is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
     assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
-
-
-def test_api75_storage_broker_retry_requires_an_identical_persisted_row(
-        _mock_serve_db):
-    service_name = 'svc-api75-broker-retry'
-    yaml_content = 'value: api75-projected'
-    projections = _placement_projection_args()
-    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
-    assert serve_state.add_version(service_name) == 2
-    assert (serve_state.add_or_update_version(service_name, 2,
-                                              _v2_service_spec('projected'),
-                                              yaml_content, **projections)
-            is serve_state.VersionCommitResult.COMMITTED)
-
-    legacy_projections = copy.deepcopy(projections)
-    broker = legacy_projections['storage_broker']
-    assert isinstance(broker, dict)
-    del broker['transfer_authorization_limit_bytes']
-    with orm.Session(_mock_serve_db) as session:
-        session.execute(serve_state.version_specs_table.update().where(
-            serve_state.version_specs_table.c.service_name == service_name,
-            serve_state.version_specs_table.c.version == 2).values(
-                storage_broker=broker))
-        session.commit()
-    row_before = _read_version_row(_mock_serve_db, service_name, 2)
-
-    with pytest.raises(ValueError, match='contain exactly'):
-        serve_state.add_or_update_version(service_name, 2,
-                                          _v2_service_spec('unmarked-retry'),
-                                          yaml_content,
-                                          **copy.deepcopy(legacy_projections))
-
-    assert (serve_state.add_or_update_version(
-        service_name,
-        2,
-        _v2_service_spec('rebuilt-on-retry'),
-        yaml_content,
-        allow_legacy_storage_broker_retry=True,
-        **copy.deepcopy(legacy_projections))
-            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
-    assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
-
-    assert serve_state.add_version(service_name) == 3
-    assert (serve_state.add_or_update_version(
-        service_name,
-        3,
-        _v2_service_spec('new-legacy-write'),
-        'value: new-legacy-write',
-        allow_legacy_storage_broker_retry=True,
-        **legacy_projections)
-            is serve_state.VersionCommitResult.CONTENT_CONFLICT)
 
 
 @pytest.mark.parametrize('projection_name', [

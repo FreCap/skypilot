@@ -1334,8 +1334,7 @@ _SERVE_STORAGE_BROKER_SCHEMA = {
     'type': 'object',
     'required': [
         'endpoint', 'audience', 'api_version', 'grant_uri_prefix',
-        'authenticated_worker_role_arns', 'kms_key_id',
-        'transfer_authorization_limit_bytes'
+        'authenticated_worker_role_arns', 'kms_key_id'
     ],
     'additionalProperties': False,
     'properties': {
@@ -1348,7 +1347,7 @@ _SERVE_STORAGE_BROKER_SCHEMA = {
             'minLength': 1,
         },
         'api_version': {
-            'const': 3,
+            'const': 2,
         },
         'grant_uri_prefix': {
             'type': 'string',
@@ -1368,9 +1367,6 @@ _SERVE_STORAGE_BROKER_SCHEMA = {
         'kms_key_id': {
             'type': 'string',
             'minLength': 1,
-        },
-        'transfer_authorization_limit_bytes': {
-            'const': 3_000_000_000_000,
         },
     },
 }

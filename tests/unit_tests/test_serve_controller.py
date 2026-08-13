@@ -2223,8 +2223,7 @@ class TestServiceUpdateReconciler:
                                        controller_job_projection=None,
                                        controller_work_cache=None,
                                        worker_placement_projections=None,
-                                       storage_broker=None,
-                                       allow_legacy_storage_broker_retry=False)
+                                       storage_broker=None)
 
     def test_stale_version_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
