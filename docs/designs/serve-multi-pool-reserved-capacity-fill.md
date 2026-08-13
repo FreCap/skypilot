@@ -243,9 +243,11 @@ independent, deterministically ordered edges. The repeated context is valid:
 only an overlap on the same physical UID/card is ambiguous. Context aliases
 that prove the same UID/card cannot multiply one physical pool, and aliases
 that disagree on width for that exact card fail closed.
-The deployment policy enforces the same atom invariant: it accepts multiple
-edges sharing an access context, attests that context once, and rejects only a
-second claim on the same `(physical_cluster_uid, exact_card)` atom.
+The deployment policy enforces the same atom invariant through one shared
+claim-set validator used by both activation and every later claim replacement:
+it accepts multiple edges sharing an access context, attests that context once,
+and rejects only a second claim on the same
+`(physical_cluster_uid, exact_card)` atom before provider calls.
 
 The existing service-wide meanings remain authoritative:
 
@@ -1668,7 +1670,8 @@ The current worktree now:
     retry-until-proven-absent ownership handoff; and
 22. makes deployment attestation use the same physical-UID/card atom as the
     broker so east's A100-40 and A100-80 edges may share one context without
-    duplicating capacity, and binds both Kueue Pod webhooks to their exact
+    duplicating capacity, binds activation and later claim replacement to one
+    shared atom validator, and binds both Kueue Pod webhooks to their exact
     reviewed rules and service endpoints rather than trusting object names.
 
 Regression tests exist for corrections 1--22, including owner-death,
@@ -2173,6 +2176,13 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   operations, endpoint, CA bundle, and namespace selection. Ruff and targeted
   mypy pass, pylint is 10.00/10, JSON and Python compilation pass, and the exact
   live east mutating and validating objects pass the same validator.
+- On behavior revision `f4a8aa8d003f256e5c2b621ca29461d75f84fdcd`,
+  activation and later claim replacement call the same exact-card atom
+  validator. The integrated policy/interface superset passes 123/123; new
+  activation tests accept east's distinct A100-40/A100-80 claims in one
+  context and reject a duplicated physical UID/card atom before provider
+  calls. Ruff and targeted mypy pass, pylint is 10.00/10, formatting and
+  `git diff --check` pass.
 - The post-correction local Serve047 restack at `7ca86723b` passes 58/58
   focused final-state, cleanup-presence, manager-receipt,
   reconciliation-transition, and status tests; the combined policy superset
