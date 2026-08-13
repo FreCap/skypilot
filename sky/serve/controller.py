@@ -3996,6 +3996,8 @@ class SkyServeController:
             controller_work_cache=controller_work_cache,
             worker_placement_projections=worker_placement_projections,
             storage_broker=storage_broker,
+            allow_legacy_storage_broker_retry=(authoritative_retry_service
+                                               is not None),
             **catalog_kwargs,
             **recovery_kwargs)
         if result not in (serve_state.VersionCommitResult.COMMITTED,

@@ -626,7 +626,9 @@ def test_api009_serve043_lineage_and_sqlite_stays_at_serve037(
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert server_constants.MIN_ORDINARY_LAUNCH_BINDING_API_VERSION == 74
     assert server_constants.MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION == 75
-    assert server_constants.API_VERSION == 75
+    assert (server_constants.MIN_SERVE_STORAGE_BROKER_TRANSFER_LIMIT_API_VERSION
+            == 76)
+    assert server_constants.API_VERSION == 76
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

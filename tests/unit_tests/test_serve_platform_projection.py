@@ -34,6 +34,7 @@ def _storage_broker():
             'arn:aws:iam::123456789012:role/skyserve-worker-phx',
         ],
         'kms_key_id': 'alias/skyserve-grants',
+        'transfer_authorization_limit_bytes': 3_000_000_000_000,
     }
 
 
@@ -149,6 +150,10 @@ def test_storage_broker_schema_accepts_only_non_secret_descriptor():
     'authenticated_worker_role_arns': ['not-an-iam-role']
 }, {
     'kms_key_id': ''
+}, {
+    'transfer_authorization_limit_bytes': 2_999_999_999_999
+}, {
+    'transfer_authorization_limit_bytes': True
 }])
 def test_storage_broker_validator_fails_closed(overrides):
     value = {**_storage_broker(), **overrides}
@@ -185,6 +190,58 @@ def test_storage_broker_worker_roles_are_ordered_unique():
                 ],
             },
             allow_none=False)
+
+
+def test_storage_broker_transfer_limit_is_required_and_exact():
+    broker = _storage_broker()
+    del broker['transfer_authorization_limit_bytes']
+    with pytest.raises(ValueError, match='contain exactly'):
+        kubernetes_identity.validate_storage_broker_projection(broker,
+                                                               allow_none=False)
+
+    assert (
+        kubernetes_identity.STORAGE_BROKER_TRANSFER_AUTHORIZATION_LIMIT_BYTES ==
+        3_000_000_000_000)
+
+    projected = kubernetes_identity.validate_storage_broker_projection(
+        broker, allow_none=False, allow_legacy_without_transfer_limit=True)
+    assert projected == broker
+    assert 'transfer_authorization_limit_bytes' not in projected
+
+
+def test_version_history_preserves_legacy_storage_broker_shape():
+    broker = _storage_broker()
+    del broker['transfer_authorization_limit_bytes']
+    record = {
+        'pool': False,
+        'elected_version': 1,
+        'active_versions': [1],
+    }
+    version = {
+        'version': 1,
+        'spec': mock.Mock(autoscaling_policy_str=mock.Mock(return_value='p')),
+        'yaml_content': '',
+        'submitted_yaml_content': '',
+        'created_at': 1,
+        'created_by': 'operator',
+        'quarantined_at': None,
+        'quarantine_reason': None,
+        'controller_job_projection': None,
+        'controller_work_cache': None,
+        'worker_placement_projections': None,
+        'storage_broker': broker,
+    }
+    with mock.patch.object(serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(serve_state,
+                           'get_version_records',
+                           return_value=[version]):
+        result = server._service_version_history('svc')
+
+    projected = result['versions'][0]['storage_broker']
+    assert projected == broker
+    assert 'transfer_authorization_limit_bytes' not in projected
 
 
 def test_storage_broker_projection_prefers_workspace_and_copies(monkeypatch):
