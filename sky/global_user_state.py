@@ -470,6 +470,34 @@ def get_cluster_record_identity_snapshot(
             session, cluster_name, expected_cluster_record_uuid)
 
 
+@typing.overload
+def add_or_update_user(
+    user: models.User,
+    allow_duplicate_name: bool = True,
+    return_user: Literal[False] = False,
+) -> bool:
+    ...
+
+
+@typing.overload
+def add_or_update_user(
+    user: models.User,
+    allow_duplicate_name: bool = True,
+    *,
+    return_user: Literal[True],
+) -> tuple[bool, models.User]:
+    ...
+
+
+@typing.overload
+def add_or_update_user(
+    user: models.User,
+    allow_duplicate_name: bool = True,
+    return_user: bool = ...,
+) -> bool | tuple[bool, models.User]:
+    ...
+
+
 @metrics_lib.time_me
 def add_or_update_user(
         user: models.User,

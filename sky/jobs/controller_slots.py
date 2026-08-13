@@ -497,7 +497,7 @@ class ManagedJobControllerSlotSupervisor:
         while True:
             try:
                 message = _read_message(family.control)
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except (OSError, ValueError, json.JSONDecodeError) as e:
                 raise ControllerSlotProofError(

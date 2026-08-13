@@ -163,7 +163,7 @@ class ServerPodIdentity:
     ip: str | None
 
     @classmethod
-    def from_environment(cls) -> 'ServerPodIdentity':
+    def from_environment(cls) -> ServerPodIdentity:
         """Capture the role supervisor's deployment-provided identity once."""
         return cls(name=(os.environ.get('SKYPILOT_POD_NAME') or
                          os.environ.get('HOSTNAME') or '').strip(),

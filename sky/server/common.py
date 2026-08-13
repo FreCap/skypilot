@@ -358,7 +358,7 @@ def _convert_requests_cookies_to_aiohttp(
     """Convert requests cookie jar to aiohttp-compatible dict format."""
     cookies: dict[str, str] = {}
     for cookie in cookie_jar:
-        cookies[cookie.name] = cookie.value
+        cookies[cookie.name] = typing.cast(str, cookie.value)
     return cookies
 
 

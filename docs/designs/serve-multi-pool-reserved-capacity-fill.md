@@ -2180,6 +2180,16 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   process and the required real PostgreSQL server. The retained JUnit artifact
   is `/tmp/feature-pg-123c16762.xml`, SHA-256
   `19101b79676824822e55f4fdf9c9c2299ae8792944aa59e8c673bc934a0229ac`.
+- The publication CI correction changes only static contracts and preserves
+  the three-times-reviewed behavior: it replaces deprecated typing/import
+  forms, freezes the already-narrowed observation repository in its callback,
+  records existing dynamic factory and cookie contracts for the type checker,
+  moves blocking runtime-daemon path setup to one worker-thread helper, and
+  narrows the existing lifecycle-removal locator without changing its
+  obligation. Exact Ruff, basedpyright, mypy, lifecycle-removal, formatting,
+  import-order, changed-source pylint, and focused regression checks pass on
+  the corrected tree. The callback freeze also removes a latent loop
+  late-binding ambiguity while retaining the reviewed repository identity.
 - On integrated implementation revision
   `244cc34fbfb61ba719691b33c92f93d039ef610f`, the corrected separate Boltz
   plugin and generic policy interface pass all 113 tests in the focused

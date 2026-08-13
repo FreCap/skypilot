@@ -169,7 +169,7 @@ def _request_runtime_shutdown() -> None:
 
 
 async def _monitor_compat_controller_leadership(
-        background: '_BackgroundLoop',
+        background: _BackgroundLoop,
         lease: request_postgres.ControllerLeaderLease) -> None:
     """Fence compatibility all-mode promptly if its outer session is lost."""
     while not background.is_stopping:
@@ -523,7 +523,10 @@ def _runtime_daemon_process_group_exists(process_group_id: int) -> bool:
 async def _wait_runtime_daemon_process_group_gone(
         process_group_id: int) -> None:
     """Wait until Linux reports that no process remains in the exact group."""
-    while _runtime_daemon_process_group_exists(process_group_id):
+    # Linux exposes no completion event for an arbitrary process group. The
+    # bounded supervisor must poll until even adopted descendants are gone.
+    while _runtime_daemon_process_group_exists(  # noqa: ASYNC110
+            process_group_id):
         await asyncio.sleep(_RUNTIME_DAEMON_GROUP_POLL_SECONDS)
 
 
@@ -558,21 +561,28 @@ async def _terminate_runtime_daemon_process(
     await _wait_runtime_daemon_process_group_gone(process_group_id)
 
 
+def _prepare_runtime_daemon_paths(
+        daemon_id: str) -> tuple[pathlib.Path, pathlib.Path]:
+    """Resolve and create filesystem paths used by a runtime daemon."""
+    runner_dir = pathlib.Path(__file__).resolve().parent
+    log_dir = pathlib.Path(
+        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return runner_dir, log_dir / f'{daemon_id}.log'
+
+
 async def _supervise_runtime_daemon(daemon_id: str, clean_env: dict[str, str],
                                     max_db_connections: int, parent_pid: int,
                                     parent_start_time_ticks: int,
                                     origin_capability: str,
                                     controller_owner: tuple[str, int]) -> None:
     """Supervise one blocking maintenance loop in its own process group."""
-    runner_dir = pathlib.Path(__file__).resolve().parent
+    runner_dir, log_path = await asyncio.to_thread(
+        _prepare_runtime_daemon_paths, daemon_id)
     child_env = dict(clean_env)
     python_path = child_env.get('PYTHONPATH')
     child_env['PYTHONPATH'] = (str(runner_dir) if not python_path else
                                f'{runner_dir}{os.pathsep}{python_path}')
-    log_dir = pathlib.Path(
-        server_constants.REQUEST_LOG_PATH_PREFIX).expanduser()
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f'{daemon_id}.log'
     restart_delay = _RUNTIME_DAEMON_RESTART_INITIAL_SECONDS
     while True:
         process: asyncio.subprocess.Process | None = None

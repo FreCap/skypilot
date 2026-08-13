@@ -24,6 +24,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import enum
+import functools
 import hashlib
 import json
 import math
@@ -2964,14 +2965,14 @@ def poller_loop(
                                         )
                                 if (observation_repository is not None and
                                         observation_worker is None):
+                                    query_target = functools.partial(
+                                        _query_pool_capacity_target_with_reclaim_policy,
+                                        observation_repository)
                                     observation_worker = (
                                         pool_capacity_observer.
                                         PoolCapacityObserver(
                                             observation_repository,
-                                            lambda target, deadline:
-                                            (_query_pool_capacity_target_with_reclaim_policy(
-                                                observation_repository, target,
-                                                deadline)),
+                                            query_target,
                                             publish=(None if notify_reconcile
                                                      is None else lambda _row:
                                                      notify_reconcile()),

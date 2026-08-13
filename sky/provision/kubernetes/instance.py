@@ -1,5 +1,6 @@
 """Kubernetes instance provisioning."""
 from collections.abc import Callable
+from collections.abc import Iterator
 from collections.abc import Mapping
 import contextlib
 import copy
@@ -7,7 +8,7 @@ import datetime
 import json
 import re
 import time
-from typing import Any, Iterator, Literal, NoReturn, Optional, TYPE_CHECKING
+from typing import Any, Literal, NoReturn, Optional, TYPE_CHECKING
 
 from sky import exceptions
 from sky import global_user_state

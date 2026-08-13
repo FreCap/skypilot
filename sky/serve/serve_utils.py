@@ -3813,8 +3813,8 @@ def get_next_cluster_name(
 
         free_resources = None
         cluster_records = None
-        resolved_handles: (
-            'dict[str, CloudVmRayResourceHandle | None] | None') = None
+        resolved_handles: (dict[str, CloudVmRayResourceHandle | None] |
+                           None) = None
         if resource_aware:
             cluster_records = _get_pool_cluster_records(replicas)
             resolved_handles = {}

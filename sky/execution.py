@@ -969,7 +969,10 @@ def _execute_dag_under_provider_fence(
                 raise exceptions.ReservedFillLaunchFenceError(
                     'Reserved-fill backend cannot guard post-create '
                     f'{phase}.')
-            return effect_guard_factory()
+            typed_effect_guard_factory = typing.cast(
+                typing.Callable[[], typing.ContextManager[None]],
+                effect_guard_factory)
+            return typed_effect_guard_factory()
 
         do_workdir = (Stage.SYNC_WORKDIR in stages and not dryrun and
                       task.workdir is not None)

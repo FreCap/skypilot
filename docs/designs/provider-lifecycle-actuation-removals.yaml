@@ -16447,7 +16447,7 @@ artifacts:
   - kind: python_ast_pattern
     path: sky/provision/provisioner.py
     symbol: bulk_provision
-    pattern: "bootstrap_config = provision_common.ProvisionConfig(provider_config=original_config['provider'], authentication_config=original_config['auth'], docker_config=original_config.get('docker', {}), node_config=original_config['available_node_types'][head_node_type]['node_config'], count=num_nodes, tags={}, resume_stopped_nodes=True, ports_to_open_on_launch=ports_to_open_on_launch, cluster_incarnation=cluster_incarnation)"
+    pattern: cluster_incarnation
   - kind: python_ast_pattern
     path: sky/backends/cloud_vm_ray_backend.py
     symbol: RetryingVmProvisioner._retry_zones
