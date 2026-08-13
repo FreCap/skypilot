@@ -601,8 +601,6 @@ def _validated_placement_projections(
     controller_work_cache: dict[str, Any] | None,
     worker_placement_projections: list[dict[str, Any]] | None,
     storage_broker: dict[str, Any] | None,
-    *,
-    allow_legacy_storage_broker: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]] |
            None, dict[str, Any] | None]:
     """Validate and copy immutable platform projections at the DB boundary."""
@@ -614,8 +612,7 @@ def _validated_placement_projections(
     workers = kubernetes_identity.validate_worker_placement_projections(
         worker_placement_projections)
     broker = kubernetes_identity.validate_storage_broker_projection(
-        storage_broker,
-        allow_legacy_without_transfer_limit=allow_legacy_storage_broker)
+        storage_broker)
     if workers is not None and broker is not None:
         broker_role_values = broker['authenticated_worker_role_arns']
         assert isinstance(broker_role_values, list)
@@ -5663,7 +5660,6 @@ def add_or_update_version(
     controller_work_cache: dict[str, Any] | None = None,
     worker_placement_projections: list[dict[str, Any]] | None = None,
     storage_broker: dict[str, Any] | None = None,
-    allow_legacy_storage_broker_retry: bool = False,
 ) -> VersionCommitResult:
     """Commit a version placeholder once, or accept an identical retry.
 
@@ -5677,14 +5673,8 @@ def add_or_update_version(
     (controller_job_projection, controller_work_cache,
      worker_placement_projections,
      storage_broker) = (_validated_placement_projections(
-         controller_job_projection,
-         controller_work_cache,
-         worker_placement_projections,
-         storage_broker,
-         allow_legacy_storage_broker=allow_legacy_storage_broker_retry))
-    legacy_storage_broker_retry = (storage_broker is not None and
-                                   'transfer_authorization_limit_bytes'
-                                   not in storage_broker)
+         controller_job_projection, controller_work_cache,
+         worker_placement_projections, storage_broker))
     engine = _db_manager.get_engine()
     projection_columns_available = _require_projection_columns_if_nonnull(
         engine, controller_job_projection, controller_work_cache,
@@ -5774,11 +5764,6 @@ def add_or_update_version(
                 ] if projection_columns_available else [])).where(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version)).fetchone()
-        if (legacy_storage_broker_retry and
-            (existing is None or not projection_columns_available or
-             existing[11] != storage_broker)):
-            session.rollback()
-            return VersionCommitResult.CONTENT_CONFLICT
         # A retired history row deliberately resembles an interrupted
         # placeholder to old readers (NULL committed YAML plus pickled None),
         # but its version identity is permanently consumed.  Never let the

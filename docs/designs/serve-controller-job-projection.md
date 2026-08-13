@@ -2,7 +2,7 @@
 
 **Status:** Implementation in progress; platform attestation and deployment
 smoke tests pending
-**Last updated:** 2026-08-13
+**Last updated:** 2026-08-12
 
 ## Goals
 
@@ -161,8 +161,7 @@ descriptor exactly:
     "arn:aws:iam::123456789012:role/skyserve-worker-east",
     "arn:aws:iam::123456789012:role/skyserve-worker-phx"
   ],
-  "kms_key_id": "alias/skyserve-grants",
-  "transfer_authorization_limit_bytes": 3000000000000
+  "kms_key_id": "alias/skyserve-grants"
 }
 ```
 
@@ -176,27 +175,14 @@ and table-bucket name forms; the authority cannot silently name a different S3
 resource type. The
 worker-role array is ordered, non-empty, duplicate-free, and every entry is an
 IAM role ARN; it binds a grant to the finite set of ambient worker principals
-authorized across the service's regions.
-`transfer_authorization_limit_bytes` is the exact integer
-`3000000000000`; publishing it in the immutable server projection makes the
-broker's strictly-less-than-3-TB cumulative logical-byte fence part of the
-consumer contract instead of an independently configured campaign assumption.
-`api_version` is exactly 3. Version 3
+authorized across the service's regions. `api_version` is exactly 3. Version 3
 is the clean-cutover contract that requires server-owned, atomic cumulative
 campaign transfer reservations before byte-moving authorization; version 2's
 per-grant accounting cannot establish the campaign-wide transfer ceiling. The
 object never contains a bearer token, secret, temporary credentials, signed
 URL, or grant.
-Clients require SkyPilot API >= 76 as well as placement protocol 1 before
-consuming a storage-broker projection with the transfer ceiling. API 75
-advertises the base placement/storage descriptor but is not activation-capable
-for this broker contract.
-
-API 76 forward-reads a persisted API-75 six-key descriptor without synthesizing
-the ceiling. Its history response preserves that old shape, so a strict API-76
-consumer fails closed instead of treating an old row as newly authorized. Only
-a version committed from the API-76 seven-key server configuration carries the
-ceiling.
+Clients require SkyPilot API >= 75 as well as placement protocol 1 before
+consuming this co-released field.
 
 The only cache kinds in protocol v1 are `none` and `node_local`. `none` has no
 other keys. `node_local` is exactly:
@@ -430,21 +416,6 @@ projections; old versions remain null and ineligible. Rollback never re-derives
 or deletes projections. External campaign-controller takeover remains
 unavailable before, during, and after this rollout; rollback cannot authorize
 campaign replay.
-
-API 76 must be running before the first seven-key configuration is exposed; a
-deployment that already has the API-75 six-key configuration upgrades image and
-configuration atomically. The initial Boltz rollout may deploy the image first
-only after verifying that production has no broker configuration and no
-non-null persisted broker row, then add the first seven-key configuration in a
-later reviewed apply. API 75 rejects the seventh key, while API 76 requires it
-for every new non-null broker projection. Before an API-76 version is
-committed, rollback restores the absent or six-key configuration before or with
-the API-75 image. After activation, API 75 cannot read a seven-key persisted
-row. A rollback must therefore keep API 76 running, drain and remove every
-service containing such a version, verify that no seven-key rows remain, and
-only then restore the API-75 image and configuration. If preserving those
-versions is required, roll forward with an API-76 fix instead. Never deploy the
-old binary alone as a rollback.
 
 ## Verification
 

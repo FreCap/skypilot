@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 76  # SkyServe storage-broker transfer ceiling API
+API_VERSION = 75  # SkyServe placement and storage-broker projection API
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -145,11 +145,6 @@ ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
 # cross-context placement and storage-broker projections. Consumers must also
 # require placement_projection_protocol_version == 1.
 MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 75
-
-# Minimum API version whose immutable storage-broker projection carries the
-# exact cumulative logical-byte authorization ceiling. API 75 introduced the
-# projection but cannot activate a consumer that requires this fence.
-MIN_SERVE_STORAGE_BROKER_TRANSFER_LIMIT_API_VERSION = 76
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies

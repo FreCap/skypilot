@@ -102,8 +102,7 @@ def _service_version_history(service_name: str) -> dict:
                     version_record.get('worker_placement_projections')),
             'storage_broker':
                 kubernetes_identity.validate_storage_broker_projection(
-                    version_record.get('storage_broker'),
-                    allow_legacy_without_transfer_limit=True),
+                    version_record.get('storage_broker')),
             'policy':
                 (spec.autoscaling_policy_str() if spec is not None else None),
             'elected': version == elected_version,
