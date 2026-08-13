@@ -206,9 +206,9 @@ def _placement_projection_args() -> dict[str, object]:
             },
         }],
         'storage_broker': {
-            'endpoint': 'https://storage-broker.int.boltz.bio/v3/grants',
+            'endpoint': 'https://storage-broker.int.boltz.bio/v2/grants',
             'audience': 'boltz-skyserve-worker',
-            'api_version': 3,
+            'api_version': 2,
             'grant_uri_prefix': 's3://boltz-skyserve-grants/prod',
             'authenticated_worker_role_arns': [worker_role],
             'kms_key_id': 'alias/skyserve-grants',

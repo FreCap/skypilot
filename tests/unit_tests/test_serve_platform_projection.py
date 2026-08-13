@@ -25,9 +25,9 @@ from sky.utils import yaml_utils
 
 def _storage_broker():
     return {
-        'endpoint': 'https://storage-broker.int.boltz.bio/v3/grants',
+        'endpoint': 'https://storage-broker.int.boltz.bio/v2/grants',
         'audience': 'boltz-skyserve-worker',
-        'api_version': 3,
+        'api_version': 2,
         'grant_uri_prefix': 's3://boltz-skyserve-grants/prod',
         'authenticated_worker_role_arns': [
             'arn:aws:iam::123456789012:role/skyserve-worker-east',
@@ -141,10 +141,6 @@ def test_storage_broker_schema_accepts_only_non_secret_descriptor():
     'grant_uri_prefix': 's3://bucket/prefix?X-Amz-Signature=secret'
 }, {
     'api_version': 1
-}, {
-    'api_version': 2
-}, {
-    'api_version': 4
 }, {
     'authenticated_worker_role_arns': ['not-an-iam-role']
 }, {
