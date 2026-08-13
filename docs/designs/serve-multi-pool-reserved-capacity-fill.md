@@ -2237,7 +2237,7 @@ consecutive sequence restarts from round 1 again.
 
 | Round | Revision reviewed | Result | Material findings/fixes |
 |---|---|---|---|
-| 1 | pending restart over the exact accelerator-scheduling correction, its design successor, and the newly restacked cleanup | pending | Historical and failed attempts do not count. |
+| 1 | feature/design `123c16762aea510d34db74f52c0c27e733fbb07d`; stacked Serve047 cleanup `bc2725c54149d14bc4e90edb2df24af5efccd789` | pass | No material or non-material findings. The review traced the exact normalized accelerator label key, sorted values, and resource through projection, activation, claim replacement, durable receipt/scope hashing, terminal authorization, rendering, Pod admission/adoption, and bound-Node proof. It also found no oversubscription, stale-authority, paid-spill, duplicate-happy-path, or BCL reclaim regression, and confirmed Serve047 leaves one forward-only two-state authorization path. |
 | 2 | pending | pending | pending |
 | 3 | pending | pending | pending |
 
