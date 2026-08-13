@@ -3,9 +3,9 @@
 Status: Serve046, its separately packaged Boltz reclaim policy, and the local
 Serve047 final-state cleanup restack are implemented after the identity-free
 worker-partition correction. Automated validation and three consecutive exact
-adversarial reviews are complete. The remote feature and cleanup PR heads still
-need their final evidence-only successor publication and CI, and platform
-prerequisites remain; not merged, deployed, or activated
+adversarial reviews are complete. Platform prerequisites remain; the feature
+is not deployed or activated, and the cleanup remains blocked on its documented
+live final-state gate
 
 Last updated: 2026-08-13
 
@@ -1689,8 +1689,8 @@ request-liveness, legacy-row retirement, runtime-daemon supervision,
 scheduler/bound-Node admission, capability bootstrap, and fixed managed-job
 slot ownership. The complete non-PostgreSQL matrix, changed-source lint, and
 Terraform module tests pass. The exact serial PostgreSQL freeze and corrected
-deployment-policy matrix pass; three restarted consecutive adversarial passes
-remain required before merge.
+deployment-policy matrix pass, and all three restarted consecutive adversarial
+reviews passed without findings.
 
 The audit also proved that BCL reclaim is a deployment prerequisite rather
 than a Pod-priority property. A read-only production audit on 2026-08-13 found
@@ -1784,7 +1784,7 @@ either case.
 | 2a | Full-fleet combined feature-and-policy image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
 | 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separately packaged plugin, strict bundle, Node cross-attestation, unique entry point, and reusable least-privilege spoke audit boundary are integrated into the one feature image and focused tests pass. They are not upstream-merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
 | 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; the combined image cannot activate until the deployment policy and live attestation gates pass. |
-| 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | Reauthored and tested in the local exact restack; the remote draft is still stale until the final reviewed OID is published and remains merge-gated below. |
+| 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | Reauthored and tested in the exact restack; it remains draft and merge-gated below. |
 
 Durable acceptance hands rows to the existing asynchronous launch path, and
 status projects the same allocation/observation evidence used by
@@ -2280,7 +2280,8 @@ commit and final cleanup rebase. The local PR #1452 implementation has been
 restacked onto the frozen feature, reauthored for Serve046/projection v2 and
 the controller-runtime transition removals, and rerun against the integrated
 policy tree. The old remote cleanup tip remains stale and is not deployment or
-merge evidence. Historical cleanup PR #1263 is not this correction's removal
+merge evidence. Any earlier remote cleanup tip is stale evidence after the
+final exact successor is published. Historical cleanup PR #1263 is not this correction's removal
 PR.
 
 The cleanup uses a new forward-only Serve047 migration; it never edits or
@@ -2377,13 +2378,6 @@ legacy activation.
 
 ## Open gates
 
-- Freeze the integrated feature/plugin/audit revision and this exact canonical
-  design over Serve046 behavior revision
-  `688521ffd6cce0838b55c98fbb1196584116fc70`.
-- Complete and record three consecutive adversarial review passes.
-- Restack cleanup PR #1452 as the Serve047 successor over the frozen Serve046
-  feature, including protocol-v1 projection-decoder removal and the enumerated
-  managed-job/daemon transition removals, then record both OIDs.
 - Merge the feature stack.
 - Build and deploy one immutable image to the complete split-role fleet with a
   reviewed direct Helm upgrade using `--reuse-values`; verify the rendered
