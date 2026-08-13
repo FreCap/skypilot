@@ -1340,6 +1340,11 @@ _SERVE_CONTROLLER_WORKSPACE_SCHEMA = {
     'minLength': 1,
 }
 
+_SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA = {
+    'type': 'string',
+    'minLength': 1,
+}
+
 _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA = {
     'oneOf': [{
         'type': 'string',
@@ -1458,6 +1463,7 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
     },
     'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
     'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
+    'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
     'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
@@ -2893,6 +2899,7 @@ def get_config_schema():
                         'serve_controller_context': _SERVE_CONTROLLER_CONTEXT_SCHEMA,
                         'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
                         'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
+                        'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
                         'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
@@ -2976,6 +2983,7 @@ def get_config_schema():
                                     },
                                     'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
                                     'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
+                                    'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
                                     'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,

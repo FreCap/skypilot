@@ -66,7 +66,10 @@ The first four fields are non-empty strings. `priority_class_name` is a
 non-empty string or null. The service workspace selects an explicit
 server-owned `serve_controller_workspace`; the context and remaining identity
 are then resolved inside that target workspace. They are not inferred from an
-inference worker context or identity.
+inference worker context or identity. Controller priority is resolved only
+from the target workspace/context's typed server-owned
+`serve_controller_priority_class_name`; it is never inferred from
+`pod_config`. An absent property projects null.
 
 `lb_data_plane_auth` is a server-owned Secret reference, never Secret bytes.
 Its name and key come from the target controller context's
@@ -221,8 +224,10 @@ and controller cache are all resolved within that controller workspace. The
 named workspace must exist and differ from the service's inference workspace. A
 context without an explicit controller workspace fails closed so the
 controller can never inherit a worker's inference namespace or service
-account. Worker candidates continue resolving only from the original service
-workspace.
+account. Priority uses the narrow
+`serve_controller_priority_class_name` property with context-over-workspace
+precedence rather than the workspace's broad `pod_config`. Worker candidates
+continue resolving only from the original service workspace.
 
 Worker candidates come from the immutable placement catalog when present.
 Every task resource alternative must have an exact persisted-catalog match on

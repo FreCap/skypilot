@@ -155,6 +155,7 @@ _HA_CONFIG_SAFE_KUBERNETES_KEYS = frozenset({
     'provision_timeout',
     'quota',
     'remote_identity',
+    'serve_controller_priority_class_name',
     'set_pod_resource_limits',
 })
 _HA_CONFIG_SAFE_CONTROLLER_KEYS = frozenset({
