@@ -536,14 +536,9 @@ def _project_location(context: str, cluster_config_overrides: dict[str, Any],
                                                     workspace=workspace,
                                                     override_configs=None),
         'service_account_name': service_account_name,
-        'priority_class_name': pod_spec.get('priorityClassName'),
     }
     for key in ('kubernetes_context', 'namespace', 'service_account_name'):
         _strict_nonempty_string(projection[key], f'Projected location {key}')
-    priority = projection['priority_class_name']
-    if priority is not None:
-        _strict_nonempty_string(priority,
-                                'Projected location priority_class_name')
     return projection
 
 
@@ -679,9 +674,24 @@ def build_controller_job_projection(
     if not isinstance(configured_auth, dict):
         raise ValueError('Kubernetes Serve controller workspace/context must '
                          'configure serve_controller_lb_data_plane_auth.')
+    controller_priority = (
+        skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            region=context,
+            keys=('serve_controller_priority_class_name',),
+            workspace=controller_workspace,
+            default_value=None))
+    if controller_priority is not None:
+        controller_priority = _strict_nonempty_string(
+            controller_priority,
+            'Kubernetes Serve controller priority class name')
+    projected_location = _project_location(context, {}, controller_workspace)
+    # Controller priority is a narrow server-owned contract. In particular,
+    # do not infer it from the controller workspace's broad pod_config.
+    projected_location['priority_class_name'] = controller_priority
     projected = {
         'workspace': controller_workspace,
-        **_project_location(context, {}, controller_workspace),
+        **projected_location,
         'lb_data_plane_auth': {
             'secret_name': configured_auth.get('secret_name'),
             'secret_key': configured_auth.get('secret_key'),

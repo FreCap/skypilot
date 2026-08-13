@@ -1202,21 +1202,24 @@ class TestSanitizeHaRecoveryConfigBytes:
             serve_utils.sanitize_ha_recovery_config_bytes(config)
 
     def test_strips_pod_config_including_per_context(self):
-        config = (b'active_workspace: mt_native\n'
-                  b'kubernetes:\n'
-                  b'  allowed_contexts: [ctx-a, ctx-b]\n'
-                  b'  pod_config:\n'
-                  b'    spec:\n'
-                  b'      containers:\n'
-                  b'        - env:\n'
-                  b'            - {name: REGISTRY_PASSWORD, value: hunter2}\n'
-                  b'  context_configs:\n'
-                  b'    ctx-a:\n'
-                  b'      provision_timeout: 10\n'
-                  b'      pod_config:\n'
-                  b'        spec: {imagePullSecrets: [{name: sekret}]}\n'
-                  b'ssh:\n'
-                  b'  pod_config: {spec: {x: topsecret}}\n')
+        config = (
+            b'active_workspace: mt_native\n'
+            b'kubernetes:\n'
+            b'  allowed_contexts: [ctx-a, ctx-b]\n'
+            b'  serve_controller_priority_class_name: controller-default\n'
+            b'  pod_config:\n'
+            b'    spec:\n'
+            b'      containers:\n'
+            b'        - env:\n'
+            b'            - {name: REGISTRY_PASSWORD, value: hunter2}\n'
+            b'  context_configs:\n'
+            b'    ctx-a:\n'
+            b'      provision_timeout: 10\n'
+            b'      serve_controller_priority_class_name: controller-context\n'
+            b'      pod_config:\n'
+            b'        spec: {imagePullSecrets: [{name: sekret}]}\n'
+            b'ssh:\n'
+            b'  pod_config: {spec: {x: topsecret}}\n')
         out = serve_utils.sanitize_ha_recovery_config_bytes(config)
         assert b'hunter2' not in out
         assert b'sekret' not in out
@@ -1224,8 +1227,12 @@ class TestSanitizeHaRecoveryConfigBytes:
         parsed = yaml.safe_load(out)
         # Non-credential neighbors survive.
         assert parsed['kubernetes']['allowed_contexts'] == ['ctx-a', 'ctx-b']
+        assert parsed['kubernetes'][
+            'serve_controller_priority_class_name'] == 'controller-default'
         assert parsed['kubernetes']['context_configs']['ctx-a'][
             'provision_timeout'] == 10
+        assert parsed['kubernetes']['context_configs']['ctx-a'][
+            'serve_controller_priority_class_name'] == 'controller-context'
 
     def test_strips_extensions_and_keeps_safe_jobs_policy(self):
         config = (

@@ -136,6 +136,10 @@ def test_controller_projection_resolves_only_in_controller_workspace(
                 'secret_name': auth['secret_name'],
                 'secret_key': auth['secret_key'],
             }
+        if keys == ('serve_controller_priority_class_name',):
+            assert region == 'east-context'
+            assert workspace == 'controller'
+            return 'typed-controller-priority'
         raise AssertionError((keys, region, workspace))
 
     location_calls = []
@@ -146,7 +150,7 @@ def test_controller_projection_resolves_only_in_controller_workspace(
             'kubernetes_context': context,
             'namespace': 'controller-system',
             'service_account_name': 'controller-sa',
-            'priority_class_name': 'controller-priority',
+            'priority_class_name': 'pod-config-priority-must-not-win',
         }
 
     monkeypatch.setattr(skypilot_config,
@@ -169,12 +173,14 @@ def test_controller_projection_resolves_only_in_controller_workspace(
         'kubernetes_context': 'east-context',
         'namespace': 'controller-system',
         'service_account_name': 'controller-sa',
-        'priority_class_name': 'controller-priority',
+        'priority_class_name': 'typed-controller-priority',
         'lb_data_plane_auth': _controller_auth(),
     }
     assert cache == controller_cache
     assert location_calls == [('east-context', {}, 'controller')]
     assert (('serve_controller_work_cache',), 'east-context',
+            'controller') in calls
+    assert (('serve_controller_priority_class_name',), 'east-context',
             'controller') in calls
 
 
@@ -223,27 +229,51 @@ def test_controller_workspace_must_be_distinct_and_configured(monkeypatch):
 
 
 def test_controller_workspace_is_server_owned_config():
-    common_utils.validate_schema(
-        {
-            'kubernetes': {
-                'serve_controller_workspace': 'controller',
-            },
-            'workspaces': {
-                'controller': {
-                    'kubernetes': {
-                        'serve_controller_context': 'east',
-                        'serve_controller_lb_data_plane_auth': {
-                            'secret_name': 'skypilot-serve-lb-data-plane-auth',
-                            'secret_key': 'tokens',
-                        },
+    config = {
+        'kubernetes': {
+            'serve_controller_workspace': 'controller',
+        },
+        'workspaces': {
+            'controller': {
+                'kubernetes': {
+                    'serve_controller_context': 'east',
+                    'serve_controller_priority_class_name': 'workspace-controller-priority',
+                    'serve_controller_lb_data_plane_auth': {
+                        'secret_name': 'skypilot-serve-lb-data-plane-auth',
+                        'secret_key': 'tokens',
                     },
+                    'context_configs': {
+                        'east': {
+                            'serve_controller_priority_class_name': 'context-controller-priority',
+                        },
+                    }
                 },
             },
-        }, schemas.get_config_schema(), 'Invalid config')
+        },
+    }
+    common_utils.validate_schema(config, schemas.get_config_schema(),
+                                 'Invalid config')
+    assert skypilot_config.get_effective_workspace_region_config_from_snapshot(
+        config_snapshot=config,
+        cloud='kubernetes',
+        region='east',
+        keys=('serve_controller_priority_class_name',),
+        workspace='controller',
+        default_value=None) == 'context-controller-priority'
+    config['workspaces']['controller']['kubernetes']['context_configs']['east'][
+        'serve_controller_priority_class_name'] = ''
+    with pytest.raises(exceptions.InvalidSkyPilotConfigError):
+        common_utils.validate_schema(config, schemas.get_config_schema(),
+                                     'Invalid config')
     assert ('kubernetes', 'serve_controller_workspace') in (
         skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
     assert ('kubernetes', 'serve_controller_lb_data_plane_auth') in (
         skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    assert ('kubernetes', 'serve_controller_priority_class_name') in (
+        skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    assert ('kubernetes', 'context_configs', '*',
+            'serve_controller_priority_class_name') in (
+                skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
 
 
 def test_controller_projection_requires_server_auth_reference(monkeypatch):

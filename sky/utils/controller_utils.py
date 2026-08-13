@@ -261,6 +261,7 @@ _CONTROLLER_WORKSPACE_KUBERNETES_KEYS = (
     'serve_controller_context',
     'serve_controller_work_cache',
     'serve_controller_lb_data_plane_auth',
+    'serve_controller_priority_class_name',
 )
 _CONTROLLER_CONTEXT_KUBERNETES_KEYS = (
     'namespace',
@@ -268,6 +269,7 @@ _CONTROLLER_CONTEXT_KUBERNETES_KEYS = (
     'auto_mounts',
     'serve_controller_work_cache',
     'serve_controller_lb_data_plane_auth',
+    'serve_controller_priority_class_name',
 )
 
 
@@ -280,7 +282,7 @@ def _controller_pod_config_projection(value: Any) -> dict[str, Any] | None:
         return None
     projected_spec = {
         key: copy.deepcopy(pod_spec[key])
-        for key in ('serviceAccountName', 'priorityClassName')
+        for key in ('serviceAccountName',)
         if key in pod_spec
     }
     if not projected_spec:

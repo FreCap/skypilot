@@ -115,6 +115,7 @@ def test_snapshot_retains_minimal_distinct_controller_workspace():
                     'serve_controller_context': 'controller-east',
                     'namespace': 'controller-default',
                     'remote_identity': 'controller-default-sa',
+                    'serve_controller_priority_class_name': 'controller-default-priority',
                     'serve_controller_work_cache': controller_cache,
                     'serve_controller_lb_data_plane_auth': unsafe_controller_auth,
                     'pod_config': {
@@ -138,6 +139,7 @@ def test_snapshot_retains_minimal_distinct_controller_workspace():
                         'controller-east': {
                             'namespace': 'controller-system',
                             'remote_identity': 'controller-east-sa',
+                            'serve_controller_priority_class_name': 'controller-context-priority',
                             'serve_controller_work_cache': controller_cache,
                             'serve_controller_lb_data_plane_auth': unsafe_controller_auth,
                             'pod_config': {
@@ -179,24 +181,24 @@ def test_snapshot_retains_minimal_distinct_controller_workspace():
             'namespace': 'controller-default',
             'remote_identity': 'controller-default-sa',
             'serve_controller_context': 'controller-east',
+            'serve_controller_priority_class_name': 'controller-default-priority',
             'serve_controller_work_cache': controller_cache,
             'serve_controller_lb_data_plane_auth': controller_auth,
             'pod_config': {
                 'spec': {
                     'serviceAccountName': 'controller-default-sa',
-                    'priorityClassName': 'controller-priority',
                 },
             },
             'context_configs': {
                 'controller-east': {
                     'namespace': 'controller-system',
                     'remote_identity': 'controller-east-sa',
+                    'serve_controller_priority_class_name': 'controller-context-priority',
                     'serve_controller_work_cache': controller_cache,
                     'serve_controller_lb_data_plane_auth': controller_auth,
                     'pod_config': {
                         'spec': {
                             'serviceAccountName': 'controller-east-sa',
-                            'priorityClassName': 'controller-priority',
                         },
                     },
                 },
@@ -230,6 +232,12 @@ def test_snapshot_retains_minimal_distinct_controller_workspace():
             region='controller-east',
             workspace='controller',
             default_value=None) == 'controller-system'
+        assert skypilot_config.get_effective_workspace_region_config(
+            cloud='kubernetes',
+            keys=('serve_controller_priority_class_name',),
+            region='controller-east',
+            workspace='controller',
+            default_value=None) == 'controller-context-priority'
 
 
 def _server_shaped_config() -> config_utils.Config:
