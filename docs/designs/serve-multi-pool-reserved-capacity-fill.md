@@ -2183,10 +2183,12 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   context and reject a duplicated physical UID/card atom before provider
   calls. Ruff and targeted mypy pass, pylint is 10.00/10, formatting and
   `git diff --check` pass.
-- The post-correction local Serve047 restack at `7ca86723b` passes 58/58
+- The post-correction local Serve047 implementation restack at `dec0766a2`
+  passes 58/58
   focused final-state, cleanup-presence, manager-receipt,
   reconciliation-transition, and status tests; the combined policy superset
-  passes 123/123; and its real-PostgreSQL Serve047 schema suite passes 12/12.
+  passes 125/125; and its required real-PostgreSQL Serve047 schema suite passes
+  12/12 with zero skips against the isolated local PostgreSQL server.
   These reruns supplement the complete cleanup freeze recorded below; the
   final cleanup OID will change when it is rebased over review-record-only
   feature commits, without changing its tested implementation tree.
