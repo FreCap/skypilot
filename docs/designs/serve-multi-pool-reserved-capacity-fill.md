@@ -243,6 +243,9 @@ independent, deterministically ordered edges. The repeated context is valid:
 only an overlap on the same physical UID/card is ambiguous. Context aliases
 that prove the same UID/card cannot multiply one physical pool, and aliases
 that disagree on width for that exact card fail closed.
+The deployment policy enforces the same atom invariant: it accepts multiple
+edges sharing an access context, attests that context once, and rejects only a
+second claim on the same `(physical_cluster_uid, exact_card)` atom.
 
 The existing service-wide meanings remain authoritative:
 
@@ -873,8 +876,14 @@ selectors, GPU flavor quotas, preemption policies, provider-owned
 ResourceFlavor instance selectors, WorkloadPriorityClass, Pod PriorityClass,
 immutable custom scheduler deployment, current Kueue controller, Pod
 integration,
-`AssignQueueLabelsForPods: true`, fail-closed Kueue webhooks, and the Deny
-queue-name admission-policy binding. HyperPod remains the sole owner of its
+`AssignQueueLabelsForPods: true`, and the Deny queue-name admission-policy
+binding. It does not infer Pod admission from a webhook configuration name:
+for both the mutating and validating configurations it requires exactly one
+named Pod webhook with the reviewed core/v1 Pod operations, Kueue service
+name/namespace/path/port, nonempty CA bundle, admission review version,
+selectors, side effects, timeout, match and failure policies, plus the
+mutating reinvocation policy. Any missing rule or endpoint drift fails
+activation and every later policy check. HyperPod remains the sole owner of its
 ResourceFlavors: the attestor proves each flavor's exact provider-owned
 instance selector, then cross-binds that selector to the GPU product label and
 `nvidia.com/gpu` capacity on the current physical cluster's Nodes. It requires
@@ -1656,9 +1665,13 @@ The current worktree now:
     and replaces managed-job PID-file spawning with fixed runtime-owned slots
     whose generation/slot-attempt fence covers every state and provider-effect
     boundary and whose exact families participate in the same
-    retry-until-proven-absent ownership handoff.
+    retry-until-proven-absent ownership handoff; and
+22. makes deployment attestation use the same physical-UID/card atom as the
+    broker so east's A100-40 and A100-80 edges may share one context without
+    duplicating capacity, and binds both Kueue Pod webhooks to their exact
+    reviewed rules and service endpoints rather than trusting object names.
 
-Regression tests exist for corrections 1--21, including owner-death,
+Regression tests exist for corrections 1--22, including owner-death,
 request-liveness, legacy-row retirement, runtime-daemon supervision,
 scheduler/bound-Node admission, capability bootstrap, and fixed managed-job
 slot ownership. The complete non-PostgreSQL matrix, changed-source lint, and
@@ -1689,7 +1702,10 @@ PHX exposes 64 `ml.p5e.48xlarge` Nodes with 8 H200 GPUs each. The east
 ResourceFlavor selectors are the live beta/stable/HyperPod labels for p4d and
 beta/HyperPod labels for p4de; PHX has beta/stable/HyperPod labels for p5e.
 The queue-name Deny policy and binding are absent in east and present in PHX;
-Kueue webhooks fail closed in both. The current hub writer is forbidden from
+Kueue webhooks fail closed in both. A direct 2026-08-13 east read additionally
+confirmed that the new exact mutating and validating Pod-webhook contracts
+match the live v0.18 objects; PHX must pass the same code-owned v0.19 contract
+through deployment preflight before activation. The current hub writer is forbidden from
 reading the required Namespace, ServiceAccount, queue, priority, flavor, Node,
 scheduler, controller, and admission objects in both spokes. These are exact
 platform IAM/RBAC and object gates; SkyPilot core does not duplicate their
@@ -2150,6 +2166,13 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   reject a
   missing or mismatched Node inventory, selector/product/capacity drift, and a
   deleting-only flavor while accepting a non-Ready initializing Node.
+- On correction revision `70cb55a2fb003a4cd9665c5f3118c2b923a1f6ea`, the
+  integrated policy/interface superset passes 121/121. New tests accept the two
+  east exact-card edges in one context, reject a duplicate physical UID/card
+  atom before provider calls, and reject missing Pod rules or drift in webhook
+  operations, endpoint, CA bundle, and namespace selection. Ruff and targeted
+  mypy pass, pylint is 10.00/10, JSON and Python compilation pass, and the exact
+  live east mutating and validating objects pass the same validator.
 - The post-integration local Serve047 restack at `4200b43fb` passes 58/58
   focused final-state, cleanup-presence, manager-receipt,
   reconciliation-transition, and status tests; the combined policy superset
@@ -2166,9 +2189,16 @@ The implementation is not merge-ready until three consecutive reviews pass
 against the exact current file and code. A finding that changes behavior must
 update this file before the next round.
 
+One non-counting review attempt on feature `b93db03fb` and cleanup
+`1094b9ded` failed. It found that the deployment policy rejected valid
+same-context exact-card edges and that webhook attestation trusted names
+without proving Pod admission rules or the Kueue endpoint. Revision
+`70cb55a2f` fixes both findings and adds the fail-closed coverage above. The
+consecutive sequence therefore restarts from round 1.
+
 | Round | Revision reviewed | Result | Material findings/fixes |
 |---|---|---|---|
-| 1 | pending restart over the integrated feature/plugin/audit revision and this exact design | pending | The historical PASS at documentation `1e8ddf095` is superseded and does not count: exact live ResourceFlavor and research-quota evidence materially corrected the deployment-policy contract. |
+| 1 | pending restart over correction `70cb55a2f`, its exact design successor, and the newly restacked cleanup | pending | Historical and failed attempts do not count. |
 | 2 | pending | pending | pending |
 | 3 | pending | pending | pending |
 
