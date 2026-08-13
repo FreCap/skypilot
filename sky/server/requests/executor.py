@@ -1102,7 +1102,7 @@ _SILENT_WORKSPACE_RESOLUTION_SOURCES = {
 
 def _should_apply_workspace_resolver(client_api_version: int | None) -> bool:
     """Returns True iff the per-user workspace resolver should run for
-    this request. Three gates, in order:
+    this request. Two gates, in order:
 
       (a) skip when the client API version is below the version that
           added /users/me/workspace + WorkspaceAmbiguousError handling —
@@ -1172,7 +1172,7 @@ def override_request_env_and_config(
                 # always landing on the bare 'default' literal. Explicit
                 # intent (any value, including 'default') is passed through
                 # unchanged. See _should_apply_workspace_resolver for the
-                # exact gate conditions (daemon skip, client API version,
+                # exact gate conditions (client API version and
                 # explicit-intent respect).
                 workspace_ctx: contextlib.AbstractContextManager = (
                     contextlib.nullcontext())

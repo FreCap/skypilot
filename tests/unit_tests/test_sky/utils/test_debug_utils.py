@@ -2072,9 +2072,10 @@ class TestRequestBodyAllowlistCoverage:
         # Recipe content: YAML content similar to tasks
         'sky.recipes.create',
         'sky.recipes.update',
-        # Transition-only decoder names for retired request-backed daemons.
-        # Runtime supervisors do not persist RequestBody rows for these names;
-        # Serve047 removes the decoder symbols after the stale-writer gate.
+        # Decoder/log-identity names for retired request-backed daemons.
+        # Runtime supervisors do not persist RequestBody rows for these names.
+        # Serve047 removes the managed-job compatibility RequestName after the
+        # stale-writer gate; the RuntimeDaemon names remain as log identities.
         'sky.status-refresh',
         'sky.volume-refresh',
         'sky.managed-job-status-refresh',
