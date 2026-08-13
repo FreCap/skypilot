@@ -844,14 +844,16 @@ def test_projected_worker_preserves_trusted_version_runtime_inputs():
 }])
 def test_projected_worker_rejects_task_kubernetes_identity_overrides(
         task_kubernetes_config):
-    task = task_lib.Task.from_yaml_str(f'''
+    task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
   accelerators: H200:1
-config:
-  kubernetes: {json.dumps(task_kubernetes_config)}
 run: echo hi
 ''')
+    resource = next(iter(task.resources))
+    resource._cluster_config_overrides = {  # pylint: disable=protected-access
+        'kubernetes': task_kubernetes_config,
+    }
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
         constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [{}],

@@ -2219,7 +2219,11 @@ class TestServiceUpdateReconciler:
                                        expected_service_hash='incarnation-a',
                                        expected_lifecycle_epoch=7,
                                        expected_controller_owner=(123,
-                                                                  '10.0.0.1'))
+                                                                  '10.0.0.1'),
+                                       controller_job_projection=None,
+                                       controller_work_cache=None,
+                                       worker_placement_projections=None,
+                                       storage_broker=None)
 
     def test_stale_version_returns_409_without_scheduling(self):
         ctrl = _make_update_controller()
@@ -2319,7 +2323,11 @@ class TestServiceUpdateReconciler:
                  IDEMPOTENT_RETRY), \
              mock.patch.object(controller.serve_state,
                                'get_spec',
-                               return_value=persisted) as get_spec:
+                               return_value=persisted) as get_spec, \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, None, None)):
             response = ctrl._commit_service_update(  # pylint: disable=protected-access
                 1, caller, 'service: same-legacy-yaml',
                 serve_utils.UpdateMode.BLUE_GREEN, 'incarnation-a', 7)
@@ -2370,6 +2378,10 @@ class TestServiceUpdateReconciler:
              mock.patch.object(controller.serve_state,
                                'get_placement_catalog',
                                return_value=placement_catalog), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, None, None)), \
              mock.patch.object(controller.task_lib.Task,
                                'from_yaml_str') as parse_task, \
              mock.patch.object(
@@ -2409,6 +2421,10 @@ class TestServiceUpdateReconciler:
                      'schema_version': 1,
                      'entries': [],
                  }), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, None, None)), \
              mock.patch.object(controller.task_lib.Task,
                                'from_yaml_str') as parse_task, \
              mock.patch.object(
@@ -2463,6 +2479,10 @@ class TestServiceUpdateReconciler:
              mock.patch.object(controller.serve_state,
                                'get_spec',
                                return_value=persisted), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_placement_projection_record',
+                 return_value=(True, None, None, None, None)), \
              mock.patch.object(
                  controller.serve_state,
                  'add_or_update_version',
