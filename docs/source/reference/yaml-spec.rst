@@ -1690,7 +1690,9 @@ allowing large queues of small payloads.
 ``service.replica_policy``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Autoscaling configuration for service replicas (one of replica_policy or replicas is required).
+Optional autoscaling configuration for service replicas. If both
+``replica_policy`` and ``replicas`` are omitted, SkyServe uses a fixed zero
+replica count until an update supplies a positive count.
 
 Describes how SkyServe autoscales your service based on the QPS (queries per second) of your service.
 
