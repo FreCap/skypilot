@@ -1,4 +1,5 @@
 """Tests for SkyServiceSpec, specifically pool configuration validation."""
+import pathlib
 import pickle
 
 import pytest
@@ -12,8 +13,56 @@ from sky.serve import service_spec
 
 def test_default_min_replicas_is_zero():
     spec = service_spec.SkyServiceSpec.from_yaml_config({})
+    rendered = spec.to_yaml_config()
+    restored = service_spec.SkyServiceSpec.from_yaml_config(rendered)
 
     assert spec.min_replicas == 0
+    assert spec.max_replicas is None
+    assert rendered['replica_policy'] == {'min_replicas': 0}
+    assert restored.min_replicas == 0
+    assert restored.max_replicas is None
+
+
+def test_zero_replica_default_is_documented_in_both_references():
+    repo_root = pathlib.Path(__file__).parents[3]
+    rst_reference = (repo_root /
+                     'docs/source/reference/yaml-spec.rst').read_text()
+    skill_reference = (
+        repo_root /
+        'agent/skills/skypilot/references/yaml-spec.md').read_text()
+
+    expected_rst = (
+        'If both\n``replica_policy`` and ``replicas`` are omitted, SkyServe '
+        'uses a fixed zero\nreplica count until an update supplies a positive '
+        'count.')
+    expected_markdown = (
+        'If both\n`replica_policy` and `replicas` are omitted, SkyServe uses a '
+        'fixed zero replica\ncount until an update supplies a positive count.')
+    assert expected_rst in rst_reference
+    assert expected_markdown in skill_reference
+
+
+@pytest.mark.parametrize(
+    ('config', 'expected_min', 'expected_max'),
+    [
+        ({
+            'replicas': 2
+        }, 2, None),
+        ({
+            'replica_policy': {
+                'min_replicas': 1,
+                'max_replicas': 3,
+                'target_qps_per_replica': 1,
+            }
+        }, 1, 3),
+    ],
+)
+def test_explicit_replica_config_overrides_default(config, expected_min,
+                                                   expected_max):
+    spec = service_spec.SkyServiceSpec.from_yaml_config(config)
+
+    assert spec.min_replicas == expected_min
+    assert spec.max_replicas == expected_max
 
 
 def test_old_pickled_spec_backfills_non_pool_interface():
@@ -119,6 +168,16 @@ class TestPoolConfiguration:
 
         # Verify the values were properly set
         assert spec.min_replicas == 1
+        assert spec.max_replicas == 5
+
+    def test_pool_with_only_max_workers_defaults_to_zero(self):
+        spec = service_spec.SkyServiceSpec.from_yaml_config({
+            'pool': {
+                'max_workers': 5,
+            },
+        })
+
+        assert spec.min_replicas == 0
         assert spec.max_replicas == 5
 
     def test_pool_with_only_workers(self):
