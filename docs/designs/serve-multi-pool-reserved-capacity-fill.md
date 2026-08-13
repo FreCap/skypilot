@@ -2193,15 +2193,15 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   context and reject a duplicated physical UID/card atom before provider
   calls. Ruff and targeted mypy pass, pylint is 10.00/10, formatting and
   `git diff --check` pass.
-- The correction after failed review round 1 carries the exact Kubernetes
+- On correction revision `bfbd6cbe0a9f22487d035f9149ac673ca4dacd95`,
+  the fix after failed review round 1 carries the exact Kubernetes
   accelerator scheduling atom through the typed admission and rejects drift in
   its label key, label values, or resource key before provider calls at claim,
   activation, and launch. The strict bundle rejects cross-card flavor or
   scheduling overlap, and its east A100 contract now owns only the 40GB
   product. The integrated policy/interface superset passes 132/132; Ruff and
   targeted mypy pass, pylint is 10.00/10, JSON parsing, compilation,
-  formatting, and `git diff --check` pass. The exact correction revision is
-  recorded after the behavior commit below.
+  formatting, and `git diff --check` pass.
 - The post-correction local Serve047 implementation restack at `dec0766a2`
   passes 58/58
   focused final-state, cleanup-presence, manager-receipt,
