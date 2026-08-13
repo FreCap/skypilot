@@ -97,6 +97,115 @@ KubernetesPhysicalClusterFenceBusyError = (
 
 
 @dataclasses.dataclass(frozen=True)
+class _ApiCallDeadline:
+    """One inherited absolute deadline for synchronous Kubernetes work."""
+
+    deadline_monotonic: float
+    cancellations: tuple[threading.Event, ...]
+
+
+_API_CALL_DEADLINE: contextvars.ContextVar[_ApiCallDeadline |
+                                           None] = contextvars.ContextVar(
+                                               'kubernetes_api_call_deadline',
+                                               default=None)
+
+
+@contextlib.contextmanager
+def api_call_deadline(
+    deadline_monotonic: float,
+    cancellation: threading.Event,
+) -> typing.Iterator[None]:
+    """Bound Kubernetes RPCs and retry waits to one monotonic deadline.
+
+    Generated Kubernetes API methods are synchronous and Python cannot safely
+    terminate an arbitrary running thread.  This scope instead clamps every
+    request timeout and makes client-admission/retry waits cancellation-aware,
+    so a timed-out observer query releases its executor worker.
+    """
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float)) or
+            not math.isfinite(float(deadline_monotonic))):
+        raise ValueError('Kubernetes API deadline must be finite.')
+    if not isinstance(cancellation, threading.Event):
+        raise TypeError('Kubernetes API cancellation must be an Event.')
+    previous = _API_CALL_DEADLINE.get()
+    effective_deadline = float(deadline_monotonic)
+    cancellations: tuple[threading.Event, ...] = (cancellation,)
+    if previous is not None:
+        effective_deadline = min(effective_deadline,
+                                 previous.deadline_monotonic)
+        cancellations = previous.cancellations + cancellations
+    token = _API_CALL_DEADLINE.set(
+        _ApiCallDeadline(effective_deadline, cancellations))
+    try:
+        raise_if_api_call_deadline_exceeded()
+        yield
+    finally:
+        _API_CALL_DEADLINE.reset(token)
+
+
+def api_call_deadline_is_active() -> bool:
+    """Whether this execution context carries an absolute API deadline."""
+    return _API_CALL_DEADLINE.get() is not None
+
+
+def remaining_api_call_budget_seconds() -> float | None:
+    """Return remaining scoped time, raising after cancellation/expiry."""
+    scope = _API_CALL_DEADLINE.get()
+    if scope is None:
+        return None
+    if any(cancellation.is_set() for cancellation in scope.cancellations):
+        raise TimeoutError('Kubernetes API call was cancelled.')
+    remaining = scope.deadline_monotonic - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError('Kubernetes API call exceeded its deadline.')
+    return remaining
+
+
+def raise_if_api_call_deadline_exceeded() -> None:
+    """Fail the current synchronous provider operation after its deadline."""
+    remaining_api_call_budget_seconds()
+
+
+def bounded_api_call_timeout(configured_timeout: float) -> float:
+    """Clamp one provider timeout to the current absolute deadline."""
+    if (isinstance(configured_timeout, bool) or
+            not isinstance(configured_timeout, (int, float)) or
+            not math.isfinite(float(configured_timeout)) or
+            configured_timeout <= 0):
+        raise ValueError('Kubernetes API timeout must be finite and positive.')
+    remaining = remaining_api_call_budget_seconds()
+    if remaining is None:
+        return float(configured_timeout)
+    return min(float(configured_timeout), remaining)
+
+
+def wait_for_api_call_retry(delay_seconds: float) -> None:
+    """Wait for a retry without sleeping past a scoped query deadline."""
+    if (isinstance(delay_seconds, bool) or
+            not isinstance(delay_seconds, (int, float)) or
+            not math.isfinite(float(delay_seconds)) or delay_seconds < 0):
+        raise ValueError(
+            'Kubernetes retry delay must be finite and nonnegative.')
+    scope = _API_CALL_DEADLINE.get()
+    if scope is None:
+        time.sleep(float(delay_seconds))
+        return
+    wake_at = time.monotonic() + float(delay_seconds)
+    while True:
+        remaining_budget = remaining_api_call_budget_seconds()
+        assert remaining_budget is not None
+        remaining_delay = wake_at - time.monotonic()
+        if remaining_delay <= 0:
+            return
+        wait_seconds = min(remaining_delay, remaining_budget, 0.05)
+        # Wait once, then recheck every inherited signal at the top of the
+        # loop.  Nested scopes must not multiply the retry-poll interval.
+        if scope.cancellations[-1].wait(wait_seconds):
+            raise TimeoutError('Kubernetes API call was cancelled.')
+
+
+@dataclasses.dataclass(frozen=True)
 class PhysicalClusterUidFenceTarget:
     """One capture-pinned Kubernetes target admitted by a durable UID."""
 
@@ -274,16 +383,27 @@ def _capture_fenced_kubeconfig(context: str) -> str:
         with os.fdopen(file_descriptor, 'wb') as output:
             file_descriptor = -1
             try:
-                result = subprocess.run(
-                    [
-                        'kubectl', 'config', 'view', '--raw', '--flatten',
-                        '--minify', '--context', context
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=output,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                    timeout=_FENCED_KUBECONFIG_CAPTURE_TIMEOUT_SECONDS)
+                capture_timeout = bounded_api_call_timeout(
+                    _FENCED_KUBECONFIG_CAPTURE_TIMEOUT_SECONDS)
+                result = subprocess.run([
+                    'kubectl', 'config', 'view', '--raw', '--flatten',
+                    '--minify', '--context', context
+                ],
+                                        stdin=subprocess.DEVNULL,
+                                        stdout=output,
+                                        stderr=subprocess.DEVNULL,
+                                        check=False,
+                                        timeout=capture_timeout)
+                raise_if_api_call_deadline_exceeded()
+            except subprocess.TimeoutExpired as error:
+                if api_call_deadline_is_active():
+                    try:
+                        raise_if_api_call_deadline_exceeded()
+                    except TimeoutError as deadline_error:
+                        raise deadline_error from error
+                raise KubernetesPhysicalClusterIdentityError(
+                    'Kubernetes context capture timed out for physical-'
+                    'cluster fencing.') from error
             except (OSError, subprocess.SubprocessError) as error:
                 raise KubernetesPhysicalClusterIdentityError(
                     'Kubernetes context could not be captured for physical-'
@@ -321,8 +441,19 @@ def _new_api_client_from_fence_capture(context: str,
         return _get_api_client(in_cluster_context_name(),
                                _ignore_physical_cluster_fence=True)
     try:
+        if api_call_deadline_is_active():
+            remaining = remaining_api_call_budget_seconds()
+            assert remaining is not None
+            core, _ = _bounded_core_api(
+                context,
+                exec_credential_timeout_seconds=remaining,
+                provider_fence=raise_if_api_call_deadline_exceeded,
+                config_file=kubeconfig_path)
+            return core.api_client
         return kubernetes.config.new_client_from_config(
             config_file=kubeconfig_path, context=context)
+    except TimeoutError:
+        raise
     except Exception as error:
         raise KubernetesPhysicalClusterIdentityError(
             'Captured Kubernetes target could not be loaded.') from error
@@ -331,13 +462,22 @@ def _new_api_client_from_fence_capture(context: str,
 def _read_physical_cluster_uid_from_api_client(client: Any) -> str:
     """Read the cluster UID through the exact supplied raw client."""
     try:
+        request_timeout = bounded_api_call_timeout(API_TIMEOUT)
         namespace = kubernetes.client.CoreV1Api(
             api_client=client).read_namespace('kube-system',
-                                              _request_timeout=API_TIMEOUT)
+                                              _request_timeout=request_timeout)
+        raise_if_api_call_deadline_exceeded()
         metadata = getattr(namespace, 'metadata', None)
         raw_uid = getattr(metadata, 'uid', None)
         observed_uid = raw_uid.strip() if isinstance(raw_uid, str) else ''
+    except TimeoutError:
+        raise
     except Exception as error:
+        if api_call_deadline_is_active():
+            try:
+                raise_if_api_call_deadline_exceeded()
+            except TimeoutError as deadline_error:
+                raise deadline_error from error
         raise KubernetesPhysicalClusterIdentityError(
             'Kubernetes physical-cluster identity could not be verified.'
         ) from (error)
@@ -353,12 +493,15 @@ def physical_cluster_uid_fence(
     expected_uid: str,
     *,
     wait_for_initializer: bool = True,
+    require_existing: bool = False,
 ) -> typing.Iterator[None]:
     """Fence every Kubernetes API client used in this provisioning scope.
 
     Concurrent scopes may share one context only when they expect the same
     physical cluster. A kubeconfig retarget that produces conflicting durable
     expectations fails closed before either expectation can replace the other.
+    ``require_existing`` is a join-only handoff: it reuses an active matching
+    capture and fails before kubeconfig or API-client initialization otherwise.
     """
     if not isinstance(context, str) or not context:
         raise ValueError('Kubernetes physical-cluster fence needs a context.')
@@ -366,6 +509,8 @@ def physical_cluster_uid_fence(
         raise ValueError('Kubernetes physical-cluster fence needs a UID.')
     if not isinstance(wait_for_initializer, bool):
         raise ValueError('wait_for_initializer must be a bool.')
+    if not isinstance(require_existing, bool):
+        raise ValueError('require_existing must be a bool.')
     _ensure_physical_cluster_uid_fence_process()
     scope_pid = _PHYSICAL_CLUSTER_UID_FENCE_PID
     canonical_context = _canonical_physical_cluster_fence_context(context)
@@ -408,7 +553,7 @@ def physical_cluster_uid_fence(
                     raise KubernetesPhysicalClusterIdentityError(
                         'Conflicting Kubernetes physical-cluster provisioning '
                         'fences are active for one context.')
-                if not wait_for_initializer:
+                if require_existing or not wait_for_initializer:
                     raise KubernetesPhysicalClusterFenceBusyError(
                         'A Kubernetes physical-cluster fence is being '
                         'initialized for this context.', canonical_context,
@@ -416,6 +561,12 @@ def physical_cluster_uid_fence(
                             canonical_context, 0))
                 _PHYSICAL_CLUSTER_UID_FENCES_CONDITION.wait()
                 continue
+            if require_existing:
+                raise KubernetesPhysicalClusterFenceBusyError(
+                    'A preinitialized Kubernetes physical-cluster fence is '
+                    'not active for this context.', canonical_context,
+                    _PHYSICAL_CLUSTER_UID_FENCE_FAILURE_GENERATIONS.get(
+                        canonical_context, 0))
             _PHYSICAL_CLUSTER_UID_FENCE_INITIALIZERS[
                 canonical_context] = expected_uid
             owns_initializer = True
@@ -2265,8 +2416,11 @@ def _close_bounded_core(core: Any | None) -> None:
 
 
 def _bounded_core_api_isolated_impl(
-        context: str, *, exec_credential_timeout_seconds: float,
-        provider_fence: Callable[[], None]) -> _BoundedCoreApiResult:
+        context: str,
+        *,
+        exec_credential_timeout_seconds: float,
+        provider_fence: Callable[[], None],
+        config_file: str | None = None) -> _BoundedCoreApiResult:
     """Builds a client while keeping credential state out of exceptions."""
     control_error = _capture_provider_fence(provider_fence)
     if control_error is not None:
@@ -2301,7 +2455,7 @@ def _bounded_core_api_isolated_impl(
     try:
         kube_config = kubernetes.config.kube_config
         loader = kube_config._get_kube_config_loader_for_yaml_file(  # pylint: disable=protected-access
-            _get_config_file(),
+            _get_config_file() if config_file is None else config_file,
             active_context=context)
         user = loader._user  # pylint: disable=protected-access
         if user is None:
@@ -2376,14 +2530,18 @@ def _bounded_core_api_isolated_impl(
 
 
 def _bounded_core_api_isolated(
-        context: str, *, exec_credential_timeout_seconds: float,
-        provider_fence: Callable[[], None]) -> _BoundedCoreApiResult:
+        context: str,
+        *,
+        exec_credential_timeout_seconds: float,
+        provider_fence: Callable[[], None],
+        config_file: str | None = None) -> _BoundedCoreApiResult:
     """Total isolation and post-failure fence for bounded client creation."""
     try:
         result = _bounded_core_api_isolated_impl(
             context,
             exec_credential_timeout_seconds=exec_credential_timeout_seconds,
-            provider_fence=provider_fence)
+            provider_fence=provider_fence,
+            config_file=config_file)
     except BaseException:  # pylint: disable=broad-exception-caught  # noqa: ASYNC103
         # Never expose the sensitive inner frame.
         result = _bounded_core_api_failure(
@@ -2396,13 +2554,17 @@ def _bounded_core_api_isolated(
 
 
 def _bounded_core_api(
-        context: str, *, exec_credential_timeout_seconds: float,
-        provider_fence: Callable[[], None]) -> tuple[Any, float | None]:
+        context: str,
+        *,
+        exec_credential_timeout_seconds: float,
+        provider_fence: Callable[[], None],
+        config_file: str | None = None) -> tuple[Any, float | None]:
     """Builds one CoreV1Api without a transparent unbounded exec refresh."""
     result = _bounded_core_api_isolated(
         context,
         exec_credential_timeout_seconds=exec_credential_timeout_seconds,
-        provider_fence=provider_fence)
+        provider_fence=provider_fence,
+        config_file=config_file)
     if result.control_error is not None:
         raise result.control_error.with_traceback(None) from None
     if result.failure_message is not None:
@@ -2746,7 +2908,8 @@ class RetryableClientWrapper:
         """Borrow one stable client; refresh waits for all outstanding calls."""
         with self._state_condition:
             while self._refreshing:
-                self._state_condition.wait()
+                self._state_condition.wait(
+                    timeout=remaining_api_call_budget_seconds())
             requested_fence_token = (None if target is None else target.token)
             target_changed = (self._installed_fence_token
                               != requested_fence_token)
@@ -2760,8 +2923,14 @@ class RetryableClientWrapper:
                 self._active_calls += 1
                 return self._client
             self._refreshing = True
-            while self._active_calls:
-                self._state_condition.wait()
+            try:
+                while self._active_calls:
+                    self._state_condition.wait(
+                        timeout=remaining_api_call_budget_seconds())
+            except BaseException:
+                self._refreshing = False
+                self._state_condition.notify_all()
+                raise
             installed_client = self._client
 
         replace_client = target_changed or interval_elapsed
@@ -2777,6 +2946,7 @@ class RetryableClientWrapper:
             if target is not None:
                 self._verify_physical_cluster_uid(candidate,
                                                   target.expected_uid)
+            raise_if_api_call_deadline_exceeded()
         except BaseException:
             if candidate is not installed_client:
                 self._close_client(candidate)
@@ -2825,11 +2995,24 @@ class RetryableClientWrapper:
 
         @functools.wraps(attr)
         def with_refresh(*args, **kwargs):
+            raise_if_api_call_deadline_exceeded()
             target = active_physical_cluster_command_target(self._context)
             client = self._acquire_client(target)
             try:
                 method = getattr(client, name)
-                return method(*args, **kwargs)
+                if '_request_timeout' in kwargs:
+                    configured_timeout = kwargs['_request_timeout']
+                    if isinstance(configured_timeout, (int, float)):
+                        kwargs['_request_timeout'] = bounded_api_call_timeout(
+                            float(configured_timeout))
+                    elif (isinstance(configured_timeout, tuple) and
+                          len(configured_timeout) == 2):
+                        kwargs['_request_timeout'] = tuple(
+                            bounded_api_call_timeout(float(timeout))
+                            for timeout in configured_timeout)
+                result = method(*args, **kwargs)
+                raise_if_api_call_deadline_exceeded()
+                return result
             finally:
                 self._release_client()
 

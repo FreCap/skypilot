@@ -18,7 +18,6 @@ import uvicorn
 from uvicorn.supervisors import multiprocess
 
 from sky import sky_logging
-from sky.server import daemons
 from sky.server import metrics as metrics_lib
 from sky.server import state
 from sky.server import watchdog
@@ -232,11 +231,6 @@ class Server(uvicorn.Server):
                 break
             logger.info(f'{len(requests)} on-going requests '
                         'found, waiting for them to finish...')
-            # Proactively cancel internal requests and logs requests since
-            # they can run for infinite time.
-            internal_request_ids = {
-                d.id for d in daemons.INTERNAL_REQUEST_DAEMONS
-            }
             if time.monotonic() >= interrupt_deadline:
                 logger.warning('Timeout waiting for on-going requests to '
                                'finish, cancelling all on-going requests.')
@@ -245,8 +239,7 @@ class Server(uvicorn.Server):
                 break
             interrupted = 0
             for request_id, name in requests:
-                if (name in _RETRIABLE_REQUEST_NAMES or
-                        request_id in internal_request_ids):
+                if name in _RETRIABLE_REQUEST_NAMES:
                     self.interrupt_request_for_retry(request_id)
                     interrupted += 1
                 # TODO(aylei): interrupt pending requests to accelerate the
@@ -259,6 +252,13 @@ class Server(uvicorn.Server):
 
     def interrupt_request_for_retry(self, request_id: str) -> None:
         """Interrupt a request for retry."""
+        durable_result = request_storage.get_request_backend(
+        ).interrupt_request_for_shutdown_retry(request_id)
+        if durable_result is not None:
+            if durable_result:
+                logger.info(f'Request {request_id} interrupted and will be '
+                            'retried by client.')
+            return
         with requests_lib.update_request(request_id) as req:
             if req is None:
                 return

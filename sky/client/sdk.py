@@ -39,8 +39,6 @@ from sky.client import request_results
 from sky.client.api_auth import api_login
 from sky.client.api_auth import api_logout
 from sky.events import api_models as event_api_models
-from sky.jobs import scheduler
-from sky.jobs import utils as managed_job_utils
 from sky.schemas.api import responses
 from sky.server import common as server_common
 from sky.server import constants as server_constants
@@ -2984,27 +2982,9 @@ def api_stop() -> None:
     # stopping and starting the API server at the same time.
     with filelock.FileLock(
             os.path.expanduser(constants.API_SERVER_CREATION_LOCK_PATH)):
-        try:
-            records = scheduler.get_controller_process_records()
-            if records is not None:
-                for record in records:
-                    try:
-                        if managed_job_utils.controller_process_alive(
-                                record, quiet=False):
-                            subprocess_utils.kill_children_processes(
-                                parent_pids=[record.pid], force=True)
-                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                        continue
-                os.remove(os.path.expanduser(scheduler.JOB_CONTROLLER_PID_PATH))
-        except FileNotFoundError:
-            # its fine we will create it
-            pass
-        except Exception as e:  # pylint: disable=broad-except
-            # in case we get perm issues or something is messed up, just ignore
-            # it and assume the process is dead
-            logger.error(f'Error looking at job controller pid file: {e}')
-            pass
-
+        # The runtime owns and drains managed-job slot families before its
+        # process exits.  The CLI has no cross-process PID authority and must
+        # not race that supervisor with an independent process-tree scan.
         found = _local_api_server_running(kill=True)
 
     if found:

@@ -2,6 +2,7 @@
 import bisect
 from collections.abc import Iterable
 from collections.abc import Sequence
+import contextlib
 import copy
 import dataclasses
 import math
@@ -18,6 +19,7 @@ from sky.serve import autoscaler_decisions
 from sky.serve import constants
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -471,6 +473,12 @@ class Autoscaler:
         # explicit lifecycle reset. Same-order feed refreshes deliberately
         # retain the revision.
         self._fill_pool_order_revision = 0
+        # The sequenced planner is invoked by the controller on the same
+        # thread as ``generate_scaling_decisions``.  A thread-local scope
+        # keeps that one decision tick from speculatively spending the legacy
+        # protocol-v2 feed while leaving concurrent status/poller readers and
+        # legacy ticks untouched.
+        self._sequenced_reserved_fill_planning_state = threading.local()
         # Opt-in economic replacement.  The placer reference is injected by
         # the controller each tick because ReplicaManager owns placement state.
         self.cost_rebalance: bool = bool(spec.cost_rebalance)
@@ -595,6 +603,274 @@ class Autoscaler:
     def fill_target(self) -> int:
         """Return the latest aggregate reserved-capacity fill target."""
         return self._fill_target
+
+    @contextlib.contextmanager
+    def sequenced_reserved_fill_planning(self) -> typing.Iterator[None]:
+        """Suppress legacy v2 launch emission for one typed planning tick.
+
+        The legacy overlay still computes its ordinary decisions, scale-down
+        shelter, and status target.  Only speculative protocol-v2 launch
+        emission and its feed/rotation mutation are disabled; a validated
+        durable manager receipt is the sole commit point in sequenced mode.
+        """
+        state = self._sequenced_reserved_fill_planning_state
+        previously_enabled = bool(getattr(state, 'enabled', False))
+        state.enabled = True
+        try:
+            yield
+        finally:
+            state.enabled = previously_enabled
+
+    def _sequenced_reserved_fill_planning_enabled(self) -> bool:
+        return bool(
+            getattr(self._sequenced_reserved_fill_planning_state, 'enabled',
+                    False))
+
+    def reserved_fill_rotation_anchor(self) -> str | None:
+        """Return the pool whose last wave began with durable acceptance."""
+        with self._fill_pool_state_lock:
+            anchor = self._fill_pool_last_started_key
+            return anchor if anchor in self._fill_pool_states else None
+
+    def commit_reserved_fill_rotation_anchor(self, pool_key: str) -> bool:
+        """Commit a receipt-proven rotation anchor if the pool is still live.
+
+        Returns false across a concurrent pool-set replacement.  The caller
+        can simply wake reconciliation: the next authenticated map will use
+        its own ordered membership and no stale anchor is restored.
+        """
+        if not isinstance(pool_key, str) or not pool_key:
+            raise ValueError('Reserved-fill rotation anchor must be a '
+                             'nonempty pool key.')
+        with self._fill_pool_state_lock:
+            if pool_key not in self._fill_pool_states:
+                return False
+            self._fill_pool_last_started_key = pool_key
+            return True
+
+    def reserved_fill_planned_capacity(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> int:
+        """Return rollout-safe planned capacity in the configured unit.
+
+        Old-version rows remain real service-wide headroom consumers.  For
+        the latest version, the larger of already materialized capacity and
+        the ordinary demand target is planned, matching the existing v2 hard
+        ceiling without treating opportunistic fill as demand.
+        """
+        old_capacity = 0
+        latest_capacity = 0
+        for info in replica_infos:
+            if info.is_terminal:
+                continue
+            capacity = self._fill_capacity_units(info)
+            if info.version == self.latest_version:
+                latest_capacity += capacity
+            else:
+                old_capacity += capacity
+        return old_capacity + max(latest_capacity,
+                                  self.get_final_target_num_replicas())
+
+    def reserved_fill_ordinary_demand_debits(
+        self,
+        allocation_map: reserved_fill_planner.AuthenticatedAllocationMap,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        decisions: list[AutoscalerDecision],
+    ) -> tuple[reserved_fill_planner.OrdinaryDemandDebit, ...]:
+        """Project ordinary demand onto each compatible authenticated pool.
+
+        Debit values are physical replica slots even for a logical service.
+        An exact-card decision without an exact pool placement is deliberately
+        debited against every compatible pool: until durable admission chooses
+        one pool, each is a possible consumer.  Every debit is independently
+        capped by that pool/card's authenticated feed; no process-global or
+        prior-round free-capacity gauge participates in this calculation.
+        """
+        if not isinstance(allocation_map,
+                          reserved_fill_planner.AuthenticatedAllocationMap):
+            raise ValueError('Ordinary-demand debits require an authenticated '
+                             'allocation map.')
+        allocation_map.validate_authentication()
+
+        # Canonical card inventory and the only admissible per-pool caps.
+        caps: dict[tuple[str, str], int] = {}
+        snapshots_by_key = {
+            snapshot.pool_key: snapshot
+            for snapshot in allocation_map.pool_snapshots
+        }
+        for snapshot in allocation_map.pool_snapshots:
+            if snapshot.free_slots_by_accelerator is None:
+                snapshot_cards = {
+                    location.accelerator.casefold()
+                    for location in snapshot.locations
+                }
+                exact = ({
+                    next(iter(snapshot_cards)): snapshot.free_slots
+                } if len(snapshot_cards) == 1 else {})
+            else:
+                exact = dict(snapshot.free_slots_by_accelerator)
+            for card, free_slots in exact.items():
+                caps[(snapshot.pool_key,
+                      card.casefold())] = min(snapshot.free_slots,
+                                              snapshot.grant, snapshot.edge_cap,
+                                              max(0, int(free_slots)))
+
+        claims: dict[tuple[str, str], int] = {key: 0 for key in caps}
+
+        def _override_matches_snapshot(override: dict[
+            str, Any], snapshot: reserved_fill_planner.PoolFillSnapshot,
+                                       card: str) -> bool:
+            raw_cloud = override.get('cloud')
+            if raw_cloud is not None and 'kubernetes' not in str(
+                    raw_cloud).casefold():
+                return False
+            raw_use_spot = override.get('use_spot')
+            if isinstance(raw_use_spot, bool) and raw_use_spot:
+                return False
+            for location in snapshot.locations:
+                if location.accelerator.casefold() != card:
+                    continue
+                raw_region = override.get('region')
+                if raw_region is not None and raw_region != location.region:
+                    continue
+                raw_zone = override.get('zone')
+                if raw_zone is not None and raw_zone != location.zone:
+                    continue
+                raw_instance_type = override.get('instance_type')
+                if (raw_instance_type is not None and
+                        raw_instance_type != location.instance_type):
+                    continue
+                return True
+            return False
+
+        # Exact physical overrides are additive: each decision can persist a
+        # distinct ordinary row.  A target-less physical decision is the most
+        # ambiguous ordinary launch: the existing placer may choose any
+        # authenticated zero-cost pool/card after this planner returns.  Copy
+        # it into every map-local card so fill accepted earlier in the same
+        # controller tick cannot spend capacity that ordinary demand may use.
+        # Every copied claim is clipped only at the final authenticated cap.
+        for decision in decisions:
+            if decision.operator != AutoscalerDecisionOperator.SCALE_UP:
+                continue
+            target = decision.target
+            if target is None:
+                for key in claims:
+                    claims[key] += 1
+                continue
+            if not isinstance(target, dict):
+                continue
+            if target.get(constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY):
+                continue
+            accelerators = target.get('accelerators')
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                continue
+            raw_card = next(iter(accelerators))
+            if not isinstance(raw_card, str) or not raw_card:
+                continue
+            card = raw_card.casefold()
+            for pool_key, snapshot in snapshots_by_key.items():
+                key = (pool_key, card)
+                if key in claims and _override_matches_snapshot(
+                        target, snapshot, card):
+                    claims[key] += 1
+
+        def _replica_shape(
+            info: 'replica_managers.ReplicaInfo',) -> tuple[str, int] | None:
+            location = info.get_spot_location()
+            accelerators = (location.accelerators
+                            if location is not None else None)
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                override = info.resources_override
+                accelerators = (override.get('accelerators') if isinstance(
+                    override, dict) else None)
+            if not isinstance(accelerators, dict) or len(accelerators) != 1:
+                return None
+            raw_card, raw_width = next(iter(accelerators.items()))
+            if (not isinstance(raw_card, str) or not raw_card or
+                    isinstance(raw_width, bool) or
+                    not isinstance(raw_width, (int, float)) or
+                    not float(raw_width).is_integer() or raw_width <= 0):
+                return None
+            return raw_card.casefold(), int(raw_width)
+
+        # Logical targets are absolute.  Multiple copies of the same target
+        # cannot add launch authority, so retain the largest possible physical
+        # shortage per card and add it once to each compatible pool.
+        logical_claims: dict[str, int] = {}
+        for decision in decisions:
+            if decision.operator != AutoscalerDecisionOperator.SCALE_UP:
+                continue
+            target = decision.target
+            if not isinstance(target, LogicalScaleTarget):
+                continue
+            target_by_card = {
+                str(card).casefold(): raw_target
+                for card, raw_target in target.target_capacity_by_accelerator
+            }
+            shapes = {
+                str(card).casefold(): raw_width
+                for card, raw_width in target.accelerator_shapes
+            }
+            if not target_by_card or target.launch_budget == 0:
+                continue
+            current_by_card: dict[str, int] = {}
+            replacements = set(target.replace_unknown_replica_ids)
+            for info in replica_infos:
+                if (info.is_terminal or info.version != target.version or
+                        info.replica_id in replacements or
+                        getattr(info.status_property, 'is_scale_down',
+                                None) is True):
+                    continue
+                shape = _replica_shape(info)
+                if shape is None:
+                    continue
+                card, _ = shape
+                if card not in target_by_card:
+                    continue
+                capacity = self._reserved_fill_committed_capacity(info)
+                if capacity <= 0:
+                    continue
+                current_by_card[card] = (current_by_card.get(card, 0) +
+                                         capacity)
+            for card, raw_target in target_by_card.items():
+                raw_width = shapes.get(card)
+                if (isinstance(raw_target, bool) or
+                        not isinstance(raw_target, int) or raw_target < 0 or
+                        isinstance(raw_width, bool) or
+                        not isinstance(raw_width, int) or raw_width <= 0):
+                    continue
+                shortage = max(0, raw_target - current_by_card.get(card, 0))
+                launch_budget = target.launch_budget
+                if (isinstance(launch_budget, int) and
+                        not isinstance(launch_budget, bool)):
+                    if launch_budget < 0:
+                        continue
+                    shortage = min(shortage, launch_budget)
+                physical_slots = math.ceil(shortage / raw_width)
+                logical_claims[card] = max(logical_claims.get(card, 0),
+                                           physical_slots)
+        for (pool_key, card) in claims:
+            claims[(pool_key, card)] += logical_claims.get(card, 0)
+
+        debits: list[reserved_fill_planner.OrdinaryDemandDebit] = []
+        for snapshot in allocation_map.pool_snapshots:
+            ordered_cards: list[str] = []
+            for pool_location in snapshot.locations:
+                card = pool_location.accelerator.casefold()
+                if card not in ordered_cards:
+                    ordered_cards.append(card)
+            for card in ordered_cards:
+                key = (snapshot.pool_key, card)
+                replica_slots = min(caps.get(key, 0), claims.get(key, 0))
+                if replica_slots > 0:
+                    debits.append(
+                        reserved_fill_planner.OrdinaryDemandDebit(
+                            pool_key=snapshot.pool_key,
+                            accelerator=card,
+                            replica_slots=replica_slots))
+        return tuple(debits)
 
     def _calculate_target_num_replicas(self) -> int:
         """Calculate target number of replicas."""
@@ -1441,6 +1717,11 @@ class Autoscaler:
         del info
         return 1
 
+    def _reserved_fill_committed_capacity(
+            self, info: 'replica_managers.ReplicaInfo') -> int:
+        """Capacity an ordinary absolute target can already rely on."""
+        return self._fill_capacity_units(info)
+
     def _supports_exact_fill_shape_resolution(self) -> bool:
         """Whether this autoscaler can resolve exact replica GPU shapes."""
         return False
@@ -1703,8 +1984,16 @@ class Autoscaler:
         decisions: list[AutoscalerDecision],
         states: dict[str, _PoolFillState],
         pool_order_revision: int,
+        *,
+        emit_legacy_launches: bool = True,
     ) -> list[AutoscalerDecision]:
-        """Apply independently fenced pool feeds under one service ceiling."""
+        """Apply independently fenced pool feeds under one service ceiling.
+
+        ``emit_legacy_launches=False`` retains the complete target/shelter
+        calculation while leaving feed and rotation state unchanged.  The
+        typed sequenced planner uses that mode and commits only from a durable
+        manager receipt.
+        """
         if not states:
             return decisions
         ordered_keys = list(states)
@@ -1908,7 +2197,8 @@ class Autoscaler:
         demand_target = self.get_final_target_num_replicas()
         planned_total = (num_old_nonterminal +
                          max(num_latest_nonterminal, demand_target))
-        hard_headroom = max(0, self.max_replicas - planned_total)
+        hard_headroom = (max(0, self.max_replicas -
+                             planned_total) if emit_legacy_launches else 0)
         emitted_by_pool: dict[str, int] = {key: 0 for key in ordered_keys}
         emitted_by_pool_card: dict[str, dict[str, int]] = {
             key: {} for key in ordered_keys
@@ -2161,7 +2451,12 @@ class Autoscaler:
             self._pool_fill_states_snapshot_with_order_revision())
         if pool_states:
             return self._apply_reserved_capacity_fill_v2(
-                replica_infos, decisions, pool_states, pool_order_revision)
+                replica_infos,
+                decisions,
+                pool_states,
+                pool_order_revision,
+                emit_legacy_launches=(
+                    not self._sequenced_reserved_fill_planning_enabled()))
         # Zero-cost accounting is version-asymmetric by design; the
         # four roles use different version scopes:
         # - LAUNCH TARGET: latest-version zero-cost rows only. Old-version
@@ -5765,6 +6060,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if info.is_ready and observed is not None:
             return min(planned, observed)
         return planned
+
+    def _reserved_fill_committed_capacity(
+            self, info: 'replica_managers.ReplicaInfo') -> int:
+        if self.replica_unit == 'logical':
+            return max(0, self._committed_capacity(info))
+        return super()._reserved_fill_committed_capacity(info)
 
     def get_ready_replica_capacity(self,
                                    info: 'replica_managers.ReplicaInfo') -> int:

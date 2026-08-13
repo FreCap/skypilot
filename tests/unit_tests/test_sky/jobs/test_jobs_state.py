@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import datetime
 import inspect
+import os
 import textwrap
 import time
 from unittest import mock
@@ -16,8 +17,35 @@ from sqlalchemy import create_engine
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from sky.jobs import constants as jobs_constants
+from sky.jobs import controller_fencing
 from sky.jobs import state
 from sky.skylet import constants
+
+
+@contextlib.contextmanager
+def _local_controller_attempt(monkeypatch):
+    """Publish one exact local slot only around direct scheduler claims."""
+    owner = ('12345678-1234-4234-8234-123456789abc', 1)
+    attempt = 'abcdefab-1234-4234-8234-abcdefabcdef'
+    with monkeypatch.context() as scoped:
+        scoped.setenv(jobs_constants.CONTROLLER_OWNER_MODE_ENV_VAR,
+                      controller_fencing.LOCAL_OWNER_MODE)
+        scoped.setenv(jobs_constants.CONTROLLER_OWNER_INSTANCE_ID_ENV_VAR,
+                      owner[0])
+        scoped.setenv(jobs_constants.CONTROLLER_OWNER_GENERATION_ENV_VAR,
+                      str(owner[1]))
+        scoped.setenv(jobs_constants.CONTROLLER_OWNER_PID_ENV_VAR,
+                      str(os.getpid()))
+        scoped.setenv(
+            jobs_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+            str(controller_fencing._read_process_start_time_ticks(os.getpid())))
+        scoped.setenv(jobs_constants.CONTROLLER_SLOT_ID_ENV_VAR, '0')
+        scoped.setenv(jobs_constants.CONTROLLER_SLOT_ATTEMPT_ENV_VAR, attempt)
+        yield {
+            'controller_slot_id': 0,
+            'controller_slot_attempt': attempt,
+        }
 
 
 @pytest.fixture
@@ -1836,15 +1864,18 @@ class TestSetPendingCancelledFinalizes:
         assert self._end_at(job_id) is not None
 
     def test_cancelled_job_is_not_reclaimed_and_never_runs(
-            self, _mock_managed_jobs_db_conn):
+            self, _mock_managed_jobs_db_conn, monkeypatch):
         # The liveness invariant that matters most: a cancelled job must not
         # be handed back to a controller, which would provision a cluster and
         # run the user's task after the CLI reported the job cancelled.
         job_id = self._seed(state.ManagedJobScheduleState.WAITING)
         assert state.set_pending_cancelled(job_id) is True
 
-        reclaimed = asyncio.run(
-            state.get_waiting_job_async(pid=4242, pid_started_at=1.0))
+        with _local_controller_attempt(monkeypatch) as slot:
+            reclaimed = asyncio.run(
+                state.get_waiting_job_async(pid=4242,
+                                            pid_started_at=1.0,
+                                            **slot))
 
         assert reclaimed is None
         assert (state.get_job_schedule_state(job_id) ==
@@ -1873,14 +1904,17 @@ class TestSetPendingCancelledFinalizes:
         assert self._end_at(job_id) is not None
 
     def test_losing_the_claim_race_is_a_complete_no_op(
-            self, _mock_managed_jobs_db_conn):
+            self, _mock_managed_jobs_db_conn, monkeypatch):
         # A controller claimed the job first (WAITING -> LAUNCHING). The
         # cancel must lose the compare-and-set and write nothing at all: no
         # status change, no end_at, and no CANCELLED event on a job that is
         # about to run.
         job_id = self._seed(state.ManagedJobScheduleState.WAITING)
-        claimed = asyncio.run(
-            state.get_waiting_job_async(pid=4242, pid_started_at=1.0))
+        with _local_controller_attempt(monkeypatch) as slot:
+            claimed = asyncio.run(
+                state.get_waiting_job_async(pid=4242,
+                                            pid_started_at=1.0,
+                                            **slot))
         assert claimed is not None
         assert (state.get_job_schedule_state(job_id) ==
                 state.ManagedJobScheduleState.LAUNCHING)
@@ -1948,7 +1982,7 @@ class TestSetPendingCancelledFinalizes:
         assert 'SELECT' not in statements
 
     def test_cancel_at_claim_releases_the_autostop_counter(
-            self, _mock_managed_jobs_db_conn):
+            self, _mock_managed_jobs_db_conn, monkeypatch):
         # The other pre-launch cancel path: the cancel signal lands after
         # get_waiting_job_async already moved the job WAITING -> LAUNCHING.
         # The controller finalizes it with set_cancelling/set_cancelled plus
@@ -1956,22 +1990,53 @@ class TestSetPendingCancelledFinalizes:
         # stays LAUNCHING, so get_num_alive_jobs() (which gates jobs-controller
         # autostop in sky/skylet/events.py) never returns to zero.
         job_id = self._seed(state.ManagedJobScheduleState.WAITING)
-        assert asyncio.run(
-            state.get_waiting_job_async(pid=4242,
-                                        pid_started_at=1.0)) is not None
-        assert state.get_num_alive_jobs() == 1
+        with _local_controller_attempt(monkeypatch) as slot:
+            assert asyncio.run(
+                state.get_waiting_job_async(pid=4242,
+                                            pid_started_at=1.0,
+                                            **slot)) is not None
+            assert state.get_num_alive_jobs() == 1
 
-        async def _finalize():
-            await state.set_cancelling_async(job_id=job_id,
-                                             callback_func=_noop_callback)
-            await state.set_cancelled_async(job_id=job_id,
-                                            callback_func=_noop_callback)
-            await state.scheduler_set_done_async(job_id, idempotent=True)
+            async def _finalize():
+                await state.set_cancelling_async(job_id=job_id,
+                                                 callback_func=_noop_callback)
+                await state.set_cancelled_async(job_id=job_id,
+                                                callback_func=_noop_callback)
+                await state.scheduler_set_done_async(job_id, idempotent=True)
 
-        asyncio.run(_finalize())
+            asyncio.run(_finalize())
 
         assert state.get_num_alive_jobs() == 0
         assert (state.get_job_schedule_state(job_id) ==
                 state.ManagedJobScheduleState.DONE)
         assert state.get_status(job_id) == state.ManagedJobStatus.CANCELLED
         assert self._end_at(job_id) is not None
+
+    def test_quiescing_attempt_cannot_publish_final_done(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        job_id = self._seed(state.ManagedJobScheduleState.WAITING)
+        with _local_controller_attempt(monkeypatch) as slot:
+            assert asyncio.run(
+                state.get_waiting_job_async(pid=4242,
+                                            pid_started_at=1.0,
+                                            **slot)) is not None
+
+            async def _terminalize():
+                await state.set_cancelling_async(job_id=job_id,
+                                                 callback_func=_noop_callback)
+                await state.set_cancelled_async(job_id=job_id,
+                                                callback_func=_noop_callback)
+
+            asyncio.run(_terminalize())
+            with _mock_managed_jobs_db_conn.begin() as conn:
+                conn.execute(
+                    sqlalchemy.update(state.job_info_table).where(
+                        state.job_info_table.c.spot_job_id == job_id).values(
+                            controller_slot_quiescing=True))
+
+            with pytest.raises(AssertionError):
+                asyncio.run(state.scheduler_set_done_async(job_id))
+
+        assert (state.get_job_schedule_state(job_id) ==
+                state.ManagedJobScheduleState.LAUNCHING)
+        assert state.get_status(job_id) == state.ManagedJobStatus.CANCELLED

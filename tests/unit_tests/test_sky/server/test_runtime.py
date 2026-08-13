@@ -13,11 +13,13 @@ from unittest import mock
 
 import pytest
 
+from sky.jobs import controller_slots
 from sky.jobs import managed_job_refresh_thread
 from sky.jobs.server import server as jobs_server
 from sky.server import runtime
 from sky.server.requests import cutover as request_cutover
 from sky.server.requests import registry as request_registry
+from sky.utils import controller_capability
 
 _SYSTEM_OOM_METRIC_CHILD_SCRIPT = """
 from sky.serve import system_oom_recovery_observability as observability
@@ -43,6 +45,79 @@ def _args() -> SimpleNamespace:
     return SimpleNamespace(host='127.0.0.1',
                            metrics_port=9090,
                            role_health_port=46581)
+
+
+@pytest.fixture(autouse=True)
+def _stub_controller_slot_supervisor(monkeypatch):
+    """Runtime unit tests never launch real managed-job process families."""
+    controller_capability.clear_process_local()
+    monkeypatch.setattr(runtime.controller_capability,
+                        'make_process_non_dumpable', mock.Mock())
+    supervisor = mock.Mock()
+    factory = mock.Mock(return_value=supervisor)
+    monkeypatch.setattr(controller_slots, 'ManagedJobControllerSlotSupervisor',
+                        factory)
+    authority = mock.Mock()
+    authority.capability = 'A' * 43
+    authority.path = '/tmp/test-controller-origin-authority'
+    monkeypatch.setattr(controller_slots,
+                        'LocalControllerOriginCapabilityAuthority',
+                        mock.Mock(return_value=authority))
+    yield supervisor, factory
+    controller_capability.clear_process_local()
+
+
+def test_runtime_capability_is_process_local_and_hidden_from_exec_child():
+    capability = 'A' * 43
+    script = f"""
+import ctypes
+import json
+import os
+import subprocess
+import sys
+from sky.server import runtime
+from sky.utils import controller_capability
+
+capability = {capability!r}
+os.environ['SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY'] = capability
+os.environ['SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH'] = '/old/path'
+runtime._publish_controller_origin_capability(capability)
+child_script = '''
+import json
+import os
+from sky.utils import controller_capability
+try:
+    ancestor_environ = open(f"/proc/{{os.getppid()}}/environ", "rb").read().decode("utf-8", "replace")
+except OSError as error:
+    ancestor_environ = type(error).__name__
+print(json.dumps({{
+    "capability": controller_capability.get_process_local(),
+    "environment": dict(os.environ),
+    "ancestor_environ": ancestor_environ,
+}}))
+'''
+child = subprocess.run([sys.executable, '-c', child_script], capture_output=True,
+                       text=True, check=True)
+print(json.dumps({{
+    'registry': controller_capability.get_process_local(),
+    'environment': dict(os.environ),
+    'dumpable': ctypes.CDLL(None).prctl(3, 0, 0, 0, 0),
+    'child': json.loads(child.stdout.splitlines()[-1]),
+}}))
+"""
+
+    result = subprocess.run([sys.executable, '-c', script],
+                            capture_output=True,
+                            text=True,
+                            check=True)
+    proof = json.loads(result.stdout.splitlines()[-1])
+
+    assert proof['registry'] == capability
+    assert proof['dumpable'] == 0
+    assert capability not in json.dumps(proof['environment'])
+    assert proof['child']['capability'] is None
+    assert capability not in json.dumps(proof['child']['environment'])
+    assert capability not in proof['child']['ancestor_environ']
 
 
 def test_controller_owns_one_distributed_handoff_retention_task(monkeypatch):
@@ -243,7 +318,15 @@ def test_executor_role_starts_workers_without_public_server(monkeypatch):
         config,
         execution_classes=frozenset({request_registry.ExecutionClass.NORMAL}))
     start_refresh.assert_not_called()
-    lease.set_ready.assert_called_once()
+    assert lease.set_ready.call_args_list == [
+        mock.call(True,
+                  health_detail={
+                      'phase': 'claiming',
+                      'long_workers': mock.ANY,
+                      'short_workers': mock.ANY,
+                  }),
+        mock.call(False, health_detail={'phase': 'draining'}),
+    ]
     health_server.start.assert_called_once_with()
     health_server.stop.assert_called_once_with()
     lease.stop.assert_called_once_with()
@@ -251,6 +334,214 @@ def test_executor_role_starts_workers_without_public_server(monkeypatch):
     queue_server.kill.assert_called_once_with()
     queue_server.join.assert_called_once_with()
     assert background.stopped
+
+
+def test_all_mode_awaits_managed_job_cutover_before_workers(monkeypatch):
+    background = _BackgroundLoop()
+    state = runtime.RuntimeState('all', mock.Mock(), None, False)
+    queue_server = mock.Mock()
+    worker = mock.Mock()
+    managed_refresh = mock.Mock()
+
+    def start_after_cutover(*args, **kwargs):
+        del args, kwargs
+        managed_refresh.wait_for_cutover.assert_called_once_with()
+        return queue_server, [worker]
+
+    start_workers = mock.Mock(side_effect=start_after_cutover)
+    monkeypatch.setattr(runtime, '_start_background_loop',
+                        lambda *args: background)
+    monkeypatch.setattr(runtime.managed_job_utils, 'is_consolidation_mode',
+                        lambda: True)
+    monkeypatch.setattr(runtime.executor, 'start', start_workers)
+    monkeypatch.setattr(runtime, '_run_uvicorn', mock.Mock())
+    monkeypatch.setattr(managed_job_refresh_thread,
+                        'start_managed_job_refresh_daemon',
+                        mock.Mock(return_value=managed_refresh))
+    monkeypatch.setattr(runtime, '_request_worker_shutdown', mock.Mock())
+    monkeypatch.setattr(runtime, '_stop_queue_server', mock.Mock())
+    monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
+                        mock.Mock())
+    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [])
+
+    runtime.run_role(state, _args())
+
+    managed_refresh.wait_for_cutover.assert_called_once_with()
+    start_workers.assert_called_once_with(state.config, execution_classes=None)
+
+
+def test_postgres_all_mode_fences_and_recovers_before_admission(
+        monkeypatch, _stub_controller_slot_supervisor):
+    supervisor, _ = _stub_controller_slot_supervisor
+    events = []
+    background = _BackgroundLoop()
+    instance_lease = mock.Mock()
+    instance_lease.instance_id = '00000000-0000-0000-0000-000000000001'
+    state = runtime.RuntimeState('all', mock.Mock(), instance_lease, False)
+    queue_server = mock.Mock()
+    worker = mock.Mock()
+    managed_refresh = mock.Mock()
+    leader = mock.Mock()
+    leader.instance_id = instance_lease.instance_id
+    leader.generation = 37
+    leader.origin_capability = 'A' * 43
+    leader.try_acquire.side_effect = lambda: (events.append('acquire') or True)
+    request_backend = mock.Mock(
+        spec=runtime.request_postgres.PostgresRequestBackend)
+    request_backend.retire_legacy_internal_daemon_rows.side_effect = (
+        lambda **kwargs: events.append(('retire', kwargs)) or 2)
+    request_backend.recover_on_startup.side_effect = (
+        lambda **kwargs: events.append(('recover', kwargs)) or True)
+
+    class Transition:
+
+        def __enter__(self):
+            events.append('transition-enter')
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del exc_type, exc_value, traceback
+            events.append('transition-exit')
+
+    start_workers = mock.Mock(side_effect=lambda *args, **kwargs: (
+        events.append(('workers', args, kwargs)) or (queue_server, [worker])))
+    managed_refresh.wait_for_cutover.side_effect = lambda: events.append(
+        'refresh-cutover')
+    supervisor.start.side_effect = lambda: events.append('slots-start')
+
+    monkeypatch.setattr(
+        runtime, '_start_background_loop', lambda *args:
+        (events.append('background-start') or background))
+    monkeypatch.setattr(runtime.managed_job_utils, 'is_consolidation_mode',
+                        lambda: True)
+    monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
+                        lambda *args: leader)
+    monkeypatch.setattr(runtime.request_storage, 'get_request_backend',
+                        lambda: request_backend)
+    monkeypatch.setattr(runtime.request_postgres, 'legacy_daemon_transition',
+                        Transition)
+    monkeypatch.setattr(
+        runtime.request_postgres, 'fence_stale_controller_claims',
+        lambda *owner: events.append(('fence', owner)) or {
+            'replayed': 1,
+            'interrupted': 2,
+        })
+    monkeypatch.setattr(runtime.executor, 'start', start_workers)
+    monkeypatch.setattr(runtime.executor, 'reenqueue_recovered_requests',
+                        lambda: events.append('reenqueue'))
+    monkeypatch.setattr(runtime, '_run_uvicorn', mock.Mock())
+    monkeypatch.setattr(runtime, '_start_surface_interrupted_cluster_launches',
+                        lambda: events.append('surface-recovery'))
+    monkeypatch.setattr(
+        managed_job_refresh_thread, 'start_managed_job_refresh_daemon',
+        mock.Mock(side_effect=lambda:
+                  (events.append('refresh-start') or managed_refresh)))
+    monkeypatch.setattr(runtime, '_request_worker_shutdown', mock.Mock())
+    monkeypatch.setattr(runtime, '_stop_queue_server', mock.Mock())
+    monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
+                        lambda: events.append('capture-env'))
+    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [])
+
+    runtime.run_role(state, _args())
+
+    managed_refresh.wait_for_cutover.assert_called_once_with()
+    start_workers.assert_called_once_with(state.config,
+                                          execution_classes=None,
+                                          controller_generation=37)
+    owner = (leader.instance_id, 37)
+    assert events[:11] == [
+        'acquire',
+        'transition-enter',
+        ('retire', {
+            'controller_owner': owner
+        }),
+        ('fence', owner),
+        ('recover', {
+            'controller_owner': owner
+        }),
+        'transition-exit',
+        'surface-recovery',
+        'capture-env',
+        'background-start',
+        'refresh-start',
+        'refresh-cutover',
+    ]
+    assert events.index('slots-start') < next(
+        index for index, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == 'workers')
+    assert events.index('transition-exit') < events.index('slots-start')
+    assert events.index('transition-exit') < events.index('background-start')
+    assert events.index('reenqueue') > next(
+        index for index, event in enumerate(events)
+        if isinstance(event, tuple) and event[0] == 'workers')
+    leader.release.assert_called_once_with()
+
+
+def test_postgres_all_mode_without_consolidation_still_owns_mixed_queue(
+        monkeypatch, _stub_controller_slot_supervisor):
+    _, slot_factory = _stub_controller_slot_supervisor
+    background = _BackgroundLoop()
+    instance_lease = mock.Mock()
+    instance_lease.instance_id = '00000000-0000-0000-0000-000000000001'
+    state = runtime.RuntimeState('all', mock.Mock(), instance_lease, False)
+    leader = mock.Mock()
+    leader.instance_id = instance_lease.instance_id
+    leader.generation = 41
+    leader.origin_capability = 'A' * 43
+    leader.try_acquire.return_value = True
+    request_backend = mock.Mock(
+        spec=runtime.request_postgres.PostgresRequestBackend)
+    request_backend.recover_on_startup.return_value = False
+    queue_server = mock.Mock()
+    worker = mock.Mock()
+    start_workers = mock.Mock(return_value=(queue_server, [worker]))
+
+    class Transition:
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            del exc_type, exc_value, traceback
+
+    monkeypatch.setattr(runtime, '_start_metrics_background_loop',
+                        lambda *args: None)
+    monkeypatch.setattr(runtime, '_start_background_loop',
+                        lambda *args: background)
+    monkeypatch.setattr(runtime.managed_job_utils, 'is_consolidation_mode',
+                        lambda: False)
+    monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
+                        lambda *args: leader)
+    monkeypatch.setattr(runtime.request_storage, 'get_request_backend',
+                        lambda: request_backend)
+    monkeypatch.setattr(runtime.request_postgres, 'legacy_daemon_transition',
+                        Transition)
+    monkeypatch.setattr(runtime.request_postgres,
+                        'fence_stale_controller_claims', lambda *owner: {
+                            'replayed': 0,
+                            'interrupted': 0,
+                        })
+    monkeypatch.setattr(runtime.executor, 'start', start_workers)
+    monkeypatch.setattr(runtime, '_run_uvicorn', mock.Mock())
+    monkeypatch.setattr(runtime, '_start_surface_interrupted_cluster_launches',
+                        mock.Mock())
+    start_refresh = mock.Mock(return_value=None)
+    monkeypatch.setattr(managed_job_refresh_thread,
+                        'start_managed_job_refresh_daemon', start_refresh)
+    monkeypatch.setattr(runtime, '_request_worker_shutdown', mock.Mock())
+    monkeypatch.setattr(runtime, '_stop_queue_server', mock.Mock())
+    monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
+                        mock.Mock())
+    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [])
+
+    runtime.run_role(state, _args())
+
+    leader.try_acquire.assert_called_once_with()
+    start_workers.assert_called_once_with(state.config,
+                                          execution_classes=None,
+                                          controller_generation=41)
+    start_refresh.assert_called_once_with()
+    slot_factory.assert_not_called()
+    leader.release.assert_called_once_with()
 
 
 def test_stop_queue_server_is_idempotent_after_child_cleanup():
@@ -273,24 +564,35 @@ def test_controller_role_fences_children_and_exits_on_lock_loss(monkeypatch):
     leader = mock.Mock()
     leader.instance_id = instance_lease.instance_id
     leader.generation = 7
+    leader.origin_capability = 'A' * 43
     leader.try_acquire.return_value = True
     leader.backend_pid.return_value = 123
     leader.heartbeat.return_value = False
     health_server = mock.Mock()
     queue_server = mock.Mock()
     worker = mock.Mock()
-    start_workers = mock.Mock(return_value=(queue_server, [worker]))
-    start_refresh = mock.Mock()
+    managed_refresh = mock.Mock()
+
+    def start_workers_after_cutover(*args, **kwargs):
+        del args, kwargs
+        managed_refresh.wait_for_cutover.assert_called_once_with()
+        return queue_server, [worker]
+
+    start_workers = mock.Mock(side_effect=start_workers_after_cutover)
+    start_refresh = mock.Mock(return_value=managed_refresh)
     shutdown_workers = mock.Mock()
     stop_queue = mock.Mock()
-    kill_children = mock.Mock()
     surface_scan = mock.Mock()
     fence_claims = mock.Mock(return_value={'replayed': 2, 'interrupted': 1})
+    retire_daemons = mock.Mock()
 
     monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
                         lambda *args: leader)
     monkeypatch.setattr(runtime.request_postgres,
                         'fence_stale_controller_claims', fence_claims)
+    monkeypatch.setattr(
+        runtime.request_storage, 'get_request_backend',
+        lambda: mock.Mock(retire_legacy_internal_daemon_rows=retire_daemons))
     monkeypatch.setattr(runtime.request_postgres,
                         'recent_legacy_controller_consumers', lambda *args: [])
     monkeypatch.setattr(runtime, '_RoleHealthServer',
@@ -302,8 +604,6 @@ def test_controller_role_fences_children_and_exits_on_lock_loss(monkeypatch):
                         'start_managed_job_refresh_daemon', start_refresh)
     monkeypatch.setattr(runtime, '_request_worker_shutdown', shutdown_workers)
     monkeypatch.setattr(runtime, '_stop_queue_server', stop_queue)
-    monkeypatch.setattr(runtime, '_kill_local_controller_children',
-                        kill_children)
     monkeypatch.setattr(runtime, '_start_surface_interrupted_cluster_launches',
                         surface_scan)
     monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
@@ -321,10 +621,12 @@ def test_controller_role_fences_children_and_exits_on_lock_loss(monkeypatch):
             {request_registry.ExecutionClass.CONTROLLER}),
         controller_generation=7)
     start_refresh.assert_called_once_with()
+    managed_refresh.wait_for_cutover.assert_called_once_with()
     surface_scan.assert_called_once_with()
     worker.request_shutdown.assert_called_once_with()
-    kill_children.assert_called_once_with()
-    shutdown_workers.assert_called_once_with([worker], terminate_children=True)
+    shutdown_workers.assert_called_once_with([worker],
+                                             terminate_children=True,
+                                             request_stop=False)
     stop_queue.assert_called_once_with(queue_server)
     leader.release.assert_called_once_with()
     health_server.start.assert_called_once_with()
@@ -340,6 +642,39 @@ def test_controller_role_fences_children_and_exits_on_lock_loss(monkeypatch):
     assert background.stopped
 
 
+def test_controller_retires_daemon_rows_before_fencing(monkeypatch):
+    instance_lease = mock.Mock()
+    instance_lease.instance_id = '00000000-0000-0000-0000-000000000001'
+    state = runtime.RuntimeState('controller', mock.Mock(), instance_lease,
+                                 False)
+    leader = mock.Mock(instance_id=instance_lease.instance_id, generation=7)
+    leader.origin_capability = 'A' * 43
+    leader.try_acquire.return_value = True
+    lifecycle = mock.Mock()
+    backend = mock.Mock()
+    lifecycle.attach_mock(backend.retire_legacy_internal_daemon_rows, 'retire')
+    fence = mock.Mock(side_effect=RuntimeError('stop after ordering proof'))
+    lifecycle.attach_mock(fence, 'fence')
+    monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
+                        lambda *args: leader)
+    monkeypatch.setattr(runtime.request_postgres,
+                        'recent_legacy_controller_consumers', lambda *args: [])
+    monkeypatch.setattr(runtime.request_storage, 'get_request_backend',
+                        lambda: backend)
+    monkeypatch.setattr(runtime.request_postgres,
+                        'fence_stale_controller_claims', fence)
+    monkeypatch.setattr(runtime, '_RoleHealthServer', lambda *args: mock.Mock())
+    monkeypatch.setattr(runtime.plugins, 'get_plugins', lambda: [])
+
+    with pytest.raises(RuntimeError, match='ordering proof'):
+        runtime.run_role(state, _args())
+
+    assert lifecycle.mock_calls[:2] == [
+        mock.call.retire(),
+        mock.call.fence(instance_lease.instance_id, 7)
+    ]
+
+
 def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
     background = _BackgroundLoop()
     instance_lease = mock.Mock()
@@ -349,6 +684,7 @@ def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
     leader = mock.Mock()
     leader.instance_id = instance_lease.instance_id
     leader.generation = 8
+    leader.origin_capability = 'A' * 43
     leader.try_acquire.return_value = True
     leader.backend_pid.return_value = 123
     health_server = mock.Mock()
@@ -356,6 +692,9 @@ def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
     queue_server = mock.Mock()
     lifecycle = mock.Mock()
     lifecycle.attach_mock(instance_lease.set_ready, 'set_ready')
+    background.stop = mock.Mock(
+        side_effect=lambda: setattr(background, 'stopped', True))
+    lifecycle.attach_mock(background.stop, 'background_stop')
     lifecycle.attach_mock(leader.release, 'release')
 
     class ShutdownAfterPromotion:
@@ -391,7 +730,6 @@ def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
                         'start_managed_job_refresh_daemon', mock.Mock())
     monkeypatch.setattr(runtime, '_request_worker_shutdown', mock.Mock())
     monkeypatch.setattr(runtime, '_stop_queue_server', mock.Mock())
-    monkeypatch.setattr(runtime, '_kill_local_controller_children', mock.Mock())
     monkeypatch.setattr(runtime, '_start_surface_interrupted_cluster_launches',
                         mock.Mock())
     monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
@@ -408,6 +746,9 @@ def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
     assert draining in lifecycle.mock_calls
     assert lifecycle.mock_calls.index(draining) < lifecycle.mock_calls.index(
         mock.call.release())
+    assert lifecycle.mock_calls.index(
+        mock.call.background_stop()) < lifecycle.mock_calls.index(
+            mock.call.release())
     assert background.stopped
 
 
@@ -526,6 +867,7 @@ def test_controller_role_exits_if_m2_executor_reappears(monkeypatch):
     leader = mock.Mock()
     leader.instance_id = instance_lease.instance_id
     leader.generation = 9
+    leader.origin_capability = 'A' * 43
     leader.try_acquire.return_value = True
     leader.backend_pid.return_value = 123
     health_server = mock.Mock()
@@ -534,7 +876,6 @@ def test_controller_role_exits_if_m2_executor_reappears(monkeypatch):
     recent_consumers = mock.Mock(side_effect=[[], [], ['legacy-executor']])
     shutdown_workers = mock.Mock()
     stop_queue = mock.Mock()
-    kill_children = mock.Mock()
 
     monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
                         lambda *args: leader)
@@ -555,8 +896,6 @@ def test_controller_role_exits_if_m2_executor_reappears(monkeypatch):
                         'start_managed_job_refresh_daemon', mock.Mock())
     monkeypatch.setattr(runtime, '_request_worker_shutdown', shutdown_workers)
     monkeypatch.setattr(runtime, '_stop_queue_server', stop_queue)
-    monkeypatch.setattr(runtime, '_kill_local_controller_children',
-                        kill_children)
     monkeypatch.setattr(runtime, '_start_surface_interrupted_cluster_launches',
                         mock.Mock())
     monkeypatch.setattr(runtime.clean_env_module, 'capture_clean_server_env',
@@ -571,8 +910,9 @@ def test_controller_role_exits_if_m2_executor_reappears(monkeypatch):
     assert recent_consumers.call_count == 3
     leader.heartbeat.assert_not_called()
     worker.request_shutdown.assert_called_once_with()
-    kill_children.assert_called_once_with()
-    shutdown_workers.assert_called_once_with([worker], terminate_children=True)
+    shutdown_workers.assert_called_once_with([worker],
+                                             terminate_children=True,
+                                             request_stop=False)
     stop_queue.assert_called_once_with(queue_server)
     leader.release.assert_called_once_with()
     assert any(

@@ -387,6 +387,71 @@ def test_physical_uid_fence_refcounts_and_rejects_conflicts(
         context) is None
 
 
+def test_physical_uid_fence_require_existing_never_initializes(
+        monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'join-only-missing-context'
+    capture = MagicMock(
+        side_effect=AssertionError('join-only scope initialized a capture'))
+    client_factory = MagicMock(
+        side_effect=AssertionError('join-only scope created an API client'))
+    monkeypatch.setattr(kubernetes, '_capture_fenced_kubeconfig', capture)
+    monkeypatch.setattr(kubernetes, '_new_api_client_from_fence_capture',
+                        client_factory)
+
+    with pytest.raises(kubernetes.KubernetesPhysicalClusterFenceBusyError,
+                       match='preinitialized') as exc_info:
+        with kubernetes.physical_cluster_uid_fence(context,
+                                                   'physical-a',
+                                                   require_existing=True):
+            raise AssertionError('missing join-only fence was entered')
+
+    assert exc_info.value.context == context
+    capture.assert_not_called()
+    client_factory.assert_not_called()
+
+
+def test_physical_uid_fence_require_existing_joins_cross_thread_holder(
+        monkeypatch, tmp_path):
+    _install_physical_fence_capture(monkeypatch, tmp_path)
+    context = 'join-only-held-context'
+    original_capture = kubernetes._capture_fenced_kubeconfig
+    capture = MagicMock(side_effect=original_capture)
+    monkeypatch.setattr(kubernetes, '_capture_fenced_kubeconfig', capture)
+    holder_ready = threading.Event()
+    holder_release = threading.Event()
+    holder_errors = []
+
+    def hold_capture() -> None:
+        try:
+            with kubernetes.physical_cluster_uid_fence(context, 'physical-a'):
+                holder_ready.set()
+                assert holder_release.wait(timeout=5)
+        except BaseException as error:  # pylint: disable=broad-exception-caught
+            holder_errors.append(error)
+            holder_ready.set()
+
+    holder = threading.Thread(target=hold_capture, daemon=True)
+    holder.start()
+    assert holder_ready.wait(timeout=5)
+    try:
+        assert not holder_errors
+        with kubernetes.physical_cluster_uid_fence(context,
+                                                   'physical-a',
+                                                   require_existing=True):
+            target = kubernetes.active_physical_cluster_command_target(context)
+            assert target is not None
+            assert target.expected_uid == 'physical-a'
+        # Only the holder initialized a capture. The join-only scope reused it.
+        assert capture.call_count == 1
+    finally:
+        holder_release.set()
+        holder.join(timeout=5)
+
+    assert not holder.is_alive()
+    assert not holder_errors
+
+
 def test_in_cluster_alias_and_provider_none_share_fence(monkeypatch, tmp_path):
     _install_physical_fence_capture(monkeypatch, tmp_path)
     context = kubernetes.in_cluster_context_name()

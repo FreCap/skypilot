@@ -13,6 +13,26 @@ per-request env pollution from `override_request_env_and_config`.
 """
 import os
 
+# Authority is installed only at an exact execution boundary.  Keep this leaf
+# module independent of ``sky`` imports by owning the literal denylist for its
+# neutral process snapshot.
+_CONTROLLER_AUTHORITY_ENV_VARS = (
+    'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID',
+    'SKYPILOT_SERVER_CONTROLLER_GENERATION',
+    'SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY',
+    'SKYPILOT_SERVER_CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_OWNER_MODE',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_INSTANCE_ID',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_GENERATION',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_OWNER_PID',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_OWNER_START_TICKS',
+    'SKYPILOT_SERVER_MANAGED_JOB_ID',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_SLOT_ID',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_READY_FD',
+    'SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_CAPABILITY_FD',
+)
+
 # Set once via capture_clean_server_env() in the main API server process, and
 # once per worker via executor_initializer (forwarded from the main process's
 # snapshot through initargs). Reads happen via get_clean_server_env().
@@ -29,7 +49,11 @@ def capture_clean_server_env() -> None:
     """
     global _clean_server_env
     if _clean_server_env is None:
-        _clean_server_env = dict(os.environ)
+        _clean_server_env = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in _CONTROLLER_AUTHORITY_ENV_VARS
+        }
 
 
 def set_clean_server_env(env: dict[str, str]) -> None:

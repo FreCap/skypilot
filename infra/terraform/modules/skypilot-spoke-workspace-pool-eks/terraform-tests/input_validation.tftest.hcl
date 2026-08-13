@@ -120,6 +120,127 @@ run "rejects_a_blank_cluster_queue_name" {
   expect_failures = [var.partitions]
 }
 
+run "accepts_a_63_character_cluster_queue_dns_label" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  assert {
+    condition     = kubernetes_manifest.partition_local_queue["training"].manifest["spec"]["clusterQueue"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    error_message = "A 63-character DNS-1123 label must remain a valid ClusterQueue name."
+  }
+}
+
+run "rejects_a_dotted_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training.reserved"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_an_uppercase_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "Training"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_an_underscore_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training_reserved"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_an_overlength_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_a_trailing_hyphen_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
 run "rejects_a_cluster_queue_that_cannot_prove_namespace_eligibility" {
   command = plan
 

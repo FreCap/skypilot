@@ -54,6 +54,11 @@ variable "partitions" {
     LocalQueue and ClusterQueue names, FSx claim name, and the derived RBAC
     resource names. Change them only with a reviewed Terraform state and
     workload migration.
+
+    Each Kueue ClusterQueue name must be one DNS-1123 label of at most 63
+    characters. Strict SkyPilot admission requires Kueue's
+    AssignQueueLabelsForPods feature to publish that name on admitted Pods;
+    dotted DNS subdomains and other non-label names cannot be published.
   EOT
   type = list(object({
     namespace                    = string
@@ -158,16 +163,11 @@ variable "partitions" {
       for partition in var.partitions :
       partition.kueue == null ? true : (
         length(partition.kueue.cluster_queue_name) >= 1 &&
-        length(partition.kueue.cluster_queue_name) <= 253 &&
-        alltrue([
-          for label in split(".", partition.kueue.cluster_queue_name) :
-          length(label) >= 1 &&
-          length(label) <= 63 &&
-          can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
-        ])
+        length(partition.kueue.cluster_queue_name) <= 63 &&
+        can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", partition.kueue.cluster_queue_name))
       )
     ])
-    error_message = "Each kueue.cluster_queue_name must be a Kubernetes DNS-1123 subdomain of at most 253 characters."
+    error_message = "Each kueue.cluster_queue_name must be a Kubernetes DNS-1123 label of at most 63 characters so Kueue AssignQueueLabelsForPods can publish it."
   }
 
   validation {

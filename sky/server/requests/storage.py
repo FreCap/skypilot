@@ -8,14 +8,17 @@ from collections.abc import Generator
 import contextlib
 import contextvars
 import dataclasses
-import hashlib
 import os
 import pathlib
+import signal
 import time
 from typing import Any, TYPE_CHECKING
 
+import filelock
+
+from sky.skylet import runtime_utils
+
 if TYPE_CHECKING:
-    from sky.server import daemons as daemons_lib
     from sky.server.requests.requests import Request
     from sky.server.requests.requests import RequestStatus
     from sky.server.requests.requests import RequestTaskFilter
@@ -34,71 +37,105 @@ class ExecutionClaim:
     worker_instance_id: str | None = None
 
 
-_EXECUTION_CANCELLATION_DIRECTORY = pathlib.Path(
-    '/tmp/skypilot-execution-cancellation')
-_EXECUTION_CANCELLATION_MARKER_MAX_AGE_SECONDS = 24 * 60 * 60
+ManagedJobControllerSlotIdentity = tuple[str, int, int, str]
 
 
-def execution_cancellation_marker_path(pid: int,
-                                       claim: ExecutionClaim) -> pathlib.Path:
-    """Return the unguessable-enough local marker for one exact invocation."""
-    if pid <= 0:
-        raise ValueError('Execution cancellation PID must be positive.')
-    identity = (f'{pid}\0{claim.request_id}\0{claim.execution_generation}\0'
-                f'{claim.claim_token}').encode()
-    digest = hashlib.sha256(identity).hexdigest()
-    return _EXECUTION_CANCELLATION_DIRECTORY / f'{pid}-{digest}'
+class ManagedJobRequestQuiescenceError(RuntimeError):
+    """An exact controller attempt could not prove nested effects stopped."""
 
 
-def arm_execution_cancellation(pid: int, claim: ExecutionClaim) -> pathlib.Path:
-    """Create an exact-claim marker before signalling a reusable worker PID."""
-    marker = execution_cancellation_marker_path(pid, claim)
-    marker.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    cutoff = time.time() - _EXECUTION_CANCELLATION_MARKER_MAX_AGE_SECONDS
-    # A worker normally consumes the marker. If it died just before delivery,
-    # no handshake is possible; bounded-age pruning prevents those markers from
-    # leaking inodes forever without weakening delayed-signal protection.
+_MANAGED_JOB_REQUEST_AUTHORITY_LOCK_PATH = runtime_utils.get_runtime_dir_path(
+    '.sky/locks/managed_job_request_authority.lock')
+
+
+def managed_job_request_authority_lock() -> filelock.FileLock:
+    """Return the cross-SQLite authority lock for job and request state.
+
+    PostgreSQL uses row locks in one database.  The non-consolidated local
+    runtime still stores managed-job and API-request rows in separate SQLite
+    files, so both sides take this one file lock before validating or changing
+    a controller-attempt/request relationship.
+    """
+    pathlib.Path(_MANAGED_JOB_REQUEST_AUTHORITY_LOCK_PATH).parent.mkdir(
+        parents=True, exist_ok=True)
+    return filelock.FileLock(_MANAGED_JOB_REQUEST_AUTHORITY_LOCK_PATH)
+
+
+def managed_job_request_authority_lock_async() -> filelock.AsyncFileLock:
+    """Async counterpart using the exact same cross-SQLite lock file."""
+    pathlib.Path(_MANAGED_JOB_REQUEST_AUTHORITY_LOCK_PATH).parent.mkdir(
+        parents=True, exist_ok=True)
+    return filelock.AsyncFileLock(_MANAGED_JOB_REQUEST_AUTHORITY_LOCK_PATH)
+
+
+def read_linux_process_start_time_ticks(pid: int) -> int:
+    """Read Linux procfs birth identity for one exact PID.
+
+    Field 22 of ``/proc/<pid>/stat`` is the process start time in clock ticks
+    since boot. Parsing from the final right parenthesis is required because a
+    process ``comm`` may itself contain spaces and parentheses. Absence,
+    permission errors, and malformed content remain distinct exceptions so
+    callers can accept only an explicit absence or identity mismatch as proof.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        raise ValueError('Process PID must be a positive integer.')
+    stat_path = pathlib.Path('/proc') / str(pid) / 'stat'
+    content = stat_path.read_text(encoding='utf-8')
+    comm_end = content.rfind(')')
+    if comm_end < 2 or not content.startswith(f'{pid} ('):
+        raise ValueError(f'Malformed process stat identity for PID {pid}.')
+    fields_after_comm = content[comm_end + 1:].split()
+    # The first token after comm is field 3 (state), so field 22 is index 19.
+    if len(fields_after_comm) <= 19:
+        raise ValueError(f'Malformed process stat identity for PID {pid}.')
     try:
-        for candidate in marker.parent.iterdir():
-            try:
-                if candidate.stat().st_mtime < cutoff:
-                    candidate.unlink()
-            except (FileNotFoundError, OSError):
-                continue
-    except OSError:
-        pass
-    # O_NOFOLLOW prevents replacing the final marker with a symlink in the
-    # shared container filesystem.  The claim token makes paths invocation-
-    # unique, so truncation is safe for duplicate cancellation delivery.
-    flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC
-    flags |= getattr(os, 'O_NOFOLLOW', 0)
-    fd = os.open(marker, flags, 0o600)
-    os.close(fd)
-    return marker
+        start_time_ticks = int(fields_after_comm[19])
+    except ValueError as e:
+        raise ValueError(
+            f'Malformed process start identity for PID {pid}.') from e
+    if start_time_ticks <= 0:
+        raise ValueError(f'Invalid process start identity for PID {pid}.')
+    return start_time_ticks
 
 
-def consume_execution_cancellation(marker: pathlib.Path) -> bool:
-    """Atomically consume an exact-claim marker, if it is armed."""
-    try:
-        marker.unlink()
-    except FileNotFoundError:
+def signal_exact_local_process(pid: int, expected_start_time_ticks: int,
+                               signum: int) -> bool:
+    """Signal one same-UID guardian through its PID and birth identity.
+
+    The pidfd binds signal delivery to the process that was opened, while the
+    procfs start ticks reject PID reuse before delivery.  The process title
+    prevents a corrupted request row from targeting an unrelated same-UID
+    process.  Absence or any unverifiable identity fails closed.
+    """
+    if (isinstance(expected_start_time_ticks, bool) or
+            not isinstance(expected_start_time_ticks, int) or
+            expected_start_time_ticks <= 0 or isinstance(signum, bool) or
+            not isinstance(signum, int)):
         return False
-    return True
-
-
-def clear_execution_cancellation(marker: pathlib.Path | None) -> None:
-    """Best-effort removal of this invocation's marker."""
-    if marker is None:
-        return
+    pidfd_open = getattr(os, 'pidfd_open', None)
+    pidfd_send_signal = getattr(signal, 'pidfd_send_signal', None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        return False
     try:
-        marker.unlink()
-    except OSError:
-        # Cleanup must never turn an otherwise completed wrapper Future into
-        # an ambiguous failure: that would suppress the exact-generation
-        # quiescence receipt forever.  A leftover marker is harmless because
-        # the path is claim-token and generation addressed and is pruned after
-        # a bounded age.
-        pass
+        pidfd = pidfd_open(pid, 0)  # pylint: disable=not-callable
+    except (OSError, ProcessLookupError, ValueError):
+        return False
+    try:
+        process_path = pathlib.Path('/proc') / str(pid)
+        if process_path.stat().st_uid != os.geteuid():
+            return False
+        if read_linux_process_start_time_ticks(
+                pid) != expected_start_time_ticks:
+            return False
+        command = (process_path / 'cmdline').read_bytes().split(b'\0', 1)[0]
+        if not command.startswith(b'SkyPilot:executor:guardian:'):
+            return False
+        pidfd_send_signal(pidfd, signum, None, 0)  # pylint: disable=not-callable
+        return True
+    except (OSError, ProcessLookupError, ValueError):
+        return False
+    finally:
+        os.close(pidfd)
 
 
 _EXECUTION_CLAIM: contextvars.ContextVar[ExecutionClaim |
@@ -152,6 +189,11 @@ class RequestBackend(abc.ABC):
         """Heartbeat cadence for claimed work, or None without leases."""
         return None
 
+    @property
+    def supports_local_execution_quiescence(self) -> bool:
+        """Whether unclaimed invocations publish PID/birth-bound receipts."""
+        return False
+
     @abc.abstractmethod
     def get_request(self,
                     request_id: str,
@@ -196,42 +238,14 @@ class RequestBackend(abc.ABC):
         """
         raise NotImplementedError
 
-    @abc.abstractmethod
-    async def create_or_refresh_internal_daemon_async(self,
-                                                      request: Request) -> bool:
-        """For an internal daemon request: insert a fresh PENDING row or
-        refresh env-bearing columns on an existing row.
+    def retire_legacy_internal_daemon_rows(self) -> int:
+        """Delete explicitly known legacy daemon request/queue rows.
 
-        Returns True if a new row was inserted (caller should enqueue
-        the request onto the task queue), False if an existing row was
-        refreshed in-place (the task_queue entry from the original
-        creator stays in place; do NOT enqueue again).
-
-        Atomic + idempotent under concurrent callers. Replaces
-        `create_if_not_exists_async` on the daemon submission path:
-        the dedup contract is identical (exactly one concurrent caller
-        gets True), but losing callers also UPDATE `request_body`,
-        `name`, and `schedule_type` on the existing row so the
-        persisted `env_vars` reflect the current process's
-        `os.environ` rather than whatever the original creator
-        captured (which may be from a previous deployment generation
-        in HA setups).
+        The built-in SQLite and PostgreSQL backends override this synchronous
+        startup primitive. Plugin backends predate the transition and have no
+        built-in legacy rows, so their source-compatible default is a no-op.
         """
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    async def delete_orphan_internal_daemons_async(
-        self,
-        internal_daemons: list[daemons_lib.InternalRequestDaemon],
-    ) -> None:
-        """Delete daemon-shaped rows whose `request_id` is not in
-        `internal_daemons` (daemon was renamed / removed in code),
-        along with any task_queue entries (for backends with a
-        persistent queue).
-
-        Idempotent under concurrent callers.
-        """
-        raise NotImplementedError
+        return 0
 
     @abc.abstractmethod
     def query_requests(self, req_filter: RequestTaskFilter) -> list[Request]:
@@ -273,7 +287,8 @@ class RequestBackend(abc.ABC):
                          request_id: str,
                          pid: int | None,
                          execution_generation: int = 0,
-                         claim_token: str | None = None) -> bool:
+                         claim_token: str | None = None,
+                         process_start_time_ticks: int | None = None) -> bool:
         """Atomically flip a request to RUNNING if it is still executable.
 
         Records `pid` and clears any stale retry-backoff status_msg. Non-
@@ -285,7 +300,7 @@ class RequestBackend(abc.ABC):
             True iff the request was in an executable status and is now
             RUNNING.
         """
-        del execution_generation, claim_token
+        del execution_generation, claim_token, process_start_time_ticks
         # Runtime import to avoid a circular import: the requests module
         # imports this module at the top level.
         # pylint: disable=import-outside-toplevel
@@ -312,10 +327,13 @@ class RequestBackend(abc.ABC):
         return True
 
     def interrupt_cancelled_claim(self, claim: ExecutionClaim) -> bool:
-        """Signal a cancelled claim owned by this backend instance.
+        """Signal a cancelled or otherwise revoked exact local claim.
 
         Distributed backends override this so an API process can record
-        cancellation intent and the remote owning executor can deliver it.
+        cancellation intent and the remote owning executor can deliver it. A
+        failed lease renewal is also a revocation: the implementation may
+        interrupt a still-RUNNING claim only when durable state proves that its
+        exact generation no longer has execution authority.
         Returning True means only that the matching local generation was
         signalled or its process had already exited; it does not prove that
         effect-bearing handler code has quiesced.
@@ -337,6 +355,99 @@ class RequestBackend(abc.ABC):
         """
         del claim
         return False
+
+    def acknowledge_local_execution_quiescence(
+            self, request_id: str, pid: int,
+            process_start_time_ticks: int) -> bool:
+        """Publish local stable-empty proof for one exact guardian birth.
+
+        Only the parent Future monitor may call this after the disposable
+        boundary reports a non-ambiguous result.  Durable-claim backends use
+        :meth:`acknowledge_execution_quiescence` instead.
+        """
+        del request_id, pid, process_start_time_ticks
+        return False
+
+    def quiesce_managed_job_slot_requests(
+            self,
+            identity: ManagedJobControllerSlotIdentity,
+            *,
+            timeout_seconds: float = 60.0,
+            poll_seconds: float = 0.1) -> int:
+        """Revoke and wait for every nested request from one exact slot.
+
+        Implementations must first close new admission for ``identity`` and
+        may return only after every admitted request generation has an exact
+        boundary-authored quiescence receipt.  Plugin backends fail closed:
+        they cannot safely participate in managed-job controller handoff.
+        """
+        del identity, timeout_seconds, poll_seconds
+        raise ManagedJobRequestQuiescenceError(
+            'The request backend cannot prove managed-job nested request '
+            'quiescence.')
+
+    def quiesce_stale_managed_job_requests(self,
+                                           current_owner: tuple[str, int],
+                                           *,
+                                           timeout_seconds: float = 60.0,
+                                           poll_seconds: float = 0.1) -> int:
+        """Close and quiesce nested work owned by older outer generations."""
+        del current_owner, timeout_seconds, poll_seconds
+        raise ManagedJobRequestQuiescenceError(
+            'The request backend cannot prove stale managed-job request '
+            'quiescence.')
+
+    def converge_execution_completion(
+            self,
+            claim: ExecutionClaim,
+            error: BaseException | None = None,
+            terminal_cause: str = 'handler_failed') -> bool:
+        """Converge one parent-proven callable completion and its receipt.
+
+        The Future monitor calls this until it returns or the exact claim is
+        definitively obsolete. Durable backends override it so outcome and
+        receipt mutations are one idempotent transaction. The default keeps
+        plugin backends source-compatible.
+
+        Returns:
+            True iff the receipt is durable. False iff this backend cannot
+            accept the exact claim (including an obsolete identity).
+        """
+        if error is not None:
+            # Runtime import avoids a requests <-> storage import cycle.
+            # pylint: disable=import-outside-toplevel
+            from sky.server.requests import requests as requests_lib
+
+            self.transition_request_terminal(claim.request_id,
+                                             requests_lib.RequestStatus.FAILED,
+                                             terminal_cause,
+                                             error=error)
+        return self.acknowledge_execution_quiescence(claim)
+
+    def handoff_execution_retry(self, claim: ExecutionClaim, status_msg: str,
+                                retry_wait_seconds: float) -> bool | None:
+        """Atomically consume one completion proof into a delayed retry.
+
+        Durable backends override this primitive so the exact execution
+        receipt, request ``WAITING`` transition, claim release, and delayed
+        queue delivery are one transaction.  ``False`` means that cancellation
+        or another owner already made this exact claim obsolete.  ``None`` is
+        the source-compatible result for local/plugin backends without durable
+        claims.
+        """
+        del claim, status_msg, retry_wait_seconds
+        return None
+
+    def interrupt_request_for_shutdown_retry(self,
+                                             request_id: str) -> bool | None:
+        """Atomically interrupt a durable claim for graceful-shutdown retry.
+
+        ``None`` means the backend does not implement this durable primitive;
+        callers preserve the legacy local-backend path. PostgreSQL overrides
+        it with exact claim and process-birth fencing.
+        """
+        del request_id
+        return None
 
     def set_request_finished(self,
                              request_id: str,

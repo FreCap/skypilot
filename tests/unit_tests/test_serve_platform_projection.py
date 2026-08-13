@@ -1,5 +1,8 @@
 """Strict immutable SkyServe platform projections."""
 # pylint: disable=protected-access
+import copy
+import hashlib
+import json
 from unittest import mock
 
 import pytest
@@ -9,6 +12,7 @@ from sky import execution
 from sky import resources as resources_lib
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.provision.kubernetes import config as kubernetes_config
 from sky.provision.kubernetes import instance as kubernetes_instance
@@ -16,6 +20,7 @@ from sky.serve import constants
 from sky.serve import kubernetes_identity
 from sky.skylet import constants as skylet_constants
 from sky.utils import common_utils
+from sky.utils import resources_utils
 from sky.utils import schemas
 from sky.utils import yaml_utils
 
@@ -40,6 +45,38 @@ def _accelerator_scheduling(accelerator='H200'):
     }
 
 
+def _worker_projection(*,
+                       context='phx',
+                       accelerator='H200',
+                       protocol_version=1,
+                       kueue_admission=None,
+                       scheduler_name='default-scheduler'):
+    projection = {
+        'candidate_id': 'kubernetes-0000',
+        'kubernetes_context': context,
+        'namespace': 'inference',
+        'service_account_name': f'{context}-worker',
+        'priority_class_name': 'preemptible-inference-low',
+        'priority_value': -1000,
+        'preemption_policy': 'Never',
+        'pod_identity_role_arn': _worker_role(context),
+        'accelerator_name': accelerator,
+        'accelerator_count': 1,
+        'accelerator_scheduling': _accelerator_scheduling(accelerator),
+        'cache': {
+            'kind': 'none'
+        },
+    }
+    if protocol_version == 2:
+        projection = {
+            'projection_version': 2,
+            **projection,
+            'scheduler_name': scheduler_name,
+            'kueue_admission': kueue_admission,
+        }
+    return projection
+
+
 def _kubernetes_api_error(status):
     return kubernetes_instance.kubernetes.api_exception()(status=status)
 
@@ -50,6 +87,84 @@ def test_historical_version_has_null_projections():
         None) is None
     assert kubernetes_identity.validate_worker_placement_projections(
         None) is None
+
+
+def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
+    v1 = _worker_projection()
+    admission = {
+        'local_queue_name': 'inference',
+        'workload_priority_class_name': 'inference-low',
+    }
+    v2 = _worker_projection(protocol_version=2, kueue_admission=admission)
+
+    assert kubernetes_identity.worker_projection_protocol_version(v1) == 1
+    assert kubernetes_identity.worker_projection_protocol_version(v2) == 2
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v1], require_protocol_version=1) == [v1]
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v2], require_protocol_version=2) == [v2]
+    with pytest.raises(ValueError, match='does not satisfy required version'):
+        kubernetes_identity.validate_worker_placement_projections(
+            [v1], require_protocol_version=2)
+    with pytest.raises(ValueError, match='must not mix protocol versions'):
+        kubernetes_identity.validate_worker_placement_projections([v1, v2])
+    with pytest.raises(ValueError, match='protocol-v1 keys'):
+        kubernetes_identity.worker_projection_protocol_version({
+            **v2, 'unknown': True
+        })
+
+
+@pytest.mark.parametrize('kueue_admission', [{
+    'local_queue_name': 'inference',
+}, {
+    'local_queue_name': '',
+    'workload_priority_class_name': 'inference-low',
+}, {
+    'local_queue_name': 'inference',
+    'workload_priority_class_name': '',
+}, {
+    'local_queue_name': 'inference',
+    'workload_priority_class_name': 'inference-low',
+    'require_managed': True,
+}])
+def test_worker_projection_v2_rejects_partial_kueue_admission(kueue_admission):
+    projection = _worker_projection(protocol_version=2,
+                                    kueue_admission=kueue_admission)
+    with pytest.raises(ValueError):
+        kubernetes_identity.validate_worker_placement_projections(
+            [projection], require_protocol_version=2)
+
+
+def test_worker_projection_v2_digest_covers_complete_validated_candidate():
+    projection = _worker_projection(
+        protocol_version=2,
+        kueue_admission={
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        })
+    validated = kubernetes_identity.validate_worker_placement_projections(
+        [projection], allow_none=False, require_protocol_version=2)
+    assert validated is not None
+    canonical = json.dumps(validated[0],
+                           sort_keys=True,
+                           separators=(',', ':'),
+                           ensure_ascii=False,
+                           allow_nan=False)
+    expected = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    assert kubernetes_identity.worker_projection_sha256(projection) == expected
+    assert kubernetes_identity.worker_projection_sha256(
+        dict(reversed(list(projection.items())))) == expected
+
+    mutated = json.loads(json.dumps(projection))
+    mutated['kueue_admission'][
+        'workload_priority_class_name'] = 'inference-lower'
+    assert kubernetes_identity.worker_projection_sha256(mutated) != expected
+    mutated_scheduler = json.loads(json.dumps(projection))
+    mutated_scheduler['scheduler_name'] = 'trusted-batch-scheduler'
+    assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler)
+            != expected)
+    with pytest.raises(ValueError, match='does not satisfy required version'):
+        kubernetes_identity.worker_projection_sha256(_worker_projection())
 
 
 def test_controller_projection_requires_explicit_workspace():
@@ -397,6 +512,7 @@ def test_worker_priority_projection_ignores_pod_config(monkeypatch):
         'east', {}, 'inference')
 
     assert projected['priority_class_name'] is None
+    assert projected['scheduler_name'] == 'default-scheduler'
     assert projected['pod_identity_role_arn'] is None
 
 
@@ -411,6 +527,11 @@ def test_worker_priority_projection_freezes_configured_expectation(monkeypatch):
     monkeypatch.setattr(
         skypilot_config, 'get_effective_workspace_region_config',
         lambda *, keys, **_kwargs: {
+            ('pod_config',): {
+                'spec': {
+                    'schedulerName': 'trusted-batch-scheduler'
+                }
+            },
             ('serve_worker_priority_class_name',): 'preemptible-inference-low',
             ('serve_worker_priority_value',): -1000,
             ('serve_worker_preemption_policy',): 'Never',
@@ -421,9 +542,150 @@ def test_worker_priority_projection_freezes_configured_expectation(monkeypatch):
         'east', {}, 'inference')
 
     assert projected['priority_class_name'] == 'preemptible-inference-low'
+    assert projected['scheduler_name'] == 'trusted-batch-scheduler'
     assert projected['priority_value'] == -1000
     assert projected['preemption_policy'] == 'Never'
     assert projected['pod_identity_role_arn'] == _worker_role()
+
+
+def test_worker_scheduler_projection_uses_trusted_workspace_not_task_override(
+        monkeypatch):
+    monkeypatch.setattr(
+        kubernetes_identity, '_project_location', lambda *_args, **_kwargs: {
+            'kubernetes_context': 'east',
+            'namespace': 'inference',
+            'service_account_name': 'worker',
+            'priority_class_name': None,
+        })
+
+    def effective_config(*, keys, **_kwargs):
+        if keys == ('pod_config',):
+            return {'spec': {'schedulerName': 'trusted-batch-scheduler'}}
+        return None
+
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_workspace_region_config',
+                        effective_config)
+
+    projected = kubernetes_identity._project_worker_location(
+        'east', {
+            'kubernetes': {
+                'pod_config': {
+                    'spec': {
+                        'schedulerName': 'caller-scheduler'
+                    }
+                }
+            }
+        }, 'inference')
+
+    assert projected['scheduler_name'] == 'trusted-batch-scheduler'
+
+
+def test_worker_kueue_projection_is_workspace_owned_and_all_or_none(
+        monkeypatch):
+    queue_resolver = mock.Mock(return_value='inference')
+    managed_resolver = mock.Mock(return_value=True)
+    class_resolver = mock.Mock(return_value='inference-low')
+    monkeypatch.setattr(skypilot_config, 'get_effective_queue_name',
+                        queue_resolver)
+    monkeypatch.setattr(skypilot_config, 'get_effective_kueue_require_managed',
+                        managed_resolver)
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_workspace_region_config', class_resolver)
+
+    assert kubernetes_identity._project_worker_kueue_admission(
+        'phx', 'research') == {
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        }
+    queue_resolver.assert_called_once_with(cloud='kubernetes',
+                                           region='phx',
+                                           workspace='research',
+                                           override_configs=None)
+    managed_resolver.assert_called_once_with(cloud='kubernetes',
+                                             region='phx',
+                                             workspace='research',
+                                             override_configs=None)
+    class_resolver.assert_called_once_with(
+        cloud='kubernetes',
+        region='phx',
+        keys=('serve_worker_kueue_workload_priority_class_name',),
+        workspace='research',
+        default_value=None)
+
+    class_resolver.return_value = None
+    with pytest.raises(ValueError, match='both configured or both absent'):
+        kubernetes_identity._project_worker_kueue_admission('phx', 'research')
+
+
+def test_worker_kueue_workload_priority_class_is_server_owned():
+    common_utils.validate_schema(
+        {
+            'kubernetes': {
+                'serve_worker_kueue_workload_priority_class_name': 'inference-low',
+                'context_configs': {
+                    'phx': {
+                        'serve_worker_kueue_workload_priority_class_name': 'inference-phx-low',
+                    },
+                },
+            },
+            'workspaces': {
+                'research': {
+                    'kubernetes': {
+                        'serve_worker_kueue_workload_priority_class_name': 'workspace-low',
+                    },
+                },
+            },
+        }, schemas.get_config_schema(), 'Invalid config')
+    assert ('kubernetes',
+            'serve_worker_kueue_workload_priority_class_name') in (
+                skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    assert ('kubernetes', 'context_configs', '*',
+            'serve_worker_kueue_workload_priority_class_name') in (
+                skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    with pytest.raises(ValueError):
+        common_utils.validate_schema(
+            {
+                'kubernetes': {
+                    'serve_worker_kueue_workload_priority_class_name': '',
+                },
+            }, schemas.get_config_schema(), 'Invalid config')
+
+
+@pytest.mark.parametrize('resource_mutator', [
+    lambda resource: resource._set_priority_class('caller-priority'),
+    lambda resource: setattr(resource, '_cluster_config_overrides', {
+        'kubernetes': {
+            'kueue': {
+                'local_queue_name': 'caller-queue'
+            }
+        }
+    }),
+    lambda resource: setattr(
+        resource, '_cluster_config_overrides', {
+            'kubernetes': {
+                'context_configs': {
+                    'phx': {
+                        'quota': {
+                            'queue': 'caller-queue'
+                        }
+                    }
+                }
+            }
+        }),
+])
+def test_projected_worker_rejects_task_owned_admission(resource_mutator):
+    task = task_lib.Task.from_yaml_str('''
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+run: echo hi
+''')
+    resource = next(iter(task.resources))
+    resource_mutator(resource)
+
+    with pytest.raises(ValueError, match='Projected SkyServe Kubernetes'):
+        kubernetes_identity.validate_no_task_worker_admission_overrides(task)
 
 
 def test_worker_role_is_server_owned_and_strict():
@@ -508,6 +770,7 @@ run: echo hi
             'kubernetes_context': context,
             'namespace': 'rescluster-k8s-prod-east1-preemptible-inference',
             'service_account_name': f'{context}-worker',
+            'scheduler_name': 'default-scheduler',
             'priority_class_name': 'preemptible-inference-low',
             'priority_value': -1000,
             'preemption_policy': 'Never',
@@ -515,6 +778,12 @@ run: echo hi
         })
     monkeypatch.setattr(kubernetes_identity, '_project_cache',
                         lambda context, _workspace: {'kind': 'none'})
+    monkeypatch.setattr(
+        kubernetes_identity, '_project_worker_kueue_admission',
+        lambda _context, _workspace: {
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        })
     monkeypatch.setattr(
         kubernetes_identity, '_project_accelerator_scheduling',
         lambda _context, accelerator, _workspace: _accelerator_scheduling(
@@ -531,6 +800,12 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
+    assert all(item['projection_version'] == 2 for item in projected)
+    assert all(
+        item['kueue_admission'] == {
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        } for item in projected)
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
@@ -618,7 +893,9 @@ run: echo hi
 ''')
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [{}],
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=2)
+        ],
     }
 
     with pytest.raises(exceptions.RequestCancelled,
@@ -639,7 +916,9 @@ def test_projected_worker_preserves_trusted_version_runtime_inputs():
         {'MODEL_RUNTIME_TOKEN': 'operator-owned-version-secret'})
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [{}],
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=2)
+        ],
     }
 
     execution._validate_projected_service_task_inputs(dag, launch_context)
@@ -686,7 +965,9 @@ run: echo hi
     }
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [{}],
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=2)
+        ],
     }
 
     with pytest.raises(exceptions.RequestCancelled,
@@ -711,7 +992,9 @@ run: echo hi
     }
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
-        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [{}],
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=2)
+        ],
     }
 
     with pytest.raises(exceptions.RequestCancelled,
@@ -841,11 +1124,44 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
                             }],
                         }, {
                             'name': 'sidecar',
+                            'resources': {
+                                'requests': {
+                                    'nvidia.com/gpu': 4,
+                                },
+                                'limits': {
+                                    'nvidia.com/gpu': 4,
+                                },
+                            },
                             'env': [{
                                 'name': 'SKYPILOT_SERVE_CACHE_EVIL',
                                 'value': 'caller-value',
                             }],
                         }],
+                        'initContainers': [{
+                            'name': 'gpu-init',
+                            'resources': {
+                                'requests': {
+                                    'nvidia.com/gpu': 8,
+                                },
+                                'limits': {
+                                    'nvidia.com/gpu': 8,
+                                },
+                            },
+                        }],
+                        'overhead': {
+                            'nvidia.com/gpu': 2,
+                            'cpu': '100m',
+                        },
+                        'resources': {
+                            'requests': {
+                                'nvidia.com/gpu': 16,
+                                'cpu': '2',
+                            },
+                            'limits': {
+                                'nvidia.com/gpu': 16,
+                                'memory': '4Gi',
+                            },
+                        },
                     }
                 }
             }
@@ -860,6 +1176,7 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
     assert cluster_yaml['provider'] == {
         'context': 'phx',
         'namespace': 'rescluster-k8s-prod-east1-preemptible-inference',
+        'serve_worker_projection_protocol_version': 1,
         'serve_worker_expected_priority_class_name': 'preemptible-inference-low',
         'serve_worker_expected_priority_value': -1000,
         'serve_worker_expected_preemption_policy': 'Never',
@@ -891,6 +1208,213 @@ def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
         'value': 'none',
     }]
     assert not pod_spec['containers'][1]['env']
+    assert pod_spec['containers'][1]['resources'] == {
+        'requests': {},
+        'limits': {},
+    }
+    assert pod_spec['initContainers'][0]['resources'] == {
+        'requests': {},
+        'limits': {},
+    }
+    assert pod_spec['overhead'] == {'cpu': '100m'}
+    assert pod_spec['resources'] == {
+        'requests': {
+            'cpu': '2',
+        },
+        'limits': {
+            'memory': '4Gi',
+        },
+    }
+
+
+@pytest.mark.parametrize('claim_surface', ['pod', 'runtime_container'])
+def test_final_kubernetes_yaml_rejects_dynamic_resource_claims(claim_surface):
+    projection = _worker_projection()
+    pod_spec = {
+        'containers': [{
+            'name': 'ray-node',
+        }],
+    }
+    if claim_surface == 'pod':
+        pod_spec['resourceClaims'] = [{'name': 'opaque-gpu'}]
+    else:
+        pod_spec['containers'][0]['resources'] = {
+            'claims': [{
+                'name': 'opaque-gpu'
+            }]
+        }
+    cluster_yaml = {
+        'provider': {},
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': pod_spec,
+                },
+            },
+        },
+    }
+
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='Dynamic Resource Allocation'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            cluster_yaml, projection)
+
+
+def test_final_kubernetes_yaml_reasserts_v2_kueue_admission():
+    projection = _worker_projection(
+        protocol_version=2,
+        scheduler_name='trusted-batch-scheduler',
+        kueue_admission={
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        })
+    cluster_yaml = {
+        'provider': {
+            'kueue_local_queue_name': 'caller-queue',
+            'kueue_require_managed': False,
+            'kueue_workload_priority_class_name': 'caller-workload-priority',
+        },
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'metadata': {
+                        'labels': {
+                            'kueue.x-k8s.io/managed': 'true',
+                            'kueue.x-k8s.io/queue-name': 'caller-queue',
+                            'kueue.x-k8s.io/priority-class': 'caller-workload-priority',
+                        },
+                    },
+                    'spec': {
+                        'nodeName': 'caller-selected-node',
+                        'schedulerName': 'caller-scheduler',
+                        'priorityClassName': 'caller-pod-priority',
+                        'containers': [{
+                            'name': 'ray-node',
+                        }],
+                    },
+                },
+            },
+        },
+    }
+
+    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+        cluster_yaml, projection)
+
+    provider = cluster_yaml['provider']
+    assert provider['kueue_local_queue_name'] == 'inference'
+    assert provider['kueue_require_managed'] is True
+    assert provider['kueue_workload_priority_class_name'] == 'inference-low'
+    assert provider['serve_worker_expected_scheduler_name'] == (
+        'trusted-batch-scheduler')
+    node_config = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']
+    assert node_config['metadata']['labels'] == {
+        'kueue.x-k8s.io/queue-name': 'inference',
+        'kueue.x-k8s.io/priority-class': 'inference-low',
+    }
+    assert node_config['spec'][
+        'priorityClassName'] == 'preemptible-inference-low'
+    assert 'nodeName' not in node_config['spec']
+    assert node_config['spec']['schedulerName'] == 'trusted-batch-scheduler'
+
+    projection_without_kueue = _worker_projection(protocol_version=2,
+                                                  kueue_admission=None)
+    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+        cluster_yaml, projection_without_kueue)
+    assert provider['kueue_local_queue_name'] is None
+    assert provider['kueue_require_managed'] is False
+    assert provider['kueue_workload_priority_class_name'] is None
+    assert not any(
+        key in node_config['metadata']['labels']
+        for key in ('kueue.x-k8s.io/queue-name',
+                    'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
+
+
+def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
+    resources = mock.MagicMock()
+    resources.instance_type = '8CPU--32GB--H200:1'
+    resources.accelerators = {'H200': 1}
+    resources.use_spot = False
+    resources.cluster_config_overrides = {}
+    resources.network_tier = resources_utils.NetworkTier.STANDARD
+    resources.requires_fuse = False
+    resources.priority_class = 'caller-priority'
+    resources.ephemeral_storage = None
+    resources.hooks = None
+    resources.extract_docker_image.return_value = None
+    setattr(resources, 'assert_launchable', lambda: resources)
+    projection = _worker_projection(
+        protocol_version=2,
+        kueue_admission={
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        })
+    cloud = kubernetes_identity.clouds.Kubernetes()
+    region = mock.MagicMock()
+    region.name = 'phx'
+
+    queue_resolver = mock.Mock(
+        side_effect=AssertionError('v2 must not resolve a live queue'))
+    managed_resolver = mock.Mock(
+        side_effect=AssertionError('v2 must not resolve live management'))
+    service_account_resolver = mock.Mock(
+        side_effect=AssertionError('v2 must not resolve live identity'))
+    accelerator_resolver = mock.Mock(
+        side_effect=AssertionError('v2 must not discover live labels'))
+    resource_key_resolver = mock.Mock(
+        side_effect=AssertionError('v2 must not discover a resource key'))
+    monkeypatch.setattr(skypilot_config, 'get_effective_queue_name',
+                        queue_resolver)
+    monkeypatch.setattr(skypilot_config, 'get_effective_kueue_require_managed',
+                        managed_resolver)
+    monkeypatch.setattr(kubernetes_identity.kubernetes_cloud,
+                        'get_service_account_name', service_account_resolver)
+    monkeypatch.setattr(kubernetes_identity.kubernetes_utils,
+                        'get_accelerator_label_key_values',
+                        accelerator_resolver)
+    monkeypatch.setattr(kubernetes_identity.kubernetes_utils,
+                        'get_gpu_resource_key', resource_key_resolver)
+    monkeypatch.setattr(
+        kubernetes_identity.kubernetes_utils, 'adjust_resources_to_allocatable',
+        mock.Mock(side_effect=AssertionError('v2 must not inspect nodes')))
+    monkeypatch.setattr(kubernetes_identity.kubernetes_utils,
+                        'resolve_effective_pod_config',
+                        lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        kubernetes_identity.kubernetes_cloud.network_utils, 'get_port_mode',
+        mock.Mock(return_value=mock.MagicMock(value='portforward')))
+    monkeypatch.setattr(kubernetes_identity.kubernetes_cloud.gcp_utils,
+                        'get_dws_config',
+                        mock.Mock(return_value=(False, False, None)))
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_region_config',
+                        lambda *, keys, default_value=None, **_kwargs: 30
+                        if keys == ('provision_timeout',) else default_value)
+    monkeypatch.setattr(kubernetes_identity.kubernetes_cloud.catalog,
+                        'get_image_id_from_tag',
+                        mock.Mock(return_value='worker-image'))
+    monkeypatch.setattr(
+        cloud, '_detect_network_type',
+        mock.Mock(return_value=(kubernetes_identity.kubernetes_utils.
+                                KubernetesHighPerformanceNetworkType.NONE,
+                                None)))
+
+    deploy_vars = cloud.make_deploy_resources_variables(
+        resources,
+        resources_utils.ClusterName('replica', 'replica'),
+        region,
+        None,
+        1,
+        worker_placement_projection=projection)
+
+    assert deploy_vars['k8s_namespace'] == 'inference'
+    assert deploy_vars['k8s_service_account_name'] == 'phx-worker'
+    assert deploy_vars['k8s_kueue_require_managed'] is True
+    assert deploy_vars['k8s_kueue_local_queue_name'] == 'inference'
+    assert deploy_vars[
+        'k8s_kueue_workload_priority_class_name'] == 'inference-low'
+    assert deploy_vars['k8s_acc_label_key'] == 'nvidia.com/gpu.product'
+    assert deploy_vars['k8s_resource_key'] == 'nvidia.com/gpu'
 
 
 def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
@@ -1058,6 +1582,72 @@ def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
     assert 'inject-sidecar' not in serialized
 
 
+def test_legacy_yaml_restore_reasserts_v2_kueue_admission():
+    projection = _worker_projection(
+        protocol_version=2,
+        kueue_admission={
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        })
+    fresh_node = {
+        'node_config': {
+            'metadata': {
+                'labels': {
+                    'kueue.x-k8s.io/queue-name': 'inference',
+                    'kueue.x-k8s.io/priority-class': 'inference-low',
+                },
+            },
+            'spec': {
+                'containers': [{
+                    'name': 'ray-node',
+                }],
+            },
+        },
+    }
+    stale_node = copy.deepcopy(fresh_node)
+    stale_node['node_config']['metadata']['labels'] = {
+        'kueue.x-k8s.io/queue-name': 'caller-queue',
+        'kueue.x-k8s.io/priority-class': 'caller-priority',
+    }
+    fresh = {
+        'provider': {
+            'context': 'phx',
+            'namespace': 'inference',
+            'kueue_local_queue_name': 'inference',
+            'kueue_require_managed': True,
+            'kueue_workload_priority_class_name': 'inference-low',
+        },
+        'available_node_types': {
+            'ray_head_default': fresh_node,
+        },
+    }
+    stale = {
+        'provider': {
+            'context': 'old',
+            'namespace': 'old',
+            'kueue_local_queue_name': 'caller-queue',
+            'kueue_require_managed': False,
+            'kueue_workload_priority_class_name': 'caller-priority',
+        },
+        'available_node_types': {
+            'ray_head_default': stale_node,
+        },
+    }
+
+    restored = backend_utils._restore_projected_worker_kubernetes_fields(
+        yaml_utils.dump_yaml_str(fresh), yaml_utils.dump_yaml_str(stale),
+        projection)
+    restored_config = yaml_utils.safe_load(restored)
+    assert restored_config['provider']['kueue_local_queue_name'] == 'inference'
+    assert restored_config['provider']['kueue_require_managed'] is True
+    assert restored_config['provider'][
+        'kueue_workload_priority_class_name'] == 'inference-low'
+    labels = restored_config['available_node_types']['ray_head_default'][
+        'node_config']['metadata']['labels']
+    assert labels['kueue.x-k8s.io/queue-name'] == 'inference'
+    assert labels['kueue.x-k8s.io/priority-class'] == 'inference-low'
+
+
 def test_legacy_yaml_restore_rejects_changed_node_type_set():
     projection = {
         'candidate_id': 'kubernetes-0000',
@@ -1182,6 +1772,8 @@ def _admitted_accelerator_pod(*,
     pod = mock.Mock()
     pod.metadata.name = 'replica-head'
     pod.spec.containers = [container]
+    pod.spec.init_containers = []
+    pod.spec.overhead = {}
     pod.spec.affinity = affinity if include_affinity else None
     return pod
 
@@ -1192,6 +1784,34 @@ def test_admitted_worker_accelerator_scheduling_contract_is_accepted():
         'nvidia.com/gpu.product', ['NVIDIA-H200'], 'nvidia.com/gpu', 1)
 
 
+def test_real_kubernetes_client_pod_accelerator_contract_is_accepted():
+    client = kubernetes_adaptor.kubernetes.client
+    expression = client.V1NodeSelectorRequirement(key='nvidia.com/gpu.product',
+                                                  operator='In',
+                                                  values=['NVIDIA-H200'])
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(name='replica-head'),
+        spec=client.V1PodSpec(
+            containers=[
+                client.V1Container(name='ray-node',
+                                   resources=client.V1ResourceRequirements(
+                                       requests={'nvidia.com/gpu': 1},
+                                       limits={'nvidia.com/gpu': 1})),
+            ],
+            init_containers=[],
+            overhead={},
+            affinity=client.V1Affinity(node_affinity=client.V1NodeAffinity(
+                required_during_scheduling_ignored_during_execution=(
+                    client.V1NodeSelector(node_selector_terms=[
+                        client.V1NodeSelectorTerm(
+                            match_expressions=[expression])
+                    ]))))))
+
+    kubernetes_instance._attest_serve_worker_accelerator_scheduling(
+        pod, 'inference', 'phx', 'nvidia.com/gpu.product', ['NVIDIA-H200'],
+        'nvidia.com/gpu', 1)
+
+
 @pytest.mark.parametrize('pod', [
     _admitted_accelerator_pod(include_affinity=False),
     _admitted_accelerator_pod(alternate_term=True),
@@ -1199,6 +1819,47 @@ def test_admitted_worker_accelerator_scheduling_contract_is_accepted():
     _admitted_accelerator_pod(resource_count=2),
 ])
 def test_admitted_worker_accelerator_mutation_is_deleted(monkeypatch, pod):
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
+    monkeypatch.setattr(kubernetes_instance.kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(kubernetes_config.KubernetesError,
+                       match='accelerator scheduling contract'):
+        kubernetes_instance._attest_serve_worker_accelerator_scheduling(
+            pod, 'inference', 'phx', 'nvidia.com/gpu.product', ['NVIDIA-H200'],
+            'nvidia.com/gpu', 1)
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+@pytest.mark.parametrize('injection', [
+    'sidecar',
+    'init_container',
+    'overhead',
+    'pod_resources',
+    'pod_resource_claim',
+    'container_resource_claim',
+])
+def test_admitted_worker_rejects_noncanonical_accelerator_surface(
+        monkeypatch, injection):
+    pod = _admitted_accelerator_pod()
+    injected_resources = mock.Mock(requests={'nvidia.com/gpu': 8}, limits={})
+    injected_container = mock.Mock(name='admission-injected',
+                                   resources=injected_resources)
+    if injection == 'sidecar':
+        pod.spec.containers.append(injected_container)
+    elif injection == 'init_container':
+        pod.spec.init_containers = [injected_container]
+    elif injection == 'overhead':
+        pod.spec.overhead = {'nvidia.com/gpu': 8}
+    elif injection == 'pod_resources':
+        pod.spec.resources = mock.Mock(requests={'nvidia.com/gpu': 8},
+                                       limits={})
+    elif injection == 'pod_resource_claim':
+        pod.spec.resource_claims = [mock.Mock(name='opaque-gpu')]
+    else:
+        pod.spec.containers[0].resources.claims = [mock.Mock(name='opaque-gpu')]
     core_api = mock.MagicMock()
     core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
     monkeypatch.setattr(kubernetes_instance.kubernetes, 'core_api',
@@ -1245,6 +1906,7 @@ def test_admitted_worker_priority_semantics_mismatch_is_deleted(
 def test_admitted_worker_service_account_mismatch_is_deleted(monkeypatch):
     pod = mock.MagicMock()
     pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference'
     pod.spec.service_account_name = 'webhook-mutated-sa'
     core_api = mock.MagicMock()
     core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
@@ -1268,6 +1930,7 @@ def test_admitted_worker_mismatch_retries_delete_and_confirms_absence(
         monkeypatch):
     pod = mock.MagicMock()
     pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference'
     pod.spec.service_account_name = 'webhook-mutated-sa'
     core_api = mock.MagicMock()
     core_api.delete_namespaced_pod.side_effect = [
@@ -1292,6 +1955,7 @@ def test_admitted_worker_mismatch_accepts_lost_delete_ack_when_absent(
         monkeypatch):
     pod = mock.MagicMock()
     pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference'
     pod.spec.service_account_name = 'webhook-mutated-sa'
     core_api = mock.MagicMock()
     core_api.delete_namespaced_pod.side_effect = _kubernetes_api_error(500)
@@ -1311,6 +1975,7 @@ def test_admitted_worker_mismatch_accepts_lost_delete_ack_when_absent(
 def test_admitted_worker_mismatch_treats_already_gone_as_confirmed(monkeypatch):
     pod = mock.MagicMock()
     pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference'
     pod.spec.service_account_name = 'webhook-mutated-sa'
     core_api = mock.MagicMock()
     core_api.delete_namespaced_pod.side_effect = _kubernetes_api_error(404)
@@ -1330,6 +1995,7 @@ def test_admitted_worker_mismatch_treats_already_gone_as_confirmed(monkeypatch):
 def test_admitted_worker_mismatch_reports_non_api_cleanup_failure(monkeypatch):
     pod = mock.MagicMock()
     pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference'
     pod.spec.service_account_name = 'webhook-mutated-sa'
     core_api = mock.MagicMock()
     core_api.delete_namespaced_pod.side_effect = RuntimeError('transport broke')
@@ -1347,6 +2013,25 @@ def test_admitted_worker_mismatch_reports_non_api_cleanup_failure(monkeypatch):
 
     assert core_api.delete_namespaced_pod.call_count == 3
     assert core_api.read_namespaced_pod.call_count == 3
+
+
+def test_admitted_worker_namespace_mismatch_is_deleted(monkeypatch):
+    pod = mock.MagicMock()
+    pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'webhook-mutated-namespace'
+    pod.spec.service_account_name = 'phx-worker'
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
+    monkeypatch.setattr(kubernetes_instance.kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(kubernetes_config.KubernetesError,
+                       match=r"has namespace 'webhook-mutated-namespace'; "
+                       r"expected 'inference'"):
+        kubernetes_instance._attest_serve_worker_service_account(
+            pod, 'inference', 'phx', 'phx-worker')
+
+    core_api.delete_namespaced_pod.assert_called_once()
 
 
 def test_final_kubernetes_yaml_requires_one_runtime_container():

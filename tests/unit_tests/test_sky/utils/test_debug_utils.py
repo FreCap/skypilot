@@ -1110,7 +1110,7 @@ class TestCreateDebugDump:
             mock_jobs_from_req, mock_clusters_from_req, mock_clusters_from_jobs,
             mock_dump_server, mock_dump_requests, mock_dump_clusters,
             mock_dump_jobs, tmp_path):
-        """System daemon request IDs should always be included."""
+        """Finite system request IDs should always be included."""
         with mock.patch('sky.utils.debug_utils.DEBUG_DUMP_DIR',
                         str(tmp_path / 'debug_dumps')):
             debug_utils.create_debug_dump()
@@ -1472,16 +1472,15 @@ class TestSystemRequestIds:
             assert isinstance(rid, str)
 
     def test_known_system_ids(self):
-        """Known system daemon IDs should be present."""
+        """Only finite system API request IDs should be present."""
         from sky.server import constants as server_constants
         from sky.server import daemons
 
-        # All internal daemon IDs should be present
-        for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
-            assert daemon.id in debug_utils.SYSTEM_REQUEST_IDS
-        # On-boot check should be present
-        assert server_constants.ON_BOOT_CHECK_REQUEST_ID in \
-            debug_utils.SYSTEM_REQUEST_IDS
+        assert debug_utils.SYSTEM_REQUEST_IDS == [
+            server_constants.ON_BOOT_CHECK_REQUEST_ID
+        ]
+        assert not ({daemon.id for daemon in daemons.RUNTIME_DAEMONS} &
+                    set(debug_utils.SYSTEM_REQUEST_IDS))
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,10 @@
 # Fail-closed Kueue management for Kubernetes pods
 
-- Status: Incident root cause proven; Phase 1 merged; reusable LocalQueue and runtime drift defenses implemented and locally verified; cluster policy rollout pending
-- Last updated: 2026-08-10
+- Status: Incident root cause proven; Phase 1 merged; protocol-v2 response,
+  adoption, and post-wait admitted-only/Pod-UID continuity hardening
+  implemented in the reserved-fill feature worktree; final feature validation
+  and cluster policy rollout pending
+- Last updated: 2026-08-13
 - Owners: SkyPilot Kubernetes and Serve
 
 ## Context
@@ -79,7 +82,9 @@ References:
   or cannot be verified.
 - Make the effective queue a server-owned placement decision in required mode.
 - Map SkyPilot's named resource `priority_class` to Kueue's
-  WorkloadPriorityClass in required mode.
+  WorkloadPriorityClass on the generic non-projected required path. Protocol-v2
+  projected workers reject task-owned priority and use immutable server-owned
+  projection admission.
 - Preserve existing behavior for placements with no effective Kueue queue.
 - Cover SkyServe replicas because they use the same Kubernetes Pod provisioning
   path as ordinary SkyPilot clusters.
@@ -142,22 +147,50 @@ When an effective queue is present, or `require_managed` is `true`:
    are also stripped during the server merge.  On a server with no configured
    queue or strict placement, a legacy request-provided queue remains accepted,
    but it also activates gating and attestation rather than best-effort mode.
-3. SkyPilot reasserts the queue, pod-group name, group size, and optional
-   WorkloadPriorityClass after all custom Pod configuration has been merged.
+3. SkyPilot reasserts the queue, label-form pod-group name, exact group size,
+   `retriable-in-group=false`, and optional WorkloadPriorityClass after all
+   custom Pod configuration has been merged. It removes the competing
+   annotation-form group identity.
 4. SkyPilot removes any client-supplied `kueue.x-k8s.io/managed` label and
-   pre-adds the Kueue admission scheduling gate before submitting the Pod.
-5. The create response must contain both
-   `kueue.x-k8s.io/managed=true` and the expected queue label.  Those values
-   prove that admission mutation ran against the intended queue.
-6. A Pod that fails attestation is immediately force-deleted and provisioning
-   fails.  If deletion itself fails, the SkyPilot-added scheduling gate still
-   prevents the unverified Pod from scheduling.
-7. Existing Pending or Running Pods found during resume/recovery are subject to
-   the same attestation.  Non-compliant Pods are deleted rather than adopted.
-8. A resource-level `priority_class` is emitted as the official
-   `kueue.x-k8s.io/priority-class` label.  If that WorkloadPriorityClass does not
-   exist, Kueue keeps the workload from being admitted; SkyPilot does not fall
-   back to an unprioritized workload.
+   Kueue managed finalizer, then pre-adds the Kueue admission scheduling gate
+   before submitting the Pod. Protocol-v2 projected workers first strip every
+   caller-supplied Kueue-prefixed label/annotation and scheduling gate, then
+   install this one canonical request contract.
+5. The immediate create response must contain `kueue.x-k8s.io/managed=true`,
+   the exact queue, pod-group, and WorkloadPriorityClass labels; exact group
+   count and `retriable-in-group=false` annotations; Kueue's eight-lowercase-
+   hexadecimal `role-hash` annotation; and the Kueue admission scheduling
+   gate. Admission-phase `podset`, `workload`, `local-queue`, and
+   `cluster-queue` outputs must still be absent. Those values prove admission
+   mutation ran against the intended closed contract.
+6. A Pod that fails immediate create-response attestation is force-deleted and
+   provisioning fails. If deletion itself fails at this pre-admission phase,
+   the SkyPilot-added scheduling gate still prevents the unverified Pod from
+   scheduling. An admitted, reused, or post-wait Pod is no longer protected by
+   that premise: rejection still fails closed, and a materialized protocol-v2
+   reserved-fill request forbids broad request-owned teardown or placement
+   failover. If immediate absence cannot be confirmed, its durable replica
+   owner performs exact cleanup under fresh authority.
+7. Existing Pending or Running Pods found during resume/recovery are attested
+   against their current Kueue lifecycle state. They require the same exact
+   managed, queue, workload-priority, pod-group, group-count,
+   `retriable-in-group=false`, and role-hash contract plus either the
+   still-present admission gate or Kueue's managed finalizer after admission
+   removes the gate. An admitted Pod must bind `podset` to its role hash;
+   `workload=<pod-group>` is optional because it depends on topology-aware
+   scheduling. The `local-queue=<queue>` and
+   `cluster-queue=<preflight-cluster-queue>` outputs are mandatory and exact
+   after admission. This requires Kueue's `AssignQueueLabelsForPods` feature
+   and closes a LocalQueue-retargeting race between preflight and admission.
+   Protocol v2 rejects unknown
+   Kueue-prefixed metadata and any scheduling gate other than Kueue admission
+   or topology. Non-compliant Pods are deleted rather than adopted.
+8. On the generic non-projected path, a resource-level `priority_class` is
+   emitted as the official `kueue.x-k8s.io/priority-class` label. If that
+   WorkloadPriorityClass does not exist, Kueue keeps the workload from being
+   admitted; SkyPilot does not fall back to an unprioritized workload.
+   Protocol-v2 projected workers instead reject task-owned priority and attest
+   the immutable server-owned projection admission.
 
 Kueue plain-Pod management does not cover Deployment-owned Pods with the same
 create-response attestation boundary.  Required mode therefore rejects
@@ -199,6 +232,15 @@ consists solely of
 conservative subset is mechanically provable without guessing external
 namespace labels.  It then waits for the LocalQueue's `Active=True` condition.
 
+Although the ClusterQueue object name field accepts a DNS subdomain, Kueue
+0.18's `AssignQueueLabelsForPods` controller emits the admitted
+`cluster-queue-name` Pod label only when that name is also a DNS-1123 label.
+Strict adoption requires that exact output to bind admission to preflight.
+Both the infrastructure module and runtime preflight therefore reject dotted,
+over-63-character, uppercase, underscore-containing, or otherwise non-label
+ClusterQueue names before any Pod mutation, with an actionable error. This is
+an explicit deployment naming prerequisite, not a post-admission retry.
+
 The selector check is necessary because Kueue 0.18 defines LocalQueue
 `Active=True` only in terms of the referenced ClusterQueue's active condition;
 the scheduler checks the ClusterQueue namespace selector later.  A queue can
@@ -236,19 +278,24 @@ preflight namespace-local LocalQueue
   - object exists
   - current-generation Active=True
   - target ClusterQueue exists and is current-generation Active=True
+  - target ClusterQueue name is a DNS-1123 label (output-label capable)
   - target ClusterQueue selector matches the current Namespace
   - read is authorized
         |
         v
 final Pod spec after custom pod_config
-  - overwrite queue/group/priority metadata
-  - remove forged managed label
-  - add Kueue admission scheduling gate
+  - overwrite queue/group/count/retriable/priority metadata
+  - remove forged managed/finalizer and competing group identity
+  - protocol v2 strips all other Kueue metadata and gates
+  - protocol v2 removes nodeName and installs its frozen server-owned scheduler
+  - add the one Kueue admission scheduling gate
+  - represented by kubernetes-python >=32.0.1 without typed-field loss
         |
         v
 Kubernetes admission
         |
-        +-- Kueue mutates Pod --> managed=true --> attest --> wait for admission
+        +-- Kueue mutates Pod --> managed=true + role-hash --> attest
+        |                         --> wait for admission
         |
         `-- Kueue does not mutate --> delete + error; scheduling gate stays shut
 ```
@@ -267,12 +314,33 @@ The following invariants hold whenever an effective queue exists or
   performed before config merge, because ignoring only the resource-level
   override would still leave the request value in the merged config.
 - A custom Pod spec cannot change the selected queue, pod-group identity, group
-  cardinality, or WorkloadPriorityClass after server policy is resolved.
+  cardinality, retriable policy, or WorkloadPriorityClass after server policy
+  is resolved. A protocol-v2 projected worker has no second Kueue-prefixed
+  metadata or scheduling-gate path. It also has no caller-selected scheduler or
+  direct `nodeName` binding path: the candidate freezes the effective
+  server-owned scheduler (defaulting to `default-scheduler`), final rendering
+  installs that exact name, and removes `nodeName`.
 - A caller cannot forge attestation by supplying the managed label in its Pod
   config.
-- Successful provisioning implies that Kueue admission mutation ran.  It does
-  not imply that the Workload has yet been admitted; normal provisioning waits
-  while Kueue retains the scheduling gate.
+- The immediate create response proves that Kueue admission mutation ran but
+  not that quota was admitted; normal provisioning waits while Kueue retains
+  the scheduling gate. The all-containers-Running observation returns each
+  Pod's exact UID. Successful provisioning additionally requires a fresh
+  post-wait GET of that same name and UID, still in `Running`, and attests its
+  admitted-only identity. The fresh Pod must retain its exact projected
+  scheduler and bind a non-empty `nodeName`; a fresh read of that exact Node
+  must carry the immutable projection's exact accelerator label. A same-name
+  replacement, still-gated or unbound object, alternate scheduler, or wrong
+  accelerator Node fails closed.
+- Immediate creation and later adoption are distinct attestation phases. The
+  create response must have pre-admission metadata plus Kueue's role hash and
+  admission gate and must remain unbound. Adoption accepts only that state or
+  an admitted state with
+  `podset=role-hash`, optional TAS workload identity, the mandatory exact
+  local/cluster queue output pair, and Kueue's managed finalizer. A bound
+  admitted adoption is accepted only after the exact bound Node passes the
+  projected accelerator-label check; an admitted Pending Pod may remain
+  unbound until the post-wait proof.
 - Multi-node clusters remain one Kueue pod group, so partial admission cannot
   make a subset of the requested nodes run.
 - Kueue preemption may delete a Pod.  SkyPilot/SkyServe recovery recreates the
@@ -307,13 +375,14 @@ shared inference placement is enabled, the cluster must provide:
    strip/gate/create-response attestation remains the boundary against a
    deliberate forgery.  The reusable module owns the Pod-specific rule
    automatically.
-6. A lower Kueue workload priority for inference than research.  Kueue uses an
-   explicit WorkloadPriorityClass label when supplied; otherwise it derives the
-   Workload priority from the Pod's Kubernetes PriorityClass.  The Boltz
-   inference partition already creates and admission-enforces a `-1000`
-   Kubernetes PriorityClass, so the initial rollout deliberately uses that
-   verified fallback and does not require a service-YAML change or a redundant
-   same-name WorkloadPriorityClass.
+6. A lower Kueue workload priority for inference than research. Generic strict
+   Pods may omit the WorkloadPriorityClass label and let Kueue derive workload
+   priority from the Pod's Kubernetes PriorityClass. Protocol-v2 projected
+   workers do not rely on that implicit fallback: the server-owned projection
+   freezes an explicit WorkloadPriorityClass together with the admission
+   queue. The Boltz rollout may give it the same reviewed `-1000` semantics as
+   the admission-enforced Pod PriorityClass, but it is a distinct Kueue object
+   and contract field.
 7. One verified preemption domain:
    - preferably the same ClusterQueue with `withinClusterQueue: LowerPriority`;
      or
@@ -327,7 +396,8 @@ solution.
 
 SkyServe must also retain its shared-fleet safety contract: scale to zero when
 idle, no unconditional nonzero fill floor, and no placement re-enable before
-the Kueue preemption smoke test passes.
+existing evidence or a separately authorized Kueue qualification proves the
+preemption contract.
 
 ## Implementation phases
 
@@ -347,7 +417,21 @@ the Kueue preemption smoke test passes.
   reference to the ClusterQueue and validate current-generation activity plus
   the full Kubernetes Namespace selector on every launch.  This catches policy
   drift that occurs after the infrastructure apply.
+- Require kubernetes-python >=32.0.1. Clients before 26.1 deserialize away
+  `spec.schedulingGates` and DRA claim fields, while clients 26.1 through 31
+  still deserialize away Pod-level `spec.resources`. Either loss can hide an
+  admission mutation from the protocol-v2 whole-Pod accelerator contract. The
+  dependency floor is global so strict attestation has one typed model path
+  rather than a version-specific raw-JSON fallback; 32.0.0 remains unsupported
+  because of its authentication regression.
 - Gate, normalize, attest, and clean up direct Pods in the provisioner.
+- For projection protocol v2, expose an explicit provider protocol marker,
+  strip every caller Kueue metadata/gate surface, and attest Kueue v0.18's
+  phase-specific role-hash, PodSet, optional workload, mandatory exact queue
+  outputs, and narrow response allowlists. The all-containers-Running wait
+  returns exact Pod UIDs; fresh-read and admitted-only reattest those same
+  names and UIDs after the passive wait. Do not infer this strict contract from
+  the accidental presence of individual projection fields.
 - Reject the Deployment path in required mode.
 - Extend config, request-sanitization, template, and provisioning unit tests.
 - Update the Kueue example documentation.
@@ -363,9 +447,15 @@ the Kueue preemption smoke test passes.
   Kueue webhook auto-fix behavior.
 - Provision an operator-owned inference admission domain.  The referenced
   ClusterQueue must already select the inference namespace and implement the
-  reviewed quota/cohort/preemption policy; the module must not infer it.
-- Retain the existing admission-enforced `-1000` Kubernetes PriorityClass as
-  both Pod and Kueue Workload priority for the initial Boltz rollout.
+  reviewed quota/cohort/preemption policy; its name must be a DNS-1123 label so
+  Kueue can publish the exact admission output; the module must not infer it.
+- Enable and verify Kueue's `AssignQueueLabelsForPods` feature. SkyPilot needs
+  its exact LocalQueue/ClusterQueue output pair to bind admission to the queue
+  preflight and fails closed when the pair is absent.
+- Retain the existing admission-enforced `-1000` Kubernetes PriorityClass for
+  Pods, and provision and freeze a distinct server-owned
+  WorkloadPriorityClass with the reviewed lower-priority semantics for the
+  initial Boltz rollout.
 - Connect inference and research to a tested preemption domain.
 - Expand queue-label admission to non-Pod workload kinds where each cluster's
   Kueue installation supports them.
@@ -373,15 +463,17 @@ the Kueue preemption smoke test passes.
   `require_managed: true` may be retained as an explicit assertion.
 - Keep the shared research placement disabled until the rollout gates pass.
 
-### Phase 3: canary and activation
+### Phase 3: activation and non-compute verification
 
-- Launch a one-node low-priority inference canary and inspect its Pod and
-  generated Workload.
-- Exercise queued multi-node admission and research-over-inference preemption.
-- Re-enable one bounded SkyServe placement tier, observe it through scale-up,
-  preemption recovery, and scale-to-zero, then expand.
+- Inspect the existing managed inference and research evidence against the
+  exact Pod/Workload contract before activation. If existing evidence cannot
+  prove reclaim, keep activation closed until a separately authorized Kueue
+  qualification supplies it; this rollout creates no GPU or BCL canary.
+- Re-enable the intended SkyServe placement only after the immutable image,
+  queue policy, and policy-plugin identity are proven, then observe ordinary
+  traffic, preemption recovery, and scale-to-zero through existing workload.
 
-## Deployment and rollback
+## Deployment and fix forward
 
 SkyPilot code can deploy before cluster activation because placements without
 an effective queue remain unchanged.  Cluster resources and server-owned queue
@@ -401,9 +493,12 @@ For module-managed partitions, apply ordering is:
    `Active=True`, and installs exact-name read RBAC plus exact-queue Pod
    admission.  Import an existing LocalQueue only if it already references the
    intended ClusterQueue; drain and replace rather than retarget it in place.
-4. Verify the module output and a direct authorization check.
+4. Verify the module output, `AssignQueueLabelsForPods`, and a direct
+   authorization check.
 5. Add the identical queue name to the server-owned inference workspace.
-6. Run the canary and only then re-enable shared placement.
+6. Verify the immutable version/Pod/Workload evidence without launching a
+   synthetic workload, then re-enable shared placement only when the reclaim
+   contract is already proven.
 
 An unused LocalQueue does not affect existing Pods, but the exact-queue
 admission binding deliberately does.  The drain in step 2 is therefore a hard
@@ -415,22 +510,23 @@ assertion) on a context with existing ordinary Pods intentionally makes those
 Pods ineligible for adoption.  Operators should drain or down old replicas
 before activation, then let SkyServe recreate them under the new contract.
 
-Rollback order is the reverse:
-
-1. Disable the shared inference placement or scale the service to zero.
-2. Remove the queue from the server-owned placement if SkyPilot must
-   temporarily return to unqueued behavior.  Setting `require_managed: false`
-   alone does not bypass management for a queued placement.
-3. Remove the partition's `kueue` object and apply the spoke stack while the
-   referenced ClusterQueue and Kueue CRDs still exist.  This destroys the
-   module-owned binding, policy, LocalQueue, and extra RBAC cleanly.
-4. Only then remove the separately owned ClusterQueue or uninstall Kueue.
-
-Do not remove Kueue policy while strict mode and the shared placement remain
-enabled.  Strict mode would safely stop new Pods, but the service would be
-unavailable and continuously attempt recovery.
+There is no supported demotion to unmanaged placement after activation. If a
+defect appears, stop new shared inference placement or scale the service to
+zero, preserve the Kueue objects and durable evidence, and deploy a corrected
+full-fleet image or policy forward. Do not remove queue policy while strict
+placement remains enabled: strict mode would safely stop new Pods, but the
+service would be unavailable and continuously attempt recovery.
 
 ## Verification evidence and test plan
+
+The protocol-v2 lifecycle hardening was verified on 2026-08-13 with a focused
+`uv run --no-sync pytest` selection covering post-wait, required-Kueue,
+adoption, and immediate-worker-attestation cases. It passed the wrong
+ClusterQueue, still-gated, same-name replacement UID, and non-Running negative
+regressions, in addition to the accepted lifecycle. The complete
+`tests/unit_tests/kubernetes/test_provision.py` file subsequently exited
+successfully. These results are new evidence and are not included in the
+historical 197-test count below.
 
 The reusable module and expanded runtime drift contract were verified on
 2026-08-10:
@@ -529,9 +625,9 @@ a Workload.  An otherwise identical pre-gated Pod without a queue label received
 no managed label, finalizer, or Workload and remained scheduling-gated.  This
 validates both the positive attestation and safe negative path used by Phase 1.
 The temporary attestation resources were also deleted and verified absent.  The
-remaining production smoke test below is a Phase 2/3 activation gate for the
-new strict SkyPilot path and cross-priority eviction, not an incident-attribution
-gate.
+remaining production qualification below is a Phase 2/3 activation gate for
+the new strict SkyPilot path and cross-priority eviction, not an incident-
+attribution gate.
 
 Automated tests must prove:
 
@@ -548,14 +644,27 @@ Automated tests must prove:
   request-provided queues and enforce them strictly;
 - system-controller queue removal also disables strict mode;
 - rendered strict Pods carry the queue, pod group, group count, gate, and
-  WorkloadPriorityClass;
-- a Kueue-mutated create response succeeds;
-- an unmutated or wrong-queue response is deleted and rejected;
+  `retriable-in-group=false`, and WorkloadPriorityClass;
+- a Kueue-mutated create response succeeds only with the exact role-hash and
+  pre-admission metadata phase;
+- an unmutated, wrong-queue, malformed-role-hash, competing-group, unknown-
+  metadata, or unknown-gate response is deleted and rejected;
 - the AppArmor retry and terminating-Pod retry cannot bypass attestation;
-- existing non-compliant Pods are not adopted; and
+- existing gated pre-admission Pods and ungated admitted Pods with
+  `podset=role-hash` plus the exact local/cluster queue output pair are adopted;
+  optional TAS workload is accepted only when exact; an ungated finalizer-only
+  Pod, an admitted Pod without queue outputs, a label-only
+  Pod, or any other phase mismatch is deleted rather than adopted; and
+- post-wait success requires the exact UID observed with all containers
+  Running, a fresh object still in `Running`, no admission gate, and the
+  complete admitted PodSet/queue binding, exact projected scheduler, non-empty
+  `nodeName`, and a fresh exact Node with the projected accelerator label; a
+  gated object, same-name replacement, unbound/wrong-node object, alternate
+  scheduler, or non-Running object is deleted and rejected; and
 - required mode rejects Deployment-owned Pods.
 
-Production smoke test, with exact namespace, queue, and classes substituted:
+Production non-compute inspection, with exact namespace, queue, and classes
+substituted:
 
 ```bash
 kubectl -n <inference-ns> get pod <replica-pod> -o yaml
@@ -563,18 +672,18 @@ kubectl -n <inference-ns> get workload -l kueue.x-k8s.io/queue-name=<queue> -o y
 kubectl get clusterqueue <cluster-queue> -o yaml
 ```
 
-The replica Pod must show `managed=true`, the expected queue and priority
-labels, and no admission gate after admission.  Its Workload must show the
-expected LocalQueue, ClusterQueue, priority, admitted quota, and full pod-group
-cardinality.
+The replica Pod must show `managed=true`, the expected queue, group, priority,
+role-hash, and `podset=role-hash` binding, and no admission gate after
+admission. Its Workload must show the expected LocalQueue, ClusterQueue,
+priority, admitted quota, and full pod-group cardinality.
 
-Then consume idle capacity with low-priority inference and launch a higher
-priority four-node research gang workload.  The pass condition is that Kueue
-evicts enough inference Workloads and admits the research workload without a
-Kueue restart, manual Pod deletion, or namespace drain.  SkyServe may recreate
-the evicted replica, but it must remain NotAdmitted while research holds quota
-and must not thrash.  Finally scale the service to zero and verify that no
-inference Pods, Workloads, or stuck Kueue finalizers remain.
+The production rollout does not create a GPU/BCL canary. Existing deployment
+evidence, or a separately authorized Kueue-policy qualification, must show that
+higher-priority research evicts enough low-priority inference Workloads and is
+admitted without a Kueue restart, manual Pod deletion, or namespace drain.
+SkyServe recreation must remain NotAdmitted while research holds quota and
+must not thrash. Existing scale-to-zero evidence must show no inference Pods,
+Workloads, or stuck Kueue finalizers remain.
 
 ## Open gates
 
@@ -600,8 +709,10 @@ inference Pods, Workloads, or stuck Kueue finalizers remain.
   installation; Phoenix already ships such a policy behind its own namespace
   label, while east1 needs an independently owned equivalent if non-Pod clients
   are admitted there.
-- The research-over-inference preemption smoke test must pass before Phoenix is
-  re-enabled for SkyServe.
+- The research-over-inference reclaim contract must be proven from existing
+  deployment evidence or a separately authorized Kueue-policy qualification
+  before Phoenix is re-enabled for SkyServe. This feature rollout itself does
+  not launch a capacity-consuming canary.
 
 ## Alternatives considered
 
@@ -627,9 +738,12 @@ the label in place while the ordinary scheduler runs the Pod.
 ### Check for a Workload after Pod creation
 
 Rejected as the primary boundary.  It adds a controller race and leaves a
-window in which an ungated Pod can schedule.  Create-response attestation plus
-a pre-added scheduling gate is synchronous and fail closed.  Workload checks
-remain valuable operational verification.
+window in which an ungated Pod can schedule. Create-response attestation plus
+a pre-added scheduling gate is synchronous and fail closed before admission.
+A fresh post-wait Pod attestation then binds the admitted Pod to the exact
+preflight ClusterQueue before provisioning can succeed. Workload checks remain
+valuable operational verification but are not the runtime correctness
+boundary.
 
 ### Let Kueue retain a gated Pod when the LocalQueue is missing
 

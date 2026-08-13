@@ -220,6 +220,7 @@ class InitializeRequestAuthUserMiddleware(
         request.state.auth_user = None
         request.state.anonymous_user = False
         request.state.controller_origin = None
+        request.state.managed_job_origin = None
         request.state.csp_nonce = None
         return await call_next(request)
 

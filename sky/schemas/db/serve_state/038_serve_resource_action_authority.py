@@ -484,11 +484,42 @@ def _verify_worker_cohort_serve033_catalog(bind: sa.engine.Connection) -> None:
 
 
 def _common_runtime_table(table_name: str) -> sa.Table:
-    return {
+    runtime = {
         _SERVICES: serve_state_schema.services_table,
         _VERSION_SPECS: serve_state_schema.version_specs_table,
         _REPLICAS: serve_state_schema.replicas_table,
     }[table_name]
+    # These columns are owned by the frozen Serve042 migration.  Project them
+    # out of Serve038's historical relation contract so a fresh install does
+    # not require future fields before the revision that creates them.  Keep
+    # this list named and closed: arbitrary runtime metadata additions must
+    # continue to fail Serve038's exact catalog verification.
+    serve042_owned_columns = {
+        _SERVICES: frozenset({
+            'controller_incarnation',
+            'controller_owner_epoch',
+            'ordinary_launch_binding_capable',
+            'ordinary_launch_binding_mode',
+            'ordinary_launch_binding_epoch',
+        }),
+        _REPLICAS: frozenset({'ordinary_launch_association_id'}),
+    }.get(table_name, frozenset())
+    if not serve042_owned_columns:
+        return runtime
+    projected_metadata = sa.MetaData()
+    # ``to_metadata()`` preserves string-declared foreign keys; copy all
+    # referenced relations into the private metadata so their targets remain
+    # resolvable while the projected common table is verified.
+    for foreign_key in runtime.foreign_keys:
+        referenced_table = foreign_key.column.table
+        if referenced_table.name not in projected_metadata.tables:
+            referenced_table.to_metadata(projected_metadata)
+    projected = runtime.to_metadata(projected_metadata)
+    for column_name in serve042_owned_columns:
+        column = projected.c.get(column_name)
+        if column is not None:
+            projected._columns.remove(column)
+    return projected
 
 
 def _common_revision_038_table(table_name: str,

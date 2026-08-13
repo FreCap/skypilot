@@ -829,9 +829,62 @@ def test_spot_jobs_database_targets_latest_migration(tmp_path, monkeypatch):
 
     upgrade.assert_called_once_with(engine,
                                     migration_utils.SPOT_JOBS_DB_NAME,
-                                    '027',
+                                    '028',
                                     mode='auto')
-    assert migration_utils.SPOT_JOBS_VERSION == '027'
+    assert migration_utils.SPOT_JOBS_VERSION == '028'
+    engine.dispose()
+
+
+def test_schema_028_adds_controller_attempt_quiescence_columns(
+        tmp_path, monkeypatch):
+    engine = sqlalchemy.create_engine(
+        f'sqlite:///{tmp_path / "controller-slots.db"}')
+    old_metadata = sqlalchemy.MetaData()
+    old_job_info = sqlalchemy.Table(
+        'job_info', old_metadata,
+        sqlalchemy.Column('spot_job_id',
+                          sqlalchemy.Integer,
+                          primary_key=True,
+                          autoincrement=True),
+        sqlalchemy.Column('controller_instance_id', sqlalchemy.Text),
+        sqlalchemy.Column('controller_generation', sqlalchemy.BigInteger))
+    sqlalchemy.Table(
+        'alembic_version_spot_jobs_db', old_metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True))
+    old_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(old_job_info.insert().values(spot_job_id=1))
+        connection.execute(
+            sqlalchemy.text(
+                'INSERT INTO alembic_version_spot_jobs_db (version_num) '
+                "VALUES ('027')"))
+
+    @contextlib.contextmanager
+    def unlocked(_section):
+        yield
+
+    monkeypatch.setattr(migration_utils, 'db_lock', unlocked)
+    migration_utils.safe_alembic_upgrade(engine,
+                                         migration_utils.SPOT_JOBS_DB_NAME,
+                                         '028')
+
+    columns = {
+        column['name']: column
+        for column in sqlalchemy.inspect(engine).get_columns('job_info')
+    }
+    assert columns['controller_slot_id']['nullable']
+    assert columns['controller_slot_attempt']['nullable']
+    assert not columns['controller_slot_quiescing']['nullable']
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.text('SELECT controller_slot_quiescing FROM job_info '
+                            'WHERE spot_job_id = 1')).scalar_one() == 0
+        revision = connection.execute(
+            sqlalchemy.text('SELECT version_num FROM '
+                            'alembic_version_spot_jobs_db')).scalar_one()
+    assert revision == '028'
     engine.dispose()
 
 

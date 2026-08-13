@@ -417,7 +417,8 @@ def _claim(backend, request_id):
     assert item.request_id == request_id
     assert item.claim_token is not None
     assert backend.try_mark_running(item.request_id, 1234,
-                                    item.execution_generation, item.claim_token)
+                                    item.execution_generation, item.claim_token,
+                                    424242)
     return item
 
 

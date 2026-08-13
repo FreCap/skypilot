@@ -1436,6 +1436,8 @@ def _project_bound_ordinary_launch_for_teardown(
         info.replica_record_id,
         projection.context.association_id,
         info,
+        provider_launch_succeeded=(not projection.pre_effect_terminal and
+                                   projection.status.value == 'SUCCEEDED'),
         paid_capacity_pool_key=projection.paid_capacity_pool_key,
         paid_capacity_outcome=paid_outcome)
 

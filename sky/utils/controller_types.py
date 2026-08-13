@@ -9,9 +9,9 @@ import colorama
 
 from sky import skypilot_config
 from sky.jobs import constants as managed_job_constants
-from sky.serve import constants as serve_constants
 from sky.utils import common
 from sky.utils import common_utils
+from sky.utils import controller_constants
 
 
 @dataclasses.dataclass
@@ -130,8 +130,10 @@ class Controllers(enum.Enum):
         default_hint_if_non_existent='No live services.',
         connection_error_hint=(
             'Failed to connect to serve controller, please try again later.'),
-        default_resources_config=serve_constants.CONTROLLER_RESOURCES,
-        default_autostop_config=serve_constants.CONTROLLER_AUTOSTOP)
+        default_resources_config=(
+            controller_constants.SERVE_CONTROLLER_RESOURCES),
+        default_autostop_config=(
+            controller_constants.SERVE_CONTROLLER_AUTOSTOP))
 
     @classmethod
     def from_name(cls,

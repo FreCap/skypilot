@@ -1223,6 +1223,7 @@ class TestBoundOrdinaryLaunchManagerIntegration:
                 None, mock.sentinel.connection, projection)
 
         assert info.status == replica_managers.serve_state.ReplicaStatus.PENDING
+        assert update.call_args.kwargs['provider_launch_succeeded'] is False
         assert update.call_args.kwargs['paid_capacity_pool_key'] == 'pool-a'
         assert (update.call_args.kwargs['paid_capacity_outcome'] ==
                 paid_capacity.LaunchOutcome.OTHER_FAILURE)
@@ -1283,11 +1284,12 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         with mock.patch.object(
                 replica_managers.serve_state,
                 'update_replica_for_bound_ordinary_launch_in_transaction',
-                return_value=True):
+                return_value=True) as update:
             assert manager._project_bound_ordinary_launch(
                 None, mock.sentinel.connection, projection)
         assert (info.status_property.sky_launch_status ==
                 common_utils.ProcessStatus.INTERRUPTED)
+        assert update.call_args.kwargs['provider_launch_succeeded'] is True
 
     def test_exact_success_decoder_requires_matching_vm_handle(self):
         request = mock.Mock()
@@ -1397,11 +1399,12 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         with mock.patch.object(
                 replica_managers.serve_state,
                 'update_replica_for_bound_ordinary_launch_in_transaction',
-                return_value=True):
+                return_value=True) as update:
             assert manager._project_bound_ordinary_launch(
                 None, mock.sentinel.connection, projection)
         assert (info.status_property.sky_launch_status ==
                 common_utils.ProcessStatus.INTERRUPTED)
+        assert update.call_args.kwargs['provider_launch_succeeded'] is False
 
     def test_pre_effect_cancel_releases_paid_claim(self):
         settle_claim = (request_postgres.

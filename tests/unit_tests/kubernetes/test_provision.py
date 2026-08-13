@@ -1,5 +1,6 @@
 """Tests for Kubernetes provision."""
 
+import contextlib
 import datetime
 import json
 import multiprocessing
@@ -11,6 +12,8 @@ import types
 from unittest import mock
 
 import filelock
+from packaging import requirements as packaging_requirements
+from packaging import version as packaging_version
 import pytest
 
 from sky import clouds
@@ -25,7 +28,34 @@ from sky.provision.kubernetes import instance
 from sky.provision.kubernetes import pod_scheduling
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.instance import logger
+from sky.setup_files import dependencies
 from sky.utils import subprocess_utils
+
+_VALID_KUEUE_ROLE_HASH = '4cb13f91'
+
+
+def test_kubernetes_client_models_cover_strict_projection_surfaces():
+    """The dependency floor must preserve every typed attestation surface."""
+    client_requirements = [
+        packaging_requirements.Requirement(requirement)
+        for requirement in dependencies.kubernetes_dependencies
+        if packaging_requirements.Requirement(requirement).name == 'kubernetes'
+    ]
+    assert len(client_requirements) == 1
+    client_specifier = client_requirements[0].specifier
+    assert packaging_version.Version('31.0.0') not in client_specifier
+    assert packaging_version.Version('32.0.0') not in client_specifier
+    assert packaging_version.Version('32.0.1') in client_specifier
+
+    pod_spec_fields = kubernetes.kubernetes.client.V1PodSpec.openapi_types
+    assert {
+        'scheduling_gates',
+        'resource_claims',
+        'resources',
+    }.issubset(pod_spec_fields)
+    resource_fields = (
+        kubernetes.kubernetes.client.V1ResourceRequirements.openapi_types)
+    assert 'claims' in resource_fields
 
 
 def _remove_colorama_escape_codes(error_output):
@@ -60,6 +90,108 @@ def _fake_pod(name):
     return pod
 
 
+def _required_kueue_post_create_attestation(namespace,
+                                            queue,
+                                            workload_priority=None,
+                                            *,
+                                            pod_group='service-replica',
+                                            pod_group_total_count=1):
+
+    def attest(pod):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            pod,
+            namespace,
+            None,
+            queue,
+            pod_group,
+            pod_group_total_count,
+            workload_priority,
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            defer_cleanup=True)
+
+    return attest
+
+
+def _set_required_kueue_group_identity(pod,
+                                       pod_group='service-replica',
+                                       pod_group_total_count=1,
+                                       role_hash=_VALID_KUEUE_ROLE_HASH):
+    pod.metadata.labels[k8s_constants.KUEUE_POD_GROUP_LABEL] = pod_group
+    pod.metadata.annotations = {
+        k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION:
+            str(pod_group_total_count),
+        k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION: 'false',
+        k8s_constants.KUEUE_ROLE_HASH_ANNOTATION: role_hash,
+    }
+
+
+def _set_admitted_kueue_identity(pod,
+                                 *,
+                                 pod_group='service-replica',
+                                 queue='inference',
+                                 cluster_queue='inference-reserved'):
+    role_hash = pod.metadata.annotations[
+        k8s_constants.KUEUE_ROLE_HASH_ANNOTATION]
+    pod.metadata.annotations[
+        k8s_constants.KUEUE_WORKLOAD_ANNOTATION] = pod_group
+    pod.metadata.labels[k8s_constants.KUEUE_PODSET_LABEL] = role_hash
+    pod.metadata.labels[k8s_constants.KUEUE_LOCAL_QUEUE_LABEL] = queue
+    pod.metadata.labels[k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL] = cluster_queue
+
+
+_INVALID_KUEUE_ROLE_HASHES = (
+    '',
+    '4cb13f910',
+    '4CB13F91',
+    'nothex00',
+    12345678,
+)
+
+_STRICT_KUEUE_CONTRACT_MUTATIONS = (
+    'wrong_group_label',
+    'missing_group_label',
+    'wrong_total_count',
+    'missing_total_count',
+    'retriable_group',
+    'missing_retriable_flag',
+    'competing_group_annotation',
+    'unknown_kueue_label',
+    'unknown_kueue_annotation',
+    'fast_admission_annotation',
+    'external_scheduling_gate',
+)
+
+
+def _mutate_strict_kueue_contract(pod, mutation):
+    labels = pod.metadata.labels
+    annotations = pod.metadata.annotations
+    if mutation == 'wrong_group_label':
+        labels[k8s_constants.KUEUE_POD_GROUP_LABEL] = 'another-group'
+    elif mutation == 'missing_group_label':
+        labels.pop(k8s_constants.KUEUE_POD_GROUP_LABEL)
+    elif mutation == 'wrong_total_count':
+        annotations[k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION] = '2'
+    elif mutation == 'missing_total_count':
+        annotations.pop(k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION)
+    elif mutation == 'retriable_group':
+        annotations[k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION] = 'true'
+    elif mutation == 'missing_retriable_flag':
+        annotations.pop(k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION)
+    elif mutation == 'competing_group_annotation':
+        annotations[k8s_constants.KUEUE_POD_GROUP_LABEL] = 'annotation-group'
+    elif mutation == 'unknown_kueue_label':
+        labels['kueue.x-k8s.io/future-admission-mode'] = 'enabled'
+    elif mutation == 'unknown_kueue_annotation':
+        annotations['kueue.x-k8s.io/future-admission-mode'] = 'enabled'
+    elif mutation == 'fast_admission_annotation':
+        annotations['kueue.x-k8s.io/pod-group-fast-admission'] = 'true'
+    else:
+        assert mutation == 'external_scheduling_gate'
+        pod.spec.scheduling_gates.append(
+            types.SimpleNamespace(name='example.com/external-admission'))
+
+
 def test_cluster_name_annotation_collision_fails_closed():
     pod = mock.MagicMock()
     pod.metadata.name = 'short-name-head'
@@ -76,7 +208,11 @@ def test_cluster_name_annotation_collision_fails_closed():
         )
 
 
-def _patch_create_pods_k8s_boundary(monkeypatch, existing_pods, head_name):
+def _patch_create_pods_k8s_boundary(monkeypatch,
+                                    existing_pods,
+                                    head_name,
+                                    *,
+                                    stub_post_wait_attestation=True):
     """Stub the Kubernetes-touching calls _create_pods makes.
 
     Leaves the to_start_count arithmetic and per-pod skip logic to run for
@@ -100,11 +236,18 @@ def _patch_create_pods_k8s_boundary(monkeypatch, existing_pods, head_name):
                         lambda *a, **k: False)
     monkeypatch.setattr(instance, '_wait_for_pods_to_schedule',
                         lambda *a, **k: None)
-    monkeypatch.setattr(instance, '_wait_for_pods_to_run', lambda *a, **k: None)
+    monkeypatch.setattr(
+        instance, '_wait_for_pods_to_run',
+        lambda _namespace, _context, _cluster_name, pods:
+        {pod.metadata.name: f'uid-{pod.metadata.name}' for pod in pods})
     monkeypatch.setattr(instance, 'is_high_availability_cluster_by_kubectl',
                         lambda *a, **k: False)
     monkeypatch.setattr(instance, '_preflight_required_kueue_local_queue',
-                        lambda *a, **k: None)
+                        lambda *a, **k: 'inference-reserved')
+    if stub_post_wait_attestation:
+        monkeypatch.setattr(instance,
+                            '_read_and_attest_pod_with_provider_guard',
+                            lambda *a, **k: None)
 
 
 def test_create_pods_is_idempotent_when_all_pods_exist(monkeypatch):
@@ -165,7 +308,13 @@ def test_create_pods_resolves_placement_once_before_finalizing_each_pod(
         finalizer_calls.append(kwargs['pod_name'])
         return original_finalize(*args, **kwargs)
 
-    def create_pod(_namespace, pod_spec, _context):
+    def create_pod(_namespace,
+                   pod_spec,
+                   _context,
+                   post_create_attestation=None,
+                   provider_effect_guard_factory=None):
+        assert post_create_attestation is None
+        assert provider_effect_guard_factory is None
         created_specs.append(pod_spec)
         pod = types.SimpleNamespace()
         pod.metadata = types.SimpleNamespace(
@@ -203,7 +352,7 @@ def test_create_pods_resolves_placement_once_before_finalizing_each_pod(
     assert record.created_instance_ids == finalizer_calls
 
 
-def test_projected_worker_uses_frozen_gpu_resource_key_through_finalizer(
+def test_sidecar_first_projected_worker_uses_frozen_gpu_runtime_contract(
         monkeypatch):
     cluster_on_cloud = 'test-cluster-frozen-gpu-key'
     _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
@@ -219,13 +368,20 @@ def test_projected_worker_uses_frozen_gpu_resource_key_through_finalizer(
         finalizer_calls.append(kwargs)
         return original_finalize(*args, **kwargs)
 
-    def create_pod(_namespace, pod_spec, _context):
+    def create_pod(_namespace,
+                   pod_spec,
+                   _context,
+                   post_create_attestation=None,
+                   provider_effect_guard_factory=None):
+        assert provider_effect_guard_factory is None
         pod = types.SimpleNamespace()
         pod.metadata = types.SimpleNamespace(
             name=pod_spec['metadata']['name'],
             labels=pod_spec['metadata']['labels'],
         )
         pod.status = types.SimpleNamespace(phase='Pending')
+        if post_create_attestation is not None:
+            post_create_attestation(pod)
         return pod
 
     monkeypatch.setattr(instance.pod_spec_lib, 'finalize_pod_spec',
@@ -260,17 +416,23 @@ def test_projected_worker_uses_frozen_gpu_resource_key_through_finalizer(
                 },
             },
         },
-        'containers': [{
-            'name': 'ray-node',
-            'resources': {
-                'requests': {
-                    'nvidia.com/gpu': 1,
-                },
-                'limits': {
-                    'nvidia.com/gpu': 1,
+        'containers': [
+            {
+                'name': 'metrics-sidecar',
+                'resources': {},
+            },
+            {
+                'name': 'ray-node',
+                'resources': {
+                    'requests': {
+                        'nvidia.com/gpu': 1,
+                    },
+                    'limits': {
+                        'nvidia.com/gpu': 1,
+                    },
                 },
             },
-        }],
+        ],
     })
 
     instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
@@ -296,8 +458,13 @@ def test_create_pods_enforces_required_kueue_after_finalization(monkeypatch):
                         lambda fn, items, *_args: [fn(i) for i in items])
     created_specs = []
 
-    def create_pod(_namespace, pod_spec, _context, expected_kueue_queue=None):
-        created_specs.append((pod_spec, expected_kueue_queue))
+    def create_pod(_namespace,
+                   pod_spec,
+                   _context,
+                   post_create_attestation=None,
+                   provider_effect_guard_factory=None):
+        assert provider_effect_guard_factory is None
+        created_specs.append((pod_spec, post_create_attestation))
         pod = types.SimpleNamespace()
         pod.metadata = types.SimpleNamespace(
             name=pod_spec['metadata']['name'],
@@ -305,8 +472,19 @@ def test_create_pods_enforces_required_kueue_after_finalization(monkeypatch):
                 **pod_spec['metadata']['labels'],
                 k8s_constants.KUEUE_MANAGED_KEY: 'true',
             },
+            annotations={
+                **pod_spec['metadata']['annotations'],
+                k8s_constants.KUEUE_ROLE_HASH_ANNOTATION: _VALID_KUEUE_ROLE_HASH,
+            },
+            finalizers=[],
         )
+        pod.spec = types.SimpleNamespace(scheduling_gates=[
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ])
         pod.status = types.SimpleNamespace(phase='Pending')
+        assert post_create_attestation is not None
+        post_create_attestation(pod)
         return pod
 
     monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
@@ -332,8 +510,8 @@ def test_create_pods_enforces_required_kueue_after_finalization(monkeypatch):
 
     assert record.created_instance_ids == [f'{cluster_on_cloud}-head']
     assert len(created_specs) == 1
-    pod_spec, expected_queue = created_specs[0]
-    assert expected_queue == 'inference'
+    pod_spec, post_create_attestation = created_specs[0]
+    assert post_create_attestation is not None
     labels = pod_spec['metadata']['labels']
     assert labels[k8s_constants.KUEUE_QUEUE_LABEL] == 'inference'
     assert labels[k8s_constants.KUEUE_POD_GROUP_LABEL] == cluster_on_cloud
@@ -343,6 +521,439 @@ def test_create_pods_enforces_required_kueue_after_finalization(monkeypatch):
     assert pod_spec['spec']['schedulingGates'] == [{
         'name': k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
     }]
+
+
+def test_parallel_create_attests_each_pod_before_sibling_batch_returns(
+        monkeypatch):
+    """A schedulable Pod is fully attested while a sibling create is blocked."""
+    cluster_on_cloud = 'test-cluster-immediate-worker-attestation'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance.volume, 'check_pvc_usage_for_pod',
+                        lambda *_args, **_kwargs: None)
+
+    events = []
+    head_fully_attested = threading.Event()
+
+    def record_attestation(kind):
+
+        def record(pod, *_args, **_kwargs):
+            events.append((pod.metadata.name, kind))
+            if (kind == 'accelerator' and pod.metadata.name.endswith('-head')):
+                head_fully_attested.set()
+
+        return record
+
+    monkeypatch.setattr(instance, '_attest_required_kueue_pod',
+                        record_attestation('kueue'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_priority_class',
+                        record_attestation('priority'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_service_account',
+                        record_attestation('service-account'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_accelerator_scheduling',
+                        record_attestation('accelerator'))
+    monkeypatch.setattr(instance, '_attest_serve_worker_scheduler_and_binding',
+                        record_attestation('scheduler'))
+
+    def create_pod(_namespace,
+                   pod_spec,
+                   _context,
+                   post_create_attestation=None,
+                   provider_effect_guard_factory=None):
+        assert provider_effect_guard_factory is None
+        name = pod_spec['metadata']['name']
+        events.append((name, 'api-response'))
+        if name.endswith('-worker1'):
+            assert head_fully_attested.wait(timeout=5), (
+                'parallel create joined before the earlier Pod was attested')
+        pod = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                name=name, labels=pod_spec['metadata']['labels']),
+            status=types.SimpleNamespace(phase='Pending'))
+        assert post_create_attestation is not None
+        post_create_attestation(pod)
+        events.append((name, 'create-return'))
+        return pod
+
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+
+    config = _make_provision_config(count=2)
+    config.provider_config.update({
+        'kueue_local_queue_name': 'inference',
+        'kueue_workload_priority_class_name': 'inference-low',
+        'serve_worker_projection_protocol_version': 2,
+        'serve_worker_expected_priority_class_name': 'inference-low',
+        'serve_worker_expected_priority_value': -1000,
+        'serve_worker_expected_preemption_policy': 'Never',
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+    })
+
+    record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
+                                   config)
+
+    head_name = f'{cluster_on_cloud}-head'
+    assert record.head_instance_id == head_name
+    assert [kind for name, kind in events if name == head_name] == [
+        'api-response', 'kueue', 'priority', 'service-account', 'accelerator',
+        'scheduler', 'create-return'
+    ]
+
+
+def test_provider_effect_guard_covers_create_attestation_not_passive_waits(
+        monkeypatch):
+    """Provider authority is held only through immediate create effects."""
+    cluster_on_cloud = 'test-cluster-provider-effect-guard'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance.volume, 'check_pvc_usage_for_pod',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+
+    events = []
+    guard_active = False
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal guard_active
+        assert not guard_active
+        guard_active = True
+        events.append('guard-enter')
+        try:
+            yield
+        finally:
+            events.append('guard-exit')
+            guard_active = False
+
+    def attest_service_account(*_args, **_kwargs):
+        assert guard_active
+        events.append('attest')
+
+    def create_pod(_namespace,
+                   pod_spec,
+                   _context,
+                   post_create_attestation=None,
+                   provider_effect_guard_factory=None):
+        assert provider_effect_guard_factory is provider_effect_guard
+        with provider_effect_guard_factory():
+            assert guard_active
+            events.append('create')
+            pod = types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name=pod_spec['metadata']['name'],
+                    labels=pod_spec['metadata']['labels']),
+                status=types.SimpleNamespace(phase='Pending'))
+            assert post_create_attestation is not None
+            post_create_attestation(pod)
+            assert guard_active
+            events.append('create-return')
+            return pod
+
+    def wait_for_schedule(*_args, **_kwargs):
+        assert not guard_active
+        events.append('schedule-wait')
+
+    def wait_for_run(_namespace, _context, _cluster_name, pods):
+        assert not guard_active
+        events.append('running-wait')
+        return {pod.metadata.name: f'uid-{pod.metadata.name}' for pod in pods}
+
+    monkeypatch.setattr(instance, '_attest_serve_worker_service_account',
+                        attest_service_account)
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+    monkeypatch.setattr(instance, '_wait_for_pods_to_schedule',
+                        wait_for_schedule)
+    monkeypatch.setattr(instance, '_wait_for_pods_to_run', wait_for_run)
+
+    config = _make_provision_config(count=1)
+    config.provider_config['serve_worker_expected_service_account_name'] = (
+        'inference-worker')
+    config.provider_effect_guard_factory = provider_effect_guard
+
+    record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
+                                   config)
+
+    assert record.created_instance_ids == [f'{cluster_on_cloud}-head']
+    assert events == [
+        'guard-enter', 'create', 'attest', 'create-return', 'guard-exit',
+        'schedule-wait', 'running-wait'
+    ]
+
+
+def test_apparmor_retry_reacquires_guard_and_bounds_each_create(monkeypatch):
+    forbidden = _make_api_exception(
+        422,
+        'Unprocessable Entity',
+        body=json.dumps({'message': 'FieldValueForbidden AppArmorProfile: nil'
+                        }))
+    created_pod = mock.MagicMock()
+    created_pod.metadata.name = 'replica-head'
+    core_api = mock.MagicMock()
+    active_epoch = None
+    next_epoch = 0
+    events = []
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal active_epoch, next_epoch
+        assert active_epoch is None
+        next_epoch += 1
+        active_epoch = next_epoch
+        events.append(f'guard-{active_epoch}-enter')
+        try:
+            yield
+        finally:
+            events.append(f'guard-{active_epoch}-exit')
+            active_epoch = None
+
+    def create_pod(*_args, **kwargs):
+        assert active_epoch is not None
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append(f'create-{active_epoch}')
+        if active_epoch == 1:
+            raise forbidden
+        return created_pod
+
+    core_api.create_namespaced_pod.side_effect = create_pod
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+    apparmor_key = ('container.apparmor.security.beta.kubernetes.io/'
+                    f'{k8s_constants.RAY_NODE_CONTAINER_NAME}')
+    pod_spec = {
+        'metadata': {
+            'name': 'replica-head',
+            'annotations': {
+                apparmor_key: 'unconfined'
+            },
+        },
+    }
+
+    result = instance._create_namespaced_pod_with_retries(
+        'inference-ns',
+        pod_spec,
+        None,
+        provider_effect_guard_factory=provider_effect_guard)
+
+    assert result is created_pod
+    assert events == [
+        'guard-1-enter', 'create-1', 'guard-1-exit', 'guard-2-enter',
+        'create-2', 'guard-2-exit'
+    ]
+    assert apparmor_key not in pod_spec['metadata']['annotations']
+
+
+def test_terminating_retry_guards_force_remove_and_recreate_separately(
+        monkeypatch):
+    conflict = _make_api_exception(
+        409,
+        'Conflict',
+        body=json.dumps({
+            'message': ('object is being deleted: pods "replica-head" '
+                        'already exists')
+        }))
+    created_pod = mock.MagicMock()
+    created_pod.metadata.name = 'replica-head'
+    stuck_pod = mock.MagicMock()
+    stuck_pod.metadata.deletion_timestamp = object()
+    stuck_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    core_api = mock.MagicMock()
+    active_epoch = None
+    next_epoch = 0
+    events = []
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal active_epoch, next_epoch
+        assert active_epoch is None
+        next_epoch += 1
+        active_epoch = next_epoch
+        events.append(f'guard-{active_epoch}-enter')
+        try:
+            yield
+        finally:
+            events.append(f'guard-{active_epoch}-exit')
+            active_epoch = None
+
+    def create_pod(*_args, **kwargs):
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append(f'create-{active_epoch}')
+        if active_epoch == 1:
+            raise conflict
+        return created_pod
+
+    def read_pod(*_args, **kwargs):
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append(f'read-{active_epoch}')
+        return stuck_pod
+
+    def patch_pod(*_args, **kwargs):
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append(f'patch-{active_epoch}')
+
+    def delete_pod(*_args, **kwargs):
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append(f'delete-{active_epoch}')
+
+    core_api.create_namespaced_pod.side_effect = create_pod
+    core_api.read_namespaced_pod.side_effect = read_pod
+    core_api.patch_namespaced_pod.side_effect = patch_pod
+    core_api.delete_namespaced_pod.side_effect = delete_pod
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    result = instance._create_namespaced_pod_with_retries(
+        'inference-ns', {'metadata': {
+            'name': 'replica-head'
+        }},
+        None,
+        provider_effect_guard_factory=provider_effect_guard)
+
+    assert result is created_pod
+    assert events == [
+        'guard-1-enter', 'create-1', 'guard-1-exit', 'guard-2-enter', 'read-2',
+        'patch-2', 'delete-2', 'guard-2-exit', 'guard-3-enter', 'create-3',
+        'guard-3-exit'
+    ]
+
+
+def test_identity_rejection_cleanup_reacquires_and_sleeps_without_guard(
+        monkeypatch):
+    pod = mock.MagicMock()
+    pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference-ns'
+    pod.spec.service_account_name = 'mutated-worker'
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = [
+        pod, _make_api_exception(404, 'Not Found')
+    ]
+    active_epoch = None
+    next_epoch = 0
+    events = []
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal active_epoch, next_epoch
+        assert active_epoch is None
+        next_epoch += 1
+        active_epoch = next_epoch
+        events.append(f'guard-{active_epoch}-enter')
+        try:
+            yield
+        finally:
+            events.append(f'guard-{active_epoch}-exit')
+            active_epoch = None
+
+    def create_pod(*_args, **kwargs):
+        assert active_epoch == 1
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append('create-1')
+        return pod
+
+    def attest(created_pod):
+        assert active_epoch == 1
+        events.append('attest-1')
+        instance._attest_serve_worker_service_account(created_pod,
+                                                      'inference-ns',
+                                                      None,
+                                                      'expected-worker',
+                                                      defer_cleanup=True)
+
+    def delete_pod(*_args, **_kwargs):
+        assert active_epoch in (2, 3)
+        events.append(f'delete-{active_epoch}')
+
+    def read_pod(*args, **kwargs):
+        assert active_epoch in (2, 3)
+        assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+        events.append(f'read-{active_epoch}')
+        return core_api.read_namespaced_pod_mock(*args, **kwargs)
+
+    core_api.create_namespaced_pod.side_effect = create_pod
+    core_api.delete_namespaced_pod.side_effect = delete_pod
+    core_api.read_namespaced_pod_mock = mock.Mock(
+        side_effect=[pod, _make_api_exception(404, 'Not Found')])
+    core_api.read_namespaced_pod.side_effect = read_pod
+
+    def sleep(_seconds):
+        assert active_epoch is None
+        events.append('sleep')
+
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+    monkeypatch.setattr(instance.time, 'sleep', sleep)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Its absence was confirmed'):
+        instance._create_namespaced_pod_with_retries(
+            'inference-ns', {'metadata': {
+                'name': 'replica-head'
+            }},
+            None,
+            post_create_attestation=attest,
+            provider_effect_guard_factory=provider_effect_guard)
+
+    assert events == [
+        'guard-1-enter', 'create-1', 'attest-1', 'guard-1-exit',
+        'guard-2-enter', 'delete-2', 'read-2', 'guard-2-exit', 'sleep',
+        'guard-3-enter', 'delete-3', 'read-3', 'guard-3-exit'
+    ]
+
+
+def test_identity_cleanup_guard_cancellation_stays_terminal(monkeypatch):
+    pod = mock.MagicMock()
+    pod.metadata.name = 'replica-head'
+    pod.metadata.namespace = 'inference-ns'
+    pod.spec.service_account_name = 'mutated-worker'
+    core_api = mock.MagicMock()
+    terminal = sky_exceptions.ReservedFillLaunchFenceError('authority changed')
+    guard_attempt = 0
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal guard_attempt
+        guard_attempt += 1
+        if guard_attempt == 2:
+            raise terminal
+        yield
+
+    def attest(created_pod):
+        instance._attest_serve_worker_service_account(created_pod,
+                                                      'inference-ns',
+                                                      None,
+                                                      'expected-worker',
+                                                      defer_cleanup=True)
+
+    core_api.create_namespaced_pod.return_value = pod
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(sky_exceptions.ReservedFillLaunchFenceError) as exc_info:
+        instance._create_namespaced_pod_with_retries(
+            'inference-ns', {'metadata': {
+                'name': 'replica-head'
+            }},
+            None,
+            post_create_attestation=attest,
+            provider_effect_guard_factory=provider_effect_guard)
+
+    assert exc_info.value is terminal
+    core_api.delete_namespaced_pod.assert_not_called()
 
 
 def test_create_pods_raises_on_more_pods_than_requested(monkeypatch):
@@ -362,24 +973,795 @@ def test_create_pods_raises_on_more_pods_than_requested(monkeypatch):
 
 
 def test_required_kueue_rejects_existing_unmanaged_pod(monkeypatch):
-    """Strict mode never adopts a Pod that bypassed Kueue admission."""
+    """Strict mode rejects exact labels without Kueue lifecycle proof."""
     cluster_on_cloud = 'test-cluster-required-kueue'
     head_name = f'{cluster_on_cloud}-head'
     existing_pod = _fake_pod(head_name)
+    existing_pod.status.phase = 'Running'
+    existing_pod.metadata.namespace = 'ns'
     existing_pod.metadata.labels = {
-        k8s_constants.KUEUE_QUEUE_LABEL: 'inference'
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
     }
+    _set_required_kueue_group_identity(existing_pod, cluster_on_cloud)
+    existing_pod.metadata.finalizers = []
+    existing_pod.spec.scheduling_gates = []
     existing = {head_name: existing_pod}
     _patch_create_pods_k8s_boundary(monkeypatch, existing, head_name)
 
     core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
     monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
 
     config = _make_provision_config(count=1)
     config.provider_config.update({
         'kueue_local_queue_name': 'inference',
+        'kueue_workload_priority_class_name': 'inference-low',
     })
-    with pytest.raises(config_lib.KubernetesError, match='was not admitted'):
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    core_api.delete_namespaced_pod.assert_called_once_with(
+        head_name,
+        'ns',
+        grace_period_seconds=0,
+        _request_timeout=config_lib.DELETION_TIMEOUT)
+
+
+def test_required_kueue_adopts_realistic_admitted_running_pod(monkeypatch):
+    """A Kueue v0.18 Running Pod carries a bound role and workload identity."""
+    cluster_on_cloud = 'test-cluster-required-kueue-admitted'
+    head_name = f'{cluster_on_cloud}-head'
+    existing_pod = _fake_pod(head_name)
+    existing_pod.status.phase = 'Running'
+    existing_pod.metadata.namespace = 'ns'
+    existing_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(existing_pod, cluster_on_cloud)
+    _set_admitted_kueue_identity(existing_pod,
+                                 pod_group=cluster_on_cloud,
+                                 queue='inference')
+    existing_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    existing_pod.spec.priority_class_name = 'inference-low'
+    existing_pod.spec.priority = -1000
+    existing_pod.spec.preemption_policy = 'Never'
+    existing_pod.spec.service_account_name = 'inference-worker'
+    existing_pod.spec.scheduler_name = 'default-scheduler'
+    existing_pod.spec.node_name = 'h200-node'
+    existing_pod.spec.scheduling_gates = [
+        types.SimpleNamespace(name=k8s_constants.KUEUE_TOPOLOGY_SCHEDULING_GATE)
+    ]
+    _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
+                                    head_name)
+
+    core_api = mock.MagicMock()
+    core_api.read_node.return_value = types.SimpleNamespace(
+        metadata=types.SimpleNamespace(
+            name='h200-node', labels={'nvidia.com/gpu.product': 'NVIDIA-H200'}))
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(instance, '_attest_serve_worker_accelerator_scheduling',
+                        lambda *_args, **_kwargs: None)
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'kueue_local_queue_name': 'inference',
+        'kueue_workload_priority_class_name': 'inference-low',
+        'serve_worker_projection_protocol_version': 2,
+        'serve_worker_expected_priority_class_name': 'inference-low',
+        'serve_worker_expected_priority_value': -1000,
+        'serve_worker_expected_preemption_policy': 'Never',
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+    })
+
+    record = instance._create_pods('us', cluster_on_cloud, cluster_on_cloud,
+                                   config)
+
+    assert record.head_instance_id == head_name
+    assert record.created_instance_ids == []
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+def test_required_kueue_adoption_accepts_optional_tas_workload_metadata():
+    """Kueue v0.18 can omit TAS/workload while queue outputs stay exact."""
+    pod_group = 'service-replica'
+    admitted_pod = _fake_pod('replica-head')
+    admitted_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(admitted_pod, pod_group)
+    _set_admitted_kueue_identity(admitted_pod,
+                                 pod_group=pod_group,
+                                 queue='inference')
+    admitted_pod.metadata.annotations.pop(
+        k8s_constants.KUEUE_WORKLOAD_ANNOTATION)
+    admitted_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    admitted_pod.spec.scheduling_gates = []
+
+    instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+        admitted_pod,
+        'inference-ns',
+        None,
+        'inference',
+        pod_group,
+        1,
+        'inference-low',
+        expected_cluster_queue='inference-reserved',
+        strict_projection=True,
+        expected_lifecycle='adoption')
+
+
+def _projected_scheduler_pod(*,
+                             scheduler_name='default-scheduler',
+                             node_name=None,
+                             gated=False,
+                             uid='running-uid'):
+    pod = _fake_pod('replica-head')
+    pod.metadata.namespace = 'inference-ns'
+    pod.metadata.uid = uid
+    pod.status.phase = 'Running'
+    pod.spec.scheduler_name = scheduler_name
+    pod.spec.node_name = node_name
+    pod.spec.scheduling_gates = ([] if not gated else [
+        types.SimpleNamespace(
+            name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+    ])
+    return pod
+
+
+def _projected_accelerator_node(*, name='h200-node', label_value='NVIDIA-H200'):
+    return types.SimpleNamespace(metadata=types.SimpleNamespace(
+        name=name,
+        labels={'nvidia.com/gpu.product': label_value},
+    ))
+
+
+@pytest.mark.parametrize(('mutation', 'error_match'), [
+    ('scheduler', 'scheduler'),
+    ('node_name', 'pre-admission node binding'),
+])
+def test_projected_create_response_rejects_webhook_scheduler_or_binding(
+        monkeypatch, mutation, error_match):
+    pod = _projected_scheduler_pod(
+        scheduler_name=('webhook-scheduler'
+                        if mutation == 'scheduler' else 'default-scheduler'),
+        node_name=('h200-node' if mutation == 'node_name' else None),
+        gated=True)
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError, match=error_match):
+        instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+            pod, 'inference-ns', None, 'default-scheduler',
+            'nvidia.com/gpu.product', ['NVIDIA-H200'], 'create_response')
+
+    core_api.read_node.assert_not_called()
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_projected_gated_adoption_rejects_direct_binding(monkeypatch):
+    pod = _projected_scheduler_pod(node_name='h200-node', gated=True)
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='pre-admission node binding'):
+        instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+            pod, 'inference-ns', None, 'default-scheduler',
+            'nvidia.com/gpu.product', ['NVIDIA-H200'], 'adoption')
+
+    core_api.read_node.assert_not_called()
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_projected_admitted_adoption_accepts_unbound_or_correct_node(
+        monkeypatch):
+    core_api = mock.MagicMock()
+    core_api.read_node.return_value = _projected_accelerator_node()
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+        _projected_scheduler_pod(), 'inference-ns', None, 'default-scheduler',
+        'nvidia.com/gpu.product', ['NVIDIA-H200'], 'adoption')
+    instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+        _projected_scheduler_pod(node_name='h200-node'), 'inference-ns', None,
+        'default-scheduler', 'nvidia.com/gpu.product', ['NVIDIA-H200'],
+        'adoption')
+
+    core_api.read_node.assert_called_once_with(
+        'h200-node', _request_timeout=kubernetes.API_TIMEOUT)
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.parametrize(('node_result', 'error_match'), [
+    (_projected_accelerator_node(label_value='NVIDIA-H100'),
+     'bound Node accelerator identity'),
+    (_projected_accelerator_node(name='different-node'),
+     'bound Node accelerator identity'),
+    (types.SimpleNamespace(
+        metadata=types.SimpleNamespace(name='h200-node', labels=[])),
+     'bound Node accelerator identity'),
+    (kubernetes.api_exception()(status=503), 'bound Node accelerator identity'),
+    (kubernetes.max_retry_error()(
+        None, 'https://node',
+        OSError('connection reset')), 'bound Node accelerator identity'),
+])
+def test_projected_admitted_adoption_rejects_wrong_or_unreadable_node(
+        monkeypatch, node_result, error_match):
+    pod = _projected_scheduler_pod(node_name='h200-node')
+    core_api = mock.MagicMock()
+    if isinstance(node_result, BaseException):
+        core_api.read_node.side_effect = node_result
+    else:
+        core_api.read_node.return_value = node_result
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError, match=error_match):
+        instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+            pod, 'inference-ns', None, 'default-scheduler',
+            'nvidia.com/gpu.product', ['NVIDIA-H200'], 'adoption')
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_projected_bound_node_read_preserves_authority_cancellation(
+        monkeypatch):
+    pod = _projected_scheduler_pod(node_name='h200-node')
+    core_api = mock.MagicMock()
+    core_api.read_node.side_effect = sky_exceptions.RequestCancelled(
+        'launch authority changed')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(sky_exceptions.RequestCancelled,
+                       match='launch authority changed'):
+        instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+            pod, 'inference-ns', None, 'default-scheduler',
+            'nvidia.com/gpu.product', ['NVIDIA-H200'], 'adoption')
+
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.parametrize('node_shape', ['unbound', 'wrong_label'])
+def test_projected_post_wait_rejects_unbound_or_wrong_node(
+        monkeypatch, node_shape):
+    pod = _projected_scheduler_pod(
+        node_name=None if node_shape == 'unbound' else 'h200-node')
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = [
+        pod, _make_api_exception(404, 'Not Found')
+    ]
+    core_api.read_node.return_value = _projected_accelerator_node(
+        label_value='NVIDIA-H100')
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    def attest_admitted(candidate):
+        instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+            candidate,
+            'inference-ns',
+            None,
+            'default-scheduler',
+            'nvidia.com/gpu.product', ['NVIDIA-H200'],
+            'admitted',
+            defer_cleanup=True)
+
+    with pytest.raises(
+            config_lib.KubernetesError,
+            match=('post-admission node binding' if node_shape == 'unbound' else
+                   'bound Node accelerator identity')):
+        instance._read_and_attest_pod_with_provider_guard(  # pylint: disable=protected-access
+            'replica-head', 'running-uid', 'inference-ns', None,
+            attest_admitted, None)
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_projected_post_wait_reads_correct_node_in_same_authority_guard(
+        monkeypatch):
+    pod = _projected_scheduler_pod(node_name='h200-node')
+    core_api = mock.MagicMock()
+    guard_active = False
+    events = []
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal guard_active
+        assert not guard_active
+        guard_active = True
+        events.append('guard-enter')
+        try:
+            yield
+        finally:
+            events.append('guard-exit')
+            guard_active = False
+
+    def read_pod(*_args, **_kwargs):
+        assert guard_active
+        events.append('pod-read')
+        return pod
+
+    def read_node(*_args, **_kwargs):
+        assert guard_active
+        events.append('node-read')
+        return _projected_accelerator_node()
+
+    core_api.read_namespaced_pod.side_effect = read_pod
+    core_api.read_node.side_effect = read_node
+    monkeypatch.setattr(kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    def attest_admitted(candidate):
+        instance._attest_serve_worker_scheduler_and_binding(  # pylint: disable=protected-access
+            candidate,
+            'inference-ns',
+            None,
+            'default-scheduler',
+            'nvidia.com/gpu.product', ['NVIDIA-H200'],
+            'admitted',
+            defer_cleanup=True)
+
+    instance._read_and_attest_pod_with_provider_guard(  # pylint: disable=protected-access
+        'replica-head', 'running-uid', 'inference-ns', None, attest_admitted,
+        provider_effect_guard)
+
+    assert events == ['guard-enter', 'pod-read', 'node-read', 'guard-exit']
+    core_api.delete_namespaced_pod.assert_not_called()
+
+
+def test_required_kueue_post_wait_rejects_gated_pre_admission_pod(monkeypatch):
+    """Only admitted identity, never a gated phase, can publish success."""
+    pod_group = 'service-replica'
+    gated_pod = _fake_pod('replica-head')
+    gated_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(gated_pod, pod_group)
+    gated_pod.metadata.finalizers = []
+    gated_pod.spec.scheduling_gates = [
+        types.SimpleNamespace(
+            name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+    ]
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            gated_pod,
+            'inference-ns',
+            None,
+            'inference',
+            pod_group,
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle='admitted')
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_required_kueue_adoption_rejects_missing_queue_outputs(monkeypatch):
+    """Ungated adoption must close the LocalQueue-retargeting race."""
+    pod_group = 'service-replica'
+    admitted_pod = _fake_pod('replica-head')
+    admitted_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(admitted_pod, pod_group)
+    _set_admitted_kueue_identity(admitted_pod,
+                                 pod_group=pod_group,
+                                 queue='inference')
+    admitted_pod.metadata.labels.pop(k8s_constants.KUEUE_LOCAL_QUEUE_LABEL)
+    admitted_pod.metadata.labels.pop(k8s_constants.KUEUE_CLUSTER_QUEUE_LABEL)
+    admitted_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    admitted_pod.spec.scheduling_gates = []
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            admitted_pod,
+            'inference-ns',
+            None,
+            'inference',
+            pod_group,
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle='adoption')
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_required_kueue_adoption_rejects_wrong_cluster_queue(monkeypatch):
+    """Queue-label outputs bind the exact ClusterQueue read at preflight."""
+    pod_group = 'service-replica'
+    admitted_pod = _fake_pod('replica-head')
+    admitted_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(admitted_pod, pod_group)
+    _set_admitted_kueue_identity(admitted_pod,
+                                 pod_group=pod_group,
+                                 queue='inference',
+                                 cluster_queue='another-valid-queue')
+    admitted_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    admitted_pod.spec.scheduling_gates = []
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            admitted_pod,
+            'inference-ns',
+            None,
+            'inference',
+            pod_group,
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle='adoption')
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_required_kueue_rejects_post_wait_cluster_queue_retarget(monkeypatch):
+    """Provisioning cannot succeed after admission through another queue."""
+    cluster_on_cloud = 'test-cluster-post-wait-kueue-retarget'
+    _patch_create_pods_k8s_boundary(monkeypatch, {},
+                                    None,
+                                    stub_post_wait_attestation=False)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(instance.volume, 'check_pvc_usage_for_pod',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+    active_epoch = None
+    next_epoch = 0
+    events = []
+
+    @contextlib.contextmanager
+    def provider_effect_guard():
+        nonlocal active_epoch, next_epoch
+        assert active_epoch is None
+        next_epoch += 1
+        active_epoch = next_epoch
+        events.append(f'guard-{active_epoch}-enter')
+        try:
+            yield
+        finally:
+            events.append(f'guard-{active_epoch}-exit')
+            active_epoch = None
+
+    def create_pod(_namespace,
+                   pod_spec,
+                   _context,
+                   post_create_attestation=None,
+                   provider_effect_guard_factory=None):
+        assert provider_effect_guard_factory is provider_effect_guard
+        with provider_effect_guard_factory():
+            assert active_epoch == 1
+            events.append('create-response')
+            pod = _fake_pod(pod_spec['metadata']['name'])
+            pod.metadata.namespace = 'ns'
+            pod.metadata.labels = {
+                **pod_spec['metadata']['labels'],
+                k8s_constants.KUEUE_MANAGED_KEY: 'true',
+            }
+            pod.metadata.annotations = {
+                **pod_spec['metadata']['annotations'],
+                k8s_constants.KUEUE_ROLE_HASH_ANNOTATION: _VALID_KUEUE_ROLE_HASH,
+            }
+            pod.metadata.finalizers = []
+            pod.spec.scheduling_gates = [
+                types.SimpleNamespace(
+                    name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+            ]
+            assert post_create_attestation is not None
+            post_create_attestation(pod)
+            events.append('create-attested')
+            return pod
+
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+
+    admitted_pod = _fake_pod(f'{cluster_on_cloud}-head')
+    admitted_pod.status.phase = 'Running'
+    admitted_pod.metadata.namespace = 'ns'
+    admitted_pod.metadata.uid = f'uid-{cluster_on_cloud}-head'
+    admitted_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(admitted_pod, cluster_on_cloud)
+    _set_admitted_kueue_identity(admitted_pod,
+                                 pod_group=cluster_on_cloud,
+                                 queue='inference',
+                                 cluster_queue='retargeted-queue')
+    admitted_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    admitted_pod.spec.scheduling_gates = []
+
+    core_api = mock.MagicMock()
+
+    def read_pod(*_args, **_kwargs):
+        events.append(f'read-{active_epoch}')
+        if active_epoch == 2:
+            return admitted_pod
+        assert active_epoch == 3
+        raise _make_api_exception(404, 'Not Found')
+
+    def delete_pod(*_args, **_kwargs):
+        assert active_epoch == 3
+        events.append('delete-3')
+
+    core_api.read_namespaced_pod.side_effect = read_pod
+    core_api.delete_namespaced_pod.side_effect = delete_pod
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'kueue_local_queue_name': 'inference',
+        'kueue_workload_priority_class_name': 'inference-low',
+    })
+    config.provider_effect_guard_factory = provider_effect_guard
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    core_api.delete_namespaced_pod.assert_called_once_with(
+        f'{cluster_on_cloud}-head',
+        'ns',
+        grace_period_seconds=0,
+        _request_timeout=config_lib.DELETION_TIMEOUT)
+    assert events == [
+        'guard-1-enter', 'create-response', 'create-attested', 'guard-1-exit',
+        'guard-2-enter', 'read-2', 'guard-2-exit', 'guard-3-enter', 'delete-3',
+        'read-3', 'guard-3-exit'
+    ]
+
+
+@pytest.mark.parametrize(('post_wait_shape', 'error_match'), [
+    ('gated', 'Kueue admission contract'),
+    ('replacement', 'post-wait Pod UID'),
+    ('not_running', 'post-wait Pod phase'),
+])
+def test_required_kueue_rejects_nonexact_post_wait_pod(monkeypatch,
+                                                       post_wait_shape,
+                                                       error_match):
+    """Success binds admitted state to the exact UID observed Running."""
+    pod_group = 'service-replica'
+    pod = _fake_pod('replica-head')
+    pod.metadata.namespace = 'inference-ns'
+    pod.metadata.uid = ('replacement-uid'
+                        if post_wait_shape == 'replacement' else 'running-uid')
+    pod.status.phase = 'Running'
+    pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(pod, pod_group)
+    if post_wait_shape == 'gated':
+        pod.metadata.finalizers = []
+        pod.spec.scheduling_gates = [
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ]
+    else:
+        _set_admitted_kueue_identity(pod,
+                                     pod_group=pod_group,
+                                     queue='inference')
+        pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+        pod.spec.scheduling_gates = []
+        if post_wait_shape == 'not_running':
+            pod.status.phase = 'Pending'
+
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = [
+        pod, _make_api_exception(404, 'Not Found')
+    ]
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    def attest_admitted(candidate):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            candidate,
+            'inference-ns',
+            None,
+            'inference',
+            pod_group,
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle='admitted',
+            defer_cleanup=True)
+
+    with pytest.raises(config_lib.KubernetesError, match=error_match):
+        instance._read_and_attest_pod_with_provider_guard(  # pylint: disable=protected-access
+            'replica-head', 'running-uid', 'inference-ns', None,
+            attest_admitted, None)
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_required_kueue_adoption_rejects_ungated_finalizer_only_pod(
+        monkeypatch):
+    """A pre-admission finalizer cannot prove quota admission after ungating."""
+    pod_group = 'service-replica'
+    pending_pod = _fake_pod('replica-head')
+    pending_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(pending_pod, pod_group)
+    pending_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    pending_pod.spec.scheduling_gates = []
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            pending_pod,
+            'inference-ns',
+            None,
+            'inference',
+            pod_group,
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle='adoption')
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+@pytest.mark.parametrize('role_hash', _INVALID_KUEUE_ROLE_HASHES)
+def test_required_kueue_adoption_rejects_invalid_role_hash(
+        monkeypatch, role_hash):
+    pod_group = 'service-replica'
+    admitted_pod = _fake_pod('replica-head')
+    admitted_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(admitted_pod,
+                                       pod_group,
+                                       role_hash=role_hash)
+    _set_admitted_kueue_identity(admitted_pod,
+                                 pod_group=pod_group,
+                                 queue='inference')
+    admitted_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    admitted_pod.spec.scheduling_gates = [
+        types.SimpleNamespace(name=k8s_constants.KUEUE_TOPOLOGY_SCHEDULING_GATE)
+    ]
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
+        instance._attest_required_kueue_pod(  # pylint: disable=protected-access
+            admitted_pod,
+            'inference-ns',
+            None,
+            'inference',
+            pod_group,
+            1,
+            'inference-low',
+            expected_cluster_queue='inference-reserved',
+            strict_projection=True,
+            expected_lifecycle='adoption')
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+@pytest.mark.parametrize('mutation', _STRICT_KUEUE_CONTRACT_MUTATIONS)
+def test_required_kueue_rejects_mutated_existing_admitted_pod(
+        monkeypatch, mutation):
+    cluster_on_cloud = 'test-cluster-required-kueue-mutated'
+    head_name = f'{cluster_on_cloud}-head'
+    existing_pod = _fake_pod(head_name)
+    existing_pod.status.phase = 'Running'
+    existing_pod.metadata.labels = {
+        k8s_constants.KUEUE_MANAGED_KEY: 'true',
+        k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+        k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+    }
+    _set_required_kueue_group_identity(existing_pod, cluster_on_cloud)
+    existing_pod.metadata.finalizers = [k8s_constants.KUEUE_MANAGED_FINALIZER]
+    existing_pod.spec.scheduling_gates = [
+        types.SimpleNamespace(
+            name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+    ]
+    _mutate_strict_kueue_contract(existing_pod, mutation)
+    _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
+                                    head_name)
+
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _make_api_exception(
+        404, 'Not Found')
+    monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+    monkeypatch.setattr(kubernetes, 'api_exception', lambda: FakeApiException)
+    config = _make_provision_config(count=1)
+    config.provider_config.update({
+        'kueue_local_queue_name': 'inference',
+        'kueue_workload_priority_class_name': 'inference-low',
+        'serve_worker_projection_protocol_version': 2,
+        'serve_worker_expected_priority_class_name': 'inference-low',
+        'serve_worker_expected_priority_value': -1000,
+        'serve_worker_expected_preemption_policy': 'Never',
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+    })
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='Kueue admission contract'):
         instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
 
     core_api.delete_namespaced_pod.assert_called_once_with(
@@ -453,9 +1835,15 @@ def test_required_kueue_preflight_repeats_for_reattach(monkeypatch):
         k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
         k8s_constants.KUEUE_MANAGED_KEY: 'true',
     }
+    _set_required_kueue_group_identity(existing_pod, cluster_on_cloud)
+    existing_pod.metadata.finalizers = []
+    existing_pod.spec.scheduling_gates = [
+        types.SimpleNamespace(
+            name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+    ]
     _patch_create_pods_k8s_boundary(monkeypatch, {head_name: existing_pod},
                                     head_name)
-    preflight = mock.MagicMock()
+    preflight = mock.MagicMock(return_value='inference-reserved')
     monkeypatch.setattr(instance, '_preflight_required_kueue_local_queue',
                         preflight)
 
@@ -4471,6 +5859,30 @@ class TestRequiredKueueAdmission:
         core_api.read_namespace.assert_called_once_with(
             'inference-ns', _request_timeout=kubernetes.API_TIMEOUT)
 
+    @pytest.mark.parametrize('cluster_queue_name', [
+        'inference.reserved.example',
+        'a' * 64,
+        'Inference-reserved',
+        'inference_reserved',
+        'inference-',
+    ])
+    def test_preflight_rejects_cluster_queue_name_not_dns_label(
+            self, monkeypatch, cluster_queue_name):
+        local_queue = self._queue_object(
+            'default',
+            namespace='inference-ns',
+            spec={'clusterQueue': cluster_queue_name})
+        custom_api, core_api = self._patch_ready_kueue(monkeypatch,
+                                                       local_queue=local_queue)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='AssignQueueLabelsForPods'):
+            instance._preflight_required_kueue_local_queue(  # pylint: disable=protected-access
+                'inference-ns', 'research', 'default')
+
+        custom_api.get_cluster_custom_object.assert_not_called()
+        core_api.read_namespace.assert_not_called()
+
     def test_preflight_falls_back_to_v1beta1(self, monkeypatch):
         local_queue = self._queue_object(
             'default',
@@ -4827,6 +6239,7 @@ class TestRequiredKueueAdmission:
                     k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'admin',
                 },
                 'annotations': {
+                    k8s_constants.KUEUE_POD_GROUP_LABEL: 'annotation-wins',
                     k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION: '99',
                 },
                 'finalizers': [
@@ -4859,6 +6272,8 @@ class TestRequiredKueueAdmission:
             k8s_constants.KUEUE_POD_GROUP_TOTAL_COUNT_ANNOTATION] == '4'
         assert metadata['annotations'][
             k8s_constants.KUEUE_RETRIABLE_IN_GROUP_ANNOTATION] == 'false'
+        assert k8s_constants.KUEUE_POD_GROUP_LABEL not in metadata[
+            'annotations']
         assert metadata['finalizers'] == ['example.com/keep']
         assert pod_spec['spec']['schedulingGates'] == [
             {
@@ -4897,13 +6312,20 @@ class TestRequiredKueueAdmission:
             'name': k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE
         }]
 
-    def test_create_accepts_kueue_mutated_response(self, monkeypatch):
+    def test_create_accepts_kueue_response_with_valid_role_hash(
+            self, monkeypatch):
         created_pod = mock.MagicMock()
         created_pod.metadata.name = 'replica-head'
         created_pod.metadata.labels = {
             k8s_constants.KUEUE_MANAGED_KEY: 'true',
             k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+            k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
         }
+        _set_required_kueue_group_identity(created_pod)
+        created_pod.spec.scheduling_gates = [
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ]
         core_api_mock = mock.MagicMock()
         core_api_mock.create_namespaced_pod.return_value = created_pod
         monkeypatch.setattr(kubernetes, 'core_api',
@@ -4914,10 +6336,52 @@ class TestRequiredKueueAdmission:
                 'name': 'replica-head'
             }},
             None,
-            expected_kueue_queue='inference')
+            post_create_attestation=(_required_kueue_post_create_attestation(
+                'inference-ns', 'inference', 'inference-low')))
 
         assert result is created_pod
         core_api_mock.delete_namespaced_pod.assert_not_called()
+
+    @pytest.mark.parametrize('role_hash', _INVALID_KUEUE_ROLE_HASHES)
+    def test_create_deletes_and_rejects_invalid_role_hash(
+            self, monkeypatch, role_hash):
+        created_pod = _fake_pod('replica-head')
+        created_pod.metadata.labels = {
+            k8s_constants.KUEUE_MANAGED_KEY: 'true',
+            k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+            k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+        }
+        _set_required_kueue_group_identity(created_pod, role_hash=role_hash)
+        created_pod.metadata.finalizers = []
+        created_pod.spec.scheduling_gates = [
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ]
+        core_api_mock = mock.MagicMock()
+        core_api_mock.create_namespaced_pod.return_value = created_pod
+        core_api_mock.read_namespaced_pod.side_effect = _make_api_exception(
+            404, 'Not Found')
+        monkeypatch.setattr(kubernetes, 'core_api',
+                            lambda *a, **k: core_api_mock)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Kueue admission contract'):
+            instance._create_namespaced_pod_with_retries(
+                'inference-ns', {'metadata': {
+                    'name': 'replica-head'
+                }},
+                None,
+                post_create_attestation=(
+                    _required_kueue_post_create_attestation(
+                        'inference-ns', 'inference', 'inference-low')))
+
+        core_api_mock.delete_namespaced_pod.assert_called_once_with(
+            'replica-head',
+            'inference-ns',
+            grace_period_seconds=0,
+            _request_timeout=config_lib.DELETION_TIMEOUT)
 
     @pytest.mark.parametrize('labels', [
         {
@@ -4927,25 +6391,159 @@ class TestRequiredKueueAdmission:
             k8s_constants.KUEUE_MANAGED_KEY: 'true',
             k8s_constants.KUEUE_QUEUE_LABEL: 'wrong-queue',
         },
+        {
+            k8s_constants.KUEUE_MANAGED_KEY: 'true',
+            k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+            k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'wrong-priority',
+        },
     ])
     def test_create_deletes_and_rejects_unattested_response(
             self, monkeypatch, labels):
         created_pod = mock.MagicMock()
         created_pod.metadata.name = 'replica-head'
         created_pod.metadata.labels = labels
+        _set_required_kueue_group_identity(created_pod)
+        created_pod.spec.scheduling_gates = [
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ]
         core_api_mock = mock.MagicMock()
         core_api_mock.create_namespaced_pod.return_value = created_pod
         monkeypatch.setattr(kubernetes, 'core_api',
                             lambda *a, **k: core_api_mock)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+        core_api_mock.read_namespaced_pod.side_effect = _make_api_exception(
+            404, 'Not Found')
 
         with pytest.raises(config_lib.KubernetesError,
-                           match='to prevent it from bypassing Kueue'):
+                           match='Kueue admission contract'):
             instance._create_namespaced_pod_with_retries(
                 'inference-ns', {'metadata': {
                     'name': 'replica-head'
                 }},
                 None,
-                expected_kueue_queue='inference')
+                post_create_attestation=(
+                    _required_kueue_post_create_attestation(
+                        'inference-ns', 'inference', 'inference-low')))
+
+        core_api_mock.delete_namespaced_pod.assert_called_once_with(
+            'replica-head',
+            'inference-ns',
+            grace_period_seconds=0,
+            _request_timeout=config_lib.DELETION_TIMEOUT)
+
+    def test_create_deletes_and_rejects_missing_admission_gate(
+            self, monkeypatch):
+        created_pod = mock.MagicMock()
+        created_pod.metadata.name = 'replica-head'
+        created_pod.metadata.labels = {
+            k8s_constants.KUEUE_MANAGED_KEY: 'true',
+            k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+            k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+        }
+        _set_required_kueue_group_identity(created_pod)
+        created_pod.spec.scheduling_gates = []
+        core_api_mock = mock.MagicMock()
+        active_epoch = None
+        next_epoch = 0
+        events = []
+
+        @contextlib.contextmanager
+        def provider_effect_guard():
+            nonlocal active_epoch, next_epoch
+            assert active_epoch is None
+            next_epoch += 1
+            active_epoch = next_epoch
+            events.append(f'guard-{active_epoch}-enter')
+            try:
+                yield
+            finally:
+                events.append(f'guard-{active_epoch}-exit')
+                active_epoch = None
+
+        def create_pod(*_args, **kwargs):
+            assert active_epoch == 1
+            assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+            events.append('create-1')
+            return created_pod
+
+        def delete_pod(*_args, **kwargs):
+            assert active_epoch == 2
+            assert kwargs['_request_timeout'] == config_lib.DELETION_TIMEOUT
+            events.append('delete-2')
+
+        def read_pod(*_args, **kwargs):
+            assert active_epoch == 2
+            assert kwargs['_request_timeout'] == kubernetes.API_TIMEOUT
+            events.append('read-2')
+            raise _make_api_exception(404, 'Not Found')
+
+        core_api_mock.create_namespaced_pod.side_effect = create_pod
+        core_api_mock.delete_namespaced_pod.side_effect = delete_pod
+        core_api_mock.read_namespaced_pod.side_effect = read_pod
+        monkeypatch.setattr(kubernetes, 'core_api',
+                            lambda *a, **k: core_api_mock)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Kueue admission contract'):
+            instance._create_namespaced_pod_with_retries(
+                'inference-ns', {'metadata': {
+                    'name': 'replica-head'
+                }},
+                None,
+                post_create_attestation=(
+                    _required_kueue_post_create_attestation(
+                        'inference-ns', 'inference', 'inference-low')),
+                provider_effect_guard_factory=provider_effect_guard)
+
+        core_api_mock.delete_namespaced_pod.assert_called_once_with(
+            'replica-head',
+            'inference-ns',
+            grace_period_seconds=0,
+            _request_timeout=config_lib.DELETION_TIMEOUT)
+        assert events == [
+            'guard-1-enter', 'create-1', 'guard-1-exit', 'guard-2-enter',
+            'delete-2', 'read-2', 'guard-2-exit'
+        ]
+
+    @pytest.mark.parametrize('mutation', _STRICT_KUEUE_CONTRACT_MUTATIONS)
+    def test_create_deletes_and_rejects_mutated_strict_contract(
+            self, monkeypatch, mutation):
+        created_pod = _fake_pod('replica-head')
+        created_pod.metadata.labels = {
+            k8s_constants.KUEUE_MANAGED_KEY: 'true',
+            k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
+            k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL: 'inference-low',
+        }
+        _set_required_kueue_group_identity(created_pod)
+        created_pod.metadata.finalizers = []
+        created_pod.spec.scheduling_gates = [
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ]
+        _mutate_strict_kueue_contract(created_pod, mutation)
+        core_api_mock = mock.MagicMock()
+        core_api_mock.create_namespaced_pod.return_value = created_pod
+        core_api_mock.read_namespaced_pod.side_effect = _make_api_exception(
+            404, 'Not Found')
+        monkeypatch.setattr(kubernetes, 'core_api',
+                            lambda *a, **k: core_api_mock)
+        monkeypatch.setattr(kubernetes, 'api_exception',
+                            lambda: FakeApiException)
+
+        with pytest.raises(config_lib.KubernetesError,
+                           match='Kueue admission contract'):
+            instance._create_namespaced_pod_with_retries(
+                'inference-ns', {'metadata': {
+                    'name': 'replica-head'
+                }},
+                None,
+                post_create_attestation=(
+                    _required_kueue_post_create_attestation(
+                        'inference-ns', 'inference', 'inference-low')))
 
         core_api_mock.delete_namespaced_pod.assert_called_once_with(
             'replica-head',
@@ -4968,6 +6566,8 @@ class TestRequiredKueueAdmission:
         core_api_mock.create_namespaced_pod.side_effect = [
             forbidden, created_pod
         ]
+        core_api_mock.read_namespaced_pod.side_effect = _make_api_exception(
+            404, 'Not Found')
         monkeypatch.setattr(kubernetes, 'core_api',
                             lambda *a, **k: core_api_mock)
         monkeypatch.setattr(kubernetes, 'api_exception',
@@ -4984,12 +6584,14 @@ class TestRequiredKueueAdmission:
         }
 
         with pytest.raises(config_lib.KubernetesError,
-                           match='was not admitted'):
+                           match='Kueue admission contract'):
             instance._create_namespaced_pod_with_retries(
                 'inference-ns',
                 pod_spec,
                 None,
-                expected_kueue_queue='inference')
+                post_create_attestation=(
+                    _required_kueue_post_create_attestation(
+                        'inference-ns', 'inference')))
 
         assert core_api_mock.create_namespaced_pod.call_count == 2
         assert apparmor_key not in pod_spec['metadata']['annotations']
@@ -5009,6 +6611,11 @@ class TestRequiredKueueAdmission:
             k8s_constants.KUEUE_MANAGED_KEY: 'true',
             k8s_constants.KUEUE_QUEUE_LABEL: 'inference',
         }
+        _set_required_kueue_group_identity(created_pod)
+        created_pod.spec.scheduling_gates = [
+            types.SimpleNamespace(
+                name=k8s_constants.KUEUE_ADMISSION_SCHEDULING_GATE)
+        ]
         stuck_pod = mock.MagicMock()
         stuck_pod.metadata.deletion_timestamp = object()
         stuck_pod.metadata.finalizers = []
@@ -5027,7 +6634,8 @@ class TestRequiredKueueAdmission:
                 'name': 'replica-head'
             }},
             None,
-            expected_kueue_queue='inference')
+            post_create_attestation=(_required_kueue_post_create_attestation(
+                'inference-ns', 'inference')))
 
         assert result is created_pod
         assert core_api_mock.create_namespaced_pod.call_count == 2

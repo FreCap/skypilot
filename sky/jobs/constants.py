@@ -1,6 +1,7 @@
 """Constants used for Managed Jobs."""
 import os
-from typing import Any
+
+from sky.utils import controller_constants
 
 # Environment variable for JobGroup name, injected into all jobs in a JobGroup
 SKYPILOT_JOBGROUP_NAME_ENV_VAR = 'SKYPILOT_JOBGROUP_NAME'
@@ -39,18 +40,11 @@ JOBS_CONSOLIDATION_RELOADED_SIGNAL_FILE = (
 
 # Resources as a dict for the jobs controller.
 # We use 50 GB disk size to reduce the cost.
-CONTROLLER_RESOURCES: dict[str, str | int] = {
-    'cpus': '4+',
-    'memory': '4x',
-    'disk_size': 50
-}
+CONTROLLER_RESOURCES = controller_constants.JOBS_CONTROLLER_RESOURCES
 
 # Autostop config for the jobs controller. These are the default values for
 # jobs.controller.autostop in ~/.sky/config.yaml.
-CONTROLLER_AUTOSTOP: dict[str, Any] = {
-    'idle_minutes': 10,
-    'down': False,
-}
+CONTROLLER_AUTOSTOP = controller_constants.JOBS_CONTROLLER_AUTOSTOP
 
 # TODO(zhwu): This is no longer accurate, after #4592, which increases the
 # length of user hash appended to the cluster name from 4 to 8 chars. This makes
@@ -88,3 +82,41 @@ MANAGED_JOB_TOKEN_NAME_PREFIX = 'managed-job-'
 # api_server_access token expire mid-run. Add token renewal so the TTL only
 # bounds leaked-token lifetime, not in-use token lifetime.
 MANAGED_JOB_TOKEN_TTL_DAYS = 3
+
+# Immutable runtime-owned ControllerManager owner and slot identity.  These
+# values use the server-only prefix so they cannot be supplied or overwritten
+# by a client request body.
+CONTROLLER_OWNER_MODE_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_OWNER_MODE_ENV_VAR)
+CONTROLLER_OWNER_INSTANCE_ID_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_INSTANCE_ID_ENV_VAR)
+CONTROLLER_OWNER_GENERATION_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_GENERATION_ENV_VAR)
+CONTROLLER_OWNER_PID_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_OWNER_PID_ENV_VAR)
+CONTROLLER_OWNER_START_TICKS_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_OWNER_START_TICKS_ENV_VAR)
+# Installed only in a per-job coroutine context.  Nested SDK requests turn it
+# into authenticated internal admission metadata; it is never forwarded as an
+# ordinary task/request environment variable.
+CONTROLLER_JOB_ID_ENV_VAR = controller_constants.MANAGED_JOB_ID_ENV_VAR
+
+# These values are
+# installed only in one disposable slot family and inherited by nested API
+# requests so durable state and provider admission can reject a replaced
+# manager even while its process is still winding down.
+CONTROLLER_SLOT_ID_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR)
+CONTROLLER_SLOT_ATTEMPT_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR)
+# One-shot inherited file descriptor used only by the local slot guardian.
+# The ControllerManager writes readiness after imports, plugins, and its
+# long-lived loops have survived their first event-loop turn.
+CONTROLLER_READY_FD_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_READY_FD_ENV_VAR)
+CONTROLLER_CAPABILITY_FD_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_CAPABILITY_FD_ENV_VAR)
+CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR = (
+    controller_constants.CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR)
+CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR = (
+    controller_constants.CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR)

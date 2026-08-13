@@ -3085,6 +3085,42 @@ class TestServiceStatusEndpointSnapshot:
         for key, value in expected.items():
             assert status[key] == value
 
+    def test_service_status_propagates_reserved_fill_reconciliation(self):
+        service_record = {
+            'name': 'svc-a',
+            'pool': False,
+            'hash': 'incarnation-a',
+        }
+        reconciliation = {
+            'enabled': True,
+            'authority_mode': 'sequenced',
+            'allocation_current': True,
+            'allocation_generation': 5,
+            'allocation_input_sha256': 'a' * 64,
+            'allocation_claim_generation': 11,
+            'pools': {},
+        }
+        response = mock.Mock()
+        response.json.return_value = {
+            'target_num_replicas': 1,
+            'reserved_fill_reconciliation': reconciliation,
+        }
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_service_from_name',
+                return_value=service_record), \
+             mock.patch('sky.serve.serve_utils.'
+                        '_get_to_controller_with_retry',
+                        return_value=response):
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_replica_info=False,
+                with_yaml=False,
+                with_target_num_replicas=True)
+
+        assert status is not None
+        assert status['reserved_fill_reconciliation'] == reconciliation
+
     def test_service_status_reuses_batched_cluster_snapshot_for_endpoints(self):
         replicas_and_handles = [self._replica(f'r-{i}') for i in (1, 2)]
         replicas = [info for info, _ in replicas_and_handles]

@@ -1354,6 +1354,15 @@ _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA = {
     }],
 }
 
+_SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA = {
+    'oneOf': [{
+        'type': 'string',
+        'minLength': 1,
+    }, {
+        'type': 'null',
+    }],
+}
+
 _SERVE_WORKER_PRIORITY_VALUE_SCHEMA = {
     'oneOf': [{
         'type': 'integer',
@@ -1466,6 +1475,7 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
     'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
     'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
+    'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
     'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
     'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
@@ -2662,7 +2672,7 @@ def get_config_schema():
         'properties': {}
     }
 
-    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
+    for daemon in daemons.RUNTIME_DAEMONS:
         daemon_schema['properties'][daemon.id] = daemon_config
 
     api_server = {
@@ -2902,6 +2912,7 @@ def get_config_schema():
                         'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
                         'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
+                        'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
                         'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
                         'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
@@ -2986,6 +2997,7 @@ def get_config_schema():
                                     'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
                                     'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
+                                    'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
                                     'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
                                     'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,

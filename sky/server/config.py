@@ -8,7 +8,6 @@ from typing import Literal
 
 from sky import sky_logging
 from sky.server import constants as server_constants
-from sky.server import daemons
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import config_utils
@@ -279,12 +278,8 @@ def _max_long_worker_parallism(cpu_count: int,
 
 
 def _get_min_short_workers() -> int:
-    """Min number of short workers."""
-    daemon_count = 0
-    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
-        if not daemon.should_skip():
-            daemon_count += 1
-    return _MIN_IDLE_SHORT_WORKERS + daemon_count
+    """Min number of workers for finite short API requests."""
+    return _MIN_IDLE_SHORT_WORKERS
 
 
 def _max_short_worker_parallism(mem_size_gb: float,

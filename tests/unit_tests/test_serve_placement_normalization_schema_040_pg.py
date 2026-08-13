@@ -243,7 +243,7 @@ def _insert_manifest(connection: sqlalchemy.engine.Connection,
 
 
 def test_serve040_lineage_and_postgresql_only() -> None:
-    assert migration_utils.SERVE_VERSION == '043'
+    assert migration_utils.SERVE_VERSION == '046'
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
@@ -749,7 +749,7 @@ def test_serve040_runtime_authority_rejects_assertion_body_drift(
     with serve040.connect() as connection:
         with pytest.raises(placement_normalization_authority.
                            PlacementNormalizationAuthorityError,
-                           match='assertion body differs'):
+                           match='Revision-040 assertion'):
             (placement_normalization_authority.assert_reader_database_authority(
                 connection))
 
@@ -1070,7 +1070,50 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
     with serve040.connect() as connection:
         with pytest.raises(placement_normalization_authority.
                            PlacementNormalizationAuthorityError,
-                           match='does not own exactly revision'):
+                           match='does not own one recognized additive'):
+            (placement_normalization_authority.assert_reader_database_authority(
+                connection))
+
+
+@pytest.mark.parametrize('revision', ['041', '042', '043', '044', '045', '046'])
+def test_serve040_runtime_authority_accepts_recognized_additive_head(
+        serve040, revision: str) -> None:
+    _upgrade(serve040, revision)
+
+    with serve040.connect() as connection:
+        authority = (placement_normalization_authority.
+                     assert_reader_database_authority(connection))
+
+    assert authority.schema == 'public'
+    assert authority.is_open
+
+
+def test_later_head_still_rejects_revision_040_function_drift(serve040) -> None:
+    _upgrade(serve040, '046')
+    function = placement_normalization_authority.AUTHORITY_FUNCTION
+    with serve040.begin() as connection:
+        connection.exec_driver_sql(
+            f'CREATE OR REPLACE FUNCTION public.{function}() '
+            'RETURNS boolean LANGUAGE plpgsql AS '
+            '$$BEGIN RETURN TRUE; END;$$')
+
+    with serve040.connect() as connection:
+        with pytest.raises(placement_normalization_authority.
+                           PlacementNormalizationAuthorityError,
+                           match='Revision-040 assertion'):
+            (placement_normalization_authority.assert_reader_database_authority(
+                connection))
+
+
+def test_serve040_runtime_authority_rejects_unknown_later_head(
+        serve040) -> None:
+    with serve040.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE alembic_version_serve_state_db SET version_num = '047'")
+    with serve040.connect() as connection:
+        with pytest.raises(placement_normalization_authority.
+                           PlacementNormalizationAuthorityError,
+                           match='does not own one recognized additive'):
             (placement_normalization_authority.assert_reader_database_authority(
                 connection))
 

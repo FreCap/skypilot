@@ -1135,10 +1135,16 @@ def _protocol_v2_reserved_fill_launch_context() -> dict[str, object]:
         reserved_capacity.make_protocol_v2_launch_fence(
             pool_key=pool_key,
             service_generation=7,
+            service_version=3,
             physical_cluster_uid='physical-uid',
             kubernetes_context='phx-context',
             accelerator='H200',
-            accelerator_count=1))
+            accelerator_count=1,
+            reconciliation_gate_generation=11,
+            reclaim_fleet_bundle_sha256='a' * 64,
+            reclaim_policy_revision='policy-v2',
+            reclaim_provider_inventory_sha256='b' * 64,
+            worker_projection_sha256='c' * 64))
     return context
 
 

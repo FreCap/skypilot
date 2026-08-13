@@ -1,5 +1,7 @@
 """Common data structures for provisioning"""
 import abc
+from collections.abc import Callable
+import contextlib
 import dataclasses
 import functools
 import os
@@ -22,6 +24,9 @@ _START_TITLE = '\n' + '-' * 20 + 'Start: {} ' + '-' * 20
 _END_TITLE = '-' * 20 + 'End:   {} ' + '-' * 20 + '\n'
 
 logger = sky_logging.init_logger(__name__)
+
+ProviderEffectGuardFactory = Callable[
+    [], contextlib.AbstractContextManager[None]]
 
 
 class ProvisionerError(RuntimeError):
@@ -82,12 +87,22 @@ class ProvisionConfig:
     cluster_incarnation: str | None = dataclasses.field(default=None,
                                                         kw_only=True,
                                                         repr=False)
+    # Runtime-only authorization boundary. Built-in provisioners enter this
+    # immediately around bounded provider mutations and release it before
+    # passive capacity/readiness waits.
+    provider_effect_guard_factory: ProviderEffectGuardFactory | None = (
+        dataclasses.field(default=None, kw_only=True, repr=False, compare=False))
 
     def get_redacted_config(self) -> dict[str, Any]:
         """Get the redacted config."""
-        config = dataclasses.asdict(self)
+        # Avoid deepcopying a bound guard factory (and therefore its backend)
+        # while projecting this dataclass for logging.
+        serializable = dataclasses.replace(self,
+                                           provider_effect_guard_factory=None)
+        config = dataclasses.asdict(serializable)
         # This internal identity is not part of the provision-log contract.
         config.pop('cluster_incarnation', None)
+        config.pop('provider_effect_guard_factory', None)
 
         config_copy = config_utils.Config(config)
 
@@ -96,6 +111,17 @@ class ProvisionConfig:
             if val is not None:
                 config_copy.set_nested(field_list, '<redacted>')
         return dict(**config_copy)
+
+
+@contextlib.contextmanager
+def provider_effect_guard(config: ProvisionConfig):
+    """Enter one runtime-only provider mutation authorization, if supplied."""
+    factory = config.provider_effect_guard_factory
+    if factory is None:
+        yield
+        return
+    with factory():
+        yield
 
 
 # -------------------- output data model -------------------- #

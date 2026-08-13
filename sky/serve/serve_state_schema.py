@@ -620,6 +620,11 @@ reserved_fill_service_claim_sets_table = sqlalchemy.Table(
                       nullable=False,
                       server_default='0'),
     sqlalchemy.Column('semantic_hash', sqlalchemy.Text, server_default=None),
+    # Null only for migration shadows and bounded LEGACY_ACTIVE compatibility
+    # rows.  A sequenced claim locks one exact immutable version row.
+    sqlalchemy.Column('service_version',
+                      sqlalchemy.Integer,
+                      server_default=None),
     sqlalchemy.Column('global_headroom',
                       sqlalchemy.Integer,
                       server_default=None),
@@ -639,6 +644,9 @@ reserved_fill_service_claim_sets_table = sqlalchemy.Table(
                                name='ck_reserved_fill_claim_set_generation'),
     sqlalchemy.CheckConstraint('edge_count >= 0',
                                name='ck_reserved_fill_claim_set_edge_count'),
+    sqlalchemy.CheckConstraint(
+        'service_version IS NULL OR service_version > 0',
+        name='ck_reserved_fill_claim_set_service_version'),
     sqlalchemy.CheckConstraint(
         'global_headroom IS NULL OR global_headroom >= 0',
         name='ck_reserved_fill_claim_set_headroom'),
@@ -664,6 +672,13 @@ reserved_fill_pool_claims_table = sqlalchemy.Table(
                       sqlalchemy.Text,
                       server_default=None),
     sqlalchemy.Column('accelerator_names', sqlalchemy.Text,
+                      server_default=None),
+    # One exact v2 worker-projection digest per case-folded accelerator in the
+    # edge.  Null belongs only to migration/LEGACY_ACTIVE compatibility state;
+    # sequenced readers validate the closed map against accelerator_names.
+    sqlalchemy.Column('worker_projection_sha256_by_accelerator',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
                       server_default=None),
     sqlalchemy.Column('service_generation',
                       sqlalchemy.BigInteger,

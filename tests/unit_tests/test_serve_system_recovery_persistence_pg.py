@@ -7,6 +7,7 @@ import copy
 import pickle
 from typing import Any
 
+from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from test_serve_resource_action_state_pg import postgres_engine
@@ -20,6 +21,7 @@ from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state as recovery_state
 from sky.utils import common_utils
 from sky.utils.db import db_utils
+from sky.utils.db import migration_utils
 
 _SERVICE_NAME = 'svc'
 _SERVICE_HASH = 'service-hash'
@@ -34,6 +36,18 @@ def recovery_database(postgres_engine, monkeypatch):  # noqa: F811
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
         connection.exec_driver_sql('CREATE SCHEMA public')
     serve_state_schema.Base.metadata.create_all(postgres_engine)
+    config = migration_utils.get_alembic_config(postgres_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.stamp(config, '042')
+    # create_all() supplies the current table shape but not the Serve035 data
+    # migration that creates the one protocol row.  Seed that historical
+    # invariant before exercising the forward-only Serve045 migration.
+    alembic_command.upgrade(config, '044')
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            serve_state.reserved_fill_protocol_state_table.insert().values(
+                id=1))
+    alembic_command.upgrade(config, '045')
     monkeypatch.setattr(serve_state._db_manager, '_engine', postgres_engine)
     with postgres_engine.begin() as connection:
         connection.execute(

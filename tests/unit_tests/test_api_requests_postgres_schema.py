@@ -11,11 +11,16 @@ def test_postgres_record_schema_topology() -> None:
             ('request_id', 'name', 'handler_name', 'payload_type',
              'payload_format', 'payload_version', 'producer_version',
              'payload_json', 'execution_class', 'status', 'terminal_cause',
-             'return_value', 'error', 'pid', 'created_at', 'cluster_name',
+             'return_value', 'error', 'pid',
+             'execution_process_start_time_ticks', 'created_at', 'cluster_name',
              'schedule_type', 'user_id', 'status_msg', 'should_retry',
              'finished_at', 'file_mounts_blob_id', 'ignore_return_value',
              'retryable', 'execution_generation', 'claim_token',
-             'worker_instance_id', 'controller_generation', 'lease_expires_at',
+             'worker_instance_id', 'controller_generation', 'managed_job_id',
+             'managed_job_controller_instance_id',
+             'managed_job_controller_generation',
+             'managed_job_controller_slot_id',
+             'managed_job_controller_slot_attempt', 'lease_expires_at',
              'heartbeat_at', 'cancel_requested_at', 'cancel_acknowledged_at',
              'execution_quiescence_required', 'execution_quiesced_generation',
              'execution_quiesced_at', 'interrupted_reason', 'event_context',
@@ -53,8 +58,8 @@ def test_postgres_record_schema_topology() -> None:
              'ordinary_launch_binding_capable'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
-             'generation_lock_key', 'acquired_at', 'heartbeat_at', 'released_at'
-            ),
+             'generation_lock_key', 'origin_capability_sha256', 'acquired_at',
+             'heartbeat_at', 'released_at'),
         'api_controller_action_reservations':
             ('logical_action_id', 'resource_identity', 'action_type', 'state',
              'controller_generation', 'controller_instance_id',
@@ -98,3 +103,33 @@ def test_execution_quiescence_required_keeps_api007_insert_default() -> None:
 
     assert column.server_default is not None
     assert str(column.server_default.arg) == 'false'
+
+
+def test_managed_job_origin_schema_is_complete_and_exactly_indexed() -> None:
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in postgres_schema.REQUESTS.constraints
+        if constraint.name is not None
+    }
+    complete = ''.join(
+        constraints['ck_api_requests_managed_job_origin_complete'].split())
+    values = ''.join(
+        constraints['ck_api_requests_managed_job_origin_values'].split())
+
+    for field in ('managed_job_id', 'managed_job_controller_instance_id',
+                  'managed_job_controller_generation',
+                  'managed_job_controller_slot_id',
+                  'managed_job_controller_slot_attempt'):
+        assert field in complete
+    assert 'IN(0,5)' in complete
+    assert 'managed_job_id>0' in values
+    assert 'managed_job_controller_generation>0' in values
+    assert 'managed_job_controller_slot_id>=0' in values
+
+    indexes = {index.name: index for index in postgres_schema.REQUESTS.indexes}
+    attempt_index = indexes['ix_api_requests_managed_job_attempt']
+    assert tuple(column.name for column in attempt_index.columns) == (
+        'managed_job_id', 'managed_job_controller_instance_id',
+        'managed_job_controller_generation', 'managed_job_controller_slot_id',
+        'managed_job_controller_slot_attempt')
+    assert attempt_index.dialect_options['postgresql']['where'] is not None

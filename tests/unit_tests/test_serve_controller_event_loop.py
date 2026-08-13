@@ -103,6 +103,42 @@ async def test_autoscaler_info_does_not_block_controller_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_autoscaler_info_contains_fail_closed_diagnostic_fallback(
+        monkeypatch):
+    autoscaler = mock.Mock()
+    autoscaler.info.return_value = {'target_num_replicas': 0}
+    autoscaler.reserved_capacity_fill = True
+    replica_manager = mock.Mock()
+    replica_manager.spot_placer = None
+    replica_manager.drain_proof_stats_snapshot.return_value = {}
+
+    def configure_controller(ctrl):
+        ctrl._reserved_fill_reconciliation_info = mock.Mock(
+            side_effect=RuntimeError('diagnostic regression'))
+
+    app = _register_controller_routes(monkeypatch,
+                                      autoscaler,
+                                      replica_manager,
+                                      controller_setup=configure_controller)
+    transport = httpx.ASGITransport(app=app)
+    headers = {constants.CONTROLLER_OWNER_HEADER: 'owner-a'}
+    async with httpx.AsyncClient(transport=transport,
+                                 base_url='http://test') as client:
+        response = await client.get('/autoscaler/info', headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()['reserved_fill_reconciliation'] == {
+        'enabled': True,
+        'authority_mode': 'unavailable',
+        'allocation_current': False,
+        'allocation_generation': None,
+        'allocation_input_sha256': None,
+        'allocation_claim_generation': None,
+        'pools': {},
+    }
+
+
+@pytest.mark.asyncio
 async def test_lb_sync_runtime_tail_does_not_block_health_route(monkeypatch):
     tail_started = threading.Event()
     allow_tail = threading.Event()

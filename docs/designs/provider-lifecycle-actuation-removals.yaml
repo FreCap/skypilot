@@ -18138,7 +18138,7 @@ artifacts:
     call: _mark_controller_action_state
   - kind: python_call_within
     path: sky/server/requests/postgres.py
-    symbol: PostgresQueueBackend.get
+    symbol: PostgresQueueBackend._claim_candidate
     call: _reserve_controller_action
   replacement: Generalized durable lifecycle action ledger
   dependencies: []

@@ -17,7 +17,8 @@ only sqlite. This module:
   PostgresLock advisory path are exercised for real.
 """
 # pylint: disable=cell-var-from-loop,missing-class-docstring
-# pylint: disable=protected-access,redefined-outer-name,unused-import
+# pylint: disable=protected-access,redefined-outer-name,unexpected-keyword-arg
+# pylint: disable=unused-import
 import contextlib
 import datetime
 import importlib
@@ -63,6 +64,7 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 _POSTGRES_REQUIRED = os.environ.get('SKYPILOT_REQUIRE_SERVE_POSTGRES') == '1'
+_POSTGRES_URL = os.environ.get('SKYPILOT_TEST_POSTGRES_URL')
 
 
 def _required_import(module: str):
@@ -125,6 +127,9 @@ def pg_server():
     mapping and readiness). Local runs skip when the container cannot start;
     the required unit-test CI lane fails instead.
     """
+    if _POSTGRES_URL is not None:
+        yield _POSTGRES_URL
+        return
     container = testcontainers_postgres.PostgresContainer(_PG_IMAGE)
     try:
         container.start()
@@ -139,8 +144,27 @@ def pg_server():
         container.stop()
 
 
-def _create_database(pg_server, dbname: str) -> str:
+def _create_database(pg_server,
+                     dbname: str,
+                     *,
+                     template: str | None = None) -> str:
     """Creates a fresh database on the server; returns its SQLAlchemy URL."""
+    if isinstance(pg_server, str):
+        admin_engine = create_engine(pg_server, isolation_level='AUTOCOMMIT')
+        quoted = admin_engine.dialect.identifier_preparer.quote(dbname)
+        template_clause = ''
+        if template is not None:
+            quoted_template = admin_engine.dialect.identifier_preparer.quote(
+                template)
+            template_clause = f' TEMPLATE {quoted_template}'
+        try:
+            with admin_engine.connect() as connection:
+                connection.exec_driver_sql(
+                    f'CREATE DATABASE {quoted}{template_clause}')
+        finally:
+            admin_engine.dispose()
+        return sqlalchemy.engine.make_url(pg_server).set(
+            database=dbname).render_as_string(hide_password=False)
     host = pg_server.get_container_host_ip()
     port = pg_server.get_exposed_port(pg_server.port)
     conn = psycopg2.connect(host=host,
@@ -151,31 +175,86 @@ def _create_database(pg_server, dbname: str) -> str:
     conn.autocommit = True
     try:
         with conn.cursor() as cursor:
-            cursor.execute(f'CREATE DATABASE "{dbname}"')
+            template_clause = ('' if template is None else
+                               f' TEMPLATE "{template}"')
+            cursor.execute(f'CREATE DATABASE "{dbname}"{template_clause}')
     finally:
         conn.close()
     return (f'postgresql://{pg_server.username}:{pg_server.password}'
             f'@{host}:{port}/{dbname}')
 
 
+def _drop_database(pg_server, dbname: str) -> None:
+    """Drop one isolated test database after terminating its test sessions."""
+    if isinstance(pg_server, str):
+        admin_engine = create_engine(pg_server, isolation_level='AUTOCOMMIT')
+        quoted = admin_engine.dialect.identifier_preparer.quote(dbname)
+        try:
+            with admin_engine.connect() as connection:
+                connection.execute(
+                    sqlalchemy.text('SELECT pg_terminate_backend(pid) '
+                                    'FROM pg_stat_activity '
+                                    'WHERE datname = :database '
+                                    'AND pid <> pg_backend_pid()'),
+                    {'database': dbname})
+                connection.exec_driver_sql(f'DROP DATABASE {quoted}')
+        finally:
+            admin_engine.dispose()
+        return
+    host = pg_server.get_container_host_ip()
+    port = pg_server.get_exposed_port(pg_server.port)
+    conn = psycopg2.connect(host=host,
+                            port=port,
+                            user=pg_server.username,
+                            password=pg_server.password,
+                            dbname=pg_server.dbname)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                'SELECT pg_terminate_backend(pid) FROM pg_stat_activity '
+                'WHERE datname = %s AND pid <> pg_backend_pid()', (dbname,))
+            cursor.execute(f'DROP DATABASE "{dbname}"')
+    finally:
+        conn.close()
+
+
 @pytest.fixture(scope='session')
-def _pg_mechanics_url(pg_server):
-    """One database reused by every round-mechanics test (reset per test)."""
-    return _create_database(pg_server, 'broker_mechanics')
+def _pg_mechanics_template(pg_server):
+    """One migrated template cloned for isolated round-mechanics tests."""
+    database_name = f'broker_template_{uuid.uuid4().hex[:10]}'
+    url = _create_database(pg_server, database_name)
+    engine = create_engine(url)
+    try:
+        migration_utils.safe_alembic_upgrade(engine,
+                                             migration_utils.SERVE_DB_NAME,
+                                             '045')
+    finally:
+        engine.dispose()
+    try:
+        yield database_name
+    finally:
+        _drop_database(pg_server, database_name)
 
 
 @pytest.fixture
-def broker_engine(_pg_mechanics_url):
+def broker_engine(pg_server, _pg_mechanics_template):
     """Overrides the sqlite suite's engine with a real-PG one.
 
-    drop_all resets the reused database to empty; `_broker_db` (imported
-    from the sqlite suite) then runs create_all against it, exactly as it
-    does for sqlite.
+    The session fixture installs the exact current migration once. Each test
+    clones that template, so append-only triggers and every other PostgreSQL
+    contract stay enabled without sharing data between test cases.
     """
-    engine = create_engine(_pg_mechanics_url)
-    serve_state.Base.metadata.drop_all(engine)
-    yield engine
-    engine.dispose()
+    database_name = f'broker_case_{uuid.uuid4().hex[:10]}'
+    url = _create_database(pg_server,
+                           database_name,
+                           template=_pg_mechanics_template)
+    engine = create_engine(url)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+        _drop_database(pg_server, database_name)
 
 
 # ============ The full sqlite DB-touching suite, on Postgres ============
@@ -5301,7 +5380,7 @@ class TestServeStatusHistoryPG:
 
 
 @pytest.fixture
-def _pg_concurrency_db(pg_server, monkeypatch):
+def _pg_concurrency_db(pg_server, _pg_mechanics_template, monkeypatch):
     """PG serve DB with the REAL lock path (no nullcontext, no fake clock).
 
     locks.get_lock detects the backend (and PostgresLock borrows its
@@ -5309,18 +5388,23 @@ def _pg_concurrency_db(pg_server, monkeypatch):
     that at the serve PG engine takes the advisory path exactly as a
     Postgres-backed api-server pod does.
     """
-    url = _create_database(pg_server, f'concurrency_{uuid.uuid4().hex[:8]}')
+    database_name = f'concurrency_{uuid.uuid4().hex[:10]}'
+    url = _create_database(pg_server,
+                           database_name,
+                           template=_pg_mechanics_template)
     engine = create_engine(url)
-    serve_state.Base.metadata.create_all(engine)
     monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
     monkeypatch.setattr(locks.global_user_state, 'initialize_and_get_db',
                         lambda: engine)
     monkeypatch.setattr(serve_state, 'get_replica_infos',
                         mock.Mock(return_value=[]))
     broker.clear_caches()
-    yield engine
-    broker.clear_caches()
-    engine.dispose()
+    try:
+        yield engine
+    finally:
+        broker.clear_caches()
+        engine.dispose()
+        _drop_database(pg_server, database_name)
 
 
 @pytest.mark.usefixtures('_pg_concurrency_db')
@@ -5351,7 +5435,7 @@ class TestConcurrentRoundsPG:
             results = {}
             errors = []
 
-            def query():
+            def query(query_calls=query_calls):
                 query_calls.append(1)
                 # Hold the round (and thus the advisory lock) long enough
                 # that the losing thread must actually wait on it.
@@ -5359,7 +5443,11 @@ class TestConcurrentRoundsPG:
                 return broker.PoolObservation(free_slots=10,
                                               gpu_names=('A100',))
 
-            def run(name, pool=pool):
+            def run(name,
+                    pool=pool,
+                    barrier=barrier,
+                    results=results,
+                    errors=errors):
                 try:
                     barrier.wait(timeout=30)
                     results[name] = broker.run_round_if_stale(

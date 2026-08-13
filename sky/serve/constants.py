@@ -1,5 +1,8 @@
 """Constants used for SkyServe."""
 
+from sky.utils import controller_constants
+from sky.utils import serve_types
+
 CONTROLLER_TEMPLATE = 'sky-serve-controller.yaml.j2'
 
 # Server-owned operational fence used while persisted Serve state is rewritten.
@@ -95,6 +98,8 @@ RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY = (
 RESERVED_FILL_LAUNCH_POOL_KEY = f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}pool_key'
 RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY = (
     f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}service_generation')
+RESERVED_FILL_LAUNCH_SERVICE_VERSION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}service_version')
 RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY = (
     f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}physical_cluster_uid')
 RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY = (
@@ -103,15 +108,35 @@ RESERVED_FILL_LAUNCH_ACCELERATOR_KEY = (
     f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}accelerator')
 RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY = (
     f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}accelerator_count')
-RESERVED_FILL_LAUNCH_FENCE_KEYS = (
+RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}reconciliation_gate_generation')
+RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}reclaim_fleet_bundle_sha256')
+RESERVED_FILL_LAUNCH_RECLAIM_POLICY_REVISION_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}reclaim_policy_revision')
+RESERVED_FILL_LAUNCH_RECLAIM_PROVIDER_INVENTORY_SHA256_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}reclaim_provider_inventory_sha256')
+RESERVED_FILL_LAUNCH_WORKER_PROJECTION_SHA256_KEY = (
+    f'{RESERVED_FILL_LAUNCH_FENCE_PREFIX}worker_projection_sha256')
+RESERVED_FILL_LAUNCH_BASE_FENCE_KEYS = (
     RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY,
     RESERVED_FILL_LAUNCH_POOL_KEY,
     RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY,
+    RESERVED_FILL_LAUNCH_SERVICE_VERSION_KEY,
     RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY,
     RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY,
     RESERVED_FILL_LAUNCH_ACCELERATOR_KEY,
     RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY,
 )
+RESERVED_FILL_LAUNCH_POLICY_FENCE_KEYS = (
+    RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY,
+    RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY,
+    RESERVED_FILL_LAUNCH_RECLAIM_POLICY_REVISION_KEY,
+    RESERVED_FILL_LAUNCH_RECLAIM_PROVIDER_INVENTORY_SHA256_KEY,
+    RESERVED_FILL_LAUNCH_WORKER_PROJECTION_SHA256_KEY,
+)
+RESERVED_FILL_LAUNCH_FENCE_KEYS = (RESERVED_FILL_LAUNCH_BASE_FENCE_KEYS +
+                                   RESERVED_FILL_LAUNCH_POLICY_FENCE_KEYS)
 
 # Server-only allowlist for the first same-VM system-OOM recovery rollout.
 # The value is a versioned JSON document binding an exact service incarnation
@@ -220,7 +245,7 @@ LB_AUTHORIZATION_HEADER_BYTES = LB_AUTHORIZATION_HEADER.lower().encode('ascii')
 # source of truth for in-cluster API/controller/LB processes, avoiding a split
 # between the Helm values that create RBAC/Secret projections and a separate
 # persisted SkyPilot config flag.
-EXTERNAL_LB_ENABLED_ENV_VAR = 'SKYPILOT_SERVE_EXTERNAL_LB_ENABLED'
+EXTERNAL_LB_ENABLED_ENV_VAR = serve_types.EXTERNAL_LB_ENABLED_ENV_VAR
 LB_HA_RBAC_READY_ENV_VAR = 'SKYPILOT_SERVE_LB_HA_RBAC_READY'
 
 # HTTPS termination for the external LB Service, rendered by Helm for the same
@@ -722,10 +747,39 @@ RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY = (
     '_reserved_fill_protocol_version')
 RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY = (
     '_reserved_fill_service_generation')
+RESERVED_FILL_SERVICE_VERSION_OVERRIDE_KEY = '_reserved_fill_service_version'
 RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY = (
     '_reserved_fill_physical_cluster_uid')
 RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY = (
     '_reserved_fill_allowed_locations')
+# Immutable allocation-publication identity carried only across the typed
+# protocol-v2 admission seam.  These values are persisted on ReplicaInfo so a
+# reconcile replay can debit rows already accepted from the same allocation
+# without treating them as new ordinary demand.
+RESERVED_FILL_ALLOCATION_GENERATION_OVERRIDE_KEY = (
+    '_reserved_fill_allocation_generation')
+RESERVED_FILL_ALLOCATION_INPUT_SHA256_OVERRIDE_KEY = (
+    '_reserved_fill_allocation_input_sha256')
+RESERVED_FILL_ALLOCATION_CLAIM_GENERATION_OVERRIDE_KEY = (
+    '_reserved_fill_allocation_claim_generation')
+RESERVED_FILL_GATE_GENERATION_OVERRIDE_KEY = (
+    '_reserved_fill_reconciliation_gate_generation')
+RESERVED_FILL_RECLAIM_FLEET_BUNDLE_SHA256_OVERRIDE_KEY = (
+    '_reserved_fill_reclaim_fleet_bundle_sha256')
+RESERVED_FILL_RECLAIM_POLICY_REVISION_OVERRIDE_KEY = (
+    '_reserved_fill_reclaim_policy_revision')
+RESERVED_FILL_RECLAIM_PROVIDER_INVENTORY_SHA256_OVERRIDE_KEY = (
+    '_reserved_fill_reclaim_provider_inventory_sha256')
+RESERVED_FILL_WORKER_PROJECTION_SHA256_OVERRIDE_KEY = (
+    '_reserved_fill_worker_projection_sha256')
+RESERVED_FILL_OBSERVATION_GENERATION_OVERRIDE_KEY = (
+    '_reserved_fill_observation_generation')
+RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY = (
+    '_reserved_fill_observation_sequence')
+RESERVED_FILL_ORDINARY_ADMISSION_SEQUENCE_OVERRIDE_KEY = (
+    '_reserved_fill_ordinary_admission_sequence')
+RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY = (
+    '_reserved_fill_intent_idempotency_key')
 
 # Internal resources_override marker for a cost-rebalance launch.  The value is
 # the incumbent replica id.  ReplicaManager consumes it before sky.launch and
@@ -910,13 +964,10 @@ AUTOSCALER_DEFAULT_QUEUE_LENGTH_THRESHOLD = 1
 # disk space. Maybe we could use a larger disk size, migrate to cloud storage or
 # do some log rotation.
 # Set default minimal memory to 8GB to allow at least one service to run.
-CONTROLLER_RESOURCES = {'cpus': '4+', 'memory': '8+', 'disk_size': 200}
+CONTROLLER_RESOURCES = controller_constants.SERVE_CONTROLLER_RESOURCES
 # Autostop config for the jobs controller. These are the default values for
 # serve.controller.autostop in ~/.sky/config.yaml.
-CONTROLLER_AUTOSTOP = {
-    'idle_minutes': 10,
-    'down': False,
-}
+CONTROLLER_AUTOSTOP = controller_constants.SERVE_CONTROLLER_AUTOSTOP
 
 # A period of time to initialize your service. Any readiness probe failures
 # during this period will be ignored.

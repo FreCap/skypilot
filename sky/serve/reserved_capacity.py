@@ -20,6 +20,7 @@ import asyncio
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
+import concurrent.futures
 import contextlib
 import dataclasses
 import enum
@@ -41,8 +42,14 @@ from sky import sky_logging
 from sky.adaptors import kubernetes
 from sky.catalog import kubernetes_catalog
 from sky.serve import constants
+from sky.serve import pool_capacity_observation
+from sky.serve import pool_capacity_observer
 from sky.serve import provider_phase
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_allocation
+from sky.serve import reserved_fill_planner
+from sky.serve import reserved_fill_projection_authority
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import spot_placer as spot_placer_lib
 from sky.utils import common_utils
@@ -55,6 +62,36 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 
 ReservedFillLaunchFenceError = exceptions.ReservedFillLaunchFenceError
+
+
+def raise_protocol_v2_materialized_launch_error(error: Exception, *,
+                                                phase: str) -> typing.NoReturn:
+    """Preserve terminal fences and close opaque post-create failures.
+
+    Once a protocol-v2 request may have created its Pod, request-owned
+    failover or broad teardown is no longer safe. The durable replica row and
+    physical-UID fence are the only cleanup authority.
+    """
+    if isinstance(error, (exceptions.ReservedFillLaunchFenceError,
+                          exceptions.ServeReplicaLaunchFenceError,
+                          exceptions.KubernetesPhysicalClusterIdentityError)):
+        raise error
+    raise exceptions.ReservedFillLaunchFenceError(
+        f'Reserved-fill Kubernetes {phase} stopped after Pod '
+        'materialization; durable reserved-fill reconciliation owns exact '
+        'cleanup.') from error
+
+
+@contextlib.contextmanager
+def protocol_v2_materialized_launch_error_boundary(
+        active: bool, *, phase: str) -> typing.Iterator[None]:
+    """Normalizes all failures after a protocol-v2 Pod can exist."""
+    try:
+        yield
+    except Exception as error:  # pylint: disable=broad-except
+        if not active:
+            raise
+        raise_protocol_v2_materialized_launch_error(error, phase=phase)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,6 +110,7 @@ class FillPoolCandidate:
     context: str
     shapes: tuple[tuple[str, int], ...]
     locations: tuple['spot_placer_lib.Location', ...]
+    accelerator_positions: tuple[tuple[str, int], ...]
 
     @property
     def accelerator_names(self) -> tuple[str, ...]:
@@ -86,6 +124,15 @@ class FillPoolCandidate:
                              f'got {self.shapes!r}.')
         return next(iter(widths))
 
+    def accelerator_position(self, accelerator_name: str) -> int:
+        """Return the first task-resource position of one exact card."""
+        positions = dict(self.accelerator_positions)
+        try:
+            return positions[accelerator_name]
+        except KeyError as error:
+            raise ValueError('A fill-pool candidate has no position for '
+                             f'{accelerator_name!r}.') from error
+
 
 @dataclasses.dataclass(frozen=True)
 class FillPoolSpec:
@@ -98,6 +145,16 @@ class FillPoolSpec:
     physical_cluster_uid: str
     pool_key: str
     legacy_pool_key: str
+    observation_contexts: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        contexts = self.observation_contexts or (self.context,)
+        if (self.context not in contexts or
+                len(set(contexts)) != len(contexts) or len(contexts)
+                > pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
+            raise ValueError('A fill pool needs unique observation routes '
+                             'including its placement context.')
+        object.__setattr__(self, 'observation_contexts', contexts)
 
     @property
     def accelerator_names(self) -> tuple[str, ...]:
@@ -135,10 +192,21 @@ class ProtocolV2LaunchFence:
     protocol_version: int
     pool_key: str
     service_generation: int
+    service_version: int
     physical_cluster_uid: str
     kubernetes_context: str
     accelerator: str
     accelerator_count: int
+    reconciliation_gate_generation: int | None = None
+    reclaim_fleet_bundle_sha256: str | None = None
+    reclaim_policy_revision: str | None = None
+    reclaim_provider_inventory_sha256: str | None = None
+    worker_projection_sha256: str | None = None
+
+    @property
+    def policy_bound(self) -> bool:
+        """Whether this request carries the complete sequenced identity."""
+        return self.reconciliation_gate_generation is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -147,6 +215,30 @@ class ProtocolV2CleanupFence:
 
     kubernetes_context: str
     physical_cluster_uid: str
+
+
+def require_reclaim_worker_projection(
+    fence: ProtocolV2LaunchFence,
+    projections: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any],
+           reserved_fill_reclaim_attestation.ReclaimProjectedAdmission]:
+    """Select and authenticate the sole v2 projection bound to a reclaim.
+
+    This is the canonical adapter from the persisted worker-placement source
+    record to the deployment-policy view.  Admission fields are never rebuilt
+    independently from mutable task or workspace configuration.
+    """
+    if not isinstance(fence, ProtocolV2LaunchFence) or not fence.policy_bound:
+        raise ValueError('Sequenced reclaim requires a policy-bound launch.')
+    projection_digest = fence.worker_projection_sha256
+    if not isinstance(projection_digest, str):
+        raise ValueError('Sequenced reclaim has no worker projection digest.')
+    return reserved_fill_projection_authority.projected_admission_for_candidate(
+        projections,
+        kubernetes_context=fence.kubernetes_context,
+        accelerator=fence.accelerator,
+        accelerator_count=fence.accelerator_count,
+        expected_sha256=projection_digest)
 
 
 class PhysicalReplicaPresence(enum.Enum):
@@ -643,15 +735,19 @@ def parse_protocol_v2_launch_fence(
     }
     if not claimed_keys:
         return None
-    expected_keys = set(constants.RESERVED_FILL_LAUNCH_FENCE_KEYS)
-    if claimed_keys != expected_keys:
+    base_keys = set(constants.RESERVED_FILL_LAUNCH_BASE_FENCE_KEYS)
+    complete_keys = set(constants.RESERVED_FILL_LAUNCH_FENCE_KEYS)
+    if claimed_keys not in (base_keys, complete_keys):
         raise ValueError('Reserved-fill launch context is incomplete.')
+    policy_bound = claimed_keys == complete_keys
 
     protocol_version = launch_context[
         constants.RESERVED_FILL_LAUNCH_PROTOCOL_VERSION_KEY]
     pool_key = launch_context[constants.RESERVED_FILL_LAUNCH_POOL_KEY]
     service_generation = launch_context[
         constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY]
+    service_version = launch_context[
+        constants.RESERVED_FILL_LAUNCH_SERVICE_VERSION_KEY]
     physical_cluster_uid = launch_context[
         constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY]
     kubernetes_context = launch_context[
@@ -659,6 +755,23 @@ def parse_protocol_v2_launch_fence(
     accelerator = launch_context[constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY]
     accelerator_count = launch_context[
         constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY]
+    gate_generation = None
+    reclaim_fleet_bundle_sha256 = None
+    reclaim_policy_revision = None
+    reclaim_provider_inventory_sha256 = None
+    worker_projection_sha256 = None
+    if policy_bound:
+        gate_generation = launch_context[
+            constants.RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY]
+        reclaim_fleet_bundle_sha256 = launch_context[
+            constants.RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY]
+        reclaim_policy_revision = launch_context[
+            constants.RESERVED_FILL_LAUNCH_RECLAIM_POLICY_REVISION_KEY]
+        reclaim_provider_inventory_sha256 = launch_context[
+            constants.
+            RESERVED_FILL_LAUNCH_RECLAIM_PROVIDER_INVENTORY_SHA256_KEY]
+        worker_projection_sha256 = launch_context[
+            constants.RESERVED_FILL_LAUNCH_WORKER_PROJECTION_SHA256_KEY]
 
     if (type(protocol_version) is not int or  # pylint: disable=unidiomatic-typecheck
             protocol_version != reserved_capacity_broker.PROTOCOL_V2):
@@ -668,6 +781,9 @@ def parse_protocol_v2_launch_fence(
     if (type(service_generation) is not int or  # pylint: disable=unidiomatic-typecheck
             service_generation < 1):
         raise ValueError('Reserved-fill service generation is invalid.')
+    if (type(service_version) is not int or  # pylint: disable=unidiomatic-typecheck
+            service_version < 1):
+        raise ValueError('Reserved-fill service version is invalid.')
     for value, field_name in ((physical_cluster_uid, 'physical cluster UID'),
                               (kubernetes_context, 'Kubernetes context'),
                               (accelerator, 'accelerator')):
@@ -676,6 +792,28 @@ def parse_protocol_v2_launch_fence(
     if (type(accelerator_count) is not int or  # pylint: disable=unidiomatic-typecheck
             accelerator_count < 1):
         raise ValueError('Reserved-fill accelerator count is invalid.')
+    if policy_bound and (
+            type(gate_generation) is not int or gate_generation < 1 or
+            type(reclaim_fleet_bundle_sha256) is not str or re.fullmatch(
+                r'[0-9a-f]{64}', reclaim_fleet_bundle_sha256) is None or
+            type(reclaim_policy_revision) is not str or
+            not reclaim_policy_revision or
+            type(reclaim_provider_inventory_sha256) is not str or re.fullmatch(
+                r'[0-9a-f]{64}', reclaim_provider_inventory_sha256) is None or
+            type(worker_projection_sha256) is not str or
+            re.fullmatch(r'[0-9a-f]{64}', worker_projection_sha256) is None):
+        raise ValueError('Reserved-fill reclaim policy identity is invalid.')
+    if policy_bound:
+        try:
+            reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                fleet_bundle_sha256=typing.cast(str,
+                                                reclaim_fleet_bundle_sha256),
+                policy_revision=typing.cast(str, reclaim_policy_revision),
+                provider_inventory_sha256=typing.cast(
+                    str, reclaim_provider_inventory_sha256))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                'Reserved-fill reclaim policy identity is invalid.') from error
 
     try:
         identity = reserved_capacity_broker.parse_pool_identity(pool_key)
@@ -688,23 +826,36 @@ def parse_protocol_v2_launch_fence(
     if canonical_accelerator not in identity.gpu_names:
         raise ValueError('Reserved-fill accelerator is outside its pool.')
 
-    return ProtocolV2LaunchFence(protocol_version=protocol_version,
-                                 pool_key=pool_key,
-                                 service_generation=service_generation,
-                                 physical_cluster_uid=physical_cluster_uid,
-                                 kubernetes_context=kubernetes_context,
-                                 accelerator=canonical_accelerator,
-                                 accelerator_count=accelerator_count)
+    return ProtocolV2LaunchFence(
+        protocol_version=protocol_version,
+        pool_key=pool_key,
+        service_generation=service_generation,
+        service_version=service_version,
+        physical_cluster_uid=physical_cluster_uid,
+        kubernetes_context=kubernetes_context,
+        accelerator=canonical_accelerator,
+        accelerator_count=accelerator_count,
+        reconciliation_gate_generation=(gate_generation),
+        reclaim_fleet_bundle_sha256=(reclaim_fleet_bundle_sha256),
+        reclaim_policy_revision=(reclaim_policy_revision),
+        reclaim_provider_inventory_sha256=(reclaim_provider_inventory_sha256),
+        worker_projection_sha256=worker_projection_sha256)
 
 
 def make_protocol_v2_launch_fence(
     *,
     pool_key: str,
     service_generation: int,
+    service_version: int,
     physical_cluster_uid: str,
     kubernetes_context: str,
     accelerator: str,
     accelerator_count: int,
+    reconciliation_gate_generation: int | None = None,
+    reclaim_fleet_bundle_sha256: str | None = None,
+    reclaim_policy_revision: str | None = None,
+    reclaim_provider_inventory_sha256: str | None = None,
+    worker_projection_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Build the canonical durable tuple for one selected fill location."""
     launch_context = {
@@ -712,15 +863,115 @@ def make_protocol_v2_launch_fence(
             reserved_capacity_broker.PROTOCOL_V2,
         constants.RESERVED_FILL_LAUNCH_POOL_KEY: pool_key,
         constants.RESERVED_FILL_LAUNCH_SERVICE_GENERATION_KEY: service_generation,
+        constants.RESERVED_FILL_LAUNCH_SERVICE_VERSION_KEY: service_version,
         constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY: physical_cluster_uid,
         constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY: kubernetes_context,
         constants.RESERVED_FILL_LAUNCH_ACCELERATOR_KEY: accelerator.casefold(),
         constants.RESERVED_FILL_LAUNCH_ACCELERATOR_COUNT_KEY: accelerator_count,
     }
+    policy_identity = (
+        reconciliation_gate_generation,
+        reclaim_fleet_bundle_sha256,
+        reclaim_policy_revision,
+        reclaim_provider_inventory_sha256,
+        worker_projection_sha256,
+    )
+    if any(value is not None for value in policy_identity):
+        if any(value is None for value in policy_identity):
+            raise ValueError('Reserved-fill launch policy identity must be '
+                             'complete or absent.')
+        launch_context.update({
+            constants.RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY: reconciliation_gate_generation,
+            constants.RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY: reclaim_fleet_bundle_sha256,
+            constants.RESERVED_FILL_LAUNCH_RECLAIM_POLICY_REVISION_KEY: reclaim_policy_revision,
+            constants.RESERVED_FILL_LAUNCH_RECLAIM_PROVIDER_INVENTORY_SHA256_KEY: reclaim_provider_inventory_sha256,
+            constants.RESERVED_FILL_LAUNCH_WORKER_PROJECTION_SHA256_KEY: worker_projection_sha256,
+        })
     # Keep producer and consumer validation identical.
     fence = parse_protocol_v2_launch_fence(launch_context)
     assert fence is not None
     return launch_context
+
+
+def validate_protocol_v2_launch_fence_against_replica(
+    fence: ProtocolV2LaunchFence,
+    replica_info: Any,
+) -> None:
+    """Bind every queued protocol-v2 field to one durable ReplicaInfo row."""
+    persisted = vars(replica_info)
+    if persisted.get('reserved_fill') is not True:
+        raise ValueError('Reserved-fill launch row is not a fill replica.')
+    if fence.policy_bound:
+        # Local import breaks the existing replica_info -> reserved_capacity
+        # cleanup-fence cycle. ReplicaInfo owns the one canonical attribution
+        # contract used by storage decode, serialization, and terminal launch.
+        # pylint: disable-next=import-outside-toplevel
+        from sky.serve import replica_info as replica_info_lib
+        try:
+            replica_info_lib.validate_reserved_fill_allocation_attribution(
+                replica_info, require_policy_bound_admission=True)
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            raise ValueError(
+                'Policy-bound reserved-fill launch row has no '
+                'complete admitted allocation provenance.') from error
+    resources_override = persisted.get('resources_override')
+    if not isinstance(resources_override, Mapping):
+        raise ValueError('Reserved-fill launch row has no resource pin.')
+    resource_cloud = resources_override.get('cloud')
+    is_kubernetes_cloud = (isinstance(resource_cloud, clouds.Kubernetes) or
+                           isinstance(resource_cloud, str) and
+                           resource_cloud.casefold() == 'kubernetes')
+    accelerators = resources_override.get('accelerators')
+    if (not is_kubernetes_cloud or resources_override.get('region')
+            != persisted.get('reserved_fill_kubernetes_context') or
+            not isinstance(accelerators, Mapping) or len(accelerators) != 1):
+        raise ValueError('Reserved-fill launch row resource pin is malformed.')
+    accelerator, raw_count = next(iter(accelerators.items()))
+    accelerator_count = _normalize_positive_whole_count(raw_count)
+    if (not isinstance(accelerator, str) or not accelerator or
+            accelerator_count is None):
+        raise ValueError('Reserved-fill launch row accelerator is malformed.')
+    location = persisted.get('location')
+    if not isinstance(location, Mapping):
+        raise ValueError('Reserved-fill launch row has no location pin.')
+    location_cloud = location.get('cloud')
+    location_accelerators = location.get('accelerators')
+    if (not isinstance(location_cloud, str) or
+            location_cloud.casefold() != 'kubernetes' or location.get('region')
+            != persisted.get('reserved_fill_kubernetes_context') or
+            not isinstance(location_accelerators, Mapping) or
+            len(location_accelerators) != 1):
+        raise ValueError('Reserved-fill launch row location is malformed.')
+    location_accelerator, raw_location_count = next(
+        iter(location_accelerators.items()))
+    location_count = _normalize_positive_whole_count(raw_location_count)
+    if (not isinstance(location_accelerator, str) or
+            location_accelerator.casefold() != accelerator.casefold() or
+            location_count != accelerator_count):
+        raise ValueError('Reserved-fill launch row placement is contradictory.')
+    durable_context = make_protocol_v2_launch_fence(
+        pool_key=persisted.get('reserved_fill_pool_key'),
+        service_generation=persisted.get('reserved_fill_service_generation'),
+        service_version=persisted.get('version'),
+        physical_cluster_uid=persisted.get(
+            'reserved_fill_physical_cluster_uid'),
+        kubernetes_context=persisted.get('reserved_fill_kubernetes_context'),
+        accelerator=accelerator,
+        accelerator_count=accelerator_count,
+        reconciliation_gate_generation=persisted.get(
+            'reserved_fill_reconciliation_gate_generation'),
+        reclaim_fleet_bundle_sha256=persisted.get(
+            'reserved_fill_reclaim_fleet_bundle_sha256'),
+        reclaim_policy_revision=persisted.get(
+            'reserved_fill_reclaim_policy_revision'),
+        reclaim_provider_inventory_sha256=persisted.get(
+            'reserved_fill_reclaim_provider_inventory_sha256'),
+        worker_projection_sha256=persisted.get(
+            'reserved_fill_worker_projection_sha256'))
+    durable_fence = parse_protocol_v2_launch_fence(durable_context)
+    if durable_fence != fence:
+        raise ValueError('Reserved-fill request fence changed from its '
+                         'durable replica row.')
 
 
 def validate_protocol_v2_launch_resources(
@@ -865,7 +1116,9 @@ def get_kubernetes_physical_cluster_uid(
     while True:
         try:
             namespace = kubernetes.core_api(context).read_namespace(
-                'kube-system', _request_timeout=kubernetes.API_TIMEOUT)
+                'kube-system',
+                _request_timeout=kubernetes.bounded_api_call_timeout(
+                    kubernetes.API_TIMEOUT))
             metadata = getattr(namespace, 'metadata', None)
             raw_uid = getattr(metadata, 'uid', None)
             uid = raw_uid.strip() if isinstance(raw_uid, str) else ''
@@ -880,6 +1133,10 @@ def get_kubernetes_physical_cluster_uid(
                 retirement_deadline = (
                     time.monotonic() +
                     _PHYSICAL_CLUSTER_UID_FENCE_RETIREMENT_TIMEOUT_SECONDS)
+                remaining = kubernetes.remaining_api_call_budget_seconds()
+                if remaining is not None:
+                    retirement_deadline = min(retirement_deadline,
+                                              time.monotonic() + remaining)
             if busy_error.context != context:
                 lookup_error = busy_error
                 break
@@ -956,8 +1213,10 @@ def group_zero_cost_fill_pools(
 
     Pool order is the first matching task-resource position. Accelerator names
     are canonicalized case-insensitively, while locations retain their input
-    order for deterministic launch selection.  One physical context must use
-    one positive whole GPU width; separate contexts may use different widths.
+    order for deterministic launch selection. Each exact accelerator card has
+    one positive whole GPU width; different cards in the same context may use
+    different widths because physical-pool resolution splits them into
+    independent edges.
     """
     grouped: dict[str, dict[str, Any]] = {}
     for position, location in enumerate(zero_cost_locations):
@@ -983,83 +1242,218 @@ def group_zero_cost_fill_pools(
             raise ValueError('Reserved-fill Kubernetes locations require a '
                              'nonempty accelerator name.')
         exact_count = int(raw_count)
-        group = grouped.setdefault(context, {
-            'position': position,
-            'shapes': {},
-            'widths': set(),
-            'locations': [],
-        })
+        group = grouped.setdefault(
+            context, {
+                'position': position,
+                'shapes': {},
+                'accelerator_positions': {},
+                'locations': [],
+            })
+        previous_width = group['shapes'].get(normalized_name)
+        if previous_width is not None and previous_width != exact_count:
+            raise ValueError('Reserved-fill capacity requires one GPU count '
+                             'for each accelerator within a Kubernetes '
+                             f'context; context {context!r} accelerator '
+                             f'{normalized_name!r} has widths '
+                             f'{sorted((previous_width, exact_count))}.')
         group['shapes'][normalized_name] = exact_count
-        group['widths'].add(exact_count)
+        group['accelerator_positions'].setdefault(normalized_name, position)
         group['locations'].append(location)
 
     candidates: list[FillPoolCandidate] = []
     for context, group in grouped.items():
-        widths = group['widths']
-        if len(widths) != 1:
-            raise ValueError('Reserved-fill capacity requires one GPU count '
-                             'within each Kubernetes context; context '
-                             f'{context!r} has widths {sorted(widths)}.')
+        shapes = tuple(sorted(group['shapes'].items()))
         candidates.append(
             FillPoolCandidate(position=group['position'],
                               context=context,
-                              shapes=tuple(sorted(group['shapes'].items())),
-                              locations=tuple(group['locations'])))
+                              shapes=shapes,
+                              locations=tuple(group['locations']),
+                              accelerator_positions=tuple(
+                                  (name, group['accelerator_positions'][name])
+                                  for name, _ in shapes)))
+    exact_card_pool_count = sum(
+        len(candidate.shapes) for candidate in candidates)
+    if (exact_card_pool_count
+            > pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS):
+        raise ValueError(
+            'Reserved-fill capacity exceeds the bounded '
+            'Kubernetes pool count '
+            f'{pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS}.')
     return tuple(candidates)
 
 
 def resolve_fill_pool_specs(
-    candidates: tuple[FillPoolCandidate, ...],) -> tuple[FillPoolSpec, ...]:
-    """Resolve physical identities and reject later alias/overlap edges.
+    candidates: tuple[FillPoolCandidate, ...],
+    *,
+    previous_specs: tuple[FillPoolSpec, ...] = (),
+    discovery_timeout_seconds: float = (
+        pool_capacity_observer.DEFAULT_QUERY_TIMEOUT_SECONDS),
+) -> tuple[FillPoolSpec, ...]:
+    """Resolve physical identities under one bound and merge exact aliases.
 
-    A failed identity lookup removes only that candidate.  For aliases that
-    resolve to the same physical cluster and overlap in accelerator names, the
-    first task-resource position survives deterministically.
+    A transient lookup failure retains a previously proven context-to-UID edge;
+    every subsequent observation and launch still re-proves that UID through a
+    capture fence. Exact aliases become query routes on one physical pool, so a
+    broken route cannot create or blackout a competing pool identity.
     """
-    resolved: list[FillPoolSpec] = []
-    physical_accelerators: dict[str, set[str]] = {}
-    for candidate in candidates:
-        physical_uid = get_kubernetes_physical_cluster_uid(candidate.context)
+    if (isinstance(discovery_timeout_seconds, bool) or
+            not isinstance(discovery_timeout_seconds, (int, float)) or
+            not math.isfinite(float(discovery_timeout_seconds)) or
+            discovery_timeout_seconds <= 0):
+        raise ValueError('discovery_timeout_seconds must be positive.')
+    max_workers = min(len(candidates),
+                      pool_capacity_observer.DEFAULT_MAX_QUERY_WORKERS)
+    physical_uids: list[str | None] = [None] * len(candidates)
+    if max_workers == 0:
+        return ()
+    else:
+        deadline = time.monotonic() + float(discovery_timeout_seconds)
+        cancellations = [threading.Event() for _ in candidates]
+
+        def _resolve(index: int) -> str | None:
+            with kubernetes.api_call_deadline(deadline, cancellations[index]):
+                return get_kubernetes_physical_cluster_uid(
+                    candidates[index].context)
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix='serve-pool-identity')
+        futures = {
+            executor.submit(_resolve, index): index
+            for index in range(len(candidates))
+        }
+        done, pending = concurrent.futures.wait(
+            futures, timeout=max(0.0, deadline - time.monotonic()))
+        for future in done:
+            index = futures[future]
+            try:
+                physical_uids[index] = future.result()
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill physical identity discovery '
+                               f'failed for {candidates[index].context!r}: '
+                               f'{common_utils.format_exception(error)}')
+        for future in pending:
+            index = futures[future]
+            cancellations[index].set()
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    previous_by_context: dict[str, list[FillPoolSpec]] = {}
+    for spec in previous_specs:
+        if isinstance(spec, FillPoolSpec):
+            previous_by_context.setdefault(spec.context, []).append(spec)
+    for index, candidate in enumerate(candidates):
+        if physical_uids[index] is not None:
+            continue
+        prior_specs = previous_by_context.get(candidate.context, [])
+        candidate_shapes = dict(candidate.shapes)
+        matching = [
+            spec for spec in prior_specs if all(
+                candidate_shapes.get(name) == width
+                for name, width in spec.shapes)
+        ]
+        prior_uids = {spec.physical_cluster_uid for spec in matching}
+        prior_cards = {name for spec in matching for name, _ in spec.shapes}
+        if (len(prior_uids) == 1 and
+                prior_cards == set(candidate.accelerator_names)):
+            physical_uids[index] = prior_uids.pop()
+            logger.warning('Reserved-fill is retaining the last proven '
+                           f'physical UID for transiently unavailable context '
+                           f'{candidate.context!r}; its next query remains '
+                           'UID-fenced.')
+
+    # A physical pool is atomic by exact card.  This makes partial aliases
+    # composable (A / A+H / H) and keeps width-independent raw GPU evidence
+    # from being double-counted across overlapping set-valued keys.
+    resolved_by_identity: dict[tuple[str, str], FillPoolSpec] = {}
+    source_positions: dict[tuple[str, str], int] = {}
+    for candidate, physical_uid in zip(candidates, physical_uids):
         if physical_uid is None:
             logger.error('Reserved-fill pool edge for context '
                          f'{candidate.context!r} is inactive because its '
                          'physical cluster identity could not be resolved.')
             continue
-        accelerator_names = candidate.accelerator_names
-        prior_names = physical_accelerators.setdefault(physical_uid, set())
-        overlap = prior_names.intersection(accelerator_names)
-        if overlap:
-            logger.error(
-                'Reserved-fill pool edge for context '
-                f'{candidate.context!r} overlaps an earlier context alias '
-                f'on physical cluster {physical_uid!r} for accelerators '
-                f'{sorted(overlap)}; keeping the first task-resource edge.')
-            continue
-        prior_names.update(accelerator_names)
-        pool_key = reserved_capacity_broker.make_pool_key(
-            candidate.context,
-            accelerator_names,
-            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
-            physical_cluster_uid=physical_uid)
-        legacy_pool_key = reserved_capacity_broker.make_pool_key(
-            candidate.context, accelerator_names)
-        resolved.append(
-            FillPoolSpec(position=candidate.position,
-                         context=candidate.context,
-                         shapes=candidate.shapes,
-                         locations=candidate.locations,
-                         physical_cluster_uid=physical_uid,
-                         pool_key=pool_key,
-                         legacy_pool_key=legacy_pool_key))
-    return tuple(resolved)
+        for card, width in candidate.shapes:
+            identity_key = (physical_uid, card)
+            source_position = candidate.accelerator_position(card)
+            prior_spec = resolved_by_identity.get(identity_key)
+            if prior_spec is not None:
+                if prior_spec.shapes != ((card, width),):
+                    raise ValueError(
+                        'Context aliases for one physical accelerator pool '
+                        'must use the same GPUs per replica.')
+                if source_position < source_positions[identity_key]:
+                    contexts = tuple(
+                        dict.fromkeys((candidate.context,) +
+                                      prior_spec.observation_contexts))
+                    locations = tuple(
+                        location for location in candidate.locations if any(
+                            str(name).casefold() == card
+                            for name in (location.accelerators or {})))
+                    if not locations:
+                        raise ValueError(
+                            'A physical card pool has no launch location.')
+                    resolved_by_identity[identity_key] = dataclasses.replace(
+                        prior_spec,
+                        position=source_position,
+                        context=candidate.context,
+                        locations=locations,
+                        legacy_pool_key=reserved_capacity_broker.make_pool_key(
+                            candidate.context, card),
+                        observation_contexts=contexts)
+                    source_positions[identity_key] = source_position
+                else:
+                    contexts = tuple(
+                        dict.fromkeys(prior_spec.observation_contexts +
+                                      (candidate.context,)))
+                    resolved_by_identity[identity_key] = dataclasses.replace(
+                        prior_spec, observation_contexts=contexts)
+                continue
+            locations = tuple(location for location in candidate.locations
+                              if any(
+                                  str(name).casefold() == card
+                                  for name in (location.accelerators or {})))
+            if not locations:
+                raise ValueError('A physical card pool has no launch location.')
+            pool_key = reserved_capacity_broker.make_pool_key(
+                candidate.context,
+                card,
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid=physical_uid)
+            legacy_pool_key = reserved_capacity_broker.make_pool_key(
+                candidate.context, card)
+            resolved_by_identity[identity_key] = FillPoolSpec(
+                position=source_position,
+                context=candidate.context,
+                shapes=((card, width),),
+                locations=locations,
+                physical_cluster_uid=physical_uid,
+                pool_key=pool_key,
+                legacy_pool_key=legacy_pool_key,
+                observation_contexts=(candidate.context,))
+            source_positions[identity_key] = source_position
+    ordered_identities = sorted(resolved_by_identity,
+                                key=lambda identity:
+                                (source_positions[identity], identity))
+    resolved = tuple(
+        dataclasses.replace(resolved_by_identity[identity], position=position)
+        for position, identity in enumerate(ordered_identities))
+    if (len(resolved) > pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS):
+        raise ValueError(
+            'Reserved-fill capacity resolves to more than the '
+            'bounded number of physical card pools '
+            f'{pool_capacity_observation.MAX_OBSERVATION_COHORT_POOLS}.')
+    return resolved
 
 
 def discover_fill_pool_specs(
-    zero_cost_locations: list['spot_placer_lib.Location'],
+        zero_cost_locations: list['spot_placer_lib.Location'],
+        *,
+        previous_specs: tuple[FillPoolSpec, ...] = (),
 ) -> tuple[FillPoolSpec, ...]:
     """Build the ordered, physically resolved protocol-v2 pool set."""
     return resolve_fill_pool_specs(
-        group_zero_cost_fill_pools(zero_cost_locations))
+        group_zero_cost_fill_pools(zero_cost_locations),
+        previous_specs=previous_specs)
 
 
 def zero_cost_pool_shapes(
@@ -1159,13 +1553,18 @@ def query_pool_group_observation(
     shapes: dict[str, int],
     *,
     expected_physical_cluster_uid: str | None = None,
+    wait_for_initializer: bool = True,
+    raise_errors: bool = False,
 ) -> reserved_capacity_broker.PoolObservation:
     """Measure several accelerator names in one Kubernetes context query."""
     try:
-        provider_fence = (contextlib.nullcontext()
-                          if expected_physical_cluster_uid is None else
-                          kubernetes.physical_cluster_uid_fence(
-                              context, expected_physical_cluster_uid))
+        fence_kwargs = ({} if wait_for_initializer else {
+            'wait_for_initializer': False
+        })
+        provider_fence = (
+            contextlib.nullcontext() if expected_physical_cluster_uid is None
+            else kubernetes.physical_cluster_uid_fence(
+                context, expected_physical_cluster_uid, **fence_kwargs))
         with provider_fence:
             _, _, available = kubernetes_catalog.list_accelerators_realtime(
                 gpus_only=True,
@@ -1175,6 +1574,8 @@ def query_pool_group_observation(
                 case_sensitive=False,
                 require_price=False)
     except Exception as e:  # pylint: disable=broad-except
+        if raise_errors:
+            raise
         logger.warning('Reserved-capacity group poll failed for context '
                        f'{context!r}: {common_utils.format_exception(e)}')
         return reserved_capacity_broker.PoolObservation(free_slots=None)
@@ -1198,6 +1599,187 @@ def query_pool_group_observation(
         free_slots=free_slots,
         gpu_names=matched_names,
         free_slots_by_accelerator=(free_slots_by_accelerator))
+
+
+def query_pool_group_gpu_capacity(
+    context: str,
+    accelerator_names: tuple[str, ...],
+    *,
+    expected_physical_cluster_uid: str,
+) -> pool_capacity_observation.PoolCapacitySuccess:
+    """Measure raw free GPUs for one exact-card physical pool route."""
+    with kubernetes.physical_cluster_uid_fence(context,
+                                               expected_physical_cluster_uid,
+                                               wait_for_initializer=True):
+        _, _, available = kubernetes_catalog.list_accelerators_realtime(
+            gpus_only=True,
+            name_filter=None,
+            region_filter=context,
+            quantity_filter=None,
+            case_sensitive=False,
+            require_price=False)
+    available_lower: dict[str, Any] = {}
+    for gpu_name, count in available.items():
+        canonical_name = str(gpu_name).casefold()
+        if canonical_name in available_lower:
+            raise ValueError('Kubernetes exact-card availability contains a '
+                             'case-folded duplicate accelerator.')
+        available_lower[canonical_name] = count
+    requested_counts = {
+        name: available_lower.get(name, 0) for name in accelerator_names
+    }
+    for count in requested_counts.values():
+        if (not isinstance(count, bool) and isinstance(count, (int, float)) and
+                math.isfinite(float(count)) and count < 0):
+            # The realtime Kubernetes catalog uses a negative sentinel when
+            # its cluster-wide Pod read is forbidden. Preserve that typed
+            # operational diagnosis instead of collapsing it into a generic
+            # provider blackout.
+            raise pool_capacity_observer.PoolCapacityQueryFailure(
+                pool_capacity_observation.PoolCapacityBlackoutReason.
+                PERMISSION_DENIED,
+                'Kubernetes realtime accelerator availability is forbidden.')
+        if (isinstance(count, bool) or not isinstance(count, (int, float)) or
+                not math.isfinite(float(count)) or
+                not float(count).is_integer() or count < 0):
+            raise ValueError('Kubernetes exact-card availability is unknown.')
+    free_by_accelerator = {
+        name: max(0, int(count)) for name, count in requested_counts.items()
+    }
+    present_names = tuple(
+        name for name in accelerator_names if name in available_lower)
+    return pool_capacity_observation.PoolCapacitySuccess.from_counts(
+        sum(free_by_accelerator.values()),
+        free_by_accelerator,
+        present_accelerator_names=present_names)
+
+
+def query_pool_capacity_target(
+    target: pool_capacity_observer.PoolObservationTarget,
+    deadline_monotonic: float,
+) -> pool_capacity_observer.PoolCapacityQuerySuccess:
+    """Query authenticated aliases until one proves the physical pool."""
+    if not isinstance(target, pool_capacity_observer.PoolObservationTarget):
+        raise ValueError('target must be a PoolObservationTarget.')
+    if (isinstance(deadline_monotonic, bool) or
+            not isinstance(deadline_monotonic, (int, float)) or
+            not math.isfinite(float(deadline_monotonic)) or
+            time.monotonic() >= float(deadline_monotonic)):
+        raise pool_capacity_observer.PoolCapacityQueryFailure(
+            pool_capacity_observation.PoolCapacityBlackoutReason.TIMEOUT)
+    try:
+        cancellation = pool_capacity_observer.current_query_cancellation()
+    except RuntimeError:
+        # Direct diagnostic callers still receive the same hard deadline;
+        # observer workers additionally set this event at timeout.
+        cancellation = threading.Event()
+
+    failures: list[pool_capacity_observer.PoolCapacityQueryFailure] = []
+    try:
+        with kubernetes.api_call_deadline(deadline_monotonic, cancellation):
+            remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+            with provider_phase.provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED,
+                    timeout_seconds=remaining):
+                for access_context in target.access_contexts:
+                    kubernetes.raise_if_api_call_deadline_exceeded()
+                    remaining_routes = (len(target.access_contexts) -
+                                        len(failures))
+                    remaining_budget = max(
+                        0.0,
+                        float(deadline_monotonic) - time.monotonic())
+                    route_deadline = (time.monotonic() +
+                                      remaining_budget / remaining_routes)
+                    try:
+                        with kubernetes.api_call_deadline(
+                                route_deadline, cancellation):
+                            payload = query_pool_group_gpu_capacity(
+                                access_context,
+                                target.accelerator_names,
+                                expected_physical_cluster_uid=(
+                                    target.physical_cluster_uid))
+                        payload_names = tuple(
+                            name
+                            for name, _ in payload.free_gpus_by_accelerator)
+                        if payload_names != target.accelerator_names:
+                            raise pool_capacity_observer.PoolCapacityQueryFailure(
+                                pool_capacity_observation.
+                                PoolCapacityBlackoutReason.MALFORMED_RESPONSE,
+                                'Pool query did not cover the exact '
+                                'accelerator set.')
+                        return pool_capacity_observer.PoolCapacityQuerySuccess(
+                            payload=payload, access_context=access_context)
+                    except TimeoutError as error:
+                        failures.append(
+                            pool_capacity_observer.PoolCapacityQueryFailure(
+                                pool_capacity_observation.
+                                PoolCapacityBlackoutReason.TIMEOUT,
+                                common_utils.format_exception(error)))
+                    except pool_capacity_observer.PoolCapacityQueryFailure as error:
+                        failures.append(error)
+                    except exceptions.KubernetesPhysicalClusterFenceBusyError as error:
+                        failures.append(
+                            pool_capacity_observer.PoolCapacityQueryFailure(
+                                pool_capacity_observation.
+                                PoolCapacityBlackoutReason.PROVIDER_ERROR,
+                                common_utils.format_exception(error)))
+                    except exceptions.KubernetesPhysicalClusterIdentityError as error:
+                        failures.append(
+                            pool_capacity_observer.PoolCapacityQueryFailure(
+                                pool_capacity_observation.
+                                PoolCapacityBlackoutReason.
+                                PHYSICAL_IDENTITY_MISMATCH,
+                                common_utils.format_exception(error)))
+                    except Exception as error:  # pylint: disable=broad-except
+                        # Kubernetes client exceptions are imported lazily by
+                        # the adaptor. A failed alias is local to that route.
+                        status = getattr(error, 'status', None)
+                        reason = (pool_capacity_observation.
+                                  PoolCapacityBlackoutReason.PERMISSION_DENIED
+                                  if status == 403 else
+                                  pool_capacity_observation.
+                                  PoolCapacityBlackoutReason.PROVIDER_ERROR)
+                        failures.append(
+                            pool_capacity_observer.PoolCapacityQueryFailure(
+                                reason, common_utils.format_exception(error)))
+    except (TimeoutError, exceptions.ProviderPhaseTimeoutError) as error:
+        raise pool_capacity_observer.PoolCapacityQueryFailure(
+            pool_capacity_observation.PoolCapacityBlackoutReason.TIMEOUT,
+            common_utils.format_exception(error)) from error
+
+    if not failures:
+        raise pool_capacity_observer.PoolCapacityQueryFailure(
+            pool_capacity_observation.PoolCapacityBlackoutReason.PROVIDER_ERROR,
+            'No authenticated Kubernetes observation route was available.')
+    reasons = {failure.reason for failure in failures}
+    if len(reasons) == 1:
+        reason = next(iter(reasons))
+    else:
+        reason = pool_capacity_observation.PoolCapacityBlackoutReason.PROVIDER_ERROR
+    detail = '; '.join(
+        f'{target.access_contexts[index]}: {failure.detail or failure.reason.value}'
+        for index, failure in enumerate(failures))
+    raise pool_capacity_observer.PoolCapacityQueryFailure(reason, detail[:4096])
+
+
+def _query_pool_capacity_target_with_reclaim_policy(
+    observation_repository: (
+        pool_capacity_observation.PoolCapacityObservationRepository),
+    target: pool_capacity_observer.PoolObservationTarget,
+    deadline_monotonic: float,
+) -> pool_capacity_observer.PoolCapacityQuerySuccess:
+    """Require the exact local policy before a sequenced provider read."""
+    gate = observation_repository.read_reconciliation_gate()
+    if gate.sequenced_active:
+        durable_identity = gate.reclaim_policy_identity
+        if durable_identity is None:
+            raise reserved_fill_reclaim_attestation.ReclaimAttestationError(
+                'Sequenced capacity observation has no durable reclaim '
+                'policy identity.')
+        policy = reserved_fill_reclaim_attestation.require_unique_policy()
+        reserved_fill_reclaim_attestation.require_exact_policy_identity(
+            policy, durable_identity)
+    return query_pool_capacity_target(target, deadline_monotonic)
 
 
 def query_free_slots(
@@ -1472,15 +2054,15 @@ def _record_allocation_observation(
     allocation: 'reserved_capacity_broker.Allocation',
 ) -> None:
     """Record only capacity carried by a successfully published round."""
-    if (allocation.observed_free is None or
-            allocation.observed_free_by_accelerator is None or
+    if (allocation.observed_free_slots is None or
+            allocation.observed_free_slots_by_accelerator is None or
             allocation.observed_at is None):
         return
     observation = reserved_capacity_broker.PoolObservation(
-        free_slots=allocation.observed_free,
-        gpu_names=tuple(allocation.observed_free_by_accelerator),
+        free_slots=allocation.observed_free_slots,
+        gpu_names=tuple(allocation.observed_free_slots_by_accelerator),
         free_slots_by_accelerator=tuple(
-            allocation.observed_free_by_accelerator.items()))
+            allocation.observed_free_slots_by_accelerator.items()))
     _record_pool_observation(placer, locations, observation,
                              allocation.observed_at)
 
@@ -1719,6 +2301,92 @@ def _pool_capacity_hint(spec: FillPoolSpec,
     return max(holdings, previous_cap)
 
 
+def _committed_pool_fill_snapshot(
+    spec: FillPoolSpec,
+    budget: FillPoolBudget,
+    allocation: reserved_capacity_broker.Allocation | None,
+    service_generation: int,
+    worker_projection_sha256_by_accelerator: Mapping[str, str] | None,
+    repository: pool_capacity_observation.PoolCapacityObservationRepository,
+) -> reserved_fill_planner.PoolFillSnapshot | None:
+    """Bind one broker allocation to its exact committed observation.
+
+    The in-memory ``Allocation`` is not itself planner authority.  Recover the
+    provenance stored with its durable round and reconstruct the immutable
+    snapshot only when every identity, generation, digest, and epoch agrees.
+    The allocation repository rechecks this same evidence under row locks at
+    publication; this helper keeps malformed or mixed evidence out of the
+    attempted complete map in the first place.
+    """
+    if (allocation is None or
+            not isinstance(worker_projection_sha256_by_accelerator, Mapping)):
+        return None
+    if (allocation.protocol_version != reserved_capacity_broker.PROTOCOL_V2 or
+            allocation.pool_key != spec.pool_key or
+            allocation.physical_cluster_uid != spec.physical_cluster_uid or
+            allocation.service_generation != service_generation or
+            allocation.edge_cap != budget.edge_cap):
+        return None
+    grant = allocation.grant
+    if grant is None:
+        return None
+    round_row = serve_state.get_reserved_fill_round(spec.pool_key)
+    if round_row is None:
+        return None
+    observation_generation = round_row.get('observation_generation')
+    observation_sequence = round_row.get('observation_sequence')
+    observation_sha256 = round_row.get('observation_payload_sha256')
+    if (type(observation_generation) is not int or
+            observation_generation <= 0 or
+            type(observation_sequence) is not int or observation_sequence < 0 or
+            not isinstance(observation_sha256, str)):
+        return None
+    observation = repository.read_exact_completed(spec.pool_key,
+                                                  observation_generation)
+    if (observation is None or
+            not isinstance(observation.payload,
+                           pool_capacity_observation.PoolCapacitySuccess) or
+            observation.observation_sequence != observation_sequence or
+            observation.payload_sha256 != observation_sha256 or
+            observation.observed_at != allocation.snapshot_time or
+            round_row.get('epoch') != allocation.epoch):
+        return None
+    exact_feed = allocation.feed_by_accelerator
+    if exact_feed is None:
+        normalized_feed = None
+    elif isinstance(exact_feed, Mapping):
+        normalized_feed = tuple(
+            sorted((str(card).casefold(), int(count))
+                   for card, count in exact_feed.items()))
+    else:
+        return None
+    try:
+        locations = tuple(
+            reserved_fill_planner.LocationSnapshot.from_pickleable(
+                location.to_pickleable()) for location in spec.locations)
+        return reserved_fill_planner.PoolFillSnapshot(
+            protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+            pool_key=spec.pool_key,
+            physical_cluster_uid=spec.physical_cluster_uid,
+            service_generation=service_generation,
+            worker_projection_sha256_by_accelerator=tuple(
+                worker_projection_sha256_by_accelerator.items()),
+            edge_cap=budget.edge_cap,
+            broker_slot_width=allocation.broker_slot_width,
+            free_slots=allocation.feed,
+            free_slots_by_accelerator=normalized_feed,
+            grant=grant,
+            grant_epoch=allocation.epoch,
+            observation_generation=observation.observation_generation,
+            observation_sequence=observation.observation_sequence,
+            ordinary_zero_cost_admission_sequence=(
+                observation.ordinary_admission_sequence),
+            valid_until=observation.valid_until,
+            locations=locations)
+    except (TypeError, ValueError):
+        return None
+
+
 def _broker_cycle_v2(
     autoscaler: 'autoscalers.Autoscaler',
     placer: 'spot_placer_lib.SpotPlacer',
@@ -1726,10 +2394,45 @@ def _broker_cycle_v2(
     zero_cost: list['spot_placer_lib.Location'],
     expected_service_hash: str | None,
     expected_controller_owner: tuple[int | None, str | None] | None,
+    *,
+    resolved_specs: tuple[FillPoolSpec, ...] | None = None,
+    observation_repository: (
+        pool_capacity_observation.PoolCapacityObservationRepository |
+        None) = None,
+    allocation_repository: (
+        reserved_fill_allocation.ReservedFillAllocationRepository |
+        None) = None,
 ) -> None:
     """Publish and consume one atomic protocol-v2 multi-pool heartbeat."""
+    reconciliation_gate = None
     try:
-        specs = discover_fill_pool_specs(zero_cost)
+        if (observation_repository is None and
+                serve_state.get_database_engine().dialect.name == 'postgresql'):
+            observation_repository = (
+                pool_capacity_observation.PoolCapacityObservationRepository())
+        if observation_repository is not None:
+            reconciliation_gate = (
+                observation_repository.read_reconciliation_gate())
+    except (RuntimeError, ValueError) as error:
+        logger.error('Reserved-fill reconciliation authority is unavailable: '
+                     f'{common_utils.format_exception(error)}')
+        autoscaler.collect_reserved_capacity_pools({})
+        return
+    sequenced_active = bool(reconciliation_gate is not None and
+                            reconciliation_gate.sequenced_active)
+    if sequenced_active and allocation_repository is None:
+        try:
+            allocation_repository = (
+                reserved_fill_allocation.ReservedFillAllocationRepository())
+        except (RuntimeError, ValueError) as error:
+            logger.error('Reserved-fill allocation publication is '
+                         'unavailable: '
+                         f'{common_utils.format_exception(error)}')
+            autoscaler.collect_reserved_capacity_pools({})
+            return
+    try:
+        specs = (discover_fill_pool_specs(zero_cost)
+                 if resolved_specs is None else resolved_specs)
     except ValueError as error:
         logger.error('Reserved-fill protocol-v2 pool discovery rejected the '
                      f'service configuration for {service_name!r}: {error}')
@@ -1895,31 +2598,70 @@ def _broker_cycle_v2(
                     f'rejected for {service_name!r}; feeding every pool 0.')
         return
 
+    sequenced_projection_maps: dict[str, Mapping[str, str]] = {}
+    if sequenced_active:
+        committed_claim_set = serve_state.get_reserved_fill_service_claim_set(
+            service_name)
+        if (committed_claim_set is not None and
+                committed_claim_set.get('integrity_valid') and
+                committed_claim_set.get('generation') == generation):
+            for committed_edge in committed_claim_set.get('edges', []):
+                pool_key = committed_edge.get('pool_key')
+                projection_map = committed_edge.get(
+                    'worker_projection_sha256_by_accelerator')
+                if (isinstance(pool_key, str) and
+                        isinstance(projection_map, Mapping)):
+                    sequenced_projection_maps[pool_key] = projection_map
+
     snapshots: dict[str, dict[str, Any]] = {}
+    planner_snapshots: list[reserved_fill_planner.PoolFillSnapshot] = []
+    complete_planner_map = (sequenced_active and
+                            len(sequenced_projection_maps) == len(specs))
     for spec, budget in zip(specs, budgets):
 
-        def _query_pool(
-            spec: FillPoolSpec = spec
-        ) -> 'reserved_capacity_broker.PoolObservation':
-            return query_pool_group_observation(
-                spec.context,
-                dict(spec.shapes),
-                expected_physical_cluster_uid=spec.physical_cluster_uid)
-
         try:
-            # The phase precedes the broker lock and remains active through the
-            # callback's exact physical proof and allocation materialization.
-            with provider_phase.provider_phase(
-                    provider_phase.ProviderPhaseMode.V2_FENCED):
-                allocation = reserved_capacity_broker.run_round_if_stale(
-                    service_name,
-                    spec.pool_key,
-                    _query_pool,
-                    poll_interval_seconds(),
-                    expected_protocol_version=(
-                        reserved_capacity_broker.PROTOCOL_V2),
-                    expected_service_generation=generation,
-                    lock_timeout_seconds=0)
+            if sequenced_active:
+                assert observation_repository is not None
+                committed_observation = (
+                    observation_repository.read_latest_authoritative(
+                        spec.pool_key))
+                if committed_observation is None:
+                    allocation = None
+                else:
+                    allocation = (reserved_capacity_broker.
+                                  run_round_from_committed_observation(
+                                      service_name,
+                                      spec.pool_key,
+                                      committed_observation,
+                                      poll_interval_seconds(),
+                                      expected_service_generation=generation,
+                                      publish_round=(reserved_capacity_broker.
+                                                     publish_committed_round),
+                                      lock_timeout_seconds=0))
+            else:
+
+                def _query_pool(
+                    spec: FillPoolSpec = spec
+                ) -> 'reserved_capacity_broker.PoolObservation':
+                    return query_pool_group_observation(
+                        spec.context,
+                        dict(spec.shapes),
+                        expected_physical_cluster_uid=(
+                            spec.physical_cluster_uid))
+
+                # LEGACY_ACTIVE retains one bounded compatibility path until
+                # the fleet-wide one-way gate selects committed evidence.
+                with provider_phase.provider_phase(
+                        provider_phase.ProviderPhaseMode.V2_FENCED):
+                    allocation = reserved_capacity_broker.run_round_if_stale(
+                        service_name,
+                        spec.pool_key,
+                        _query_pool,
+                        poll_interval_seconds(),
+                        expected_protocol_version=(
+                            reserved_capacity_broker.PROTOCOL_V2),
+                        expected_service_generation=generation,
+                        lock_timeout_seconds=0)
         except Exception as error:  # pylint: disable=broad-except
             # One pool's transient database/lock path must not suppress a
             # healthy peer edge in this same complete-map publication.
@@ -1931,6 +2673,16 @@ def _broker_cycle_v2(
             # Every controller consumes the committed round, including peers
             # whose fresh-round path deliberately skipped `_query_pool`.
             _record_allocation_observation(placer, spec.locations, allocation)
+        if sequenced_active:
+            assert observation_repository is not None
+            planner_snapshot = _committed_pool_fill_snapshot(
+                spec, budget, allocation, generation,
+                sequenced_projection_maps.get(spec.pool_key),
+                observation_repository)
+            if planner_snapshot is None:
+                complete_planner_map = False
+            else:
+                planner_snapshots.append(planner_snapshot)
         # A lock timeout or other transient round miss must not cull existing
         # fill from this one pool. Carry only the last real grant from the
         # same physical pool as scale-down shelter, including across a forward
@@ -1962,10 +2714,124 @@ def _broker_cycle_v2(
             'timestamp': now
                          if allocation is None else allocation.snapshot_time,
         }
+    if complete_planner_map:
+        assert allocation_repository is not None
+        assert reconciliation_gate is not None
+        if (not isinstance(expected_service_hash, str) or
+                not expected_service_hash or expected_controller_owner is None):
+            logger.error('Reserved-fill sequenced allocation requires one '
+                         'exact service/controller owner fence.')
+        else:
+            try:
+                published_map = allocation_repository.publish(
+                    service_name,
+                    expected_service_hash=expected_service_hash,
+                    expected_controller_owner=expected_controller_owner,
+                    expected_claim_generation=generation,
+                    expected_gate_generation=(reconciliation_gate.generation),
+                    pool_snapshots=tuple(planner_snapshots))
+                if published_map is None:
+                    logger.info('Reserved-fill allocation publication lost '
+                                'its service, claim, gate, or observation '
+                                'fence; planner authority remains unchanged.')
+            except (reserved_fill_allocation.ReservedFillAllocationError,
+                    TypeError, ValueError) as error:
+                logger.warning('Reserved-fill allocation publication failed '
+                               'closed: '
+                               f'{common_utils.format_exception(error)}')
     autoscaler.collect_reserved_capacity_pools(snapshots)
     logger.info('Reserved-fill broker: published service generation '
                 f'{generation} with {len(snapshots)} physical pool(s) for '
                 f'{service_name!r}.')
+
+
+def _service_owner_matches(
+    service_name: str | None,
+    expected_service_hash: str | None,
+    expected_controller_owner: tuple[int | None, str | None] | None,
+) -> bool:
+    """Return whether this poller still owns the exact service incarnation."""
+    if service_name is None or expected_service_hash is None:
+        return True
+    owner = serve_state.get_service_controller_owner(service_name)
+    current_owner = ((owner.get('controller_pid'),
+                      owner.get('controller_ip')) if owner else None)
+    return bool(owner is not None and
+                owner.get('hash') == expected_service_hash and
+                (expected_controller_owner is None or
+                 current_owner == expected_controller_owner))
+
+
+def _observation_targets(
+    specs: tuple[FillPoolSpec, ...],
+) -> tuple[pool_capacity_observer.PoolObservationTarget, ...]:
+    """Project physical pools with every current authenticated query route."""
+    claim_routes: dict[str, set[str]] = {}
+    try:
+        for row in serve_state.get_authoritative_reserved_fill_claims():
+            pool_key = row.get('pool_key')
+            context = row.get('access_context')
+            physical_uid = row.get('physical_cluster_uid')
+            if (not isinstance(pool_key, str) or not isinstance(context, str) or
+                    not context):
+                continue
+            try:
+                identity = reserved_capacity_broker.parse_pool_identity(
+                    pool_key)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (identity.protocol_version
+                    != reserved_capacity_broker.PROTOCOL_V2 or
+                    identity.physical_cluster_uid != physical_uid):
+                continue
+            claim_routes.setdefault(pool_key, set()).add(context)
+    except Exception as error:  # pylint: disable=broad-except
+        # Configured and last-proven routes remain available. A transient peer
+        # claim read must not erase them or invent a blackout by itself.
+        logger.warning('Reserved-fill observation routes could not read peer '
+                       f'claims: {common_utils.format_exception(error)}')
+
+    targets = []
+    for spec in specs:
+        contexts = list(spec.observation_contexts)
+        contexts.extend(
+            sorted(claim_routes.get(spec.pool_key, set()).difference(contexts)))
+        if (len(contexts)
+                > pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL):
+            logger.warning(
+                'Reserved-fill physical pool has more authenticated '
+                'aliases than one bounded observation can query; '
+                f'using the first '
+                f'{pool_capacity_observer.MAX_OBSERVATION_ROUTES_PER_POOL}.')
+            contexts = contexts[:pool_capacity_observer.
+                                MAX_OBSERVATION_ROUTES_PER_POOL]
+        targets.append(
+            pool_capacity_observer.PoolObservationTarget(
+                pool_key=spec.pool_key,
+                physical_cluster_uid=spec.physical_cluster_uid,
+                access_contexts=tuple(contexts),
+                accelerator_names=spec.accelerator_names))
+    return tuple(targets)
+
+
+def _open_observation_repository(
+) -> pool_capacity_observation.PoolCapacityObservationRepository | None:
+    """Open the PostgreSQL-only observation repository when available."""
+    try:
+        if serve_state.get_database_engine().dialect.name != 'postgresql':
+            return None
+        return pool_capacity_observation.PoolCapacityObservationRepository()
+    except (RuntimeError, ValueError) as error:
+        logger.error('Reserved-fill observation authority is unavailable: '
+                     f'{common_utils.format_exception(error)}')
+        return None
+
+
+def _poller_fixed_rate_deadline(previous_deadline: float, now: float,
+                                interval: float) -> float:
+    """Advance one fixed-rate tick and coalesce missed periods."""
+    candidate = previous_deadline + interval
+    return now if candidate <= now else candidate
 
 
 def poller_loop(
@@ -1976,19 +2842,26 @@ def poller_loop(
     expected_controller_owner: tuple[int | None, str | None] | None = None,
     stop_event: threading.Event | None = None,
     actuation_epoch_lock: contextlib.AbstractContextManager[Any] | None = None,
+    get_actuation_generation: Callable[[], int] | None = None,
+    actuation_generation_is_current: Callable[[int], bool] | None = None,
+    notify_reconcile: Callable[[], Any] | None = None,
 ) -> None:
-    """Poll free zero-cost capacity forever, feeding the autoscaler.
+    """Observe at fixed rate and reconcile committed capacity evidence.
 
-    Runs as a supervised thread started by the controller (only when the
-    service opted in AND a spot placer exists -- the placer defines the
-    zero-cost location set). Takes getters, not the live objects: an
-    update_service can replace the controller's autoscaler, and the
-    snapshot must reach the current one.
-
-    service_name enables broker arbitration (the controller always passes
-    it); None preserves the standalone pre-broker cycle for direct callers
-    and tests.
+    Provider reads run outside the controller actuation lock.  A stable
+    actuation-generation token is revalidated inside a short commit fence
+    before any resulting broker state reaches the live autoscaler.  Callers
+    without generation callbacks retain the transition-compatible serialized
+    behavior; the stacked cleanup removes that compatibility branch after all
+    controller images use generation fencing.
     """
+    callbacks_are_paired = ((get_actuation_generation
+                             is None) == (actuation_generation_is_current
+                                          is None))
+    if not callbacks_are_paired:
+        raise ValueError('Actuation generation capture and validation must be '
+                         'configured together.')
+
     # Whether a broker claim of ours may exist. Starts True: a previous
     # incarnation of this controller may have left one behind (respawn),
     # so the first disabled observation still clears it. Reset to True
@@ -1999,87 +2872,214 @@ def poller_loop(
         fence_kwargs['expected_service_hash'] = expected_service_hash
     if expected_controller_owner is not None:
         fence_kwargs['expected_controller_owner'] = expected_controller_owner
-    while stop_event is None or not stop_event.is_set():
-        epoch_context = (actuation_epoch_lock if actuation_epoch_lock
-                         is not None else contextlib.nullcontext())
-        with epoch_context:
-            # An update may have set the irreversible fence while this poller
-            # waited behind an autoscaler/update epoch. Never begin provider or
-            # durable broker work after that transition.
-            if stop_event is not None and stop_event.is_set():
-                return
-            try:
-                if (service_name is not None and
-                        expected_service_hash is not None):
-                    owner = serve_state.get_service_controller_owner(
-                        service_name)
-                    current_owner = ((owner.get('controller_pid'),
-                                      owner.get('controller_ip'))
-                                     if owner else None)
-                    if (owner is None or
-                            owner.get('hash') != expected_service_hash or
-                        (expected_controller_owner is not None and
-                         current_owner != expected_controller_owner)):
+    observation_repository = None
+    allocation_repository = None
+    observation_worker = None
+    last_resolved_specs: tuple[FillPoolSpec, ...] = ()
+    deadline = time.monotonic()
+    try:
+        while stop_event is None or not stop_event.is_set():
+            # The fallback holds the historical broad lock only for callers
+            # that do not yet expose a generation fence. Production
+            # controllers use the provider-free path below.
+            broad_epoch = (
+                actuation_epoch_lock if get_actuation_generation is None and
+                actuation_epoch_lock is not None else contextlib.nullcontext())
+            with broad_epoch:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                try:
+                    captured_generation = (get_actuation_generation()
+                                           if get_actuation_generation
+                                           is not None else None)
+                    if (captured_generation is not None and
+                            actuation_generation_is_current is not None and
+                            not actuation_generation_is_current(
+                                captured_generation)):
+                        # An update owns the odd generation.  Do not begin a
+                        # provider read that could never be committed.
+                        continue_cycle = True
+                    else:
+                        continue_cycle = False
+
+                    if not continue_cycle and not _service_owner_matches(
+                            service_name, expected_service_hash,
+                            expected_controller_owner):
                         logger.info(
                             f'Reserved-capacity poller for stale service owner '
                             f'{service_name!r}/{expected_service_hash!r}/'
                             f'{expected_controller_owner!r} is exiting.')
                         return
-                placer = get_spot_placer()
-                # An update can turn the flag off on the live autoscaler; the
-                # thread stays alive (a later update can re-enable it) but
-                # must not keep issuing the expensive cluster-wide pod-listing
-                # query for a snapshot nobody consumes.
-                autoscaler = get_autoscaler()
-                fill_enabled = autoscaler.reserved_capacity_fill
-                if placer is not None and fill_enabled:
-                    zero_cost = placer.zero_cost_locations()
-                    keys: list[dict[str, Any]] = [
-                        location.to_pickleable() for location in zero_cost
-                    ]
-                    if service_name is None:
-                        _standalone_cycle(autoscaler, zero_cost, keys)
-                    else:
-                        # Set BEFORE the cycle: it upserts the claim partway
-                        # through, and an exception after that upsert (e.g.
-                        # the round query) must still leave the flag true --
-                        # otherwise a subsequent disable would skip
-                        # remove_claim and leave a ghost claim absorbing
-                        # entitlement for the whole claim TTL.
-                        claim_may_exist = True
-                        protocol_version = (
-                            reserved_capacity_broker.get_protocol_version())
-                        if (protocol_version ==
-                                reserved_capacity_broker.PROTOCOL_V2):
-                            _broker_cycle_v2(autoscaler, placer, service_name,
-                                             zero_cost, expected_service_hash,
-                                             expected_controller_owner)
+
+                    placer = get_spot_placer()
+                    autoscaler = get_autoscaler()
+                    fill_enabled = autoscaler.reserved_capacity_fill
+                    did_reconcile = False
+                    if (not continue_cycle and placer is not None and
+                            fill_enabled):
+                        zero_cost = placer.zero_cost_locations()
+                        keys: list[dict[str, Any]] = [
+                            location.to_pickleable() for location in zero_cost
+                        ]
+                        if service_name is None:
+                            _standalone_cycle(autoscaler, zero_cost, keys)
+                            did_reconcile = True
                         else:
-                            _broker_cycle(autoscaler, placer, service_name,
-                                          zero_cost, keys,
-                                          expected_service_hash,
-                                          expected_controller_owner)
-                elif service_name is not None and claim_may_exist:
-                    # Fill turned off (or the placer is gone): withdraw the
-                    # claim NOW instead of leaving peers arbitrating around a
-                    # ghost for the whole claim TTL. Once per disable
-                    # transition (idempotent; also drops our cached
-                    # allocation), not re-spammed every cycle.
-                    try:
-                        reserved_capacity_broker.remove_claim(
-                            service_name, **fence_kwargs)
-                    finally:
-                        # Claim removal is a hard lifecycle boundary for local
-                        # shelter too. If the durable write fails, the next
-                        # poll retries it, but a later re-enable must never
-                        # inherit shelter from the deliberately withdrawn edge.
-                        autoscaler.collect_reserved_capacity_pools({})
-                    claim_may_exist = False
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error('Error in reserved-capacity poller: '
-                             f'{common_utils.format_exception(e)}')
-        interval = poll_interval_seconds()
-        if stop_event is None:
-            time.sleep(interval)
-        elif stop_event.wait(interval):
-            return
+                            # Set before any claim-set write. A later failure
+                            # must still make a disable withdraw the possible
+                            # partial lifecycle.
+                            claim_may_exist = True
+                            protocol_version = (
+                                reserved_capacity_broker.get_protocol_version())
+                            if (protocol_version
+                                    == reserved_capacity_broker.PROTOCOL_V2 and
+                                    captured_generation is not None):
+                                try:
+                                    specs = discover_fill_pool_specs(
+                                        zero_cost,
+                                        previous_specs=last_resolved_specs)
+                                    last_resolved_specs = specs
+                                except ValueError as error:
+                                    logger.error(
+                                        'Reserved-fill protocol-v2 pool '
+                                        'discovery rejected the service '
+                                        f'configuration for {service_name!r}: '
+                                        f'{error}')
+                                    specs = ()
+
+                                if observation_repository is None:
+                                    observation_repository = (
+                                        _open_observation_repository())
+                                if (observation_repository is not None and
+                                        allocation_repository is None):
+                                    try:
+                                        allocation_repository = (
+                                            reserved_fill_allocation.
+                                            ReservedFillAllocationRepository())
+                                    except (RuntimeError, ValueError) as error:
+                                        logger.error(
+                                            'Reserved-fill allocation '
+                                            'authority is unavailable: '
+                                            f'{common_utils.format_exception(error)}'
+                                        )
+                                if (observation_repository is not None and
+                                        observation_worker is None):
+                                    observation_worker = (
+                                        pool_capacity_observer.
+                                        PoolCapacityObserver(
+                                            observation_repository,
+                                            lambda target, deadline:
+                                            (_query_pool_capacity_target_with_reclaim_policy(
+                                                observation_repository, target,
+                                                deadline)),
+                                            publish=(None if notify_reconcile
+                                                     is None else lambda _row:
+                                                     notify_reconcile()),
+                                            interval_seconds=(
+                                                poll_interval_seconds()),
+                                            authority_horizon_seconds=
+                                            (poll_interval_seconds() *
+                                             constants.
+                                             RESERVED_CAPACITY_STALE_AFTER_INTERVALS
+                                            )))
+                                if observation_worker is not None:
+                                    # UID discovery and every Kubernetes read
+                                    # occur outside the actuation epoch lock.
+                                    observation_worker.observe_once(
+                                        _observation_targets(specs))
+
+                                commit_epoch = (actuation_epoch_lock if
+                                                actuation_epoch_lock is not None
+                                                else contextlib.nullcontext())
+                                with commit_epoch:
+                                    generation_is_current = (
+                                        actuation_generation_is_current
+                                        is not None and
+                                        actuation_generation_is_current(
+                                            captured_generation))
+                                    live_objects_match = (
+                                        get_autoscaler() is autoscaler and
+                                        get_spot_placer() is placer and
+                                        autoscaler.reserved_capacity_fill)
+                                    if (generation_is_current and
+                                            live_objects_match and
+                                            _service_owner_matches(
+                                                service_name,
+                                                expected_service_hash,
+                                                expected_controller_owner)):
+                                        _broker_cycle_v2(
+                                            autoscaler,
+                                            placer,
+                                            service_name,
+                                            zero_cost,
+                                            expected_service_hash,
+                                            expected_controller_owner,
+                                            resolved_specs=specs,
+                                            observation_repository=(
+                                                observation_repository),
+                                            allocation_repository=(
+                                                allocation_repository))
+                                        did_reconcile = True
+                                    else:
+                                        logger.info(
+                                            'Reserved-capacity observation '
+                                            'completed across an update epoch; '
+                                            'its durable evidence is retained '
+                                            'but this stale service view did '
+                                            'not publish a claim or plan.')
+                            elif (protocol_version ==
+                                  reserved_capacity_broker.PROTOCOL_V2):
+                                # Transition-only fallback for direct callers
+                                # without generation fencing.
+                                _broker_cycle_v2(autoscaler, placer,
+                                                 service_name, zero_cost,
+                                                 expected_service_hash,
+                                                 expected_controller_owner)
+                                did_reconcile = True
+                            else:
+                                _broker_cycle(autoscaler, placer, service_name,
+                                              zero_cost, keys,
+                                              expected_service_hash,
+                                              expected_controller_owner)
+                                did_reconcile = True
+                    elif (not continue_cycle and service_name is not None and
+                          claim_may_exist):
+                        commit_epoch = (actuation_epoch_lock
+                                        if captured_generation is not None and
+                                        actuation_epoch_lock is not None else
+                                        contextlib.nullcontext())
+                        with commit_epoch:
+                            generation_is_current = (
+                                captured_generation is None or
+                                (actuation_generation_is_current is not None and
+                                 actuation_generation_is_current(
+                                     captured_generation)))
+                            if generation_is_current:
+                                try:
+                                    reserved_capacity_broker.remove_claim(
+                                        service_name, **fence_kwargs)
+                                finally:
+                                    # Claim removal is a hard lifecycle
+                                    # boundary for local shelter as well.
+                                    autoscaler.collect_reserved_capacity_pools(
+                                        {})
+                                claim_may_exist = False
+                                did_reconcile = True
+
+                    if did_reconcile and notify_reconcile is not None:
+                        notify_reconcile()
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.error('Error in reserved-capacity poller: '
+                                 f'{common_utils.format_exception(error)}')
+
+            interval = poll_interval_seconds()
+            now = time.monotonic()
+            deadline = _poller_fixed_rate_deadline(deadline, now, interval)
+            delay = max(0.0, deadline - now)
+            if stop_event is None:
+                time.sleep(delay)
+            elif stop_event.wait(delay):
+                return
+    finally:
+        if observation_worker is not None:
+            observation_worker.close()

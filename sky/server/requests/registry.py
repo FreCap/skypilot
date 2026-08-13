@@ -218,36 +218,15 @@ def register_builtin_handlers() -> None:
         try:
             for module_name in _BUILTIN_HANDLER_MODULES:
                 _register_module_handlers(module_name)
-            _register_daemon_handlers()
             _register_payload_types()
             _BUILTINS_REGISTERED = True
         finally:
             _BUILTINS_REGISTRATION_IN_PROGRESS = False
 
 
-def _register_daemon_handlers() -> None:
-    # Import lazily to avoid requests -> registry -> daemons -> requests at
-    # module import time.
-    from sky.server import daemons  # pylint: disable=import-outside-toplevel
-
-    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
-        register_handler(
-            daemon.run_event,
-            name=f'daemon:{daemon.id}',
-            execution_class=ExecutionClass.CONTROLLER,
-            replay_policy=ReplayPolicy.RECONCILE,
-        )
-
-
 def registration_for_handler(func: Callable[..., Any]) -> HandlerRegistration:
     """Return registered metadata for a callable used by a request."""
     register_builtin_handlers()
-    daemon = getattr(func, '__self__', None)
-    daemon_id = getattr(daemon, 'id', None)
-    if (daemon_id is not None and
-            daemon.__class__.__module__ == 'sky.server.daemons' and
-            daemon.__class__.__name__ == 'InternalRequestDaemon'):
-        return resolve_handler(f'daemon:{daemon_id}')
     with _REGISTRY_LOCK:
         name = _HANDLER_NAMES_BY_IDENTITY.get(id(func))
         if name is not None:

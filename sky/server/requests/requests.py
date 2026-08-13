@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
+import math
 import os
 import pathlib
 import shutil
@@ -28,11 +29,11 @@ from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.container_images import errors as container_image_errors
 from sky.metrics import utils as metrics_lib
 from sky.server import common as server_common
 from sky.server import constants as server_constants
-from sky.server import daemons
 from sky.server import versions
 from sky.server.blob import blob_storage as bs
 from sky.server.requests import cutover as request_cutover
@@ -44,7 +45,6 @@ from sky.server.requests import storage as request_storage
 from sky.server.requests.serializers import decoders
 from sky.server.requests.serializers import encoders
 from sky.server.requests.serializers import return_value_serializers
-from sky.skylet import constants as skylet_constants
 from sky.utils import asyncio_utils
 from sky.utils import common_utils
 from sky.utils import status_lib
@@ -52,6 +52,7 @@ from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
+managed_job_state = adaptors_common.LazyImport('sky.jobs.state')
 
 _ErrorT = TypeVar('_ErrorT', bound=BaseException)
 
@@ -290,13 +291,50 @@ REQUEST_COLUMNS = [
     COL_FILE_MOUNTS_BLOB_ID,
     COL_IGNORE_RETURN_VALUE,
     COL_RETRYABLE,
-]
-REQUEST_QUERY_FIELDS = frozenset(REQUEST_COLUMNS) | frozenset({
+    # Local SQLite persists the same immutable managed-job origin and exact
+    # execution-boundary receipt used by the PostgreSQL backend.  These are
+    # server-internal columns, never fields of RequestPayload.
     'execution_generation',
+    'managed_job_id',
+    'managed_job_controller_instance_id',
+    'managed_job_controller_generation',
+    'managed_job_controller_slot_id',
+    'managed_job_controller_slot_attempt',
+    'execution_process_start_time_ticks',
     'execution_quiescence_required',
     'execution_quiesced_generation',
     'execution_quiesced_at',
-})
+]
+REQUEST_QUERY_FIELDS = frozenset(REQUEST_COLUMNS)
+
+_SQLITE_INTERNAL_REQUEST_FIELDS = (
+    COL_IGNORE_RETURN_VALUE,
+    COL_RETRYABLE,
+    'execution_generation',
+    'managed_job_id',
+    'managed_job_controller_instance_id',
+    'managed_job_controller_generation',
+    'managed_job_controller_slot_id',
+    'managed_job_controller_slot_attempt',
+    'execution_process_start_time_ticks',
+    'execution_quiescence_required',
+    'execution_quiesced_generation',
+    'execution_quiesced_at',
+)
+_SQLITE_INTERNAL_REQUEST_DEFAULTS: dict[str, Any] = {
+    COL_IGNORE_RETURN_VALUE: False,
+    COL_RETRYABLE: False,
+    'execution_generation': 0,
+    'managed_job_id': None,
+    'managed_job_controller_instance_id': None,
+    'managed_job_controller_generation': None,
+    'managed_job_controller_slot_id': None,
+    'managed_job_controller_slot_attempt': None,
+    'execution_process_start_time_ticks': None,
+    'execution_quiescence_required': False,
+    'execution_quiesced_generation': None,
+    'execution_quiesced_at': None,
+}
 
 # Scalar projections avoid decoding the durable request payload.  This is an
 # internal persistence interface, not the public status contract below.
@@ -314,6 +352,7 @@ SCALAR_REQUEST_QUERY_FIELDS = (
     COL_FINISHED_AT,
     COL_FILE_MOUNTS_BLOB_ID,
     'execution_generation',
+    'execution_process_start_time_ticks',
     'execution_quiescence_required',
     'execution_quiesced_generation',
     'execution_quiesced_at',
@@ -401,6 +440,16 @@ class Request:
     claim_token: str | None = None
     worker_instance_id: str | None = None
     controller_generation: int | None = None
+    # Immutable internal origin for work submitted by one exact managed-job
+    # controller attempt.  The complete tuple is persisted on the nested
+    # request so queue claim and RUNNING admission can fence stale work even
+    # after the originating ControllerManager process exits.
+    managed_job_id: int | None = None
+    managed_job_controller_instance_id: str | None = None
+    managed_job_controller_generation: int | None = None
+    managed_job_controller_slot_id: int | None = None
+    managed_job_controller_slot_attempt: str | None = None
+    execution_process_start_time_ticks: int | None = None
     lease_expires_at: float | None = None
     heartbeat_at: float | None = None
     cancel_requested_at: float | None = None
@@ -508,6 +557,17 @@ class Request:
             'claim_token': self.claim_token,
             'worker_instance_id': self.worker_instance_id,
             'controller_generation': self.controller_generation,
+            'managed_job_id': self.managed_job_id,
+            'managed_job_controller_instance_id':
+                self.managed_job_controller_instance_id,
+            'managed_job_controller_generation':
+                self.managed_job_controller_generation,
+            'managed_job_controller_slot_id':
+                self.managed_job_controller_slot_id,
+            'managed_job_controller_slot_attempt':
+                self.managed_job_controller_slot_attempt,
+            'execution_process_start_time_ticks':
+                self.execution_process_start_time_ticks,
             'lease_expires_at': self.lease_expires_at,
             'heartbeat_at': self.heartbeat_at,
             'cancel_requested_at': self.cancel_requested_at,
@@ -575,6 +635,28 @@ class Request:
             controller_generation=(int(values['controller_generation'])
                                    if values.get('controller_generation')
                                    is not None else None),
+            managed_job_id=(int(values['managed_job_id']) if
+                            values.get('managed_job_id') is not None else None),
+            managed_job_controller_instance_id=(
+                str(values['managed_job_controller_instance_id'])
+                if values.get('managed_job_controller_instance_id') is not None
+                else None),
+            managed_job_controller_generation=(
+                int(values['managed_job_controller_generation'])
+                if values.get('managed_job_controller_generation') is not None
+                else None),
+            managed_job_controller_slot_id=(
+                int(values['managed_job_controller_slot_id'])
+                if values.get('managed_job_controller_slot_id') is not None else
+                None),
+            managed_job_controller_slot_attempt=(
+                str(values['managed_job_controller_slot_attempt'])
+                if values.get('managed_job_controller_slot_attempt') is not None
+                else None),
+            execution_process_start_time_ticks=(
+                int(values['execution_process_start_time_ticks'])
+                if values.get('execution_process_start_time_ticks') is not None
+                else None),
             lease_expires_at=values.get('lease_expires_at'),
             heartbeat_at=values.get('heartbeat_at'),
             cancel_requested_at=values.get('cancel_requested_at'),
@@ -600,11 +682,31 @@ class Request:
         # The enqueue flags are server-internal DB columns that are not part
         # of RequestPayload; pop them and set them on the decoded request.
         # NULL (a row written by an older server) coerces to False.
-        ignore_return_value = bool(content.pop(COL_IGNORE_RETURN_VALUE, None))
-        retryable = bool(content.pop(COL_RETRYABLE, None))
+        internal = {
+            field: content.pop(field, _SQLITE_INTERNAL_REQUEST_DEFAULTS[field])
+            for field in _SQLITE_INTERNAL_REQUEST_FIELDS
+        }
         request = cls.decode(payloads.RequestPayload(**content))
-        request.ignore_return_value = ignore_return_value
-        request.retryable = retryable
+        request.ignore_return_value = bool(internal[COL_IGNORE_RETURN_VALUE])
+        request.retryable = bool(internal[COL_RETRYABLE])
+        request.execution_generation = int(internal['execution_generation'] or
+                                           0)
+        request.managed_job_id = internal['managed_job_id']
+        request.managed_job_controller_instance_id = internal[
+            'managed_job_controller_instance_id']
+        request.managed_job_controller_generation = internal[
+            'managed_job_controller_generation']
+        request.managed_job_controller_slot_id = internal[
+            'managed_job_controller_slot_id']
+        request.managed_job_controller_slot_attempt = internal[
+            'managed_job_controller_slot_attempt']
+        request.execution_process_start_time_ticks = internal[
+            'execution_process_start_time_ticks']
+        request.execution_quiescence_required = bool(
+            internal['execution_quiescence_required'])
+        request.execution_quiesced_generation = internal[
+            'execution_quiesced_generation']
+        request.execution_quiesced_at = internal['execution_quiesced_at']
         return request
 
     def to_row(self) -> tuple[Any, ...]:
@@ -615,10 +717,12 @@ class Request:
         payload.status = self.status.value
         row: list[Any] = []
         for k in REQUEST_COLUMNS:
-            if k == COL_IGNORE_RETURN_VALUE:
-                row.append(int(self.ignore_return_value))
-            elif k == COL_RETRYABLE:
-                row.append(int(self.retryable))
+            if k in _SQLITE_INTERNAL_REQUEST_FIELDS:
+                value = getattr(self, k)
+                if k in (COL_IGNORE_RETURN_VALUE, COL_RETRYABLE,
+                         'execution_quiescence_required'):
+                    value = int(bool(value))
+                row.append(value)
             else:
                 row.append(getattr(payload, k))
         return tuple(row)
@@ -684,6 +788,35 @@ class Request:
             schedule_type_cls=ScheduleType,
             logger=logger,
         )
+
+
+def _sqlite_managed_job_origin(
+    request: Request,) -> tuple[int, str, int, int, str] | None:
+    """Decode and validate the immutable local managed-job request origin."""
+    raw = (request.managed_job_id, request.managed_job_controller_instance_id,
+           request.managed_job_controller_generation,
+           request.managed_job_controller_slot_id,
+           request.managed_job_controller_slot_attempt)
+    if all(value is None for value in raw):
+        return None
+    if any(value is None for value in raw):
+        raise ValueError('Managed-job request origin is incomplete.')
+    job_id, instance_id, generation, slot_id, attempt = raw
+    if (not isinstance(job_id, int) or isinstance(job_id, bool) or
+            job_id <= 0 or not isinstance(generation, int) or
+            isinstance(generation, bool) or generation <= 0 or
+            not isinstance(slot_id, int) or isinstance(slot_id, bool) or
+            slot_id < 0 or not isinstance(instance_id, str) or
+            not isinstance(attempt, str)):
+        raise ValueError('Managed-job request origin is malformed.')
+    try:
+        canonical_instance_id = str(uuid.UUID(instance_id))
+        canonical_attempt = str(uuid.UUID(attempt))
+    except ValueError as e:
+        raise ValueError('Managed-job request origin is malformed.') from e
+    if canonical_instance_id != instance_id or canonical_attempt != attempt:
+        raise ValueError('Managed-job request origin is not canonical.')
+    return job_id, instance_id, generation, slot_id, attempt
 
 
 def get_new_request_id() -> str:
@@ -756,10 +889,9 @@ def _update_request_row_fields(
         content['finished_at'] = None
     if COL_FILE_MOUNTS_BLOB_ID not in fields:
         content[COL_FILE_MOUNTS_BLOB_ID] = None
-    if COL_IGNORE_RETURN_VALUE not in fields:
-        content[COL_IGNORE_RETURN_VALUE] = False
-    if COL_RETRYABLE not in fields:
-        content[COL_RETRYABLE] = False
+    for field, default in _SQLITE_INTERNAL_REQUEST_DEFAULTS.items():
+        if field not in fields:
+            content[field] = default
 
     # Convert back to tuple in the same order as REQUEST_COLUMNS
     return tuple(content[col] for col in REQUEST_COLUMNS)
@@ -802,7 +934,17 @@ def create_table(cursor, conn):
         {COL_SHOULD_RETRY} INTEGER,
         {COL_FINISHED_AT} REAL,
         {COL_IGNORE_RETURN_VALUE} INTEGER,
-        {COL_RETRYABLE} INTEGER
+        {COL_RETRYABLE} INTEGER,
+        execution_generation INTEGER NOT NULL DEFAULT 0,
+        managed_job_id INTEGER,
+        managed_job_controller_instance_id TEXT,
+        managed_job_controller_generation INTEGER,
+        managed_job_controller_slot_id INTEGER,
+        managed_job_controller_slot_attempt TEXT,
+        execution_process_start_time_ticks INTEGER,
+        execution_quiescence_required INTEGER NOT NULL DEFAULT 0,
+        execution_quiesced_generation INTEGER,
+        execution_quiesced_at REAL
         )""")
 
     db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_STATUS_MSG,
@@ -817,6 +959,29 @@ def create_table(cursor, conn):
                                  COL_IGNORE_RETURN_VALUE, 'INTEGER')
     db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_RETRYABLE,
                                  'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'execution_generation',
+                                 'INTEGER NOT NULL DEFAULT 0')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, 'managed_job_id',
+                                 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'managed_job_controller_instance_id', 'TEXT')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'managed_job_controller_generation', 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'managed_job_controller_slot_id', 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'managed_job_controller_slot_attempt', 'TEXT')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'execution_process_start_time_ticks',
+                                 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'execution_quiescence_required',
+                                 'INTEGER NOT NULL DEFAULT 0')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'execution_quiesced_generation', 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 'execution_quiesced_at', 'REAL')
 
     # Add an index on (status, name) to speed up queries
     # that filter on these columns.
@@ -836,6 +1001,9 @@ def create_table(cursor, conn):
     # GC, which repeatedly queries finished requests older than the retention.
     cursor.execute(f"""\
         CREATE INDEX IF NOT EXISTS finished_at_idx ON {REQUEST_TABLE} ({COL_FINISHED_AT}) WHERE status IN ('SUCCEEDED', 'FAILED', 'CANCELLED');
+    """)
+    cursor.execute(f"""\
+        CREATE INDEX IF NOT EXISTS managed_job_origin_idx ON {REQUEST_TABLE} (managed_job_controller_instance_id, managed_job_controller_generation, managed_job_controller_slot_id, managed_job_controller_slot_attempt) WHERE managed_job_id IS NOT NULL;
     """)
 
 
@@ -942,13 +1110,6 @@ def _log_orphaned_inflight_requests() -> None:
         logger.debug('Could not scan for orphaned in-flight requests during '
                      f'API server startup (continuing): {e}')
         return
-    # Internal daemon requests sit in RUNNING for the whole life of the
-    # server and are recreated on every startup, so their rows are not
-    # dropped work; skip them like the other kill paths do.
-    orphaned = [
-        req for req in orphaned
-        if not daemons.is_daemon_request_id(req.request_id)
-    ]
     if not orphaned:
         return
     logger.warning(
@@ -1099,9 +1260,6 @@ def _recover_requests() -> tuple[int, int]:
     All executor processes died with the previous server, so no recovered
     row has a live worker. Reconcile each non-terminal row:
 
-    - Internal daemon rows are deleted: a stale row would make
-      ``schedule_internal_daemon_async``'s create-or-refresh path skip the
-      enqueue and the daemon would never run this boot.
     - Interrupted launch rows whose cluster is still INIT are flipped back
       to PENDING for re-execution
       (``_find_interrupted_launches_to_requeue``): re-running a launch is
@@ -1126,16 +1284,11 @@ def _recover_requests() -> tuple[int, int]:
     with _init_db_lock:
         _init_db_within_lock()
     assert _DB is not None
-    daemon_ids = sorted(d.id for d in daemons.INTERNAL_REQUEST_DAEMONS)
     # Resolved before the transaction: the cluster-status lookups may be
     # remote and must not extend it (see the helper's docstring).
     requeue_ids = _find_interrupted_launches_to_requeue()
     with _DB.conn:
         cursor = _DB.conn.cursor()
-        placeholders = ', '.join(['?'] * len(daemon_ids))
-        cursor.execute(
-            f'DELETE FROM {REQUEST_TABLE} '
-            f'WHERE request_id IN ({placeholders})', daemon_ids)
         if requeue_ids:
             placeholders = ', '.join(['?'] * len(requeue_ids))
             cursor.execute(
@@ -1208,6 +1361,7 @@ def recover_db_and_logs() -> bool:
         reset_db_and_logs()
         return False
     try:
+        backend.retire_legacy_internal_daemon_rows()
         interrupted, replayable = _recover_requests()
         if interrupted or replayable:
             logger.warning(
@@ -1350,11 +1504,6 @@ def _should_kill_request(request_id: str,
     if request_record is None:
         logger.debug(f'No request ID {request_id}')
         return False
-    # Skip internal requests. The internal requests are scheduled with
-    # request_id in range(len(INTERNAL_REQUEST_EVENTS)).
-    if request_record.request_id in set(
-            event.id for event in daemons.INTERNAL_REQUEST_DAEMONS):
-        return False
     if request_record.status > RequestStatus.RUNNING:
         logger.debug(f'Request {request_id} already finished')
         return False
@@ -1397,7 +1546,8 @@ def update_request(request_id: str) -> Generator[Request | None, None, None]:
 def try_mark_running(request_id: str,
                      pid: int | None,
                      execution_generation: int = 0,
-                     claim_token: str | None = None) -> bool:
+                     claim_token: str | None = None,
+                     process_start_time_ticks: int | None = None) -> bool:
     """Atomically flip a request to RUNNING if it is still executable.
 
     Returns:
@@ -1406,7 +1556,34 @@ def try_mark_running(request_id: str,
         status_msg cleared.
     """
     return request_storage.get_request_backend().try_mark_running(
-        request_id, pid, execution_generation, claim_token)
+        request_id, pid, execution_generation, claim_token,
+        process_start_time_ticks)
+
+
+def quiesce_managed_job_slot_requests(
+    identity: request_storage.ManagedJobControllerSlotIdentity,
+    *,
+    timeout_seconds: float = 60.0,
+    poll_seconds: float = 0.1,
+) -> int:
+    """Close one controller attempt and await exact nested receipts."""
+    return request_storage.get_request_backend(
+    ).quiesce_managed_job_slot_requests(identity,
+                                        timeout_seconds=timeout_seconds,
+                                        poll_seconds=poll_seconds)
+
+
+def quiesce_stale_managed_job_requests(
+    current_owner: tuple[str, int],
+    *,
+    timeout_seconds: float = 60.0,
+    poll_seconds: float = 0.1,
+) -> int:
+    """Close older outer generations and await their nested receipts."""
+    return request_storage.get_request_backend(
+    ).quiesce_stale_managed_job_requests(current_owner,
+                                         timeout_seconds=timeout_seconds,
+                                         poll_seconds=poll_seconds)
 
 
 @metrics_lib.time_me
@@ -1583,54 +1760,6 @@ async def create_if_not_exists_async(request: Request) -> bool:
     """
     return await request_storage.get_request_backend(
     ).create_if_not_exists_async(request)
-
-
-def build_internal_daemon_request(
-        daemon: 'daemons.InternalRequestDaemon') -> Request:
-    """Build a fresh `Request` for an internal daemon.
-
-    Captures the current process's `os.environ` via `payloads.RequestBody()`.
-    Status starts at PENDING with no `pid`. The returned object is not yet
-    persisted.
-    """
-    body = payloads.RequestBody()
-    return Request(
-        request_id=daemon.id,
-        name=server_constants.REQUEST_NAME_PREFIX + daemon.name,
-        entrypoint=daemon.run_event,
-        request_body=body,
-        status=RequestStatus.PENDING,
-        created_at=time.time(),
-        schedule_type=ScheduleType.SHORT,
-        user_id=skylet_constants.SKYPILOT_SYSTEM_USER_ID,
-        # Matches the retryable=True used when scheduling daemon requests
-        # (executor.schedule_internal_daemon_async).
-        retryable=True,
-        should_enqueue=True,
-    )
-
-
-async def create_or_refresh_internal_daemon_async(request: Request) -> bool:
-    """Insert or refresh an internal daemon's row.
-
-    Thin module-level wrapper. See
-    `RequestBackend.create_or_refresh_internal_daemon_async` for the
-    contract.
-    """
-    return await request_storage.get_request_backend(
-    ).create_or_refresh_internal_daemon_async(request)
-
-
-async def delete_orphan_internal_daemons_async(
-    internal_daemons: list['daemons.InternalRequestDaemon'],) -> None:
-    """Delete persisted daemon rows whose id is not in `internal_daemons`.
-
-    Thin module-level wrapper. See
-    `RequestBackend.delete_orphan_internal_daemons_async` for the
-    contract.
-    """
-    return await request_storage.get_request_backend(
-    ).delete_orphan_internal_daemons_async(internal_daemons)
 
 
 @dataclasses.dataclass
@@ -1828,11 +1957,6 @@ _EXECUTABLE_STATUS_VALUES = tuple(
     s.value for s in RequestStatus.executable_statuses())
 _TERMINAL_STATUS_VALUES = tuple(
     s.value for s in RequestStatus.finished_status())
-
-_try_mark_running_sql = (
-    f'UPDATE {REQUEST_TABLE} SET status = ?, pid = ?, '
-    f'{COL_STATUS_MSG} = NULL WHERE request_id = ? AND status IN '
-    f'({", ".join(["?"] * len(_EXECUTABLE_STATUS_VALUES))})')
 
 
 def _finish_request_update_sql(request_id: str, status: RequestStatus,
@@ -2295,6 +2419,10 @@ atexit.register(_cleanup)
 class SqliteRequestBackend(request_storage.RequestBackend):
     """SQLite-based request backend."""
 
+    @property
+    def supports_local_execution_quiescence(self) -> bool:
+        return True
+
     @init_db
     def get_request(self,
                     request_id: str,
@@ -2336,73 +2464,58 @@ class SqliteRequestBackend(request_storage.RequestBackend):
     async def create_if_not_exists_async(self, request: Request) -> bool:
         request_cutover.require_legacy_submissions_allowed()
         assert _DB is not None
-        request_columns = ', '.join(REQUEST_COLUMNS)
-        values_str = ', '.join(['?'] * len(REQUEST_COLUMNS))
-        sql_statement = (f'INSERT INTO {REQUEST_TABLE} '
-                         f'({request_columns}) VALUES '
-                         f'({values_str}) ON CONFLICT(request_id) DO NOTHING '
-                         f'RETURNING ROWID')
-        request_row = request.to_row()
-        if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
-            logger.debug(f'Start creating request {request.request_id}')
-        try:
-            row = await _DB.execute_get_returning_value_async(
-                sql_statement, request_row)
-        finally:
+        origin = _sqlite_managed_job_origin(request)
+
+        async def _insert() -> bool:
+            assert _DB is not None
+            request_columns = ', '.join(REQUEST_COLUMNS)
+            values_str = ', '.join(['?'] * len(REQUEST_COLUMNS))
+            sql_statement = (f'INSERT INTO {REQUEST_TABLE} '
+                             f'({request_columns}) VALUES '
+                             f'({values_str}) '
+                             'ON CONFLICT(request_id) DO NOTHING '
+                             'RETURNING ROWID')
+            request_row = request.to_row()
             if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
-                logger.debug(f'End creating request {request.request_id}')
-        return True if row else False
+                logger.debug(f'Start creating request {request.request_id}')
+            try:
+                row = await _DB.execute_get_returning_value_async(
+                    sql_statement, request_row)
+            finally:
+                if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+                    logger.debug(f'End creating request {request.request_id}')
+            return bool(row)
 
-    @init_db_async
-    @asyncio_utils.shield
-    async def create_or_refresh_internal_daemon_async(self,
-                                                      request: Request) -> bool:
-        assert _DB is not None
-        # Try insert first (the dedup primitive: only one concurrent
-        # caller wins the conflict).
-        inserted = await self.create_if_not_exists_async(request)
-        if inserted:
-            return True
-        # Lost the insert race: an existing row remains. UPDATE the
-        # env-bearing columns so the persisted row reflects this
-        # process's `os.environ` (and the matching `name` /
-        # `schedule_type` from the current code). Concurrent UPDATEs
-        # from sibling uvicorn workers in the same process write the
-        # same values; cross-pod UPDATEs from a newer generation win
-        # by virtue of happening last.
-        encoded_body = encoders.pickle_and_encode(request.request_body)
-        await _DB.execute_and_commit_async(
-            f'UPDATE {REQUEST_TABLE} '
-            f'SET request_body=?, name=?, schedule_type=? '
-            f'WHERE request_id=?',
-            (encoded_body, request.name, request.schedule_type.value,
-             request.request_id))
-        return False
+        if origin is None:
+            return await _insert()
+        identity = origin[1:]
+        async with request_storage.managed_job_request_authority_lock_async():
+            if not managed_job_state.controller_job_attempt_is_current(
+                    origin[0], identity):
+                raise request_storage.ManagedJobRequestQuiescenceError(
+                    'The managed-job controller attempt is no longer '
+                    'admissible for nested requests.')
+            return await _insert()
 
-    @init_db_async
-    @asyncio_utils.shield
-    async def delete_orphan_internal_daemons_async(
-        self,
-        internal_daemons: list['daemons.InternalRequestDaemon'],
-    ) -> None:
+    @init_db
+    def retire_legacy_internal_daemon_rows(self) -> int:
+        """Retire the explicit legacy daemon inventory from local SQLite."""
+        # Runtime import keeps the request model independent of daemon event
+        # imports during ordinary client use.
+        # pylint: disable=import-outside-toplevel
+        from sky.server import daemons
         assert _DB is not None
-        keep_ids = {d.id for d in internal_daemons}
-        # SQLite has no `is_daemon` column; use the `*-daemon` naming
-        # convention (verified against sky/server/daemons.py).
-        # TODO(cooperc): replace LIKE with a dedicated marker column if
-        # a non-daemon request_id ever ends in `-daemon`.
-        async with _DB.execute_fetchall_async(
-            f'SELECT request_id FROM {REQUEST_TABLE} '
-            f'WHERE request_id LIKE \'%-daemon\'') as rows:
-            existing = [r[0] for r in rows if r[0].endswith('-daemon')]
-        stale_ids = [rid for rid in existing if rid not in keep_ids]
-        if not stale_ids:
-            return
-        id_list_str = ','.join(repr(rid) for rid in stale_ids)
-        await _DB.execute_and_commit_async(
-            f'DELETE FROM {REQUEST_TABLE} '
-            f'WHERE request_id IN ({id_list_str})')
-        logger.info(f'Deleted orphan internal daemon rows: {stale_ids}')
+        daemon_ids = sorted(daemons.LEGACY_REQUEST_DAEMON_IDS)
+        placeholders = ', '.join(['?'] * len(daemon_ids))
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute(
+                f'DELETE FROM {REQUEST_TABLE} '
+                f'WHERE request_id IN ({placeholders})', daemon_ids)
+            retired = cursor.rowcount
+        if retired:
+            logger.info(f'Retired {retired} legacy internal daemon row(s).')
+        return retired
 
     @init_db
     def query_requests(self, req_filter: RequestTaskFilter) -> list[Request]:
@@ -2435,7 +2548,6 @@ class SqliteRequestBackend(request_storage.RequestBackend):
             ]
         return [Request.from_row(row) for row in rows]
 
-    @init_db_async
     @init_db_async
     async def delete_requests(self, request_ids: list[str]) -> None:
         if not request_ids:
@@ -2480,22 +2592,299 @@ class SqliteRequestBackend(request_storage.RequestBackend):
                          request_id: str,
                          pid: int | None,
                          execution_generation: int = 0,
-                         claim_token: str | None = None) -> bool:
-        del execution_generation, claim_token
+                         claim_token: str | None = None,
+                         process_start_time_ticks: int | None = None) -> bool:
+        del claim_token
         assert _DB is not None
-        # The per-request FileLock is required for composition with
-        # update_request()'s full-row read-modify-write writers (kill
-        # paths, interrupt_request_for_retry): the status IN (...) guard
-        # is atomic only at UPDATE time and cannot protect against a
-        # writer that read the row before this UPDATE and later REPLACEs
-        # the full (stale) row back.
+        preview = _get_request_no_lock(request_id)
+        if preview is None:
+            return False
+        try:
+            preview_origin = _sqlite_managed_job_origin(preview)
+        except ValueError:
+            logger.warning(
+                'Refusing RUNNING admission for request %s with '
+                'an invalid managed-job origin.', request_id)
+            return False
+        if (preview_origin is not None and
+            (pid is None or isinstance(pid, bool) or pid <= 0 or
+             process_start_time_ticks is None or
+             isinstance(process_start_time_ticks, bool) or
+             process_start_time_ticks <= 0)):
+            return False
+
+        def _transition(
+                expected_origin: tuple[int, str, int, int, str] | None) -> bool:
+            # The per-request FileLock composes with every full-row writer.
+            # Managed requests reach it only after the authority and job-row
+            # validation, preserving authority -> job -> request ordering.
+            with filelock.FileLock(request_lock_path(request_id)):
+                request = _get_request_no_lock(request_id)
+                if request is None:
+                    return False
+                try:
+                    current_origin = _sqlite_managed_job_origin(request)
+                except ValueError:
+                    return False
+                if (current_origin != expected_origin or
+                    (expected_origin is not None and
+                     request.execution_generation != execution_generation) or
+                        request.status
+                        not in RequestStatus.executable_statuses()):
+                    return False
+                request.status = RequestStatus.RUNNING
+                request.pid = pid
+                request.status_msg = None
+                request.execution_process_start_time_ticks = (
+                    process_start_time_ticks)
+                request.execution_quiescence_required = True
+                request.execution_quiesced_generation = None
+                request.execution_quiesced_at = None
+                _add_or_update_request_no_lock(request)
+                return True
+
+        if preview_origin is None:
+            return _transition(None)
+        identity = preview_origin[1:]
+        with request_storage.managed_job_request_authority_lock():
+            if not managed_job_state.controller_job_attempt_is_current(
+                    preview_origin[0], identity):
+                return False
+            return _transition(preview_origin)
+
+    @init_db
+    @db_utils.retry_on_sqlite_busy
+    def acknowledge_local_execution_quiescence(
+            self, request_id: str, pid: int,
+            process_start_time_ticks: int) -> bool:
+        """Publish stable-empty proof for one exact local guardian birth."""
+        assert _DB is not None
         with filelock.FileLock(request_lock_path(request_id)):
+            request = _get_request_no_lock(request_id)
+            if (request is None or not request.execution_quiescence_required or
+                    request.pid != pid or
+                    request.execution_process_start_time_ticks
+                    != process_start_time_ticks):
+                return False
+            generation = request.execution_generation
+            if (request.execution_quiesced_generation is not None or
+                    request.execution_quiesced_at is not None):
+                return (request.execution_quiesced_generation == generation and
+                        request.execution_quiesced_at is not None)
+            request.execution_quiesced_generation = generation
+            request.execution_quiesced_at = time.time()
+            _add_or_update_request_no_lock(request)
+            return True
+
+    @staticmethod
+    def _validate_managed_job_slot_identity(
+        identity: request_storage.ManagedJobControllerSlotIdentity,
+    ) -> request_storage.ManagedJobControllerSlotIdentity:
+        if (len(identity) != 4 or not isinstance(identity[0], str) or
+                not isinstance(identity[1], int) or
+                isinstance(identity[1], bool) or identity[1] <= 0 or
+                not isinstance(identity[2], int) or
+                isinstance(identity[2], bool) or identity[2] < 0 or
+                not isinstance(identity[3], str)):
+            raise ValueError('Managed-job slot identity is malformed.')
+        try:
+            instance_id = str(uuid.UUID(identity[0]))
+            attempt = str(uuid.UUID(identity[3]))
+        except ValueError as e:
+            raise ValueError('Managed-job slot identity is malformed.') from e
+        if instance_id != identity[0] or attempt != identity[3]:
+            raise ValueError('Managed-job slot identity is not canonical.')
+        return instance_id, identity[1], identity[2], attempt
+
+    @staticmethod
+    def _validate_quiescence_timing(timeout_seconds: float,
+                                    poll_seconds: float) -> None:
+        if (not isinstance(timeout_seconds,
+                           (int, float)) or isinstance(timeout_seconds, bool) or
+                not math.isfinite(timeout_seconds) or timeout_seconds < 0 or
+                not isinstance(poll_seconds, (int, float)) or
+                isinstance(poll_seconds, bool) or
+                not math.isfinite(poll_seconds) or poll_seconds <= 0):
+            raise ValueError('Managed-job quiescence timing is invalid.')
+
+    def _quiesce_managed_job_attempt_requests(self, authority_owner: tuple[
+        str, int], identity: request_storage.ManagedJobControllerSlotIdentity,
+                                              *, timeout_seconds: float,
+                                              poll_seconds: float) -> int:
+        """Close and drain one exact local nested-request family."""
+        assert _DB is not None
+        identity = self._validate_managed_job_slot_identity(identity)
+        self._validate_quiescence_timing(timeout_seconds, poll_seconds)
+        deadline = time.monotonic() + float(timeout_seconds)
+        affected_request_ids: set[str] = set()
+        signal_failures: set[str] = set()
+        while True:
+            pending: list[str] = []
+            signal_targets: list[tuple[str, int, int]] = []
+            with request_storage.managed_job_request_authority_lock():
+                managed_job_state.begin_controller_request_quiescence(
+                    authority_owner, identity)
+                with _DB.conn:
+                    cursor = _DB.conn.cursor()
+                    cursor.execute(
+                        f'SELECT request_id FROM {REQUEST_TABLE} WHERE '
+                        'managed_job_controller_instance_id = ? AND '
+                        'managed_job_controller_generation = ? AND '
+                        'managed_job_controller_slot_id = ? AND '
+                        'managed_job_controller_slot_attempt = ? '
+                        'ORDER BY request_id', identity)
+                    request_ids = [str(row[0]) for row in cursor.fetchall()]
+                for request_id in request_ids:
+                    with filelock.FileLock(request_lock_path(request_id)):
+                        request = _get_request_no_lock(request_id)
+                        if request is None:
+                            continue
+                        try:
+                            origin = _sqlite_managed_job_origin(request)
+                        except ValueError as e:
+                            raise request_storage.ManagedJobRequestQuiescenceError(
+                                f'Nested request {request_id} has an invalid '
+                                'persisted origin.') from e
+                        if origin is None or origin[1:] != identity:
+                            continue
+                        affected_request_ids.add(request_id)
+                        generation = request.execution_generation
+                        quiesced = bool(
+                            request.execution_quiescence_required and
+                            request.execution_quiesced_generation == generation
+                            and request.execution_quiesced_at is not None)
+                        if quiesced:
+                            continue
+                        pre_effect = bool(
+                            request.pid is None and
+                            request.execution_process_start_time_ticks is None
+                            and request.status != RequestStatus.RUNNING)
+                        request.execution_quiescence_required = True
+                        request.should_retry = False
+                        request.status_msg = (
+                            'The owning managed-job controller slot stopped; '
+                            'waiting for exact nested-request execution '
+                            'quiescence.')
+                        if pre_effect:
+                            if request.status not in RequestStatus.finished_status(
+                            ):
+                                request.status = RequestStatus.CANCELLED
+                                request.finished_at = time.time()
+                            request.execution_quiesced_generation = generation
+                            request.execution_quiesced_at = time.time()
+                            _add_or_update_request_no_lock(request)
+                            continue
+                        if request.status not in RequestStatus.finished_status(
+                        ):
+                            request.status = RequestStatus.CANCELLED
+                            request.finished_at = time.time()
+                        if (request.pid is not None and
+                                request.execution_process_start_time_ticks
+                                is not None):
+                            signal_targets.append(
+                                (request_id, request.pid,
+                                 request.execution_process_start_time_ticks))
+                        pending.append(request_id)
+                        _add_or_update_request_no_lock(request)
+            for request_id, pid, start_ticks in signal_targets:
+                if not request_storage.signal_exact_local_process(
+                        pid, start_ticks, signal.SIGTERM):
+                    signal_failures.add(request_id)
+            if not pending:
+                return len(affected_request_ids)
+            if time.monotonic() >= deadline:
+                details = ', '.join(sorted(set(pending) | signal_failures))
+                raise request_storage.ManagedJobRequestQuiescenceError(
+                    'Timed out waiting for exact managed-job nested request '
+                    f'quiescence: {details}.')
+            time.sleep(float(poll_seconds))
+
+    @init_db
+    def quiesce_managed_job_slot_requests(
+            self,
+            identity: request_storage.ManagedJobControllerSlotIdentity,
+            *,
+            timeout_seconds: float = 60.0,
+            poll_seconds: float = 0.1) -> int:
+        """Close one local slot's nested admission and await receipts."""
+        identity = self._validate_managed_job_slot_identity(identity)
+        return self._quiesce_managed_job_attempt_requests(
+            identity[:2],
+            identity,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds)
+
+    @init_db
+    def quiesce_stale_managed_job_requests(self,
+                                           current_owner: tuple[str, int],
+                                           *,
+                                           timeout_seconds: float = 60.0,
+                                           poll_seconds: float = 0.1) -> int:
+        """Close every old local attempt before outer-generation reset."""
+        assert _DB is not None
+        self._validate_quiescence_timing(timeout_seconds, poll_seconds)
+        if (len(current_owner) != 2 or not isinstance(current_owner[0], str) or
+                not isinstance(current_owner[1], int) or
+                isinstance(current_owner[1], bool) or current_owner[1] <= 0):
+            raise ValueError('Current managed-job owner is malformed.')
+        try:
+            canonical_owner = str(uuid.UUID(current_owner[0]))
+        except ValueError as e:
+            raise ValueError('Current managed-job owner is malformed.') from e
+        if canonical_owner != current_owner[0]:
+            raise ValueError('Current managed-job owner is not canonical.')
+        target_identities: set[request_storage.ManagedJobControllerSlotIdentity]
+        with request_storage.managed_job_request_authority_lock():
+            plan = managed_job_state.begin_stale_controller_request_quiescence(
+                current_owner)
+            target_identities = set(plan.exact_identities)
             with _DB.conn:
                 cursor = _DB.conn.cursor()
-                cursor.execute(_try_mark_running_sql,
-                               (RequestStatus.RUNNING.value, pid, request_id) +
-                               _EXECUTABLE_STATUS_VALUES)
-                return cursor.rowcount == 1
+                if plan.legacy_job_ids:
+                    placeholders = ', '.join('?' for _ in plan.legacy_job_ids)
+                    cursor.execute(
+                        f'SELECT request_id, managed_job_id FROM '
+                        f'{REQUEST_TABLE} WHERE managed_job_id IN '
+                        f'({placeholders}) ORDER BY managed_job_id, request_id',
+                        plan.legacy_job_ids)
+                    correlated_legacy_requests = cursor.fetchall()
+                    if correlated_legacy_requests:
+                        details = ', '.join(
+                            f'{row[1]}:{row[0]}'
+                            for row in correlated_legacy_requests)
+                        raise request_storage.ManagedJobRequestQuiescenceError(
+                            'Cannot adopt pre-slot managed jobs with correlated '
+                            f'nested requests: {details}.')
+                cursor.execute(
+                    f'SELECT DISTINCT '
+                    'managed_job_controller_instance_id, '
+                    'managed_job_controller_generation, '
+                    'managed_job_controller_slot_id, '
+                    'managed_job_controller_slot_attempt '
+                    f'FROM {REQUEST_TABLE} WHERE managed_job_id IS NOT NULL '
+                    'AND (managed_job_controller_instance_id IS NULL OR '
+                    'managed_job_controller_generation IS NULL OR '
+                    'managed_job_controller_slot_id IS NULL OR '
+                    'managed_job_controller_slot_attempt IS NULL OR '
+                    'managed_job_controller_instance_id != ? OR '
+                    'managed_job_controller_generation != ?)', current_owner)
+                origins = cursor.fetchall()
+            for raw in origins:
+                if any(value is None for value in raw):
+                    raise request_storage.ManagedJobRequestQuiescenceError(
+                        'A stale nested request has an incomplete origin.')
+                target_identities.add(
+                    self._validate_managed_job_slot_identity(
+                        (str(raw[0]), int(raw[1]), int(raw[2]), str(raw[3]))))
+        affected = 0
+        deadline = time.monotonic() + float(timeout_seconds)
+        for identity in sorted(target_identities):
+            affected += self._quiesce_managed_job_attempt_requests(
+                current_owner,
+                identity,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
+                poll_seconds=poll_seconds)
+        return affected
 
     @init_db
     @db_utils.retry_on_sqlite_busy

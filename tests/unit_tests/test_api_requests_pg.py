@@ -9,6 +9,7 @@ import datetime
 import os
 import pathlib
 import shutil
+import signal
 import sqlite3
 import stat
 import threading
@@ -26,9 +27,11 @@ from sky import exceptions
 from sky import execution
 from sky import global_user_state
 from sky.events import api_models as event_api_models
+from sky.jobs import state_schema as managed_job_state_schema
 from sky.jobs.server import core as managed_jobs_core
 from sky.serve import constants as serve_constants
 from sky.serve import ordinary_launch_binding
+from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
@@ -50,6 +53,7 @@ from sky.server.requests import storage
 from sky.server.requests.queues import base as queue_base
 from sky.skylet import constants
 from sky.utils import common_utils
+from sky.utils import controller_capability
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 from sky.volumes.server import core as volume_core
@@ -157,7 +161,11 @@ def bound_request_database(request_database, monkeypatch):
     engine, backend = request_database
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(config, '042')
+    # Bound launch reduction acquires the global zero-cost event sequencer
+    # before its existing lifecycle/service/replica locks. Exercise the
+    # current production schema boundary even while the reconciliation gate
+    # remains in legacy mode.
+    alembic_command.upgrade(config, '046')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
     with engine.begin() as connection:
         connection.execute(
@@ -326,10 +334,17 @@ def _controller_request(
     replayable: bool = False,
 ) -> requests.Request:
     if replayable:
-        daemon = daemons.INTERNAL_REQUEST_DAEMONS[0]
-        request = requests.build_internal_daemon_request(daemon)
-        request.request_id = request_id
-        return request
+        return requests.Request(
+            request_id=request_id,
+            name='sky.jobs.queue',
+            entrypoint=managed_jobs_core.queue,
+            request_body=payloads.JobsQueueBody(),
+            status=requests.RequestStatus.PENDING,
+            created_at=time.time(),
+            user_id='user',
+            schedule_type=requests.ScheduleType.SHORT,
+            should_enqueue=True,
+        )
     return requests.Request(
         request_id=request_id,
         name='sky.jobs.launch',
@@ -390,6 +405,69 @@ def _controller_leader(
     return leader
 
 
+def _seed_managed_job_attempt(
+    engine: sqlalchemy.engine.Engine,
+    leader: request_postgres.ControllerLeaderLease,
+    *,
+    job_id: int,
+    slot_id: int,
+    slot_attempt: uuid.UUID,
+    schedule_state: str = 'ALIVE',
+    quiescing: bool = False,
+) -> None:
+    assert leader.generation is not None
+    managed_job_state_schema.job_info_table.create(engine, checkfirst=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(managed_job_state_schema.job_info_table).values(
+                spot_job_id=job_id,
+                schedule_state=schedule_state,
+                controller_instance_id=leader.instance_id,
+                controller_generation=leader.generation,
+                controller_slot_id=slot_id,
+                controller_slot_attempt=str(slot_attempt),
+                controller_slot_quiescing=quiescing))
+
+
+def _managed_job_request(
+    request_id: str,
+    leader: request_postgres.ControllerLeaderLease,
+    *,
+    job_id: int,
+    slot_id: int,
+    slot_attempt: uuid.UUID,
+) -> requests.Request:
+    assert leader.generation is not None
+    request = _request(request_id)
+    request.managed_job_id = job_id
+    request.managed_job_controller_instance_id = leader.instance_id
+    request.managed_job_controller_generation = leader.generation
+    request.managed_job_controller_slot_id = slot_id
+    request.managed_job_controller_slot_attempt = str(slot_attempt)
+    return request
+
+
+def _seed_legacy_managed_job(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    job_id: int,
+    schedule_state: str = 'ALIVE',
+    controller_instance_id: str | None = None,
+    controller_generation: int | None = None,
+) -> None:
+    managed_job_state_schema.job_info_table.create(engine, checkfirst=True)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(managed_job_state_schema.job_info_table).values(
+                spot_job_id=job_id,
+                schedule_state=schedule_state,
+                controller_instance_id=controller_instance_id,
+                controller_generation=controller_generation,
+                controller_slot_id=None,
+                controller_slot_attempt=None,
+                controller_slot_quiescing=False))
+
+
 def _write_legacy_database(path, legacy_requests):
     connection = sqlite3.connect(path)
     try:
@@ -414,8 +492,57 @@ def _claim(backend: request_postgres.PostgresRequestBackend,
     assert item.request_id == request_id
     assert item.claim_token is not None
     assert backend.try_mark_running(item.request_id, 1234,
-                                    item.execution_generation, item.claim_token)
+                                    item.execution_generation, item.claim_token,
+                                    424242)
     return item
+
+
+def _claim_bound(backend: request_postgres.PostgresRequestBackend,
+                 request_id: str) -> queue_base.QueueItem:
+    queue = request_postgres.PostgresQueueBackend('short')
+    candidate = queue.peek_provider_mutation()
+    assert candidate is not None
+    assert candidate.request_id == request_id
+    item = queue.claim_provider_mutation(candidate)
+    assert item is not None
+    assert item.request_id == request_id
+    assert item.claim_token is not None
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    424242)
+    return item
+
+
+def _insert_execution_owner(
+    engine: sqlalchemy.engine.Engine,
+    instance_id: str,
+    *,
+    pod_name: str,
+    pod_uid: str | None,
+    heartbeat_at: datetime.datetime,
+    role: str = 'executor',
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=uuid.UUID(instance_id),
+                role=role,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+                pod_ip='10.0.0.10',
+                version='owner-death-test',
+                started_at=heartbeat_at,
+                heartbeat_at=heartbeat_at,
+                ready=True,
+                health_detail={'phase': 'claiming'},
+                supported_handlers=[],
+                supported_payload_versions={},
+                request_storage_backend=(
+                    request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+                request_queue_backend=(
+                    request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE),
+                execution_quiescence_capable=True,
+                ordinary_launch_binding_capable=True))
 
 
 def _action_values(action_id: uuid.UUID,
@@ -459,6 +586,16 @@ def _normalized_index_predicate(index: dict[str, object]) -> str:
         '(', '').replace(')', '')
 
 
+def _drop_api010_request_identity(values: dict[str, object]) -> None:
+    """Remove fields that do not exist before API request schema 010."""
+    for field in ('execution_process_start_time_ticks', 'managed_job_id',
+                  'managed_job_controller_instance_id',
+                  'managed_job_controller_generation',
+                  'managed_job_controller_slot_id',
+                  'managed_job_controller_slot_attempt'):
+        values.pop(field, None)
+
+
 def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
     with postgres_engine.begin() as connection:
         connection.exec_driver_sql('DROP SCHEMA public CASCADE')
@@ -475,6 +612,7 @@ def test_api005_upgrade_preserves_ordinary_api004_rows(postgres_engine):
     request_values.pop('execution_quiesced_at')
     request_values.pop('terminal_cause', None)
     request_values.pop('ordinary_launch_association_id', None)
+    _drop_api010_request_identity(request_values)
     with postgres_engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(
@@ -623,6 +761,7 @@ def test_api009_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
     request_values.pop('execution_quiesced_at')
     request_values.pop('terminal_cause', None)
     request_values.pop('ordinary_launch_association_id', None)
+    _drop_api010_request_identity(request_values)
     legacy_instance_id = uuid.uuid4()
     with postgres_engine.begin() as connection:
         connection.execute(
@@ -648,9 +787,13 @@ def test_api009_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
 
     with postgres_engine.connect() as connection:
         row = connection.execute(
-            sqlalchemy.select(request_postgres.REQUESTS).where(
-                request_postgres.REQUESTS.c.request_id ==
-                request.request_id)).mappings().one()
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.execution_quiescence_required,
+                request_postgres.REQUESTS.c.execution_quiesced_generation,
+                request_postgres.REQUESTS.c.execution_quiesced_at,
+                request_postgres.REQUESTS.c.ordinary_launch_association_id,
+            ).where(request_postgres.REQUESTS.c.request_id ==
+                    request.request_id)).mappings().one()
         legacy_instance = connection.execute(
             sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
                 request_postgres.SERVER_INSTANCES.c.instance_id ==
@@ -678,6 +821,85 @@ def test_api009_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
 def test_api009_migration_is_runtime_module_independent():
     migration_path = (pathlib.Path(__file__).parents[2] / 'sky' / 'schemas' /
                       'db' / 'api_requests' / '009_ordinary_launch_binding.py')
+    tree = ast.parse(migration_path.read_text(encoding='utf-8'))
+    imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.append(node.module)
+    assert all(
+        name != 'sky' and not name.startswith('sky.') for name in imports)
+
+
+def test_api010_upgrade_preserves_legacy_process_identity_as_unknown(
+        postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '009',
+                                         mode='upgrade')
+    request = _request('pre-api010', should_enqueue=False)
+    request_values = request_postgres._request_values_for_db(request)
+    _drop_api010_request_identity(request_values)
+    request_values.update(status=requests.RequestStatus.RUNNING.value, pid=1234)
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(
+                request_postgres.REQUESTS).values(**request_values))
+
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '010',
+                                         mode='upgrade')
+
+    with postgres_engine.connect() as connection:
+        stored = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).mappings().one()
+    assert stored['execution_process_start_time_ticks'] is None
+    assert stored['managed_job_id'] is None
+    assert stored['managed_job_controller_instance_id'] is None
+    assert stored['managed_job_controller_generation'] is None
+    assert stored['managed_job_controller_slot_id'] is None
+    assert stored['managed_job_controller_slot_attempt'] is None
+    checks = {
+        check['name']: ''.join(check['sqltext'].split())
+        for check in sqlalchemy.inspect(postgres_engine).get_check_constraints(
+            'api_requests')
+    }
+    assert 'ck_api_requests_pid' in checks
+    assert 'ck_api_requests_process_start_time' in checks
+    assert 'ck_api_requests_managed_job_origin_complete' in checks
+    assert 'ck_api_requests_managed_job_origin_values' in checks
+
+    indexes = {
+        index['name']: index for index in sqlalchemy.inspect(
+            postgres_engine).get_indexes('api_requests')
+    }
+    assert indexes['ix_api_requests_managed_job_attempt']['column_names'] == [
+        'managed_job_id', 'managed_job_controller_instance_id',
+        'managed_job_controller_generation', 'managed_job_controller_slot_id',
+        'managed_job_controller_slot_attempt'
+    ]
+    assert _normalized_index_predicate(
+        indexes['ix_api_requests_managed_job_attempt']) == (
+            'managed_job_idISNOTNULL')
+
+    with pytest.raises(sqlalchemy.exc.IntegrityError):
+        with postgres_engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id == request.request_id
+                ).values(execution_process_start_time_ticks=0))
+
+
+def test_api010_migration_is_runtime_module_independent():
+    migration_path = (pathlib.Path(__file__).parents[2] / 'sky' / 'schemas' /
+                      'db' / 'api_requests' / '010_process_birth_identity.py')
     tree = ast.parse(migration_path.read_text(encoding='utf-8'))
     imports: list[str] = []
     for node in ast.walk(tree):
@@ -1043,25 +1265,20 @@ def test_bound_tombstone_gc_rechecks_request_absence_at_delete(
         connection.execute(
             sqlalchemy.delete(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id == request_id))
-    # The state machine correctly makes this deadline immutable. Simulate the
-    # passage of its 60-day retention window without fabricating an illegal
-    # association insert or transition. Trigger DDL and the update use
-    # separate transactions so deferred consistency events are fully drained.
     with engine.begin() as connection:
+        # Production creates this deadline at least 60 days in the future.
+        # This GC race needs an already-aged canonical tombstone, so bypass
+        # user triggers only for the deadline backdate in this transaction.
+        # SET LOCAL restores guarded writes automatically at transaction end.
         connection.exec_driver_sql(
-            'ALTER TABLE serve_ordinary_launch_associations DISABLE TRIGGER '
-            'skyserve042_association_guard')
-    with engine.begin() as connection:
+            "SET LOCAL session_replication_role = 'replica'")
         connection.execute(
             sqlalchemy.update(
                 ordinary_launch_binding.ordinary_launch_associations_table).
             where(ordinary_launch_binding.ordinary_launch_associations_table.c.
                   association_id == association_id).values(
-                      tombstone_not_before=now - datetime.timedelta(seconds=1)))
-    with engine.begin() as connection:
-        connection.exec_driver_sql(
-            'ALTER TABLE serve_ordinary_launch_associations ENABLE TRIGGER '
-            'skyserve042_association_guard')
+                      tombstone_not_before=(now -
+                                            datetime.timedelta(seconds=1))))
 
     request_values = request_postgres._request_values_for_db(
         _bound_request(request_id))
@@ -1113,7 +1330,7 @@ def test_bound_tombstone_gc_rechecks_request_absence_at_delete(
             connection) == 1
 
 
-def test_bound_handler_is_filtered_by_local_inventory_and_claim_carries_owner(
+def test_bound_handler_uses_reserved_selector_and_claim_carries_owner(
         request_database):
     engine, backend = request_database
     request_id = 'bound-local-handler-filter'
@@ -1140,13 +1357,139 @@ def test_bound_handler_is_filtered_by_local_inventory_and_claim_carries_owner(
         'short',
         supported_handler_names=frozenset(
             {ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME}))
-    item = capable_queue.get()
+    # Every kind in the closed provider classification is excluded from the
+    # generic claim path.
+    assert set(
+        request_postgres._PROVIDER_MUTATION_HANDLER_KINDS.values()) == set(
+            queue_base.ProviderMutationRequestKind)
+    assert capable_queue.get() is None
+    candidate = capable_queue.peek_provider_mutation()
+    assert candidate == queue_base.ProviderMutationCandidate(
+        request_id=request_id,
+        kind=(queue_base.ProviderMutationRequestKind.BOUND_ORDINARY_LAUNCH))
+    item = capable_queue.claim_provider_mutation(candidate)
     assert item is not None
     assert item.request_id == request_id
     assert item.worker_instance_id == capable_queue._instance_id
     assert item.claim_token is not None
     assert backend.try_mark_running(item.request_id, 1234,
-                                    item.execution_generation, item.claim_token)
+                                    item.execution_generation, item.claim_token,
+                                    424242)
+
+
+def test_bound_provider_candidate_has_one_concurrent_claim_winner(
+        request_database):
+    engine, _ = request_database
+    request_id = 'bound-provider-single-winner'
+    with engine.begin() as connection:
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection,
+            _bound_request(request_id),
+            ordinary_launch_association_id=uuid.uuid4())
+    queues = [request_postgres.PostgresQueueBackend('short') for _ in range(2)]
+    candidates = [queue.peek_provider_mutation() for queue in queues]
+    assert all(candidate is not None for candidate in candidates)
+    barrier = threading.Barrier(3)
+    results = []
+
+    def claim(index):
+        barrier.wait(timeout=5)
+        results.append(queues[index].claim_provider_mutation(candidates[index]))
+
+    threads = [
+        threading.Thread(target=claim, args=(index,)) for index in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sum(item is not None for item in results) == 1
+    winner = next(item for item in results if item is not None)
+    assert winner.request_id == request_id
+    assert winner.execution_generation == 1
+
+
+def test_bound_provider_handoff_failure_is_durable_and_quiescent(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    request_id = 'bound-provider-handoff-failed'
+    with engine.begin() as connection:
+        assert request_postgres.insert_bound_request_and_queue_in_transaction(
+            connection,
+            _bound_request(request_id),
+            ordinary_launch_association_id=uuid.uuid4())
+    monkeypatch.setattr(storage, '_storage_backend', backend)
+    queue = executor.RequestQueue(
+        request_postgres.PostgresQueueBackend('short'))
+    worker = executor.RequestWorker(schedule_type=requests.ScheduleType.SHORT,
+                                    config=executor.server_config.WorkerConfig(
+                                        garanteed_parallelism=1,
+                                        burstable_parallelism=0,
+                                        num_db_connections_per_worker=0))
+    reservation = mock.sentinel.bound_provider_reservation
+    proc_executor = mock.Mock(spec=executor.process.BurstableExecutor)
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.side_effect = RuntimeError(
+        'reserved handoff failed')
+
+    worker.process_request(proc_executor, queue)
+
+    proc_executor.submit_reserved.assert_called_once()
+    proc_executor.release_idle_worker_reservation.assert_called_once_with(
+        reservation)
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+        queue_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.QUEUE).where(
+                                 request_postgres.QUEUE.c.request_id ==
+                                 request_id)).scalar_one()
+    assert row['status'] == requests.RequestStatus.FAILED.value
+    assert row['terminal_cause'] == (
+        event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED.value)
+    assert row['execution_generation'] == 1
+    assert row['execution_quiesced_generation'] == 1
+    assert row['execution_quiesced_at'] is not None
+    assert queue_count == 0
+
+
+def test_generic_handoff_failure_is_durable_and_quiescent(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    request_id = 'generic-handoff-failed'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    monkeypatch.setattr(storage, '_storage_backend', backend)
+    queue = executor.RequestQueue(
+        request_postgres.PostgresQueueBackend('short'))
+    worker = executor.RequestWorker(schedule_type=requests.ScheduleType.SHORT,
+                                    config=executor.server_config.WorkerConfig(
+                                        garanteed_parallelism=1,
+                                        burstable_parallelism=0,
+                                        num_db_connections_per_worker=0))
+    reservation = mock.sentinel.generic_reservation
+    proc_executor = mock.Mock(spec=executor.process.BurstableExecutor)
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.side_effect = RuntimeError(
+        'generic handoff failed')
+
+    worker.process_request(proc_executor, queue)
+
+    proc_executor.submit_reserved.assert_called_once()
+    proc_executor.release_idle_worker_reservation.assert_called_once_with(
+        reservation)
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.FAILED.value
+    assert request_row['terminal_cause'] == (
+        event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED.value)
+    assert request_row['execution_quiesced_generation'] == 1
+    assert request_row['execution_quiesced_at'] is not None
+    assert queue_row == {}
 
 
 def test_bound_effect_claim_requires_exact_request_queue_pin_and_owner(
@@ -1159,7 +1502,7 @@ def test_bound_effect_claim_requires_exact_request_queue_pin_and_owner(
             connection,
             _bound_request(request_id),
             ordinary_launch_association_id=association_id)
-    item = _claim(backend, request_id)
+    item = _claim_bound(backend, request_id)
     assert item.claim_token is not None
     assert item.worker_instance_id is not None
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
@@ -1206,7 +1549,9 @@ def _claim_gc_bound_request(engine, _backend):
             ordinary_launch_association_id=identity.association_id)
     context = _gc_binding_context(identity, admission.launch_generation)
     queue = request_postgres.PostgresQueueBackend('short')
-    item = queue.get()
+    candidate = queue.peek_provider_mutation()
+    assert candidate is not None
+    item = queue.claim_provider_mutation(candidate)
     assert item is not None
     assert item.request_id == identity.request_id
     assert item.claim_token is not None
@@ -1264,7 +1609,88 @@ def test_generic_reaper_leaves_expired_bound_claim_for_canonical_reducer(
         item.execution_generation)
 
 
-def test_terminal_expired_bound_claim_settles_only_before_provider_io(
+def test_bound_reducer_blocks_on_protocol_before_authority_rows(
+        bound_request_database, monkeypatch):
+    engine, backend = bound_request_database
+    identity, context, queue, _ = _claim_gc_bound_request(engine, backend)
+    _expire_claim(engine, identity.request_id)
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+
+    reducer_pid = []
+    reducer_connected = threading.Event()
+    original_lock = (
+        serve_state.lock_zero_cost_protocol_for_bound_launch_projection)
+
+    def capture_pid_before_protocol(connection):
+        reducer_pid.append(
+            connection.execute(
+                sqlalchemy.text('SELECT pg_backend_pid()')).scalar_one())
+        reducer_connected.set()
+        original_lock(connection)
+
+    monkeypatch.setattr(serve_state,
+                        'lock_zero_cost_protocol_for_bound_launch_projection',
+                        capture_pid_before_protocol)
+    protocol = pool_capacity_observation_schema.protocol_state_sequence_table
+    with engine.connect() as holder:
+        transaction = holder.begin()
+        holder.execute(
+            sqlalchemy.select(protocol.c.id).where(
+                protocol.c.id == 1).with_for_update()).one()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                request_postgres.reduce_bound_ordinary_launch,
+                context,
+                _gc_binding_authority(),
+                project_replica_result=_keep_replica_projection)
+            assert reducer_connected.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            blockers = []
+            while time.monotonic() < deadline:
+                blockers = holder.execute(
+                    sqlalchemy.text('SELECT pg_blocking_pids(:pid)'), {
+                        'pid': reducer_pid[0]
+                    }).scalar_one()
+                if blockers:
+                    break
+                time.sleep(0.05)
+            assert blockers
+
+            # A protocol-owning participant can still take every downstream
+            # authority mutex. If the reducer took any of them before protocol,
+            # this exact schedule would form a cycle instead of completing.
+            holder.execute(
+                sqlalchemy.select(
+                    serve_state_schema.service_lifecycle_fences_table.c.name).
+                where(serve_state_schema.service_lifecycle_fences_table.c.name
+                      == 'gc-service').with_for_update()).one()
+            holder.execute(
+                sqlalchemy.select(
+                    serve_state_schema.services_table.c.name).where(
+                        serve_state_schema.services_table.c.name ==
+                        'gc-service').with_for_update()).one()
+            holder.execute(
+                sqlalchemy.select(
+                    serve_state_schema.replicas_table.c.replica_id).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'gc-service',
+                        serve_state_schema.replicas_table.c.replica_id ==
+                        3).with_for_update()).one()
+            holder.execute(
+                sqlalchemy.select(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.association_id).where(
+                        ordinary_launch_binding.
+                        ordinary_launch_associations_table.c.association_id ==
+                        identity.association_id).with_for_update()).one()
+            transaction.commit()
+            reduction = future.result(timeout=5)
+    assert reduction.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL)
+
+
+def test_terminal_bound_pidless_claim_settles_immediately_before_provider_io(
         bound_request_database):
     engine, backend = bound_request_database
     identity, context, _, item = _claim_gc_bound_request(engine, backend)
@@ -1273,8 +1699,8 @@ def test_terminal_expired_bound_claim_settles_only_before_provider_io(
     assert facts.status is requests.RequestStatus.CANCELLED
     assert not facts.queue_exists
     assert facts.claim_token == uuid.UUID(item.claim_token)
-    assert not facts.quiescent
-    _expire_claim(engine, identity.request_id)
+    assert facts.quiescent
+    assert facts.execution_quiesced_generation == item.execution_generation
 
     reduction = request_postgres.reduce_bound_ordinary_launch(
         context,
@@ -1287,8 +1713,8 @@ def test_terminal_expired_bound_claim_settles_only_before_provider_io(
     assert reduction.request.quiescent
     assert reduction.request.execution_quiesced_generation == (
         item.execution_generation)
-    # Synthesized proof keeps the exact owner identity, so a late genuine ACK
-    # is an idempotent success instead of losing its generation.
+    # Atomic pre-effect proof keeps the exact owner identity, so a late wrapper
+    # acknowledgement is an idempotent success.
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token, item.worker_instance_id)
     assert backend.acknowledge_execution_quiescence(claim)
@@ -1299,7 +1725,8 @@ def test_active_expired_bound_claim_preserves_prior_exact_quiescence(
     engine, backend = bound_request_database
     identity, context, _, item = _claim_gc_bound_request(engine, backend)
     assert backend.try_mark_running(item.request_id, 1234,
-                                    item.execution_generation, item.claim_token)
+                                    item.execution_generation, item.claim_token,
+                                    424242)
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token, item.worker_instance_id)
     # The handler's finally block can win after its terminal status CAS loses
@@ -1332,7 +1759,8 @@ def test_expired_bound_claim_after_provider_io_is_ambiguous(
     engine, backend = bound_request_database
     identity, context, queue, item = _claim_gc_bound_request(engine, backend)
     assert backend.try_mark_running(item.request_id, 1234,
-                                    item.execution_generation, item.claim_token)
+                                    item.execution_generation, item.claim_token,
+                                    424242)
     body = _legacy_serve_launch_request(identity.request_id).request_body
     ordinary_launch_binding.install_bound_context(body, identity,
                                                   context.launch_generation)
@@ -1368,14 +1796,56 @@ def test_expired_bound_claim_after_provider_io_is_ambiguous(
                 resolution).where(
                     ordinary_launch_binding.ordinary_launch_associations_table.
                     c.association_id == identity.association_id)).scalar_one()
+        request_row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id)).mappings().one()
+        queue_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                )).select_from(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    identity.request_id)).scalar_one()
     assert resolution == ordinary_launch_binding.Resolution.AMBIGUOUS.value
+    assert reduction.request.status is requests.RequestStatus.CANCELLED
+    assert request_row['cancel_requested_at'] is not None
+    assert request_row['execution_quiescence_required'] is True
+    assert request_row['execution_quiesced_generation'] is None
+    assert request_row['execution_quiesced_at'] is None
+    assert request_row['pid'] == 1234
+    assert request_row['claim_token'] == uuid.UUID(item.claim_token)
+    assert request_row['worker_instance_id'] == uuid.UUID(
+        item.worker_instance_id)
+    assert request_row['should_retry'] is False
+    assert queue_count == 0
+    assert not reduction.request.quiescent
+    if terminal_before_expiry:
+        assert reduction.request.terminal_cause is (
+            event_api_models.EventCause.EXPLICIT_CANCEL)
+    else:
+        assert reduction.request.terminal_cause is (
+            event_api_models.EventCause.EXECUTION_LEASE_EXPIRED)
+
+    # PROVIDER_IO makes the provider outcome ambiguous, but does not erase the
+    # exact local execution address or manufacture proof that its handler has
+    # stopped. The real wrapper receipt remains accepted and idempotent later.
+    assert backend.acknowledge_execution_quiescence(claim)
+    assert backend.acknowledge_execution_quiescence(claim)
+    replay = request_postgres.reduce_bound_ordinary_launch(
+        context,
+        _gc_binding_authority(),
+        project_replica_result=_keep_replica_projection)
+    assert replay.disposition is (
+        request_postgres.OrdinaryLaunchReductionDisposition.AMBIGUOUS)
+    assert replay.request.quiescent
 
 
 def test_malformed_success_result_is_durably_ambiguous(bound_request_database):
     engine, backend = bound_request_database
     identity, context, _, item = _claim_gc_bound_request(engine, backend)
     assert backend.try_mark_running(item.request_id, 1234,
-                                    item.execution_generation, item.claim_token)
+                                    item.execution_generation, item.claim_token,
+                                    424242)
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token, item.worker_instance_id)
     body = _legacy_serve_launch_request(identity.request_id).request_body
@@ -1516,7 +1986,7 @@ def test_retention_pin_primary_key_kind_check_and_request_fk(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '010'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -1532,6 +2002,7 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     assert {'resource_action_id',
             'resource_action_attempt'}.issubset(request_columns)
     assert 'ordinary_launch_association_id' in request_columns
+    assert 'execution_process_start_time_ticks' in request_columns
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
         'execution_quiesced_at'
@@ -1880,22 +2351,22 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api009_downgrade_guard_retains_head(request_database):
+def test_api010_downgrade_guard_retains_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
-    with pytest.raises(RuntimeError, match='009 is additive'):
+    with pytest.raises(RuntimeError, match='010 is additive'):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '010'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
     assert 'api_request_retention_pins' in inspector.get_table_names()
 
 
-def test_api009_downgrade_guard_retains_binding_evidence(request_database):
+def test_api010_downgrade_guard_retains_binding_evidence(request_database):
     engine, _ = request_database
     columns_before = {
         column['name']
@@ -1908,14 +2379,17 @@ def test_api009_downgrade_guard_retains_binding_evidence(request_database):
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
 
-    with pytest.raises(RuntimeError, match='009 is additive'):
+    with pytest.raises(RuntimeError, match='010 is additive'):
         alembic_command.downgrade(config, '008')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '009'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '010'
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
-        'execution_quiesced_at', 'ordinary_launch_association_id'
+        'execution_quiesced_at', 'ordinary_launch_association_id',
+        'managed_job_id', 'managed_job_controller_instance_id',
+        'managed_job_controller_generation', 'managed_job_controller_slot_id',
+        'managed_job_controller_slot_attempt'
     } <= columns_before
     assert columns_before == {
         column['name']
@@ -1975,6 +2449,18 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['ordinary_launch_binding_capable'] is True
     assert (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME
             in row['supported_handlers'])
+    monkeypatch.setenv('HOSTNAME', 'request-overlaid-pod')
+    monkeypatch.setenv('SKYPILOT_POD_UID', 'request-overlaid-uid')
+    monkeypatch.setenv('POD_IP', '203.0.113.99')
+    assert lease._heartbeat()
+    with engine.connect() as connection:
+        immutable_row = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == uuid.UUID(
+                    instance_id))).mappings().one()
+    assert immutable_row['pod_name'] == 'executor-pod'
+    assert immutable_row['pod_uid'] == 'pod-uid'
+    assert immutable_row['pod_ip'] == '10.0.0.1'
     drain_marker.touch()
     assert not lease.is_locally_ready()
     assert not request_postgres.current_instance_is_ready()
@@ -2660,6 +3146,19 @@ def test_controller_leadership_uses_same_session_and_monotonic_generation(
     second = request_postgres.ControllerLeaderLease(second_id)
     try:
         assert first.generation == 1
+        first_capability = first.origin_capability
+        assert len(first_capability) == 43
+        with engine.connect() as connection:
+            stored_digest = connection.execute(
+                sqlalchemy.select(request_postgres.CONTROLLER_LEADERSHIP.c.
+                                  origin_capability_sha256)).scalar_one()
+        assert stored_digest == controller_capability.digest(first_capability)
+        assert request_postgres.controller_origin_capability_is_current(
+            first_id, 1, first_capability)
+        guessed_capability = ('A' if first_capability[0] != 'A' else
+                              'B') + first_capability[1:]
+        assert not request_postgres.controller_origin_capability_is_current(
+            first_id, 1, guessed_capability)
         assert not second.try_acquire()
         lock_backend_pid = first.backend_pid()
         assert lock_backend_pid is not None
@@ -2676,6 +3175,11 @@ def test_controller_leadership_uses_same_session_and_monotonic_generation(
         while not second.try_acquire() and time.monotonic() < deadline:
             time.sleep(0.05)
         assert second.generation == 2
+        assert second.origin_capability != first_capability
+        assert request_postgres.controller_origin_capability_is_current(
+            second_id, 2, second.origin_capability)
+        assert not request_postgres.controller_origin_capability_is_current(
+            second_id, 2, first_capability)
         assert request_postgres.controller_leadership_is_current(second_id, 2)
         assert not request_postgres.controller_leadership_is_current(
             first_id, 1)
@@ -2684,22 +3188,28 @@ def test_controller_leadership_uses_same_session_and_monotonic_generation(
         second.release()
 
 
-def test_stale_controller_cannot_refresh_daemons_or_fence_new_generation(
+def test_stale_controller_cannot_retire_legacy_daemon_rows(
         request_database, monkeypatch):
     engine, backend = request_database
     first_id = str(uuid.uuid4())
     second_id = str(uuid.uuid4())
     first = _controller_leader(engine, monkeypatch, first_id)
     second = request_postgres.ControllerLeaderLease(second_id)
-    request = requests.build_internal_daemon_request(
-        daemons.INTERNAL_REQUEST_DAEMONS[0])
+    daemon_ids = sorted(daemons.LEGACY_REQUEST_DAEMON_IDS)
+    first_request = _request(daemon_ids[0])
+    normal_request = _request('normal-row')
+    assert asyncio.run(backend.create_if_not_exists_async(first_request))
+    assert asyncio.run(backend.create_if_not_exists_async(normal_request))
     try:
         monkeypatch.setenv(request_postgres.CONTROLLER_INSTANCE_ID_ENV_VAR,
                            first_id)
         monkeypatch.setenv(request_postgres.CONTROLLER_GENERATION_ENV_VAR,
                            str(first.generation))
-        assert asyncio.run(
-            backend.create_or_refresh_internal_daemon_async(request))
+        assert backend.retire_legacy_internal_daemon_rows() == 1
+        assert backend.retire_legacy_internal_daemon_rows() == 0
+        assert backend.get_request('normal-row') is not None
+        second_request = _request(daemon_ids[1])
+        assert asyncio.run(backend.create_if_not_exists_async(second_request))
 
         lock_backend_pid = first.backend_pid()
         assert lock_backend_pid is not None
@@ -2710,8 +3220,7 @@ def test_stale_controller_cannot_refresh_daemons_or_fence_new_generation(
         assert second.try_acquire()
 
         with pytest.raises(RuntimeError, match='leadership changed'):
-            asyncio.run(
-                backend.create_or_refresh_internal_daemon_async(request))
+            backend.retire_legacy_internal_daemon_rows()
         with pytest.raises(RuntimeError, match='leadership changed'):
             request_postgres.fence_stale_controller_claims(
                 first_id, first.generation)
@@ -2720,11 +3229,61 @@ def test_stale_controller_cannot_refresh_daemons_or_fence_new_generation(
                            second_id)
         monkeypatch.setenv(request_postgres.CONTROLLER_GENERATION_ENV_VAR,
                            str(second.generation))
-        assert not asyncio.run(
-            backend.create_or_refresh_internal_daemon_async(request))
+        assert backend.retire_legacy_internal_daemon_rows() == 1
+        assert backend.get_request(daemon_ids[1]) is None
+        assert backend.get_request('normal-row') is not None
     finally:
         first.release()
         second.release()
+
+
+def test_legacy_daemon_retirement_covers_all_states_and_only_allowlist(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    daemon_ids = sorted(daemons.LEGACY_REQUEST_DAEMON_IDS)[:3]
+    ordinary_suffix_id = 'user-selected-daemon'
+    try:
+        assert leader.generation is not None
+        controller_owner = (leader.instance_id, leader.generation)
+        for request_id in (*daemon_ids, ordinary_suffix_id):
+            assert asyncio.run(
+                backend.create_if_not_exists_async(_request(request_id)))
+
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id == daemon_ids[1]).
+                values(status=requests.RequestStatus.RUNNING.value))
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    daemon_ids[2]).values(
+                        status=requests.RequestStatus.SUCCEEDED.value,
+                        terminal_cause='handler_succeeded'))
+            request_postgres.insert_request_retention_pin_in_transaction(
+                connection, daemon_ids[2], 'legacy-daemon-test', uuid.uuid4())
+
+        assert backend.retire_legacy_internal_daemon_rows(
+            controller_owner=controller_owner) == len(daemon_ids)
+        assert backend.retire_legacy_internal_daemon_rows(
+            controller_owner=controller_owner) == 0
+        for request_id in daemon_ids:
+            assert backend.get_request(request_id) is None
+        assert backend.get_request(ordinary_suffix_id) is not None
+        with engine.connect() as connection:
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    request_postgres.QUEUE).where(
+                        request_postgres.QUEUE.c.request_id.in_(
+                            daemon_ids))).scalar_one() == 0
+            assert connection.execute(
+                sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                    request_postgres.REQUEST_RETENTION_PINS).where(
+                        request_postgres.REQUEST_RETENTION_PINS.c.request_id.
+                        in_(daemon_ids))).scalar_one() == 0
+    finally:
+        leader.release()
 
 
 def test_role_scoped_queues_isolate_normal_and_controller_claims(
@@ -2732,6 +3291,9 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
     engine, fixture_backend = request_database
     instance_id = str(uuid.uuid4())
     leader = _controller_leader(engine, monkeypatch, instance_id)
+    # Exercise both execution-class views in the compatibility process.  A
+    # dedicated controller role intentionally advertises no normal handlers.
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
     backend = request_postgres.PostgresRequestBackend()
     try:
         normal_request = _request('normal-class')
@@ -2767,7 +3329,7 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
         assert controller_item.request_id == 'controller-class'
         assert backend.try_mark_running(controller_item.request_id, 1234,
                                         controller_item.execution_generation,
-                                        controller_item.claim_token)
+                                        controller_item.claim_token, 424242)
 
         restored = backend.get_request('controller-class')
         assert restored.controller_generation == leader.generation
@@ -2782,6 +3344,137 @@ def test_role_scoped_queues_isolate_normal_and_controller_claims(
         assert reservation['state'] == 'running'
         assert reservation['controller_generation'] == leader.generation
         assert str(reservation['controller_instance_id']) == instance_id
+    finally:
+        leader.release()
+
+
+def test_all_mode_mixed_queue_fences_only_controller_claims(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    instance_id = fixture_backend.instance_id
+    leader = _controller_leader(engine, monkeypatch, instance_id)
+    backend = request_postgres.PostgresRequestBackend()
+    first_generation = leader.generation
+    assert first_generation is not None
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
+    try:
+        controller_request = _controller_request('all-mode-controller')
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(controller_request))
+        queue = request_postgres.PostgresQueueBackend(
+            'short', controller_generation=first_generation)
+        controller_item = queue.get()
+        assert controller_item is not None
+        assert controller_item.request_id == controller_request.request_id
+        assert backend.try_mark_running(controller_item.request_id, 1234,
+                                        controller_item.execution_generation,
+                                        controller_item.claim_token, 424242)
+        restored = backend.get_request(controller_item.request_id)
+        assert restored.controller_generation == first_generation
+        assert restored.worker_instance_id == instance_id
+
+        claim = storage.ExecutionClaim(controller_item.request_id,
+                                       controller_item.execution_generation,
+                                       controller_item.claim_token)
+        leader.release()
+
+        assert not backend.heartbeat_claim(claim)
+        stale_context = storage.activate_execution_claim(
+            claim.request_id, claim.execution_generation, claim.claim_token)
+        try:
+            assert not backend.set_request_finished(
+                claim.request_id, requests.RequestStatus.SUCCEEDED, result=[])
+        finally:
+            storage.deactivate_execution_claim(stale_context)
+
+        stale_request = _controller_request('all-mode-stale-controller')
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(stale_request))
+        assert queue.get() is None
+
+        normal_request = _request('all-mode-normal')
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(normal_request))
+        normal_item = request_postgres.PostgresQueueBackend('short').get()
+        assert normal_item is not None
+        assert normal_item.request_id == normal_request.request_id
+        normal_restored = backend.get_request(normal_item.request_id)
+        assert normal_restored.controller_generation is None
+    finally:
+        leader.release()
+
+
+def test_all_mode_explicit_controller_queue_requires_generation(
+        request_database, monkeypatch):
+    _, backend = request_database
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
+
+    with pytest.raises(ValueError, match='active controller generation'):
+        request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}))
+    with pytest.raises(RuntimeError, match='active controller generation'):
+        backend.retire_legacy_internal_daemon_rows()
+    with pytest.raises(RuntimeError, match='active controller generation'):
+        backend.recover_on_startup()
+
+
+def test_all_mode_startup_fence_requeues_null_generation_claim(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    leader = _controller_leader(engine, monkeypatch,
+                                fixture_backend.instance_id)
+    backend = request_postgres.PostgresRequestBackend()
+    assert leader.generation is not None
+    monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
+    try:
+        request = _controller_request('all-mode-null-generation',
+                                      replayable=True)
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+        queue = request_postgres.PostgresQueueBackend(
+            'short', controller_generation=leader.generation)
+        legacy_item = queue.get()
+        assert legacy_item is not None
+        assert legacy_item.claim_token is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    legacy_item.request_id).values(controller_generation=None))
+
+        assert not backend.try_mark_running(legacy_item.request_id, 1234,
+                                            legacy_item.execution_generation,
+                                            legacy_item.claim_token, 424242)
+        assert request_postgres.fence_stale_controller_claims(
+            leader.instance_id, leader.generation) == {
+                'replayed': 1,
+                'interrupted': 0,
+            }
+        _assert_execution_claim_requeued(engine, legacy_item.request_id)
+
+        replacement = queue.get()
+        assert replacement is not None
+        assert replacement.request_id == legacy_item.request_id
+        assert (replacement.execution_generation ==
+                legacy_item.execution_generation + 1)
+        restored = backend.get_request(replacement.request_id)
+        assert restored.controller_generation == leader.generation
+        assert replacement.claim_token is not None
+        assert backend.try_mark_running(replacement.request_id, 1234,
+                                        replacement.execution_generation,
+                                        replacement.claim_token, 424242)
+        replacement_claim = storage.ExecutionClaim(
+            replacement.request_id, replacement.execution_generation,
+            replacement.claim_token, replacement.worker_instance_id)
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    replacement.request_id).values(controller_generation=None))
+        assert not backend.heartbeat_claim(replacement_claim)
+        assert not backend.handoff_execution_retry(replacement_claim,
+                                                   'must stay fenced', 1)
     finally:
         leader.release()
 
@@ -2804,15 +3497,15 @@ def test_cancelling_running_controller_action_marks_outcome_ambiguous(
         assert item is not None
         assert backend.try_mark_running(item.request_id, 1234,
                                         item.execution_generation,
-                                        item.claim_token)
-        kill = mock.Mock()
-        monkeypatch.setattr(request_postgres.os, 'kill', kill)
-        monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
-                            lambda _pid: True)
+                                        item.claim_token, 424242)
+        signal_exact = mock.Mock(return_value=True)
+        monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                            signal_exact)
 
         assert backend.kill_requests([item.request_id]) == [item.request_id]
 
-        kill.assert_called_once_with(1234, request_postgres.signal.SIGTERM)
+        signal_exact.assert_called_once_with(1234, 424242,
+                                             request_postgres.signal.SIGTERM)
         with engine.connect() as connection:
             reservation = connection.execute(
                 sqlalchemy.select(
@@ -2887,7 +3580,7 @@ def test_controller_handoff_interrupts_ambiguous_mutation_and_fences_write(
         assert item is not None
         assert first_backend.try_mark_running(item.request_id, 1234,
                                               item.execution_generation,
-                                              item.claim_token)
+                                              item.claim_token, 424242)
         stale_context = storage.activate_execution_claim(
             item.request_id, item.execution_generation, item.claim_token)
 
@@ -2927,8 +3620,122 @@ def test_controller_handoff_interrupts_ambiguous_mutation_and_fences_write(
         second.release()
 
 
-def test_controller_handoff_requeues_reconcilable_work(request_database,
-                                                       monkeypatch):
+def test_controller_handoff_retains_old_owner_interrupt_and_receipt_address(
+        request_database, monkeypatch):
+    """Takeover revokes a mutator without erasing its local stop handshake."""
+    engine, fixture_backend = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    first_backend = request_postgres.PostgresRequestBackend()
+    second = request_postgres.ControllerLeaderLease(second_id)
+    request_id = 'controller-takeover-quiescence-handshake'
+    try:
+        assert asyncio.run(
+            fixture_backend.create_if_not_exists_async(
+                _controller_request(request_id)))
+        queue = request_postgres.PostgresQueueBackend(
+            'short',
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=first.generation)
+        item = queue.get()
+        assert item is not None
+        assert item.claim_token is not None
+        assert item.worker_instance_id == first_id
+        assert first_backend.try_mark_running(item.request_id, 1234,
+                                              item.execution_generation,
+                                              item.claim_token, 424242)
+        claim = storage.ExecutionClaim(item.request_id,
+                                       item.execution_generation,
+                                       item.claim_token,
+                                       item.worker_instance_id)
+
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'),
+                {'pid': lock_backend_pid})
+        assert not first.heartbeat()
+        assert second.try_acquire()
+        assert second.generation == 2
+        assert request_postgres.fence_stale_controller_claims(
+            second_id, second.generation) == {
+                'replayed': 0,
+                'interrupted': 1,
+            }
+
+        with engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id)).mappings().one()
+            queue_count = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.count(  # pylint: disable=not-callable
+                    )).select_from(request_postgres.QUEUE).where(
+                        request_postgres.QUEUE.c.request_id ==
+                        request_id)).scalar_one()
+        assert row['status'] == requests.RequestStatus.CANCELLED.value
+        assert row['terminal_cause'] == (
+            event_api_models.EventCause.CONTROLLER_LEADERSHIP_LOST.value)
+        assert row['cancel_requested_at'] is not None
+        assert row['execution_quiescence_required'] is True
+        assert row['execution_quiesced_generation'] is None
+        assert row['execution_quiesced_at'] is None
+        assert row['pid'] == 1234
+        assert row['claim_token'] == uuid.UUID(item.claim_token)
+        assert row['worker_instance_id'] == uuid.UUID(first_id)
+        assert row['controller_generation'] == first.generation
+        assert row['lease_expires_at'] is not None
+        assert row['heartbeat_at'] is not None
+        assert queue_count == 0
+
+        signal_exact = mock.Mock(return_value=True)
+        monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                            signal_exact)
+        assert first_backend.interrupt_cancelled_claim(claim)
+        signal_exact.assert_called_once_with(1234, 424242,
+                                             request_postgres.signal.SIGTERM)
+        with engine.connect() as connection:
+            delivered = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.REQUESTS.c.cancel_acknowledged_at,
+                    request_postgres.REQUESTS.c.execution_quiesced_generation,
+                    request_postgres.REQUESTS.c.execution_quiesced_at).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        request_id)).one()
+        assert delivered.cancel_acknowledged_at is not None
+        assert delivered.execution_quiesced_generation is None
+        assert delivered.execution_quiesced_at is None
+
+        assert first_backend.acknowledge_execution_quiescence(claim)
+        assert first_backend.acknowledge_execution_quiescence(claim)
+        with engine.connect() as connection:
+            receipt = connection.execute(
+                sqlalchemy.select(
+                    request_postgres.REQUESTS.c.execution_quiesced_generation,
+                    request_postgres.REQUESTS.c.execution_quiesced_at,
+                    request_postgres.REQUESTS.c.pid,
+                    request_postgres.REQUESTS.c.claim_token,
+                    request_postgres.REQUESTS.c.worker_instance_id,
+                    request_postgres.REQUESTS.c.lease_expires_at).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        request_id)).one()
+        assert receipt.execution_quiesced_generation == item.execution_generation
+        assert receipt.execution_quiesced_at is not None
+        assert receipt.pid == 1234
+        assert receipt.claim_token == uuid.UUID(item.claim_token)
+        assert receipt.worker_instance_id == uuid.UUID(first_id)
+        assert receipt.lease_expires_at is not None
+    finally:
+        first.release()
+        second.release()
+
+
+def test_controller_handoff_requeues_reconcilable_work_after_exact_receipt(
+        request_database, monkeypatch):
     engine, fixture_backend = request_database
     first_id = str(uuid.uuid4())
     second_id = str(uuid.uuid4())
@@ -2948,7 +3755,7 @@ def test_controller_handoff_requeues_reconcilable_work(request_database,
         assert first_item is not None
         assert first_backend.try_mark_running(first_item.request_id, 1234,
                                               first_item.execution_generation,
-                                              first_item.claim_token)
+                                              first_item.claim_token, 424242)
 
         lock_backend_pid = first.backend_pid()
         assert lock_backend_pid is not None
@@ -2962,6 +3769,195 @@ def test_controller_handoff_requeues_reconcilable_work(request_database,
             second_id, second.generation)
         assert fenced == {'replayed': 1, 'interrupted': 0}
 
+        # Replayability does not make loss of the old controller session into
+        # execution stop proof. Keep its exact claim and delivery until its
+        # wrapper publishes the generation-bound receipt.
+        with engine.connect() as connection:
+            blocked = connection.execute(
+                sqlalchemy.select(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    first_item.request_id)).mappings().one()
+            delivery = connection.execute(
+                sqlalchemy.select(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    first_item.request_id)).mappings().one()
+        assert blocked['status'] == requests.RequestStatus.RUNNING.value
+        assert blocked['cancel_requested_at'] is not None
+        assert blocked['execution_quiescence_required'] is True
+        assert blocked['execution_quiesced_generation'] is None
+        assert blocked['execution_quiesced_at'] is None
+        assert blocked['pid'] == 1234
+        assert blocked['claim_token'] == uuid.UUID(first_item.claim_token)
+        assert blocked['worker_instance_id'] == uuid.UUID(first_id)
+        assert blocked['controller_generation'] == first.generation
+        assert blocked['lease_expires_at'] is not None
+        assert blocked['heartbeat_at'] is not None
+        assert delivery['delivery_state'] == 'claimed'
+        assert delivery['claim_generation'] == first_item.execution_generation
+
+        monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
+                           second_id)
+        second_queue = request_postgres.PostgresQueueBackend(
+            request.schedule_type.value,
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=second.generation)
+        assert second_queue.get() is None
+
+        claim = storage.ExecutionClaim(first_item.request_id,
+                                       first_item.execution_generation,
+                                       first_item.claim_token, first_id)
+        context = storage.activate_execution_claim(
+            first_item.request_id, first_item.execution_generation,
+            first_item.claim_token)
+        try:
+            assert not first_backend.set_request_finished(
+                first_item.request_id,
+                requests.RequestStatus.SUCCEEDED,
+                result=[])
+        finally:
+            storage.deactivate_execution_claim(context)
+        assert first_backend.acknowledge_execution_quiescence(claim)
+        with engine.connect() as connection:
+            released = connection.execute(
+                sqlalchemy.select(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    first_item.request_id)).mappings().one()
+            delivery = connection.execute(
+                sqlalchemy.select(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    first_item.request_id)).mappings().one()
+        assert released['status'] == requests.RequestStatus.WAITING.value
+        assert released['terminal_cause'] is None
+        assert released['claim_token'] is None
+        assert released['worker_instance_id'] is None
+        assert released['controller_generation'] is None
+        assert released['cancel_requested_at'] is None
+        assert not released['execution_quiescence_required']
+        assert delivery['delivery_state'] == 'queued'
+        assert delivery['claim_generation'] is None
+        second_item = second_queue.get()
+        assert second_item is not None
+        assert second_item.request_id == first_item.request_id
+        assert (second_item.execution_generation ==
+                first_item.execution_generation + 1)
+        assert second_item.claim_token != first_item.claim_token
+    finally:
+        first.release()
+        second.release()
+
+
+def test_controller_handoff_requeues_pending_pidless_claim_pre_effect(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    first_backend = request_postgres.PostgresRequestBackend()
+    second = request_postgres.ControllerLeaderLease(second_id)
+    try:
+        request = _controller_request('pending-controller-handoff',
+                                      replayable=True)
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+        queue = request_postgres.PostgresQueueBackend(
+            request.schedule_type.value,
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=first.generation)
+        item = queue.get()
+        assert item is not None
+        # Deliberately stop before the child commits try_mark_running().
+        assert first_backend.get_request(
+            item.request_id).status is requests.RequestStatus.PENDING
+
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'),
+                {'pid': lock_backend_pid})
+        assert second.try_acquire()
+        assert request_postgres.fence_stale_controller_claims(
+            second_id, second.generation) == {
+                'replayed': 1,
+                'interrupted': 0,
+            }
+
+        _assert_execution_claim_requeued(engine, item.request_id)
+        assert not first_backend.try_mark_running(
+            item.request_id, 1234, item.execution_generation, item.claim_token,
+            424242)
+    finally:
+        first.release()
+        second.release()
+
+
+def test_controller_handoff_sweep_consumes_receipt_published_first(
+        request_database, monkeypatch):
+    engine, fixture_backend = request_database
+    first_id = str(uuid.uuid4())
+    second_id = str(uuid.uuid4())
+    first = _controller_leader(engine, monkeypatch, first_id)
+    second = request_postgres.ControllerLeaderLease(second_id)
+    try:
+        request = _controller_request('receipt-first-controller-action',
+                                      replayable=True)
+        assert asyncio.run(fixture_backend.create_if_not_exists_async(request))
+        first_queue = request_postgres.PostgresQueueBackend(
+            request.schedule_type.value,
+            execution_classes=frozenset(
+                {registry.ExecutionClass.CONTROLLER.value}),
+            controller_generation=first.generation)
+        first_item = first_queue.get()
+        assert first_item is not None
+        first_backend = request_postgres.PostgresRequestBackend()
+        assert first_backend.try_mark_running(first_item.request_id, 1234,
+                                              first_item.execution_generation,
+                                              first_item.claim_token, 424242)
+
+        # Model the wrapper receipt committing immediately before the new
+        # controller's revocation transaction. The fence must consume it in
+        # the same shared reducer instead of leaving a claimed delivery stuck.
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    first_item.request_id).values(
+                        execution_quiesced_generation=(
+                            first_item.execution_generation),
+                        execution_quiesced_at=(
+                            sqlalchemy.func.clock_timestamp())))
+
+        lock_backend_pid = first.backend_pid()
+        assert lock_backend_pid is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.text('SELECT pg_terminate_backend(:pid)'),
+                {'pid': lock_backend_pid})
+        assert second.try_acquire()
+        assert request_postgres.fence_stale_controller_claims(
+            second_id, second.generation) == {
+                'replayed': 1,
+                'interrupted': 0,
+            }
+
+        with engine.connect() as connection:
+            released = connection.execute(
+                sqlalchemy.select(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    first_item.request_id)).mappings().one()
+            delivery = connection.execute(
+                sqlalchemy.select(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    first_item.request_id)).mappings().one()
+        assert released['status'] == requests.RequestStatus.WAITING.value
+        assert released['terminal_cause'] is None
+        assert released['claim_token'] is None
+        assert released['worker_instance_id'] is None
+        assert not released['execution_quiescence_required']
+        assert delivery['delivery_state'] == 'queued'
+        assert delivery['claim_generation'] is None
+
         monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
                            second_id)
         second_queue = request_postgres.PostgresQueueBackend(
@@ -2971,10 +3967,8 @@ def test_controller_handoff_requeues_reconcilable_work(request_database,
             controller_generation=second.generation)
         second_item = second_queue.get()
         assert second_item is not None
-        assert second_item.request_id == first_item.request_id
         assert (second_item.execution_generation ==
                 first_item.execution_generation + 1)
-        assert second_item.claim_token != first_item.claim_token
     finally:
         first.release()
         second.release()
@@ -2996,6 +3990,312 @@ def test_create_round_trip_and_atomic_enqueue(request_database):
                 request.request_id)).mappings().one()
     assert queue_row['delivery_state'] == 'queued'
     assert queue_row['precondition_payload'] is None
+
+
+def test_managed_job_origin_mapping_round_trip_without_database() -> None:
+    controller_instance_id = uuid.uuid4()
+    slot_attempt = uuid.uuid4()
+    request = _request('managed-job-origin-mapping-round-trip')
+    request.managed_job_id = 42
+    request.managed_job_controller_instance_id = str(controller_instance_id)
+    request.managed_job_controller_generation = 7
+    request.managed_job_controller_slot_id = 3
+    request.managed_job_controller_slot_attempt = str(slot_attempt)
+
+    db_values = request_postgres._request_values_for_db(request)
+    assert db_values['managed_job_controller_instance_id'] == (
+        controller_instance_id)
+    assert db_values['managed_job_controller_slot_attempt'] == slot_attempt
+    restored = request_postgres._request_from_mapping(db_values)
+    assert restored.managed_job_id == 42
+    assert restored.managed_job_controller_instance_id == str(
+        controller_instance_id)
+    assert restored.managed_job_controller_generation == 7
+    assert restored.managed_job_controller_slot_id == 3
+    assert restored.managed_job_controller_slot_attempt == str(slot_attempt)
+
+
+def test_managed_job_origin_round_trip_and_database_constraints(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    controller_instance_id = uuid.UUID(backend.instance_id)
+    slot_attempt = uuid.uuid4()
+    leader = _controller_leader(engine, monkeypatch,
+                                str(controller_instance_id))
+    try:
+        _seed_managed_job_attempt(engine,
+                                  leader,
+                                  job_id=42,
+                                  slot_id=3,
+                                  slot_attempt=slot_attempt)
+        request = _managed_job_request('managed-job-origin-round-trip',
+                                       leader,
+                                       job_id=42,
+                                       slot_id=3,
+                                       slot_attempt=slot_attempt)
+
+        db_values = request_postgres._request_values_for_db(request)
+        assert db_values['managed_job_controller_instance_id'] == (
+            controller_instance_id)
+        assert db_values['managed_job_controller_slot_attempt'] == slot_attempt
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+
+        restored = backend.get_request(request.request_id)
+        assert restored is not None
+        assert restored.managed_job_id == 42
+        assert restored.managed_job_controller_instance_id == str(
+            controller_instance_id)
+        assert restored.managed_job_controller_generation == leader.generation
+        assert restored.managed_job_controller_slot_id == 3
+        assert restored.managed_job_controller_slot_attempt == str(slot_attempt)
+
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.update(request_postgres.REQUESTS).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        request.request_id).values(
+                            managed_job_controller_slot_attempt=None))
+
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.update(request_postgres.REQUESTS).where(
+                        request_postgres.REQUESTS.c.request_id == request.
+                        request_id).values(managed_job_controller_slot_id=-1))
+    finally:
+        leader.release()
+
+
+@pytest.mark.parametrize(('schedule_state', 'quiescing'), [
+    ('ALIVE', True),
+    ('DONE', False),
+])
+def test_managed_job_request_creation_rejects_closed_attempt(
+        request_database, monkeypatch, schedule_state, quiescing):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    slot_attempt = uuid.uuid4()
+    request_id = f'managed-job-create-closed-{schedule_state}-{quiescing}'
+    try:
+        _seed_managed_job_attempt(engine,
+                                  leader,
+                                  job_id=43,
+                                  slot_id=4,
+                                  slot_attempt=slot_attempt,
+                                  schedule_state=schedule_state,
+                                  quiescing=quiescing)
+        request = _managed_job_request(request_id,
+                                       leader,
+                                       job_id=43,
+                                       slot_id=4,
+                                       slot_attempt=slot_attempt)
+        with pytest.raises(storage.ManagedJobRequestQuiescenceError):
+            asyncio.run(backend.create_if_not_exists_async(request))
+        assert backend.get_request(request_id) is None
+    finally:
+        leader.release()
+
+
+def test_managed_job_claim_terminalizes_stale_pre_effect_request(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    slot_attempt = uuid.uuid4()
+    request_id = 'managed-job-stale-queued-claim'
+    try:
+        _seed_managed_job_attempt(engine,
+                                  leader,
+                                  job_id=44,
+                                  slot_id=5,
+                                  slot_attempt=slot_attempt)
+        request = _managed_job_request(request_id,
+                                       leader,
+                                       job_id=44,
+                                       slot_id=5,
+                                       slot_attempt=slot_attempt)
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    managed_job_state_schema.job_info_table).where(
+                        managed_job_state_schema.job_info_table.c.spot_job_id ==
+                        44).values(controller_slot_attempt=str(uuid.uuid4())))
+
+        # The nested request uses an ordinary API handler. Its executor may
+        # share this process in compatibility mode while the leader's dedicated
+        # PostgreSQL lock session continues to prove outer authority.
+        monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
+        assert request_postgres.PostgresQueueBackend('short').get() is None
+        restored = backend.get_request(request_id)
+        assert restored is not None
+        assert restored.status is requests.RequestStatus.CANCELLED
+        assert restored.execution_quiescence_required
+        assert restored.execution_quiesced_generation == 0
+        assert restored.execution_quiesced_at is not None
+        assert request_postgres.PostgresQueueBackend('short').qsize() == 0
+    finally:
+        leader.release()
+
+
+def test_managed_job_running_admission_revalidates_exact_attempt(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    slot_attempt = uuid.uuid4()
+    request_id = 'managed-job-running-admission-revalidation'
+    try:
+        _seed_managed_job_attempt(engine,
+                                  leader,
+                                  job_id=45,
+                                  slot_id=6,
+                                  slot_attempt=slot_attempt)
+        request = _managed_job_request(request_id,
+                                       leader,
+                                       job_id=45,
+                                       slot_id=6,
+                                       slot_attempt=slot_attempt)
+        assert asyncio.run(backend.create_if_not_exists_async(request))
+        monkeypatch.setenv(request_postgres.SERVER_ROLE_ENV_VAR, 'all')
+        item = request_postgres.PostgresQueueBackend('short').get()
+        assert item is not None
+        assert item.claim_token is not None
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(
+                    managed_job_state_schema.job_info_table).where(
+                        managed_job_state_schema.job_info_table.c.spot_job_id ==
+                        45).values(controller_slot_attempt=str(uuid.uuid4())))
+
+        assert not backend.try_mark_running(
+            request_id, 1234, item.execution_generation, item.claim_token,
+            424242)
+        identity = (leader.instance_id, leader.generation, 6, str(slot_attempt))
+        assert backend.quiesce_managed_job_slot_requests(identity,
+                                                         timeout_seconds=0) == 1
+        restored = backend.get_request(request_id)
+        assert restored is not None
+        assert restored.status is requests.RequestStatus.CANCELLED
+        assert restored.execution_quiesced_generation == (
+            item.execution_generation)
+        assert restored.execution_quiesced_at is not None
+    finally:
+        leader.release()
+
+
+def test_managed_job_first_slot_rollout_marks_request_free_legacy_jobs(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    old_instance_id = str(uuid.uuid4())
+    try:
+        _seed_legacy_managed_job(engine,
+                                 job_id=46,
+                                 controller_instance_id=old_instance_id,
+                                 controller_generation=1)
+        _seed_legacy_managed_job(engine, job_id=47)
+        _seed_legacy_managed_job(engine, job_id=48, schedule_state='DONE')
+        assert leader.generation is not None
+        assert backend.quiesce_stale_managed_job_requests(
+            (leader.instance_id, leader.generation), timeout_seconds=0) == 0
+        with engine.connect() as connection:
+            rows = connection.execute(
+                sqlalchemy.select(
+                    managed_job_state_schema.job_info_table.c.spot_job_id,
+                    managed_job_state_schema.job_info_table.c.
+                    controller_slot_quiescing).where(
+                        managed_job_state_schema.job_info_table.c.spot_job_id.
+                        in_([46, 47, 48
+                            ])).order_by(managed_job_state_schema.
+                                         job_info_table.c.spot_job_id)).all()
+        assert rows == [(46, True), (47, True), (48, False)]
+    finally:
+        leader.release()
+
+
+def test_managed_job_first_slot_rollout_rejects_correlated_request(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    old_instance_id = str(uuid.uuid4())
+    old_attempt = uuid.uuid4()
+    try:
+        _seed_legacy_managed_job(engine,
+                                 job_id=49,
+                                 controller_instance_id=old_instance_id,
+                                 controller_generation=1)
+        correlated = _request('legacy-job-correlated', should_enqueue=False)
+        correlated.managed_job_id = 49
+        correlated.managed_job_controller_instance_id = old_instance_id
+        correlated.managed_job_controller_generation = 1
+        correlated.managed_job_controller_slot_id = 0
+        correlated.managed_job_controller_slot_attempt = str(old_attempt)
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(request_postgres.REQUESTS).values(
+                    **request_postgres._request_values_for_db(correlated)))
+
+        assert leader.generation is not None
+        with pytest.raises(storage.ManagedJobRequestQuiescenceError,
+                           match='pre-slot managed jobs'):
+            backend.quiesce_stale_managed_job_requests(
+                (leader.instance_id, leader.generation), timeout_seconds=0)
+        with engine.connect() as connection:
+            quiescing = connection.execute(
+                sqlalchemy.select(
+                    managed_job_state_schema.job_info_table.c.
+                    controller_slot_quiescing).where(
+                        managed_job_state_schema.job_info_table.c.spot_job_id ==
+                        49)).scalar_one()
+        assert not quiescing
+    finally:
+        leader.release()
+
+
+def test_managed_job_first_slot_rollout_requires_fresh_outer_generation(
+        request_database, monkeypatch):
+    engine, backend = request_database
+    leader = _controller_leader(engine, monkeypatch, backend.instance_id)
+    try:
+        assert leader.generation is not None
+        _seed_legacy_managed_job(engine,
+                                 job_id=50,
+                                 controller_instance_id=leader.instance_id,
+                                 controller_generation=leader.generation)
+        with pytest.raises(storage.ManagedJobRequestQuiescenceError,
+                           match='unsafe prior controller identity'):
+            backend.quiesce_stale_managed_job_requests(
+                (leader.instance_id, leader.generation), timeout_seconds=0)
+    finally:
+        leader.release()
+
+
+def test_managed_job_origin_storage_validation() -> None:
+    partial = _request('managed-job-origin-partial')
+    partial.managed_job_id = 42
+    with pytest.raises(ValueError, match='all five fields'):
+        request_postgres._request_values_for_db(partial)
+
+    invalid_uuid = _request('managed-job-origin-invalid-uuid')
+    invalid_uuid.managed_job_id = 42
+    invalid_uuid.managed_job_controller_instance_id = 'not-a-uuid'
+    invalid_uuid.managed_job_controller_generation = 7
+    invalid_uuid.managed_job_controller_slot_id = 3
+    invalid_uuid.managed_job_controller_slot_attempt = str(uuid.uuid4())
+    with pytest.raises(
+            ValueError,
+            match='managed_job_controller_instance_id must be a UUID'):
+        request_postgres._request_values_for_db(invalid_uuid)
+
+    invalid_generation = _request('managed-job-origin-invalid-generation')
+    invalid_generation.managed_job_id = 42
+    invalid_generation.managed_job_controller_instance_id = str(uuid.uuid4())
+    invalid_generation.managed_job_controller_generation = 0
+    invalid_generation.managed_job_controller_slot_id = 3
+    invalid_generation.managed_job_controller_slot_attempt = str(uuid.uuid4())
+    with pytest.raises(ValueError,
+                       match='managed_job_controller_generation must be'):
+        request_postgres._request_values_for_db(invalid_generation)
 
 
 def test_concurrent_creation_has_one_winner(request_database):
@@ -3190,54 +4490,270 @@ def test_expired_mutating_claim_is_not_replayed(request_database, monkeypatch):
                                  'expired-claim')).scalar_one() == 0
 
 
-def test_expired_read_only_claim_replays_with_new_generation(
+def test_expired_mutating_claim_retains_exact_interrupt_and_receipt_address(
         request_database, monkeypatch):
-    _, backend = request_database
-    monkeypatch.setattr(request_postgres, '_CLAIM_LEASE_SECONDS', 0.05)
+    """Expiry revokes execution without erasing its quiescence handshake."""
+    engine, backend = request_database
+    request_id = 'expired-claim-quiescence-handshake'
+    request = _request(request_id)
+    request.name = 'sky.stop'
+    request.entrypoint = core.stop
+    request.request_body = payloads.StopOrDownBody(cluster_name='cluster')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    assert item.worker_instance_id is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    _expire_claim(engine, request_id)
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+        queue_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                )).select_from(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    request_id)).scalar_one()
+    assert row['status'] == requests.RequestStatus.CANCELLED.value
+    assert row['terminal_cause'] == (
+        event_api_models.EventCause.EXECUTION_LEASE_EXPIRED.value)
+    assert row['cancel_requested_at'] is not None
+    assert row['execution_quiescence_required'] is True
+    assert row['execution_quiesced_generation'] is None
+    assert row['execution_quiesced_at'] is None
+    assert row['pid'] == 1234
+    assert row['claim_token'] == uuid.UUID(item.claim_token)
+    assert row['worker_instance_id'] == uuid.UUID(item.worker_instance_id)
+    assert row['lease_expires_at'] is not None
+    assert queue_count == 0
+
+    signal_exact = mock.Mock(return_value=True)
+    monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                        signal_exact)
+    assert backend.interrupt_cancelled_claim(claim)
+    signal_exact.assert_called_once_with(1234, 424242,
+                                         request_postgres.signal.SIGTERM)
+    # Signal delivery is not a receipt. Only the exact wrapper may publish
+    # the generation-bound proof, and replaying that receipt is idempotent.
+    with engine.connect() as connection:
+        before_receipt = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.cancel_acknowledged_at,
+                request_postgres.REQUESTS.c.execution_quiesced_generation,
+                request_postgres.REQUESTS.c.execution_quiesced_at).
+            where(request_postgres.REQUESTS.c.request_id == request_id)).one()
+    assert before_receipt.cancel_acknowledged_at is not None
+    assert before_receipt.execution_quiesced_generation is None
+    assert before_receipt.execution_quiesced_at is None
+    assert backend.acknowledge_execution_quiescence(claim)
+    assert backend.acknowledge_execution_quiescence(claim)
+
+    with engine.connect() as connection:
+        receipt = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.execution_quiesced_generation,
+                request_postgres.REQUESTS.c.execution_quiesced_at,
+                request_postgres.REQUESTS.c.claim_token,
+                request_postgres.REQUESTS.c.worker_instance_id).
+            where(request_postgres.REQUESTS.c.request_id == request_id)).one()
+    assert receipt.execution_quiesced_generation == item.execution_generation
+    assert receipt.execution_quiesced_at is not None
+    # Keep the exact tombstone after receipt so a duplicate finally-block write
+    # remains an idempotent success until normal request GC removes the row.
+    assert receipt.claim_token == uuid.UUID(item.claim_token)
+    assert receipt.worker_instance_id == uuid.UUID(item.worker_instance_id)
+
+
+def test_receipt_before_reaper_preserves_expired_mutating_claim_tombstone(
+        request_database):
+    """The wrapper receipt may win the lease-expiry terminalization race."""
+    engine, backend = request_database
+    request_id = 'expired-claim-receipt-before-reaper'
+    request = _request(request_id)
+    request.name = 'sky.stop'
+    request.entrypoint = core.stop
+    request.request_body = payloads.StopOrDownBody(cluster_name='cluster')
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    assert item.worker_instance_id is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    _expire_claim(engine, request_id)
+
+    # The effect-bearing wrapper can finish after its lease expires but before
+    # the queue sweep terminalizes the still-RUNNING request. Its exact receipt
+    # is genuine and must survive the later reaper transaction.
+    assert backend.acknowledge_execution_quiescence(claim)
+    with engine.connect() as connection:
+        receipt_before_reap = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.execution_quiesced_at).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id)).scalar_one()
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+        queue_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                )).select_from(request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    request_id)).scalar_one()
+    assert row['status'] == requests.RequestStatus.CANCELLED.value
+    assert row['terminal_cause'] == (
+        event_api_models.EventCause.EXECUTION_LEASE_EXPIRED.value)
+    assert row['cancel_requested_at'] is not None
+    assert row['execution_quiescence_required'] is True
+    assert row['execution_quiesced_generation'] == item.execution_generation
+    assert row['execution_quiesced_at'] == receipt_before_reap
+    assert row['pid'] == 1234
+    assert row['claim_token'] == uuid.UUID(item.claim_token)
+    assert row['worker_instance_id'] == uuid.UUID(item.worker_instance_id)
+    assert row['lease_expires_at'] is not None
+    assert row['heartbeat_at'] is not None
+    assert queue_count == 0
+    assert backend.acknowledge_execution_quiescence(claim)
+
+
+def test_expired_read_only_claim_replays_after_exact_receipt(request_database):
+    engine, backend = request_database
     assert asyncio.run(
-        backend.create_if_not_exists_async(_request('replay-read-only')))
-    first = request_postgres.PostgresQueueBackend('short').get()
-    assert first is not None
-    time.sleep(0.1)
-    second = request_postgres.PostgresQueueBackend('short').get()
+        backend.create_if_not_exists_async(_event_request('replay-read-only')))
+    first = _claim(backend, 'replay-read-only')
+    _expire_claim(engine, first.request_id)
+    queue = request_postgres.PostgresQueueBackend('short')
+
+    assert queue.get() is None
+    with engine.connect() as connection:
+        blocked = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                first.request_id)).mappings().one()
+        delivery = connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                first.request_id)).mappings().one()
+    assert blocked['status'] == requests.RequestStatus.RUNNING.value
+    assert blocked['cancel_requested_at'] is not None
+    assert blocked['execution_quiescence_required'] is True
+    assert blocked['execution_quiesced_generation'] is None
+    assert blocked['execution_quiesced_at'] is None
+    assert blocked['pid'] == 1234
+    assert blocked['claim_token'] == uuid.UUID(first.claim_token)
+    assert blocked['worker_instance_id'] == uuid.UUID(first.worker_instance_id)
+    assert blocked['lease_expires_at'] is not None
+    assert blocked['heartbeat_at'] is not None
+    assert delivery['delivery_state'] == 'claimed'
+    assert delivery['claim_generation'] == first.execution_generation
+
+    claim = storage.ExecutionClaim(first.request_id, first.execution_generation,
+                                   first.claim_token, first.worker_instance_id)
+    assert not backend.heartbeat_claim(claim)
+    context = storage.activate_execution_claim(first.request_id,
+                                               first.execution_generation,
+                                               first.claim_token)
+    try:
+        assert not backend.set_request_finished(
+            first.request_id, requests.RequestStatus.SUCCEEDED, result=[])
+    finally:
+        storage.deactivate_execution_claim(context)
+    with engine.connect() as connection:
+        event_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                )).select_from(event_schema.RESOURCE_EVENTS).where(
+                    event_schema.RESOURCE_EVENTS.c.source_request_id ==
+                    first.request_id)).scalar_one()
+    assert event_count == 0
+
+    assert backend.acknowledge_execution_quiescence(claim)
+    with engine.connect() as connection:
+        released = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                first.request_id)).mappings().one()
+        delivery = connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                first.request_id)).mappings().one()
+        event_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count(  # pylint: disable=not-callable
+                )).select_from(event_schema.RESOURCE_EVENTS).where(
+                    event_schema.RESOURCE_EVENTS.c.source_request_id ==
+                    first.request_id)).scalar_one()
+    assert released['status'] == requests.RequestStatus.WAITING.value
+    assert released['terminal_cause'] is None
+    assert released['claim_token'] is None
+    assert released['worker_instance_id'] is None
+    assert released['cancel_requested_at'] is None
+    assert not released['execution_quiescence_required']
+    assert delivery['delivery_state'] == 'queued'
+    assert delivery['claim_generation'] is None
+    assert event_count == 0
+
+    second = queue.get()
     assert second is not None
     assert second.request_id == first.request_id
     assert second.execution_generation == first.execution_generation + 1
     assert second.claim_token != first.claim_token
-    assert not backend.heartbeat_claim(
-        storage.ExecutionClaim(first.request_id, first.execution_generation,
-                               first.claim_token))
 
 
-def test_terminal_internal_daemon_is_revived_with_fresh_delivery(
+def test_expired_read_only_sweep_consumes_receipt_published_first(
         request_database):
-    _, backend = request_database
-    request = requests.build_internal_daemon_request(
-        daemons.INTERNAL_REQUEST_DAEMONS[0])
-    assert asyncio.run(backend.create_or_refresh_internal_daemon_async(request))
+    engine, backend = request_database
+    request_id = 'replay-read-only-receipt-first'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    first = _claim(backend, request_id)
+    _expire_claim(engine, request_id)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    execution_quiesced_generation=first.execution_generation,
+                    execution_quiesced_at=(sqlalchemy.func.clock_timestamp())))
+
     queue = request_postgres.PostgresQueueBackend('short')
-    item = queue.get()
-    assert item is not None
-    context = storage.activate_execution_claim(item.request_id,
-                                               item.execution_generation,
-                                               item.claim_token)
-    try:
-        assert backend.try_mark_running(item.request_id, 1234,
-                                        item.execution_generation,
-                                        item.claim_token)
-        backend.set_request_finished(item.request_id,
-                                     requests.RequestStatus.FAILED,
-                                     error=RuntimeError('daemon stopped'))
-    finally:
-        storage.deactivate_execution_claim(context)
-    assert asyncio.run(backend.create_or_refresh_internal_daemon_async(request))
-    restored = backend.get_request(request.request_id)
-    assert restored.status is requests.RequestStatus.PENDING
-    assert restored.error is None
-    assert not restored.execution_quiescence_required
-    assert restored.execution_quiesced_generation is None
-    assert restored.execution_quiesced_at is None
-    assert queue.qsize() == 1
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+    with engine.connect() as connection:
+        released = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+        delivery = connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                request_id)).mappings().one()
+    assert released['status'] == requests.RequestStatus.WAITING.value
+    assert released['terminal_cause'] is None
+    assert released['claim_token'] is None
+    assert released['worker_instance_id'] is None
+    assert released['cancel_requested_at'] is None
+    assert not released['execution_quiescence_required']
+    assert delivery['delivery_state'] == 'queued'
+    assert delivery['claim_generation'] is None
+
+    second = queue.get()
+    assert second is not None
+    assert second.request_id == request_id
+    assert second.execution_generation == first.execution_generation + 1
 
 
 def test_cancel_never_signals_a_different_instance(request_database,
@@ -3278,6 +4794,35 @@ def test_pending_durable_cancel_records_immediate_quiescence(request_database):
     assert restored.execution_generation == 0
     assert restored.execution_quiesced_generation == 0
     assert restored.execution_quiesced_at is not None
+
+
+@pytest.mark.parametrize(
+    'status', [requests.RequestStatus.PENDING, requests.RequestStatus.WAITING])
+def test_claimed_pidless_cancel_records_exact_quiescence(
+        request_database, status):
+    engine, backend = request_database
+    request_id = f'claimed-pidless-{status.value.lower()}-cancel'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = request_postgres.PostgresQueueBackend('short').get()
+    assert item is not None
+    assert item.claim_token is not None
+    if status is requests.RequestStatus.WAITING:
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id).values(status=status.value))
+
+    assert backend.kill_requests([request_id]) == [request_id]
+
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.CANCELLED.value
+    assert request_row['pid'] is None
+    assert request_row['execution_process_start_time_ticks'] is None
+    assert request_row['execution_quiesced_generation'] == (
+        item.execution_generation)
+    assert request_row['execution_quiesced_at'] is not None
+    assert queue_row == {}
 
 
 def test_unclaimed_insert_opts_into_quiescence_only_when_claimed(
@@ -3471,6 +5016,156 @@ def test_running_pidless_cancel_does_not_invent_quiescence(request_database):
     assert restored.execution_quiesced_at is None
 
 
+def test_expired_running_pidless_replayable_claim_fails_closed(
+        request_database):
+    engine, backend = request_database
+    request_id = 'expired-running-pidless'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    pid=None,
+                    execution_process_start_time_ticks=None,
+                    lease_expires_at=sqlalchemy.func.clock_timestamp() -
+                    datetime.timedelta(seconds=1)))
+
+    queue = request_postgres.PostgresQueueBackend('short')
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+
+    _assert_execution_claim_blocked(engine, request_id, item)
+    with engine.connect() as connection:
+        first = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+    assert first['cancel_requested_at'] is not None
+    with engine.begin() as connection:
+        queue._reap_expired_claims(connection)
+    with engine.connect() as connection:
+        second = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).mappings().one()
+    assert second['updated_at'] == first['updated_at']
+
+
+def test_expired_pending_pidless_replayable_claim_requeues_pre_effect(
+        request_database):
+    engine, backend = request_database
+    request_id = 'expired-pending-pidless'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    queue = request_postgres.PostgresQueueBackend('short')
+    item = queue.get()
+    assert item is not None
+    assert item.request_id == request_id
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    lease_expires_at=sqlalchemy.func.clock_timestamp() -
+                    datetime.timedelta(seconds=1)))
+        queue._reap_expired_claims(connection)
+
+    _assert_execution_claim_requeued(engine, request_id)
+
+
+def test_expired_claim_reaper_filters_handled_rows_before_limit(
+        request_database):
+    engine, backend = request_database
+    queue = request_postgres.PostgresQueueBackend('short')
+    target_id = 'expired-target-after-handled-limit'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(target_id)))
+    target = queue.get()
+    assert target is not None
+    assert target.request_id == target_id
+    _expire_claim(engine, target_id)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expired = now - datetime.timedelta(minutes=5)
+    request_rows = []
+    queue_rows = []
+    for index in range(101):
+        request_id = f'already-handled-expired-{index:03d}'
+        never = index >= 51
+        request = _request(request_id,
+                           entrypoint=(volume_core.volume_apply
+                                       if never else core.enabled_clouds))
+        request_values = request_postgres._request_values_for_db(request)
+        generation = 1
+        request_values.update(
+            status=(requests.RequestStatus.CANCELLED.value
+                    if never else requests.RequestStatus.RUNNING.value),
+            terminal_cause='explicit_cancel' if never else None,
+            execution_generation=generation,
+            claim_token=uuid.uuid4(),
+            worker_instance_id=uuid.UUID(backend.instance_id),
+            lease_expires_at=expired,
+            heartbeat_at=expired,
+            pid=20000 + index,
+            execution_process_start_time_ticks=424242 + index,
+            cancel_requested_at=now if not never else None,
+            execution_quiescence_required=not never,
+            should_retry=never,
+            finished_at=now if never else None,
+            updated_at=expired)
+        request_rows.append(request_values)
+        queue_values = request_postgres._queue_values(request)
+        queue_values.update(available_at=expired,
+                            enqueued_at=expired,
+                            delivery_state='claimed',
+                            claim_generation=generation,
+                            updated_at=expired)
+        queue_rows.append(queue_values)
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.insert(request_postgres.REQUESTS),
+                           request_rows)
+        connection.execute(sqlalchemy.insert(request_postgres.QUEUE),
+                           queue_rows)
+        queue._reap_expired_claims(connection)
+
+    _assert_execution_claim_requeued(engine, target_id)
+
+
+def test_quiescence_reducer_filters_never_policy_before_limit(request_database):
+    engine, backend = request_database
+    blockers = []
+    old = datetime.datetime.now(
+        datetime.timezone.utc) - datetime.timedelta(minutes=5)
+    for index in range(101):
+        request = _request(f'never-reducer-blocker-{index:03d}',
+                           entrypoint=volume_core.volume_apply,
+                           should_enqueue=False)
+        values = request_postgres._request_values_for_db(request)
+        values.update(status=requests.RequestStatus.CANCELLED.value,
+                      terminal_cause='explicit_cancel',
+                      should_retry=True,
+                      finished_at=old,
+                      updated_at=old)
+        blockers.append(values)
+    with engine.begin() as connection:
+        connection.execute(sqlalchemy.insert(request_postgres.REQUESTS),
+                           blockers)
+
+    target_id = 'reducer-target-after-never-limit'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(target_id)))
+    item = _claim(backend, target_id)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == target_id).values(
+                    cancel_requested_at=sqlalchemy.func.clock_timestamp(),
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=item.execution_generation,
+                    execution_quiesced_at=sqlalchemy.func.clock_timestamp()))
+        assert request_postgres._requeue_quiesced_replayable_requests(
+            connection) == 1
+
+    _assert_execution_claim_requeued(engine, target_id)
+
+
 def test_remote_cancel_signal_is_not_execution_quiescence(
         request_database, monkeypatch):
     engine, executor_backend = request_database
@@ -3483,22 +5178,22 @@ def test_remote_cancel_signal_is_not_execution_quiescence(
     monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
                        str(uuid.uuid4()))
     api_backend = request_postgres.PostgresRequestBackend()
-    kill = mock.Mock()
-    monkeypatch.setattr(request_postgres.os, 'kill', kill)
+    signal_exact = mock.Mock(return_value=True)
+    monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                        signal_exact)
     assert api_backend.kill_requests(['remote-cancel']) == ['remote-cancel']
-    kill.assert_not_called()
+    signal_exact.assert_not_called()
     assert not api_backend.acknowledge_execution_quiescence(
         storage.ExecutionClaim(item.request_id, item.execution_generation,
                                item.claim_token))
 
     monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR,
                        executor_instance_id)
-    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
-                        lambda _pid: True)
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token)
     assert executor_backend.interrupt_cancelled_claim(claim)
-    kill.assert_called_once_with(1234, request_postgres.signal.SIGTERM)
+    signal_exact.assert_called_once_with(1234, 424242,
+                                         request_postgres.signal.SIGTERM)
     with engine.connect() as connection:
         row = connection.execute(
             sqlalchemy.select(
@@ -3542,13 +5237,13 @@ def test_cancel_signal_and_receipt_are_serialized_by_request_lock(
     receipt_returned = threading.Event()
     receipt_result: list[bool] = []
 
-    def blocking_kill(_pid, _signal):
+    def blocking_signal(_pid, _start_time_ticks, _signal):
         signal_entered.set()
         assert signal_release.wait(timeout=5)
+        return True
 
-    monkeypatch.setattr(request_postgres.os, 'kill', blocking_kill)
-    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
-                        lambda _pid: True)
+    monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                        blocking_signal)
 
     cancel_thread = threading.Thread(target=backend.kill_requests,
                                      args=([request_id],))
@@ -3569,8 +5264,6 @@ def test_cancel_signal_and_receipt_are_serialized_by_request_lock(
     assert not cancel_thread.is_alive()
     assert not receipt_thread.is_alive()
     assert receipt_result == [True]
-    storage.clear_execution_cancellation(
-        storage.execution_cancellation_marker_path(1234, claim))
 
 
 @pytest.mark.parametrize('terminal_status', [
@@ -3606,6 +5299,59 @@ def test_exact_worker_records_terminal_execution_quiescence(
     assert restored.execution_quiescence_required
     assert (restored.execution_quiesced_generation == item.execution_generation)
     assert restored.execution_quiesced_at is not None
+
+
+def test_parent_transport_exception_atomically_fails_and_quiesces(
+        request_database):
+    engine, backend = request_database
+    request_id = 'parent-transport-exception'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+
+    assert backend.converge_execution_completion(
+        claim, error=RuntimeError('transported callable failure'))
+
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.FAILED.value
+    assert request_row['terminal_cause'] == (
+        event_api_models.EventCause.HANDLER_FAILED.value)
+    assert request_row['execution_quiesced_generation'] == (
+        item.execution_generation)
+    assert request_row['execution_quiesced_at'] is not None
+    assert queue_row == {}
+    restored = backend.get_request(request_id)
+    assert restored.get_error()['type'] == 'RuntimeError'
+
+
+def test_parent_normal_completion_preserves_child_terminal_result(
+        request_database):
+    engine, backend = request_database
+    request_id = 'parent-preserves-child-terminal'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    context = storage.activate_execution_claim(item.request_id,
+                                               item.execution_generation,
+                                               item.claim_token)
+    try:
+        assert backend.set_request_finished(request_id,
+                                            requests.RequestStatus.SUCCEEDED,
+                                            result=[])
+    finally:
+        storage.deactivate_execution_claim(context)
+
+    assert backend.converge_execution_completion(claim)
+
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.SUCCEEDED.value
+    assert request_row['return_value'] == []
+    assert request_row['execution_quiesced_generation'] == (
+        item.execution_generation)
+    assert request_row['execution_quiesced_at'] is not None
+    assert queue_row == {}
 
 
 def test_new_claim_resets_prior_generation_quiescence(request_database):
@@ -3653,25 +5399,52 @@ def test_cancel_never_signals_an_expired_local_claim(request_database,
     assert item.claim_token is not None
 
 
-def test_cancel_never_signals_a_reused_unowned_pid(request_database,
-                                                   monkeypatch):
+def test_cancel_never_signals_same_pid_with_different_birth(
+        request_database, monkeypatch):
     _, backend = request_database
     request_id = 'cancel-reused-unowned-pid'
     assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
     item = _claim(backend, request_id)
-    kill = mock.Mock()
-    monkeypatch.setattr(request_postgres.os, 'kill', kill)
-    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
-                        lambda _pid: False)
+    signal_exact = mock.Mock(return_value=False)
+    monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                        signal_exact)
 
     assert backend.kill_requests([request_id]) == [request_id]
 
-    kill.assert_not_called()
+    signal_exact.assert_called_once_with(1234, 424242,
+                                         request_postgres.signal.SIGTERM)
     restored = backend.get_request(request_id)
     assert restored.status is requests.RequestStatus.CANCELLED
     assert restored.execution_quiescence_required
     assert restored.execution_quiesced_generation is None
     assert item.claim_token is not None
+
+
+def test_exact_signal_uses_pidfd_and_process_birth_identity(monkeypatch):
+    pidfd_send_signal = mock.Mock()
+    monkeypatch.setattr(request_postgres.os,
+                        'pidfd_open',
+                        lambda pid, flags: 9,
+                        raising=False)
+    monkeypatch.setattr(request_postgres.signal,
+                        'pidfd_send_signal',
+                        pidfd_send_signal,
+                        raising=False)
+    monkeypatch.setattr(request_postgres.os, 'close', mock.Mock())
+    monkeypatch.setattr(request_postgres, '_is_owned_executor_process',
+                        lambda _pid: True)
+    monkeypatch.setattr(storage, 'read_linux_process_start_time_ticks',
+                        lambda _pid: 777)
+
+    assert not request_postgres._signal_exact_executor_process(
+        1234, 424242, request_postgres.signal.SIGTERM)
+    pidfd_send_signal.assert_not_called()
+
+    assert request_postgres._signal_exact_executor_process(
+        1234, 777, request_postgres.signal.SIGTERM)
+    pidfd_send_signal.assert_called_once_with(9,
+                                              request_postgres.signal.SIGTERM,
+                                              None, 0)
 
 
 def test_registry_rejects_row_selected_code_and_execution_class():
@@ -3748,8 +5521,6 @@ def test_registry_owns_controller_classes_and_replay_policies():
     volume_apply = registry.registration_for_handler(volume_core.volume_apply)
     volume_delete = registry.registration_for_handler(volume_core.volume_delete)
     volume_list = registry.registration_for_handler(volume_core.volume_list)
-    daemon = registry.registration_for_handler(
-        daemons.INTERNAL_REQUEST_DAEMONS[0].run_event)
 
     assert jobs_launch.execution_class is registry.ExecutionClass.CONTROLLER
     assert jobs_launch.replay_policy is registry.ReplayPolicy.NEVER
@@ -3769,8 +5540,10 @@ def test_registry_owns_controller_classes_and_replay_policies():
     assert volume_delete.replay_policy is registry.ReplayPolicy.NEVER
     assert volume_list.execution_class is registry.ExecutionClass.NORMAL
     assert volume_list.replay_policy is registry.ReplayPolicy.READ_ONLY
-    assert daemon.execution_class is registry.ExecutionClass.CONTROLLER
-    assert daemon.replay_policy is registry.ReplayPolicy.RECONCILE
+    with pytest.raises(ValueError, match='not registered'):
+        registry.registration_for_handler(daemons.RUNTIME_DAEMONS[0].run_event)
+    assert all(not registration.name.startswith('daemon:')
+               for registration in registry.registered_handlers())
 
 
 def test_local_sqlite_request_claim_arguments_are_ignored(
@@ -3919,10 +5692,85 @@ def test_claim_predicate_uses_database_clock(request_database):
                 lease_expires_at=datetime.datetime.now(datetime.timezone.utc) -
                 datetime.timedelta(seconds=1)))
     assert not backend.try_mark_running(
-        item.request_id, 1234, item.execution_generation, item.claim_token)
+        item.request_id, 1234, item.execution_generation, item.claim_token,
+        424242)
     assert not backend.heartbeat_claim(
         storage.ExecutionClaim(item.request_id, item.execution_generation,
                                item.claim_token))
+
+
+def test_retry_handoff_is_atomic_after_lease_expiry(request_database):
+    """Family proof, not lease age, authorizes a completed delayed retry."""
+    engine, backend = request_database
+    request_id = 'retry-handoff-after-expiry'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    lease_expires_at=(sqlalchemy.func.clock_timestamp() -
+                                      datetime.timedelta(seconds=1))))
+
+    assert backend.handoff_execution_retry(
+        claim, 'capacity pending (retrying in 200s)', 200)
+
+    with engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.status,
+                request_postgres.REQUESTS.c.claim_token,
+                request_postgres.REQUESTS.c.worker_instance_id,
+                request_postgres.REQUESTS.c.lease_expires_at,
+                request_postgres.REQUESTS.c.execution_quiescence_required,
+                request_postgres.REQUESTS.c.status_msg,
+                request_postgres.QUEUE.c.delivery_state,
+                request_postgres.QUEUE.c.claim_generation,
+                request_postgres.QUEUE.c.available_at,
+                sqlalchemy.func.clock_timestamp().label('database_now')).join(
+                    request_postgres.QUEUE, request_postgres.QUEUE.c.request_id
+                    == request_postgres.REQUESTS.c.request_id).where(
+                        request_postgres.REQUESTS.c.request_id ==
+                        request_id)).mappings().one()
+    assert row['status'] == requests.RequestStatus.WAITING.value
+    assert row['claim_token'] is None
+    assert row['worker_instance_id'] is None
+    assert row['lease_expires_at'] is None
+    assert not row['execution_quiescence_required']
+    assert row['status_msg'] == 'capacity pending (retrying in 200s)'
+    assert row['delivery_state'] == 'queued'
+    assert row['claim_generation'] is None
+    delay = (row['available_at'] - row['database_now']).total_seconds()
+    assert 195 <= delay <= 200
+
+
+def test_retry_handoff_does_not_resurrect_cancellation(request_database):
+    engine, backend = request_database
+    request_id = 'retry-handoff-cancel-wins'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    assert item.claim_token is not None
+    claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    assert backend.kill_requests([request_id], user_id=None) == [request_id]
+
+    assert not backend.handoff_execution_retry(claim, 'must not retry', 200)
+
+    with engine.connect() as connection:
+        status = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS.c.status).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request_id)).scalar_one()
+        delivery_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                request_postgres.QUEUE).where(
+                    request_postgres.QUEUE.c.request_id ==
+                    request_id)).scalar_one()
+    assert status == requests.RequestStatus.CANCELLED.value
+    assert delivery_count == 0
 
 
 def test_terminal_event_commits_with_request_and_queue_exactly_once(
@@ -4363,3 +6211,96 @@ def test_non_terminal_requests_are_never_reaped(request_database):
     row = _quiescence_state(engine, 'still-running')
     assert row.execution_quiesced_generation is None
     assert row.execution_quiesced_at is None
+
+
+def _execution_claim_state(engine: sqlalchemy.engine.Engine,
+                           request_id: str) -> tuple[dict, dict]:
+    with engine.connect() as connection:
+        request_row = dict(
+            connection.execute(
+                sqlalchemy.select(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request_id)).mappings().one())
+        queue_mapping = connection.execute(
+            sqlalchemy.select(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id ==
+                request_id)).mappings().one_or_none()
+        queue_row = dict(queue_mapping) if queue_mapping is not None else {}
+    return request_row, queue_row
+
+
+def _assert_execution_claim_requeued(engine: sqlalchemy.engine.Engine,
+                                     request_id: str) -> None:
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.WAITING.value
+    assert request_row['pid'] is None
+    assert request_row['claim_token'] is None
+    assert request_row['worker_instance_id'] is None
+    assert not request_row['execution_quiescence_required']
+    assert request_row['execution_quiesced_generation'] is None
+    assert request_row['execution_quiesced_at'] is None
+    assert queue_row['delivery_state'] == 'queued'
+    assert queue_row['claim_generation'] is None
+
+
+def _assert_execution_claim_blocked(engine: sqlalchemy.engine.Engine,
+                                    request_id: str,
+                                    item: queue_base.QueueItem) -> None:
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.RUNNING.value
+    assert request_row['claim_token'] == uuid.UUID(item.claim_token)
+    assert request_row['worker_instance_id'] == uuid.UUID(
+        item.worker_instance_id)
+    assert request_row['execution_quiesced_generation'] is None
+    assert request_row['execution_quiesced_at'] is None
+    assert queue_row['delivery_state'] == 'claimed'
+    assert queue_row['claim_generation'] == item.execution_generation
+
+
+@pytest.mark.parametrize('invalid_pid', [True, 0, -1])
+def test_durable_running_claim_rejects_invalid_pid(request_database,
+                                                   invalid_pid):
+    _, backend = request_database
+    request_id = f'invalid-pid-{invalid_pid!r}'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = request_postgres.PostgresQueueBackend('short').get()
+    assert item is not None
+    assert item.claim_token is not None
+
+    with pytest.raises(ValueError, match='positive PID'):
+        backend.try_mark_running(request_id, invalid_pid,
+                                 item.execution_generation, item.claim_token,
+                                 424242)
+
+
+@pytest.mark.parametrize('signal_delivered', [False, True])
+def test_shutdown_retry_waits_for_exact_quiescence_receipt(
+        request_database, monkeypatch, signal_delivered):
+    engine, backend = request_database
+    request_id = f'shutdown-retry-receipt-{signal_delivered}'
+    assert asyncio.run(backend.create_if_not_exists_async(_request(request_id)))
+    item = _claim(backend, request_id)
+    signal_exact = mock.Mock(return_value=signal_delivered)
+    monkeypatch.setattr(request_postgres, '_signal_exact_executor_process',
+                        signal_exact)
+
+    assert (backend.interrupt_request_for_shutdown_retry(request_id)
+            is signal_delivered)
+    signal_exact.assert_called_once_with(1234, 424242, signal.SIGTERM)
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    # Signal delivery is not stop proof: polling cannot observe client retry
+    # until the exact wrapper publishes its generation-bound receipt.
+    assert request_row['status'] == requests.RequestStatus.RUNNING.value
+    assert not request_row['should_retry']
+    assert request_row['execution_quiesced_at'] is None
+    assert queue_row['delivery_state'] == 'claimed'
+
+    claim = storage.ExecutionClaim(request_id, item.execution_generation,
+                                   item.claim_token, item.worker_instance_id)
+    assert backend.acknowledge_execution_quiescence(claim)
+    request_row, queue_row = _execution_claim_state(engine, request_id)
+    assert request_row['status'] == requests.RequestStatus.CANCELLED.value
+    assert request_row['should_retry']
+    assert request_row['execution_quiesced_generation'] == (
+        item.execution_generation)
+    assert queue_row == {}

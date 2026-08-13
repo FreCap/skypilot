@@ -490,8 +490,9 @@ After acquiring its nonblocking session advisory lock and before opening the
 writer snapshot, every protocol-4 apply also invokes revision 040's exact
 runtime-authority assertion by its canonical schema-qualified name.  The
 application discovers that canonical schema from exactly one persistent
-`alembic_version_serve_state_db = '040'` relation colocated with the assertion,
-gate, and both ledger relations; it never trusts caller-controlled
+`alembic_version_serve_state_db` relation colocated with the assertion, gate,
+and both ledger relations and carrying one recognized additive revision at or
+after `040`; it never trusts caller-controlled
 `current_schema()` or unqualified name resolution.  Before invoking the
 database function, the application compares its complete `prosrc` byte string
 with the exact expected definition regenerated from the compiled, frozen
@@ -510,9 +511,11 @@ unique primary index, both named `alembic_version_serve_state_db_pkc`.  That
 index is the unparameterized default btree with default opclass, source-column
 collation, ascending/nulls-last key, owner-only ACL, and no predicate,
 expression, exclusion, deferred-validity, or physical storage options.  Its
-single row contains `040`.  The schema-qualified assertion then verifies the complete
+single row contains one closed, application-recognized additive Serve revision
+at or after `040`.  The schema-qualified assertion then verifies the complete
 040 catalog, its exact relation/function OIDs, and one coherent open or terminal
-singleton.
+singleton. An unknown head still fails closed, and accepting a later head does
+not relax any revision-040 relation, function, or singleton verification.
 
 There are three named application interfaces rather than one boolean flag.  A
 reader assertion accepts exact open or terminal state and retains an `ACCESS

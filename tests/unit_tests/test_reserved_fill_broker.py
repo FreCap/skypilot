@@ -9,10 +9,12 @@ downstream identity.
 # pylint: disable=protected-access,invalid-name,missing-class-docstring
 # pylint: disable=redefined-outer-name,not-callable
 import contextlib
+import dataclasses
 import json
 import pickle
 import threading
 from unittest import mock
+import uuid
 
 import pytest
 import sqlalchemy
@@ -22,6 +24,7 @@ from sqlalchemy import orm
 from sqlalchemy.sql import dml
 
 from sky.serve import constants as serve_constants
+from sky.serve import pool_capacity_observation
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import serve_state
@@ -549,6 +552,32 @@ def test_exact_card_feed_partition_is_deterministic_and_conserved():
     assert sum(clipped['svc-a'].values()) == 2
 
 
+def test_exact_card_occupancy_debit_never_moves_to_another_card():
+    aggregate, spendable = broker._apply_occupancy_to_exact_card_observation(
+        {
+            'a100': 1,
+            'h200': 1,
+        }, 1, {'a100': 1})
+
+    assert aggregate == 1
+    assert spendable == {'a100': 0, 'h200': 1}
+    assert broker._allocate_feed_by_accelerator({'svc': 1}, spendable,
+                                                aggregate) == {
+                                                    'svc': {
+                                                        'h200': 1
+                                                    }
+                                                }
+
+    # An already-exhausted A100 card cannot transfer its debit to H200.
+    aggregate, spendable = broker._apply_occupancy_to_exact_card_observation(
+        {
+            'a100': 0,
+            'h200': 2,
+        }, 1, {'a100': 1})
+    assert aggregate == 2
+    assert spendable == {'a100': 0, 'h200': 2}
+
+
 def _replica_stub(is_ready=True,
                   is_terminal=False,
                   created_at=None,
@@ -560,6 +589,7 @@ def _replica_stub(is_ready=True,
     info = _replica()
     info.created_at = created_at
     info.reserved_fill = reserved_fill
+    info.is_zero_cost = reserved_fill
     # launched=False models a launch-cancelled row (sky.launch interrupted
     # before a pod was provisioned).
     info.status_property.sky_launch_status = (
@@ -601,62 +631,67 @@ class TestProtocolV2ReplicaPoolProvenance:
                       region='phx-context',
                       gpu='H200'):
         info = _replica_stub(region=region, gpu=gpu, reserved_fill=True)
+        info.is_zero_cost = True
         info.reserved_fill_pool_key = pool_key or cls._POOL
         info.reserved_fill_service_generation = generation
         info.reserved_fill_physical_cluster_uid = physical_cluster_uid
         return info
 
     @classmethod
-    def _matches(cls, info, current_service_generation=5):
-        return broker._replica_row_on_pool(
-            info, ('phx-context',), ('h200',),
-            pool_key=cls._POOL,
-            physical_cluster_uid='phx-cluster',
-            current_service_generation=current_service_generation,
-            pool_gpus_per_replica=1)
+    def _matches(cls, info):
+        return broker._replica_row_on_pool(info, ('phx-context',), ('h200',),
+                                           pool_key=cls._POOL,
+                                           physical_cluster_uid='phx-cluster')
 
     def test_complete_matching_tuple_accepts_current_and_older_generation(self):
         assert self._matches(self._explicit_row(generation=5))
         assert self._matches(self._explicit_row(generation=4))
+        assert self._matches(self._explicit_row(region='retired-alias'))
+        prior_width = self._explicit_row()
+        prior_width.location['accelerators'] = {'H200': 8}
+        assert self._matches(prior_width)
 
     def test_complete_former_claimant_tuple_remains_physical_occupancy(self):
-        assert self._matches(self._explicit_row(),
-                             current_service_generation=None)
+        assert self._matches(self._explicit_row())
 
-    def test_partial_malformed_or_contradictory_tuple_fails_closed(self):
+    def test_only_self_consistent_other_pool_provenance_excludes_occupancy(
+            self):
         other_pool = broker.make_pool_key(
             'phx-context',
             'H200',
             protocol_version=broker.PROTOCOL_V2,
             physical_cluster_uid='replacement-cluster')
-        cases = []
-
         partial = _replica_stub(region='phx-context',
                                 gpu='H200',
                                 reserved_fill=True)
         partial.reserved_fill_pool_key = self._POOL
-        cases.append(partial)
-        cases.extend([
-            self._explicit_row(generation=True),
-            self._explicit_row(generation=6),
-            self._explicit_row(pool_key=other_pool),
-            self._explicit_row(physical_cluster_uid='replacement-cluster'),
-            self._explicit_row(region='other-context'),
-            self._explicit_row(gpu='A100'),
-        ])
+        # Partial provenance cannot prove that the row is absent from this
+        # physical pool.  Conservatively debit every plausible same-card pool.
+        assert self._matches(partial)
+        assert self._matches(self._explicit_row(generation=6))
+        assert self._matches(self._explicit_row(pool_key=other_pool))
+        assert not self._matches(
+            self._explicit_row(pool_key=other_pool,
+                               physical_cluster_uid='replacement-cluster'))
+        # A contradictory tuple is not proof of exact absence.  It falls back
+        # to conservative hints instead of authorizing a potentially occupied
+        # slot.
+        assert self._matches(
+            self._explicit_row(physical_cluster_uid='replacement-cluster'))
+        assert self._matches(self._explicit_row(region='other-context'))
+        assert self._matches(self._explicit_row(gpu='A100'))
         shapeless = self._explicit_row()
         shapeless.location['accelerators'] = {}
-        cases.append(shapeless)
+        assert self._matches(shapeless)
         wrong_width = self._explicit_row()
         wrong_width.location['accelerators'] = {'H200': 8}
-        cases.append(wrong_width)
+        assert self._matches(wrong_width)
         mixed_cards = self._explicit_row()
         mixed_cards.location['accelerators'] = {'H200': 1, 'A100': 1}
-        cases.append(mixed_cards)
+        assert self._matches(mixed_cards)
 
-        assert all(not self._matches(info) for info in cases)
-
-    def test_genuinely_legacy_row_retains_location_fallback(self):
+    def test_v2_fill_without_explicit_provenance_is_conservatively_debited(
+            self):
         legacy = _replica_stub(region='phx-context',
                                gpu='H200',
                                reserved_fill=True)
@@ -683,10 +718,256 @@ class TestProtocolV2ReplicaPoolProvenance:
                                          claim_generations={'svc-a': 5},
                                          pool_gpus_per_replica=1)
 
-        # The future claimant row receives no holding.  A former claimant has
-        # no current generation fence, but its complete immutable launch tuple
-        # still proves one unclaimed physical occupant of this pool.
-        assert result == (0, 0, {'svc-a': 0}, 1)
+        # Generation authority can reject a new launch but cannot move a
+        # persisted pod off its immutable physical pool. Count both physical
+        # occupants; only the former claimant is unclaimed.
+        assert result == (0, 0, {}, {'svc-a': 1}, 1)
+
+    def test_materialized_during_observation_drainer_is_still_debited(
+            self, monkeypatch):
+        drainer = self._explicit_row()
+        drainer.status_property.sky_down_status = (
+            common_utils.ProcessStatus.RUNNING)
+        drainer.zero_cost_admission_sequence = 1
+        drainer.zero_cost_materialization_sequence = 2
+        # Teardown may replace the current launch process status; the immutable
+        # materialization marker remains the proof that cleanup is physical.
+        drainer.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': [drainer]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=1,
+                                         observation_materialization_sequence=1)
+
+        assert result == (1, 1, {'h200': 1}, {'svc-a': 0}, 1)
+
+    @pytest.mark.parametrize('reserved_fill', [False, True])
+    def test_interrupted_cleanup_with_missing_materialization_is_debited(
+            self, monkeypatch, reserved_fill):
+        drainer = self._explicit_row()
+        drainer.reserved_fill = reserved_fill
+        drainer.status_property.sky_down_status = (
+            common_utils.ProcessStatus.RUNNING)
+        drainer.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.INTERRUPTED)
+        drainer.zero_cost_admission_sequence = 1
+        drainer.zero_cost_materialization_sequence = None
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': [drainer]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=1,
+                                         observation_materialization_sequence=1)
+
+        assert result == (1, 1, {'h200': 1}, {'svc-a': 0}, 0)
+
+    def test_old_alias_prior_width_row_debits_current_slot_equivalent(
+            self, monkeypatch):
+        prior = self._explicit_row(region='retired-alias')
+        prior.location['accelerators'] = {'H200': 8}
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-a': [prior]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=0,
+                                         observation_materialization_sequence=0)
+
+        assert result == (8, 8, {'h200': 8}, {'svc-a': 8}, 0)
+
+    @pytest.mark.parametrize('terminal', [False, True])
+    def test_false_cost_row_on_physical_pool_is_conservatively_debited(
+            self, monkeypatch, terminal):
+        physical = self._explicit_row()
+        physical.reserved_fill = False
+        physical.is_zero_cost = False
+        physical.zero_cost_admission_sequence = None
+        physical.zero_cost_materialization_sequence = None
+        if terminal:
+            physical.status_property.sky_down_status = (
+                common_utils.ProcessStatus.RUNNING)
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-a': [physical]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=0,
+                                         observation_materialization_sequence=0)
+
+        assert result == (1, 1, {'h200': 1}, {'svc-a': 0}, 0)
+
+    def test_unattributed_false_cost_row_on_retired_alias_is_conservative(
+            self, monkeypatch):
+        other = _replica_stub(region='other-context',
+                              gpu='H200',
+                              reserved_fill=False)
+        other._version = 15
+        other.is_zero_cost = False
+        other.zero_cost_admission_sequence = None
+        other.zero_cost_materialization_sequence = None
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': [other]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=1,
+                                         observation_materialization_sequence=1)
+
+        # With no immutable UID, another same-card Kubernetes context could be
+        # a retired alias of this physical cluster. A rewrite preserves the
+        # false compatibility default, so cost classification cannot prove
+        # physical absence. Withhold conservatively until attribution/cleanup.
+        assert result == (1, 1, {'h200': 1}, {'svc-a': 0}, 0)
+
+    @pytest.mark.parametrize('reserved_fill', [False, True])
+    @pytest.mark.parametrize('terminal', [False, True])
+    @pytest.mark.parametrize('record_version', [10, 15])
+    def test_legacy_row_rewritten_without_cost_truth_still_debits(
+            self, monkeypatch, reserved_fill, terminal, record_version):
+        legacy = _replica_stub(region='phx-context',
+                               gpu='H200',
+                               reserved_fill=reserved_fill)
+        # Replica serialization upgrades an old row to the latest version but
+        # cannot reconstruct historical is_zero_cost truth. Physical placement
+        # must therefore remain authoritative after that rewrite.
+        legacy._version = record_version
+        legacy.is_zero_cost = False
+        legacy.zero_cost_admission_sequence = None
+        legacy.zero_cost_materialization_sequence = None
+        if terminal:
+            legacy.status_property.sky_down_status = (
+                common_utils.ProcessStatus.RUNNING)
+            legacy.status_property.sky_launch_status = (
+                common_utils.ProcessStatus.INTERRUPTED)
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'svc-gone': [legacy]}))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=1,
+                                         observation_materialization_sequence=1)
+
+        expected_unclaimed = int(reserved_fill and not terminal)
+        assert result == (1, 1, {'h200': 1}, {'svc-a': 0}, expected_unclaimed)
+
+
+class TestSequencedOrdinaryZeroCostOccupancy:
+    """Unattributed ordinary rows debit every plausible same-card pool."""
+
+    @staticmethod
+    def _ordinary_row(*, gpu='H200', count=1):
+        info = _replica_stub(region='retired-alias',
+                             gpu=gpu,
+                             reserved_fill=False)
+        info.location['accelerators'] = {gpu: count}
+        info.is_zero_cost = True
+        info.zero_cost_admission_sequence = 2
+        info.zero_cost_materialization_sequence = 2
+        return info
+
+    @staticmethod
+    def _debit(monkeypatch, row, *, uid='phx-cluster', gpu='H200', width=1):
+        pool = broker.make_pool_key('ignored-alias',
+                                    gpu,
+                                    protocol_version=broker.PROTOCOL_V2,
+                                    physical_cluster_uid=uid)
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={'ordinary-svc': [row]}))
+        return broker._occupying_debit(['fill-svc'],
+                                       pool,
+                                       10.0,
+                                       access_contexts=('current-alias',),
+                                       physical_cluster_uid=uid,
+                                       claim_generations={'fill-svc': 7},
+                                       pool_gpus_per_replica=width,
+                                       observation_admission_sequence=1,
+                                       observation_materialization_sequence=1)
+
+    def test_same_card_and_width_debits_each_plausible_v2_pool(
+            self, monkeypatch):
+        row = self._ordinary_row()
+        assert self._debit(monkeypatch, row, uid='physical-a') == (1, 1, {
+            'h200': 1
+        }, {
+            'fill-svc': 0
+        }, 0)
+        assert self._debit(monkeypatch, row, uid='physical-b') == (1, 1, {
+            'h200': 1
+        }, {
+            'fill-svc': 0
+        }, 0)
+
+    def test_different_card_is_excluded_but_width_is_conservative(
+            self, monkeypatch):
+        row = self._ordinary_row()
+        assert self._debit(monkeypatch, row, gpu='H100') == (0, 0, {}, {
+            'fill-svc': 0
+        }, 0)
+        assert self._debit(monkeypatch, row, width=2) == (1, 1, {
+            'h200': 1
+        }, {
+            'fill-svc': 0
+        }, 0)
+        prior_width = self._ordinary_row(count=8)
+        assert self._debit(monkeypatch, prior_width, width=2) == (4, 4, {
+            'h200': 4
+        }, {
+            'fill-svc': 0
+        }, 0)
+
+    def test_complete_snapshot_failure_rejects_sequenced_authority(
+            self, monkeypatch):
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(side_effect=ValueError('decode failed')))
+        pool = broker.make_pool_key('phx-context',
+                                    'H200',
+                                    protocol_version=broker.PROTOCOL_V2,
+                                    physical_cluster_uid='phx-cluster')
+        with pytest.raises(broker.IncompleteReplicaOccupancySnapshotError,
+                           match='incomplete'):
+            broker._occupying_debit(['fill-svc'],
+                                    pool,
+                                    10.0,
+                                    access_contexts=('phx-context',),
+                                    physical_cluster_uid='phx-cluster',
+                                    claim_generations={'fill-svc': 7},
+                                    pool_gpus_per_replica=1,
+                                    observation_admission_sequence=1,
+                                    observation_materialization_sequence=1)
 
 
 def _live_fill_rows(count):
@@ -726,7 +1007,50 @@ def _v2_edge(pool_key,
     }
 
 
+def _install_legacy_reconciliation_gate(monkeypatch):
+    """Keep non-PostgreSQL claim-facade tests on the legacy branch."""
+    gate = pool_capacity_observation.ReconciliationGate(
+        state=(pool_capacity_observation.ReconciliationGateState.LEGACY_ACTIVE),
+        generation=0)
+    repository = mock.Mock()
+    repository.read_reconciliation_gate.return_value = gate
+    monkeypatch.setattr(pool_capacity_observation,
+                        'PoolCapacityObservationRepository',
+                        mock.Mock(return_value=repository))
+
+
+def _committed_observation(
+    pool_key: str,
+    *,
+    free_gpus: int = 10,
+    observed_at: float = 990.0,
+    valid_until: float = 1060.0,
+) -> pool_capacity_observation.PoolCapacityObservation:
+    identity = broker.parse_pool_identity(pool_key)
+    assert identity.physical_cluster_uid is not None
+    payload = pool_capacity_observation.PoolCapacitySuccess.from_counts(
+        free_gpus, {identity.gpu_names[0]: free_gpus})
+    return pool_capacity_observation.PoolCapacityObservation(
+        pool_key=pool_key,
+        physical_cluster_uid=identity.physical_cluster_uid,
+        accelerator_names=identity.gpu_names,
+        access_context='phx-context',
+        observation_generation=11,
+        lease_token=uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'),
+        lease_expires_at=1020.0,
+        observation_sequence=29,
+        ordinary_admission_sequence=29,
+        materialization_sequence=23,
+        payload=payload,
+        payload_sha256='a' * 64,
+        observed_at=observed_at,
+        completed_at=995.0,
+        valid_until=valid_until,
+        published_at=999.0)
+
+
 def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
+    _install_legacy_reconciliation_gate(monkeypatch)
     pool = broker.make_pool_key('phx-context',
                                 'H200',
                                 protocol_version=broker.PROTOCOL_V2,
@@ -826,6 +1150,48 @@ def test_replace_claim_set_overlap_withdraws_previous_generation(monkeypatch):
     broker.clear_caches()
 
 
+def test_replace_claim_set_allows_disjoint_cards_in_one_access_context(
+        monkeypatch):
+    _install_legacy_reconciliation_gate(monkeypatch)
+    h200_pool = broker.make_pool_key('phx-context',
+                                     'H200',
+                                     protocol_version=broker.PROTOCOL_V2,
+                                     physical_cluster_uid='phx-cluster')
+    a100_pool = broker.make_pool_key('phx-context',
+                                     'A100',
+                                     protocol_version=broker.PROTOCOL_V2,
+                                     physical_cluster_uid='phx-cluster')
+    h200_edge = _v2_edge(h200_pool)
+    a100_edge = _v2_edge(a100_pool)
+    a100_edge.update({
+        'legacy_pool_key': broker.make_pool_key('phx-context', 'A100'),
+        'pool_position': 1,
+        'accelerator_names': ['A100'],
+    })
+    replace = mock.Mock(return_value=7)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state, 'replace_reserved_fill_claim_set', replace)
+    monkeypatch.setattr(broker.locks, 'get_lock',
+                        lambda *args, **kwargs: _InertLock())
+
+    generation = broker.replace_claim_set('svc-a',
+                                          semantic_hash='two-exact-card-edges',
+                                          global_headroom=3,
+                                          utilization_ceiling=3,
+                                          utilization_state={},
+                                          edges=[h200_edge, a100_edge],
+                                          expected_service_hash='owner-hash')
+
+    assert generation == 7
+    assert replace.call_args.kwargs['edges'] == [h200_edge, a100_edge]
+
+
 def test_v2_round_single_claimant_is_integer_generation_fenced(
         _broker_db, monkeypatch):
     pool = broker.make_pool_key('phx-context',
@@ -861,8 +1227,8 @@ def test_v2_round_single_claimant_is_integer_generation_fenced(
     assert allocation.edge_cap == 3
     assert allocation.pool_key == pool
     assert allocation.feed_by_accelerator == {'h200': 3}
-    assert allocation.observed_free == 10
-    assert allocation.observed_free_by_accelerator == {'h200': 10}
+    assert allocation.observed_free_slots == 10
+    assert allocation.observed_free_slots_by_accelerator == {'h200': 10}
     assert allocation.observed_at == allocation.snapshot_time
     assert publish.call_args.kwargs['protocol_version'] == broker.PROTOCOL_V2
     assert json.loads(publish.call_args.kwargs['feed_by_accelerator']) == {
@@ -883,6 +1249,202 @@ def test_v2_round_single_claimant_is_integer_generation_fenced(
         accelerator_names=('h200',),
         physical_cluster_uid='phx-cluster',
         service_generation=7)
+
+
+def test_committed_observation_drives_provider_free_round_with_provenance(
+        _broker_db, monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    edge = _v2_edge(pool)
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    legacy_publish = mock.Mock(side_effect=AssertionError(
+        'committed rounds must not use the legacy publication boundary'))
+    monkeypatch.setattr(serve_state, 'publish_reserved_fill_round',
+                        legacy_publish)
+    monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                        mock.Mock(return_value={}))
+    publish_round = mock.Mock(return_value=True)
+    observation = _committed_observation(pool)
+
+    allocation = broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        observation,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round)
+
+    assert allocation is not None
+    assert allocation.feed == 3
+    assert allocation.feed_by_accelerator == {'h200': 3}
+    assert allocation.observed_free_slots == 10
+    assert allocation.observed_free_slots_by_accelerator == {'h200': 10}
+    assert allocation.snapshot_time == observation.observed_at
+    assert allocation.observed_at == observation.observed_at
+    publication = publish_round.call_args.args[0]
+    assert isinstance(publication, broker.ReservedFillRoundPublication)
+    assert publication.snapshot_time == observation.observed_at
+    assert publication.observation_provenance == (
+        broker.RoundObservationProvenance(pool_key=pool,
+                                          physical_cluster_uid='phx-cluster',
+                                          accelerator_names=('h200',),
+                                          access_context='phx-context',
+                                          observation_generation=11,
+                                          observation_sequence=29,
+                                          materialization_sequence=23,
+                                          payload_sha256='a' * 64,
+                                          observed_at=observation.observed_at,
+                                          valid_until=observation.valid_until))
+    legacy_publish.assert_not_called()
+
+
+def test_committed_observation_converts_raw_gpus_once_with_broker_width(
+        _broker_db, monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    edge = _v2_edge(pool)
+    edge['gpus_per_replica'] = 8
+    monkeypatch.setattr(broker, 'get_protocol_version',
+                        mock.Mock(return_value=broker.PROTOCOL_V2))
+    monkeypatch.setattr(serve_state, 'get_authoritative_reserved_fill_claims',
+                        mock.Mock(return_value=[edge]))
+    monkeypatch.setattr(serve_state,
+                        'prune_authoritative_reserved_fill_claim_sets',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                        mock.Mock(return_value={}))
+    publish_round = mock.Mock(return_value=True)
+    observation = _committed_observation(pool, free_gpus=10)
+
+    allocation = broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        observation,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round)
+
+    assert allocation is not None
+    assert allocation.feed == 1
+    assert allocation.feed_by_accelerator == {'h200': 1}
+    assert allocation.observed_free_slots == 1
+    assert allocation.observed_free_slots_by_accelerator == {'h200': 1}
+    assert allocation.broker_slot_width == 8
+    publication = publish_round.call_args.args[0]
+    assert publication.last_observed_free == 1
+    assert json.loads(publication.feed_by_accelerator) == {
+        broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
+            'h200': 1
+        },
+        broker._BROKER_SLOT_WIDTH_KEY: 8,
+        'svc-a': {
+            'h200': 1
+        },
+    }
+
+
+def test_committed_observation_fails_closed_before_lock_when_invalid(
+        monkeypatch):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    lock = mock.Mock()
+    monkeypatch.setattr(broker.locks, 'get_lock', lock)
+    monkeypatch.setattr(broker.time, 'time', mock.Mock(return_value=1000.0))
+    publish_round = mock.Mock(return_value=True)
+    observation = _committed_observation(pool)
+
+    blackout = dataclasses.replace(
+        observation,
+        payload=pool_capacity_observation.PoolCapacityBlackout(
+            pool_capacity_observation.PoolCapacityBlackoutReason.TIMEOUT))
+    assert broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        blackout,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round) is None
+
+    mismatched_identity = dataclasses.replace(observation,
+                                              physical_cluster_uid='other')
+    assert broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        mismatched_identity,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round) is None
+
+    mismatched_split = dataclasses.replace(
+        observation,
+        payload=pool_capacity_observation.PoolCapacitySuccess.from_counts(
+            10, {'h100': 10}))
+    assert broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        mismatched_split,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round) is None
+
+    expired = dataclasses.replace(observation, valid_until=999.0)
+    assert broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        expired,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round) is None
+
+    lock.assert_not_called()
+    publish_round.assert_not_called()
+
+
+def test_committed_observation_expiring_while_waiting_for_lock_fails_closed(
+        _broker_db, monkeypatch, clock):
+    pool = broker.make_pool_key('phx-context',
+                                'H200',
+                                protocol_version=broker.PROTOCOL_V2,
+                                physical_cluster_uid='phx-cluster')
+    observation = _committed_observation(pool, valid_until=1001.0)
+
+    class _ExpiringLock:
+
+        def __enter__(self):
+            clock.advance(2.0)
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    monkeypatch.setattr(broker.locks, 'get_lock',
+                        mock.Mock(return_value=_ExpiringLock()))
+    acquire_lease = mock.Mock()
+    monkeypatch.setattr(serve_state, 'acquire_reserved_fill_lease_token',
+                        acquire_lease)
+    publish_round = mock.Mock(return_value=True)
+
+    assert broker.run_round_from_committed_observation(
+        'svc-a',
+        pool,
+        observation,
+        60.0,
+        expected_service_generation=7,
+        publish_round=publish_round) is None
+    acquire_lease.assert_not_called()
+    publish_round.assert_not_called()
 
 
 def test_cas_lost_writer_returns_no_measured_capacity(_broker_db, monkeypatch):
@@ -989,8 +1551,8 @@ def test_v2_confirmed_phantom_preserves_generation_and_healthy_sibling(
     assert phantom is not None
     assert phantom.grant == 0
     assert phantom.feed == 0
-    assert phantom.observed_free is None
-    assert phantom.observed_free_by_accelerator is None
+    assert phantom.observed_free_slots is None
+    assert phantom.observed_free_slots_by_accelerator is None
     assert phantom.service_generation == 7
     remove_pool.assert_not_called()
     phantom_publish = publish.call_args
@@ -1260,6 +1822,7 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
         broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
             'h200': 3
         },
+        broker._BROKER_SLOT_WIDTH_KEY: 1,
     })
     allocation = broker._allocation_from_round(
         'svc-a',
@@ -1271,8 +1834,8 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation is not None
     assert allocation.feed == 1
     assert allocation.feed_by_accelerator == {'h200': 1}
-    assert allocation.observed_free == 3
-    assert allocation.observed_free_by_accelerator == {'h200': 3}
+    assert allocation.observed_free_slots == 3
+    assert allocation.observed_free_slots_by_accelerator == {'h200': 3}
     assert allocation.observed_at == round_row['snapshot_time']
 
     # Observation corruption suppresses only bench-release evidence; valid
@@ -1284,6 +1847,7 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
         broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
             'h200': 2
         },
+        broker._BROKER_SLOT_WIDTH_KEY: 1,
     })
     allocation = broker._allocation_from_round(
         'svc-a',
@@ -1295,7 +1859,7 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation is not None
     assert allocation.feed == 1
     assert allocation.feed_by_accelerator == {'h200': 1}
-    assert allocation.observed_free is None
+    assert allocation.observed_free_slots is None
 
     # Service corruption still fails launch authority closed, independently
     # of a valid committed observation.
@@ -1306,6 +1870,7 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
         broker._OBSERVED_FREE_BY_ACCELERATOR_KEY: {
             'h200': 3
         },
+        broker._BROKER_SLOT_WIDTH_KEY: 1,
     })
     allocation = broker._allocation_from_round(
         'svc-a',
@@ -1317,8 +1882,8 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation is not None
     assert allocation.feed == 0
     assert allocation.feed_by_accelerator == {}
-    assert allocation.observed_free == 3
-    assert allocation.observed_free_by_accelerator == {'h200': 3}
+    assert allocation.observed_free_slots == 3
+    assert allocation.observed_free_slots_by_accelerator == {'h200': 3}
 
     round_row['feed_by_accelerator'] = '{malformed'
     allocation = broker._allocation_from_round(
@@ -1331,8 +1896,8 @@ def test_v2_round_reader_rejects_generation_mismatch_and_clamps_cap():
     assert allocation is not None
     assert allocation.feed == 0
     assert allocation.feed_by_accelerator == {}
-    assert allocation.observed_free is None
-    assert allocation.observed_free_by_accelerator is None
+    assert allocation.observed_free_slots is None
+    assert allocation.observed_free_slots_by_accelerator is None
     broker.clear_caches()
 
 
@@ -1402,8 +1967,8 @@ class TestSingleClaimantFastPath:
         assert alloc is not None
         assert alloc.grant is None
         assert alloc.feed == 0
-        assert alloc.observed_free is None
-        assert alloc.observed_free_by_accelerator is None
+        assert alloc.observed_free_slots is None
+        assert alloc.observed_free_slots_by_accelerator is None
 
     def test_v1_publishes_committed_exact_card_observation(self):
         _upsert('svc-a')
@@ -1414,8 +1979,8 @@ class TestSingleClaimantFastPath:
         assert alloc.grant is None
         assert alloc.feed == 7
         assert alloc.feed_by_accelerator == {'a100': 7}
-        assert alloc.observed_free == 7
-        assert alloc.observed_free_by_accelerator == {'a100': 7}
+        assert alloc.observed_free_slots == 7
+        assert alloc.observed_free_slots_by_accelerator == {'a100': 7}
         assert alloc.observed_at == alloc.snapshot_time
 
     def test_invalid_exact_card_split_is_a_blackout(self):
@@ -1425,8 +1990,8 @@ class TestSingleClaimantFastPath:
                                                         (('a100', 6),)))
         assert alloc is not None
         assert alloc.feed == 0
-        assert alloc.observed_free is None
-        assert alloc.observed_free_by_accelerator is None
+        assert alloc.observed_free_slots is None
+        assert alloc.observed_free_slots_by_accelerator is None
 
 
 @pytest.mark.usefixtures('_broker_db')
@@ -1527,17 +2092,17 @@ class TestMultiClaimantRounds:
         observation = broker.PoolObservation(10, ('A100',), (('a100', 10),))
         first = _run('svc-a', observation=observation)
         assert first is not None
-        assert first.observed_free == 10
-        assert first.observed_free_by_accelerator == {'a100': 10}
+        assert first.observed_free_slots == 10
+        assert first.observed_free_slots_by_accelerator == {'a100': 10}
         query = mock.Mock(side_effect=AssertionError('must not re-query'))
         clock.advance(10)  # well inside the freshness window
         again = broker.run_round_if_stale('svc-b', _POOL, query, 60.0)
         assert again is not None
         assert again.round_id == first.round_id
         assert again.epoch == first.epoch
-        assert again.observed_free == first.observed_free
-        assert (again.observed_free_by_accelerator ==
-                first.observed_free_by_accelerator)
+        assert again.observed_free_slots == first.observed_free_slots
+        assert (again.observed_free_slots_by_accelerator ==
+                first.observed_free_slots_by_accelerator)
         assert again.observed_at == first.observed_at
         query.assert_not_called()
 
@@ -1928,7 +2493,7 @@ class TestEpochFencing:
         clock.advance(61)
         raw_only = _run_v2({'h200': 11, 'h100': 0})
         assert raw_only is not None
-        assert raw_only.observed_free == 11
+        assert raw_only.observed_free_slots == 11
         assert raw_only.feed_by_accelerator == {'h200': 3}
         assert raw_only.epoch == first.epoch
 
@@ -2618,7 +3183,7 @@ class TestReplicaSnapshotDebit:
 
         result = broker._occupying_debit(['svc-a', 'svc-b'], _POOL, 10.0)
 
-        assert result == (1, 0, {'svc-a': 1, 'svc-b': 0}, 1)
+        assert result == (1, 0, {'a100': 1}, {'svc-a': 1, 'svc-b': 0}, 1)
         snapshot.assert_called_once_with()
         legacy_names.assert_not_called()
         legacy_infos.assert_not_called()
@@ -2648,7 +3213,7 @@ class TestReplicaSnapshotDebit:
 
         result = broker._occupying_debit(['svc-a', 'svc-bad'], _POOL, 10.0)
 
-        assert result == (1, 0, {'svc-a': 1}, 1)
+        assert result == (1, 0, {'a100': 1}, {'svc-a': 1}, 1)
         assert {call.args[0] for call in isolated_read.call_args_list
                } == {'svc-a', 'svc-bad', 'svc-gone'}
 

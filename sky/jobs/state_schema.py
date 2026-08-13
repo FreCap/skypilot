@@ -92,6 +92,23 @@ job_info_table = sqlalchemy.Table(
     sqlalchemy.Column('controller_generation',
                       sqlalchemy.BigInteger,
                       server_default=None),
+    # Runtime-owned managed-job slot identity.  Together with the outer
+    # controller owner these columns form the complete disposable-manager
+    # fencing token.  PIDs are retained only as diagnostics.
+    sqlalchemy.Column('controller_slot_id',
+                      sqlalchemy.Integer,
+                      server_default=None),
+    sqlalchemy.Column('controller_slot_attempt',
+                      sqlalchemy.Text,
+                      server_default=None),
+    # Durable admission revocation for one slot attempt.  A dead slot marks
+    # its exact jobs quiescing before it waits for nested API request receipts;
+    # request creation/claim/RUNNING admission reject the row until recovery
+    # publishes WAITING and clears the controller tuple.
+    sqlalchemy.Column('controller_slot_quiescing',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.sql.expression.false()),
     sqlalchemy.Column('dag_yaml_path', sqlalchemy.Text),
     sqlalchemy.Column('env_file_path', sqlalchemy.Text),
     sqlalchemy.Column('dag_yaml_content', sqlalchemy.Text, server_default=None),

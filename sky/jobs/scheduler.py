@@ -45,316 +45,21 @@ from argparse import ArgumentParser
 import asyncio
 import contextlib
 import os
-import pathlib
-import shutil
-import signal
-import sys
 import typing
-import uuid
-
-import filelock
 
 from sky import exceptions
 from sky import sky_logging
 from sky import skypilot_config
-from sky.adaptors import common as adaptors_common
-from sky.client import sdk
-from sky.jobs import constants as managed_job_constants
 from sky.jobs import state
-from sky.jobs import utils as managed_job_utils
 from sky.skylet import constants
 from sky.utils import asyncio_utils
 from sky.utils import controller_utils
 from sky.utils import dag_utils
-from sky.utils import subprocess_utils
-
-if typing.TYPE_CHECKING:
-
-    import psutil
-else:
-    psutil = adaptors_common.LazyImport('psutil')
 
 logger = sky_logging.init_logger('sky.jobs.controller')
 
-# Job controller lock. This is used to synchronize writing/reading the
-# controller pid file.
-JOB_CONTROLLER_PID_LOCK = os.path.expanduser(
-    '~/.sky/locks/job_controller_pid.lock')
-
-JOB_CONTROLLER_PID_PATH = os.path.expanduser('~/.sky/job_controller_pid')
-JOB_CONTROLLER_ENV_PATH = os.path.expanduser('~/.sky/job_controller_env')
-
-CURRENT_HASH = os.path.expanduser('~/.sky/wheels/current_sky_wheel_hash')
-
-
-def _parse_controller_pid_entry(entry: str) -> state.ControllerPidRecord | None:
-    entry = entry.strip()
-    if not entry:
-        return None
-    # The entry should be like <pid>,<started_at>
-    # pid is an integer, started_at is a float
-    entry_parts = entry.split(',')
-    if len(entry_parts) != 2:
-        # Unknown format
-        return None
-    raw_pid, raw_started_at = entry_parts
-
-    try:
-        pid = int(raw_pid)
-    except ValueError:
-        return None
-
-    try:
-        started_at = float(raw_started_at)
-    except ValueError:
-        return None
-    return state.ControllerPidRecord(pid=pid, started_at=started_at)
-
-
-def get_controller_process_records() -> list[state.ControllerPidRecord] | None:
-    """Return recorded controller processes if the file can be read."""
-    if not os.path.exists(JOB_CONTROLLER_PID_PATH):
-        # If the file doesn't exist, it means the controller server is not
-        # running, so we return an empty list
-        return []
-    try:
-        with open(JOB_CONTROLLER_PID_PATH, encoding='utf-8') as f:
-            lines = f.read().splitlines()
-    except (FileNotFoundError, OSError):
-        return None
-
-    records: list[state.ControllerPidRecord] = []
-    for line in lines:
-        record = _parse_controller_pid_entry(line)
-        if record is not None:
-            records.append(record)
-    return records
-
-
-def _append_controller_pid_record(pid: int, started_at: float) -> None:
-    # Note: started_at is a float, but converting to a string will not lose any
-    # precision. See https://docs.python.org/3/tutorial/floatingpoint.html and
-    # https://github.com/python/cpython/issues/53583
-    entry = f'{pid},{started_at}'
-    with open(JOB_CONTROLLER_PID_PATH, 'a', encoding='utf-8') as f:
-        f.write(entry + '\n')
-
-
-def start_controller() -> None:
-    """Start the job controller process.
-
-    This requires that the env file is already set up.
-    """
-    logs_dir = os.path.expanduser(
-        managed_job_constants.JOBS_CONTROLLER_LOGS_DIR)
-    os.makedirs(logs_dir, exist_ok=True)
-    controller_uuid = str(uuid.uuid4())
-    log_path = os.path.join(logs_dir, f'controller_{controller_uuid}.log')
-
-    activate_python_env_cmd = (f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV};')
-    run_controller_cmd = (f'{sys.executable} -u -m'
-                          f'sky.jobs.controller {controller_uuid}')
-
-    # Bake IS_SKYPILOT_JOB_CONTROLLER into the shell command rather than
-    # mutating os.environ. Setting os.environ here was harmless before
-    # PR #9731 (the daemon ran in a child process with its own isolated env),
-    # but after #9731 the daemon runs as a main-process thread — the mutation
-    # leaks permanently into the API server's os.environ and causes
-    # serve_utils.is_consolidation_mode() to return True for all serve
-    # requests, even when serve consolidation mode is not configured.
-    run_cmd = (f'export {constants.OVERRIDE_CONSOLIDATION_MODE}=true; '
-               f'{activate_python_env_cmd}'
-               f'{run_controller_cmd}')
-
-    logger.info(f'Running controller with command: {run_cmd}')
-
-    pid = subprocess_utils.launch_new_process_tree(run_cmd, log_output=log_path)
-    pid_started_at = psutil.Process(pid).create_time()
-    _append_controller_pid_record(pid, pid_started_at)
-
-
-def get_alive_controllers() -> int | None:
-    records = get_controller_process_records()
-    if records is None:
-        # If we cannot read the file reliably, avoid starting extra controllers.
-        return None
-    if not records:
-        return 0
-
-    alive = 0
-    for record in records:
-        if managed_job_utils.controller_process_alive(record, quiet=False):
-            alive += 1
-    return alive
-
-
-def kill_local_job_controllers(sig: int = signal.SIGTERM) -> int:
-    """SIGTERM all live controller PIDs recorded on this replica.
-
-    Returns:
-        The number of signals delivered.
-    """
-    records = get_controller_process_records()
-    if not records:
-        return 0
-    signaled = 0
-    for record in records:
-        if not managed_job_utils.controller_process_alive(record):
-            continue
-        try:
-            os.kill(record.pid, sig)
-            signaled += 1
-        except ProcessLookupError:
-            # Already gone between the alive-check and the kill — fine.
-            pass
-        except OSError as e:
-            logger.warning(f'Failed to signal controller pid={record.pid}: {e}')
-    if signaled:
-        logger.info(f'Sent {sig.name if hasattr(sig, "name") else sig} to '
-                    f'{signaled} job controller(s)')
-    return signaled
-
-
-def fail_stop_local_job_controllers() -> int:
-    """SIGKILL every live local controller process tree.
-
-    Leadership loss is not a user cancellation.  A catchable signal would let
-    ControllerManager run its cancellation finalizers, terminalize the managed
-    job, and tear down a still-running workload.  Revalidate each recorded
-    process start time, kill its isolated process group atomically, then kill
-    any snapshotted descendants that created their own process group.
-
-    Returns:
-        The number of validated controller process trees signaled.
-    """
-    records = get_controller_process_records()
-    if not records:
-        return 0
-    signaled = 0
-    current_process_group = os.getpgrp()
-    for record in records:
-        if not managed_job_utils.controller_process_alive(record):
-            continue
-        try:
-            process = psutil.Process(record.pid)
-            if process.create_time() != record.started_at:
-                continue
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
-            logger.warning('Failed to validate managed-job controller '
-                           f'pid={record.pid}: {e}')
-            continue
-        try:
-            descendants = process.children(recursive=True)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
-            logger.warning('Could not enumerate every descendant of '
-                           f'managed-job controller pid={record.pid}: {e}')
-            descendants = []
-        try:
-            # Recheck after enumeration so PID reuse during the snapshot cannot
-            # target a replacement process.
-            if process.create_time() != record.started_at:
-                continue
-            process_group = os.getpgid(record.pid)
-            if process_group == current_process_group:
-                # launch_new_process_tree() creates an isolated session.  Keep
-                # this defensive fallback so a malformed record cannot kill
-                # the API/controller supervisor's own process group.
-                process.kill()
-            else:
-                os.killpg(process_group, signal.SIGKILL)
-            signaled += 1
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e:
-            logger.warning('Failed to fail-stop managed-job controller '
-                           f'process group for pid={record.pid}: {e}')
-            try:
-                if process.create_time() != record.started_at:
-                    continue
-                process.kill()
-                signaled += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as e2:
-                logger.warning('Failed to fail-stop managed-job controller '
-                               f'pid={record.pid}: {e2}')
-                continue
-        for descendant in descendants:
-            try:
-                descendant.kill()
-            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                pass
-    if signaled:
-        logger.info(f'Fail-stopped {signaled} job controller process tree(s)')
-    return signaled
-
-
-def maybe_start_controllers(from_scheduler: bool = False) -> None:
-    """Start the job controller process.
-
-    If the process is already running, it will not start a new one.
-    Will also add the job_id, dag_yaml_path, and env_file_path to the
-    controllers list of processes.
-    """
-    # In consolidation mode, during rolling update, two API servers may be
-    # running. If we are on the new API server, and we haven't finished the
-    # recovery process, we should avoid starting new controllers. The old API
-    # server/consolidated jobs controller could run update_managed_jobs_statuses
-    # and if there are jobs running on the new API server, the old one will not
-    # see the corresponding processes and may mark them as FAILED_CONTROLLER.
-    if from_scheduler and managed_job_utils.is_consolidation_mode(
-    ) and os.path.exists(
-            os.path.expanduser(
-                constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE)):
-        # This could happen during an API server rolling update, or during
-        # normal running while managed-job-status-refresh-daemon is running. In
-        # either case, the controllers should be already started or will be
-        # started by the recovery process.
-        logger.info('Recovery is still in progress, skipping controller start.')
-        return
-    try:
-        with filelock.FileLock(JOB_CONTROLLER_PID_LOCK, blocking=False):
-            if from_scheduler and not managed_job_utils.is_consolidation_mode():
-                cur = pathlib.Path(CURRENT_HASH)
-                old = pathlib.Path(f'{CURRENT_HASH}.old')
-
-                if old.exists() and cur.exists():
-                    if (old.read_text(encoding='utf-8')
-                            != cur.read_text(encoding='utf-8')):
-                        # TODO(luca): there is a 1/2^160 chance that there will
-                        # be a collision. using a geometric distribution and
-                        # assuming one update a day, we expect a bug slightly
-                        # before the heat death of the universe. should get
-                        # this fixed before then.
-                        try:
-                            # this will stop all the controllers and the api
-                            # server.
-                            sdk.api_stop()
-                            # All controllers should be dead. Remove the PIDs so
-                            # that update_managed_jobs_statuses won't think they
-                            # have failed.
-                            state.reset_jobs_for_recovery()
-                        except Exception as e:  # pylint: disable=broad-except
-                            logger.error(f'Failed to stop the api server: {e}')
-                            pass
-                        else:
-                            shutil.copyfile(cur, old)
-                if not old.exists():
-                    shutil.copyfile(cur, old)
-
-            alive = get_alive_controllers()
-            if alive is None:
-                return
-            wanted = controller_utils.get_number_of_jobs_controllers()
-            started = 0
-
-            while alive + started < wanted:
-                start_controller()
-                started += 1
-
-            if started > 0:
-                logger.info(f'Started {started} controllers')
-
-    except filelock.Timeout:
-        # If we can't get the lock, just exit. The process holding the lock
-        # should launch any pending jobs.
-        pass
+# Managed-job controller capacity is owned by fixed runtime slots in
+# sky.jobs.controller_slots.  This module contains only durable scheduling.
 
 
 def submit_jobs(job_ids: list[int],
@@ -372,24 +77,6 @@ def submit_jobs(job_ids: list[int],
     The user hash should be set (e.g. via SKYPILOT_USER_ID) before calling this.
     """
     job_ids = list(dict.fromkeys(job_ids))
-    if not job_ids:
-        return
-
-    controller_processes = state.get_job_controller_processes(job_ids)
-    job_ids_without_controller_process = []
-    for job_id in job_ids:
-        controller_process = controller_processes.get(job_id)
-        if controller_process is not None:
-            # why? TODO(cooperc): figure out why this is needed, fix it, and
-            # remove
-            if managed_job_utils.controller_process_alive(controller_process):
-                # This can happen when HA recovery runs for some reason but the
-                # job controller is still alive.
-                logger.warning(f'Job {job_id} is still alive with controller '
-                               f'{controller_process}, skipping submission')
-                continue
-        job_ids_without_controller_process.append(job_id)
-    job_ids = job_ids_without_controller_process
     if not job_ids:
         return
 
@@ -421,7 +108,6 @@ def submit_jobs(job_ids: list[int],
     state.scheduler_set_waiting(job_ids, dag_yaml_content,
                                 original_user_yaml_content, env_file_content,
                                 config_file_content, priority, priority_class)
-    maybe_start_controllers(from_scheduler=True)
 
 
 @asyncio_utils.shield
