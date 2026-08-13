@@ -46,6 +46,9 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     placement_projection_version = (
         server_constants.MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION)
     assert placement_projection_version == 75
+    storage_broker_transfer_limit_version = (
+        server_constants.MIN_SERVE_STORAGE_BROKER_TRANSFER_LIMIT_API_VERSION)
+    assert storage_broker_transfer_limit_version == 76
     assert (server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION
             < server_constants.API_VERSION)
     assert execution_quiescence_version < pricing_version
@@ -53,7 +56,8 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert public_capacity_version < owner_scoped_request_access_version
     assert owner_scoped_request_access_version < ordinary_launch_binding_version
     assert ordinary_launch_binding_version < placement_projection_version
-    assert server_constants.API_VERSION == placement_projection_version
+    assert placement_projection_version < storage_broker_transfer_limit_version
+    assert server_constants.API_VERSION == storage_broker_transfer_limit_version
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

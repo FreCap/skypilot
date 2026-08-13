@@ -26,7 +26,11 @@ _STORAGE_BROKER_KEYS = frozenset({
     'grant_uri_prefix',
     'authenticated_worker_role_arns',
     'kms_key_id',
+    'transfer_authorization_limit_bytes',
 })
+_LEGACY_STORAGE_BROKER_KEYS = (_STORAGE_BROKER_KEYS -
+                               {'transfer_authorization_limit_bytes'})
+STORAGE_BROKER_TRANSFER_AUTHORIZATION_LIMIT_BYTES = 3_000_000_000_000
 _AWS_ROLE_ARN_PATTERN = re.compile(
     r'^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
     r'role/[A-Za-z0-9+=,.@_/-]+$')
@@ -306,13 +310,18 @@ def validate_storage_broker_projection(
     value: Any,
     *,
     allow_none: bool = True,
+    allow_legacy_without_transfer_limit: bool = False,
 ) -> dict[str, str | int | list[str]] | None:
     """Strictly validate a non-secret storage-grant broker descriptor."""
     if value is None:
         if allow_none:
             return None
         raise ValueError('Storage-broker projection must not be null.')
-    if not isinstance(value, dict) or set(value) != _STORAGE_BROKER_KEYS:
+    keys = set(value) if isinstance(value, dict) else set()
+    legacy = (allow_legacy_without_transfer_limit and
+              keys == _LEGACY_STORAGE_BROKER_KEYS)
+    if (not isinstance(value, dict) or
+        (keys != _STORAGE_BROKER_KEYS and not legacy)):
         raise ValueError('Storage-broker projection must contain exactly '
                          f'{sorted(_STORAGE_BROKER_KEYS)!r}.')
     endpoint = _strict_nonempty_string(value['endpoint'],
@@ -339,7 +348,7 @@ def validate_storage_broker_projection(
     if len(validated_role_arns) != len(set(validated_role_arns)):
         raise ValueError('Storage-broker authenticated_worker_role_arns must '
                          'not contain duplicates.')
-    return {
+    result: dict[str, str | int | list[str]] = {
         'endpoint': endpoint,
         'audience': _strict_nonempty_string(value['audience'],
                                             'Storage-broker audience'),
@@ -349,6 +358,16 @@ def validate_storage_broker_projection(
         'kms_key_id': _strict_nonempty_string(value['kms_key_id'],
                                               'Storage-broker kms_key_id'),
     }
+    if legacy:
+        return result
+    transfer_limit = value['transfer_authorization_limit_bytes']
+    if (type(transfer_limit) is not int or transfer_limit
+            != STORAGE_BROKER_TRANSFER_AUTHORIZATION_LIMIT_BYTES):
+        raise ValueError(
+            'Storage-broker transfer_authorization_limit_bytes must be '
+            f'exactly {STORAGE_BROKER_TRANSFER_AUTHORIZATION_LIMIT_BYTES}.')
+    result['transfer_authorization_limit_bytes'] = transfer_limit
+    return result
 
 
 def build_storage_broker_projection(
