@@ -426,7 +426,10 @@ class ManagedJobControllerSlotSupervisor:
                     with self._lock:
                         if self._unsafe_failure is None:
                             self._unsafe_failure = proof_error
-                    raise proof_error from prepare_error
+                    # This synchronous slot thread cannot receive an asyncio
+                    # cancellation; replace the preparation failure with the
+                    # stronger fail-closed quiescence proof error.
+                    raise proof_error from prepare_error  # noqa: ASYNC104
             else:
                 runtime_control.close()
             raise
@@ -606,7 +609,9 @@ class ManagedJobControllerSlotSupervisor:
                     self._terminate_and_drain_unadmitted(family)
                     return
                 self._wait_for_started(family)
-        except BaseException as e:  # pylint: disable=broad-except
+        # This is a synchronous supervisor thread. Catch every thread/process
+        # failure so it drains the exact family before relinquishing ownership.
+        except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
             self.request_shutdown()
             # An admission/readiness failure can leave a published guardian
             # draining after this monitor would otherwise exit.  This slot

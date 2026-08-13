@@ -1,10 +1,9 @@
 sky/client/interactive_utils.py:86:30: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:92:31: ASYNC231 Sync call os.fdopen in async function,  use a library such as aiofiles or anyio.
 sky/client/interactive_utils.py:108:24: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:1900:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/jobs/controller.py:2018:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
-sky/server/requests/executor.py:1479:9: ASYNC120 checkpoint inside except on line 1474 will discard the active exception if cancelled.
-sky/server/requests/process.py:132:12: ASYNC103 BaseException block with a code path that doesn't re-raise the error. Consider adding an `except asyncio.exceptions.CancelledError: raise` before this exception handler.
+sky/jobs/controller.py:1920:28: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/jobs/controller.py:2038:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
+sky/server/requests/executor.py:1783:9: ASYNC120 checkpoint inside except on line 1778 will discard the active exception if cancelled.
 sky/server/requests/threads.py:54:16: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/ssh_proxy.py:425:20: ASYNC103 asyncio.exceptions.CancelledError block with a code path that doesn't re-raise the error.
 sky/server/stream_utils.py:331:21: ASYNC119 Yield in contextmanager in async generator might not trigger cleanup. Use `@asynccontextmanager` or refactor.

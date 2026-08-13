@@ -353,7 +353,9 @@ class RequestWorker:
         finally:
             try:
                 _request_role_shutdown_after_boundary_ambiguity(error)
-            except BaseException:  # pylint: disable=broad-except
+            # Synchronous dispatcher callback: retain the boundary ambiguity
+            # even if the role-level shutdown hook raises a BaseException.
+            except BaseException:  # noqa: ASYNC103  # pylint: disable=broad-except
                 # The worker is already locally fenced. Preserve the ambiguity
                 # for wait_for_shutdown() so runtime ownership still fails
                 # closed even when the role-level wakeup itself fails.
@@ -383,7 +385,9 @@ class RequestWorker:
             self._monitor_threads.add(monitor)
         try:
             monitor.start()
-        except BaseException as start_error:  # pylint: disable=broad-exception-caught
+        # Thread start is synchronous; every failure must converge the already
+        # accepted invocation before this dispatcher can return.
+        except BaseException as start_error:  # noqa: ASYNC103  # pylint: disable=broad-exception-caught
             # The executor has already accepted the Future. Keep the registered
             # ownership token while the dispatcher synchronously performs the
             # exact same convergence work; dropping it here would leave an
@@ -395,7 +399,7 @@ class RequestWorker:
             if isinstance(fut, process.InvocationFuture):
                 fut.request_cancel()
             run_monitor()
-            return False
+            return False  # noqa: ASYNC104 - synchronous dispatcher path
         return True
 
     def process_request(self, executor: process.BurstableExecutor,
@@ -952,7 +956,9 @@ class RequestWorker:
                     queue = _get_queue(self.schedule_type)
                     queue.put(requeue_element)
                     logger.info(f'Rescheduled request {request_id} for retry')
-            except BaseException as e:  # pylint: disable=broad-except
+            # The result monitor is a synchronous thread and transports child
+            # BaseExceptions as durable request outcomes.
+            except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                 if claim is None:
                     self._converge_local_execution_quiescence(
                         request_element.request_id, fut)
@@ -1044,7 +1050,9 @@ class RequestWorker:
                             pending_reported = True
                         time.sleep(_QUIESCENCE_RECEIPT_RETRY_INITIAL_SECONDS)
                         continue
-                    except BaseException as e:  # pylint: disable=broad-except
+                    # The dispatcher thread must retain any shutdown proof
+                    # failure for the runtime supervisor.
+                    except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                         self._shutdown_error = e
                         logger.error(
                             f'[{self}] Executor shutdown did not prove every '

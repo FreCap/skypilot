@@ -7788,7 +7788,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # until the manager has completed every in-lock join.
                 preflight.ready.set()
                 preflight.release.wait()
-            except BaseException as error:  # pylint: disable=broad-except
+            # This closure runs only in a dedicated synchronous preflight
+            # thread, where every provider/context failure is result data.
+            except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
                 if preflight.error is None:
                     preflight.error = error
                 preflight.ready.set()
@@ -7797,7 +7799,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     assert physical_context is not None
                     try:
                         physical_context.__exit__(None, None, None)
-                    except BaseException as error:  # pylint: disable=broad-except
+                    except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
                         if preflight.error is None:
                             preflight.error = error
                         preflight.ready.set()

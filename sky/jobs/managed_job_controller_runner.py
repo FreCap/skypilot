@@ -464,7 +464,9 @@ def _run_inner_warden(control: socket.socket, runtime_control: socket.socket,
                 'type': 'started',
                 'controller_pid': command.pid,
             })
-    except BaseException as e:  # pylint: disable=broad-except
+    # This process warden is synchronous and must report every pre-drain
+    # failure; no asyncio cancellation can be delivered in this scope.
+    except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
         try:
             _write_message(control, {
                 'type': 'failed',
@@ -611,7 +613,9 @@ def _run_outer_guardian(args: argparse.Namespace) -> int:
                     'controller_slot_attempt': args.controller_slot_attempt,
                     'controller_pid': started.get('controller_pid'),
                 })
-    except BaseException as e:  # pylint: disable=broad-except
+    # This process guardian is synchronous and must fail closed for every
+    # admission error; no asyncio cancellation can be delivered here.
+    except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
         termination_requested.set()
         try:
             _write_message(

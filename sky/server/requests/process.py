@@ -394,8 +394,10 @@ def _converge_family(
 def _transportable_error(error: BaseException) -> BaseException:
     try:
         pickle.dumps(error)
-    except BaseException:  # pylint: disable=broad-except
-        return BoundaryExecutionError(
+    # Pure synchronous serialization probe: an arbitrary user exception may
+    # itself fail pickling and must be converted into transportable data.
+    except BaseException:  # noqa: ASYNC103  # pylint: disable=broad-except
+        return BoundaryExecutionError(  # noqa: ASYNC104
             f'Untransportable {type(error).__name__}: {error}')
     return error
 
@@ -436,12 +438,14 @@ def _handler_main(fn: Callable, initializer: Callable | None, initargs: tuple,
         except exceptions.ExecutionRetryableError as e:
             outcome = InvocationOutcome(InvocationOutcomeKind.RETRYABLE,
                                         error=_transportable_error(e))
-        except BaseException as e:  # pylint: disable=broad-except
+        # The handler is a synchronous child process. Every callable failure
+        # is transported as an outcome before the family is drained.
+        except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
             outcome = InvocationOutcome(InvocationOutcomeKind.FAILED,
                                         error=_transportable_error(e))
         try:
             report_connection.send(_HandlerReport(outcome))
-        except BaseException as e:  # pylint: disable=broad-except
+        except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
             fallback = InvocationOutcome(
                 InvocationOutcomeKind.FAILED,
                 error=BoundaryExecutionError(
@@ -449,7 +453,7 @@ def _handler_main(fn: Callable, initializer: Callable | None, initargs: tuple,
                     f'{e}'))
             try:
                 report_connection.send(_HandlerReport(fallback))
-            except BaseException:  # pylint: disable=broad-except
+            except BaseException:  # noqa: ASYNC103  # pylint: disable=broad-except
                 pass
         finally:
             report_connection.close()
@@ -1063,7 +1067,9 @@ class DisposableExecutor:
         if callback is not None:
             try:
                 callback(error)
-            except BaseException:  # pylint: disable=broad-except
+            # Synchronous poison hook: boundary ownership remains poisoned even
+            # when the process-level termination callback itself fails.
+            except BaseException:  # noqa: ASYNC103  # pylint: disable=broad-except
                 logger.exception('Ambiguous-boundary termination hook failed.')
 
     def _claim_start_slot(self) -> None:
@@ -1093,9 +1099,11 @@ class DisposableExecutor:
                     payload = connection.recv()
                 except EOFError:
                     break
-                except BaseException as e:  # pylint: disable=broad-except
+                # Dedicated synchronous boundary monitor: transport failures
+                # become proof failures rather than escaping the owner thread.
+                except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                     receive_error = e
-                    break
+                    break  # noqa: ASYNC104
                 if (isinstance(payload, _BoundaryEnvelope) and
                         payload.token == record.future._boundary_token and  # pylint: disable=protected-access
                         payload.event is _Event.RESULT
@@ -1124,7 +1132,7 @@ class DisposableExecutor:
             try:
                 record.guardian.join(
                     timeout=_PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
-            except BaseException as e:  # pylint: disable=broad-except
+            except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                 receive_error = e
             guardian_reaped = record.guardian.exitcode is not None
             if not guardian_reaped and receive_error is None:
@@ -1318,7 +1326,9 @@ class DisposableExecutor:
                     # ownership atomic to shutdown.  Process startup happened
                     # before acquiring this lock.
                     monitor.start()
-                except BaseException as e:  # pylint: disable=broad-except
+                # Thread creation is synchronous; retain ownership and run the
+                # monitor inline for every BaseException.
+                except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                     monitor_start_error = e
                 self._starting_workers -= 1
                 self._start_condition.notify_all()
@@ -1366,7 +1376,9 @@ class DisposableExecutor:
                     elif guardian is not None and guardian.pid is not None:
                         guardian.join(
                             timeout=_PROCESS_REAP_PROOF_TIMEOUT_SECONDS)
-                except BaseException as e:  # pylint: disable=broad-except
+                # Synchronous startup cleanup must convert every failure into an
+                # ambiguity proof before releasing process ownership.
+                except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                     cleanup_error = e
                     cleanup_proven = False
                 finally:
@@ -1384,7 +1396,7 @@ class DisposableExecutor:
                         'authenticated family-drain result.')
                     ambiguity.__cause__ = cleanup_error or submit_error
                     self._poison(ambiguity)
-                    raise ambiguity from submit_error
+                    raise ambiguity from submit_error  # noqa: ASYNC104
             raise
 
     def has_idle_workers(self) -> bool:
@@ -1607,7 +1619,9 @@ class BurstableExecutor:
         for executor in executors:
             try:
                 executor.shutdown(timeout=max(0, deadline - time.monotonic()))
-            except BaseException as e:  # pylint: disable=broad-except
+            # Synchronous shutdown aggregates every lane proof failure before
+            # choosing the authoritative fail-closed result.
+            except BaseException as e:  # noqa: ASYNC103  # pylint: disable=broad-except
                 errors.append(e)
         if errors:
             with self._reservation_lock:
