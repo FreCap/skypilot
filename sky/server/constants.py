@@ -3,6 +3,7 @@
 import os
 
 from sky.skylet import constants
+from sky.utils import controller_constants
 
 # pylint: disable=line-too-long
 # The SkyPilot API version that the code currently use.
@@ -10,7 +11,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 73  # Owner-scoped persisted request access
+API_VERSION = 77  # SkyServe immutable Kubernetes/Kueue worker admission
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -117,6 +118,10 @@ MIN_OPERATIONAL_EVENTS_API_VERSION = 64
 # Minimum API version with metadata-only SkyServe status projections.
 MIN_SERVE_PROGRESSIVE_STATUS_API_VERSION = 65
 
+# Minimum API version whose SkyServe status includes the provider-free,
+# durable reserved-fill reconciliation projection.
+MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION = 76
+
 # Minimum API version with direct persisted SkyServe dashboard history reads.
 MIN_SERVE_DASHBOARD_HISTORY_API_VERSION = 66
 
@@ -136,6 +141,15 @@ MIN_PUBLIC_CAPACITY_API_VERSION = 72
 
 # Minimum API version that scopes persisted request payload access by owner.
 MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
+
+# Minimum API version with the private atomic ordinary-launch binding endpoint.
+MIN_ORDINARY_LAUNCH_BINDING_API_VERSION = 74
+ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
+
+# Minimum API version whose Serve version-history response exposes immutable
+# cross-context placement with Kubernetes/Kueue admission. Consumers must also
+# require placement_projection_protocol_version == 2.
+MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies
@@ -201,13 +215,39 @@ AUTH_SESSION_TIMEOUT_SECONDS = 300  # 5 minutes
 # Cookie header for stream request id.
 STREAM_REQUEST_HEADER = 'X-SkyPilot-Stream-Request-ID'
 
-# Server-owned controller origin carried by nested SDK requests. These headers
-# do not grant authorization; API middleware uses them only to reject work from
-# a controller generation whose PostgreSQL leadership fence is no longer live.
+# Server-owned controller origin carried by nested SDK requests.  The opaque
+# capability authenticates the public identity fields in addition to the
+# request's normal user/service-account authentication.
 CONTROLLER_INSTANCE_ID_HEADER = 'X-SkyPilot-Controller-Instance-ID'
 CONTROLLER_GENERATION_HEADER = 'X-SkyPilot-Controller-Generation'
+CONTROLLER_ORIGIN_CAPABILITY_HEADER = (
+    'X-SkyPilot-Controller-Origin-Capability')
 CONTROLLER_INSTANCE_ID_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_INSTANCE_ID'
 CONTROLLER_GENERATION_ENV_VAR = 'SKYPILOT_SERVER_CONTROLLER_GENERATION'
+CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR = (
+    controller_constants.CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR)
+CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR = (
+    controller_constants.CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR)
+
+# Exact managed-job attempt carried only by controller-internal SDK requests.
+# The outer pair remains in the generic controller headers above so existing
+# controller admission and authorization code has one canonical outer fence.
+MANAGED_JOB_ID_HEADER = 'X-SkyPilot-Managed-Job-ID'
+MANAGED_JOB_CONTROLLER_SLOT_ID_HEADER = (
+    'X-SkyPilot-Managed-Job-Controller-Slot-ID')
+MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_HEADER = (
+    'X-SkyPilot-Managed-Job-Controller-Slot-Attempt')
+MANAGED_JOB_CONTROLLER_OWNER_MODE_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_OWNER_MODE_ENV_VAR)
+MANAGED_JOB_CONTROLLER_INSTANCE_ID_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_INSTANCE_ID_ENV_VAR)
+MANAGED_JOB_CONTROLLER_GENERATION_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_GENERATION_ENV_VAR)
+MANAGED_JOB_ID_ENV_VAR = controller_constants.MANAGED_JOB_ID_ENV_VAR
+MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_ENV_VAR)
+MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR = (
+    controller_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_ENV_VAR)
 
 # Valid empty values for pickled fields (base64-encoded pickled None)
 # base64.b64encode(pickle.dumps(None)).decode('utf-8')

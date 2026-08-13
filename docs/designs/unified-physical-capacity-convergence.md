@@ -2,13 +2,14 @@
 
 Status: C1 foundation implemented, verified, and retained; C2.1 and C2.2 are
 historical-complete; C2.3 was cancelled without activation and C2.4 will not
-run; the C2-only evidence scanner is retired and its exact cleanup normally
+run; the C2-only evidence scanner is retired and its cleanup normally
 merged in PR #1107 at `1edab50b5201da05544a5acd895044eddad25071`
-(tag `v1.1.1053`), with the disabled deployment verification still pending; no payoff gate
+(tag `v1.1.1053`). The cleanup reached the API as its exact merge artifact and
+all three roles as a verified descendant containing that merge. No payoff gate
 was satisfied, and every materialized or authoritative capacity product remains
-unauthorized
+unauthorized.
 
-Last updated: 2026-08-03
+Last updated: 2026-08-11
 
 Canonical owner: this file. Rejected materialized/active-control drafts remain
 recoverable from branch history and the review record; they are not a second
@@ -82,7 +83,10 @@ and is now also retired; it supplied no evidence for the capacity hypothesis.
 
 The only surviving Serve issue is localized ordinary-launch API request
 binding across controller restart. Its bounded design explicitly reuses the
-ordinary request executor and does not introduce a shared capacity projector,
+normal request executor with a distinct bound handler, atomically commits the
+Serve association, request, retention pin, and durable queue row in one central
+PostgreSQL transaction, and adopts that exact request under a durable service-
+owner epoch. It does not introduce a shared capacity projector,
 reservation/occupancy ledger, provider renderer, or mutation authority.
 
 No capacity runtime may return without a newly accepted design based on
@@ -1565,11 +1569,28 @@ On the 2026-08-02 refresh, the retained capacity model/state and migration
 test set passed with `SKYPILOT_CONFIG=/dev/null`; `git diff --check` passed;
 and the repository formatter completed YAPF, mypy, pylint, dashboard lint, and
 Prettier. PR #1107 subsequently normally merged that cleanup as
-`1edab50b5201da05544a5acd895044eddad25071`; this record does not yet contain
-its exact disabled staged-deployment evidence.
+`1edab50b5201da05544a5acd895044eddad25071`.
 
-This is implementation evidence only. It does not claim that the cleanup image
-has been built or deployed; the retirement rollout checks above remain open.
+### C2 cleanup deployment evidence (2026-08-02)
+
+The exact clean merge was built as image digest
+`sha256:861a4189b1f27d53ba30446f4a821a11b8243965a93e4d63f11bd370965e4426`.
+Helm revision 81 ran its migration and advanced the API role to that exact
+artifact; the API reached 2/2 and reported the merge commit. Before the
+controller and executor stages, independent revision 82 began, so the rollout
+did not race it. Revision 82 used descendant
+`e43ceee0ae7cb551eb5d03bbdb58d811dae7514b`, whose immutable image was verified
+to contain the cleanup merge, across API, controller, and executor.
+
+Revision 82 completed with every role 2/2 Ready on one digest, zero container
+restarts, and disruption allowance one for each role PDB. Live imports on all
+three roles proved the seven scanner modules absent. All capacity environment
+variables were absent; `disabled` remained accepted and `shadow` failed closed.
+Capacity schema head remained `001`, every one of its five retained tables had
+zero rows, capacity-named PostgreSQL connections were zero, and scanner log
+matches were zero. This verifies cleanup deployment while accurately recording
+that controller/executor ran a containing descendant rather than the exact
+merge image.
 
 Before retirement, automated tests covered:
 
@@ -1641,9 +1662,10 @@ Cancelled C2.3 manual activation plan (not executed):
   frozen, and no gate decision can claim production evidence.
 - C2 cleanup normally merged in PR #1107 at
   `1edab50b5201da05544a5acd895044eddad25071` (tag `v1.1.1053`): the exact
-  ledger is removed and retained C1 tests pass. The disabled staged rollout
-  remains pending; deployment must add no schema/data deletion and must record
-  exact live evidence here.
+  ledger is removed and retained C1 tests pass. Revision 81 verified the exact
+  merge artifact on API; revision 82 verified a containing descendant on all
+  three roles with the scanner absent, retained tables empty, and no scanner
+  connections, variables, or logs.
 
 The activated-pilot 14-day decision and 45-day removal clocks never started.
 The explicit no-go decision authorizes earlier cleanup without fabricating an

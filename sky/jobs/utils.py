@@ -5,7 +5,6 @@ jobs.constants.MANAGED_JOBS_VERSION and handle the API change in the
 ManagedJobCodeGen.
 """
 import asyncio
-import contextlib
 from datetime import datetime
 import os
 import pathlib
@@ -33,7 +32,6 @@ from sky.jobs import log_streaming as managed_job_log_streaming
 from sky.jobs import managed_job_codegen
 from sky.jobs import queue_utils as managed_job_queue_utils
 from sky.jobs import runtime as managed_job_runtime
-from sky.jobs import scheduler
 from sky.jobs import state as managed_job_state
 from sky.jobs.naming import generate_managed_job_cluster_name
 from sky.skylet import constants
@@ -44,8 +42,6 @@ from sky.utils import annotations
 from sky.utils import common as common_lib
 from sky.utils import common_utils
 from sky.utils import context_utils
-from sky.utils import controller_utils
-from sky.utils import debug_dump_helpers
 from sky.utils import message_utils
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
@@ -58,8 +54,11 @@ if typing.TYPE_CHECKING:
     import psutil
 
     import sky
+    from sky.client import sdk
     from sky.schemas.generated import jobsv1_pb2
     from sky.schemas.generated import managed_jobsv1_pb2
+    from sky.utils import controller_utils
+    from sky.utils import debug_dump_helpers
 else:
     json_format = adaptors_common.LazyImport('google.protobuf.json_format')
     descriptor = adaptors_common.LazyImport('google.protobuf.descriptor')
@@ -68,6 +67,13 @@ else:
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
     managed_jobsv1_pb2 = adaptors_common.LazyImport(
         'sky.schemas.generated.managed_jobsv1_pb2')
+    sdk = adaptors_common.LazyImport('sky.client.sdk')
+    # jobs.utils is imported while the public jobs package is still being
+    # initialized.  Both helpers eventually import task/Serve modules, so
+    # defer them until an actual controller operation needs them.
+    controller_utils = adaptors_common.LazyImport('sky.utils.controller_utils')
+    debug_dump_helpers = adaptors_common.LazyImport(
+        'sky.utils.debug_dump_helpers')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -157,27 +163,13 @@ def terminate_cluster(
     graceful: bool = False,
     graceful_timeout: int | None = None,
 ) -> None:
-    """Terminate the cluster."""
-    from sky import core  # pylint: disable=import-outside-toplevel
+    """Terminate a managed-job cluster through the fenced request path.
 
-    # Pin the active workspace to the cluster's recorded workspace before
-    # calling `core.down`. Controller-side callers (cancel and recovery
-    # teardown paths) run in the system/daemon process, without this pin
-    # `skypilot_config.get_active_workspace()` falls back to the default
-    # workspace and the owner-identity check at
-    # `backend_utils._check_owner_identity_with_record` fails for any
-    # cluster whose recorded workspace is not 'default'.
-    # DB lookup once outside the loop — cluster workspace is immutable. This
-    # is also the authoritative existence check: callers do not need a
-    # separate handle lookup before teardown.
-    record = global_user_state.get_cluster_from_name(cluster_name,
-                                                     include_user_info=False,
-                                                     summary_response=True)
-    if record is None:
-        logger.debug(f'The cluster {cluster_name} is already down.')
-        return
-    cluster_workspace = record.get('workspace')
-
+    Provider effects from a managed-job controller must be represented by a
+    nested API request.  The request carries the authenticated outer
+    generation and exact job slot attempt, allowing handoff to revoke and
+    quiesce the effect before a successor attempt is admitted.
+    """
     retry_cnt = 0
     # In some cases, e.g. botocore.exceptions.NoCredentialsError due to AWS
     # metadata service throttling, the failed sky.down attempt can take 10-11
@@ -194,18 +186,10 @@ def terminate_cluster(
     while True:
         try:
             usage_lib.messages.usage.set_internal()
-            # Construct the ctx inside the loop: `local_active_workspace_ctx`
-            # is a `@contextlib.contextmanager` generator and cannot be
-            # re-entered — reusing one instance across retries raises
-            # `RuntimeError` from the spent generator and masks the real
-            # failure.
-            workspace_ctx: contextlib.AbstractContextManager = (
-                skypilot_config.local_active_workspace_ctx(cluster_workspace)
-                if cluster_workspace else contextlib.nullcontext())
-            with workspace_ctx:
-                core.down(cluster_name,
-                          graceful=graceful,
-                          graceful_timeout=graceful_timeout)
+            request_id = sdk.down(cluster_name,
+                                  graceful=graceful,
+                                  graceful_timeout=graceful_timeout)
+            sdk.get(request_id)
             return
         except exceptions.ClusterDoesNotExist:
             # The cluster is already down.
@@ -364,61 +348,11 @@ def ha_recovery_for_consolidation_mode() -> None:
                 'outer controller generation.\n')
             logger.info(message.rstrip())
             f.write(message)
-        jobs, _ = managed_job_state.get_managed_jobs_with_filters(fields=[
-            'job_id', 'controller_pid', 'controller_pid_started_at',
-            'controller_instance_id', 'controller_generation', 'schedule_state',
-            'status'
-        ])
-        for job in jobs:
-            job_id = job['job_id']
-            controller_pid = job['controller_pid']
-            controller_pid_started_at = job.get('controller_pid_started_at')
-
-            # In consolidation mode, it is possible that only the API server
-            # process is restarted, and the controller process is not. In such
-            # case, we don't need to do anything and the controller process will
-            # just keep running. However, in most cases, the controller process
-            # will also be stopped - either by a pod restart in k8s API server,
-            # or by `sky api stop`, which will stop controllers.
-            # TODO(cooperc): Make sure we cannot have a controller process
-            # running across API server restarts for consistency.
-            if controller_pid is not None:
-                try:
-                    if controller_process_alive(
-                            managed_job_state.ControllerPidRecord(
-                                pid=controller_pid,
-                                started_at=controller_pid_started_at)):
-                        message = (f'Controller pid {controller_pid} for '
-                                   f'job {job_id} is still running. '
-                                   'Skipping recovery.\n')
-                        logger.debug(message)
-                        f.write(message)
-                        continue
-                except Exception:  # pylint: disable=broad-except
-                    # _controller_process_alive may raise if psutil fails; we
-                    # should not crash the recovery logic because of this.
-                    message = ('Error checking controller pid '
-                               f'{controller_pid} for job {job_id}\n')
-                    logger.warning(message, exc_info=True)
-                    f.write(message)
-
-            # Controller process is not set or not alive.
-            if job['schedule_state'] not in [
-                    managed_job_state.ManagedJobScheduleState.DONE,
-                    managed_job_state.ManagedJobScheduleState.WAITING,
-                    # INACTIVE job may be mid-submission, don't set to WAITING.
-                    managed_job_state.ManagedJobScheduleState.INACTIVE,
-            ]:
-                managed_job_state.reset_job_for_recovery(job_id)
-                message = (f'Job {job_id} completed recovery at '
-                           f'{datetime.now()}\n')
-                logger.info(message)
-                f.write(message)
-        # Start schedulers only after every stale or dead PID has been reset.
-        # Starting them before the scan lets a replacement claim race the
-        # recovery writes and can stamp a PID that recovery immediately
-        # invalidates.
-        scheduler.maybe_start_controllers()
+        # Disposable ControllerManager processes are fixed runtime-owned
+        # slots.  The successor generation resets all stale/null-slot rows
+        # above, then runtime admission starts the complete fixed slot set.
+        # PID inspection and scheduler-triggered process birth are deliberately
+        # absent: Linux identities are Pod-local supervision diagnostics.
         f.write(f'HA recovery completed at {datetime.now()}\n')
         f.write(f'Total recovery time: {time.time() - start} seconds\n')
 
@@ -574,21 +508,6 @@ def _controller_is_restarting() -> bool:
         os.path.expanduser(constants.PERSISTENT_RUN_RESTARTING_SIGNAL_FILE))
 
 
-def _task_has_launch_attempt(task: dict[str, Any]) -> bool:
-    """Whether cleanup must treat this task as having launched.
-
-    A later pipeline stage that never left the backlog still has a durable
-    ``spot`` row, but it never owned a cluster and should not trigger a best-
-    effort teardown. Launch and recovery paths stamp at least one of the
-    lifecycle timestamps below and keep it when the task falls back to
-    ``PENDING`` during retry backoff, so the marker remains correct on the
-    failure path without refetching the full task row.
-    """
-    return any(
-        task.get(field) is not None
-        for field in ('submitted_at', 'start_at', 'last_recovered_at'))
-
-
 def update_managed_jobs_statuses(job_ids: list[int] | None = None,
                                  jobs_info: dict[int, dict[str, Any]] |
                                  None = None):
@@ -618,53 +537,6 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
     current_controller_owner = (
         managed_job_state.get_current_controller_owner())
 
-    def _cleanup_job_clusters(job_id: int, tasks: list[dict[str, Any]],
-                              pool: str | None) -> str | None:
-        """Clean up clusters for a job. Returns error message if any.
-
-        This function should not throw any exception. If it fails, it will
-        capture the error message, and log/return it.
-
-        ``tasks`` is the launch-identity snapshot already fetched by
-        ``get_jobs_to_check_status_info``. Reusing it avoids a second task join
-        on the failure path and keeps cleanup keyed off ``task_name``, which is
-        what the controller uses to name task clusters.
-        """
-        if pool is not None:
-            return None
-        cluster_names = []
-        for task in tasks:
-            if not _task_has_launch_attempt(task):
-                continue
-            cluster_name = generate_managed_job_cluster_name(
-                task['task_name'], job_id)
-            if cluster_name is not None:
-                cluster_names.append(cluster_name)
-        cluster_names = list(dict.fromkeys(cluster_names))
-
-        def _terminate_one(cluster_name: str) -> str | None:
-            try:
-                terminate_cluster(cluster_name)
-                return None
-            except Exception as e:  # pylint: disable=broad-except
-                error_msg = (
-                    f'Failed to terminate cluster {cluster_name}: '
-                    f'{common_utils.format_exception(e, use_bracket=True)}')
-                logger.exception(error_msg, exc_info=e)
-                return error_msg
-
-        # Terminate the task clusters in parallel: each task in a JobGroup has
-        # a distinct cluster, and a single teardown can take minutes, so a
-        # serial walk holds up the whole refresh tick and widens the window in
-        # which the batched status snapshot goes stale.
-        error_msgs = [
-            msg for msg in subprocess_utils.run_in_parallel(
-                _terminate_one, cluster_names) if msg is not None
-        ]
-        if not error_msgs:
-            return None
-        return '; '.join(error_msgs)
-
     def _snapshot_kwargs(snapshot: dict[str, Any]) -> dict[str, Any]:
         return {
             'schedule_state': snapshot['schedule_state'],
@@ -672,6 +544,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
             'controller_pid_started_at': snapshot['controller_pid_started_at'],
             'controller_instance_id': snapshot.get('controller_instance_id'),
             'controller_generation': snapshot.get('controller_generation'),
+            'controller_slot_id': snapshot.get('controller_slot_id'),
+            'controller_slot_attempt': snapshot.get('controller_slot_attempt'),
         }
 
     def _snapshot_is_unchanged(info: dict[str, Any],
@@ -684,90 +558,19 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
                 fresh_info.get('controller_instance_id')
                 == info.get('controller_instance_id') and
                 fresh_info.get('controller_generation')
-                == info.get('controller_generation'))
-
-    def _finish_terminal_cleanup(job_id: int, tasks: list[dict[str, Any]],
-                                 pool: str | None, snapshot: dict[str,
-                                                                  Any]) -> None:
-        """Clean a terminal job, then finish its exact durable snapshot."""
-        if _controller_is_restarting():
-            logger.info(f'Controller restart in progress for terminal job '
-                        f'{job_id}; deferring cleanup/finalization to the next '
-                        'status update cycle.')
-            return
-        cleanup_error = _cleanup_job_clusters(job_id, tasks, pool)
-        if cleanup_error:
-            logger.error(cleanup_error)
-            return
-        finished = (
-            managed_job_state.finish_controller_cleanup_if_current_snapshot(
-                job_id, **_snapshot_kwargs(snapshot)))
-        if not finished:
-            logger.info(f'Job {job_id} changed while terminal cleanup was in '
-                        'progress; deferring DONE to the next status update.')
-
-    def _get_done_jobs_with_cluster_rows(
-            excluded_job_ids: set[int]) -> dict[int, dict[str, Any]]:
-        """Find terminal DONE jobs whose managed cluster row still exists.
-
-        DONE terminal jobs are normally excluded from status checks. Older
-        controllers could nevertheless mark cleanup-failed jobs DONE, leaving
-        a current cluster row (and its usage interval) behind permanently.
-        Modern rows carry a workload id. For legacy rows without attribution,
-        derive only a candidate id from the name and then require an exact
-        match against a cluster name generated from that job's task snapshot.
-        """
-        cluster_candidates = (
-            global_user_state.get_managed_job_cluster_cleanup_candidates())
-        cluster_names_by_job_id: dict[int, set[str]] = {}
-        for cluster_name, workload_id in cluster_candidates.items():
-            candidate_id = workload_id
-            if candidate_id is None:
-                _, separator, suffix = cluster_name.rpartition('-')
-                if not separator:
-                    continue
-                candidate_id = suffix
-            try:
-                job_id = int(candidate_id)
-            except (TypeError, ValueError):
-                continue
-            if job_id in excluded_job_ids:
-                continue
-            cluster_names_by_job_id.setdefault(job_id, set()).add(cluster_name)
-
-        candidates = managed_job_state.get_jobs_status_check_info(
-            list(cluster_names_by_job_id))
-        result = {}
-        for job_id, info in candidates.items():
-            if (info['schedule_state']
-                    != managed_job_state.ManagedJobScheduleState.DONE or
-                    info['pool'] is not None or
-                    not all(task['status'].is_terminal()
-                            for task in info['tasks'])):
-                continue
-            expected_cluster_names = {
-                cluster_name for task in info['tasks']
-                if _task_has_launch_attempt(task) for cluster_name in
-                [generate_managed_job_cluster_name(task['task_name'], job_id)]
-                if cluster_name is not None
-            }
-            if expected_cluster_names.isdisjoint(
-                    cluster_names_by_job_id[job_id]):
-                continue
-            result[job_id] = info
-        return result
+                == info.get('controller_generation') and
+                fresh_info.get('controller_slot_id')
+                == info.get('controller_slot_id') and
+                fresh_info.get('controller_slot_attempt')
+                == info.get('controller_slot_attempt') and
+                fresh_info.get('controller_slot_quiescing')
+                == info.get('controller_slot_quiescing'))
 
     # Fetch the jobs that need checking together with the small per-job fields
     # the loop consumes. This keeps the refresh tick on a single slim query
     # instead of a filtered job-id query followed by a second detail query.
     if jobs_info is None:
         jobs_info = managed_job_state.get_jobs_to_check_status_info(job_ids)
-    if job_ids is None:
-        # The periodic global sweep also repairs rows orphaned by older
-        # controllers that finalized the scheduler despite cleanup failure.
-        for job_id, info in _get_done_jobs_with_cluster_rows(
-                set(jobs_info)).items():
-            jobs_info.setdefault(job_id, info)
     if not jobs_info:
         # The given jobs are already terminal, or if job_ids is None, there
         # are no jobs that need to be checked.
@@ -784,20 +587,29 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
         # Handle jobs with schedule state (non-legacy jobs):
         pid = info['controller_pid']
         pid_started_at = info['controller_pid_started_at']
+        has_complete_fixed_slot_identity = all(
+            info.get(field) is not None
+            for field in ('controller_instance_id', 'controller_generation',
+                          'controller_slot_id', 'controller_slot_attempt'))
+        if has_complete_fixed_slot_identity:
+            # Fixed-slot jobs are owned by the runtime slot supervisor.  It
+            # proves the complete process family absent, quiesces exact nested
+            # requests, and hands the row to the scheduler for recovery or
+            # cleanup adoption.  A periodic refresher cannot establish those
+            # facts from a Pod-local PID and must have no provider or terminal
+            # lifecycle effects for these rows.
+            logger.debug(f'Job {job_id} has a complete fixed-slot identity; '
+                         'deferring liveness and cleanup to slot supervision.')
+            continue
         snapshot_all_tasks_terminal = all(
             task['status'].is_terminal() for task in tasks)
         if snapshot_all_tasks_terminal:
-            fresh_info = managed_job_state.get_job_status_check_state(job_id)
-            if not _snapshot_is_unchanged(info, fresh_info):
-                logger.info(f'Job {job_id} changed since the terminal status '
-                            'snapshot; deferring cleanup.')
-                continue
-            assert fresh_info is not None
-            if not fresh_info['all_tasks_terminal']:
-                logger.info(f'Job {job_id} is no longer terminal; deferring '
-                            'cleanup.')
-                continue
-            _finish_terminal_cleanup(job_id, tasks, info['pool'], fresh_info)
+            # Terminal cleanup has one canonical owner: the controller manager
+            # or a replacement scheduler cleanup adopter.  Keep old/incomplete
+            # rows visible as a deployment gate instead of reintroducing a
+            # second best-effort provider cleanup path in the refresh daemon.
+            logger.info(f'Job {job_id} has terminal tasks but an incomplete '
+                        'fixed-slot identity; deferring cleanup adoption.')
             continue
         if current_controller_owner is not None:
             recorded_owner = (info.get('controller_instance_id'),
@@ -910,19 +722,13 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
                 failure_reason=failure_message))
         if (failure_decision ==
                 managed_job_state.ControllerFailureDecision.TERMINALIZED):
-            # Terminal task state is the durable no-recovery decision. Provider
-            # cleanup follows it so a handoff can retry teardown but cannot
-            # relaunch the workload underneath an old generation's destructive
-            # request.
             logger.info(failure_message)
-            _finish_terminal_cleanup(job_id, tasks, info['pool'], info)
             continue
         if (failure_decision ==
                 managed_job_state.ControllerFailureDecision.ALREADY_TERMINAL):
             logger.info(f'Job {job_id} already reached terminal task status; '
-                        'finalizing schedule state without rewriting the job '
+                        'deferring cleanup adoption without rewriting the job '
                         'to FAILED_CONTROLLER.')
-            _finish_terminal_cleanup(job_id, tasks, info['pool'], info)
             continue
 
         # The atomic FAILED_CONTROLLER write already locked and rechecked the

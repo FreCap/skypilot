@@ -93,6 +93,12 @@ clients on clusters that do not grant the usual discovery role. The workload
 ServiceAccount's self-teardown Role receives no Kueue permission. Omitting the
 input creates no Kueue RBAC and is backward compatible.
 
+`cluster_queue_name` must be one DNS-1123 label of at most 63 characters, even
+though the ClusterQueue API itself accepts a DNS subdomain. Strict SkyPilot
+admission requires Kueue 0.18's `AssignQueueLabelsForPods` feature to publish
+the exact ClusterQueue name on each admitted Pod; dotted and other non-label
+names are therefore rejected before any RBAC is created.
+
 ### Node self-teardown
 
 Everything bound to `subjects` is the *control plane's* identity. One SkyPilot
@@ -172,7 +178,7 @@ No modules.
 | Name | Description | Type | Default | Required |
 | ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_allow_pvc_read"></a> [allow\_pvc\_read](#input\_allow\_pvc\_read) | Grant read (get/list) on persistentvolumeclaims in the namespace. Required when<br/>a tier mounts pre-existing PVCs (e.g. FSx): before creating the pod SkyPilot GETs<br/>each referenced claim to check its phase. Read-only — the PVCs are Terraform-<br/>provisioned, so SkyPilot never creates/deletes them. Leave false for tiers with<br/>no volumes (nothing to read). | `bool` | `false` | no |
-| <a name="input_kueue"></a> [kueue](#input\_kueue) | Optional Kueue objects that the SkyPilot control-plane subjects must<br/>preflight before launching a Pod. When set, grant only exact-name `get` on<br/>the namespaced LocalQueue, cluster-scoped ClusterQueue, and this Namespace,<br/>plus exact `GET /apis` and `GET /apis/` for served-version discovery. The<br/>workload ServiceAccount receives no Kueue permission. | <pre>object({<br/>    local_queue_name   = string<br/>    cluster_queue_name = string<br/>  })</pre> | `null` | no |
+| <a name="input_kueue"></a> [kueue](#input\_kueue) | Optional Kueue objects that the SkyPilot control-plane subjects must<br/>preflight before launching a Pod. When set, grant only exact-name `get` on<br/>the namespaced LocalQueue, cluster-scoped ClusterQueue, and this Namespace,<br/>plus exact `GET /apis` and `GET /apis/` for served-version discovery. The<br/>workload ServiceAccount receives no Kueue permission.<br/><br/>cluster\_queue\_name must be one DNS-1123 label of at most 63 characters.<br/>Strict SkyPilot admission requires Kueue's AssignQueueLabelsForPods<br/>feature to publish that name on admitted Pods; dotted DNS subdomains and<br/>other non-label names cannot be published. | <pre>object({<br/>    local_queue_name   = string<br/>    cluster_queue_name = string<br/>  })</pre> | `null` | no |
 | <a name="input_labels"></a> [labels](#input\_labels) | Extra labels applied to the RBAC objects. | `map(string)` | `{}` | no |
 | <a name="input_manage_namespace"></a> [manage\_namespace](#input\_manage\_namespace) | Create the namespace. Set false if it is provisioned elsewhere. | `bool` | `true` | no |
 | <a name="input_name"></a> [name](#input\_name) | Name for the RBAC objects (ClusterRole/Role/bindings). | `string` | `"skypilot-pool"` | no |

@@ -2,6 +2,7 @@
 
 import abc
 import dataclasses
+import enum
 import multiprocessing
 import os
 import queue as queue_lib
@@ -15,6 +16,25 @@ from sky.utils import common_utils
 logger = sky_logging.init_logger(__name__)
 
 
+class ProviderMutationRequestKind(enum.Enum):
+    """Closed queue classification for provider-mutating requests.
+
+    API009 currently has one provider-mutating request handler.  Future typed
+    provider handlers must be added to this enum and to the PostgreSQL
+    handler-to-kind map before the generic queue is allowed to see them.
+    """
+
+    BOUND_ORDINARY_LAUNCH = 'bound_ordinary_launch'
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderMutationCandidate:
+    """Non-authoritative hint returned before a durable queue claim."""
+
+    request_id: str
+    kind: ProviderMutationRequestKind
+
+
 @dataclasses.dataclass(frozen=True)
 class QueueItem:
     """One queue delivery plus an optional durable execution claim."""
@@ -24,6 +44,11 @@ class QueueItem:
     retryable: bool
     execution_generation: int = 0
     claim_token: str | None = None
+    worker_instance_id: str | None = None
+    # Present only for authenticated nested requests from one exact managed-
+    # job controller attempt.  Dispatchers use this complete tuple to decide
+    # whether the disposable handler may receive controller capability.
+    managed_job_origin: tuple[int, str, int, int, str] | None = None
 
 
 QueueItemLike = QueueItem | tuple[str, bool, bool]
@@ -55,6 +80,23 @@ class QueueBackend(abc.ABC):
     def get(self) -> QueueItemLike | None:
         """Non-blocking get. Returns None if queue is empty."""
         raise NotImplementedError
+
+    def peek_provider_mutation(self) -> ProviderMutationCandidate | None:
+        """Read a provider candidate without claiming durable ownership.
+
+        Legacy/plugin queues return ``None`` and retain their historical
+        generic delivery behavior.  A backend overriding this method must also
+        override :meth:`claim_provider_mutation` and exclude every kind in
+        :class:`ProviderMutationRequestKind` from :meth:`get`.
+        """
+        return None
+
+    def claim_provider_mutation(
+            self, candidate: ProviderMutationCandidate) -> QueueItem | None:
+        """Try to claim an exact previously observed provider candidate."""
+        del candidate
+        raise NotImplementedError(
+            'This queue backend does not support reserved provider claims.')
 
     @abc.abstractmethod
     def qsize(self) -> int:

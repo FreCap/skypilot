@@ -20,7 +20,6 @@ import dotenv
 import filelock
 
 import sky
-from sky import core
 from sky import exceptions
 from sky import global_user_state
 from sky import sky_logging
@@ -29,6 +28,7 @@ from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.batch import coordinator as batch_coordinator
+from sky.client import sdk
 from sky.data import data_utils
 from sky.jobs import constants as jobs_constants
 from sky.jobs import file_content_utils
@@ -50,6 +50,7 @@ from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import context
 from sky.utils import context_utils
+from sky.utils import controller_capability
 from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import status_lib
@@ -82,6 +83,22 @@ _background_tasks: set[asyncio.Task] = set()
 _NOT_UP_CONFIRMATIONS_BEFORE_RECOVERY = 3
 _FILE_MOUNTS_BLOB_ID_UNSET = object()
 _OUTER_CONTROLLER_PROBE_SECONDS = 2
+_TERMINAL_CLEANUP_RETRY_INITIAL_SECONDS = 1
+_TERMINAL_CLEANUP_RETRY_MAX_SECONDS = 30
+_CONTROLLER_RUNTIME_ENV_VARS = frozenset({
+    jobs_constants.CONTROLLER_OWNER_MODE_ENV_VAR,
+    jobs_constants.CONTROLLER_OWNER_INSTANCE_ID_ENV_VAR,
+    jobs_constants.CONTROLLER_OWNER_GENERATION_ENV_VAR,
+    jobs_constants.CONTROLLER_OWNER_PID_ENV_VAR,
+    jobs_constants.CONTROLLER_OWNER_START_TICKS_ENV_VAR,
+    jobs_constants.CONTROLLER_JOB_ID_ENV_VAR,
+    jobs_constants.CONTROLLER_SLOT_ID_ENV_VAR,
+    jobs_constants.CONTROLLER_SLOT_ATTEMPT_ENV_VAR,
+    jobs_constants.CONTROLLER_READY_FD_ENV_VAR,
+    jobs_constants.CONTROLLER_CAPABILITY_FD_ENV_VAR,
+    jobs_constants.CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR,
+    jobs_constants.CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR,
+})
 
 
 def _fail_stop_outer_controller_process_group(reason: str) -> typing.NoReturn:
@@ -219,7 +236,7 @@ def _should_keep_monitoring_healthy_cluster(
     return not last_known_job_status.is_terminal()
 
 
-def create_background_task(coro: typing.Coroutine) -> None:
+def create_background_task(coro: typing.Coroutine) -> asyncio.Task:
     """Create a background task and add it to the set of background tasks.
 
     Main reason we do this is since tasks are only held as a weak reference in
@@ -235,6 +252,7 @@ def create_background_task(coro: typing.Coroutine) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 # Make sure to limit the size as we don't want to cache too many DAGs in memory.
@@ -1673,7 +1691,7 @@ class JobController:
         # Phase 1: Launch clusters for tasks that need launching
         launch_start = time.time()
         cluster_names: list[str | None] = []
-        strategy_executors: list[recovery_strategy.StrategyExecutor] = []
+        strategy_executors: list[recovery_strategy.StrategyExecutor | None] = []
         tasks_to_launch = [
             tid for tid in range(len(tasks)) if needs_launch(tid)
         ]
@@ -1684,15 +1702,16 @@ class JobController:
             for task_id, task in enumerate(tasks):
                 if is_terminal(task_id):
                     cluster_names.append(None)
-                    strategy_executors.append(None)  # type: ignore[arg-type]
+                    strategy_executors.append(None)
                     continue
 
                 # Get list of other job names (excluding current task)
                 other_job_names = [t.name for t in tasks if t.name != task.name]
-                name, executor = await self._prepare_job_group_task_for_launch(
-                    task, task_id, job_group_name, other_job_names)
+                name, prepared_executor = (
+                    await self._prepare_job_group_task_for_launch(
+                        task, task_id, job_group_name, other_job_names))
                 cluster_names.append(name)
-                strategy_executors.append(executor)
+                strategy_executors.append(prepared_executor)
 
             # Only launch tasks that need launching
             if tasks_to_launch:
@@ -1703,10 +1722,10 @@ class JobController:
                 # across concurrent tasks sharing the same context.
                 launch_coros = []
                 for task_id in tasks_to_launch:
-                    executor = strategy_executors[task_id]
-                    if executor is not None:
+                    launch_executor = strategy_executors[task_id]
+                    if launch_executor is not None:
                         launch_coros.append(
-                            context.contextual_async(executor.launch)())
+                            context.contextual_async(launch_executor.launch)())
 
                 if launch_coros:
                     results = await asyncio.gather(*launch_coros,
@@ -1830,13 +1849,14 @@ class JobController:
 
             _, force_recovery = task_resume_info[task_id]
             task_handle = handles[task_id]
-            executor = strategy_executors[task_id]
+            monitor_executor = strategy_executors[task_id]
             cluster_name = cluster_names[task_id]
             assert cluster_name is not None
-            assert executor is not None
+            assert monitor_executor is not None
             coro = self._monitor_job_group_task(task_id, task, cluster_name,
-                                                executor, job_group_name,
-                                                tasks_handles, force_recovery)
+                                                monitor_executor,
+                                                job_group_name, tasks_handles,
+                                                force_recovery)
             monitor_async_tasks[task_id] = asyncio.create_task(
                 coro, name=f'monitor_{task.name}')
 
@@ -2227,10 +2247,16 @@ class ControllerManager:
     Many jobs will be handled by this, each by a single JobController.
     """
 
-    def __init__(self, controller_uuid: str) -> None:
+    def __init__(self,
+                 controller_uuid: str,
+                 controller_slot_id: int | None = None,
+                 controller_slot_attempt: str | None = None) -> None:
         self._controller_uuid = controller_uuid
+        self._controller_slot_id = controller_slot_id
+        self._controller_slot_attempt = controller_slot_attempt
         # Global state for active jobs
         self.job_tasks: dict[int, asyncio.Task] = {}
+        self._cleanup_only_job_ids: set[int] = set()
         self.starting: set[int] = set()
 
         # Lock for synchronizing access to global state dictionary
@@ -2249,6 +2275,16 @@ class ControllerManager:
 
         self._pid = os.getpid()
         self._pid_started_at = psutil.Process(self._pid).create_time()
+
+    def _require_controller_slot_id(self) -> int:
+        if self._controller_slot_id is None:
+            raise RuntimeError('ControllerManager has no runtime slot ID.')
+        return self._controller_slot_id
+
+    def _require_controller_slot_attempt(self) -> str:
+        if self._controller_slot_attempt is None:
+            raise RuntimeError('ControllerManager has no runtime slot attempt.')
+        return self._controller_slot_attempt
 
     @staticmethod
     def _cleanup_api_server_access_token(job_id: int) -> None:
@@ -2303,8 +2339,9 @@ class ControllerManager:
                         cluster_name,
                         graceful=graceful,
                         graceful_timeout=graceful_timeout)
-                    status = core.status(cluster_names=[cluster_name],
-                                         all_users=True)
+                    status_request_id = sdk.status(cluster_names=[cluster_name],
+                                                   all_users=True)
+                    status = sdk.get(status_request_id)
                     assert (len(status) == 0 or
                             status[0]['status'] == sky.ClusterStatus.STOPPED), (
                                 f'{cluster_name} is not down: {status}')
@@ -2315,38 +2352,40 @@ class ControllerManager:
                     if pool_cluster_name is not None:
                         cluster_name = pool_cluster_name
                         if job_id_on_pool_cluster is not None:
-                            core.cancel(cluster_name=cluster_name,
-                                        job_ids=[job_id_on_pool_cluster],
-                                        _try_cancel_if_cluster_is_init=True)
+                            cancel_request_id = sdk.cancel(
+                                cluster_name=cluster_name,
+                                job_ids=[job_id_on_pool_cluster],
+                                _try_cancel_if_cluster_is_init=True)
+                            sdk.get(cancel_request_id)
             except Exception as e:  # pylint: disable=broad-except
                 error = e
                 cluster_display_name = cluster_name or task.name
                 logger.warning(
                     f'Failed to terminate cluster {cluster_display_name}: {e}')
                 # we continue to try cleaning up whatever else we can.
-            # Clean up Storages with persistent=False.
-            # TODO(zhwu): this assumes the specific backend.
-            backend = cloud_vm_ray_backend.CloudVmRayBackend()
-            # Need to re-construct storage object in the controller process
-            # because when SkyPilot API server machine sends the yaml config to
-            # the controller machine, only storage metadata is sent, not the
-            # storage object itself.
-            try:
-                for storage in task.storage_mounts.values():
-                    storage.construct()
-            except (exceptions.StorageSpecError, exceptions.StorageError) as e:
-                logger.warning(
-                    f'Failed to construct storage object for teardown: {e}\n'
-                    'This may happen because storage construction already '
-                    'failed during launch, storage was deleted externally, '
-                    'credentials expired/changed, or network connectivity '
-                    'issues.')
-            try:
-                backend.teardown_ephemeral_storage(task)
-            except Exception as e:  # pylint: disable=broad-except
-                error = e
-                logger.warning(f'Failed to teardown ephemeral storage: {e}')
-                # we continue to try cleaning up whatever else we can.
+            # Provider cleanup must use the same nested request boundary as
+            # launch/cancel/down.  A stale slot attempt is then rejected before
+            # effect admission, while reset waits for any already-admitted
+            # request to publish exact process-family quiescence.
+            for storage in task.storage_mounts.values():
+                if storage.persistent:
+                    continue
+                try:
+                    if storage.name is None:
+                        raise exceptions.StorageSpecError(
+                            'Ephemeral storage has no durable name.')
+                    storage_request_id = sdk.storage_delete(storage.name)
+                    sdk.get(storage_request_id)
+                except ValueError:
+                    # Missing durable storage state is an idempotent cleanup
+                    # result, matching an already-deleted cluster.
+                    logger.info(f'Ephemeral storage {storage.name!r} is '
+                                'already deleted.')
+                except Exception as e:  # pylint: disable=broad-except
+                    error = e
+                    logger.warning(f'Failed to teardown ephemeral storage '
+                                   f'{storage.name!r}: {e}')
+                    # Continue cleaning independent mounts and local files.
 
             # Clean up any files mounted from the local disk, such as two-hop
             # file mounts for non-consolidation mode.
@@ -2479,6 +2518,71 @@ class ControllerManager:
                     f'Failed to download logs for job {job_id}, '
                     f'task {task_id}: {common_utils.format_exception(e)}')
 
+    def _initialize_job_context(self, job_id: int, log_file: str,
+                                pool: str | None) -> int | None:
+        """Install the exact per-job context shared by run and cleanup work."""
+        ctx = context.get()
+        assert ctx is not None, 'Context is not initialized'
+        ctx.redirect_log(pathlib.Path(log_file))
+        logger.info(f'Starting job lifecycle for {job_id}')
+        logger.info(f'  log_file={log_file}')
+        logger.info(f'  pool={pool}')
+        logger.info(f'From controller {self._controller_uuid}')
+        logger.info(f'  pid={self._pid}')
+
+        job_rank = None
+        env_content = file_content_utils.get_job_env_content(job_id)
+        if env_content:
+            try:
+                env_vars = dotenv.dotenv_values(stream=io.StringIO(env_content))
+                logger.info('Loading %d environment variables for job %s',
+                            len(env_vars), job_id)
+                for key, value in env_vars.items():
+                    if key in _CONTROLLER_RUNTIME_ENV_VARS:
+                        logger.warning(
+                            'Ignoring persisted controller-owned '
+                            'environment variable %s for job %s.', key, job_id)
+                        continue
+                    if value is not None:
+                        ctx.override_envs({key: value})
+                        logger.debug('Set environment variable: %s=%s', key,
+                                     value)
+
+                # Cleanup needs the same user config/auth context as launch.
+                file_content_utils.restore_job_config_file(job_id)
+                skypilot_config.reload_config()
+
+                if ('SKYPILOT_JOB_ID_TO_RANK' in env_vars and
+                        env_vars['SKYPILOT_JOB_ID_TO_RANK']):
+                    try:
+                        job_id_to_rank = json.loads(
+                            env_vars['SKYPILOT_JOB_ID_TO_RANK'])
+                        logger.debug('Loaded job_id_to_rank map: %s',
+                                     job_id_to_rank)
+                        job_rank = job_id_to_rank.get(str(job_id))
+                    except json.JSONDecodeError as e:
+                        logger.warning(
+                            'Failed to parse SKYPILOT_JOB_ID_TO_RANK for job '
+                            '%s: %s', job_id, e)
+                else:
+                    logger.debug('SKYPILOT_JOB_ID_TO_RANK not found in '
+                                 'environment variables')
+            except Exception as e:  # pylint: disable=broad-except
+                logger.error(
+                    'Failed to load environment variables for job '
+                    '%s: %s', job_id, e)
+
+        # Install the server-owned field last so persisted user/legacy env
+        # content cannot replace the exact job bound to this coroutine.
+        # Nested SDK requests combine it with the immutable outer and slot
+        # environment inherited by the manager process.
+        ctx.override_envs(
+            {jobs_constants.CONTROLLER_JOB_ID_ENV_VAR: str(job_id)})
+
+        # Bind usage state after the per-job environment is installed.
+        usage_lib.install_fresh_messages_for_current_context()
+        return job_rank
+
     # Use context.contextual to enable per-job output redirection and env var
     # isolation.
     @asyncio_utils.shield
@@ -2489,6 +2593,7 @@ class ControllerManager:
                 self.starting.remove(job_id)
                 self._starting_signal.notify()
             self.job_tasks.pop(job_id, None)
+            self._cleanup_only_job_ids.discard(job_id)
 
         # A cancellation that lands after the job task already finished
         # stores cancel info that no CancelledError handler will consume.
@@ -2539,73 +2644,7 @@ class ControllerManager:
                             log_file: str,
                             pool: str | None = None):
         """Background task that runs the job loop."""
-        ctx = context.get()
-        assert ctx is not None, 'Context is not initialized'
-        ctx.redirect_log(pathlib.Path(log_file))
-
-        logger.info(f'Starting job loop for {job_id}')
-        logger.info(f'  log_file={log_file}')
-        logger.info(f'  pool={pool}')
-        logger.info(f'From controller {self._controller_uuid}')
-        logger.info(f'  pid={self._pid}')
-
-        job_rank = None
-        env_content = file_content_utils.get_job_env_content(job_id)
-        if env_content:
-            try:
-                env_vars = dotenv.dotenv_values(stream=io.StringIO(env_content))
-                logger.info('Loading %d environment variables for job %s',
-                            len(env_vars), job_id)
-                if ctx is not None:
-                    for key, value in env_vars.items():
-                        if value is not None:
-                            ctx.override_envs({key: value})
-                            logger.debug('Set environment variable: %s=%s', key,
-                                         value)
-
-                    # Restore config file if needed
-                    file_content_utils.restore_job_config_file(job_id)
-
-                    skypilot_config.reload_config()
-
-                    # Set SKYPILOT_JOB_RANK from job_id_to_rank mapping if
-                    # available
-                    if ('SKYPILOT_JOB_ID_TO_RANK' in env_vars and
-                            env_vars['SKYPILOT_JOB_ID_TO_RANK']):
-                        try:
-                            job_id_to_rank = (json.loads(
-                                env_vars['SKYPILOT_JOB_ID_TO_RANK']))
-                            logger.debug(
-                                f'Loaded job_id_to_rank map: {job_id_to_rank}')
-                            job_rank = job_id_to_rank.get(str(job_id))
-                        except json.JSONDecodeError as e:
-                            logger.warning(
-                                'Failed to parse SKYPILOT_JOB_ID_TO_RANK for '
-                                'job %s: %s', job_id, e)
-                    else:
-                        logger.debug(
-                            'SKYPILOT_JOB_ID_TO_RANK not found in environment '
-                            'variables')
-                else:  # pragma: no cover - defensive
-                    logger.error('Context is None, cannot set environment '
-                                 'variables')
-            except Exception as e:  # pylint: disable=broad-except
-                logger.error(
-                    'Failed to load environment variables for job %s: '
-                    '%s', job_id, e)
-
-        # Install a fresh per-job usage MessageCollection so the run id and
-        # other identity fields reflect the per-job env we just loaded into
-        # ``ctx``. Without this, in consolidation mode the controller
-        # subprocess inherits a MessageCollection that was created at
-        # module import time (when class-body decorators like
-        # ``@usage_lib.messages.usage.update_runtime('provision')`` in
-        # ``sky/backends/backend.py`` first accessed the proxy) and bound
-        # the run id to whoever first spawned the controller; subsequent
-        # JobController coroutines would all share that one MC instead of
-        # their own per-job state. The override is scoped to this
-        # coroutine's contextvars Context.
-        usage_lib.install_fresh_messages_for_current_context()
+        job_rank = self._initialize_job_context(job_id, log_file, pool)
 
         cancelling = False
         superseded = False
@@ -2780,6 +2819,69 @@ class ControllerManager:
                         f'Deferring scheduler finalization for managed job '
                         f'{job_id} until cluster cleanup succeeds.')
 
+    @context.contextual_async
+    async def run_cleanup_loop(self,
+                               job_id: int,
+                               log_file: str,
+                               pool: str | None = None) -> None:
+        """Adopt terminal work without entering the workload execution path."""
+        initialized = False
+        cleanup_complete = False
+        retry_seconds = _TERMINAL_CLEANUP_RETRY_INITIAL_SECONDS
+        try:
+            while True:
+                try:
+                    if not initialized:
+                        self._initialize_job_context(job_id, log_file, pool)
+                        initialized = True
+                    if not cleanup_complete:
+                        # This is the same canonical provider/storage cleanup
+                        # used by the ordinary job finalizer.  No JobController
+                        # is constructed and no workload callback/state path is
+                        # entered for an already-terminal task family.
+                        await self._cleanup(job_id, pool=pool)
+                        cleanup_complete = True
+                        logger.info('Terminal cleanup completed for managed '
+                                    f'job {job_id}.')
+                    await asyncio.to_thread(
+                        self._cleanup_api_server_access_token, job_id)
+                    await managed_job_state.scheduler_set_cleanup_done_async(
+                        job_id)
+                    logger.info('Cleanup-only managed job %s is DONE.', job_id)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except managed_job_state.ControllerLeadershipLostError:
+                    # The guardian owns death/replacement.  A fenced manager
+                    # must leave this loop so its exact attempt can drain and
+                    # the terminal row can be re-adopted; retrying under a
+                    # lost claim would only replay stale finalizer phases.
+                    raise
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Cleanup-only managed job %s remains claimed after '
+                        'failure; retrying in %ss: %s', job_id, retry_seconds,
+                        common_utils.format_exception(e))
+                    await asyncio.sleep(retry_seconds)
+                    retry_seconds = min(retry_seconds * 2,
+                                        _TERMINAL_CLEANUP_RETRY_MAX_SECONDS)
+        finally:
+            await self._release_job_loop_ownership(job_id)
+
+    async def start_cleanup_job(self,
+                                job_id: int,
+                                pool: str | None = None) -> None:
+        """Hand one cleanup-only claim to a tracked contextual coroutine."""
+        log_file = await asyncio.to_thread(_prepare_job_log_path, job_id)
+        async with self._job_tasks_lock:
+            if job_id in self.job_tasks:
+                raise ValueError(
+                    f'Managed job {job_id} already has local lifecycle work.')
+            task = create_background_task(
+                self.run_cleanup_loop(job_id, log_file, pool))
+            self.job_tasks[job_id] = task
+            self._cleanup_only_job_ids.add(job_id)
+
     async def start_job(
         self,
         job_id: int,
@@ -2839,7 +2941,8 @@ class ControllerManager:
         async with self._job_tasks_lock:
             owned_tasks = [(job_id, self.job_tasks[job_id])
                            for job_id in cancel_job_ids
-                           if job_id in self.job_tasks]
+                           if (job_id in self.job_tasks and
+                               job_id not in self._cleanup_only_job_ids)]
         owned_job_ids = {job_id for job_id, _ in owned_tasks}
         orphan_job_ids = [
             job_id for job_id in cancel_job_ids if job_id not in owned_job_ids
@@ -3017,7 +3120,11 @@ class ControllerManager:
             # Check if there are any jobs that are waiting to launch
             try:
                 waiting_job = await managed_job_state.get_waiting_job_async(
-                    pid=self._pid, pid_started_at=self._pid_started_at)
+                    pid=self._pid,
+                    pid_started_at=self._pid_started_at,
+                    controller_slot_id=self._require_controller_slot_id(),
+                    controller_slot_attempt=(
+                        self._require_controller_slot_attempt()))
             except Exception as e:  # pylint: disable=broad-except
                 logger.error(f'Failed to get waiting job: {e}')
                 await asyncio.sleep(5)
@@ -3031,6 +3138,7 @@ class ControllerManager:
             logger.info(f'Claiming job {waiting_job["job_id"]}')
             job_id = waiting_job['job_id']
             pool = waiting_job.get('pool', None)
+            cleanup_only = waiting_job['cleanup_only']
 
             cancels = await asyncio.to_thread(
                 os.listdir, jobs_constants.CONSOLIDATED_SIGNAL_PATH)
@@ -3055,7 +3163,10 @@ class ControllerManager:
                     await scheduler.job_done_async(job_id, idempotent=True)
                     continue
 
-            await self.start_job(job_id, pool)
+            if cleanup_only:
+                await self.start_cleanup_job(job_id, pool)
+            else:
+                await self.start_job(job_id, pool)
 
 
 async def _finish_superseded_cleanup(
@@ -3075,7 +3186,25 @@ async def _finish_superseded_cleanup(
     cleanup_task.result()
 
 
-async def main(controller_uuid: str):
+def _require_bootstrapped_controller_origin_capability() -> None:
+    """Fail closed unless the stdlib bootstrap installed manager authority."""
+    raw_capability_fd = os.environ.pop(
+        jobs_constants.CONTROLLER_CAPABILITY_FD_ENV_VAR, None)
+    os.environ.pop(jobs_constants.CONTROLLER_ORIGIN_CAPABILITY_ENV_VAR, None)
+    os.environ.pop(
+        jobs_constants.CONTROLLER_ORIGIN_CAPABILITY_AUTHORITY_PATH_ENV_VAR,
+        None)
+    if raw_capability_fd is not None:
+        raise RuntimeError(
+            'ControllerManager capability bypassed the pre-import bootstrap.')
+    if controller_capability.get_process_local() is None:
+        raise RuntimeError(
+            'ControllerManager has no process-local capability authority.')
+
+
+async def main(controller_uuid: str, controller_slot_id: int,
+               controller_slot_attempt: str):
+    _require_bootstrapped_controller_origin_capability()
     db_utils.set_postgres_connection_metrics_process_role(
         'managed-job-controller')
     logger.info(f'Starting controller {controller_uuid}')
@@ -3085,7 +3214,8 @@ async def main(controller_uuid: str):
     plugins.load_plugins(
         plugins.ExtensionContext(context=plugins.PluginContext.CONTROLLER))
 
-    controller = ControllerManager(controller_uuid)
+    controller = ControllerManager(controller_uuid, controller_slot_id,
+                                   controller_slot_attempt)
 
     # Will happen multiple times, who cares though
     os.makedirs(jobs_constants.CONSOLIDATED_SIGNAL_PATH, exist_ok=True)
@@ -3111,6 +3241,28 @@ async def main(controller_uuid: str):
         controller_tasks.append(
             asyncio.create_task(
                 _watch_outer_controller_generation(outer_owner)))
+    # A successful fork is not manager readiness: imports, plugin setup, or
+    # long-lived loop construction can still fail immediately.  Give every
+    # loop one turn, reject an already-failed loop, then complete the one-shot
+    # guardian handshake before the runtime marks this slot started.
+    await asyncio.sleep(0)
+    for controller_task in controller_tasks:
+        if controller_task.done():
+            controller_task.result()
+            raise RuntimeError(
+                'Managed-job controller loop exited during initialization.')
+    raw_ready_fd = os.environ.pop(jobs_constants.CONTROLLER_READY_FD_ENV_VAR,
+                                  None)
+    if raw_ready_fd is None:
+        raise RuntimeError('Managed-job controller has no readiness channel.')
+    try:
+        ready_fd = int(raw_ready_fd)
+        os.write(ready_fd, b'1')
+    finally:
+        try:
+            os.close(int(raw_ready_fd))
+        except (OSError, ValueError):
+            pass
     # Run the garbage collector in a dedicated daemon thread to avoid affecting
     # the main event loop.
     gc_thread = threading.Thread(target=log_gc.elect_for_log_gc, daemon=True)
@@ -3123,4 +3275,7 @@ async def main(controller_uuid: str):
 
 
 if __name__ == '__main__':
-    asyncio.run(main(sys.argv[1]))
+    if len(sys.argv) != 4:
+        raise RuntimeError('ControllerManager requires UUID, slot ID, and '
+                           'slot-attempt arguments.')
+    asyncio.run(main(sys.argv[1], int(sys.argv[2]), sys.argv[3]))

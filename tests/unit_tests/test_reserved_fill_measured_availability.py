@@ -590,8 +590,8 @@ class TestBrokerWiresTheObservationIntoThePlacer:
             round_id=1,
             epoch=1,
             snapshot_time=observed_at,
-            observed_free=free_slots,
-            observed_free_by_accelerator=by_accelerator,
+            observed_free_slots=free_slots,
+            observed_free_slots_by_accelerator=by_accelerator,
             observed_at=observed_at)
 
     def test_per_accelerator_split_is_recorded_per_location(self):

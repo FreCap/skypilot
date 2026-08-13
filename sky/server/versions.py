@@ -52,6 +52,15 @@ _remote_api_version: contextvars.ContextVar[int | None] = \
     contextvars.ContextVar('remote_api_version', default=None)
 _remote_version: contextvars.ContextVar[str] = \
     contextvars.ContextVar('remote_version', default='unknown')
+# Trusted origin for one exact managed-job controller attempt.  Middleware
+# installs authenticated HTTP origin for the lifetime of a dispatch; internal
+# controller code may install a locked job snapshot around one nested SDK call.
+# The central request builder and service-account header builder consume this
+# single context-local path, so concurrent coroutines cannot leak identities.
+_managed_job_origin: contextvars.ContextVar[tuple[int, str, int, int, str] |
+                                            None] = contextvars.ContextVar(
+                                                'managed_job_origin',
+                                                default=None)
 _reminded_for_minor_version_upgrade = False
 
 
@@ -69,6 +78,22 @@ def get_remote_version() -> str:
 
 def set_remote_version(version: str) -> None:
     _remote_version.set(version)
+
+
+def set_managed_job_origin(
+    origin: tuple[int, str, int, int, str] | None,) -> contextvars.Token:
+    """Install trusted managed-job origin for one bounded dispatch/call."""
+    return _managed_job_origin.set(origin)
+
+
+def reset_managed_job_origin(token: contextvars.Token) -> None:
+    """Restore the prior dispatch origin."""
+    _managed_job_origin.reset(token)
+
+
+def get_managed_job_origin() -> tuple[int, str, int, int, str] | None:
+    """Return the authenticated managed-job origin for this HTTP request."""
+    return _managed_job_origin.get()
 
 
 class VersionInfo(NamedTuple):

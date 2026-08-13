@@ -399,6 +399,7 @@ def _retry_on_error(max_retries=DEFAULT_MAX_RETRIES,
 
             for attempt in range(max_retries):
                 try:
+                    kubernetes.raise_if_api_call_deadline_exceeded()
                     return func(*args, **kwargs)
                 except (kubernetes.max_retry_error(),
                         kubernetes.api_exception(),
@@ -423,7 +424,7 @@ def _retry_on_error(max_retries=DEFAULT_MAX_RETRIES,
                             f'Kubernetes API call {func.__name__} '
                             f'failed with {error_type} {str(e)}. Retrying in '
                             f'{sleep_time:.1f}s...')
-                        time.sleep(sleep_time)
+                        kubernetes.wait_for_api_call_retry(sleep_time)
                         continue
 
             # Format error message based on the type of exception
@@ -2831,10 +2832,12 @@ def get_kubernetes_nodes(*, context: str | None = None) -> list[V1Node]:
     response = kubernetes.core_api(context).list_node(
         _request_timeout=kubernetes.API_TIMEOUT, _preload_content=False)
     try:
-        nodes = [
-            V1Node.from_dict(item_dict) for item_dict in ijson.items(
-                response, 'items.item', buf_size=IJSON_BUFFER_SIZE)
-        ]
+        nodes = []
+        for item_dict in ijson.items(response,
+                                     'items.item',
+                                     buf_size=IJSON_BUFFER_SIZE):
+            kubernetes.raise_if_api_call_deadline_exceeded()
+            nodes.append(V1Node.from_dict(item_dict))
     finally:
         response.release_conn()
 
@@ -3011,6 +3014,7 @@ def get_allocated_resources_by_node(
         for item_dict in ijson.items(response,
                                      'items.item',
                                      buf_size=IJSON_BUFFER_SIZE):
+            kubernetes.raise_if_api_call_deadline_exceeded()
             pod = V1Pod.from_dict(item_dict)
             if should_exclude_pod_from_gpu_allocation(pod):
                 logger.debug(

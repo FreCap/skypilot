@@ -5,6 +5,7 @@ import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.ext import compiler as sqlalchemy_compiler
 from sqlalchemy.ext import declarative
 
 from sky.serve import constants
@@ -15,6 +16,34 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 Base = declarative.declarative_base()
+
+
+class _ControllerIncarnationDefault(sqlalchemy.sql.expression.FunctionElement):
+    """Dialect-native UUID default for the canonical current metadata."""
+
+    inherit_cache = True
+    type = sqlalchemy.Uuid(as_uuid=True)
+
+
+@sqlalchemy_compiler.compiles(_ControllerIncarnationDefault, 'postgresql')
+def _compile_controller_incarnation_postgres(_element, _compiler, **_kwargs):
+    return 'gen_random_uuid()'
+
+
+@sqlalchemy_compiler.compiles(_ControllerIncarnationDefault, 'sqlite')
+def _compile_controller_incarnation_sqlite(_element, _compiler, **_kwargs):
+    # Local SQLite is physically capped before Serve042, but unit tests build
+    # the canonical metadata directly.  Keep that graph insertable without a
+    # client-side default, which would leak this future column into statements
+    # against historical schemas.
+    return ("(lower(hex(randomblob(4))) || '-' || "
+            "lower(hex(randomblob(2))) || '-4' || "
+            "substr(lower(hex(randomblob(2))), 2) || '-' || "
+            "substr('89ab', (random() & 3) + 1, 1) || "
+            "substr(lower(hex(randomblob(2))), 2) || '-' || "
+            "lower(hex(randomblob(6))))")
+
+
 # === Database schema ===
 services_table = sqlalchemy.Table(
     'services',
@@ -82,6 +111,35 @@ services_table = sqlalchemy.Table(
     # Pod IP where the controller process is running.
     # Written by the sky.serve.service process at startup.
     sqlalchemy.Column('controller_ip', sqlalchemy.Text, server_default=None),
+    # ABA-safe owner identity for durable ordinary-launch request binding.
+    # PID/IP remain routing metadata; every controller takeover installs a
+    # fresh incarnation and advances the owner epoch atomically in Serve042.
+    sqlalchemy.Column(
+        'controller_incarnation',
+        sqlalchemy.Uuid(as_uuid=True),
+        nullable=False,
+        # A server default mirrors Serve042 without injecting
+        # this future column into historical INSERT statements.
+        server_default=_ControllerIncarnationDefault()),
+    sqlalchemy.Column('controller_owner_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='1'),
+    # Capability is bound to the exact controller incarnation above.  Existing
+    # services remain dark until a capable subprocess explicitly promotes the
+    # non-pool service from legacy to bound mode.
+    sqlalchemy.Column('ordinary_launch_binding_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('ordinary_launch_binding_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='legacy'),
+    sqlalchemy.Column('ordinary_launch_binding_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that
@@ -181,6 +239,11 @@ replicas_table = sqlalchemy.Table(
     sqlalchemy.Column(
         'replica_state',
         sqlalchemy.JSON().with_variant(postgresql.JSONB(), 'postgresql')),
+    # Neutral request association for the ordinary launch path.  Generic
+    # ReplicaInfo persistence omits this scalar so old writers cannot erase a
+    # durable binding by rewriting the JSON payload.
+    sqlalchemy.Column('ordinary_launch_association_id',
+                      sqlalchemy.Uuid(as_uuid=True)),
     # These columns are initialized and mutated only by typed resource-action
     # transitions.  Generic ReplicaInfo persistence deliberately omits them.
     # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed
@@ -254,6 +317,18 @@ version_specs_table = sqlalchemy.Table(
     # for choosing a proven generation after a newer version is quarantined.
     sqlalchemy.Column('controller_applied_at',
                       sqlalchemy.Float,
+                      server_default=None),
+    sqlalchemy.Column('controller_job_projection',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
+    sqlalchemy.Column('controller_work_cache',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
+                      server_default=None),
+    sqlalchemy.Column('worker_placement_projections',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
                       server_default=None),
     *resource_action_m4_state_schema.version_spec_identity_columns(),
     sqlalchemy.CheckConstraint(
@@ -545,6 +620,11 @@ reserved_fill_service_claim_sets_table = sqlalchemy.Table(
                       nullable=False,
                       server_default='0'),
     sqlalchemy.Column('semantic_hash', sqlalchemy.Text, server_default=None),
+    # Null only for migration shadows and bounded LEGACY_ACTIVE compatibility
+    # rows.  A sequenced claim locks one exact immutable version row.
+    sqlalchemy.Column('service_version',
+                      sqlalchemy.Integer,
+                      server_default=None),
     sqlalchemy.Column('global_headroom',
                       sqlalchemy.Integer,
                       server_default=None),
@@ -564,6 +644,9 @@ reserved_fill_service_claim_sets_table = sqlalchemy.Table(
                                name='ck_reserved_fill_claim_set_generation'),
     sqlalchemy.CheckConstraint('edge_count >= 0',
                                name='ck_reserved_fill_claim_set_edge_count'),
+    sqlalchemy.CheckConstraint(
+        'service_version IS NULL OR service_version > 0',
+        name='ck_reserved_fill_claim_set_service_version'),
     sqlalchemy.CheckConstraint(
         'global_headroom IS NULL OR global_headroom >= 0',
         name='ck_reserved_fill_claim_set_headroom'),
@@ -589,6 +672,13 @@ reserved_fill_pool_claims_table = sqlalchemy.Table(
                       sqlalchemy.Text,
                       server_default=None),
     sqlalchemy.Column('accelerator_names', sqlalchemy.Text,
+                      server_default=None),
+    # One exact v2 worker-projection digest per case-folded accelerator in the
+    # edge.  Null belongs only to migration/LEGACY_ACTIVE compatibility state;
+    # sequenced readers validate the closed map against accelerator_names.
+    sqlalchemy.Column('worker_projection_sha256_by_accelerator',
+                      sqlalchemy.JSON(none_as_null=True).with_variant(
+                          postgresql.JSONB(none_as_null=True), 'postgresql'),
                       server_default=None),
     sqlalchemy.Column('service_generation',
                       sqlalchemy.BigInteger,

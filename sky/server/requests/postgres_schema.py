@@ -17,9 +17,15 @@ REQUESTS = sqlalchemy.Table(
     sqlalchemy.Column('payload_json', postgresql.JSONB, nullable=False),
     sqlalchemy.Column('execution_class', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('status', sqlalchemy.Text, nullable=False),
+    # Nullable for API008 rows upgraded in place.  Every terminal transition
+    # written by API009 persists one of the closed operational-event causes;
+    # a bound reducer treats a legacy NULL as ambiguous evidence.
+    sqlalchemy.Column('terminal_cause', sqlalchemy.Text),
     sqlalchemy.Column('return_value', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('error', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('pid', sqlalchemy.Integer),
+    sqlalchemy.Column('execution_process_start_time_ticks',
+                      sqlalchemy.BigInteger),
     sqlalchemy.Column('created_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
@@ -39,6 +45,17 @@ REQUESTS = sqlalchemy.Table(
     sqlalchemy.Column('claim_token', postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('worker_instance_id', postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('controller_generation', sqlalchemy.BigInteger),
+    # Immutable origin of a request submitted by one exact managed-job
+    # controller slot attempt.  Legacy and ordinary requests keep the entire
+    # tuple NULL; managed-job nested requests persist every member together.
+    sqlalchemy.Column('managed_job_id', sqlalchemy.BigInteger),
+    sqlalchemy.Column('managed_job_controller_instance_id',
+                      postgresql.UUID(as_uuid=True)),
+    sqlalchemy.Column('managed_job_controller_generation',
+                      sqlalchemy.BigInteger),
+    sqlalchemy.Column('managed_job_controller_slot_id', sqlalchemy.Integer),
+    sqlalchemy.Column('managed_job_controller_slot_attempt',
+                      postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('lease_expires_at', sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column('heartbeat_at', sqlalchemy.DateTime(timezone=True)),
     sqlalchemy.Column('cancel_requested_at',
@@ -56,10 +73,77 @@ REQUESTS = sqlalchemy.Table(
     sqlalchemy.Column('event_context', postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('resource_action_id', postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('resource_action_attempt', sqlalchemy.Integer),
+    # Immutable request-to-association correlation. Request retention is owned
+    # independently by REQUEST_RETENTION_PINS, so projection can release the
+    # active pin without rewriting this evidence.
+    sqlalchemy.Column('ordinary_launch_association_id',
+                      postgresql.UUID(as_uuid=True)),
     sqlalchemy.Column('updated_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
+    sqlalchemy.CheckConstraint('pid IS NULL OR pid > 0',
+                               name='ck_api_requests_pid'),
+    sqlalchemy.CheckConstraint(
+        'execution_process_start_time_ticks IS NULL OR '
+        'execution_process_start_time_ticks > 0',
+        name='ck_api_requests_process_start_time'),
+    sqlalchemy.CheckConstraint(
+        '(ordinary_launch_association_id IS NULL) = '
+        "(handler_name <> 'sky.server.requests.ordinary_launch:launch')",
+        name='ck_api_requests_ordinary_launch_handler'),
+    sqlalchemy.CheckConstraint(
+        'num_nonnulls(managed_job_id, '
+        'managed_job_controller_instance_id, '
+        'managed_job_controller_generation, '
+        'managed_job_controller_slot_id, '
+        'managed_job_controller_slot_attempt) IN (0, 5)',
+        name='ck_api_requests_managed_job_origin_complete'),
+    sqlalchemy.CheckConstraint(
+        '(managed_job_id IS NULL OR managed_job_id > 0) AND '
+        '(managed_job_controller_generation IS NULL OR '
+        'managed_job_controller_generation > 0) AND '
+        '(managed_job_controller_slot_id IS NULL OR '
+        'managed_job_controller_slot_id >= 0)',
+        name='ck_api_requests_managed_job_origin_values'),
+    sqlalchemy.CheckConstraint(
+        "terminal_cause IS NULL OR (status IN ('SUCCEEDED', 'FAILED', "
+        "'CANCELLED') AND terminal_cause IN ('handler_succeeded', "
+        "'handler_failed', 'dispatcher_submit_failed', 'explicit_cancel', "
+        "'coroutine_disconnected', 'graceful_shutdown_retry', "
+        "'compatibility_restart', 'controller_leadership_lost', "
+        "'execution_lease_expired', 'precondition_failed', "
+        "'controller_reservation_conflict'))",
+        name='ck_api_requests_terminal_cause'),
 )
+sqlalchemy.Index('ix_api_requests_managed_job_attempt',
+                 REQUESTS.c.managed_job_id,
+                 REQUESTS.c.managed_job_controller_instance_id,
+                 REQUESTS.c.managed_job_controller_generation,
+                 REQUESTS.c.managed_job_controller_slot_id,
+                 REQUESTS.c.managed_job_controller_slot_attempt,
+                 postgresql_where=REQUESTS.c.managed_job_id.is_not(None))
+REQUEST_RETENTION_PINS = sqlalchemy.Table(
+    'api_request_retention_pins',
+    metadata,
+    sqlalchemy.Column('pin_kind', sqlalchemy.Text, primary_key=True),
+    sqlalchemy.Column('pin_id', postgresql.UUID(as_uuid=True),
+                      primary_key=True),
+    sqlalchemy.Column('request_id',
+                      sqlalchemy.Text,
+                      sqlalchemy.ForeignKey(
+                          'api_requests.request_id',
+                          name='fk_api_request_retention_pins_request',
+                          ondelete='RESTRICT'),
+                      nullable=False),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.CheckConstraint('char_length(pin_kind) BETWEEN 1 AND 128',
+                               name='ck_api_request_retention_pins_kind'),
+)
+sqlalchemy.Index('ix_api_request_retention_pins_request',
+                 REQUEST_RETENTION_PINS.c.request_id)
 RESOURCE_ACTIONS = sqlalchemy.Table(
     'api_resource_actions',
     metadata,
@@ -207,6 +291,10 @@ SERVER_INSTANCES = sqlalchemy.Table(
                       sqlalchemy.Boolean,
                       nullable=False,
                       server_default=sqlalchemy.false()),
+    sqlalchemy.Column('ordinary_launch_binding_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
 )
 CONTROLLER_LEADERSHIP = sqlalchemy.Table(
     'api_controller_leadership',
@@ -220,6 +308,10 @@ CONTROLLER_LEADERSHIP = sqlalchemy.Table(
     sqlalchemy.Column('generation_lock_key',
                       sqlalchemy.BigInteger,
                       nullable=False),
+    # API009 controller writers leave this NULL during a rolling migration.
+    # API010 leaders always bind a fresh 256-bit capability digest atomically
+    # with generation advancement, and origin admission rejects NULL.
+    sqlalchemy.Column('origin_capability_sha256', postgresql.BYTEA),
     sqlalchemy.Column('acquired_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
@@ -227,6 +319,10 @@ CONTROLLER_LEADERSHIP = sqlalchemy.Table(
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
     sqlalchemy.Column('released_at', sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.CheckConstraint(
+        'origin_capability_sha256 IS NULL OR '
+        'octet_length(origin_capability_sha256) = 32',
+        name='ck_api_controller_leadership_capability_sha256'),
 )
 CONTROLLER_ACTION_RESERVATIONS = sqlalchemy.Table(
     'api_controller_action_reservations',

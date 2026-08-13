@@ -8,7 +8,6 @@ import typing
 
 from sky import sky_logging
 from sky.jobs import constants as managed_job_constants
-from sky.jobs import scheduler as managed_job_scheduler
 from sky.jobs import state as managed_job_state
 from sky.jobs import utils as managed_job_utils
 from sky.skylet import constants
@@ -59,38 +58,134 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # to go with it; the leader role is meant to track main's lifecycle.
         super().__init__(name='managed-job-refresh', daemon=True)
         self._lock: locks.DistributedLock | None = None
+        self._stop_event = threading.Event()
+        self._effects_stopped = threading.Event()
+        self._ownership_released = threading.Event()
+        self._release_requested = threading.Event()
+        self._release_failure: BaseException | None = None
+        self._cutover_ready = threading.Event()
+        self._cutover_failure: BaseException | None = None
+
+    def request_shutdown(self) -> None:
+        """Fence future refresh/recovery effects and wake bounded waits.
+
+        The lock remains held until ``run()`` has returned from any in-flight
+        recovery/event effect.  Releasing it here would let a replacement
+        leader begin while this thread was still mutating managed-job state.
+        """
+        self._stop_event.set()
+
+    def wait_for_cutover(self) -> None:
+        """Block all-mode controller request claims until migration completes."""
+        timeout = max(_LOCK_PROBE_INTERVAL_SECONDS,
+                      _ACQUIRE_RETRY_INTERVAL_SECONDS) + 30
+        if not self._cutover_ready.wait(timeout=timeout):
+            raise RuntimeError(
+                'Managed-job controller family cutover did not become ready.')
+        if self._cutover_failure is not None:
+            raise RuntimeError('Managed-job controller family cutover failed.'
+                              ) from (self._cutover_failure)
+
+    def wait_for_shutdown(self) -> None:
+        """Wait for effect quiescence while the owner thread retains its lock."""
+        timeout = max(_LOCK_PROBE_INTERVAL_SECONDS,
+                      _ACQUIRE_RETRY_INTERVAL_SECONDS) + 1
+        if not self._effects_stopped.wait(timeout=timeout):
+            raise RuntimeError(
+                'Managed-job refresh effects did not prove quiescence.')
+        if not self.is_alive() and not self._ownership_released.is_set():
+            raise RuntimeError('Managed-job refresh owner exited before its '
+                               'ownership-release barrier.')
+
+    def release_ownership(self) -> None:
+        """Release the inner lock after all controller spawners/families stop."""
+        if not self._effects_stopped.is_set():
+            raise RuntimeError('Managed-job refresh effects must stop before '
+                               'ownership release.')
+        if self._ownership_released.is_set():
+            return
+        self._release_requested.set()
+        self.join(timeout=max(_LOCK_PROBE_INTERVAL_SECONDS,
+                              _ACQUIRE_RETRY_INTERVAL_SECONDS) + 1)
+        if self._ownership_released.is_set() and not self.is_alive():
+            return
+        if self._release_failure is not None:
+            raise RuntimeError('Managed-job refresh ownership did not release.'
+                              ) from (self._release_failure)
+        raise RuntimeError('Managed-job refresh owner did not exit after its '
+                           'ownership-release request.')
+
+    def _wait_or_stopping(self, seconds: float) -> bool:
+        return self._stop_event.wait(seconds)
 
     def run(self) -> None:
-        while True:
-            try:
-                if self._lock is None:
-                    self._lock = locks.get_lock(
-                        managed_job_constants.CONSOLIDATION_MODE_LOCK_ID)
-                self._become_leader_and_run()
-                # _become_leader_and_run only returns normally after
-                # _suicide_on_lock_loss sent SIGTERM. Re-entering would
-                # skip the lock acquire (stale local `_acquired` flag),
-                # touch the signal file, and call ha_recovery →
-                # maybe_start_controllers — which would spawn fresh
-                # controllers under a now-released lock while the new
-                # leader on another replica is doing the same. Stop the
-                # thread instead so the SIGTERM-driven drain runs to
-                # completion without further controller churn.
-                return
-            except Exception:  # pylint: disable=broad-except
-                logger.exception(
-                    'managed-job refresh error; '
-                    f'retrying in {_ACQUIRE_RETRY_INTERVAL_SECONDS}s')
-                # If we previously held the lock and lost the session
-                # mid-recovery, retrying would run as a stale leader
-                # (local `_acquired` flag still True, server-side lock
-                # released, another replica can grab it).  Hand off via
-                # SIGTERM, same as the steady-state probe path.
-                if (self._lock is not None and self._lock.is_locked() and
-                        not self._lock_still_held()):
-                    self._suicide_on_lock_loss()
+        synchronous_invocation = threading.current_thread() is not self
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    if self._lock is None:
+                        self._lock = locks.get_lock(
+                            managed_job_constants.CONSOLIDATION_MODE_LOCK_ID)
+                    self._become_leader_and_run()
+                    # _become_leader_and_run only returns normally after
+                    # lock-loss SIGTERM or an explicit shutdown.  Re-entering
+                    # with a stale local lock flag could run recovery beside a
+                    # successor generation, so let runtime-owned drain finish.
                     return
-                time.sleep(_ACQUIRE_RETRY_INTERVAL_SECONDS)
+                except Exception as e:  # pylint: disable=broad-except
+                    if not self._cutover_ready.is_set():
+                        self._cutover_failure = e
+                        self._cutover_ready.set()
+                    logger.exception(
+                        'managed-job refresh error; '
+                        f'retrying in {_ACQUIRE_RETRY_INTERVAL_SECONDS}s')
+                    # If we previously held the lock and lost the session
+                    # mid-recovery, retrying would run as a stale leader
+                    # (local `_acquired` flag still True, server-side lock
+                    # released, another replica can grab it).  Hand off via
+                    # SIGTERM, same as the steady-state probe path.
+                    if (self._lock is not None and self._lock.is_locked() and
+                            not self._lock_still_held()):
+                        self._suicide_on_lock_loss()
+                        return
+                    if self._wait_or_stopping(_ACQUIRE_RETRY_INTERVAL_SECONDS):
+                        return
+                except BaseException:  # pylint: disable=try-except-raise
+                    # SystemExit/KeyboardInterrupt are test/process-control
+                    # boundaries, not retryable refresh failures.
+                    raise
+        finally:
+            # The runtime releases the lock only after request spawners and all
+            # admitted controller families are absent.  This is required by
+            # compatibility ``all`` mode, which has no outer leader lease.
+            self._effects_stopped.set()
+            if synchronous_invocation:
+                # Unit-level state-machine calls do not have a concurrent
+                # runtime owner to drive the two-phase handoff.
+                try:
+                    if self._lock is not None:
+                        self._lock.release()
+                except Exception as e:  # pylint: disable=broad-except
+                    self._release_failure = e
+                    raise
+                self._ownership_released.set()
+            else:
+                while not self._ownership_released.is_set():
+                    self._release_requested.wait()
+                    self._release_requested.clear()
+                    try:
+                        if self._lock is not None:
+                            self._lock.release()
+                    except Exception as e:  # pylint: disable=broad-except
+                        # Keep the owner thread and its object/session alive.
+                        # The next runtime convergence iteration can request a
+                        # fresh, authoritative release attempt.
+                        self._release_failure = e
+                        logger.exception(
+                            'Failed to release managed-job refresh ownership.')
+                        continue
+                    self._release_failure = None
+                    self._ownership_released.set()
 
     def _become_leader_and_run(self) -> None:
         assert self._lock is not None
@@ -113,10 +208,18 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # what we want (controller starts stay gated until we hold the lock).
         signal_file = _touch_recovery_signal_file()
 
+        if self._stop_event.is_set():
+            return
+
         if not self._lock.is_locked():
             logger.info(f'Acquiring the consolidation mode lock: {self._lock}')
-            self._lock.acquire()
+            # A nonblocking probe keeps shutdown bounded while a previous
+            # replica owns the lock.  The outer loop provides the canonical
+            # retry cadence for both lock types.
+            self._lock.acquire(blocking=False)
             logger.info('Consolidation mode lock acquired')
+        if self._stop_event.is_set():
+            return
 
         # Wait before recovery whenever a nonterminal job exists. A previous
         # image may have a detached scheduler that can claim a WAITING row
@@ -137,11 +240,16 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         if not lock_still_held:
             self._suicide_on_lock_loss()
             return
+        if self._stop_event.is_set():
+            return
 
         try:
             managed_job_utils.ha_recovery_for_consolidation_mode()
         finally:
             signal_file.unlink(missing_ok=True)
+        # Runtime admits fixed slots only after stale/null-slot ownership has
+        # been recovered under this still-held inner lock.
+        self._cutover_ready.set()
 
         # Event-loop tick at events.EVENT_CHECKING_INTERVAL_SECONDS and lock
         # probe at _LOCK_PROBE_INTERVAL_SECONDS. Sleep until the earlier
@@ -151,6 +259,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         next_probe = now + _LOCK_PROBE_INTERVAL_SECONDS
         next_event = now
         while True:
+            if self._stop_event.is_set():
+                return
             now = time.monotonic()
             if now >= next_probe:
                 if not self._lock_still_held():
@@ -158,6 +268,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
                     return
                 next_probe = now + _LOCK_PROBE_INTERVAL_SECONDS
             if now >= next_event:
+                if self._stop_event.is_set():
+                    return
                 try:
                     refresh_event.run()
                 except Exception:  # pylint: disable=broad-except
@@ -165,7 +277,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
                 next_event = now + events.EVENT_CHECKING_INTERVAL_SECONDS
             sleep_seconds = max(0.0, min(next_probe, next_event) - now)
             if sleep_seconds > 0:
-                time.sleep(sleep_seconds)
+                if self._wait_or_stopping(sleep_seconds):
+                    return
 
     def _wait_for_recovery_grace(self) -> bool:
         """Wait for old controllers while probing this leader's lock.
@@ -179,7 +292,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
             return self._lock_still_held()
         while remaining > 0:
             sleep_seconds = min(_LOCK_PROBE_INTERVAL_SECONDS, remaining)
-            time.sleep(sleep_seconds)
+            if self._wait_or_stopping(sleep_seconds):
+                return True
             remaining -= sleep_seconds
             if not self._lock_still_held():
                 return False
@@ -204,19 +318,11 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
             _touch_recovery_signal_file()
         except OSError:
             logger.warning('Failed to touch recovery signal file on lock-loss')
-        # The lock is already released, kill job controllers to avoid split
-        # brain, e.g. new job controllers might have been launched on the new
-        # replica during rolling-update
-        try:
-            managed_job_scheduler.fail_stop_local_job_controllers()
-        except Exception:  # pylint: disable=broad-except
-            logger.exception(
-                'Failed to fail-stop local controllers on lock-loss')
         # SIGTERM to trigger graceful shutdown
         os.kill(os.getpid(), signal.SIGTERM)
 
 
-def start_managed_job_refresh_daemon() -> None:
+def start_managed_job_refresh_daemon() -> ManagedJobRefreshDaemonThread | None:
     """Start the refresh thread for this API server process, if needed.
 
     No-op when consolidation mode is off — mirrors the gating that the
@@ -225,6 +331,8 @@ def start_managed_job_refresh_daemon() -> None:
     if not managed_job_utils.is_consolidation_mode():
         logger.debug('Consolidation mode is off; not starting the managed-job '
                      'refresh thread.')
-        return
+        return None
     logger.info('Starting the managed-job refresh thread')
-    ManagedJobRefreshDaemonThread().start()
+    daemon = ManagedJobRefreshDaemonThread()
+    daemon.start()
+    return daemon

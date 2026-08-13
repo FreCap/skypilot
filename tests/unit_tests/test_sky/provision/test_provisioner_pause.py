@@ -13,6 +13,7 @@ import pytest
 from sky import clouds
 from sky import exceptions
 from sky import global_user_state
+from sky.provision import common
 from sky.provision import provisioner
 from sky.utils import resources_utils
 
@@ -46,16 +47,21 @@ def patched_bulk_provision(monkeypatch):
     return teardown_mock
 
 
-def _call_bulk_provision(tmp_path):
-    return provisioner.bulk_provision(cloud=clouds.Kubernetes(),
-                                      region=clouds.Region('us'),
-                                      zones=None,
-                                      cluster_name=resources_utils.ClusterName(
-                                          'c', 'c-on-cloud'),
-                                      num_nodes=1,
-                                      cluster_yaml='/fake/cluster.yaml',
-                                      prev_cluster_ever_up=False,
-                                      log_dir=str(tmp_path))
+def _call_bulk_provision(
+    tmp_path,
+    provider_effect_guard_factory: common.ProviderEffectGuardFactory |
+    None = None,
+):
+    return provisioner.bulk_provision(
+        cloud=clouds.Kubernetes(),
+        region=clouds.Region('us'),
+        zones=None,
+        cluster_name=resources_utils.ClusterName('c', 'c-on-cloud'),
+        num_nodes=1,
+        cluster_yaml='/fake/cluster.yaml',
+        prev_cluster_ever_up=False,
+        log_dir=str(tmp_path),
+        provider_effect_guard_factory=(provider_effect_guard_factory))
 
 
 def test_bulk_provision_does_not_teardown_on_pause(patched_bulk_provision,
@@ -88,3 +94,49 @@ def test_bulk_provision_tears_down_on_ordinary_failure(patched_bulk_provision,
         _call_bulk_provision(tmp_path)
 
     patched_bulk_provision.assert_called_once()
+
+
+def test_bulk_provision_tears_down_on_ordinary_request_cancellation(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=exceptions.RequestCancelled('cancelled')))
+
+    with pytest.raises(exceptions.RequestCancelled, match='cancelled'):
+        _call_bulk_provision(tmp_path)
+
+    patched_bulk_provision.assert_called_once()
+
+
+def test_policy_bound_kubernetes_failure_defers_cleanup_to_replica_owner(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        provisioner, '_bulk_provision',
+        mock.MagicMock(side_effect=RuntimeError('passive wait failed')))
+
+    @contextlib.contextmanager
+    def mutation_guard():
+        yield
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='durable reserved-fill reconciliation'):
+        _call_bulk_provision(tmp_path, mutation_guard)
+
+    patched_bulk_provision.assert_not_called()
+
+
+def test_policy_bound_kubernetes_preserves_terminal_fence_classification(
+        patched_bulk_provision, monkeypatch, tmp_path):
+    terminal = exceptions.ReservedFillLaunchFenceError('lost guard session')
+    monkeypatch.setattr(provisioner, '_bulk_provision',
+                        mock.MagicMock(side_effect=terminal))
+
+    @contextlib.contextmanager
+    def mutation_guard():
+        yield
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError) as exc_info:
+        _call_bulk_provision(tmp_path, mutation_guard)
+
+    assert exc_info.value is terminal
+    patched_bulk_provision.assert_not_called()

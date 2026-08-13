@@ -14,6 +14,12 @@ import sqlalchemy
 from sqlalchemy import orm
 
 AUTHORITY_REVISION = '040'
+# Keep this set closed: a later Serve migration is accepted only after review
+# confirms that it is additive with respect to the frozen revision-040
+# relation/function contract.  The catalog proof below remains the trust root;
+# the Alembic head merely identifies a recognized descendant installation.
+RECOGNIZED_ADDITIVE_REVISIONS = frozenset(
+    ('040', '041', '042', '043', '044', '045', '046'))
 AUTHORITY_FUNCTION = ('skyserve040_assert_placement_normalization_authority')
 AUTHORITY_GATE = 'placement_normalization_write_fence'
 RUNS_RELATION = 'placement_normalization_runs'
@@ -347,10 +353,12 @@ def _verify_version_relation(connection: sqlalchemy.engine.Connection,
     revisions = connection.exec_driver_sql(
         f'SELECT version_num FROM {version_relation} '
         'ORDER BY version_num').scalars().all()
-    if revisions != [AUTHORITY_REVISION]:
+    if (len(revisions) != 1 or
+            revisions[0] not in RECOGNIZED_ADDITIVE_REVISIONS):
         raise PlacementNormalizationAuthorityError(
-            'Placement-normalization authority schema does not own exactly '
-            f'revision {AUTHORITY_REVISION}; found {revisions!r}.')
+            'Placement-normalization authority schema does not own one '
+            'recognized additive revision at or after '
+            f'{AUTHORITY_REVISION}; found {revisions!r}.')
 
 
 def _expected_assertion_body(connection: sqlalchemy.engine.Connection,

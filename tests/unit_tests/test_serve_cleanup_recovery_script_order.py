@@ -22,10 +22,12 @@ from unittest import mock
 import pytest
 
 from sky import exceptions
+from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service
+from sky.utils import common_utils
 from sky.utils import controller_utils
 
 
@@ -195,6 +197,185 @@ def test_finalize_removes_service_on_clean_teardown(monkeypatch):
         ('begin_teardown', 'svc'))
     assert calls.index(('begin_teardown', 'svc')) < calls.index(
         ('delete_lb', 'svc'))
+
+
+def test_finalize_claims_and_settles_bound_launches_before_generic_quiescence(
+        monkeypatch):
+    calls = []
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    monkeypatch.setattr(service, '_cleanup', lambda *a, **k: False)
+    _patch_finalize(monkeypatch, calls)
+    monkeypatch.setattr(
+        service.ordinary_launch_binding, 'claim_controller_incarnation',
+        lambda *a, **k: calls.append(('claim_binding', a[0])) or authority)
+    monkeypatch.setattr(
+        service, '_settle_bound_ordinary_launches_for_teardown',
+        lambda claimed, infos: calls.append(
+            ('settle_binding', claimed.service_name, len(infos))))
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert calls.index(
+        ('status', serve_state.ServiceStatus.SHUTTING_DOWN)) < (calls.index(
+            ('claim_binding', 'svc')))
+    assert calls.index(('claim_binding', 'svc')) < calls.index(
+        ('settle_binding', 'svc', 0))
+    assert calls.index(('settle_binding', 'svc', 0)) < calls.index(
+        ('quiesce_launches', 'svc'))
+
+
+def test_finalize_refuses_generic_cleanup_when_bound_settlement_fails(
+        monkeypatch):
+    calls = []
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    monkeypatch.setattr(serve_state,
+                        'set_service_status_and_active_versions_if_owner',
+                        lambda *a, **k: calls.append(('status', a[4])) or True)
+    monkeypatch.setattr(service.ordinary_launch_binding,
+                        'claim_controller_incarnation',
+                        lambda *a, **k: authority)
+    monkeypatch.setattr(serve_state, 'get_replica_infos',
+                        lambda _svc: [_replica(1)])
+    monkeypatch.setattr(service, '_settle_bound_ordinary_launches_for_teardown',
+                        mock.Mock(side_effect=RuntimeError('still claimed')))
+    monkeypatch.setattr(
+        service.serve_utils, 'quiesce_service_replica_launch_requests',
+        lambda *a, **k: calls.append(('generic_quiesce', a[0])) or True)
+    monkeypatch.setattr(serve_state,
+                        'acknowledge_service_controller_teardown_if_owner',
+                        lambda *a, **k: calls.append(('ack', a[0])) or True)
+
+    service._run_cleanup_and_finalize('svc', types.SimpleNamespace(pool=False),
+                                      '/tmp/svc', 1, 'incarnation-a', 123, None)
+
+    assert calls == [('status', serve_state.ServiceStatus.SHUTTING_DOWN)]
+
+
+def test_teardown_reducer_cancels_then_polls_exact_association(monkeypatch):
+    info = _replica(1)
+    context = types.SimpleNamespace(association_id='association-a')
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    initial = types.SimpleNamespace(context=context, cancel_reason=None)
+    waiting = types.SimpleNamespace(disposition='WAIT_QUIESCENCE',
+                                    projected=False)
+    projected = types.SimpleNamespace(disposition='PROJECTED', projected=True)
+    inspect = mock.Mock(return_value=initial)
+    cancel = mock.Mock()
+    reduce = mock.Mock(side_effect=[waiting, projected])
+    monkeypatch.setattr(service.request_postgres,
+                        'lookup_bound_ordinary_launch_cancel_target', inspect)
+    monkeypatch.setattr(service.request_postgres,
+                        'request_bound_ordinary_launch_cancel', cancel)
+    monkeypatch.setattr(service.request_postgres,
+                        'reduce_bound_ordinary_launch', reduce)
+    monkeypatch.setattr(service.time, 'sleep', lambda _seconds: None)
+
+    service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    inspect.assert_called_once_with('svc', 1, info.replica_record_id)
+    assert cancel.call_args.args[:3] == (context, authority, 'service-teardown')
+    assert reduce.call_count == 2
+    assert all(
+        call.args == (context, authority) for call in reduce.call_args_list)
+    assert all(call.kwargs['project_replica_result'] is not None
+               for call in reduce.call_args_list)
+
+
+def test_teardown_success_projects_provider_materialization_evidence(
+        monkeypatch):
+    info = _replica(1)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.INTERRUPTED
+    authority = types.SimpleNamespace(service_name='svc',
+                                      service_hash='service-hash')
+    projection = types.SimpleNamespace(
+        locked_replica_info=info,
+        status=types.SimpleNamespace(value='SUCCEEDED'),
+        pre_effect_terminal=False,
+        paid_capacity_pool_key=None,
+        context=types.SimpleNamespace(association_id='association-a'))
+    update = mock.Mock(return_value=True)
+    monkeypatch.setattr(
+        serve_state, 'update_replica_for_bound_ordinary_launch_in_transaction',
+        update)
+
+    assert service._project_bound_ordinary_launch_for_teardown(
+        authority, mock.sentinel.connection, projection)
+
+    assert (info.status_property.sky_launch_status ==
+            common_utils.ProcessStatus.INTERRUPTED)
+    assert update.call_args.kwargs['provider_launch_succeeded'] is True
+
+
+def test_teardown_reducer_reuses_prior_durable_cancel_reason(monkeypatch):
+    info = _replica(1)
+    context = types.SimpleNamespace(association_id='association-a')
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    target = types.SimpleNamespace(context=context,
+                                   cancel_reason='replica-teardown')
+    projected = types.SimpleNamespace(disposition='PRE_EFFECT_TERMINAL',
+                                      projected=True)
+    monkeypatch.setattr(service.request_postgres,
+                        'lookup_bound_ordinary_launch_cancel_target',
+                        mock.Mock(return_value=target))
+    cancel = mock.Mock()
+    monkeypatch.setattr(service.request_postgres,
+                        'request_bound_ordinary_launch_cancel', cancel)
+    monkeypatch.setattr(service.request_postgres,
+                        'reduce_bound_ordinary_launch',
+                        mock.Mock(return_value=projected))
+
+    service._settle_bound_ordinary_launches_for_teardown(authority, [info])
+
+    assert cancel.call_args.args[:3] == (context, authority, 'replica-teardown')
+
+
+def test_service_teardown_cancels_every_target_before_reducing(monkeypatch):
+    infos = [_replica(1), _replica(2)]
+    contexts = [
+        types.SimpleNamespace(association_id=f'association-{index}')
+        for index in (1, 2)
+    ]
+    authority = types.SimpleNamespace(
+        capable=True,
+        binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+        service_name='svc')
+    targets = [
+        types.SimpleNamespace(context=context, cancel_reason=None)
+        for context in contexts
+    ]
+    events = []
+    monkeypatch.setattr(service.request_postgres,
+                        'lookup_bound_ordinary_launch_cancel_target',
+                        mock.Mock(side_effect=targets))
+    monkeypatch.setattr(
+        service.request_postgres, 'request_bound_ordinary_launch_cancel',
+        lambda context, *_args: events.append(
+            ('cancel', context.association_id)))
+
+    def _reduce(context, *_args, **_kwargs):
+        events.append(('reduce', context.association_id))
+        return types.SimpleNamespace(disposition='PROJECTED', projected=True)
+
+    monkeypatch.setattr(service.request_postgres,
+                        'reduce_bound_ordinary_launch', _reduce)
+
+    service._settle_bound_ordinary_launches_for_teardown(authority, infos)
+
+    assert events == [('cancel', 'association-1'), ('cancel', 'association-2'),
+                      ('reduce', 'association-1'), ('reduce', 'association-2')]
 
 
 def test_finalize_does_not_ack_or_delete_until_launches_quiesce(monkeypatch):

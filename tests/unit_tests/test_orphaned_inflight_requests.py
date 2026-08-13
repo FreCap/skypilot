@@ -19,8 +19,8 @@ import types
 import unittest.mock as mock
 
 import pytest
+import pytest_asyncio
 
-from sky.server import daemons
 from sky.server.requests import payloads
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
@@ -74,20 +74,18 @@ def test_logs_each_orphaned_inflight_request(monkeypatch):
         req_filter.fields) == {'request_id', 'name', 'status', 'cluster_name'}
 
 
-def test_daemon_requests_are_not_reported(monkeypatch):
-    # Internal daemon requests sit in RUNNING for the server's whole life and
-    # are recreated on every startup: they are not dropped work.
-    daemon_reqs = [
-        _FakeReq(daemon.id, daemon.name, 'RUNNING')
-        for daemon in daemons.INTERNAL_REQUEST_DAEMONS
-    ]
+def test_no_request_id_suffix_is_hidden(monkeypatch):
+    # Legacy daemon rows are retired before generic recovery reaches this
+    # helper. If ordering regresses, do not silently hide a finite request just
+    # because its user-selected ID has the historical suffix.
+    daemon_reqs = [_FakeReq('user-selected-daemon', 'sky.launch', 'RUNNING')]
     monkeypatch.setattr(request_storage, 'get_request_backend',
                         lambda: _FakeBackend(daemon_reqs))
     warnings = _capture_warnings(monkeypatch)
 
     requests_lib._log_orphaned_inflight_requests()
 
-    assert not warnings
+    assert len(warnings) == 2
 
 
 def test_no_orphans_no_warning(monkeypatch):
@@ -118,8 +116,8 @@ def _dummy():
     return None
 
 
-@pytest.fixture()
-def isolated_database(tmp_path):
+@pytest_asyncio.fixture()
+async def isolated_database(tmp_path):
     temp_db_path = tmp_path / 'requests.db'
     temp_log_path = tmp_path / 'logs'
     temp_log_path.mkdir()
@@ -127,9 +125,9 @@ def isolated_database(tmp_path):
                     str(temp_db_path)):
         with mock.patch('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
                         str(temp_log_path)):
-            requests_lib._DB = None
+            await requests_lib.close_db_async()
             yield
-            requests_lib._DB = None
+            await requests_lib.close_db_async()
 
 
 def _make_request(request_id: str,
@@ -156,6 +154,10 @@ async def test_reset_db_and_logs_reinitializes_backend(isolated_database,
     warnings = _capture_warnings(monkeypatch)
     assert await requests_lib.create_if_not_exists_async(
         _make_request('req-old', requests_lib.RequestStatus.RUNNING))
+    # reset_db_and_logs() is a synchronous startup-only API. Close the async
+    # test connection first so its aiosqlite worker is not orphaned when the
+    # reset drops and recreates the module-level handle.
+    await requests_lib.close_db_async()
 
     requests_lib.reset_db_and_logs()
 

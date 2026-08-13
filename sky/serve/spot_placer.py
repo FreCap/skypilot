@@ -880,6 +880,45 @@ def _get_possible_location_from_task(
                 if expand_accelerator_counts:
                     resource_shapes = _expand_accelerator_counts_for_cloud(
                         shape_resources, cloud, accelerator_counts_cache)
+                if (isinstance(cloud, sky_clouds.Kubernetes) and
+                        not isinstance(cloud, sky_clouds.SSH)):
+                    # An explicit Kubernetes candidate is declarative
+                    # dispatch policy. Catalog it from static workspace/context
+                    # authorization without asking current nodes or an
+                    # autoscaler whether the shape fits today. The reserved
+                    # capacity dispatcher owns scale-to-zero availability.
+                    allowed_contexts = set(
+                        cloud.existing_allowed_contexts(silent=True))
+                    requested_contexts = location_requirements.get(
+                        str(cloud), {})
+                    contexts = (sorted(requested_contexts) if requested_contexts
+                                else sorted(allowed_contexts))
+                    for context in contexts:
+                        if context not in allowed_contexts:
+                            continue
+                        for candidate_shape in resource_shapes:
+                            instance_type = (
+                                cloud.get_declarative_instance_type(
+                                    candidate_shape))
+                            image_id, container_image = (
+                                _location_image_fields_from_resources(
+                                    candidate_shape))
+                            possible_locations.add(
+                                Location(
+                                    cloud=cloud,
+                                    region=context,
+                                    zone=None,
+                                    accelerators=candidate_shape.accelerators,
+                                    use_spot=candidate_shape.use_spot,
+                                    image_id=image_id,
+                                    container_image=container_image,
+                                    disk_tier=(candidate_shape.disk_tier.value
+                                               if candidate_shape.disk_tier
+                                               is not None else None),
+                                    ephemeral_storage=(
+                                        candidate_shape.ephemeral_storage),
+                                    instance_type=instance_type))
+                    continue
                 for candidate_shape in resource_shapes:
                     feasible_resources: resources_utils.FeasibleResources = (
                         cloud.get_feasible_launchable_resources(

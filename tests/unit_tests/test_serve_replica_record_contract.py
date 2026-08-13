@@ -19,6 +19,19 @@ from sky.serve import serve_state
 from sky.serve import spot_placer
 from sky.utils import common_utils
 
+_RECONCILIATION_GATE_GENERATION = 29
+_RECLAIM_FLEET_BUNDLE_SHA256 = 'c' * 64
+_RECLAIM_POLICY_REVISION = 'kueue-reclaim-v1'
+_RECLAIM_PROVIDER_INVENTORY_SHA256 = 'd' * 64
+_WORKER_PROJECTION_SHA256 = 'e' * 64
+_RECLAIM_ATTRIBUTION_FIELDS = (
+    'reserved_fill_reconciliation_gate_generation',
+    'reserved_fill_reclaim_fleet_bundle_sha256',
+    'reserved_fill_reclaim_policy_revision',
+    'reserved_fill_reclaim_provider_inventory_sha256',
+    'reserved_fill_worker_projection_sha256',
+)
+
 
 def _replica() -> replica_managers.ReplicaInfo:
     location = spot_placer.Location(cloud=clouds.AWS(),
@@ -95,6 +108,27 @@ def _protocol_v2_replica() -> replica_managers.ReplicaInfo:
     return replica
 
 
+def _attributed_protocol_v2_replica() -> replica_managers.ReplicaInfo:
+    replica = _protocol_v2_replica()
+    replica.reserved_fill_allocation_generation = 5
+    replica.reserved_fill_allocation_input_sha256 = 'a' * 64
+    replica.reserved_fill_allocation_claim_generation = 11
+    replica.reserved_fill_reconciliation_gate_generation = (
+        _RECONCILIATION_GATE_GENERATION)
+    replica.reserved_fill_reclaim_fleet_bundle_sha256 = (
+        _RECLAIM_FLEET_BUNDLE_SHA256)
+    replica.reserved_fill_reclaim_policy_revision = _RECLAIM_POLICY_REVISION
+    replica.reserved_fill_reclaim_provider_inventory_sha256 = (
+        _RECLAIM_PROVIDER_INVENTORY_SHA256)
+    replica.reserved_fill_worker_projection_sha256 = (_WORKER_PROJECTION_SHA256)
+    replica.reserved_fill_observation_generation = 13
+    replica.reserved_fill_observation_sequence = 17
+    replica.reserved_fill_intent_idempotency_key = 'b' * 64
+    replica.zero_cost_admission_sequence = 19
+    replica.zero_cost_materialization_sequence = 13
+    return replica
+
+
 def _protocol_v2_handle(
         context: str = 'phx-context') -> backends.CloudVmRayResourceHandle:
     handle = mock.Mock(spec=backends.CloudVmRayResourceHandle)
@@ -165,7 +199,7 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     state = replica.to_storage_dict()
     restored = replica_managers.ReplicaInfo.from_storage_dict(state)
 
-    assert state['replica_info_version'] == 14
+    assert state['replica_info_version'] == 17
     assert set(state) == set(replica_info._REPLICA_INFO_STORAGE_FIELDS)
     assert replica.resources_override['cloud'] is cloud_before
     assert replica.resources_override['image_id'] == image_id_before
@@ -276,6 +310,184 @@ def test_protocol_v2_storage_round_trip_preserves_strict_cleanup_authority():
     fence = reserved_capacity.parse_protocol_v2_cleanup_fence(restored)
     assert fence == reserved_capacity.ProtocolV2CleanupFence(
         kubernetes_context='phx-context', physical_cluster_uid='physical-uid')
+
+
+def test_typed_fill_allocation_attribution_round_trips_json_and_pickle():
+    replica = _attributed_protocol_v2_replica()
+    state = replica.to_storage_dict()
+
+    from_json = replica_managers.ReplicaInfo.from_storage_dict(state)
+    from_pickle = pickle.loads(pickle.dumps(replica, protocol=5))
+
+    expected = {
+        'reserved_fill_allocation_generation': 5,
+        'reserved_fill_allocation_input_sha256': 'a' * 64,
+        'reserved_fill_allocation_claim_generation': 11,
+        'reserved_fill_reconciliation_gate_generation': _RECONCILIATION_GATE_GENERATION,
+        'reserved_fill_reclaim_fleet_bundle_sha256': _RECLAIM_FLEET_BUNDLE_SHA256,
+        'reserved_fill_reclaim_policy_revision': _RECLAIM_POLICY_REVISION,
+        'reserved_fill_reclaim_provider_inventory_sha256': _RECLAIM_PROVIDER_INVENTORY_SHA256,
+        'reserved_fill_worker_projection_sha256': _WORKER_PROJECTION_SHA256,
+        'reserved_fill_observation_generation': 13,
+        'reserved_fill_observation_sequence': 17,
+        'reserved_fill_intent_idempotency_key': 'b' * 64,
+        'zero_cost_admission_sequence': 19,
+        'zero_cost_materialization_sequence': 13,
+    }
+    assert {field: state[field] for field in expected} == expected
+    assert {field: getattr(from_json, field) for field in expected} == expected
+    assert {field: getattr(from_pickle, field) for field in expected} == expected
+
+
+def test_first_typed_fill_round_trips_zero_observation_sequence():
+    replica = _attributed_protocol_v2_replica()
+    replica.reserved_fill_observation_sequence = 0
+
+    state = replica.to_storage_dict()
+    from_json = replica_managers.ReplicaInfo.from_storage_dict(state)
+    from_pickle = pickle.loads(pickle.dumps(replica, protocol=5))
+
+    assert state['reserved_fill_observation_sequence'] == 0
+    assert from_json.reserved_fill_observation_sequence == 0
+    assert from_pickle.reserved_fill_observation_sequence == 0
+
+
+def test_v15_fill_record_materializes_absent_allocation_attribution():
+    state = _protocol_v2_replica().to_storage_dict()
+    state['replica_info_version'] = 15
+    for field in replica_info._RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS:
+        state.pop(field)
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert all(
+        getattr(restored, field) is None
+        for field in replica_info._RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS)
+    assert restored.to_storage_dict()['replica_info_version'] == 17
+
+
+def test_v15_typed_fill_without_reclaim_identity_remains_readable_legacy():
+    state = _attributed_protocol_v2_replica().to_storage_dict()
+    state['replica_info_version'] = 15
+    for field in _RECLAIM_ATTRIBUTION_FIELDS:
+        state.pop(field)
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert restored.reserved_fill_allocation_generation == 5
+    assert restored.reserved_fill_allocation_input_sha256 == 'a' * 64
+    assert restored.reserved_fill_allocation_claim_generation == 11
+    assert restored.reserved_fill_observation_generation == 13
+    assert restored.reserved_fill_observation_sequence == 17
+    assert restored.reserved_fill_intent_idempotency_key == 'b' * 64
+    assert all(
+        getattr(restored, field) is None
+        for field in _RECLAIM_ATTRIBUTION_FIELDS)
+
+    rewritten = restored.to_storage_dict()
+    assert rewritten['replica_info_version'] == 17
+    assert all(
+        rewritten[field] is None for field in _RECLAIM_ATTRIBUTION_FIELDS)
+    decoded_again = replica_managers.ReplicaInfo.from_storage_dict(rewritten)
+    assert decoded_again.reserved_fill_allocation_generation == 5
+    assert all(
+        getattr(decoded_again, field) is None
+        for field in _RECLAIM_ATTRIBUTION_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value', 'message'),
+    [
+        ('reserved_fill_allocation_generation', True, 'positive integer'),
+        ('reserved_fill_allocation_input_sha256', 'A' * 64, 'SHA-256'),
+        ('reserved_fill_allocation_claim_generation', 0, 'positive integer'),
+        ('reserved_fill_reconciliation_gate_generation', True,
+         'positive integer'),
+        ('reserved_fill_reclaim_fleet_bundle_sha256', 'C' * 64, 'SHA-256'),
+        ('reserved_fill_reclaim_policy_revision', '', 'nonempty text'),
+        ('reserved_fill_reclaim_provider_inventory_sha256', 'd' * 63,
+         'SHA-256'),
+        ('reserved_fill_worker_projection_sha256', 'E' * 64, 'SHA-256'),
+        ('reserved_fill_observation_generation', 1.0, 'positive integer'),
+        ('reserved_fill_observation_sequence', -1, 'nonnegative integer'),
+        ('reserved_fill_intent_idempotency_key', None, 'must be complete'),
+    ],
+)
+def test_typed_fill_allocation_attribution_rejects_malformed_fields(
+        field, value, message):
+    state = _attributed_protocol_v2_replica().to_storage_dict()
+    state[field] = value
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match=message):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('field', _RECLAIM_ATTRIBUTION_FIELDS)
+def test_typed_fill_reclaim_identity_rejects_partial_bundle(field):
+    state = _attributed_protocol_v2_replica().to_storage_dict()
+    state[field] = None
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='must be complete'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+def test_non_fill_row_cannot_claim_allocation_attribution():
+    replica = _attributed_protocol_v2_replica()
+    replica.reserved_fill = False
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='requires a fill row'):
+        replica.to_storage_dict()
+
+
+def test_zero_cost_admission_sequence_supports_ordinary_rows_and_is_typed():
+    ordinary = _replica()
+    ordinary.reserved_fill = False
+    ordinary.zero_cost_admission_sequence = 18
+    restored = replica_managers.ReplicaInfo.from_storage_dict(
+        ordinary.to_storage_dict())
+    assert restored.zero_cost_admission_sequence == 18
+
+    legacy = _protocol_v2_replica()
+    legacy.zero_cost_admission_sequence = 19
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='requires complete'):
+        legacy.to_storage_dict()
+
+    attributed = _attributed_protocol_v2_replica()
+    attributed.zero_cost_admission_sequence = True
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='positive integer'):
+        attributed.to_storage_dict()
+
+    paid = _replica()
+    paid.reserved_fill = False
+    paid.is_zero_cost = False
+    paid.zero_cost_admission_sequence = 20
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='requires a zero-cost row'):
+        paid.to_storage_dict()
+
+
+@pytest.mark.parametrize('terminal_launch_status', [
+    common_utils.ProcessStatus.INTERRUPTED,
+    common_utils.ProcessStatus.FAILED,
+])
+def test_zero_cost_materialization_sequence_survives_terminal_cleanup_status(
+        terminal_launch_status):
+    ordinary = _replica()
+    ordinary.reserved_fill = False
+    ordinary.zero_cost_admission_sequence = 18
+    ordinary.zero_cost_materialization_sequence = 7
+    ordinary.status_property.sky_launch_status = terminal_launch_status
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(
+        ordinary.to_storage_dict())
+
+    assert restored.status_property.sky_launch_status == terminal_launch_status
+    assert restored.zero_cost_materialization_sequence == 7
 
 
 def test_deserialized_malformed_v2_tuple_fails_closed_at_cleanup_parser():

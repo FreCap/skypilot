@@ -5,6 +5,7 @@ import pathlib
 import time
 from typing import List, Optional
 import unittest.mock as mock
+import uuid
 
 import filelock
 import pytest
@@ -13,6 +14,7 @@ from sky import core
 from sky.server import constants as server_constants
 from sky.server.requests import payloads
 from sky.server.requests import requests
+from sky.server.requests import storage as request_storage
 from sky.server.requests.requests import RequestStatus
 from sky.server.requests.requests import ScheduleType
 from sky.server.requests.serializers import encoders
@@ -20,6 +22,28 @@ from sky.server.requests.serializers import encoders
 
 def dummy():
     return None
+
+
+def _managed_request(
+    request_id: str,
+    identity: request_storage.ManagedJobControllerSlotIdentity,
+    *,
+    job_id: int = 41,
+) -> requests.Request:
+    return requests.Request(
+        request_id=request_id,
+        name='managed-nested-request',
+        entrypoint=dummy,
+        request_body=payloads.RequestBody(),
+        status=RequestStatus.PENDING,
+        created_at=time.time(),
+        user_id='managed-controller',
+        managed_job_id=job_id,
+        managed_job_controller_instance_id=identity[0],
+        managed_job_controller_generation=identity[1],
+        managed_job_controller_slot_id=identity[2],
+        managed_job_controller_slot_attempt=identity[3],
+    )
 
 
 @pytest.fixture()
@@ -590,6 +614,8 @@ async def test_requests_gc_daemon(isolated_database):
 @pytest.mark.asyncio
 async def test_requests_gc_daemon_disabled(isolated_database):
     """Test daemon when retention is negative (disabled)."""
+    backend = mock.Mock()
+    backend.gc_request_owned_tombstones = mock.AsyncMock(return_value=0)
     with mock.patch(
             'sky.server.requests.requests.skypilot_config') as mock_config:
         with mock.patch(
@@ -608,11 +634,15 @@ async def test_requests_gc_daemon_disabled(isolated_database):
                     mock_sleep.side_effect = [None, asyncio.CancelledError()]
 
                     # Run the daemon
-                    with pytest.raises(asyncio.CancelledError):
-                        await requests.requests_gc_daemon()
+                    with mock.patch.object(requests.request_storage,
+                                           'get_request_backend',
+                                           return_value=backend):
+                        with pytest.raises(asyncio.CancelledError):
+                            await requests.requests_gc_daemon()
 
                 # Verify cleanup was NOT called due to negative retention
                     mock_clean.assert_not_called()
+                    backend.gc_request_owned_tombstones.assert_awaited_once()
 
                     # The pressure check remains active while normal retention is
                     # disabled, but performs no database cleanup when healthy.
@@ -889,6 +919,207 @@ async def test_create_if_not_exists_async_already_exists(isolated_database):
     # Try to create the same request again
     created_second = await requests.create_if_not_exists_async(request)
     assert created_second is False
+
+
+@pytest.mark.asyncio
+async def test_sqlite_managed_origin_create_is_fenced_and_persisted(
+        isolated_database, monkeypatch):
+    identity = (str(uuid.uuid4()), 7, 3, str(uuid.uuid4()))
+    current = True
+
+    def _is_current(job_id, observed_identity):
+        assert job_id == 41
+        assert observed_identity == identity
+        return current
+
+    monkeypatch.setattr(requests.managed_job_state,
+                        'controller_job_attempt_is_current', _is_current)
+    request = _managed_request('managed-origin-current', identity)
+    assert await requests.create_if_not_exists_async(request)
+    stored = await requests.get_request_async(request.request_id)
+    assert stored is not None
+    assert requests._sqlite_managed_job_origin(stored) == (41, *identity)
+
+    current = False
+    stale = _managed_request('managed-origin-stale', identity)
+    with pytest.raises(request_storage.ManagedJobRequestQuiescenceError):
+        await requests.create_if_not_exists_async(stale)
+    assert await requests.get_request_async(stale.request_id) is None
+
+
+@pytest.mark.asyncio
+async def test_sqlite_managed_running_revalidates_and_records_exact_birth(
+        isolated_database, monkeypatch):
+    identity = (str(uuid.uuid4()), 8, 2, str(uuid.uuid4()))
+    current = True
+    monkeypatch.setattr(
+        requests.managed_job_state, 'controller_job_attempt_is_current', lambda
+        job_id, observed: job_id == 41 and observed == identity and current)
+    request = _managed_request('managed-running-fence', identity)
+    assert await requests.create_if_not_exists_async(request)
+
+    current = False
+    assert not requests.try_mark_running(request.request_id, 1201, 0, None,
+                                         9001)
+    current = True
+    assert requests.try_mark_running(request.request_id, 1201, 0, None, 9001)
+    stored = requests.get_request(request.request_id)
+    assert stored is not None
+    assert stored.status is RequestStatus.RUNNING
+    assert stored.pid == 1201
+    assert stored.execution_process_start_time_ticks == 9001
+    assert stored.execution_quiescence_required
+    assert stored.execution_quiesced_at is None
+
+
+@pytest.mark.asyncio
+async def test_sqlite_quiescence_terminalizes_only_exact_pre_effect_family(
+        isolated_database, monkeypatch):
+    identity = (str(uuid.uuid4()), 9, 1, str(uuid.uuid4()))
+    other_identity = (identity[0], identity[1], 2, str(uuid.uuid4()))
+    monkeypatch.setattr(requests.managed_job_state,
+                        'controller_job_attempt_is_current',
+                        lambda job_id, observed: True)
+    monkeypatch.setattr(requests.managed_job_state,
+                        'begin_controller_request_quiescence',
+                        lambda owner, observed: [41])
+    target = _managed_request('managed-preeffect-target', identity)
+    other = _managed_request('managed-preeffect-other', other_identity)
+    assert await requests.create_if_not_exists_async(target)
+    assert await requests.create_if_not_exists_async(other)
+
+    backend = requests.SqliteRequestBackend()
+    assert backend.quiesce_managed_job_slot_requests(identity,
+                                                     timeout_seconds=0.1,
+                                                     poll_seconds=0.01) == 1
+    target_row = requests.get_request(target.request_id)
+    other_row = requests.get_request(other.request_id)
+    assert target_row is not None
+    assert target_row.status is RequestStatus.CANCELLED
+    assert target_row.execution_quiesced_generation == 0
+    assert target_row.execution_quiesced_at is not None
+    assert other_row is not None
+    assert other_row.status is RequestStatus.PENDING
+
+
+@pytest.mark.asyncio
+async def test_sqlite_running_quiescence_requires_exact_monitor_receipt(
+        isolated_database, monkeypatch):
+    identity = (str(uuid.uuid4()), 10, 4, str(uuid.uuid4()))
+    monkeypatch.setattr(requests.managed_job_state,
+                        'controller_job_attempt_is_current',
+                        lambda job_id, observed: True)
+    monkeypatch.setattr(requests.managed_job_state,
+                        'begin_controller_request_quiescence',
+                        lambda owner, observed: [41])
+    request = _managed_request('managed-running-quiescence', identity)
+    assert await requests.create_if_not_exists_async(request)
+    assert requests.try_mark_running(request.request_id, 1401, 0, None, 9101)
+    backend = requests.SqliteRequestBackend()
+    signalled = []
+
+    def _signal(pid, start_ticks, signum):
+        signalled.append((pid, start_ticks, signum))
+        assert backend.acknowledge_local_execution_quiescence(
+            request.request_id, pid, start_ticks)
+        return True
+
+    monkeypatch.setattr(request_storage, 'signal_exact_local_process', _signal)
+    assert backend.quiesce_managed_job_slot_requests(identity,
+                                                     timeout_seconds=0.1,
+                                                     poll_seconds=0.01) == 1
+    assert signalled == [(1401, 9101, requests.signal.SIGTERM)]
+    stored = requests.get_request(request.request_id)
+    assert stored is not None
+    assert stored.status is RequestStatus.CANCELLED
+    assert stored.execution_quiesced_generation == 0
+
+
+@pytest.mark.asyncio
+async def test_sqlite_pid_reuse_never_synthesizes_quiescence_receipt(
+        isolated_database, monkeypatch):
+    identity = (str(uuid.uuid4()), 11, 5, str(uuid.uuid4()))
+    monkeypatch.setattr(requests.managed_job_state,
+                        'controller_job_attempt_is_current',
+                        lambda job_id, observed: True)
+    monkeypatch.setattr(requests.managed_job_state,
+                        'begin_controller_request_quiescence',
+                        lambda owner, observed: [41])
+    request = _managed_request('managed-pid-reuse', identity)
+    assert await requests.create_if_not_exists_async(request)
+    assert requests.try_mark_running(request.request_id, 1501, 0, None, 9201)
+    monkeypatch.setattr(request_storage, 'signal_exact_local_process',
+                        lambda pid, start_ticks, signum: False)
+    backend = requests.SqliteRequestBackend()
+    with pytest.raises(request_storage.ManagedJobRequestQuiescenceError):
+        backend.quiesce_managed_job_slot_requests(identity,
+                                                  timeout_seconds=0,
+                                                  poll_seconds=0.01)
+    stored = requests.get_request(request.request_id)
+    assert stored is not None
+    assert stored.status is RequestStatus.CANCELLED
+    assert stored.execution_quiesced_generation is None
+    assert stored.execution_quiesced_at is None
+    assert not backend.acknowledge_local_execution_quiescence(
+        request.request_id, 1501, 9202)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_first_slot_rollout_accepts_only_request_free_legacy_jobs(
+        isolated_database, monkeypatch):
+    current_owner = (str(uuid.uuid4()), 12)
+    plan = requests.managed_job_state.StaleControllerRequestQuiescencePlan(
+        exact_identities=(), legacy_job_ids=(41, 42))
+    monkeypatch.setattr(requests.managed_job_state,
+                        'begin_stale_controller_request_quiescence',
+                        lambda owner: plan)
+    backend = requests.SqliteRequestBackend()
+    assert backend.quiesce_stale_managed_job_requests(current_owner,
+                                                      timeout_seconds=0.1,
+                                                      poll_seconds=0.01) == 0
+
+    identity = (str(uuid.uuid4()), 11, 3, str(uuid.uuid4()))
+    monkeypatch.setattr(requests.managed_job_state,
+                        'controller_job_attempt_is_current',
+                        lambda job_id, observed: True)
+    correlated = _managed_request('legacy-job-correlated-request',
+                                  identity,
+                                  job_id=41)
+    assert await requests.create_if_not_exists_async(correlated)
+    with pytest.raises(request_storage.ManagedJobRequestQuiescenceError,
+                       match='pre-slot managed jobs'):
+        backend.quiesce_stale_managed_job_requests(current_owner,
+                                                   timeout_seconds=0.1,
+                                                   poll_seconds=0.01)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_stale_quiescence_rejects_partial_request_origin(
+        isolated_database, monkeypatch):
+    request = requests.Request(request_id='partial-managed-origin',
+                               name='test-request',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.PENDING,
+                               created_at=time.time(),
+                               user_id='test-user')
+    assert await requests.create_if_not_exists_async(request)
+    assert requests._DB is not None
+    with requests._DB.conn:
+        requests._DB.conn.execute(
+            f'UPDATE {requests.REQUEST_TABLE} SET managed_job_id = ? '
+            'WHERE request_id = ?', (73, request.request_id))
+    plan = requests.managed_job_state.StaleControllerRequestQuiescencePlan(
+        exact_identities=(), legacy_job_ids=())
+    monkeypatch.setattr(requests.managed_job_state,
+                        'begin_stale_controller_request_quiescence',
+                        lambda owner: plan)
+    backend = requests.SqliteRequestBackend()
+    with pytest.raises(request_storage.ManagedJobRequestQuiescenceError,
+                       match='incomplete origin'):
+        backend.quiesce_stale_managed_job_requests((str(uuid.uuid4()), 13),
+                                                   timeout_seconds=0.1,
+                                                   poll_seconds=0.01)
 
 
 @pytest.mark.asyncio

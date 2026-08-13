@@ -7,6 +7,7 @@ import sqlalchemy
 from sqlalchemy import orm
 
 from sky import sky_logging
+from sky.jobs import controller_fencing
 from sky.jobs import state_storage
 from sky.jobs.state_schema import batch_state_table
 from sky.jobs.state_schema import batch_worker_table
@@ -21,6 +22,22 @@ from sky.utils.db import retries as db_retries
 logger = sky_logging.init_logger('sky.jobs.state')
 
 _db_manager = state_storage.db_manager
+
+
+def _lock_controller_job_attempt(session: orm.Session, job_id: int) -> bool:
+    """Serialize a Batch mutation with the exact ControllerManager attempt."""
+    try:
+        identity = controller_fencing.get_current_slot_identity()
+        if identity is not None:
+            controller_fencing.lock_current_job_attempt(session, job_id,
+                                                        identity)
+            return True
+        owner = controller_fencing.get_current_owner()
+        if owner is not None:
+            controller_fencing.lock_current_owner(session, owner)
+        return True
+    except controller_fencing.ControllerLeadershipLostError:
+        return False
 
 
 def _supports_update_returning(engine: sqlalchemy.engine.Engine) -> bool:
@@ -96,6 +113,8 @@ def _lock_batch_coordinator_row(session: orm.Session,
 def _lock_batch_coordinator_owner(session: orm.Session, job_id: int,
                                   owner_token: str) -> bool:
     """Lock the coordinator row and verify the expected owner token."""
+    if not _lock_controller_job_attempt(session, job_id):
+        return False
     exists, current_token = _lock_batch_coordinator_row(session, job_id)
     return exists and current_token == owner_token
 
@@ -112,6 +131,10 @@ def acquire_batch_coordinator(job_id: int, owner_token: str) -> str | None:
 
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        if not _lock_controller_job_attempt(session, job_id):
+            session.rollback()
+            raise controller_fencing.ControllerLeadershipLostError(
+                f'Managed job {job_id} changed controller attempts.')
         exists, previous_token = _lock_batch_coordinator_row(session, job_id)
         if not exists:
             session.rollback()
@@ -241,7 +264,12 @@ def record_batch_worker_launch_request(job_id: int, owner_token: str,
 @db_retries.retry
 def record_batch_worker_job_id(job_id: int, owner_token: str,
                                worker_cluster: str, worker_job_id: int) -> bool:
-    """Durably attach the exact external job ID to a launch intent."""
+    """Durably attach the exact external job ID to a launch intent.
+
+    Like the request-ID receipt above, this is a monotonic fact about an
+    already-authorized launch.  It remains writable after controller takeover
+    so the successor does not lose the only exact cleanup identity.
+    """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = _get_batch_worker_row_for_update(session, job_id, owner_token,
@@ -289,7 +317,13 @@ def remove_batch_worker_record(job_id: int,
                                owner_token: str,
                                worker_cluster: str,
                                worker_job_id: int | None = None) -> bool:
-    """Forget a launch only after its exact external job was cleaned up."""
+    """Forget a launch only after its exact external job was cleaned up.
+
+    Retirement is a receipt for an already-completed exact cleanup, not
+    authority to begin another provider effect.  The immutable coordinator
+    token, cluster, and optional external job ID are therefore the fence; an
+    attempt rotation must not strand a proven-clean record.
+    """
     predicates = [
         batch_worker_table.c.job_id == job_id,
         batch_worker_table.c.coordinator_token == owner_token,

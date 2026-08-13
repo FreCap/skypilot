@@ -3,16 +3,17 @@
 The API server used to wipe the whole request DB and logs on every startup
 (``reset_db_and_logs``), so any restart -- hard crashes included -- destroyed
 queued PENDING/WAITING requests and left clients polling in-flight requests
-with a 404. ``recover_db_and_logs`` replaces the wipe: it deletes stale
-internal-daemon rows, marks interrupted rows CANCELLED + should_retry (the
-client retry signal), preserves queued rows for re-enqueue, and falls back to
-the legacy wipe when recovery fails or is explicitly disabled.
+with a 404. ``recover_db_and_logs`` replaces the wipe: it first retires the
+explicit legacy daemon inventory, marks interrupted rows CANCELLED +
+should_retry, preserves queued rows for re-enqueue, and falls back to the
+legacy wipe when recovery fails or is explicitly disabled.
 """
 # pylint: disable=protected-access
 # pylint: disable=redefined-outer-name,unused-argument
 import unittest.mock as mock
 
 import pytest
+import pytest_asyncio
 
 from sky.server import daemons
 from sky.server.requests import executor
@@ -25,8 +26,8 @@ def _dummy():
     return None
 
 
-@pytest.fixture()
-def isolated_database(tmp_path):
+@pytest_asyncio.fixture()
+async def isolated_database(tmp_path):
     temp_db_path = tmp_path / 'requests.db'
     temp_log_path = tmp_path / 'logs'
     temp_log_path.mkdir()
@@ -34,9 +35,9 @@ def isolated_database(tmp_path):
                     str(temp_db_path)):
         with mock.patch('sky.server.constants.REQUEST_LOG_PATH_PREFIX',
                         str(temp_log_path)):
-            requests_lib._DB = None
+            await requests_lib.close_db_async()
             yield temp_db_path
-            requests_lib._DB = None
+            await requests_lib.close_db_async()
 
 
 @pytest.fixture()
@@ -84,7 +85,7 @@ async def test_enqueue_flags_survive_insert_read_roundtrip(isolated_database):
 @pytest.mark.asyncio
 async def test_recovery_reconciles_each_status(isolated_database,
                                                isolated_legacy_logs):
-    daemon_id = daemons.INTERNAL_REQUEST_DAEMONS[0].id
+    daemon_id = next(iter(daemons.LEGACY_REQUEST_DAEMON_IDS))
     seed = [
         _make_request('req-pending', RequestStatus.PENDING),
         _make_request('req-waiting-retryable',
@@ -110,8 +111,7 @@ async def test_recovery_reconciles_each_status(isolated_database,
     # Recovery ran and completed: the caller may re-enqueue queued rows.
     assert requests_lib.recover_db_and_logs() is True
 
-    # Stale daemon rows are deleted so the daemon is re-created and
-    # re-enqueued on this boot.
+    # Legacy daemon rows are retired before generic request recovery.
     assert requests_lib.get_request(daemon_id) is None
     # Interrupted rows get the client retry signal.
     for request_id in ('req-running', 'req-waiting-not-retryable',
@@ -140,7 +140,7 @@ async def test_recovery_reconciles_each_status(isolated_database,
 @pytest.mark.asyncio
 async def test_reenqueue_recovered_requests_in_created_at_order(
         isolated_database, monkeypatch):
-    daemon_id = daemons.INTERNAL_REQUEST_DAEMONS[0].id
+    user_suffix_id = 'user-selected-daemon'
     seed = [
         _make_request('req-newer',
                       RequestStatus.PENDING,
@@ -158,7 +158,7 @@ async def test_reenqueue_recovered_requests_in_created_at_order(
         _make_request('req-waiting-not-retryable',
                       RequestStatus.WAITING,
                       created_at=0.3),
-        _make_request(daemon_id, RequestStatus.PENDING, created_at=0.1),
+        _make_request(user_suffix_id, RequestStatus.PENDING, created_at=0.1),
     ]
     for request in seed:
         assert await requests_lib.create_if_not_exists_async(request)
@@ -178,6 +178,7 @@ async def test_reenqueue_recovered_requests_in_created_at_order(
     executor.reenqueue_recovered_requests()
 
     assert puts == [
+        (requests_lib.ScheduleType.LONG, (user_suffix_id, False, False)),
         (requests_lib.ScheduleType.SHORT, ('req-older', False, True)),
         (requests_lib.ScheduleType.LONG, ('req-newer', True, False)),
     ]
@@ -235,17 +236,12 @@ def test_plugin_request_backend_falls_back_to_wipe_without_reenqueue(
 
 
 @pytest.mark.asyncio
-async def test_reenqueue_skips_daemon_pattern_ids(isolated_database,
-                                                  monkeypatch):
-    # A daemon id that was removed from the current build is not deleted by
-    # startup recovery (it is no longer in INTERNAL_REQUEST_DAEMONS) and the
-    # lifespan orphan-daemon cleanup only runs later; the daemon-id naming
-    # pattern must keep its row out of the re-enqueue regardless of cleanup
-    # ordering.
-    removed_daemon_id = 'legacy-removed-status-refresh-daemon'
-    assert removed_daemon_id not in daemons._DAEMON_IDS
+async def test_reenqueue_does_not_reserve_daemon_suffix(isolated_database,
+                                                        monkeypatch):
+    user_suffix_id = 'user-selected-daemon'
+    assert user_suffix_id not in daemons.LEGACY_REQUEST_DAEMON_IDS
     seed = [
-        _make_request(removed_daemon_id, RequestStatus.PENDING, created_at=1.0),
+        _make_request(user_suffix_id, RequestStatus.PENDING, created_at=1.0),
         _make_request('req-user-pending', RequestStatus.PENDING,
                       created_at=2.0),
     ]
@@ -258,16 +254,15 @@ async def test_reenqueue_skips_daemon_pattern_ids(isolated_database,
 
     executor.reenqueue_recovered_requests()
 
-    assert [item[0] for item in puts] == ['req-user-pending']
+    assert [item[0] for item in puts] == [user_suffix_id, 'req-user-pending']
 
 
-def test_registered_daemon_ids_follow_naming_pattern():
-    # The re-enqueue exclusion relies on daemon ids matching the naming
-    # pattern even after they are removed from a build; every registered id
-    # must therefore follow the naming convention (not just the exact-id
-    # set, which would no longer contain a removed daemon).
-    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
-        assert daemon.id.endswith(daemons._DAEMON_ID_SUFFIX), daemon.id
+def test_legacy_daemon_inventory_is_explicit_and_complete():
+    runtime_ids = {daemon.id for daemon in daemons.RUNTIME_DAEMONS}
+    assert runtime_ids < daemons.LEGACY_REQUEST_DAEMON_IDS
+    assert daemons.LEGACY_REQUEST_DAEMON_IDS - runtime_ids == {
+        'managed-job-status-refresh-daemon'
+    }
 
 
 @pytest.mark.asyncio

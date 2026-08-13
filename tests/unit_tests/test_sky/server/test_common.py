@@ -593,9 +593,11 @@ run: echo "hello world"
 
 
 def test_controller_origin_headers_cannot_be_overridden(monkeypatch):
+    capability = 'A' * 43
     server_owned = {
         server_constants.CONTROLLER_INSTANCE_ID_HEADER: '96d9d1f6-8ba4-402b-85f5-27db321fd504',
         server_constants.CONTROLLER_GENERATION_HEADER: '22',
+        server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER: capability,
     }
     monkeypatch.setattr(common.service_account_auth,
                         'get_service_account_headers',
@@ -604,8 +606,9 @@ def test_controller_origin_headers_cannot_be_overridden(monkeypatch):
         '/route',
         'http://api',
         headers={
-            server_constants.CONTROLLER_INSTANCE_ID_HEADER: '96d9d1f6-8ba4-402b-85f5-27db321fd999',
-            server_constants.CONTROLLER_GENERATION_HEADER: '999',
+            server_constants.CONTROLLER_INSTANCE_ID_HEADER.lower(): '96d9d1f6-8ba4-402b-85f5-27db321fd999',
+            server_constants.CONTROLLER_GENERATION_HEADER.lower(): '999',
+            server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER.lower(): 'guess',
         })
 
     assert kwargs['headers'][
@@ -613,3 +616,25 @@ def test_controller_origin_headers_cannot_be_overridden(monkeypatch):
             server_constants.CONTROLLER_INSTANCE_ID_HEADER]
     assert kwargs['headers'][
         server_constants.CONTROLLER_GENERATION_HEADER] == '22'
+    assert kwargs['headers'][
+        server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER] == capability
+
+
+def test_caller_controller_origin_headers_are_stripped_without_authority(
+        monkeypatch):
+    monkeypatch.setattr(common.service_account_auth,
+                        'get_service_account_headers', lambda: {})
+    origin_headers = {
+        server_constants.CONTROLLER_INSTANCE_ID_HEADER.swapcase(): '96d9d1f6-8ba4-402b-85f5-27db321fd504',
+        server_constants.CONTROLLER_GENERATION_HEADER.lower(): '22',
+        server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER.upper(): 'A' * 43,
+        server_constants.MANAGED_JOB_ID_HEADER.lower(): '3',
+        server_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_HEADER.swapcase(): '1',
+        server_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_HEADER.lower(): '907b2c34-2f1f-4d79-ab14-43e5324e8a70',
+    }
+
+    _, kwargs = common._prepare_authenticated_request_params(
+        '/route', 'http://api', headers=origin_headers)
+
+    assert not ({header.lower() for header in origin_headers}.intersection(
+        header.lower() for header in kwargs['headers']))

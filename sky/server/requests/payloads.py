@@ -29,13 +29,11 @@ import typing
 from typing import Any
 
 from sky import admin_policy
-from sky import serve
 from sky import sky_logging
 from sky import skypilot_config
 from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.container_images import models as container_image_models
-from sky.serve import constants as serve_constants
 from sky.server import common
 from sky.skylet import autostop_lib
 from sky.skylet import constants
@@ -47,12 +45,15 @@ from sky.utils import common_utils
 from sky.utils import config_utils
 from sky.utils import infra_utils
 from sky.utils import registry
+from sky.utils import serve_types
 from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
     import pydantic
 else:
     pydantic = adaptors_common.LazyImport('pydantic')
+
+serve_service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -66,8 +67,21 @@ class ContainerImageTaskValidationError(ValueError):
     """Closed marker for task-image validation failures at the REST edge."""
 
 
+_SERVE_PROJECTED_IDENTITY_OVERRIDE_KEYS = [
+    ('kubernetes', 'pod_config'),
+    ('kubernetes', 'namespace'),
+    ('kubernetes', 'remote_identity'),
+    ('kubernetes', 'context_configs', '*', 'pod_config'),
+    ('kubernetes', 'context_configs', '*', 'namespace'),
+    ('kubernetes', 'context_configs', '*', 'remote_identity'),
+]
+
+
 def _without_server_owned_override_config(
-        override_configs: dict[str, Any] | None) -> dict[str, Any] | None:
+    override_configs: dict[str, Any] | None,
+    *,
+    serve_projected_launch: bool = False,
+) -> dict[str, Any] | None:
     """Removes ignored server-owned config before durable persistence."""
     if override_configs is None:
         return None
@@ -76,6 +90,11 @@ def _without_server_owned_override_config(
     sanitized = copy.deepcopy(override_configs)
     skipped_keys = config_utils.expand_nested_key_patterns(
         sanitized, constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    if serve_projected_launch:
+        skipped_keys.extend(
+            key for key in config_utils.expand_nested_key_patterns(
+                sanitized, _SERVE_PROJECTED_IDENTITY_OVERRIDE_KEYS)
+            if key not in skipped_keys)
     for key_path in skipped_keys:
         parent: Any = sanitized
         for key in key_path[:-1]:
@@ -160,7 +179,7 @@ _SERVER_OWNED_ENV_VARS = frozenset({
     'SKYPILOT_STATE_DB_MIGRATION_MODE',
     constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR,
     constants.SKY_API_SERVER_URL_ENV_VAR,
-    serve_constants.EXTERNAL_LB_ENABLED_ENV_VAR,
+    serve_types.EXTERNAL_LB_ENABLED_ENV_VAR,
 })
 
 
@@ -628,10 +647,32 @@ def _serialized_task_uses_container_image(value: str) -> bool:
     return uses_container_image
 
 
+def _serve_body_uses_placement_projection(body: 'RequestBody') -> bool:
+    if not isinstance(body, (ServeUpBody, ServeUpdateBody)):
+        return False
+    try:
+        config = yaml_utils.read_yaml_str(body.task, reject_duplicate_keys=True)
+        if not isinstance(config, dict):
+            return False
+        service_config = config.get('service')
+        if service_config is None:
+            pool_config = config.get('pool')
+            if isinstance(pool_config, dict):
+                service_config = {'pool': pool_config}
+        if not isinstance(service_config, dict):
+            return False
+        return serve_service_spec.SkyServiceSpec.from_yaml_config(
+            service_config).placement_contract.enabled
+    except (TypeError, ValueError):
+        # The ordinary task validator owns the eventual user-facing error.
+        return False
+
+
 def validate_task_request_body_for_persistence(body: 'RequestBody') -> None:
     """Sanitizes server-owned config and revalidates final request-row data."""
     body.override_skypilot_config = _without_server_owned_override_config(
-        body.override_skypilot_config)
+        body.override_skypilot_config,
+        serve_projected_launch=_serve_body_uses_placement_projection(body))
     if isinstance(body, DagRequestBody):
         _validate_serialized_task_container_images(body.dag)
         return
@@ -1245,7 +1286,7 @@ class ServeUpdateBody(RequestBody):
 
     task: str
     service_name: str
-    mode: serve.UpdateMode
+    mode: serve_types.UpdateMode
 
     _validate_container_images = pydantic.field_validator('task')(
         _validate_serialized_task_container_images)
@@ -1300,7 +1341,7 @@ class ServeDownBody(RequestBody):
 class ServeLogsBody(RequestBody):
     """The request body for the serve logs endpoint."""
     service_name: str
-    target: str | serve.ServiceComponent
+    target: str | serve_types.ServiceComponent
     replica_id: int | None = None
     follow: bool = True
     tail: int | None = None
@@ -1310,8 +1351,8 @@ class ServeDownloadLogsBody(RequestBody):
     """The request body for the serve download logs endpoint."""
     service_name: str
     local_dir: str
-    targets: str | serve.ServiceComponent | list[str |
-                                                 serve.ServiceComponent] | None
+    targets: str | serve_types.ServiceComponent | list[str | serve_types.
+                                                       ServiceComponent] | None
     replica_ids: list[int] | None = None
     tail: int | None = None
 
@@ -1440,7 +1481,7 @@ class JobsPoolApplyBody(RequestBody):
     task: str | None = None
     workers: int | None = None
     pool_name: str
-    mode: serve.UpdateMode
+    mode: serve_types.UpdateMode
 
     _validate_container_images = pydantic.field_validator('task')(
         _validate_serialized_task_container_images)
@@ -1477,7 +1518,7 @@ class JobsPoolStatusBody(RequestBody):
 class JobsPoolLogsBody(RequestBody):
     """The request body for the jobs pool logs endpoint."""
     pool_name: str
-    target: str | serve.ServiceComponent
+    target: str | serve_types.ServiceComponent
     worker_id: int | None = None
     follow: bool = True
     tail: int | None = None
@@ -1487,8 +1528,8 @@ class JobsPoolDownloadLogsBody(RequestBody):
     """The request body for the jobs pool download logs endpoint."""
     pool_name: str
     local_dir: str
-    targets: str | serve.ServiceComponent | list[str |
-                                                 serve.ServiceComponent] | None
+    targets: str | serve_types.ServiceComponent | list[str | serve_types.
+                                                       ServiceComponent] | None
     worker_ids: list[int] | None = None
     tail: int | None = None
 

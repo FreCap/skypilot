@@ -121,13 +121,81 @@ run "rejects_an_invalid_local_queue_name" {
   expect_failures = [var.kueue]
 }
 
-run "rejects_an_invalid_cluster_queue_name" {
+run "accepts_a_63_character_cluster_queue_dns_label" {
   command = plan
 
   variables {
     kueue = {
       local_queue_name   = "default"
-      cluster_queue_name = "Invalid_Queue"
+      cluster_queue_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+
+  assert {
+    condition     = output.kueue.cluster_queue_name == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    error_message = "A 63-character DNS-1123 label must remain a valid ClusterQueue name."
+  }
+}
+
+run "rejects_a_dotted_cluster_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "inference.reserved"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}
+
+run "rejects_an_uppercase_cluster_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "Inference"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}
+
+run "rejects_an_underscore_cluster_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "inference_reserved"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}
+
+run "rejects_an_overlength_cluster_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+
+  expect_failures = [var.kueue]
+}
+
+run "rejects_a_trailing_hyphen_cluster_queue_name" {
+  command = plan
+
+  variables {
+    kueue = {
+      local_queue_name   = "default"
+      cluster_queue_name = "inference-"
     }
   }
 

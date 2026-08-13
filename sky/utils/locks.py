@@ -5,6 +5,7 @@ either local file locks or database-based distributed locks.
 """
 import abc
 from collections.abc import Callable
+import contextlib
 import hashlib
 import logging
 import os
@@ -474,6 +475,71 @@ class PostgresLock(DistributedLock):
             raise RuntimeError(
                 f'Postgres lock {self.lock_id!r} is not acquired.')
         return operation(self._connection)
+
+    @contextlib.contextmanager
+    def acquire_additional(self,
+                           lock_id: str,
+                           *,
+                           shared_lock: bool = False) -> Any:
+        """Acquire another session advisory lock on this exact session.
+
+        Composite authority boundaries sometimes need a strict lock order but
+        must also fail as one unit when their PostgreSQL session disappears.
+        Acquiring the second key on this connection gives both properties: the
+        caller first acquires ``self``, then enters this context, and closing
+        either failed session releases both keys server-side.
+        """
+        if not self._acquired or self._connection is None:
+            raise RuntimeError(
+                f'Postgres lock {self.lock_id!r} is not acquired.')
+        additional_key = postgres_lock_key(lock_id)
+        lock_func = ('pg_advisory_lock_shared'
+                     if shared_lock else 'pg_advisory_lock')
+        unlock_func = ('pg_advisory_unlock_shared'
+                       if shared_lock else 'pg_advisory_unlock')
+        cursor = None
+        try:
+            cursor = self._connection.cursor()
+            cursor.execute(f'SELECT {lock_func}(%s)', (additional_key,))
+            cursor.fetchone()
+            self._connection.commit()
+        except BaseException as error:
+            if cursor is not None:
+                cursor.close()
+            self._close_connection(invalidate=isinstance(error, psycopg2.Error))
+            self._acquired = False
+            raise
+        else:
+            cursor.close()
+
+        try:
+            yield self
+        except BaseException:
+            # Closing the session is the only reliable cleanup if the body
+            # failed because that session became indeterminate. It also
+            # releases both advisory keys atomically on the server.
+            self._close_connection()
+            self._acquired = False
+            raise
+        else:
+            cursor = None
+            try:
+                assert self._connection is not None
+                cursor = self._connection.cursor()
+                cursor.execute(f'SELECT {unlock_func}(%s)', (additional_key,))
+                unlocked = cursor.fetchone()[0]
+                self._connection.commit()
+                if not unlocked:
+                    raise RuntimeError(
+                        f'Postgres lock session no longer owns {lock_id!r}.')
+            except BaseException as error:
+                self._close_connection(
+                    invalidate=isinstance(error, psycopg2.Error))
+                self._acquired = False
+                raise
+            finally:
+                if cursor is not None:
+                    cursor.close()
 
 
 def get_lock(lock_id: str,

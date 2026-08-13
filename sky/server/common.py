@@ -315,10 +315,28 @@ def _prepare_authenticated_request_params(
     # Merge with existing headers
     if 'headers' in kwargs:
         headers.update(kwargs['headers'])
-    # A nested controller cannot override the generation inherited from its
-    # server-owned environment.
-    for header in (server_constants.CONTROLLER_INSTANCE_ID_HEADER,
-                   server_constants.CONTROLLER_GENERATION_HEADER):
+    # Controller authority exists only in the server-owned environment.  Strip
+    # all caller-supplied origin fields when that environment does not provide
+    # them; otherwise an ordinary client could synthesize a second header path.
+    controller_origin_headers = (
+        server_constants.CONTROLLER_INSTANCE_ID_HEADER,
+        server_constants.CONTROLLER_GENERATION_HEADER,
+        server_constants.CONTROLLER_ORIGIN_CAPABILITY_HEADER,
+        server_constants.MANAGED_JOB_ID_HEADER,
+        server_constants.MANAGED_JOB_CONTROLLER_SLOT_ID_HEADER,
+        server_constants.MANAGED_JOB_CONTROLLER_SLOT_ATTEMPT_HEADER,
+    )
+    # HTTP field names are case-insensitive.  Remove every caller spelling
+    # before restoring the one canonical server-owned value, otherwise a
+    # lowercase duplicate could survive this boundary and win during wire
+    # serialization.
+    origin_header_names = frozenset(
+        header.lower() for header in controller_origin_headers)
+    for candidate in list(headers):
+        if (isinstance(candidate, str) and
+                candidate.lower() in origin_header_names):
+            headers.pop(candidate)
+    for header in controller_origin_headers:
         if header in server_owned_headers:
             headers[header] = server_owned_headers[header]
     kwargs['headers'] = headers
@@ -338,10 +356,10 @@ def _prepare_authenticated_request_params(
 def _convert_requests_cookies_to_aiohttp(
         cookie_jar: requests.cookies.RequestsCookieJar) -> dict[str, str]:
     """Convert requests cookie jar to aiohttp-compatible dict format."""
-    cookies = {}
+    cookies: dict[str, str] = {}
     for cookie in cookie_jar:
-        cookies[cookie.name] = cookie.value
-    return cookies  # type: ignore
+        cookies[cookie.name] = typing.cast(str, cookie.value)
+    return cookies
 
 
 def make_authenticated_request(method: str,

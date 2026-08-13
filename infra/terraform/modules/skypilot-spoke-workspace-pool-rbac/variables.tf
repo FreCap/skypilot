@@ -124,6 +124,11 @@ variable "kueue" {
     the namespaced LocalQueue, cluster-scoped ClusterQueue, and this Namespace,
     plus exact `GET /apis` and `GET /apis/` for served-version discovery. The
     workload ServiceAccount receives no Kueue permission.
+
+    cluster_queue_name must be one DNS-1123 label of at most 63 characters.
+    Strict SkyPilot admission requires Kueue's AssignQueueLabelsForPods
+    feature to publish that name on admitted Pods; dotted DNS subdomains and
+    other non-label names cannot be published.
   EOT
   type = object({
     local_queue_name   = string
@@ -148,14 +153,9 @@ variable "kueue" {
   validation {
     condition = var.kueue == null ? true : (
       length(var.kueue.cluster_queue_name) >= 1 &&
-      length(var.kueue.cluster_queue_name) <= 253 &&
-      alltrue([
-        for label in split(".", var.kueue.cluster_queue_name) :
-        length(label) >= 1 &&
-        length(label) <= 63 &&
-        can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
-      ])
+      length(var.kueue.cluster_queue_name) <= 63 &&
+      can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", var.kueue.cluster_queue_name))
     )
-    error_message = "kueue.cluster_queue_name must be a Kubernetes DNS-1123 subdomain of at most 253 characters."
+    error_message = "kueue.cluster_queue_name must be a Kubernetes DNS-1123 label of at most 63 characters so Kueue AssignQueueLabelsForPods can publish it."
   }
 }

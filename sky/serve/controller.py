@@ -7,6 +7,7 @@ from collections.abc import Callable
 import concurrent.futures
 import contextlib
 import contextvars
+import dataclasses
 import functools
 import hashlib
 import hmac
@@ -36,18 +37,25 @@ from sky import serve
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import common as adaptors_common
 from sky.serve import autoscalers
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
+from sky.serve import kubernetes_identity
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
+from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
 from sky.serve import placement_policy
+from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity
+from sky.serve import reserved_fill_allocation
+from sky.serve import reserved_fill_planner
+from sky.serve import scale_reconciliation
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -62,6 +70,7 @@ from sky.utils import ux_utils
 from sky.utils.db import db_utils
 
 logger = sky_logging.init_logger(__name__)
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 # Keep the historical controller-module patch surface for tests and plugins.
 serve_history = controller_history.serve_history
 
@@ -130,6 +139,20 @@ def _catalog_missing_task_contexts(
 
     _walk(placement_catalog)
     return declared - present
+
+
+def _catalog_missing_task_shapes(
+        yaml_content: str,
+        placement_catalog: dict[str, Any]) -> set[tuple[str, str, int]]:
+    """Exact Kubernetes context/accelerator/count task shapes not cataloged."""
+    try:
+        task = task_lib.Task.from_yaml_str(yaml_content)
+    except Exception:  # pylint: disable=broad-except
+        # The ordinary task parser returns the user-facing error later in the
+        # update path. Do not replace it with a catalog diagnostic.
+        return set()
+    return kubernetes_identity.catalog_missing_task_shapes(
+        task, placement_catalog)
 
 
 def _uses_current_request_classification_protocol(
@@ -361,21 +384,32 @@ class SkyServeController:
         - Providing the HTTP Server API for SkyServe to communicate with.
     """
 
-    def __init__(self,
-                 service_name: str,
-                 service_spec: serve.SkyServiceSpec,
-                 version: int,
-                 host: str,
-                 port: int,
-                 controller_owner_fingerprint: str,
-                 resource_scope: str | None = None,
-                 service_hash: str | None = None,
-                 controller_pid: int | None = None,
-                 controller_ip: str | None = None,
-                 enforce_launch_fence: bool = False) -> None:
+    def __init__(
+        self,
+        service_name: str,
+        service_spec: serve.SkyServiceSpec,
+        version: int,
+        host: str,
+        port: int,
+        controller_owner_fingerprint: str,
+        resource_scope: str | None = None,
+        service_hash: str | None = None,
+        controller_pid: int | None = None,
+        controller_ip: str | None = None,
+        enforce_launch_fence: bool = False,
+        controller_binding_authority: ordinary_launch_binding.
+        ControllerBindingAuthority | None = None
+    ) -> None:
         self._service_name = service_name
         self._resource_scope = resource_scope
         self._service_hash = service_hash
+        self._ordinary_launch_binding_authority = (
+            ordinary_launch_binding.validate_controller_authority(
+                controller_binding_authority,
+                service_name=service_name,
+                service_hash=service_hash,
+                controller_pid=controller_pid,
+                controller_ip=controller_ip))
         self._history_session_id = uuid.uuid4().hex
         self._controller_owner = ((controller_pid,
                                    controller_ip) if service_hash is not None or
@@ -418,12 +452,13 @@ class SkyServeController:
         self._update_apply_failures = 0
         self._update_recovery_required = False
         self._update_reconciler_stop = threading.Event()
-        # Serialize every autoscaler actuation epoch with a controller-config
-        # transition. If a transition fails after publishing any new runtime
-        # state, its catch path raises the irreversible stop fence before this
-        # lock is released; an old or partially updated decision can therefore
-        # never resume scaling while the parent prepares a fresh child.
+        # The lock protects only publication of an actuation generation. Slow
+        # replica/provider work must never hold it. Even generations identify a
+        # stable runtime; odd generations fence an update transition in progress.
+        # Manager operations carry the captured version and the controller
+        # revalidates the exact object/generation before submitting each wave.
         self._actuation_epoch_lock = threading.RLock()
+        self._actuation_generation = 0
         self._actuation_stop = threading.Event()
         # Serialize LB snapshots while resolving a cold replica cache in the
         # threadpool. Concurrent LB Pods can overlap during a rollout; without
@@ -480,7 +515,7 @@ class SkyServeController:
             if self._lb_ha_enabled else 0)
         self._controller_owner_fingerprint = controller_owner_fingerprint
         self._is_pool = service_spec.pool
-        self._replica_manager: replica_managers.ReplicaManager = (
+        self._replica_manager: replica_managers.SkyPilotReplicaManager = (
             replica_managers.SkyPilotReplicaManager(
                 service_name=service_name,
                 spec=service_spec,
@@ -489,7 +524,9 @@ class SkyServeController:
                 service_hash=service_hash,
                 controller_pid=controller_pid,
                 controller_ip=controller_ip,
-                enforce_launch_fence=enforce_launch_fence))
+                enforce_launch_fence=enforce_launch_fence,
+                controller_binding_authority=(
+                    self._ordinary_launch_binding_authority)))
         # Pass `version` so a controller rebuilt on restart/respawn starts the
         # autoscaler at the recovered latest version (matching the replica
         # manager above), not INITIAL_VERSION. Otherwise a service updated past
@@ -499,6 +536,35 @@ class SkyServeController:
             autoscalers.Autoscaler.from_spec(service_name, service_spec,
                                              version))
         self._autoscaler.set_spot_placer(self._replica_manager.spot_placer)
+        self._scale_reconcile_coordinator = (
+            scale_reconciliation.ScaleReconcileCoordinator(
+                self._reconcile_scale_once,
+                durable_generation_reader=(
+                    self._read_scale_reconcile_recovery_generation),
+                max_idle_seconds=(
+                    scale_reconciliation.DEFAULT_MAX_IDLE_SECONDS)))
+        self._reserved_fill_observation_repository: (
+            pool_capacity_observation.PoolCapacityObservationRepository |
+            None) = None
+        self._reserved_fill_allocation_repository: (
+            reserved_fill_allocation.ReservedFillAllocationRepository |
+            None) = None
+        if service_hash is not None:
+            try:
+                engine = serve_state.get_database_engine()
+                if engine.dialect.name == 'postgresql':
+                    self._reserved_fill_observation_repository = (
+                        pool_capacity_observation.
+                        PoolCapacityObservationRepository(engine))
+                    self._reserved_fill_allocation_repository = (
+                        reserved_fill_allocation.
+                        ReservedFillAllocationRepository(engine))
+            except (RuntimeError, ValueError) as error:
+                # Repository absence is fail-closed for sequenced fill and
+                # does not affect ordinary service reconciliation.
+                logger.warning('Reserved-fill sequenced authority could not '
+                               'be initialized: '
+                               f'{common_utils.format_exception(error)}')
         try:
             placement_policy_states = (
                 serve_state.get_service_placement_policy_states(service_name))
@@ -1489,6 +1555,7 @@ class SkyServeController:
                     observed_slots_by_replica_id=observed_slots,
                     in_flight_by_replica_id=translated_in_flight,
                     unknown_replica_ids=unknown_replica_ids)
+        self._notify_scale_reconcile()
         return True
 
     def _apply_load_balancer_drain_report(
@@ -3501,6 +3568,118 @@ class SkyServeController:
     def _get_actuation_epoch_lock(self) -> threading.RLock:
         return self._actuation_epoch_lock
 
+    def get_actuation_generation(self) -> int:
+        """Return the controller's current optimistic actuation token."""
+        with self._actuation_epoch_lock:
+            return self._actuation_generation
+
+    def actuation_generation_is_current(self, expected: int) -> bool:
+        """Whether ``expected`` still names this stable live runtime."""
+        with self._actuation_epoch_lock:
+            return (not self._actuation_stop.is_set() and expected % 2 == 0 and
+                    self._actuation_generation == expected)
+
+    def _capture_scale_actuation(
+        self,) -> tuple[int, autoscalers.Autoscaler, int] | None:
+        """Capture one stable runtime token without manager/provider work."""
+        with self._actuation_epoch_lock:
+            if (self._actuation_stop.is_set() or
+                    self._actuation_generation % 2 != 0):
+                return None
+            autoscaler = self._autoscaler
+            return (self._actuation_generation, autoscaler,
+                    autoscaler.latest_version)
+
+    def _scale_actuation_is_current(self, expected_generation: int,
+                                    expected_autoscaler: autoscalers.Autoscaler,
+                                    expected_version: int) -> bool:
+        """Revalidate the exact producer immediately before an actuation."""
+        with self._actuation_epoch_lock:
+            return (not self._actuation_stop.is_set() and
+                    expected_generation % 2 == 0 and
+                    self._actuation_generation == expected_generation and
+                    self._autoscaler is expected_autoscaler and
+                    expected_autoscaler.latest_version == expected_version)
+
+    def _begin_actuation_transition(self) -> int:
+        """Fence new reconciliation while one runtime transition executes."""
+        with self._actuation_epoch_lock:
+            if self._actuation_stop.is_set():
+                raise RuntimeError(
+                    'Controller actuation is permanently fenced.')
+            if self._actuation_generation % 2 != 0:
+                raise RuntimeError(
+                    'Another actuation transition is in progress.')
+            self._actuation_generation += 1
+            generation = self._actuation_generation
+        self._notify_scale_reconcile()
+        return generation
+
+    def _finish_actuation_transition(self, transition_generation: int) -> int:
+        """Publish the stable generation following one exact transition."""
+        with self._actuation_epoch_lock:
+            if (transition_generation % 2 != 1 or
+                    self._actuation_generation != transition_generation):
+                raise RuntimeError(
+                    'Actuation transition generation changed before publish.')
+            self._actuation_generation += 1
+            generation = self._actuation_generation
+        self._notify_scale_reconcile()
+        return generation
+
+    def _notify_scale_reconcile(self) -> int:
+        """Publish every controller-owned scaling wakeup through one path."""
+        return self._scale_reconcile_coordinator.notify()
+
+    @staticmethod
+    def _read_scale_reconcile_recovery_generation() -> int:
+        """Bound lost external notifications without a second polling loop."""
+        interval = scale_reconciliation.DEFAULT_MAX_IDLE_SECONDS
+        return int(time.monotonic() // interval)
+
+    def _transition_ordinary_launch_binding(self, mode: str,
+                                            expected_binding_epoch: int) -> int:
+        """Transition binding authority outside the actuation-token lock."""
+        transition_generation = self._begin_actuation_transition()
+        try:
+            previous = self._ordinary_launch_binding_authority
+            if previous is None:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+                    'Controller has no durable binding authority.')
+            if previous.binding_mode.value == mode:
+                if previous.binding_epoch != expected_binding_epoch + 1:
+                    raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                        'Requested binding transition is not an exact '
+                        'adjacent-epoch retry.')
+                return previous.binding_epoch
+            if previous.binding_epoch != expected_binding_epoch:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Binding source epoch changed before the transition.')
+            transition = (
+                self._replica_manager.ordinary_launch_binding_transition)
+            with transition() as install:
+                if mode == 'bound':
+                    epoch = request_postgres.promote_ordinary_launch_binding_service(
+                        previous)
+                else:
+                    epoch = request_postgres.demote_ordinary_launch_binding_service(
+                        previous)
+                refresh = ordinary_launch_binding.refresh_controller_authority
+                with refresh(previous) as refreshed:
+                    if (refreshed.binding_mode.value != mode or
+                            refreshed.binding_epoch != epoch):
+                        raise (
+                            ordinary_launch_binding.
+                            OrdinaryLaunchBindingConflict(
+                                'Committed binding transition did not refresh '
+                                'to its exact mode and epoch.'))
+                    install(refreshed)
+                    self._ordinary_launch_binding_authority = refreshed
+            return epoch
+        finally:
+            if not self._actuation_stop.is_set():
+                self._finish_actuation_transition(transition_generation)
+
     def _get_actuation_stop(self) -> threading.Event:
         return self._actuation_stop
 
@@ -3511,6 +3690,7 @@ class SkyServeController:
         """Irreversibly stop this partial child from changing fleet state."""
         self._update_recovery_required = True
         self._get_actuation_stop().set()
+        self._scale_reconcile_coordinator.stop()
         self._update_reconciler_stop.set()
         self._replica_manager.fence_launches_for_update_recovery()
 
@@ -3820,12 +4000,12 @@ class SkyServeController:
             # production with a spec-declared context absent from six
             # consecutive versions' catalogs. Rebuild rather than inherit an
             # enumeration the spec has outgrown.
-            missing = _catalog_missing_task_contexts(yaml_content,
-                                                     placement_catalog)
+            missing = _catalog_missing_task_shapes(yaml_content,
+                                                   placement_catalog)
             if missing:
                 logger.info(
                     f'Rebuilding the placement catalog for version {version}: '
-                    f'the inherited catalog is missing Kubernetes context(s) '
+                    f'the inherited catalog is missing Kubernetes shape(s) '
                     f'{sorted(missing)} that the task declares.')
                 placement_catalog = None
         needs_catalog = (validation_service.placement_contract.enabled and
@@ -3833,6 +4013,7 @@ class SkyServeController:
         needs_logical_validation = (authoritative_retry_service is None and
                                     validation_service.uses_logical_replicas
                                     is True)
+        update_task = None
         if needs_catalog or needs_logical_validation:
             try:
                 if needs_catalog:
@@ -3846,11 +4027,13 @@ class SkyServeController:
                         'single-node services. Multi-node replica routing '
                         'does not yet define a safe logical capacity contract.')
                 if needs_catalog:
+                    assert update_task is not None
+                    catalog_task = update_task
 
                     def _build_catalog() -> Any:
                         return spot_placer.SpotPlacer.build_catalog(
                             validation_service,
-                            update_task,
+                            catalog_task,
                             workspace=self._replica_manager.workspace)
 
                     if prepared_config is None:
@@ -3865,18 +4048,67 @@ class SkyServeController:
                     # in this service's workspace, not that the catalog is
                     # stale. Say so: the alternative is a service that runs
                     # indefinitely without the capacity its spec asks for.
-                    still_missing = _catalog_missing_task_contexts(
+                    still_missing = _catalog_missing_task_shapes(
                         yaml_content, placement_catalog)
                     if still_missing:
-                        logger.error(
+                        raise ValueError(
                             'Placement catalog for version '
-                            f'{version} omits Kubernetes context(s) '
+                            f'{version} omits Kubernetes shape(s) '
                             f'{sorted(still_missing)} declared by the task. '
-                            'Reserved fill will not claim a pool for them. '
-                            'Check that each context is reachable and allowed '
-                            'in workspace '
+                            'Check that each exact context/accelerator/count '
+                            'is reachable and allowed in workspace '
                             f'{self._replica_manager.workspace!r}.')
             except (ValueError, RuntimeError) as e:
+                self._discard_prepared_controller_config(prepared_config)
+                return responses.JSONResponse(content={'message': str(e)},
+                                              status_code=400)
+        if authoritative_retry_service is not None:
+            (found, controller_job_projection, controller_work_cache,
+             worker_placement_projections) = (
+                 serve_state.get_placement_projection_record(
+                     self._service_name, version))
+            if not found:
+                self._discard_prepared_controller_config(prepared_config)
+                return responses.JSONResponse(content={
+                    'message': f'Service version {version} is no longer '
+                               'committed.'
+                },
+                                              status_code=409)
+        else:
+            if update_task is None:
+                try:
+                    update_task = replica_managers.load_task_with_service_spec(
+                        yaml_content, validation_service)
+                except (ValueError, RuntimeError) as e:
+                    self._discard_prepared_controller_config(prepared_config)
+                    return responses.JSONResponse(content={'message': str(e)},
+                                                  status_code=400)
+            try:
+
+                def _build_projections() -> tuple[Any, Any, Any]:
+                    if not validation_service.placement_contract.enabled:
+                        return None, None, None
+                    workspace = self._replica_manager.workspace
+                    return (
+                        kubernetes_identity.build_controller_job_projection(
+                            update_task, workspace=workspace),
+                        kubernetes_identity.
+                        build_controller_work_cache_projection(
+                            update_task, workspace=workspace),
+                        kubernetes_identity.build_worker_placement_projections(
+                            update_task,
+                            workspace=workspace,
+                            placement_catalog=placement_catalog),
+                    )
+
+                if prepared_config is None:
+                    projections = _build_projections()
+                else:
+                    projections = self._run_with_prepared_config(
+                        prepared_config, _build_projections)
+                (controller_job_projection, controller_work_cache,
+                 worker_placement_projections) = projections
+            except ValueError as e:
                 self._discard_prepared_controller_config(prepared_config)
                 return responses.JSONResponse(content={'message': str(e)},
                                               status_code=400)
@@ -3907,6 +4139,9 @@ class SkyServeController:
                                    self._service_hash),
             expected_lifecycle_epoch=lifecycle_epoch,
             expected_controller_owner=self._controller_owner,
+            controller_job_projection=controller_job_projection,
+            controller_work_cache=controller_work_cache,
+            worker_placement_projections=worker_placement_projections,
             **catalog_kwargs,
             **recovery_kwargs)
         if result not in (serve_state.VersionCommitResult.COMMITTED,
@@ -4029,6 +4264,7 @@ class SkyServeController:
             # Large stale scale-up batches use the signal to yield to the newer
             # version.
             self._replica_manager.notify_version_pending(version)
+            self._notify_scale_reconcile()
 
     def _get_update_status(self) -> dict[str, Any]:
         """Return committed-versus-applied update visibility."""
@@ -4316,6 +4552,7 @@ class SkyServeController:
         self._replica_manager.notify_version_pending(version)
         config_transition_started = False
         runtime_transition_started = False
+        transition_generation: int | None = None
 
         def _install_matching_config() -> None:
             nonlocal config_transition_started
@@ -4323,9 +4560,11 @@ class SkyServeController:
             assert prepared_config is not None
             self._install_controller_config(prepared_config)
 
-        actuation_epoch_lock = self._get_actuation_epoch_lock()
-        actuation_epoch_lock.acquire()
         try:
+            # Publish an odd generation, then release the controller lock before
+            # entering the manager. The manager's own mutex/version transition
+            # is the linearization point for concurrent stale decisions.
+            transition_generation = self._begin_actuation_transition()
             runtime_transition_started = True
             if prepared_config is None:
                 self._replica_manager.update_version(
@@ -4424,7 +4663,8 @@ class SkyServeController:
         finally:
             if not self._update_recovery_required:
                 self._replica_manager.clear_pending_version(version)
-            actuation_epoch_lock.release()
+                if transition_generation is not None:
+                    self._finish_actuation_transition(transition_generation)
         if reserved_capacity_fill_enabled:
             # An update can enable fill on a live service: give
             # the (retained or replaced) autoscaler the location
@@ -4480,24 +4720,500 @@ class SkyServeController:
                 self._service_hash,
                 self._controller_owner,
                 stop_event=self._get_actuation_stop(),
-                actuation_epoch_lock=self._get_actuation_epoch_lock()),
+                actuation_epoch_lock=self._get_actuation_epoch_lock(),
+                get_actuation_generation=self.get_actuation_generation,
+                actuation_generation_is_current=(
+                    self.actuation_generation_is_current),
+                notify_reconcile=self._notify_scale_reconcile),
             'reserved-capacity-poller',
             stop_event=self._get_actuation_stop())
 
-    def _run_autoscaler(self):
-        logger.info('Starting autoscaler.')
-        stop_event = self._get_actuation_stop()
-        while not stop_event.is_set():
-            # Clear before reading durable replica and placement state. Typed
-            # feedback that arrived before this point is consumed by this tick;
-            # feedback that arrives during the tick leaves the signal set and
-            # makes the interval wait below return immediately.
-            actuation_epoch_lock = self._get_actuation_epoch_lock()
-            actuation_epoch_lock.acquire()
+    def _run_autoscaler(self) -> None:
+        """Run the single lost-wakeup-free scale reconciliation consumer."""
+        logger.info('Starting autoscaler reconciliation coordinator.')
+        self._scale_reconcile_coordinator.run()
+
+    def _read_sequenced_reserved_fill_allocation(
+        self,
+    ) -> tuple[bool, reserved_fill_planner.AuthenticatedAllocationMap | None]:
+        """Read the one-way planner selector and current service authority.
+
+        The boolean selects the implementation, independently of whether a
+        fresh map exists.  Once the durable gate is sequenced, a missing,
+        expired, malformed, or temporarily unreadable map must withhold new
+        fill instead of falling back to the speculative legacy actuator.
+        """
+        observation_repository = getattr(
+            self, '_reserved_fill_observation_repository', None)
+        allocation_repository = getattr(self,
+                                        '_reserved_fill_allocation_repository',
+                                        None)
+        if observation_repository is None:
+            # Central PostgreSQL is the only topology that can carry the
+            # one-way selector.  Repository construction is normally
+            # infallible after migration, but a partially initialized
+            # controller must withhold rather than speculate that the durable
+            # gate is still legacy.  Local SQLite has no sequenced path.
             try:
-                if stop_event.is_set():
+                is_postgres = (serve_state.get_database_engine().dialect.name ==
+                               'postgresql')
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill reconciliation storage could '
+                               'not be classified; withholding new fill: '
+                               f'{common_utils.format_exception(error)}')
+                return True, None
+            return is_postgres, None
+        try:
+            gate = observation_repository.read_reconciliation_gate()
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill reconciliation gate could not be '
+                           'read; withholding new fill for this pass: '
+                           f'{common_utils.format_exception(error)}')
+            return True, None
+        if not gate.sequenced_active:
+            return False, None
+        if (allocation_repository is None or
+                not isinstance(self._service_hash, str) or
+                not self._service_hash):
+            return True, None
+        try:
+            allocation = allocation_repository.read_current(
+                self._service_name, self._service_hash, self._controller_owner)
+        except (reserved_fill_allocation.ReservedFillAllocationError, TypeError,
+                ValueError) as error:
+            logger.warning('Reserved-fill allocation map failed closed for '
+                           f'{self._service_name!r}: '
+                           f'{common_utils.format_exception(error)}')
+            return True, None
+        return True, allocation
+
+    @staticmethod
+    def _reserved_fill_reconciliation_base(
+        *,
+        enabled: bool,
+        authority_mode: str,
+    ) -> dict[str, Any]:
+        """Return the stable empty shape for reserved-fill diagnostics."""
+        return {
+            'enabled': enabled,
+            'authority_mode': authority_mode,
+            'allocation_current': False,
+            'allocation_generation': None,
+            'allocation_input_sha256': None,
+            'allocation_claim_generation': None,
+            'reconciliation_gate_generation': None,
+            'reclaim_policy_identity': None,
+            'pools': {},
+        }
+
+    def _reserved_fill_reconciliation_info(self) -> dict[str, Any]:
+        """Build provider-free operational state for reserved fill.
+
+        The allocation repository remains the sole authority boundary.  This
+        method only projects the already-authenticated map together with exact
+        durable observation provenance and exact-attribution replica rows.
+        Every optional diagnostic read fails unavailable; it cannot authorize
+        a launch or make ``/autoscaler/info`` fail.
+        """
+        enabled = (getattr(self._autoscaler, 'reserved_capacity_fill', False)
+                   is True)
+        if not enabled:
+            return self._reserved_fill_reconciliation_base(
+                enabled=False, authority_mode='disabled')
+
+        try:
+            sequenced, allocation = (
+                self._read_sequenced_reserved_fill_allocation())
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill reconciliation authority could not '
+                           'be inspected: '
+                           f'{common_utils.format_exception(error)}')
+            return self._reserved_fill_reconciliation_base(
+                enabled=True, authority_mode='unavailable')
+        if not sequenced:
+            return self._reserved_fill_reconciliation_base(
+                enabled=True, authority_mode='legacy')
+
+        result = self._reserved_fill_reconciliation_base(
+            enabled=True, authority_mode='sequenced')
+        observation_repository = getattr(
+            self, '_reserved_fill_observation_repository', None)
+        if observation_repository is not None:
+            try:
+                gate = observation_repository.read_reconciliation_gate()
+                identity = gate.reclaim_policy_identity
+                if gate.sequenced_active and identity is not None:
+                    result.update({
+                        'reconciliation_gate_generation': gate.generation,
+                        'reclaim_policy_identity': dataclasses.asdict(identity),
+                    })
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill gate diagnostics failed: '
+                               f'{common_utils.format_exception(error)}')
+        if allocation is None:
+            # The one-way sequenced selector remains authoritative even while
+            # a missing/stale map withholds fill.  Never present this as legacy.
+            return result
+
+        result.update({
+            'allocation_current': True,
+            'allocation_generation': allocation.allocation_generation,
+            'allocation_input_sha256': allocation.allocation_input_sha256,
+            'allocation_claim_generation':
+                allocation.allocation_claim_generation,
+            'reconciliation_gate_generation':
+                allocation.reconciliation_gate_generation,
+            'reclaim_policy_identity': {
+                'fleet_bundle_sha256': allocation.reclaim_fleet_bundle_sha256,
+                'policy_revision': allocation.reclaim_policy_revision,
+                'provider_inventory_sha256':
+                    allocation.reclaim_provider_inventory_sha256,
+            },
+        })
+
+        try:
+            replica_infos = serve_state.get_replica_infos(self._service_name)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admitted/ready progress could not '
+                           'be inspected: '
+                           f'{common_utils.format_exception(error)}')
+            replica_infos = None
+
+        pools: dict[str, dict[str, Any]] = {}
+        for snapshot in allocation.pool_snapshots:
+            context = snapshot.locations[0].region
+            allowed_contexts = frozenset(
+                location.region for location in snapshot.locations)
+            projection_digests = dict(
+                snapshot.worker_projection_sha256_by_accelerator)
+            accelerator_counts = {
+                location.accelerator.casefold(): location.accelerator_count
+                for location in snapshot.locations
+            }
+            pool_info: dict[str, Any] = {
+                'physical_cluster_uid': snapshot.physical_cluster_uid,
+                'kubernetes_context': context,
+                'service_generation': snapshot.service_generation,
+                'observation_generation': snapshot.observation_generation,
+                'observation_sequence': snapshot.observation_sequence,
+                'observation_valid_until': snapshot.valid_until,
+                'observation_available': False,
+                'broker_slot_width': snapshot.broker_slot_width,
+                'observed_free_gpus': None,
+                'observed_free_gpus_by_accelerator': None,
+                'observed_free_slots': None,
+                'observed_free_slots_by_accelerator': None,
+                'spendable_slots': snapshot.free_slots,
+                'spendable_slots_by_accelerator':
+                    (None if snapshot.free_slots_by_accelerator is None else
+                     dict(snapshot.free_slots_by_accelerator)),
+                'grant': snapshot.grant,
+                'edge_cap': snapshot.edge_cap,
+                'current_allocation_admitted_replicas': None,
+                'current_allocation_ready_replicas': None,
+            }
+            if observation_repository is not None:
+                try:
+                    observation = observation_repository.read_exact_completed(
+                        snapshot.pool_key, snapshot.observation_generation)
+                    payload = (None
+                               if observation is None else observation.payload)
+                    if (observation is not None and
+                            observation.observation_sequence
+                            == snapshot.observation_sequence and isinstance(
+                                payload,
+                                pool_capacity_observation.PoolCapacitySuccess)):
+                        observed_slots_by_accelerator = dict(
+                            payload.slot_counts(snapshot.broker_slot_width))
+                        pool_info.update({
+                            'observation_available': True,
+                            'observed_free_gpus': payload.free_gpus,
+                            'observed_free_gpus_by_accelerator': dict(
+                                payload.free_gpus_by_accelerator),
+                            'observed_free_slots': sum(
+                                observed_slots_by_accelerator.values()),
+                            'observed_free_slots_by_accelerator': observed_slots_by_accelerator,
+                        })
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Reserved-fill observation diagnostics failed for '
+                        f'pool {snapshot.pool_key!r}: '
+                        f'{common_utils.format_exception(error)}')
+
+            if replica_infos is not None:
+                try:
+                    admitted = 0
+                    ready = 0
+                    for replica in replica_infos:
+                        location = replica.get_spot_location()
+                        accelerators = (None if location is None else
+                                        location.accelerators)
+                        if not isinstance(accelerators,
+                                          dict) or len(accelerators) != 1:
+                            continue
+                        raw_accelerator, accelerator_count = next(
+                            iter(accelerators.items()))
+                        accelerator = str(raw_accelerator).casefold()
+                        if (replica.is_terminal or
+                                replica.reserved_fill is not True or
+                                replica.is_zero_cost is not True or
+                                replica.version != allocation.service_version or
+                                replica.reserved_fill_pool_key
+                                != snapshot.pool_key or
+                                replica.reserved_fill_service_generation
+                                != snapshot.service_generation or
+                                replica.reserved_fill_physical_cluster_uid
+                                != snapshot.physical_cluster_uid or
+                                replica.reserved_fill_kubernetes_context
+                                not in allowed_contexts or
+                                replica.reserved_fill_allocation_generation
+                                != allocation.allocation_generation or
+                                replica.reserved_fill_allocation_input_sha256
+                                != allocation.allocation_input_sha256 or replica
+                                .reserved_fill_allocation_claim_generation
+                                != allocation.allocation_claim_generation or
+                                getattr(
+                                    replica,
+                                    'reserved_fill_reconciliation_gate_generation',
+                                    None)
+                                != allocation.reconciliation_gate_generation or
+                                getattr(
+                                    replica,
+                                    'reserved_fill_reclaim_fleet_bundle_sha256',
+                                    None)
+                                != allocation.reclaim_fleet_bundle_sha256 or
+                                getattr(
+                                    replica,
+                                    'reserved_fill_reclaim_policy_revision',
+                                    None) != allocation.reclaim_policy_revision
+                                or getattr(
+                                    replica,
+                                    'reserved_fill_reclaim_provider_inventory_sha256',
+                                    None)
+                                != allocation.reclaim_provider_inventory_sha256
+                                or type(accelerator_count) is not int or
+                                accelerator_counts.get(accelerator)
+                                != accelerator_count or getattr(
+                                    replica,
+                                    'reserved_fill_worker_projection_sha256',
+                                    None) != projection_digests.get(accelerator)
+                                or replica.reserved_fill_observation_generation
+                                != snapshot.observation_generation or
+                                replica.reserved_fill_observation_sequence
+                                != snapshot.observation_sequence or
+                                not isinstance(
+                                    replica.
+                                    reserved_fill_intent_idempotency_key, str)
+                                or
+                                not replica.reserved_fill_intent_idempotency_key
+                                or type(replica.zero_cost_admission_sequence)
+                                is not int or
+                                replica.zero_cost_admission_sequence <= 0):
+                            continue
+                        admitted += 1
+                        if replica.is_ready:
+                            ready += 1
+                    pool_info['current_allocation_admitted_replicas'] = (
+                        admitted)
+                    pool_info['current_allocation_ready_replicas'] = ready
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Reserved-fill replica progress diagnostics failed '
+                        f'for pool {snapshot.pool_key!r}: '
+                        f'{common_utils.format_exception(error)}')
+            pools[snapshot.pool_key] = pool_info
+        result['pools'] = pools
+        return result
+
+    def _plan_scale_reconciliation(
+        self,
+        decision_autoscaler: autoscalers.Autoscaler,
+        decision_version: int,
+        actuation_generation: int,
+        replica_infos: list[replica_managers.ReplicaInfo],
+        active_versions: list[int],
+        *,
+        sequenced_reserved_fill: bool,
+    ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
+               autoscalers.UnrecoverableRolloutFailure | None, Any,
+               bool] | None:
+        """Mutate one exact autoscaler while update/LB publication is fenced."""
+        with self._routing_state_lock:
+            if not self._scale_actuation_is_current(actuation_generation,
+                                                    decision_autoscaler,
+                                                    decision_version):
+                return None
+            decision_autoscaler.set_spot_placer(
+                self._replica_manager.spot_placer)
+            if isinstance(decision_autoscaler,
+                          (autoscalers.InstanceAwareRequestRateAutoscaler,
+                           autoscalers.ConcurrencyAutoscaler)):
+                decision_autoscaler.set_free_reserved_slots_by_accelerator(
+                    self._get_free_reserved_slots_by_accelerator())
+            planning_context = (
+                decision_autoscaler.sequenced_reserved_fill_planning()
+                if sequenced_reserved_fill else contextlib.nullcontext())
+            with planning_context:
+                scaling_options = (
+                    decision_autoscaler.generate_scaling_decisions(
+                        replica_infos, active_versions))
+            target_num_replicas = None
+            if decision_autoscaler.has_recomputed_with_fresh_data() is True:
+                demand_target = (
+                    decision_autoscaler.get_final_target_num_replicas())
+                fill_target = 0
+                if decision_autoscaler.reserved_capacity_fill is True:
+                    fill_target = decision_autoscaler.fill_target
+                if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
+                        fill_target < 0):
+                    fill_target = 0
+                target_num_replicas = max(demand_target, fill_target)
+            rollout_failure = decision_autoscaler.unrecoverable_rollout_failure
+            logical_target = None
+            invalidate_logical_target = False
+            if (isinstance(decision_autoscaler,
+                           autoscalers.ConcurrencyAutoscaler) and
+                    decision_autoscaler.replica_unit == 'logical'):
+                logical_target = decision_autoscaler.logical_target_state
+                invalidate_logical_target = (logical_target is None and bool(
+                    decision_autoscaler.configured_accelerator_shapes))
+            return (scaling_options, target_num_replicas, rollout_failure,
+                    logical_target, invalidate_logical_target)
+
+    @staticmethod
+    def _committed_reserved_fill_debits(
+        allocation: reserved_fill_planner.AuthenticatedAllocationMap,
+        replica_infos: list[replica_managers.ReplicaInfo],
+    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
+        """Count durable or cleanup-unproven rows from this exact map."""
+        snapshots = {
+            snapshot.pool_key: snapshot
+            for snapshot in allocation.pool_snapshots
+        }
+        counts: dict[tuple[str, str], int] = {}
+        for info in replica_infos:
+            if info.reserved_fill is not True:
+                continue
+            if not replica_managers.replica_may_consume_physical_capacity(info):
+                continue
+            identity = (
+                info.reserved_fill_allocation_generation,
+                info.reserved_fill_allocation_input_sha256,
+                info.reserved_fill_allocation_claim_generation,
+                getattr(info, 'reserved_fill_reconciliation_gate_generation',
+                        None),
+                getattr(info, 'reserved_fill_reclaim_fleet_bundle_sha256',
+                        None),
+                getattr(info, 'reserved_fill_reclaim_policy_revision', None),
+                getattr(info, 'reserved_fill_reclaim_provider_inventory_sha256',
+                        None),
+            )
+            if identity != (allocation.allocation_generation,
+                            allocation.allocation_input_sha256,
+                            allocation.allocation_claim_generation,
+                            allocation.reconciliation_gate_generation,
+                            allocation.reclaim_fleet_bundle_sha256,
+                            allocation.reclaim_policy_revision,
+                            allocation.reclaim_provider_inventory_sha256):
+                continue
+            pool_key = info.reserved_fill_pool_key
+            if not isinstance(pool_key, str) or not pool_key:
+                raise ValueError('A same-allocation reserved-fill row has no '
+                                 'durable pool attribution.')
+            snapshot = snapshots.get(pool_key)
+            location = info.get_spot_location()
+            accelerators = (None if location is None else location.accelerators)
+            if (snapshot is None or not isinstance(accelerators, dict) or
+                    len(accelerators) != 1 or
+                    info.reserved_fill_service_generation
+                    != snapshot.service_generation or
+                    info.reserved_fill_physical_cluster_uid
+                    != snapshot.physical_cluster_uid):
+                raise ValueError('A same-allocation reserved-fill row has '
+                                 'inconsistent durable pool attribution.')
+            accelerator = str(next(iter(accelerators))).casefold()
+            key = (snapshot.pool_key, accelerator)
+            counts[key] = counts.get(key, 0) + 1
+        return tuple(
+            reserved_fill_planner.CommittedFillDebit(
+                allocation_generation=allocation.allocation_generation,
+                allocation_input_sha256=allocation.allocation_input_sha256,
+                allocation_claim_generation=(
+                    allocation.allocation_claim_generation),
+                pool_key=pool_key,
+                accelerator=accelerator,
+                replica_slots=count)
+            for (pool_key, accelerator), count in sorted(counts.items()))
+
+    def _accept_sequenced_reserved_fill(
+        self,
+        allocation: reserved_fill_planner.AuthenticatedAllocationMap | None,
+        decision_autoscaler: autoscalers.Autoscaler,
+        decision_version: int,
+        reconcile_generation: int,
+        replica_infos: list[replica_managers.ReplicaInfo],
+        scaling_options: list[autoscalers.AutoscalerDecision],
+    ) -> None:
+        """Plan from durable authority and spend only the manager receipt."""
+        if allocation is None or not allocation.pool_snapshots:
+            return
+        service_hash = self._service_hash
+        if not isinstance(service_hash, str) or not service_hash:
+            return
+        capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
+                         if decision_autoscaler.replica_unit == 'logical' else
+                         reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+        ordinary_debits = (
+            decision_autoscaler.reserved_fill_ordinary_demand_debits(
+                allocation, replica_infos, scaling_options))
+        committed_debits = self._committed_reserved_fill_debits(
+            allocation, replica_infos)
+        plan = reserved_fill_planner.ReservedFillPlanner.plan(
+            policy_revision=decision_version,
+            reconcile_generation=max(1, reconcile_generation + 1),
+            allocation_map=allocation,
+            service_incarnation=service_hash,
+            service_version=decision_version,
+            controller_owner=self._controller_owner_fingerprint,
+            max_replicas=decision_autoscaler.max_replicas,
+            planned_replicas=(decision_autoscaler.
+                              reserved_fill_planned_capacity(replica_infos)),
+            capacity_unit=capacity_unit,
+            ordinary_demand_debits=ordinary_debits,
+            committed_fill_debits=committed_debits,
+            rotation_anchor=(
+                decision_autoscaler.reserved_fill_rotation_anchor()))
+        if not plan.intents:
+            return
+        receipt = self._replica_manager.accept_reserved_fill(plan)
+        receipt.validate_for_plan(plan)
+        anchor = receipt.accepted_rotation_anchor(plan)
+        if anchor is not None:
+            decision_autoscaler.commit_reserved_fill_rotation_anchor(anchor)
+        if receipt.deferred and (receipt.accepted or any(
+                deferred.reason is (reserved_fill_planner.DeferredFillReason.
+                                    ADMISSION_SEQUENCE_CHANGED)
+                for deferred in receipt.deferred)):
+            # A prefix made durable progress. Coalesce one immediate pass for
+            # the eligible tail. A changed ordinary-admission high-water also
+            # needs an immediate durable reread/replan; an all-deferred
+            # provider-busy result relies on the bounded recovery wakeup.
+            self._notify_scale_reconcile()
+
+    def _reconcile_scale_once(self, reconcile_generation: int) -> None:
+        """Plan and actuate one optimistic, version-fenced scale epoch."""
+        stop_event = self._get_actuation_stop()
+        if not stop_event.is_set():
+            actuation = self._capture_scale_actuation()
+            if actuation is None:
+                return
+            (actuation_generation, decision_autoscaler,
+             decision_version) = actuation
+            try:
+                if not self._scale_actuation_is_current(actuation_generation,
+                                                        decision_autoscaler,
+                                                        decision_version):
                     return
-                self._replica_manager.clear_scale_reconciliation_signal()
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
                 self._replica_counts_snapshot = self._get_replica_counts(
@@ -4511,38 +5227,26 @@ class SkyServeController:
                     'No service record found for '
                     f'{self._service_name}')
                 active_versions = runtime_snapshot['active_versions']
-                # Keep the exact autoscaler instance/version that produced
-                # this tick. A concurrent update may replace or mutate
-                # `self._autoscaler` before actuation; the manager's expected
-                # version fence must carry the producer's version, not the
-                # newly published one.
-                decision_autoscaler = self._autoscaler
-                decision_version = decision_autoscaler.latest_version
-                decision_autoscaler.set_spot_placer(
-                    self._replica_manager.spot_placer)
-                if isinstance(decision_autoscaler,
-                              (autoscalers.InstanceAwareRequestRateAutoscaler,
-                               autoscalers.ConcurrencyAutoscaler)):
-                    decision_autoscaler.set_free_reserved_slots_by_accelerator(
-                        self._get_free_reserved_slots_by_accelerator())
-
-                # Autoscaler now extracts GPU type info directly from
-                # replica_infos in generate_scaling_decisions method
-                # for better decoupling.
-                scaling_options = decision_autoscaler.generate_scaling_decisions(
-                    replica_infos, active_versions)
-                target_num_replicas = None
-                if (decision_autoscaler.has_recomputed_with_fresh_data()
-                        is True):
-                    demand_target = (
-                        decision_autoscaler.get_final_target_num_replicas())
-                    fill_target = 0
-                    if decision_autoscaler.reserved_capacity_fill is True:
-                        fill_target = decision_autoscaler.fill_target
-                    if (type(fill_target) is not int or  # pylint: disable=unidiomatic-typecheck
-                            fill_target < 0):
-                        fill_target = 0
-                    target_num_replicas = max(demand_target, fill_target)
+                sequenced_reserved_fill = False
+                allocation = None
+                if decision_autoscaler.reserved_capacity_fill:
+                    (sequenced_reserved_fill, allocation) = (
+                        self._read_sequenced_reserved_fill_allocation())
+                plan = self._plan_scale_reconciliation(
+                    decision_autoscaler,
+                    decision_version,
+                    actuation_generation,
+                    replica_infos,
+                    active_versions,
+                    sequenced_reserved_fill=(sequenced_reserved_fill))
+                if plan is None:
+                    return
+                (scaling_options, target_num_replicas, rollout_failure,
+                 logical_target, invalidate_logical_target) = plan
+                if not self._scale_actuation_is_current(actuation_generation,
+                                                        decision_autoscaler,
+                                                        decision_version):
+                    return
                 self._replica_manager.publish_target_num_replicas(
                     target_num_replicas, expected_version=decision_version)
                 if not self._persist_cost_rebalance_state(decision_autoscaler):
@@ -4557,8 +5261,10 @@ class SkyServeController:
                                 option.reason == autoscalers.
                                 AutoscalerDecisionReason.COST_REBALANCE)
                     ]
-                rollout_failure = (
-                    decision_autoscaler.unrecoverable_rollout_failure)
+                if not self._scale_actuation_is_current(actuation_generation,
+                                                        decision_autoscaler,
+                                                        decision_version):
+                    return
                 if isinstance(rollout_failure,
                               autoscalers.UnrecoverableRolloutFailure):
                     if self._quarantine_unrecoverable_rollout(rollout_failure):
@@ -4569,22 +5275,28 @@ class SkyServeController:
                         # reads the durable quarantine and active-version
                         # fallback before constructing any runtime objects.
                         os._exit(1)  # pylint: disable=protected-access
-                    self._replica_manager.wait_for_scale_reconciliation(
-                        self._autoscaler.get_decision_interval())
-                    continue
-                if (isinstance(decision_autoscaler,
-                               autoscalers.ConcurrencyAutoscaler) and
-                        decision_autoscaler.replica_unit == 'logical'):
-                    target_state = decision_autoscaler.logical_target_state
-                    if target_state is not None:
-                        self._replica_manager.publish_logical_target(
-                            *target_state)
-                    elif decision_autoscaler.configured_accelerator_shapes:
-                        # Exact-card retirement must fail closed while the LB
-                        # compatibility report is incomplete. Explicitly
-                        # revoke an earlier generation as well as suppressing
-                        # this tick's aggregate-only intent.
-                        self._replica_manager.invalidate_logical_target()
+                    return
+                if logical_target is not None:
+                    self._replica_manager.publish_logical_target(
+                        *logical_target)
+                elif invalidate_logical_target:
+                    # Exact-card retirement must fail closed while the LB
+                    # compatibility report is incomplete. Explicitly revoke an
+                    # earlier generation as well as suppressing this tick's
+                    # aggregate-only intent.
+                    self._replica_manager.invalidate_logical_target()
+                if sequenced_reserved_fill:
+                    if not self._scale_actuation_is_current(
+                            actuation_generation, decision_autoscaler,
+                            decision_version):
+                        return
+                    self._accept_sequenced_reserved_fill(
+                        allocation, decision_autoscaler, decision_version,
+                        reconcile_generation, replica_infos, scaling_options)
+                    if not self._scale_actuation_is_current(
+                            actuation_generation, decision_autoscaler,
+                            decision_version):
+                        return
                 # Batch consecutive SCALE_UP decisions into ONE
                 # replica-manager call: each scale_up acquires the manager
                 # lock, which the readiness-probe round holds for tens of
@@ -4600,6 +5312,11 @@ class SkyServeController:
                 pending_logical_scale_down: list[
                     autoscalers.LogicalScaleDownTarget] = []
 
+                def _producer_is_current() -> bool:
+                    return self._scale_actuation_is_current(
+                        actuation_generation, decision_autoscaler,
+                        decision_version)
+
                 # The closure is only called within the same outer-loop
                 # iteration that (re)binds pending_scale_up, so capturing the
                 # loop-scoped list is intentional (B023 false positive).
@@ -4609,6 +5326,9 @@ class SkyServeController:
                     Autoscaler = decision_autoscaler,
                 ) -> None:
                     if not pending_scale_up:  # noqa: B023
+                        return
+                    if not _producer_is_current():
+                        pending_scale_up.clear()  # noqa: B023
                         return
                     aggregate_priority = (
                         producer_autoscaler.current_launch_priority())
@@ -4659,6 +5379,9 @@ class SkyServeController:
                 def _flush_logical_scale_down() -> None:
                     if not pending_logical_scale_down:  # noqa: B023
                         return
+                    if not _producer_is_current():
+                        pending_logical_scale_down.clear()  # noqa: B023
+                        return
                     first = pending_logical_scale_down[0]  # noqa: B023
                     exact_target_kwargs: dict[str, Any] = {}
                     if (first.target_capacity_by_accelerator or
@@ -4680,6 +5403,8 @@ class SkyServeController:
                     pending_logical_scale_down.clear()  # noqa: B023
 
                 for scaling_option in scaling_options:
+                    if not _producer_is_current():
+                        return
                     logger.info(f'Scaling option received: {scaling_option}')
                     if (scaling_option.operator ==
                             autoscalers.AutoscalerDecisionOperator.SCALE_UP):
@@ -4771,12 +5496,9 @@ class SkyServeController:
                              f'{common_utils.format_exception(e)}')
                 with ux_utils.enable_traceback():
                     logger.error(f'  Traceback: {traceback.format_exc()}')
-            finally:
-                actuation_epoch_lock.release()
             if stop_event.is_set():
                 return
-            self._replica_manager.wait_for_scale_reconciliation(
-                self._autoscaler.get_decision_interval())
+            return
 
     def run(self, controller_socket: socket.socket | None = None) -> None:
 
@@ -4868,6 +5590,28 @@ class SkyServeController:
                 info.update(counts)
             info.update(self._get_update_status())
             try:
+                info['reserved_fill_reconciliation'] = (
+                    self._reserved_fill_reconciliation_info())
+            except Exception as e:  # pylint: disable=broad-except
+                # This is a provider-free diagnostic projection, never an
+                # authority input.  Keep the supervisor/status endpoint alive
+                # even if a future repository or decoder regression escapes
+                # the narrower handling inside the projection itself.
+                logger.warning(
+                    'Could not snapshot reserved-fill reconciliation state: '
+                    f'{common_utils.format_exception(e)}')
+                info['reserved_fill_reconciliation'] = {
+                    'enabled': (getattr(self._autoscaler,
+                                        'reserved_capacity_fill', False)
+                                is True),
+                    'authority_mode': 'unavailable',
+                    'allocation_current': False,
+                    'allocation_generation': None,
+                    'allocation_input_sha256': None,
+                    'allocation_claim_generation': None,
+                    'pools': {},
+                }
+            try:
                 info['drain_proof'] = (
                     self._replica_manager.drain_proof_stats_snapshot())
             except Exception as e:  # pylint: disable=broad-except
@@ -4912,6 +5656,58 @@ class SkyServeController:
             request_data = await request.json()
             return await self._handle_load_balancer_request_history_sync(
                 request_data)
+
+        @self._app.post(
+            serve_constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        def set_ordinary_launch_binding_mode(request_data: dict[
+            str, Any] = fastapi.Body(...)) -> fastapi.Response:
+            """Transition one live manager under controller-local fences."""
+            mode = request_data.get('mode')
+            expected_service_hash = request_data.get('expected_service_hash')
+            expected_binding_epoch = request_data.get('expected_binding_epoch')
+            if mode not in ('legacy', 'bound'):
+                return responses.JSONResponse(
+                    content={'message': 'mode must be legacy or bound.'},
+                    status_code=400)
+            if (isinstance(expected_binding_epoch, bool) or
+                    not isinstance(expected_binding_epoch, int) or
+                    expected_binding_epoch < 0):
+                return responses.JSONResponse(content={
+                    'message': ('expected_binding_epoch must be a '
+                                'nonnegative integer.')
+                },
+                                              status_code=400)
+            if expected_service_hash != self._service_hash:
+                return responses.JSONResponse(content={
+                    'message': 'Service incarnation changed before the '
+                               'binding transition.'
+                },
+                                              status_code=409)
+            try:
+                epoch = self._transition_ordinary_launch_binding(
+                    mode, expected_binding_epoch)
+                return responses.JSONResponse(content={
+                    'binding_mode': mode,
+                    'binding_epoch': epoch,
+                },
+                                              status_code=200)
+            except (ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                    ordinary_launch_binding.OrdinaryLaunchBindingUnavailable,
+                    RuntimeError) as error:
+                logger.warning(
+                    'Ordinary-launch binding transition rejected for %s: %s',
+                    self._service_name, common_utils.format_exception(error))
+                return responses.JSONResponse(content={'message': str(error)},
+                                              status_code=409)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.exception(
+                    'Ordinary-launch binding transition failed for %s.',
+                    self._service_name)
+                return responses.JSONResponse(content={
+                    'message': common_utils.format_exception(error),
+                },
+                                              status_code=500)
 
         # Deliberately a sync handler: parsing and committing the task YAML can
         # perform blocking file/DB I/O. Runtime application happens on the
@@ -5252,7 +6048,9 @@ def run_controller(service_name: str,
                    controller_pid: int | None = None,
                    controller_ip: str | None = None,
                    enforce_launch_fence: bool = False,
-                   controller_socket: socket.socket | None = None):
+                   controller_socket: socket.socket | None = None,
+                   controller_binding_authority: ordinary_launch_binding.
+                   ControllerBindingAuthority | None = None):
     setproctitle.setproctitle('sky.serve.controller '
                               f'--service-name {service_name} '
                               f'--service-incarnation {service_hash or ""}')
@@ -5260,12 +6058,16 @@ def run_controller(service_name: str,
     os.environ[constants.OVERRIDE_CONSOLIDATION_MODE] = 'true'
     # Hijack sys.stdout/stderr to be context aware.
     context_utils.hijack_sys_attrs()
+    controller_kwargs: dict[str, Any] = {}
+    if controller_binding_authority is not None:
+        controller_kwargs['controller_binding_authority'] = (
+            controller_binding_authority)
     controller = SkyServeController(service_name, service_spec, version,
                                     controller_host, controller_port,
                                     controller_owner_fingerprint,
                                     resource_scope, service_hash,
                                     controller_pid, controller_ip,
-                                    enforce_launch_fence)
+                                    enforce_launch_fence, **controller_kwargs)
     if controller_socket is None:
         controller.run()
     else:

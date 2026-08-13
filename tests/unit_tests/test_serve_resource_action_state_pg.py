@@ -16,6 +16,7 @@ import sqlalchemy
 import test_serve_resource_action_down_execution_config
 import test_serve_resource_action_launch_execution_config
 
+from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
 from sky.serve import resource_action_state
 from sky.serve import resource_action_state_schema
@@ -389,6 +390,57 @@ def _replica(version: int = 1) -> replica_managers.ReplicaInfo:
                                         location=None,
                                         version=version,
                                         resources_override=None)
+
+
+def _install_sequenced_replica_authority(engine) -> None:
+    """Extend create-all fixtures with migration-owned Serve045 fields."""
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text("""
+                ALTER TABLE reserved_fill_protocol_state
+                    ADD COLUMN zero_cost_admission_sequence BIGINT NOT NULL
+                        DEFAULT 0,
+                    ADD COLUMN ordinary_zero_cost_admission_sequence BIGINT
+                        NOT NULL DEFAULT 0,
+                    ADD COLUMN zero_cost_materialization_sequence BIGINT
+                        NOT NULL DEFAULT 0,
+                    ADD COLUMN reconciliation_gate_state TEXT NOT NULL
+                        DEFAULT 'LEGACY_ACTIVE',
+                    ADD COLUMN reconciliation_gate_generation BIGINT NOT NULL
+                        DEFAULT 0,
+                    ADD COLUMN reclaim_fleet_bundle_sha256 TEXT,
+                    ADD COLUMN reclaim_policy_revision TEXT,
+                    ADD COLUMN reclaim_provider_inventory_sha256 TEXT,
+                    ADD COLUMN reclaim_claim_scope_count BIGINT,
+                    ADD COLUMN reclaim_claim_scope_sha256 TEXT,
+                    ADD COLUMN reclaim_evidence_sha256 TEXT,
+                    ADD COLUMN reclaim_authorized_at DOUBLE PRECISION
+            """))
+        connection.execute(
+            sqlalchemy.text("""
+                INSERT INTO reserved_fill_protocol_state
+                    (id, protocol_version, claim_generation, image_digest,
+                     deployment_generation, deployment_uid,
+                     pod_inventory_count, pod_inventory_sha256,
+                     reconciliation_gate_state,
+                     reconciliation_gate_generation,
+                     reclaim_fleet_bundle_sha256, reclaim_policy_revision,
+                     reclaim_provider_inventory_sha256,
+                     reclaim_claim_scope_count, reclaim_claim_scope_sha256,
+                     reclaim_evidence_sha256, reclaim_authorized_at)
+                VALUES (1, 2, 0, :image_digest, '1', 'deployment-uid', 1,
+                        :inventory_sha256, 'SEQUENCED_ACTIVE', 1,
+                        :fleet_bundle_sha256, 'test-policy-v1',
+                        :provider_inventory_sha256, 0,
+                        :claim_scope_sha256, :evidence_sha256, 1.0)
+            """), {
+                'image_digest': f"sha256:{'a' * 64}",
+                'inventory_sha256': 'b' * 64,
+                'fleet_bundle_sha256': 'c' * 64,
+                'provider_inventory_sha256': 'd' * 64,
+                'claim_scope_sha256': 'e' * 64,
+                'evidence_sha256': 'f' * 64,
+            })
 
 
 def _accept_worker_cohort(engine, store) -> None:
@@ -920,6 +972,111 @@ def test_launch_replica_admission_is_atomic_replayable_and_preserved(
     assert row['desired_generation'] == 1
     assert row['sky_cluster_record_uuid'] == uuid.UUID(_CLUSTER_UUID)
     assert row['launch_shadow_sample_id'] == sample.action_id
+
+
+def test_zero_cost_launch_shadow_replay_reloads_committed_sequence(
+        shadow_database, monkeypatch) -> None:
+    engine, store = shadow_database
+    _install_sequenced_replica_authority(engine)
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    _add_service(engine)
+    sample, _ = _sample()
+    info = _replica()
+    info.is_zero_cost = True
+
+    admitted = serve_state.add_or_update_replica_with_launch_shadow(
+        'svc',
+        7,
+        info,
+        sample,
+        expected_controller_owner=_OWNER,
+        expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    assert admitted == store.get_sample(sample.action_id)
+    assert info.zero_cost_admission_sequence == 1
+    assert info.zero_cost_materialization_sequence is None
+
+    # Simulate a lost acknowledgement: the reconstructed caller has neither
+    # database-assigned identity and has a different local record UUID. The
+    # action-owned identity makes this an exact no-op replay; the wrapper must
+    # reload the durable row before publishing sequence identities.
+    replay_info = _replica(version=2)
+    replay_info.is_zero_cost = True
+    replay = serve_state.add_or_update_replica_with_launch_shadow(
+        'svc',
+        7,
+        replay_info,
+        sample,
+        expected_controller_owner=_OWNER,
+        expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+    assert replay == admitted
+    assert replay_info.zero_cost_admission_sequence == 1
+    assert replay_info.zero_cost_materialization_sequence is None
+    with engine.connect() as connection:
+        sequences = connection.execute(
+            sqlalchemy.select(
+                pool_capacity_observation_schema.protocol_state_sequence_table.
+                c.zero_cost_admission_sequence,
+                pool_capacity_observation_schema.protocol_state_sequence_table.
+                c.ordinary_zero_cost_admission_sequence,
+                pool_capacity_observation_schema.protocol_state_sequence_table.
+                c.zero_cost_materialization_sequence)).one()
+    assert tuple(sequences) == (1, 1, 0)
+
+
+def test_zero_cost_launch_shadow_rollback_does_not_publish_or_consume(
+        shadow_database, monkeypatch) -> None:
+    engine, _ = shadow_database
+    _install_sequenced_replica_authority(engine)
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+    _add_service(engine)
+    sample, _ = _sample()
+    info = _replica()
+    info.is_zero_cost = True
+    original = (resource_action_state.PostgresServeResourceActionStateStore.
+                _admit_after_service_lock_in_session)
+
+    def fail_after_parent(self,
+                          session,
+                          new_sample,
+                          service_row,
+                          prepared_reference=None,
+                          linked_replay=None):
+        original(self,
+                 session,
+                 new_sample,
+                 service_row,
+                 prepared_reference,
+                 linked_replay=linked_replay)
+        raise RuntimeError('zero-cost shadow rollback')
+
+    monkeypatch.setattr(
+        resource_action_state.PostgresServeResourceActionStateStore,
+        '_admit_after_service_lock_in_session', fail_after_parent)
+    with pytest.raises(RuntimeError, match='zero-cost shadow rollback'):
+        serve_state.add_or_update_replica_with_launch_shadow(
+            'svc',
+            7,
+            info,
+            sample,
+            expected_controller_owner=_OWNER,
+            expected_lifecycle_epoch=_LIFECYCLE_EPOCH)
+
+    assert info.zero_cost_admission_sequence is None
+    assert info.zero_cost_materialization_sequence is None
+    with engine.connect() as connection:
+        sequences = connection.execute(
+            sqlalchemy.select(
+                pool_capacity_observation_schema.protocol_state_sequence_table.
+                c.zero_cost_admission_sequence,
+                pool_capacity_observation_schema.protocol_state_sequence_table.
+                c.ordinary_zero_cost_admission_sequence,
+                pool_capacity_observation_schema.protocol_state_sequence_table.
+                c.zero_cost_materialization_sequence)).one()
+        replica_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(  # pylint: disable=not-callable
+                serve_state_schema.replicas_table)).scalar_one()
+    assert tuple(sequences) == (0, 0, 0)
+    assert replica_count == 0
 
 
 def test_launch_replica_admission_rolls_back_both_sides(shadow_database,

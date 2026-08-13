@@ -39,8 +39,6 @@ from sky.client import request_results
 from sky.client.api_auth import api_login
 from sky.client.api_auth import api_logout
 from sky.events import api_models as event_api_models
-from sky.jobs import scheduler
-from sky.jobs import utils as managed_job_utils
 from sky.schemas.api import responses
 from sky.server import common as server_common
 from sky.server import constants as server_constants
@@ -1152,6 +1150,50 @@ def submit_prepared_launch_request(
         json=json.loads(prepared_request.submitted_bytes),
         timeout=5)
     return server_common.get_request_id(response)
+
+
+def submit_prepared_ordinary_launch_request(
+    prepared_request: PreparedLaunchRequest,
+    submission_uuid: str | uuid.UUID,
+) -> server_common.RequestId[tuple[int | None,
+                                   Optional['backends.ResourceHandle']]]:
+    """Submit one frozen launch through the private durable binding seam.
+
+    The caller must reuse ``submission_uuid`` for every transport retry.  An
+    old API target has no such route and returns 404 without scheduling through
+    the unsafe public launch fallback.
+    """
+    try:
+        parsed_submission_uuid = uuid.UUID(str(submission_uuid))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError('submission_uuid must be a UUID.') from error
+    canonical_submission_uuid = str(parsed_submission_uuid)
+    if (isinstance(submission_uuid, str) and
+            submission_uuid != canonical_submission_uuid):
+        raise ValueError('submission_uuid must be a canonical UUID string.')
+    response = server_common.make_authenticated_request(
+        'POST',
+        server_constants.ORDINARY_LAUNCH_BINDING_PATH,
+        json={
+            'submission_uuid': canonical_submission_uuid,
+            'launch': json.loads(prepared_request.submitted_bytes),
+        },
+        timeout=5)
+    server_common.handle_request_error(response)
+    try:
+        binding = responses.OrdinaryLaunchBindingResponse.model_validate(
+            response.json())
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            'Ordinary Serve launch binding returned a malformed response.') \
+            from error
+    if str(binding.submission_uuid) != canonical_submission_uuid:
+        raise RuntimeError(
+            'Ordinary Serve launch binding returned a different submission '
+            'UUID.')
+    return server_common.RequestId[tuple[int | None,
+                                         Optional['backends.ResourceHandle']]](
+                                             str(binding.request_id))
 
 
 @usage_lib.entrypoint
@@ -2727,6 +2769,8 @@ def api_status(
     _execution_quiescence_candidates_only: bool = False,
     _exact_request_ids: bool = False,
     _use_body: bool = False,
+    _request_timeout_seconds: float | None = None,
+    _retry_on_server_unavailable: bool = True,
 ) -> list[payloads.RequestPayload]:
     """Lists all requests.
 
@@ -2750,6 +2794,10 @@ def api_status(
             query them in one server-side batch instead of as prefixes.
         _use_body: Use the v70 body-backed endpoint for a potentially large
             filter set.
+        _request_timeout_seconds: Internal bounded connect/read timeout. The
+            default preserves the ordinary unbounded status-read contract.
+        _retry_on_server_unavailable: Internal switch for callers that own a
+            bounded, best-effort observation rather than an operator request.
 
     Returns:
         A list of request payloads.
@@ -2761,6 +2809,11 @@ def api_status(
     if cluster_name is not None and cluster_names is not None:
         raise ValueError('cluster_name and cluster_names are mutually '
                          'exclusive.')
+    if (_request_timeout_seconds is not None and
+        (isinstance(_request_timeout_seconds, bool) or
+         not isinstance(_request_timeout_seconds,
+                        (int, float)) or _request_timeout_seconds <= 0)):
+        raise ValueError('_request_timeout_seconds must be positive.')
 
     # Backward compatibility check for the new flag cluster_name
     version = versions.get_remote_api_version()
@@ -2798,12 +2851,20 @@ def api_status(
         request_kwargs = {
             'params': server_common.request_body_to_params(body),
         }
+    request_timeout: float | tuple[int, None]
+    if _request_timeout_seconds is None:
+        request_timeout = (
+            client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS, None)
+    else:
+        request_timeout = _request_timeout_seconds
     response = server_common.make_authenticated_request(
         'POST' if use_body else 'GET',
         '/api/status/query' if use_body else '/api/status',
         **request_kwargs,
-        timeout=(client_common.API_SERVER_REQUEST_CONNECTION_TIMEOUT_SECONDS,
-                 None))
+        timeout=request_timeout,
+        retry=_retry_on_server_unavailable,
+        allow_non_get_without_retry=(use_body and
+                                     not _retry_on_server_unavailable))
     server_common.handle_request_error(response)
     return [payloads.RequestPayload(**request) for request in response.json()]
 
@@ -2921,27 +2982,9 @@ def api_stop() -> None:
     # stopping and starting the API server at the same time.
     with filelock.FileLock(
             os.path.expanduser(constants.API_SERVER_CREATION_LOCK_PATH)):
-        try:
-            records = scheduler.get_controller_process_records()
-            if records is not None:
-                for record in records:
-                    try:
-                        if managed_job_utils.controller_process_alive(
-                                record, quiet=False):
-                            subprocess_utils.kill_children_processes(
-                                parent_pids=[record.pid], force=True)
-                    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                        continue
-                os.remove(os.path.expanduser(scheduler.JOB_CONTROLLER_PID_PATH))
-        except FileNotFoundError:
-            # its fine we will create it
-            pass
-        except Exception as e:  # pylint: disable=broad-except
-            # in case we get perm issues or something is messed up, just ignore
-            # it and assume the process is dead
-            logger.error(f'Error looking at job controller pid file: {e}')
-            pass
-
+        # The runtime owns and drains managed-job slot families before its
+        # process exits.  The CLI has no cross-process PID authority and must
+        # not race that supervisor with an independent process-tree scan.
         found = _local_api_server_running(kill=True)
 
     if found:

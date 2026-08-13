@@ -209,6 +209,39 @@ def test_root_close_rejects_new_children_but_existing_child_drains() -> None:
     _join(legacy_thread)
 
 
+def test_root_child_drain_timeout_is_bounded_and_keeps_gate_closed() -> None:
+    gate = provider_phase._ProviderPhaseGate()
+    child_entered = threading.Event()
+    child_release = threading.Event()
+    child_thread: threading.Thread | None = None
+
+    def child(admission: provider_phase.ProviderPhaseAdmission) -> None:
+        with gate.join(admission):
+            child_entered.set()
+            assert child_release.wait(timeout=2)
+
+    started = time.monotonic()
+    with pytest.raises(exceptions.ProviderPhaseTimeoutError,
+                       match='draining provider phase child users'):
+        with gate.try_phase(_V2, child_drain_timeout_seconds=0.03) as admission:
+            child_thread = threading.Thread(target=child, args=(admission,))
+            child_thread.start()
+            assert child_entered.wait(timeout=1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    # A non-cooperative child cannot make root exit wait forever, and it also
+    # cannot allow the incompatible authority mode to overlap its live work.
+    with pytest.raises(exceptions.ProviderPhaseBusyError):
+        with gate.try_phase(_LEGACY):
+            pass
+    child_release.set()
+    assert child_thread is not None
+    _join(child_thread)
+    with gate.try_phase(_LEGACY):
+        pass
+
+
 def test_same_mode_reentrancy_and_cross_mode_rejection() -> None:
     gate = provider_phase._ProviderPhaseGate()
     with gate.phase(_V2, timeout_seconds=0) as outer:

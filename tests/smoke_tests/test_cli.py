@@ -251,7 +251,7 @@ def test_debug_dump_recent(generic_cloud: str):
         'debug_dump_recent',
         [
             # Any positive value works for --recent-minutes: the server always
-            # injects a handful of system daemon request IDs into every dump
+            # injects finite system diagnostic request IDs into every dump
             # regardless of the time window, so request_count > 0 is always
             # satisfied. We use 5 rather than 60 because on a shared CI server
             # that runs tests continuously, a 60-minute window collects
@@ -274,7 +274,7 @@ def test_debug_dump_recent(generic_cloud: str):
             'assert \\\"requested\\\" in d; '
             'assert \\\"collected\\\" in d; '
             'assert d[\\\"collected\\\"][\\\"request_count\\\"] > 0, '
-            '\\\"system daemon requests should always be collected\\\"; '
+            '\\\"system diagnostic requests should always be collected\\\"; '
             '"',
             # Verify server_info.json has enriched fields
             'cd /tmp/test_debug_dump_recent/debug_dump_* && '

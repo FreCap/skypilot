@@ -254,6 +254,7 @@ def test_resource_action_existing_table_columns_are_dialect_portable():
         'down_shadow_coverage_id',
         'launch_shadow_sample_id',
         'down_shadow_sample_id',
+        'ordinary_launch_association_id',
     }
     assert serve_state._ACTION_OWNED_REPLICA_COLUMNS == uuid_columns | {
         'desired_generation',
@@ -271,6 +272,18 @@ def test_resource_action_existing_table_columns_are_dialect_portable():
         assert column_type.compile(dialect=postgresql.dialect()) == 'UUID'
     assert isinstance(serve_state.replicas_table.c.desired_generation.type,
                       sqlalchemy.BigInteger)
+
+
+def test_controller_incarnation_uses_only_a_dialect_native_server_default():
+    column = serve_state.services_table.c.controller_incarnation
+    assert column.default is None
+    assert column.server_default is not None
+    postgres_default = str(
+        column.server_default.arg.compile(dialect=postgresql.dialect()))
+    sqlite_default = str(
+        column.server_default.arg.compile(dialect=sqlite.dialect()))
+    assert postgres_default == 'gen_random_uuid()'
+    assert 'randomblob' in sqlite_default
 
 
 def test_serve_state_database_manager_owns_historical_bootstrap():

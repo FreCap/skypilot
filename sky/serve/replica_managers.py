@@ -2,6 +2,7 @@
 import asyncio
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 import contextlib
 import dataclasses
@@ -30,18 +31,22 @@ from sky import resources as resources_lib
 from sky import sky_logging
 from sky import skypilot_config
 from sky import task as task_lib
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
 from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
+from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
+from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_tls
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -67,6 +72,7 @@ from sky.utils import yaml_utils
 if typing.TYPE_CHECKING:
 
     from sky.serve import service_spec
+    from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
     from sky.serve.replica_info import ReplicaInfo
     from sky.serve.replica_info import ReplicaStatusProperty
     SpotPlacerType: typing.TypeAlias = spot_placer.SpotPlacer
@@ -75,6 +81,10 @@ else:
     ReplicaInfo = replica_info_lib.ReplicaInfo
 
 logger = sky_logging.init_logger(__name__)
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
+request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+requests = adaptors_common.LazyImport('requests')
 
 # Keep the established replica_managers import and pickle identities while the
 # versioned record implementation lives in its own low-state module.
@@ -145,10 +155,33 @@ _CHANGED_ONLY_READINESS_PERSISTENCE_ENV_VAR = (
 # measurement blackout, keep only a few probes per ACTIVE zero-cost shape.
 # Four matches SkyServe's historical per-service launch parallelism.
 _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
+# Physical-cluster capture has its own bounded 30-second provider deadline.
+# This slightly larger coordination bound is one absolute deadline for the
+# complete parallel batch, not a fresh allowance for every context.  Provider
+# I/O remains outside the manager mutex.
+_RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS = 45
+_RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS = 1
 # Sentinel for drain registration's optional pre-resolved replica URL. ``None``
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
 _REPLICA_URL_NOT_PROVIDED: Any = object()
+
+
+def replica_may_consume_physical_capacity(info: Any) -> bool:
+    """Whether a durable row may still own its provider capacity.
+
+    Terminal status is a routing/lifecycle property, not cleanup evidence.
+    Keep every row in capacity accounting until teardown has durably
+    succeeded; deleting the row is the other proof and naturally removes it
+    from the caller's snapshot.  Missing or malformed teardown state therefore
+    fails closed.
+    """
+    if not info.is_terminal:
+        return True
+    status_property = getattr(info, 'status_property', None)
+    return (status_property is None or
+            getattr(status_property, 'sky_down_status',
+                    None) != common_utils.ProcessStatus.SUCCEEDED)
 
 
 def _changed_only_readiness_persistence_enabled() -> bool:
@@ -212,16 +245,46 @@ class _ReplicaLaunchResult:
     funding: _ReplicaLaunchFunding
 
 
+@dataclasses.dataclass
+class _ReservedFillPhysicalPreflight:
+    """One concurrently initialized physical-identity capture."""
+
+    kubernetes_context: str
+    physical_cluster_uid: str
+    ready: threading.Event = dataclasses.field(default_factory=threading.Event)
+    release: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    cancellation: threading.Event = dataclasses.field(
+        default_factory=threading.Event)
+    error: BaseException | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReservedFillPhysicalPreflightBatch:
+    """Shared deadline and independently cancelable preflight holders."""
+
+    preflights: dict[tuple[str, str], _ReservedFillPhysicalPreflight]
+    threads: tuple[threading.Thread, ...]
+    deadline_monotonic: float
+
+
 class _ReplicaLaunchThread(thread_utils.SafeThread):
     """Launch worker that publishes a joinable completion notification."""
 
-    def __init__(self, *args: Any, replica_id: int,
+    def __init__(self,
+                 *args: Any,
+                 replica_id: int,
                  completion_queue: 'queue.SimpleQueue[int]',
-                 completion_event: threading.Event, **kwargs: Any) -> None:
+                 completion_event: threading.Event,
+                 bound_ordinary_launch: bool = False,
+                 ordinary_legacy_launch: bool = False,
+                 **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._completion_replica_id = replica_id
         self._completion_queue = completion_queue
         self._completion_event = completion_event
+        self.bound_ordinary_launch = bound_ordinary_launch
+        self.ordinary_legacy_launch = ordinary_legacy_launch
 
     def run(self) -> None:
         try:
@@ -369,6 +432,45 @@ class _ReplicaLaunchOwnershipLostError(RuntimeError):
 
 class _ReplicaLaunchSupersededError(RuntimeError):
     """A queued logical launch lost its exact-card target authority."""
+
+
+class _BoundOrdinaryLaunchUnresolvedError(RuntimeError):
+    """A bound request cannot safely be replaced or projected yet."""
+
+
+class _BoundOrdinaryLaunchTerminalError(RuntimeError):
+    """An exactly projected bound request finished without a launch."""
+
+
+class _BoundOrdinaryLaunchPreEffectTerminalError(
+        _BoundOrdinaryLaunchTerminalError):
+    """A bound request failed before either external-effect boundary."""
+
+
+def _bound_submission_may_have_committed(error: BaseException) -> bool:
+    """Whether submission failed at a boundary that can lose a committed ACK.
+
+    A deterministic 4xx response proves that the server rejected this exact
+    payload.  Inspecting and adopting an older replica pointer in that case
+    would turn a digest/identity conflict into success.  Network failures,
+    server failures, and response-decoding failures rooted in a truncated
+    transport remain ambiguous and may be resolved through the exact pointer.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, requests.exceptions.HTTPError):
+            response = getattr(current, 'response', None)
+            status_code = getattr(response, 'status_code', None)
+            return (not isinstance(status_code, int) or status_code >= 500)
+        if isinstance(current, requests.exceptions.RequestException):
+            return True
+        if isinstance(current, (exceptions.RequestInterruptedError,
+                                exceptions.ServerTemporarilyUnavailableError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 class _ReplicaLaunchCapacityError(RuntimeError):
@@ -550,6 +652,377 @@ def adopt_system_recovery_launch(
             f'candidate replica {replica_id}.')
 
 
+def _bound_projection_classification(projection: Any) -> str:
+    classification = getattr(projection, 'disposition', None)
+    if classification is None:
+        classification = getattr(projection, 'classification', None)
+    if isinstance(classification, enum.Enum):
+        classification = classification.value
+    if not isinstance(classification, str) or not classification:
+        raise _BoundOrdinaryLaunchUnresolvedError(
+            'The exact ordinary-launch reducer returned no classification.')
+    return classification
+
+
+def _bound_reduction_request_id(reduction: Any) -> str:
+    request = getattr(reduction, 'request', None)
+    request_id = getattr(request, 'request_id', None)
+    if request_id is None:
+        request_id = getattr(reduction, 'request_id', None)
+    if not isinstance(request_id, str) or not request_id:
+        raise _BoundOrdinaryLaunchUnresolvedError(
+            'The exact ordinary-launch association returned no request ID.')
+    return request_id
+
+
+def _decoded_bound_request_error(error: Any) -> BaseException | None:
+    """Extract the exception from the exact durable request error shape."""
+    if isinstance(error, BaseException):
+        return error
+    if not isinstance(error, dict):
+        return None
+    error_object = error.get('object')
+    error_type = error.get('type')
+    error_message = error.get('message')
+    if (set(error) != {'object', 'type', 'message'} or
+            not isinstance(error_object, BaseException) or
+            error_type != type(error_object).__name__ or
+            error_message != str(error_object)):
+        return None
+    return error_object
+
+
+def _wait_for_bound_ordinary_launch(
+    replica_id: int,
+    cluster_name: str,
+    request_id: str,
+    stream_logs: bool,
+    launch_cloud: clouds.Cloud | None,
+    reduce_exact: Callable[[Any, BaseException | None], Any],
+    cancel_exact: Callable[[str], Any],
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+    continue_guard: Callable[[], bool] | None = None,
+    supersession_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+) -> None:
+    """Adopt, quiesce, and reduce one exact durable request binding."""
+    cancel_reason: str | None = None
+    cancel_committed = False
+    cancellation_failures = 0
+    cancel_projection: Any = None
+
+    def _still_owned() -> bool:
+        if continue_guard is not None:
+            try:
+                owned = continue_guard()
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to verify bound ordinary-launch ownership; '
+                    'detaching: %s', common_utils.format_exception(error))
+                return False
+            return owned
+        return True
+
+    def _raise_if_owner_lost() -> None:
+        if _still_owned():
+            return
+        # Controller replacement transfers the durable association. It is not
+        # a cancellation decision, and the successor adopts the exact pointer.
+        raise _ReplicaLaunchOwnershipLostError(
+            f'Detaching bound ordinary launch for replica {replica_id} after '
+            'controller ownership loss.')
+
+    def _observe_cancel_reason() -> str | None:
+        nonlocal cancel_reason
+
+        if cancel_reason is None and replica_to_launch_cancelled.get(
+                replica_id, False):
+            replica_to_launch_cancelled.pop(replica_id)
+            cancel_reason = 'replica-teardown'
+        if cancel_reason is None and supersession_guard is not None:
+            try:
+                decision = supersession_guard()
+            except Exception as error:  # pylint: disable=broad-except
+                decision = (False, f'guard-error-{type(error).__name__}')
+            if isinstance(decision, bool):
+                allowed = decision
+                reason = 'guard-rejected'
+            elif (isinstance(decision, tuple) and len(decision) == 2 and
+                  isinstance(decision[0], bool) and
+                  isinstance(decision[1], str) and decision[1]):
+                allowed, reason = decision
+            else:
+                allowed, reason = False, 'invalid-guard-result'
+            if not allowed:
+                cancel_reason = reason[:128]
+        return cancel_reason
+
+    def _commit_cancel_if_needed() -> None:
+        nonlocal cancel_committed, cancellation_failures, cancel_projection
+        reason = _observe_cancel_reason()
+        if reason is not None and not cancel_committed:
+            try:
+                cancel_result = cancel_exact(reason)
+                if cancel_result is None or cancel_result is False:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Exact ordinary-launch cancellation found no binding.')
+                cancellation_failures = 0
+                cancel_committed = True
+                cancel_projection = cancel_result
+            except Exception as error:  # pylint: disable=broad-except
+                cancellation_failures += 1
+                if (cancellation_failures == 1 or
+                        cancellation_failures % 10 == 0):
+                    logger.warning(
+                        'Exact cancellation for bound replica %s is not yet '
+                        'committed (attempt %s): %s', replica_id,
+                        cancellation_failures,
+                        common_utils.format_exception(error))
+                raise
+
+    def _request_status(projection: Any) -> str | None:
+        request = getattr(projection, 'request', None)
+        status = getattr(request, 'status', None)
+        if isinstance(status, enum.Enum):
+            status = status.value
+        return status if isinstance(status, str) else None
+
+    def _request_error(projection: Any) -> BaseException | None:
+        request = getattr(projection, 'request', None)
+        error = getattr(request, 'error', None)
+        return _decoded_bound_request_error(error)
+
+    def _finish_projection(projection: Any,
+                           waiter_error: BaseException | None = None) -> None:
+        classification = _bound_projection_classification(projection)
+        if classification == 'AMBIGUOUS':
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                f'Bound ordinary launch for replica {replica_id} is '
+                'durably ambiguous; refusing a successor or cleanup.')
+        if not (getattr(projection, 'projected', False) or classification
+                in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                f'Bound ordinary launch for replica {replica_id} returned '
+                f'nonterminal classification {classification!r}.')
+
+        status = _request_status(projection)
+        request_error = _request_error(projection)
+        exact_error = request_error or waiter_error
+        persisted_cancel_reason = getattr(projection, 'cancel_reason', None)
+        if (persisted_cancel_reason is not None and
+            (not isinstance(persisted_cancel_reason, str) or
+             not persisted_cancel_reason)):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch returned a malformed durable cancel '
+                'reason.')
+        if (cancel_reason is not None and
+                persisted_cancel_reason is not None and
+                cancel_reason != persisted_cancel_reason):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch local and durable cancellation '
+                'reasons disagree.')
+        effective_cancel_reason = persisted_cancel_reason or cancel_reason
+        if effective_cancel_reason is not None:
+            if effective_cancel_reason == 'replica-teardown':
+                # Teardown owns the next action.  Exact projection has cleared
+                # the request pointer, so its caller may now proceed to down.
+                return
+            raise _ReplicaLaunchSupersededError(
+                f'Bound ordinary launch for replica {replica_id} was '
+                'cancelled after supersession: '
+                f'reason={effective_cancel_reason}.')
+        if classification == 'PRE_EFFECT_TERMINAL':
+            error = _BoundOrdinaryLaunchPreEffectTerminalError(
+                f'Bound ordinary launch for replica {replica_id} terminated '
+                'before provider or service-job I/O; the projected failure '
+                'is safe for a later retry generation.')
+            if exact_error is not None:
+                raise error from exact_error
+            raise error
+        if status == 'SUCCEEDED':
+            if exact_error is not None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound ordinary launch for replica {replica_id} has a '
+                    'successful durable result but its exact waiter failed.'
+                ) from exact_error
+            return
+        if (isinstance(exact_error, exceptions.ResourcesUnavailableError) and
+                launch_cloud is not None):
+            reason = cloud_vm_ray_backend.classify_resources_unavailable_error(
+                launch_cloud, exact_error)
+            if reason is not None:
+                raise _ReplicaLaunchCapacityError(
+                    f'Bound ordinary launch for replica {replica_id} failed '
+                    f'due to provider {reason}.',
+                    reason=reason) from exact_error
+        if exact_error is not None:
+            raise exact_error
+        raise _BoundOrdinaryLaunchTerminalError(
+            f'Bound ordinary launch for replica {replica_id} projected '
+            f'terminal status {status!r} without a launch result.')
+
+    reduction_failures = 0
+
+    def _reduce_until_wait_or_terminal(
+            waiter_result: Any = None,
+            waiter_error: BaseException | None = None) -> str:
+        """Drive the reducer and return only when an active wait is needed."""
+        nonlocal reduction_failures, cancel_projection, cancel_reason
+        nonlocal cancel_committed
+        while True:
+            _raise_if_owner_lost()
+            try:
+                _commit_cancel_if_needed()
+            except Exception:  # pylint: disable=broad-except
+                time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+                continue
+            try:
+                if cancel_projection is not None:
+                    projection = cancel_projection
+                    cancel_projection = None
+                else:
+                    projection = reduce_exact(waiter_result, waiter_error)
+            except Exception as error:  # pylint: disable=broad-except
+                reduction_failures += 1
+                if reduction_failures == 1 or reduction_failures % 10 == 0:
+                    logger.warning(
+                        'Exact ordinary-launch reduction for replica %s is '
+                        'temporarily unavailable (attempt %s): %s',
+                        replica_id, reduction_failures,
+                        common_utils.format_exception(error))
+                time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+                continue
+            reduction_failures = 0
+            if projection is None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound ordinary launch for replica {replica_id} lost '
+                    'its exact durable pointer.')
+            classification = _bound_projection_classification(projection)
+            if (getattr(projection, 'projected', False) or
+                    classification in ('PROJECTED', 'PRE_EFFECT_TERMINAL',
+                                       'SETTLED', 'AMBIGUOUS')):
+                # A reducer may atomically finish a recovered CANCEL_REQUESTED
+                # row (including expired NOT_STARTED ownership). Its pointer
+                # and pin are already cleared, so attempting cancel redelivery
+                # after projection would target a deliberately settled row.
+                _finish_projection(projection, waiter_error)
+                return 'TERMINAL'
+            durable_cancel_reason = getattr(projection, 'cancel_reason', None)
+            if durable_cancel_reason is not None:
+                if (not isinstance(durable_cancel_reason, str) or
+                        not durable_cancel_reason):
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Bound ordinary launch returned a malformed durable '
+                        'cancel reason.')
+                if (cancel_reason is not None and
+                        cancel_reason != durable_cancel_reason):
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Bound ordinary launch local and durable '
+                        'cancellation reasons disagree.')
+                if cancel_reason is None:
+                    # A replacement controller recovered a previously
+                    # committed cancel intent.  Redeliver the exact API cancel
+                    # before waiting; association CAS makes this idempotent.
+                    cancel_reason = durable_cancel_reason
+                    cancel_committed = False
+                if not cancel_committed:
+                    continue
+            if classification == 'ADOPT_ACTIVE':
+                return classification
+            if classification not in ('WAIT_QUIESCENCE', 'REDUCE_TERMINAL',
+                                      'PRE_EFFECT_TERMINALIZE'):
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound ordinary launch for replica {replica_id} returned '
+                    f'unknown classification {classification!r}.')
+            # A terminal request can precede its executor's exact-generation
+            # acknowledgement.  It cannot be replaced or cleaned up yet; poll
+            # the one reducer transaction rather than guessing from sdk.get().
+            time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+
+    # Classify before blocking in sdk.get().  In particular this closes the
+    # generation-zero terminalization case: an active request whose queue row
+    # vanished has no executor that could ever wake an SDK waiter, but its
+    # NOT_STARTED effect phase makes exact terminalization safe.
+    if _reduce_until_wait_or_terminal() == 'TERMINAL':
+        return
+
+    launch_request_id = server_common.RequestId[tuple[int | None,
+                                                      backends.ResourceHandle |
+                                                      None]](request_id)
+    result_box: list[Any] = []
+    parent_context = context.get()
+
+    def _wait_exact_request() -> None:
+        with context.initialize(parent_context):
+            if stream_logs:
+                result_box.append(sdk.stream_and_get(launch_request_id))
+            else:
+                result_box.append(sdk.get(launch_request_id))
+
+    # The exact SDK wait preserves typed results/errors and the normal log
+    # stream. Keeping it in a daemon child lets controller replacement detach
+    # promptly without cancelling the durable request it just handed off.
+    exact_waiter = thread_utils.SafeThread(
+        target=_wait_exact_request,
+        name=f'replica-{replica_id}-bound-request-wait',
+        daemon=True)
+    exact_waiter.start()
+    while exact_waiter.is_alive():
+        _raise_if_owner_lost()
+        # Drive claim expiry and terminal/quiescence even while the SDK waiter
+        # is still blocked. Bound requests are intentionally excluded from the
+        # generic queue reaper because only this association-aware reducer can
+        # distinguish NOT_STARTED settlement from post-effect ambiguity.
+        if _reduce_until_wait_or_terminal() == 'TERMINAL':
+            return
+        exact_waiter.join(timeout=_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+    exact_waiter.join()
+    exact_error = exact_waiter.exception
+    launch_result = result_box[0] if result_box else None
+    if exact_error is None:
+        result_is_exact = False
+        if isinstance(launch_result, tuple) and len(launch_result) == 2:
+            service_job_id, handle = launch_result  # pylint: disable=unpacking-non-sequence
+            result_is_exact = bool(
+                not isinstance(service_job_id, bool) and
+                isinstance(service_job_id, int) and service_job_id > 0 and
+                isinstance(handle, backends.CloudVmRayResourceHandle) and
+                handle.cluster_name == cluster_name)
+        if not result_is_exact:
+            exact_error = _BoundOrdinaryLaunchUnresolvedError(
+                f'Bound request {request_id} returned a malformed or '
+                f'mismatched result for replica {replica_id}.')
+    _reduce_until_wait_or_terminal(launch_result, exact_error)
+
+
+@context.contextual
+def adopt_bound_ordinary_launch(
+    replica_id: int,
+    cluster_name: str,
+    log_file: str,
+    request_id: str,
+    launch_cloud: clouds.Cloud | None,
+    reduce_exact: Callable[[Any, BaseException | None], Any],
+    cancel_exact: Callable[[str], Any],
+    replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
+    continue_guard: Callable[[], bool] | None = None,
+    supersession_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+) -> None:
+    """Adopt only the association named by the exact replica pointer."""
+    ctx = context.get()
+    assert ctx is not None, 'Context is not initialized'
+    ctx.redirect_log(pathlib.Path(log_file))
+    _wait_for_bound_ordinary_launch(replica_id,
+                                    cluster_name,
+                                    request_id,
+                                    False,
+                                    launch_cloud,
+                                    reduce_exact,
+                                    cancel_exact,
+                                    replica_to_launch_cancelled,
+                                    continue_guard=continue_guard,
+                                    supersession_guard=supersession_guard)
+
+
 # TODO(tian): Combine this with
 # sky/spot/recovery_strategy.py::StrategyExecutor::launch
 # Use context.contextual to enable per-launch output redirection.
@@ -580,6 +1053,16 @@ def launch_cluster(
     None = None,
     persist_system_recovery_job_id: Callable[[str, int], bool] | None = None,
     demote_system_recovery_candidate: Callable[[], bool] | None = None,
+    ordinary_launch_handoff_context: dict[str, Any] | None = None,
+    ordinary_launch_event: Callable[[
+        ordinary_launch_handoff.EventKind, str | None, int |
+        None, ordinary_launch_handoff.TerminalStatus | None
+    ], None] | None = None,
+    ordinary_launch_submission_uuid: str | None = None,
+    inspect_bound_ordinary_launch: Callable[[], Any] | None = None,
+    reduce_bound_ordinary_launch: Callable[[Any, BaseException | None], Any] |
+    None = None,
+    cancel_bound_ordinary_launch: Callable[[str], Any] | None = None,
 ) -> None:
     """Launch a sky serve replica cluster.
 
@@ -637,6 +1120,54 @@ def launch_cluster(
             kubernetes_context=protocol_v2_fence.kubernetes_context,
             physical_cluster_uid=protocol_v2_fence.physical_cluster_uid))
 
+    def _emit_ordinary_launch_event(
+        event_kind: ordinary_launch_handoff.EventKind,
+        request_id: str | None = None,
+        service_job_id: int | None = None,
+        terminal_status: ordinary_launch_handoff.TerminalStatus | None = None
+    ) -> None:
+        if ordinary_launch_event is None:
+            return
+        try:
+            ordinary_launch_event(event_kind, request_id, service_job_id,
+                                  terminal_status)
+        except Exception as error:  # pylint: disable=broad-except
+            # Telemetry is never part of launch correctness or availability.
+            logger.debug('Ordinary-launch telemetry callback failed: %s', error)
+
+    def _lookup_terminal_status(request_id: str) -> str | None:
+        request_payloads = sdk.api_status(
+            request_ids=[request_id],
+            fields=['request_id', 'status'],
+            _exact_request_ids=True,
+            _use_body=True,
+            _request_timeout_seconds=(
+                ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
+            _retry_on_server_unavailable=False)
+        exact_matches = [
+            request for request in request_payloads
+            if request.request_id == request_id
+        ]
+        if len(exact_matches) != 1:
+            return None
+        status = exact_matches[0].status
+        return status if isinstance(status, str) else None
+
+    def _observe_terminal_nonblocking(request_id: str) -> None:
+        if ordinary_launch_event is None:
+            return
+
+        def _emit_terminal(
+                terminal_status: ordinary_launch_handoff.TerminalStatus
+        ) -> None:
+            _emit_ordinary_launch_event(
+                ordinary_launch_handoff.EventKind.API_TERMINAL,
+                request_id,
+                terminal_status=terminal_status)
+
+        ordinary_launch_handoff.observe_terminal_nonblocking(
+            request_id, lookup=_lookup_terminal_status, emit=_emit_terminal)
+
     def _check_is_cancelled() -> bool:
         is_cancelled = replica_to_launch_cancelled.get(replica_id, False)
         if is_cancelled:
@@ -649,6 +1180,20 @@ def launch_cluster(
     launch_superseded = threading.Event()
     supersession_reason = ['unknown']
     supersession_cancel_failures = 0
+    ownership_loss_cancel_event_lock = threading.Lock()
+    ownership_loss_cancel_event_request_ids: set[str] = set()
+
+    def _emit_owner_loss_cancel_request_once(request_id: str) -> None:
+        """Record local cancellation intent once; it is not terminal proof."""
+        if recovery_request_attempted:
+            return
+        with ownership_loss_cancel_event_lock:
+            if request_id in ownership_loss_cancel_event_request_ids:
+                return
+            ownership_loss_cancel_event_request_ids.add(request_id)
+        _emit_ordinary_launch_event(
+            ordinary_launch_handoff.EventKind.OWNER_LOSS_CANCEL_REQUESTED,
+            request_id)
 
     def _guard_allows(guard: Callable[[], bool] | None) -> bool:
         if guard is None:
@@ -705,10 +1250,16 @@ def launch_cluster(
 
     def _cancel_request_for_ownership_loss() -> None:
         ownership_lost.set()
+        if ordinary_launch_submission_uuid is not None:
+            # A capable successor atomically transfers this association and
+            # adopts the same API request.  Process-local owner loss is never a
+            # durable cancellation decision for a bound launch.
+            return
         replica_to_launch_cancelled[replica_id] = True
         request_id = replica_to_request_id.get(replica_id)
         if request_id is None:
             return
+        _emit_owner_loss_cancel_request_once(request_id)
         try:
             sdk.api_cancel(request_id)
         except Exception as e:  # pylint: disable=broad-except
@@ -728,7 +1279,15 @@ def launch_cluster(
         if request_id is None:
             return True
         try:
-            sdk.api_cancel(request_id)
+            if ordinary_launch_submission_uuid is not None:
+                if cancel_bound_ordinary_launch is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Bound launch has no exact cancellation callback.')
+                if not cancel_bound_ordinary_launch(reason):
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Exact bound launch cancellation was not committed.')
+            else:
+                sdk.api_cancel(request_id)
         except Exception as e:  # pylint: disable=broad-except
             supersession_cancel_failures += 1
             if (supersession_cancel_failures == 1 or
@@ -844,6 +1403,129 @@ def launch_cluster(
 
     if availability_max_retry is None:
         availability_max_retry = max_retry
+
+    if ordinary_launch_submission_uuid is not None:
+        if recovery_context_available or protocol_v2_fence is not None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Special recovery and reserved-fill launches cannot enter the '
+                'ordinary binding path.')
+        if (launch_fence is None or inspect_bound_ordinary_launch is None or
+                reduce_bound_ordinary_launch is None or
+                cancel_bound_ordinary_launch is None):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch requires complete context and exact '
+                'inspection, reduction, and cancellation authority.')
+        bound_workspace_ctx: contextlib.AbstractContextManager = (
+            skypilot_config.local_active_workspace_ctx(workspace)
+            if workspace is not None else contextlib.nullcontext())
+        usage_lib.messages.usage.set_internal()
+        with bound_workspace_ctx:
+            # Freeze once. Every transport retry below submits these exact
+            # bytes with the same controller-generated UUID.
+            prepared_request = sdk.prepare_launch_request(
+                task,
+                cluster_name,
+                retry_until_up=retry_until_up,
+                _is_launched_by_sky_serve_controller=True,
+                _extra_launch_context=launch_fence)
+        expected_input_digest = ordinary_launch_binding.canonical_launch_digest(
+            prepared_request.body)
+        submit_backoff = common_utils.Backoff(_RETRY_INIT_GAP_SECONDS)
+        request_id = None
+        adopted_after_lost_ack = False
+        for submit_attempt in range(1, max_retry + 1):
+            if _check_is_cancelled():
+                return
+            _assert_launch_not_superseded()
+            cloud_launch_allowed, cloud_launch_reason = _cloud_guard_decision()
+            if not cloud_launch_allowed:
+                raise _ReplicaLaunchSupersededError(
+                    f'Refusing superseded cloud launch for replica '
+                    f'{replica_id}: reason={cloud_launch_reason}.')
+            _assert_launch_authorized()
+            try:
+                with (skypilot_config.local_active_workspace_ctx(workspace)
+                      if workspace is not None else contextlib.nullcontext()):
+                    request_id = (sdk.submit_prepared_ordinary_launch_request(
+                        prepared_request, ordinary_launch_submission_uuid))
+                break
+            except Exception as error:  # pylint: disable=broad-except
+                if not _bound_submission_may_have_committed(error):
+                    # A deterministic rejection (most importantly a 4xx digest
+                    # or identity conflict) cannot be converted into a lost-ACK
+                    # adoption of some older exact replica pointer.
+                    raise
+                # A response may be lost after the atomic transaction commits.
+                # Resolve only through this replica record's exact durable
+                # pointer; request history/latest inference is forbidden.
+                try:
+                    snapshot = inspect_bound_ordinary_launch()
+                except Exception as inspect_error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Could not inspect exact bound admission for replica '
+                        '%s after transport failure: %s', replica_id,
+                        common_utils.format_exception(inspect_error))
+                else:
+                    if snapshot is not None:
+                        snapshot_context = getattr(snapshot, 'context', None)
+                        snapshot_digest = getattr(snapshot_context,
+                                                  'input_digest', None)
+                        if snapshot_digest != expected_input_digest:
+                            raise _BoundOrdinaryLaunchUnresolvedError(
+                                'Lost-ACK inspection found a bound request with '
+                                'a different canonical launch digest.'
+                            ) from error
+                        exact_request_id = _bound_reduction_request_id(snapshot)
+                        request_id = server_common.RequestId[tuple[
+                            int | None,
+                            backends.ResourceHandle | None]](exact_request_id)
+                        adopted_after_lost_ack = True
+                        logger.warning(
+                            'Adopting exact bound request %s for replica %s '
+                            'after its admission acknowledgement was lost.',
+                            request_id, replica_id)
+                        break
+                if submit_attempt >= max_retry:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        f'Could not resolve bound ordinary launch admission for '
+                        f'replica {replica_id} after {submit_attempt} exact '
+                        'submission attempt(s).') from error
+                delay = submit_backoff.current_backoff()
+                logger.warning(
+                    f'Bound ordinary launch admission for replica {replica_id} '
+                    f'did not acknowledge attempt {submit_attempt}; retrying '
+                    f'the same submission UUID in {delay:.1f} seconds.')
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    if _check_is_cancelled():
+                        return
+                    time.sleep(min(0.1, deadline - time.monotonic()))
+        assert request_id is not None
+        logger.info(f'Replica cluster {cluster_name} bound launch requested '
+                    f'with request_id: {request_id}.')
+        replica_to_request_id[replica_id] = request_id
+        _emit_ordinary_launch_event(
+            ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED, request_id)
+        try:
+            _wait_for_bound_ordinary_launch(
+                replica_id,
+                cluster_name,
+                str(request_id),
+                not adopted_after_lost_ack,
+                next(iter(task.resources)).cloud,
+                reduce_bound_ordinary_launch,
+                cancel_bound_ordinary_launch,
+                replica_to_launch_cancelled,
+                continue_guard=continue_guard,
+                supersession_guard=supersession_guard)
+        except Exception:
+            _observe_terminal_nonblocking(request_id)
+            raise
+        _observe_terminal_nonblocking(request_id)
+        logger.info(f'Replica cluster {cluster_name} launch was exactly '
+                    'projected.')
+        return
+
     # This remains the current launch retry/request owner.  A future bounded
     # request-binding change may make the exact request association durable,
     # but the retired action-authority design does not deprecate this loop.
@@ -886,6 +1568,17 @@ def launch_cluster(
             launch_kwargs: dict[str, Any] = {}
             launch_context = (system_recovery_launch_context
                               if recovery_context_available else launch_fence)
+            if (ordinary_launch_handoff_context is not None and
+                    not recovery_context_available):
+                # Reuse the existing internal launch context transport.  This
+                # metadata is diagnostic only and remains separate from every
+                # provider-authority fence inside one nested versioned value.
+                # The initial recovery context is an exact-key contract; add
+                # this value only after durable demotion makes a retry ordinary.
+                launch_context = dict(launch_context or {})
+                launch_context[
+                    serve_constants.ORDINARY_LAUNCH_HANDOFF_CONTEXT_KEY] = (
+                        dict(ordinary_launch_handoff_context))
             if launch_context is not None:
                 launch_kwargs['_extra_launch_context'] = launch_context
             workspace_ctx: contextlib.AbstractContextManager = (
@@ -926,7 +1619,27 @@ def launch_cluster(
             logger.info(f'Replica cluster {cluster_name} launch requested '
                         f'with request_id: {request_id}.')
             replica_to_request_id[replica_id] = request_id
-            launch_result = _stream_with_launch_watchdogs(request_id)
+            if not recovery_request_attempted:
+                _emit_ordinary_launch_event(
+                    ordinary_launch_handoff.EventKind.REQUEST_PUBLISHED,
+                    request_id)
+            try:
+                launch_result = _stream_with_launch_watchdogs(request_id)
+            except Exception:  # pylint: disable=broad-except
+                if not recovery_request_attempted:
+                    _observe_terminal_nonblocking(request_id)
+                raise
+            if not recovery_request_attempted:
+                _observe_terminal_nonblocking(request_id)
+            service_job_id = (launch_result[0] if isinstance(
+                launch_result, tuple) and len(launch_result) == 2 and
+                              isinstance(launch_result[0], int) and
+                              not isinstance(launch_result[0], bool) and
+                              launch_result[0] > 0 else None)
+            if service_job_id is not None and not recovery_request_attempted:
+                _emit_ordinary_launch_event(
+                    ordinary_launch_handoff.EventKind.SERVICE_JOB_OBSERVED,
+                    request_id, service_job_id)
             _assert_launch_not_superseded()
             _assert_launch_authorized()
             if recovery_request_attempted:
@@ -1576,6 +2289,11 @@ def _is_protocol_v2_fill_override(
             protocol == reserved_capacity_broker.PROTOCOL_V2)
 
 
+def _is_lowercase_sha256(value: Any) -> bool:
+    return (type(value) is str and len(value) == 64 and
+            all(character in '0123456789abcdef' for character in value))
+
+
 def _conflicting_protocol_v2_fill_override_indexes(
     resources_overrides: typing.Sequence[Mapping[str, Any] | None],
 ) -> set[int]:
@@ -2160,6 +2878,13 @@ class ReplicaManager:
         for resources_override in resources_overrides:
             self.scale_up(resources_override)
 
+    def accept_reserved_fill(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Durably admit a typed protocol-v2 reserved-fill plan."""
+        del plan
+        raise NotImplementedError
+
     def scale_up_to_logical_capacity(
         self,
         target_capacity: int,
@@ -2408,6 +3133,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._manager_daemon_stop = threading.Event()
         self._scale_reconciliation_event = threading.Event()
         self._system_recovery_route_epoch = str(uuid.uuid4())
+        self._ordinary_launch_handoff_route_epoch = str(uuid.uuid4())
         self._system_recovery_route_registry = (
             system_recovery_route_lease.ManagerRouteLeaseRegistry())
         # Durable wall-clock anchors are restored separately. These monotonic
@@ -2424,6 +3150,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache: dict[int,
                                             service_spec.SkyServiceSpec] = {}
         self._provider_identity_uncertain_ids: set[int] = set()
+        self._ordinary_launch_binding_authority: (ControllerBindingAuthority |
+                                                  None) = None
+        self._ordinary_launch_binding_transition_lock = threading.Lock()
+        self._ordinary_launch_binding_transition_in_progress = (
+            threading.Event())
 
     def _publish_legacy_mutation_runtime_state(
             self, runtime: _LegacyReplicaMutationRuntime) -> None:
@@ -2873,6 +3604,394 @@ class SkyPilotReplicaManager(ReplicaManager):
                     service_version)
         return fence_context
 
+    def _is_ordinary_launch_binding_profile(
+            self, info: ReplicaInfo,
+            recovery_launch_kwargs: Mapping[str, Any]) -> bool:
+        """Whether one worker belongs to the narrow ordinary profile."""
+        if self._is_pool or recovery_launch_kwargs:
+            return False
+        # These paths retain their existing identity, retry, and cleanup
+        # contracts.  In particular, a promoted service must never silently
+        # reinterpret a system-OOM or physical-capacity operation as ordinary.
+        return ordinary_launch_binding.replica_has_narrow_ordinary_profile(info)
+
+    def _bound_ordinary_launch_is_eligible(
+            self, info: ReplicaInfo,
+            recovery_launch_kwargs: Mapping[str, Any]) -> bool:
+        """Select only the explicitly promoted ordinary launch profile."""
+        authority = self._ordinary_launch_binding_authority
+        return bool(
+            self._is_ordinary_launch_binding_profile(
+                info, recovery_launch_kwargs) and authority is not None and
+            authority.capable is True and
+            authority.binding_mode == ordinary_launch_binding.BindingMode.BOUND)
+
+    def _ordinary_binding_profile_launch_is_authorized(self) -> bool:
+        """Close eligible process admission during a binding transition."""
+        return bool(
+            not self._ordinary_launch_binding_transition_in_progress.is_set()
+            and self._service_is_launch_authorized())
+
+    def _bound_ordinary_launch_fence_context(
+            self, info: ReplicaInfo, service_version: int) -> dict[str, Any]:
+        """Build the complete immutable admission fence for one replica."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch has no promoted controller authority.')
+        fence = self._replica_launch_fence_context(service_version)
+        if fence is None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch has no durable service-owner fence.')
+        fence = dict(fence)
+        fence.update({
+            ordinary_launch_binding.REPLICA_ID_KEY: info.replica_id,
+            ordinary_launch_binding.REPLICA_RECORD_ID_KEY:
+                info.replica_record_id,
+            ordinary_launch_binding.LIFECYCLE_EPOCH_KEY:
+                authority.service_lifecycle_epoch,
+            ordinary_launch_binding.BINDING_EPOCH_KEY: authority.binding_epoch,
+            ordinary_launch_binding.CONTROLLER_INCARNATION_KEY: str(
+                authority.controller_incarnation),
+            ordinary_launch_binding.CONTROLLER_OWNER_EPOCH_KEY:
+                authority.controller_owner_epoch,
+        })
+        # Parse locally before publishing the request. This keeps a partially
+        # assembled context from becoming a durable admission ambiguity.
+        ordinary_launch_binding.parse_unbound_launch_context(fence)
+        return fence
+
+    @staticmethod
+    def _binding_excluded_launch_fence_context(
+        info: ReplicaInfo,
+        launch_fence: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Bind a legacy special-profile request to its persisted replica."""
+        if launch_fence is None:
+            return None
+        excluded = dict(launch_fence)
+        excluded.update({
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY:
+                (serve_constants.
+                 ORDINARY_LAUNCH_BINDING_EXCLUDED_PERSISTED_PROFILE),
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY:
+                info.replica_id,
+            serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY:
+                info.replica_record_id,
+        })
+        # Keep manager emission and API/executor parsing on one closed shape.
+        serve_state.normalize_binding_excluded_launch_context(excluded)
+        return excluded
+
+    @staticmethod
+    def _bound_launch_capacity_reason(launch_cloud: clouds.Cloud | None,
+                                      error: Any) -> str | None:
+        error = _decoded_bound_request_error(error)
+        if (launch_cloud is None or
+                not isinstance(error, exceptions.ResourcesUnavailableError)):
+            return None
+        return cloud_vm_ray_backend.classify_resources_unavailable_error(
+            launch_cloud, error)
+
+    def _project_bound_ordinary_launch(self, launch_cloud: clouds.Cloud | None,
+                                       connection: Any,
+                                       projection: Any) -> bool:
+        """Project exact request evidence and paid feedback atomically."""
+        info = projection.locked_replica_info
+        request_error = projection.request.error
+        reason = self._bound_launch_capacity_reason(launch_cloud, request_error)
+        status = projection.status.value
+        paid_outcome: paid_capacity.LaunchOutcome | None
+        if projection.pre_effect_terminal:
+            # No provider or service-job effect occurred.  Leave this exact
+            # replica record pending so the same demand can publish a fresh
+            # association generation.  An already-durable teardown remains
+            # absorbing; its exact cancellation will release the claim and
+            # the down worker owns the next action.
+            if getattr(projection, 'cancel_reason', None) is not None:
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.INTERRUPTED)
+            elif (info.status_property.sky_launch_status
+                  != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SCHEDULED)
+            # OTHER_FAILURE deliberately makes no paid-pool feedback change.
+            # The reducer, which can see the association's cancel reason,
+            # decides whether the exact claim is retained for the successor.
+            paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+        elif status == 'SUCCEEDED':
+            # Teardown writes INTERRUPTED before exact cancellation.  A request
+            # may race that cancel and finish successfully, but its result must
+            # not erase the only durable cleanup intent before the down worker
+            # records SCHEDULED.
+            if (info.status_property.sky_launch_status
+                    != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.SUCCEEDED)
+            paid_outcome = paid_capacity.LaunchOutcome.SUCCESS
+        else:
+            # A teardown persists INTERRUPTED before exact cancellation. Do
+            # not let the reducer turn that durable cleanup intent back into a
+            # generic failed launch. Post-effect terminal outcomes remain
+            # failures; they must never look successful merely because
+            # projection itself committed.
+            if (info.status_property.sky_launch_status
+                    != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.FAILED)
+            if reason == 'quota':
+                paid_outcome = paid_capacity.LaunchOutcome.QUOTA_FAILURE
+                info.status_property.failed_spot_availability = True
+            elif reason == 'capacity':
+                paid_outcome = paid_capacity.LaunchOutcome.CAPACITY_FAILURE
+                info.status_property.failed_spot_availability = True
+            else:
+                paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+        if projection.paid_capacity_pool_key is None:
+            paid_outcome = None
+        authority = self._ordinary_launch_binding_authority
+        if authority is None:
+            return False
+        return serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
+            connection,
+            self._service_name,
+            authority.service_hash,
+            info.replica_id,
+            info.replica_record_id,
+            projection.context.association_id,
+            info,
+            provider_launch_succeeded=(not projection.pre_effect_terminal and
+                                       status == 'SUCCEEDED'),
+            paid_capacity_pool_key=projection.paid_capacity_pool_key,
+            paid_capacity_outcome=paid_outcome)
+
+    def _bound_ordinary_launch_callbacks(
+        self,
+        info: ReplicaInfo,
+        launch_cloud: clouds.Cloud | None,
+        *,
+        initial_reduction: Any = None,
+    ) -> tuple[Callable[[], Any], Callable[[Any, BaseException | None], Any],
+               Callable[[str], Any]]:
+        """Close exact inspect/reduce/cancel calls over one record identity."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound ordinary launch has no controller authority.')
+        context_box: list[Any] = []
+        if initial_reduction is not None:
+            context_box.append(initial_reduction.context)
+
+        def _inspect() -> Any:
+            reduction = request_postgres.inspect_bound_ordinary_launch(
+                self._service_name, info.replica_id, info.replica_record_id)
+            if reduction is not None:
+                if context_box and context_box[0] != reduction.context:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Replica pointer resolved to a different bound '
+                        'ordinary-launch generation.')
+                if not context_box:
+                    context_box.append(reduction.context)
+            return reduction
+
+        def _context() -> Any:
+            if not context_box:
+                reduction = _inspect()
+                if reduction is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        'Replica has no exact bound ordinary-launch pointer.')
+            return context_box[0]
+
+        projector = functools.partial(self._project_bound_ordinary_launch,
+                                      launch_cloud)
+
+        def _reduce(_result: Any, _error: BaseException | None) -> Any:
+            del _result, _error
+            return request_postgres.reduce_bound_ordinary_launch(
+                _context(), authority, project_replica_result=projector)
+
+        def _cancel(reason: str) -> Any:
+            return request_postgres.cancel_bound_ordinary_launch_request(
+                _context(), authority, reason, project_replica_result=projector)
+
+        return _inspect, _reduce, _cancel
+
+    def _redrive_bound_ordinary_launch_after_pre_effect(
+            self, info: ReplicaInfo) -> bool:
+        """Re-enqueue one settled pre-effect row with its exact paid claim."""
+        prior_planned_capacity = info.planned_capacity
+        if (isinstance(prior_planned_capacity, bool) or
+                not isinstance(prior_planned_capacity, int) or
+                prior_planned_capacity < 1):
+            prior_planned_capacity = 1
+        prior_yaml_content: str | None
+        if info.version == self.latest_version:
+            prior_yaml_content = self.yaml_content
+        else:
+            prior_yaml_content = serve_state.get_yaml_content(
+                self._service_name, info.version)
+        if prior_yaml_content is None:
+            raise ValueError('yaml content not found for pre-effect retry '
+                             f'of {self._service_name} version '
+                             f'{info.version}')
+        result = self._launch_replica(
+            info.replica_id,
+            resources_override=info.resources_override,
+            recovering_existing_replica=True,
+            prior_is_zero_cost=info.is_zero_cost,
+            prior_planned_capacity=prior_planned_capacity,
+            prior_unknown_capacity_replacement=bool(
+                info.unknown_capacity_replacement),
+            prior_replica_record_id=info.replica_record_id,
+            prior_created_at=info.created_at,
+            prior_version=info.version,
+            prior_yaml_content=prior_yaml_content,
+            prior_paid_capacity_pool_key=(
+                info.paid_capacity_pool_key if isinstance(
+                    info.paid_capacity_pool_key, str) else None))
+        return result is not None
+
+    def _settle_bound_ordinary_launch_for_teardown(self,
+                                                   info: ReplicaInfo) -> None:
+        """Cancel, quiesce, and project an exact request before provider down."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND):
+            return
+        initial = request_postgres.lookup_bound_ordinary_launch_cancel_target(
+            self._service_name, info.replica_id, info.replica_record_id)
+        if initial is None:
+            return
+        _, reduce_exact, cancel_exact = (self._bound_ordinary_launch_callbacks(
+            info, None, initial_reduction=initial))
+        durable_reason = getattr(initial, 'cancel_reason', None)
+        if durable_reason is not None and (not isinstance(durable_reason, str)
+                                           or not durable_reason):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Bound teardown found a malformed durable cancel reason.')
+        projection = cancel_exact(durable_reason or 'replica-teardown')
+        attempts = 0
+        while True:
+            if projection is None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound teardown for replica {info.replica_id} lost its '
+                    'exact association.')
+            classification = _bound_projection_classification(projection)
+            if classification == 'AMBIGUOUS':
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound teardown for replica {info.replica_id} is '
+                    'durably ambiguous; refusing provider cleanup.')
+            if (getattr(projection, 'projected', False) or classification
+                    in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
+                return
+            if classification not in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE',
+                                      'REDUCE_TERMINAL',
+                                      'PRE_EFFECT_TERMINALIZE'):
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    f'Bound teardown for replica {info.replica_id} returned '
+                    f'unknown classification {classification!r}.')
+            attempts += 1
+            if attempts == 1 or attempts % 20 == 0:
+                logger.info(
+                    'Waiting for exact ordinary-launch quiescence before '
+                    'tearing down replica %s (classification=%s).',
+                    info.replica_id, classification)
+            time.sleep(_LAUNCH_OWNER_WATCH_INTERVAL_SECONDS)
+            projection = reduce_exact(None, None)
+
+    def _request_bound_ordinary_launch_cancel_for_teardown(
+            self, info: ReplicaInfo) -> None:
+        """Deliver exact cancellation without waiting for provider authority."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND):
+            return
+        target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
+            self._service_name, info.replica_id, info.replica_record_id)
+        if target is None:
+            return
+        durable_reason = target.cancel_reason
+        request_postgres.request_bound_ordinary_launch_cancel(
+            target.context, authority, durable_reason or 'replica-teardown')
+
+    @contextlib.contextmanager
+    def ordinary_launch_binding_transition(
+        self,) -> Iterator[Callable[[Any], None]]:
+        """Fence process admission while the controller changes binding mode.
+
+        The controller must already hold its actuation-epoch lock. This method
+        then establishes the manager side of the lock order: transition lock,
+        followed by ``self.lock``. The yielded installer is called only after
+        the PostgreSQL promotion/demotion transaction commits and its returned
+        authority has been refreshed. Assignment occurs while both process
+        locks and the admission gate remain held.
+        """
+        with self._ordinary_launch_binding_transition_lock:
+            self._ordinary_launch_binding_transition_in_progress.set()
+            try:
+                with self.lock:
+                    eligible_workers = [
+                        replica_id for replica_id, worker in
+                        self._legacy_mutation_runtime_state(
+                        ).launch_thread_pool.items()
+                        if (isinstance(worker, _ReplicaLaunchThread) and
+                            (worker.ordinary_legacy_launch or
+                             worker.bound_ordinary_launch))
+                    ]
+                    if eligible_workers:
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            'Ordinary-launch binding transition found local '
+                            'eligible workers that have not crossed the '
+                            f'completion barrier: {sorted(eligible_workers)}.')
+
+                    installed = False
+
+                    def _install(authority: Any) -> None:
+                        nonlocal installed
+                        if installed:
+                            raise RuntimeError(
+                                'Binding transition authority was installed '
+                                'more than once.')
+                        if not isinstance(
+                                authority, ordinary_launch_binding.
+                                ControllerBindingAuthority):
+                            raise ValueError(
+                                'Binding transition returned malformed '
+                                'controller authority.')
+                        previous = self._ordinary_launch_binding_authority
+                        if previous is None:
+                            raise _BoundOrdinaryLaunchUnresolvedError(
+                                'Manager has no prior controller binding '
+                                'authority.')
+                        immutable_identity = (
+                            authority.service_name == self._service_name and
+                            authority.service_hash == previous.service_hash and
+                            authority.service_workspace
+                            == previous.service_workspace and
+                            authority.service_lifecycle_epoch
+                            == previous.service_lifecycle_epoch and
+                            authority.controller_incarnation
+                            == previous.controller_incarnation and
+                            authority.controller_owner_epoch
+                            == previous.controller_owner_epoch and
+                            authority.controller_pid == previous.controller_pid
+                            and
+                            authority.controller_ip == previous.controller_ip)
+                        if not immutable_identity or authority.capable is not True:
+                            raise _BoundOrdinaryLaunchUnresolvedError(
+                                'Binding transition changed controller or '
+                                'service identity.')
+                        self._ordinary_launch_binding_authority = authority
+                        installed = True
+
+                    yield _install
+            finally:
+                self._ordinary_launch_binding_transition_in_progress.clear()
+
     def _queued_launch_generation_decision(
             self, expected_manager_version: int) -> tuple[bool, str]:
         """Fence every queued worker to its construction-time manager epoch."""
@@ -3127,7 +4246,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 replica_id,
                 info,
                 **self._db_fence_kwargs(),
-                expected_replica_exists=True)
+                expected_replica_exists=True,
+                guard_launch_exclusion=(
+                    serve_state.replica_info_has_binding_excluded_profile(info)
+                ))
         except BaseException:
             if suspension is not None:
                 self._resolve_ambiguous_system_recovery_route_suspensions(
@@ -3144,9 +4266,13 @@ class SkyPilotReplicaManager(ReplicaManager):
 
     def _persist_new_replica(self, replica_id: int, info: ReplicaInfo) -> None:
         """Persist an explicitly admitted initial replica row."""
-        persisted = serve_state.add_or_update_replica(self._service_name,
-                                                      replica_id, info,
-                                                      **self._db_fence_kwargs())
+        persisted = serve_state.add_or_update_replica(
+            self._service_name,
+            replica_id,
+            info,
+            **self._db_fence_kwargs(),
+            guard_launch_exclusion=(
+                serve_state.replica_info_has_binding_excluded_profile(info)))
         if persisted is False:
             raise RuntimeError(
                 f'Service {self._service_name!r} incarnation changed while '
@@ -3155,6 +4281,43 @@ class SkyPilotReplicaManager(ReplicaManager):
         # delayed callback still carries the same numeric replica ID.
         self._route_lease_registry().observe_record_identity(
             replica_id, info.replica_record_id)
+
+    def _emit_ordinary_launch_handoff_event(
+        self,
+        info: ReplicaInfo,
+        event_kind: ordinary_launch_handoff.EventKind,
+        ordinary_request_id: str | None = None,
+        service_job_id: int | None = None,
+        terminal_status: ordinary_launch_handoff.TerminalStatus | None = None,
+        *,
+        input_digest: str | None = None,
+        allow_demoted_candidate: bool = False,
+    ) -> None:
+        """Emit diagnostic evidence without changing replica behavior."""
+        if self._is_pool or info.reserved_fill:
+            return
+        disposition = info.system_recovery_disposition
+        # The launch thread captures the candidate object before durable
+        # demotion.  Its callback may use that stale value only on attempts
+        # that launch_cluster has already classified as ordinary; the bound
+        # recovery attempt is gated before every callback invocation.
+        if (disposition
+                != system_recovery_state.SystemRecoveryDisposition.ORDINARY and
+                not (allow_demoted_candidate and
+                     disposition == system_recovery_state.
+                     SystemRecoveryDisposition.CANDIDATE)):
+            return
+        ordinary_launch_handoff.emit_event(
+            event_kind=event_kind,
+            service_name=self._service_name,
+            service_version=info.version,
+            replica_id=info.replica_id,
+            replica_record_id=info.replica_record_id,
+            controller_route_epoch=self._ordinary_launch_handoff_route_epoch,
+            ordinary_request_id=ordinary_request_id,
+            service_job_id=service_job_id,
+            terminal_status=terminal_status,
+            input_digest=input_digest)
 
     def _persist_replicas(
         self,
@@ -3202,7 +4365,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._service_name,
                 replica_infos,
                 **fence_kwargs,
-                expected_replica_exists=True)
+                expected_replica_exists=True,
+                guard_launch_exclusion=any(
+                    serve_state.replica_info_has_binding_excluded_profile(info)
+                    for _, info in replica_infos))
         except BaseException:
             self._resolve_ambiguous_system_recovery_route_suspensions(
                 suspensions)
@@ -3631,15 +4797,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.replica_id, replica_record_id)
         self._persist_replica(info.replica_id, info)
 
-    def __init__(self,
-                 service_name: str,
-                 spec: 'service_spec.SkyServiceSpec',
-                 version: int,
-                 resource_scope: str | None = None,
-                 service_hash: str | None = None,
-                 controller_pid: int | None = None,
-                 controller_ip: str | None = None,
-                 enforce_launch_fence: bool = True) -> None:
+    def __init__(
+        self,
+        service_name: str,
+        spec: 'service_spec.SkyServiceSpec',
+        version: int,
+        resource_scope: str | None = None,
+        service_hash: str | None = None,
+        controller_pid: int | None = None,
+        controller_ip: str | None = None,
+        enforce_launch_fence: bool = True,
+        controller_binding_authority: (
+            'ControllerBindingAuthority | None') = None
+    ) -> None:
         # Keep the historical three-argument base-init call for embedders that
         # replace it, then restore the scope it initializes to the legacy
         # default.  Setting this before super() would be silently overwritten.
@@ -3651,6 +4821,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   controller_pid is not None or
                                   controller_ip is not None else None)
         self._enforce_launch_fence = enforce_launch_fence
+        self._ordinary_launch_binding_authority = controller_binding_authority
         yaml_content = serve_state.get_yaml_content(service_name, version)
         assert yaml_content is not None, (
             f'yaml content not found for {service_name} version {version}')
@@ -3952,14 +5123,52 @@ class SkyPilotReplicaManager(ReplicaManager):
         recovery_yaml_contents = serve_state.get_yaml_contents(
             self._service_name, recovery_versions)
 
+        bound_recovery_errors: list[tuple[int, Exception]] = []
         for replica_info in to_up_replicas:
             pending_version = self._pending_version
             if (pending_version is not None and
                     pending_version > replica_info.version):
-                logger.info('Stopping recovery re-drive for version '
-                            f'{replica_info.version} because version '
-                            f'{pending_version} is waiting to be applied.')
-                break
+                authority = self._ordinary_launch_binding_authority
+                bound_reduction = None
+                if (authority is not None and authority.capable is True and
+                        authority.binding_mode
+                        == ordinary_launch_binding.BindingMode.BOUND):
+                    bound_reduction = (
+                        request_postgres.inspect_bound_ordinary_launch(
+                            self._service_name, replica_info.replica_id,
+                            replica_info.replica_record_id))
+                if bound_reduction is not None:
+                    logger.info(
+                        'Cancelling exact bound launch for replica %s at '
+                        'version %s because version %s is waiting to be '
+                        'applied.', replica_info.replica_id,
+                        replica_info.version, pending_version)
+                    self._terminate_replica(replica_info.replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                else:
+                    logger.info(
+                        'Deferring pointerless recovery re-drive for replica '
+                        '%s at version %s because version %s is waiting to be '
+                        'applied.', replica_info.replica_id,
+                        replica_info.version, pending_version)
+                continue
+            if replica_info.version != self.latest_version:
+                logger.info(
+                    'Retiring recovered replica %s at superseded version %s; '
+                    'the current manager version is %s.',
+                    replica_info.replica_id, replica_info.version,
+                    self.latest_version)
+                # _terminate_replica first settles any exact bound pointer;
+                # pointerless pre-admission rows proceed directly to cleanup.
+                self._terminate_replica(replica_info.replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+                continue
             if replica_info.system_recovery_quarantine is not None:
                 logger.warning(
                     f'Replica {replica_info.replica_id} has quarantined '
@@ -4058,6 +5267,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             # O(pending x total rows) — tens of minutes at fleet scale.
             # Per-replica isolation: one bad row must not strand the rest
             # un-redriven.
+            authority = self._ordinary_launch_binding_authority
+            bound_profile_recovery = bool(
+                not self._is_pool and authority is not None and
+                authority.capable is True and authority.binding_mode
+                == ordinary_launch_binding.BindingMode.BOUND and
+                ordinary_launch_binding.replica_has_narrow_ordinary_profile(
+                    replica_info))
             try:
                 prior_planned_capacity = replica_info.planned_capacity
                 if (isinstance(prior_planned_capacity, bool) or
@@ -4075,6 +5291,90 @@ class SkyPilotReplicaManager(ReplicaManager):
                             f'{self._service_name} version '
                             f'{replica_info.version}')
                     prior_yaml_content = recovered_yaml_content
+                authority = self._ordinary_launch_binding_authority
+                if (authority is not None and authority.capable is True and
+                        authority.binding_mode
+                        == ordinary_launch_binding.BindingMode.BOUND):
+                    bound_reduction = (
+                        request_postgres.inspect_bound_ordinary_launch(
+                            self._service_name, replica_info.replica_id,
+                            replica_info.replica_record_id))
+                    if bound_reduction is not None:
+                        if (replica_info.replica_id
+                                in legacy_runtime.launch_thread_pool):
+                            continue
+                        recovery_spec = self._version_specs.get(
+                            replica_info.version)
+                        if recovery_spec is None:
+                            recovery_spec = serve_state.get_spec(
+                                self._service_name, replica_info.version)
+                        if recovery_spec is None:
+                            raise ValueError(
+                                'service spec not found for bound launch '
+                                f'recovery of version {replica_info.version}')
+                        recovery_task = _build_replica_launch_task(
+                            prior_yaml_content,
+                            replica_info.replica_id,
+                            replica_info.resources_override,
+                            exact_resources_override=(
+                                replica_info.get_spot_location() is not None),
+                            authoritative_service_spec=recovery_spec,
+                            service_name=self._service_name)
+                        recovery_cloud = next(iter(
+                            recovery_task.resources)).cloud
+                        _, reduce_bound, cancel_bound = (
+                            self._bound_ordinary_launch_callbacks(
+                                replica_info,
+                                recovery_cloud,
+                                initial_reduction=bound_reduction))
+                        log_file_name = (
+                            serve_utils.generate_replica_launch_log_file_name(
+                                self._service_name, replica_info.replica_id,
+                                self._resource_scope))
+                        completion_queue, completion_event = (
+                            self._launch_completion_state())
+                        launch_thread = _ReplicaLaunchThread(
+                            target=adopt_bound_ordinary_launch,
+                            replica_id=replica_info.replica_id,
+                            completion_queue=completion_queue,
+                            completion_event=completion_event,
+                            bound_ordinary_launch=True,
+                            args=(
+                                replica_info.replica_id,
+                                replica_info.cluster_name,
+                                log_file_name,
+                                bound_reduction.context.request_id,
+                                recovery_cloud,
+                                reduce_bound,
+                                cancel_bound,
+                                legacy_runtime.replica_to_launch_cancelled,
+                            ),
+                            kwargs={
+                                'continue_guard':
+                                    self._launch_owner_watchdog_allows_continue,
+                                'supersession_guard': functools.partial(
+                                    self._queued_launch_generation_decision,
+                                    replica_info.version),
+                            })
+                        legacy_runtime.replica_to_request_id[
+                            replica_info.replica_id] = (
+                                bound_reduction.context.request_id)
+                        legacy_runtime.launch_thread_pool[
+                            replica_info.replica_id] = launch_thread
+                        try:
+                            launch_thread.start()
+                        except Exception:
+                            legacy_runtime.launch_thread_pool.pop(
+                                replica_info.replica_id)
+                            legacy_runtime.replica_to_request_id.pop(
+                                replica_info.replica_id)
+                            raise
+                        logger.info(
+                            'Adopting exact bound ordinary launch %s for '
+                            'replica %s after controller restart.',
+                            bound_reduction.context.request_id,
+                            replica_info.replica_id)
+                        continue
                 launch_kwargs: dict[str, Any] = {
                     'resources_override': replica_info.resources_override,
                     'existing_replica_infos': all_replica_infos,
@@ -4100,11 +5400,32 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if isinstance(prior_paid_pool_key, str):
                     launch_kwargs['prior_paid_capacity_pool_key'] = (
                         prior_paid_pool_key)
+                input_digest = ordinary_launch_handoff.redacted_input_digest(
+                    prior_yaml_content, replica_info.resources_override)
+                if input_digest is not None:
+                    self._emit_ordinary_launch_handoff_event(
+                        replica_info,
+                        ordinary_launch_handoff.EventKind.
+                        CONTROLLER_START_NONTERMINAL,
+                        input_digest=input_digest)
+                    self._emit_ordinary_launch_handoff_event(
+                        replica_info,
+                        ordinary_launch_handoff.EventKind.RESTART_REDRIVE,
+                        input_digest=input_digest)
                 self._launch_replica(replica_info.replica_id, **launch_kwargs)
             except Exception as e:  # pylint: disable=broad-except
                 logger.error('Failed to re-drive launch of replica '
                              f'{replica_info.replica_id}: '
                              f'{common_utils.format_exception(e)}')
+                if bound_profile_recovery:
+                    # A bound row has no safe inference fallback.  Preserve
+                    # per-row isolation for this wave, but fail the recovery
+                    # pass after teardown reconstruction so the supervised
+                    # loop retries exact inspection/adoption in this same
+                    # live controller.  Otherwise a transient read, spec
+                    # reconstruction, or Thread.start failure leaves no local
+                    # owner and the normal refresher can never discover it.
+                    bound_recovery_errors.append((replica_info.replica_id, e))
 
         # A forced status refresh can remove an interrupted cluster from global
         # state before the replica row records the interruption. If the
@@ -4332,6 +5653,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 f'Recovered {len(recovering_logical_ids)} uncommitted logical '
                 'retirements; keeping them off-route until current capacity '
                 'is revalidated.')
+        if bound_recovery_errors:
+            failed_ids = [replica_id for replica_id, _ in bound_recovery_errors]
+            raise RuntimeError(
+                'Exact bound ordinary-launch recovery remains incomplete for '
+                f'replicas {failed_ids!r}; retrying the recovery pass.') from (
+                    bound_recovery_errors[0][1])
 
     ################################
     # Replica management functions #
@@ -4363,6 +5690,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
         try_provider_phase_admission: bool = False,
+        require_preinitialized_physical_fence: bool = False,
     ) -> _ReplicaLaunchResult | None:
         """Enqueue one replica launch.
 
@@ -4423,6 +5751,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         try_provider_phase_admission: batch-only mode that takes a zero-wait
         v2 admission at the exact physical-capture/persist seam. Contention
         defers this one launch without writing a row or registering a thread.
+
+        require_preinitialized_physical_fence: join a physical-identity
+        capture prepared outside the manager lock and never initialize one at
+        the persistence seam.
         """
         if self._update_recovery_required:
             logger.info(
@@ -4435,6 +5767,12 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise exceptions.ProviderPhaseMisuseError(
                 'Try-only provider admission requires one protocol-v2 fill '
                 'without an existing admission.')
+        if require_preinitialized_physical_fence and (
+                not protocol_v2_fill or try_provider_phase_admission or
+                provider_phase_admission is None):
+            raise exceptions.ProviderPhaseMisuseError(
+                'A preinitialized physical fence requires one protocol-v2 '
+                'fill with an existing provider admission.')
         if (protocol_v2_fill and not try_provider_phase_admission and
             (provider_phase_admission is None or provider_phase_admission.mode
              != provider_phase.ProviderPhaseMode.V2_FENCED)):
@@ -4457,8 +5795,21 @@ class SkyPilotReplicaManager(ReplicaManager):
         fill_pool_key: str | None = None
         fill_protocol_version: int | None = None
         fill_service_generation: int | None = None
+        fill_service_version: int | None = None
         fill_physical_cluster_uid: str | None = None
         fill_allowed_location_keys: list[dict[str, Any]] | None = None
+        fill_allocation_generation: int | None = None
+        fill_allocation_input_sha256: str | None = None
+        fill_allocation_claim_generation: int | None = None
+        fill_gate_generation: int | None = None
+        fill_reclaim_fleet_bundle_sha256: str | None = None
+        fill_reclaim_policy_revision: str | None = None
+        fill_reclaim_provider_inventory_sha256: str | None = None
+        fill_worker_projection_sha256: str | None = None
+        fill_observation_generation: int | None = None
+        fill_observation_sequence: int | None = None
+        fill_ordinary_admission_sequence: int | None = None
+        fill_intent_idempotency_key: str | None = None
         fill_pool_identity: reserved_capacity_broker.PoolIdentity | None = None
         fill_exact_accelerator_shape: tuple[str, int] | None = None
         fill_launch_context: str | None = None
@@ -4482,12 +5833,52 @@ class SkyPilotReplicaManager(ReplicaManager):
             fill_service_generation = resources_override.pop(
                 serve_constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY,
                 None)
+            fill_service_version = resources_override.pop(
+                serve_constants.RESERVED_FILL_SERVICE_VERSION_OVERRIDE_KEY,
+                None)
             fill_physical_cluster_uid = resources_override.pop(
                 serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY,
                 None)
             raw_allowed_locations = resources_override.pop(
                 serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY,
                 None)
+            fill_allocation_generation = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ALLOCATION_GENERATION_OVERRIDE_KEY, None)
+            fill_allocation_input_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ALLOCATION_INPUT_SHA256_OVERRIDE_KEY, None)
+            fill_allocation_claim_generation = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ALLOCATION_CLAIM_GENERATION_OVERRIDE_KEY, None)
+            fill_gate_generation = resources_override.pop(
+                serve_constants.RESERVED_FILL_GATE_GENERATION_OVERRIDE_KEY,
+                None)
+            fill_reclaim_fleet_bundle_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_RECLAIM_FLEET_BUNDLE_SHA256_OVERRIDE_KEY, None)
+            fill_reclaim_policy_revision = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_RECLAIM_POLICY_REVISION_OVERRIDE_KEY, None)
+            fill_reclaim_provider_inventory_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_RECLAIM_PROVIDER_INVENTORY_SHA256_OVERRIDE_KEY,
+                None)
+            fill_worker_projection_sha256 = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_WORKER_PROJECTION_SHA256_OVERRIDE_KEY, None)
+            fill_observation_generation = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_OBSERVATION_GENERATION_OVERRIDE_KEY, None)
+            fill_observation_sequence = resources_override.pop(
+                serve_constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY,
+                None)
+            fill_ordinary_admission_sequence = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_ORDINARY_ADMISSION_SEQUENCE_OVERRIDE_KEY, None)
+            fill_intent_idempotency_key = resources_override.pop(
+                serve_constants.
+                RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY, None)
             if raw_allowed_locations is not None:
                 if not isinstance(raw_allowed_locations, list):
                     self._log_fill_skip('malformed pool location fence')
@@ -4735,6 +6126,58 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._log_fill_skip('incomplete protocol-v2 pool '
                                             'fence')
                         return None
+                    allocation_attribution = (
+                        fill_allocation_generation,
+                        fill_allocation_input_sha256,
+                        fill_allocation_claim_generation,
+                        fill_service_version,
+                        fill_gate_generation,
+                        fill_reclaim_fleet_bundle_sha256,
+                        fill_reclaim_policy_revision,
+                        fill_reclaim_provider_inventory_sha256,
+                        fill_worker_projection_sha256,
+                        fill_observation_generation,
+                        fill_observation_sequence,
+                        fill_ordinary_admission_sequence,
+                        fill_intent_idempotency_key,
+                    )
+                    if any(value is not None
+                           for value in allocation_attribution):
+                        if (type(fill_allocation_generation) is not int or
+                                fill_allocation_generation < 1 or
+                                not _is_lowercase_sha256(
+                                    fill_allocation_input_sha256) or
+                                type(fill_allocation_claim_generation)
+                                is not int or
+                                fill_allocation_claim_generation < 1 or
+                                type(fill_service_version) is not int or
+                                fill_service_version < 1 or
+                                fill_service_version != launch_version or
+                                type(fill_gate_generation) is not int or
+                                fill_gate_generation < 1 or
+                                not _is_lowercase_sha256(
+                                    fill_reclaim_fleet_bundle_sha256) or
+                                not isinstance(fill_reclaim_policy_revision,
+                                               str) or
+                                not fill_reclaim_policy_revision or
+                                not _is_lowercase_sha256(
+                                    fill_reclaim_provider_inventory_sha256) or
+                                not _is_lowercase_sha256(
+                                    fill_worker_projection_sha256) or
+                                type(fill_observation_generation) is not int or
+                                fill_observation_generation < 1 or
+                                type(fill_observation_sequence) is not int or
+                                fill_observation_sequence < 0 or
+                                type(fill_ordinary_admission_sequence)
+                                is not int or
+                                fill_ordinary_admission_sequence < 0 or
+                                fill_ordinary_admission_sequence
+                                > fill_observation_sequence or
+                                not _is_lowercase_sha256(
+                                    fill_intent_idempotency_key)):
+                            self._log_fill_skip(
+                                'incomplete typed allocation attribution')
+                            return None
                     assert isinstance(fill_pool_key, str)
                     try:
                         fill_pool_identity = (
@@ -5041,7 +6484,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             assert cloud_launch_guard is None
             cloud_launch_guard = lambda: (
                 self._queued_logical_launch_fence_decision(replica_id)[:2])
-        expected_manager_version = self.latest_version
+        expected_manager_version = launch_version
         existing_cloud_launch_guard = cloud_launch_guard
 
         def _versioned_cloud_launch_guard() -> bool | tuple[bool, str]:
@@ -5073,10 +6516,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 reserved_capacity.make_protocol_v2_launch_fence(
                     pool_key=fill_pool_key,
                     service_generation=fill_service_generation,
+                    service_version=launch_version,
                     physical_cluster_uid=fill_physical_cluster_uid,
                     kubernetes_context=fill_launch_context,
                     accelerator=fill_card,
-                    accelerator_count=fill_count))
+                    accelerator_count=fill_count,
+                    reconciliation_gate_generation=fill_gate_generation,
+                    reclaim_fleet_bundle_sha256=(
+                        fill_reclaim_fleet_bundle_sha256),
+                    reclaim_policy_revision=fill_reclaim_policy_revision,
+                    reclaim_provider_inventory_sha256=(
+                        fill_reclaim_provider_inventory_sha256),
+                    worker_projection_sha256=(fill_worker_projection_sha256)))
         recovery_intent: (system_recovery_state.SystemRecoveryLaunchIntent |
                           None) = None
         recovery_launch_context: dict[str, Any] | None = None
@@ -5214,6 +6665,28 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                    if zero_cost_only else None)
         info.reserved_fill_kubernetes_context = (fill_launch_context
                                                  if zero_cost_only else None)
+        info.reserved_fill_allocation_generation = (fill_allocation_generation
+                                                    if zero_cost_only else None)
+        info.reserved_fill_allocation_input_sha256 = (
+            fill_allocation_input_sha256 if zero_cost_only else None)
+        info.reserved_fill_allocation_claim_generation = (
+            fill_allocation_claim_generation if zero_cost_only else None)
+        info.reserved_fill_reconciliation_gate_generation = (
+            fill_gate_generation if zero_cost_only else None)
+        info.reserved_fill_reclaim_fleet_bundle_sha256 = (
+            fill_reclaim_fleet_bundle_sha256 if zero_cost_only else None)
+        info.reserved_fill_reclaim_policy_revision = (
+            fill_reclaim_policy_revision if zero_cost_only else None)
+        info.reserved_fill_reclaim_provider_inventory_sha256 = (
+            fill_reclaim_provider_inventory_sha256 if zero_cost_only else None)
+        info.reserved_fill_worker_projection_sha256 = (
+            fill_worker_projection_sha256 if zero_cost_only else None)
+        info.reserved_fill_observation_generation = (
+            fill_observation_generation if zero_cost_only else None)
+        info.reserved_fill_observation_sequence = (fill_observation_sequence
+                                                   if zero_cost_only else None)
+        info.reserved_fill_intent_idempotency_key = (
+            fill_intent_idempotency_key if zero_cost_only else None)
         is_zero_cost = bool(prior_is_zero_cost or zero_cost_only)
         if not is_zero_cost and self._spot_placer is not None:
             is_zero_cost = self._spot_placer.is_zero_cost_location(location)
@@ -5232,36 +6705,107 @@ class SkyPilotReplicaManager(ReplicaManager):
             frozen_controller_config = skypilot_config.to_dict()
             frozen_controller_config_path = os.environ.get(
                 skypilot_config.ENV_VAR_SKYPILOT_CONFIG)
+            ordinary_binding_profile = (
+                self._is_ordinary_launch_binding_profile(
+                    info, recovery_launch_kwargs))
+            bound_ordinary_launch = bool(
+                ordinary_binding_profile and
+                self._bound_ordinary_launch_is_eligible(info,
+                                                        recovery_launch_kwargs))
+            ordinary_legacy_launch = bool(ordinary_binding_profile and
+                                          not bound_ordinary_launch)
+            effective_launch_fence = launch_fence
+            if not ordinary_binding_profile and not self._is_pool:
+                # Emit this while still in legacy mode too.  A queued special
+                # launch can then cross an immediately following promotion
+                # without being mistaken for an unbound ordinary request.
+                effective_launch_fence = (
+                    self._binding_excluded_launch_fence_context(
+                        info, effective_launch_fence))
+            launch_thread_kwargs: dict[str, Any] = {
+                'availability_max_retry': availability_max_retry,
+                'exact_resources_override': location is not None,
+                'pre_launch_guard':
+                    (self._ordinary_binding_profile_launch_is_authorized
+                     if ordinary_binding_profile else
+                     self._service_is_launch_authorized),
+                'cloud_launch_guard': cloud_launch_guard,
+                'supersession_guard': functools.partial(
+                    self._queued_launch_generation_decision,
+                    expected_manager_version),
+                'continue_guard': self._launch_owner_watchdog_allows_continue,
+                'cleanup_continue_guard': self._service_is_cleanup_authorized,
+                'launch_fence': effective_launch_fence,
+                'service_spec': launch_spec,
+                'service_name': self._service_name,
+                'workspace': self._workspace,
+                'frozen_controller_config': frozen_controller_config,
+                'frozen_controller_config_path': frozen_controller_config_path,
+                **recovery_launch_kwargs,
+            }
+            if bound_ordinary_launch:
+                # Build the same launch task once locally so typed provider
+                # failures can update the exact paid-capacity pool in the
+                # reducer transaction. This construction is side-effect free.
+                bound_task = _build_replica_launch_task(
+                    launch_yaml_content,
+                    replica_id,
+                    resources_override,
+                    exact_resources_override=location is not None,
+                    authoritative_service_spec=launch_spec,
+                    service_name=self._service_name)
+                bound_cloud = next(iter(bound_task.resources)).cloud
+                effective_launch_fence = (
+                    self._bound_ordinary_launch_fence_context(
+                        info, launch_version))
+                inspect_bound, reduce_bound, cancel_bound = (
+                    self._bound_ordinary_launch_callbacks(info, bound_cloud))
+                launch_thread_kwargs.update({
+                    'launch_fence': effective_launch_fence,
+                    'ordinary_launch_submission_uuid':
+                        request_postgres.
+                        stable_bound_ordinary_launch_submission_id(
+                            self._service_name, info.replica_id,
+                            info.replica_record_id),
+                    'inspect_bound_ordinary_launch': inspect_bound,
+                    'reduce_bound_ordinary_launch': reduce_bound,
+                    'cancel_bound_ordinary_launch': cancel_bound,
+                })
+            if not self._is_pool and not zero_cost_only:
+                input_digest = (ordinary_launch_handoff.redacted_input_digest(
+                    launch_yaml_content, resources_override))
+                if input_digest is not None:
+                    launch_thread_kwargs['ordinary_launch_handoff_context'] = {
+                        'context_version':
+                            (serve_constants.
+                             ORDINARY_LAUNCH_HANDOFF_CONTEXT_VERSION),
+                        'service_name': self._service_name,
+                        'service_version': launch_version,
+                        'replica_id': replica_id,
+                        'replica_record_id': info.replica_record_id,
+                        'controller_route_epoch':
+                            (self._ordinary_launch_handoff_route_epoch),
+                        'input_digest': input_digest,
+                    }
+                    launch_thread_kwargs['ordinary_launch_event'] = (
+                        functools.partial(
+                            self._emit_ordinary_launch_handoff_event,
+                            info,
+                            input_digest=input_digest,
+                            allow_demoted_candidate=bool(
+                                recovery_launch_kwargs)))
             return _ReplicaLaunchThread(
                 target=launch_cluster_with_frozen_controller_config,
                 replica_id=replica_id,
                 completion_queue=completion_queue,
                 completion_event=completion_event,
+                bound_ordinary_launch=bound_ordinary_launch,
+                ordinary_legacy_launch=ordinary_legacy_launch,
                 args=(replica_id, launch_yaml_content, cluster_name,
                       log_file_name, legacy_runtime.replica_to_request_id,
                       legacy_runtime.replica_to_launch_cancelled,
                       resources_override, retry_until_up),
-                kwargs={
-                    'availability_max_retry': availability_max_retry,
-                    'exact_resources_override': location is not None,
-                    'pre_launch_guard': self._service_is_launch_authorized,
-                    'cloud_launch_guard': cloud_launch_guard,
-                    'supersession_guard': functools.partial(
-                        self._queued_launch_generation_decision,
-                        expected_manager_version),
-                    'continue_guard':
-                        self._launch_owner_watchdog_allows_continue,
-                    'cleanup_continue_guard':
-                        self._service_is_cleanup_authorized,
-                    'launch_fence': launch_fence,
-                    'service_spec': launch_spec,
-                    'service_name': self._service_name,
-                    'workspace': self._workspace,
-                    'frozen_controller_config': frozen_controller_config,
-                    'frozen_controller_config_path':
-                        (frozen_controller_config_path),
-                    **recovery_launch_kwargs,
-                },
+                kwargs=launch_thread_kwargs,
             )
 
         if fill_protocol_version == reserved_capacity_broker.PROTOCOL_V2:
@@ -5290,14 +6834,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 with phase_context as effective_admission:
                     with provider_phase.join_provider_phase(
                             effective_admission):
-                        physical_context = (
-                            kubernetes_adaptor.physical_cluster_uid_fence(
-                                fill_launch_context,
-                                fill_physical_cluster_uid,
-                                wait_for_initializer=False)
-                            if try_provider_phase_admission else
-                            kubernetes_adaptor.physical_cluster_uid_fence(
-                                fill_launch_context, fill_physical_cluster_uid))
+                        if try_provider_phase_admission:
+                            physical_context = (
+                                kubernetes_adaptor.physical_cluster_uid_fence(
+                                    fill_launch_context,
+                                    fill_physical_cluster_uid,
+                                    wait_for_initializer=False))
+                        elif require_preinitialized_physical_fence:
+                            physical_context = (
+                                kubernetes_adaptor.physical_cluster_uid_fence(
+                                    fill_launch_context,
+                                    fill_physical_cluster_uid,
+                                    require_existing=True))
+                        else:
+                            physical_context = (
+                                kubernetes_adaptor.physical_cluster_uid_fence(
+                                    fill_launch_context,
+                                    fill_physical_cluster_uid))
                         with physical_context:
                             # Freeze the complete request tuple before its
                             # durable reservation. Construction is side-effect
@@ -5309,11 +6862,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                             except BaseException:
                                 self._release_unstarted_location_retry(location)
                                 raise
+                            needs_logical_state_guard = (
+                                logical_reconcile_fence is not None or
+                                require_preinitialized_physical_fence)
                             logical_state_guard = (self._logical_state_lock
-                                                   if logical_reconcile_fence
-                                                   is not None else
+                                                   if needs_logical_state_guard
+                                                   else
                                                    contextlib.nullcontext())
                             with logical_state_guard:
+                                pending_version = self._pending_version
+                                if (require_preinitialized_physical_fence and
+                                        pending_version is not None and
+                                        pending_version > launch_version):
+                                    self._release_unstarted_location_retry(
+                                        location)
+                                    logger.info(
+                                        'Reserved-fill launch was superseded '
+                                        'by a pending service version at its '
+                                        'final row-persistence fence.')
+                                    return None
                                 if (logical_reconcile_fence is not None and
                                         not self._logical_reconcile_fence_holds(
                                             logical_reconcile_fence,
@@ -5339,6 +6906,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             fill_service_generation),
                                         expected_physical_cluster_uid=(
                                             fill_physical_cluster_uid),
+                                        expected_ordinary_zero_cost_admission_sequence
+                                        =(fill_ordinary_admission_sequence),
                                         **self._db_fence_kwargs()):
                                     self._release_unstarted_location_retry(
                                         location)
@@ -5362,6 +6931,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # A batch holds the manager lock. Continuing to churn later
                 # items after an opposite root is admitted would retain the
                 # lock that root needs and recreate phase-to-manager HOL.
+                if require_preinitialized_physical_fence:
+                    raise
                 assert try_provider_phase_admission
                 raise exceptions.ProviderPhaseBusyError(
                     'Protocol-v2 batch item deferred at its persist seam.'
@@ -5371,6 +6942,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._log_fill_skip(
                     'selected protocol-v2 pool physical identity could not be '
                     f'proved: {common_utils.format_exception(error)}')
+                if require_preinitialized_physical_fence:
+                    raise
                 return None
 
         logical_state_guard = (self._logical_state_lock
@@ -5405,6 +6978,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                             fill_service_generation),
                         expected_physical_cluster_uid=(
                             fill_physical_cluster_uid),
+                        expected_ordinary_zero_cost_admission_sequence=(
+                            fill_ordinary_admission_sequence),
                         **self._db_fence_kwargs()):
                     # No row was written and the launch thread was never
                     # registered/started: same leak-nothing contract as the
@@ -5904,6 +7479,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         paid_launch_allowed: bool = True,
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
+        require_preinitialized_physical_fence: bool = False,
     ) -> _ReplicaLaunchResult | None:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
@@ -5936,6 +7512,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if provider_phase_admission is not None:
                 direct_launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
+                if require_preinitialized_physical_fence:
+                    direct_launch_kwargs[
+                        'require_preinitialized_physical_fence'] = True
             elif _is_protocol_v2_fill_override(resources_override):
                 direct_launch_kwargs['try_provider_phase_admission'] = True
             launch_result = self._launch_replica(self._next_replica_id,
@@ -5966,6 +7545,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             if provider_phase_admission is not None:
                 launch_kwargs['provider_phase_admission'] = (
                     provider_phase_admission)
+                if require_preinitialized_physical_fence:
+                    launch_kwargs[
+                        'require_preinitialized_physical_fence'] = True
             elif _is_protocol_v2_fill_override(resources_override):
                 launch_kwargs['try_provider_phase_admission'] = True
             launch_result = self._launch_replica(self._next_replica_id,
@@ -5976,31 +7558,703 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._next_replica_id += 1
         return launch_result
 
+    @staticmethod
+    def _reserved_fill_commit_result(
+        plan: reserved_fill_planner.FillPlan,
+        accepted: list[reserved_fill_planner.AcceptedFillIntent],
+        deferred: list[reserved_fill_planner.DeferredFillIntent],
+        *,
+        authority_current: bool,
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Build and self-check one complete, potentially sparse receipt."""
+        receipt = reserved_fill_planner.FillCommitResult(
+            accepted=tuple(accepted),
+            deferred=tuple(deferred),
+            authority_current=authority_current)
+        receipt.validate_for_plan(plan)
+        return receipt
+
+    @staticmethod
+    def _reserved_fill_deferred_tail(
+        plan: reserved_fill_planner.FillPlan,
+        deferred_from: int,
+        reason: reserved_fill_planner.DeferredFillReason,
+        detail: str,
+    ) -> list[reserved_fill_planner.DeferredFillIntent]:
+        """Build one typed tail for a batch-global admission failure."""
+        return [
+            reserved_fill_planner.DeferredFillIntent(intent, reason, detail)
+            for intent in plan.intents[deferred_from:]
+        ]
+
+    def _reserved_fill_manager_authority_failure(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> tuple[reserved_fill_planner.DeferredFillReason, str] | None:
+        """Check the manager-local and durable owner fence without providers."""
+        if not plan.intents:
+            return None
+        first = plan.intents[0]
+        expected_capacity_unit = (
+            reserved_fill_planner.FillCapacityUnit.LOGICAL
+            if self._uses_logical_replicas else
+            reserved_fill_planner.FillCapacityUnit.PHYSICAL)
+        if plan.capacity_unit is not expected_capacity_unit:
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'the manager replica unit no longer matches the plan')
+        if self._is_pool:
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'worker pools cannot accept service reserved-fill plans')
+        if self._reserved_fill_has_newer_pending_version(plan):
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'a newer service version is pending application')
+        if (self._update_recovery_required or
+                first.service_version != self.latest_version):
+            return (reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'the manager service version no longer matches the plan')
+        service_hash = self._service_hash
+        controller_owner = self._controller_owner
+        if (not isinstance(service_hash, str) or not service_hash or
+                self._resource_scope != service_hash or
+                first.service_incarnation != service_hash or
+                controller_owner is None or not self._enforce_launch_fence or
+                self._ownership_lost.is_set()):
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the manager does not hold the plan service incarnation')
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admission could not read controller '
+                           'ownership: '
+                           f'{common_utils.format_exception(error)}')
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'controller ownership could not be proven')
+        if (owner is None or owner.get('hash') != service_hash or
+            (owner.get('controller_pid'), owner.get('controller_ip'))
+                != controller_owner or owner.get('status') in
+                serve_state.ServiceStatus.replica_launch_blocking_statuses()):
+            return (
+                reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                'the durable controller owner no longer matches the manager')
+        try:
+            owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
+                service_hash, owner.get('controller_pid'),
+                owner.get('controller_ip'), owner.get('controller_port'))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admission found an invalid durable '
+                           'controller owner: '
+                           f'{common_utils.format_exception(error)}')
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the durable controller owner is incomplete')
+        if first.controller_owner != owner_fingerprint:
+            return (reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the plan controller owner is no longer current')
+
+        uids_by_context: dict[str, set[str]] = {}
+        for intent in plan.intents:
+            context_name = intent.allowed_locations[0].region
+            uids_by_context.setdefault(context_name,
+                                       set()).add(intent.physical_cluster_uid)
+        if any(len(uids) != 1 for uids in uids_by_context.values()):
+            return (reserved_fill_planner.DeferredFillReason.
+                    PHYSICAL_CLUSTER_UID_MISMATCH,
+                    'one Kubernetes context carries conflicting physical UIDs')
+        return None
+
+    def _reserved_fill_has_newer_pending_version(
+            self, plan: reserved_fill_planner.FillPlan) -> bool:
+        """Return the lock-free version signal checked at each persist seam."""
+        if not plan.intents:
+            return False
+        pending_version = self._pending_version
+        return (pending_version is not None and
+                pending_version > plan.intents[0].service_version)
+
+    def _reserved_fill_fleet_headroom_locked(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> tuple[int, list['ReplicaInfo'], set[int]]:
+        """Read the current fleet once and return exact remaining capacity."""
+        spec = self._version_specs.get(self.latest_version)
+        if spec is None:
+            spec = serve_state.get_spec(self._service_name, self.latest_version)
+        if spec is None:
+            raise ValueError('the current service specification is missing')
+        maximum = (spec.max_replicas
+                   if spec.max_replicas is not None else spec.min_replicas)
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError('the current service maximum is malformed')
+        infos = serve_state.get_replica_infos(self._service_name)
+        used_replica_ids = {info.replica_id for info in infos}
+        current_capacity = 0
+        for info in infos:
+            if not replica_may_consume_physical_capacity(info):
+                continue
+            if plan.capacity_unit is (
+                    reserved_fill_planner.FillCapacityUnit.PHYSICAL):
+                current_capacity += 1
+                continue
+            planned_capacity = info.planned_capacity
+            if (type(planned_capacity) is not int or planned_capacity < 1):
+                raise ValueError(
+                    'a nonterminal logical replica has malformed capacity')
+            current_capacity += planned_capacity
+        return max(0, maximum - current_capacity), infos, used_replica_ids
+
+    @staticmethod
+    def _reserved_fill_override(
+            intent: reserved_fill_planner.FillIntent) -> dict[str, Any]:
+        """Translate one typed intent into the sole transitional v2 seam."""
+        return {
+            serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY: True,
+            serve_constants.RESERVED_FILL_GRANT_EPOCH_OVERRIDE_KEY:
+                intent.pool_epoch,
+            serve_constants.RESERVED_FILL_POOL_KEY_OVERRIDE_KEY:
+                intent.pool_key,
+            serve_constants.RESERVED_FILL_PROTOCOL_VERSION_OVERRIDE_KEY:
+                intent.protocol_version,
+            serve_constants.RESERVED_FILL_SERVICE_GENERATION_OVERRIDE_KEY:
+                intent.service_generation,
+            serve_constants.RESERVED_FILL_SERVICE_VERSION_OVERRIDE_KEY:
+                intent.service_version,
+            serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY:
+                intent.physical_cluster_uid,
+            serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY: list(
+                intent.allowed_location_keys()),
+            serve_constants.RESERVED_FILL_ALLOCATION_GENERATION_OVERRIDE_KEY:
+                intent.allocation_generation,
+            serve_constants.RESERVED_FILL_ALLOCATION_INPUT_SHA256_OVERRIDE_KEY:
+                intent.allocation_input_sha256,
+            serve_constants.RESERVED_FILL_ALLOCATION_CLAIM_GENERATION_OVERRIDE_KEY:
+                intent.allocation_claim_generation,
+            serve_constants.RESERVED_FILL_GATE_GENERATION_OVERRIDE_KEY:
+                intent.reconciliation_gate_generation,
+            serve_constants.RESERVED_FILL_RECLAIM_FLEET_BUNDLE_SHA256_OVERRIDE_KEY:
+                intent.reclaim_fleet_bundle_sha256,
+            serve_constants.RESERVED_FILL_RECLAIM_POLICY_REVISION_OVERRIDE_KEY:
+                intent.reclaim_policy_revision,
+            serve_constants.RESERVED_FILL_RECLAIM_PROVIDER_INVENTORY_SHA256_OVERRIDE_KEY:
+                intent.reclaim_provider_inventory_sha256,
+            serve_constants.RESERVED_FILL_WORKER_PROJECTION_SHA256_OVERRIDE_KEY:
+                intent.worker_projection_sha256,
+            serve_constants.RESERVED_FILL_OBSERVATION_GENERATION_OVERRIDE_KEY:
+                intent.observation_generation,
+            serve_constants.RESERVED_FILL_OBSERVATION_SEQUENCE_OVERRIDE_KEY:
+                intent.observation_sequence,
+            serve_constants.RESERVED_FILL_ORDINARY_ADMISSION_SEQUENCE_OVERRIDE_KEY:
+                intent.ordinary_zero_cost_admission_sequence,
+            serve_constants.RESERVED_FILL_INTENT_IDEMPOTENCY_KEY_OVERRIDE_KEY:
+                intent.idempotency_key,
+            'accelerators': {
+                intent.accelerator: intent.accelerator_count
+            },
+        }
+
+    @staticmethod
+    def _start_reserved_fill_physical_preflights(
+        intents: tuple[reserved_fill_planner.FillIntent, ...],
+        admission: provider_phase.ProviderPhaseAdmission,
+        workspace: str,
+    ) -> _ReservedFillPhysicalPreflightBatch:
+        """Initialize every distinct pool capture under one batch deadline."""
+        preflights: dict[tuple[str, str], _ReservedFillPhysicalPreflight] = {}
+        for intent in intents:
+            target_key = (intent.allowed_locations[0].region,
+                          intent.physical_cluster_uid)
+            preflights.setdefault(target_key,
+                                  _ReservedFillPhysicalPreflight(*target_key))
+        deadline = (time.monotonic() +
+                    _RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS)
+
+        def _hold_preflight(preflight: _ReservedFillPhysicalPreflight) -> None:
+            physical_context: contextlib.AbstractContextManager[None] | None = (
+                None)
+            physical_context_entered = False
+            try:
+                with kubernetes_adaptor.api_call_deadline(
+                        deadline, preflight.cancellation):
+                    with skypilot_config.local_active_workspace_ctx(
+                            workspace), provider_phase.join_provider_phase(
+                                admission,
+                                timeout_seconds=max(0.0, deadline -
+                                                    time.monotonic())):
+                        physical_context = (
+                            kubernetes_adaptor.physical_cluster_uid_fence(
+                                preflight.kubernetes_context,
+                                preflight.physical_cluster_uid,
+                                wait_for_initializer=False))
+                        physical_context.__enter__()
+                        physical_context_entered = True
+                # The absolute deadline bounds provider initialization, not
+                # ownership of a verified capture. Keep that capture alive
+                # until the manager has completed every in-lock join.
+                preflight.ready.set()
+                preflight.release.wait()
+            # This closure runs only in a dedicated synchronous preflight
+            # thread, where every provider/context failure is result data.
+            except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
+                if preflight.error is None:
+                    preflight.error = error
+                preflight.ready.set()
+            finally:
+                if physical_context_entered:
+                    assert physical_context is not None
+                    try:
+                        physical_context.__exit__(None, None, None)
+                    except BaseException as error:  # noqa: ASYNC103  # pylint: disable=broad-except
+                        if preflight.error is None:
+                            preflight.error = error
+                        preflight.ready.set()
+
+        threads: list[threading.Thread] = []
+        for index, preflight in enumerate(preflights.values()):
+            worker = threading.Thread(
+                target=_hold_preflight,
+                args=(preflight,),
+                name=f'skyserve-fill-physical-preflight-{index}',
+                daemon=True)
+            worker.start()
+            threads.append(worker)
+        for preflight in preflights.values():
+            remaining = max(0.0, deadline - time.monotonic())
+            if not preflight.ready.wait(remaining):
+                preflight.cancellation.set()
+                preflight.release.set()
+                if preflight.error is None:
+                    preflight.error = TimeoutError(
+                        'physical-cluster preflight exceeded its deadline')
+        return _ReservedFillPhysicalPreflightBatch(preflights=preflights,
+                                                   threads=tuple(threads),
+                                                   deadline_monotonic=deadline)
+
+    @staticmethod
+    def _release_reserved_fill_physical_preflights(
+        batch: _ReservedFillPhysicalPreflightBatch,) -> None:
+        """Release every capture holder without waiting on a late provider."""
+        for preflight in batch.preflights.values():
+            preflight.cancellation.set()
+            preflight.release.set()
+        deadline = (time.monotonic() +
+                    _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS)
+        for worker in batch.threads:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    @staticmethod
+    def _reserved_fill_preflight_failure(
+        error: BaseException,
+    ) -> tuple[reserved_fill_planner.DeferredFillReason, str, bool]:
+        """Map physical/provider preflight failures onto the closed receipt."""
+        if isinstance(
+                error,
+            (exceptions.ProviderPhaseBusyError,
+             exceptions.ProviderPhaseTimeoutError,
+             exceptions.KubernetesPhysicalClusterFenceBusyError, TimeoutError)):
+            return (reserved_fill_planner.DeferredFillReason.
+                    PROVIDER_QUEUE_BACKPRESSURE,
+                    'provider or physical-cluster admission is busy', True)
+        if isinstance(error, exceptions.KubernetesPhysicalClusterIdentityError):
+            return (reserved_fill_planner.DeferredFillReason.
+                    PHYSICAL_CLUSTER_UID_MISMATCH,
+                    'the physical Kubernetes cluster UID could not be proved',
+                    False)
+        logger.warning('Reserved-fill physical preflight failed closed: '
+                       f'{type(error).__name__}: {error}')
+        return (reserved_fill_planner.DeferredFillReason.
+                PHYSICAL_CLUSTER_UID_MISMATCH,
+                'the physical Kubernetes cluster identity preflight failed',
+                False)
+
+    def accept_reserved_fill(
+        self, plan: reserved_fill_planner.FillPlan
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Persist a typed v2 fill plan and return an exact row receipt.
+
+        Physical identity captures for independent Kubernetes contexts start in
+        parallel before the manager mutex is acquired. The existing v2
+        transaction remains the only row-admission path; its non-None return is
+        therefore the receipt boundary. Pool-local failures produce a sparse
+        receipt so one unhealthy context cannot starve independent capacity.
+        """
+        if not isinstance(plan, reserved_fill_planner.FillPlan):
+            raise ValueError('Reserved-fill admission requires a FillPlan.')
+        # Frozen dataclasses prevent ordinary mutation. Re-run their validators
+        # at this trust boundary as defense against object.__setattr__ callers.
+        for intent in plan.intents:
+            intent.__post_init__()
+        plan.__post_init__()
+        if not plan.intents:
+            return reserved_fill_planner.FillCommitResult(
+                accepted=(), deferred=(), authority_current=True)
+
+        with self.lock:
+            authority_failure = self._reserved_fill_manager_authority_failure(
+                plan)
+            if authority_failure is not None:
+                reason, detail = authority_failure
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(plan, 0, reason, detail),
+                    authority_current=False)
+            try:
+                headroom, _, _ = self._reserved_fill_fleet_headroom_locked(plan)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill admission could not establish '
+                               'service headroom: '
+                               f'{common_utils.format_exception(error)}')
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(
+                        plan, 0, reserved_fill_planner.DeferredFillReason.
+                        SUPERSEDED_POLICY,
+                        'current service headroom could not be established'),
+                    authority_current=False)
+            if headroom == 0:
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(
+                        plan, 0, reserved_fill_planner.DeferredFillReason.
+                        MAX_REPLICAS_EXHAUSTED,
+                        'the service-global replica ceiling has no remaining '
+                        'headroom'),
+                    authority_current=True)
+            if self._spot_placer is not None:
+                self._spot_placer.refresh_workspace_policy()
+
+        # A failed early context must not consume speculative headroom or keep
+        # a later healthy context from being initialized. The locked commit
+        # loop spends the exact ceiling only for durably accepted rows.
+        accepted: list[reserved_fill_planner.AcceptedFillIntent] = []
+        deferred: list[reserved_fill_planner.DeferredFillIntent] = []
+        try:
+            phase_context = provider_phase.try_provider_phase(
+                provider_phase.ProviderPhaseMode.V2_FENCED,
+                child_drain_timeout_seconds=(
+                    _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS))
+            with phase_context as phase_admission:
+                preflight_batch = (
+                    self._start_reserved_fill_physical_preflights(
+                        plan.intents, phase_admission, self._workspace))
+                try:
+                    with self.lock:
+                        try:
+                            demand_lock = locks.get_lock(
+                                serve_constants.
+                                DEMAND_CAPACITY_RESERVATION_LOCK_ID)
+                            with demand_lock.acquire(blocking=False):
+                                return self._accept_reserved_fill_locked(
+                                    plan, accepted, deferred, phase_admission,
+                                    preflight_batch)
+                        except locks.LockTimeout:
+                            return self._reserved_fill_commit_result(
+                                plan,
+                                accepted,
+                                self._reserved_fill_deferred_tail(
+                                    plan, 0,
+                                    reserved_fill_planner.DeferredFillReason.
+                                    ADMISSION_SEQUENCE_CHANGED,
+                                    'ordinary zero-cost demand is reserving '
+                                    'shared capacity'),
+                                authority_current=False)
+                finally:
+                    self._release_reserved_fill_physical_preflights(
+                        preflight_batch)
+        except (exceptions.ProviderPhaseBusyError,
+                exceptions.ProviderPhaseTimeoutError):
+            accounted_keys = {
+                item.intent_idempotency_key for item in accepted
+            }.union(item.intent.idempotency_key for item in deferred)
+            deferred.extend(
+                reserved_fill_planner.DeferredFillIntent(
+                    intent, reserved_fill_planner.DeferredFillReason.
+                    PROVIDER_QUEUE_BACKPRESSURE,
+                    'the provider admission queue is busy')
+                for intent in plan.intents
+                if intent.idempotency_key not in accounted_keys)
+            stale_authority_reasons = {
+                reserved_fill_planner.DeferredFillReason.STALE_OBSERVATION,
+                reserved_fill_planner.DeferredFillReason.
+                ADMISSION_SEQUENCE_CHANGED,
+                reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH,
+                reserved_fill_planner.DeferredFillReason.
+                PHYSICAL_CLUSTER_UID_MISMATCH,
+            }
+            return self._reserved_fill_commit_result(
+                plan,
+                accepted,
+                deferred,
+                authority_current=not any(item.reason in stale_authority_reasons
+                                          for item in deferred))
+
+    def _accept_reserved_fill_locked(
+        self,
+        plan: reserved_fill_planner.FillPlan,
+        accepted: list[reserved_fill_planner.AcceptedFillIntent],
+        deferred: list[reserved_fill_planner.DeferredFillIntent],
+        phase_admission: provider_phase.ProviderPhaseAdmission,
+        preflight_batch: _ReservedFillPhysicalPreflightBatch,
+    ) -> reserved_fill_planner.FillCommitResult:
+        """Commit independent healthy intents under the exact global fences."""
+        authority_failure = self._reserved_fill_manager_authority_failure(plan)
+        if authority_failure is not None:
+            reason, detail = authority_failure
+            deferred.extend(
+                self._reserved_fill_deferred_tail(plan, 0, reason, detail))
+            return self._reserved_fill_commit_result(plan,
+                                                     accepted,
+                                                     deferred,
+                                                     authority_current=False)
+        try:
+            (remaining_headroom, existing_replica_infos,
+             used_replica_ids) = self._reserved_fill_fleet_headroom_locked(plan)
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Reserved-fill admission lost its service headroom '
+                           'fence: '
+                           f'{common_utils.format_exception(error)}')
+            deferred.extend(
+                self._reserved_fill_deferred_tail(
+                    plan, 0,
+                    reserved_fill_planner.DeferredFillReason.SUPERSEDED_POLICY,
+                    'current service headroom could not be revalidated'))
+            return self._reserved_fill_commit_result(plan,
+                                                     accepted,
+                                                     deferred,
+                                                     authority_current=False)
+
+        current_epochs: dict[str, int | None] = {}
+        epoch_read_errors: dict[str, Exception] = {}
+        for candidate in plan.intents:
+            if candidate.pool_key not in current_epochs:
+                try:
+                    current_epochs[candidate.pool_key] = (
+                        reserved_capacity_broker.current_epoch(
+                            candidate.pool_key))
+                except Exception as error:  # pylint: disable=broad-except
+                    current_epochs[candidate.pool_key] = None
+                    epoch_read_errors[candidate.pool_key] = error
+
+        authority_current = True
+        for index, intent in enumerate(plan.intents):
+            authority_failure = self._reserved_fill_manager_authority_failure(
+                plan)
+            if authority_failure is not None:
+                reason, detail = authority_failure
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(plan, index, reason,
+                                                      detail))
+                return self._reserved_fill_commit_result(
+                    plan, accepted, deferred, authority_current=False)
+            if time.time() >= intent.valid_until:
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent, reserved_fill_planner.DeferredFillReason.
+                        STALE_OBSERVATION,
+                        'the carried capacity observation expired before row '
+                        'admission'))
+                authority_current = False
+                continue
+            if intent.pool_key in epoch_read_errors:
+                logger.warning(
+                    'Reserved-fill pool epoch could not be read: %s',
+                    common_utils.format_exception(
+                        epoch_read_errors[intent.pool_key]))
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent,
+                        reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH,
+                        'the pool epoch could not be revalidated before row '
+                        'admission'))
+                authority_current = False
+                continue
+            if current_epochs[intent.pool_key] != intent.pool_epoch:
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent,
+                        reserved_fill_planner.DeferredFillReason.CHANGED_EPOCH,
+                        'the pool epoch changed before row admission'))
+                authority_current = False
+                continue
+            intent_cost = plan.capacity_unit.intent_cost(
+                intent.accelerator_count)
+            if intent_cost > remaining_headroom:
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        MAX_REPLICAS_EXHAUSTED,
+                        'the service-global replica ceiling was consumed '
+                        'before row admission'))
+                return self._reserved_fill_commit_result(
+                    plan,
+                    accepted,
+                    deferred,
+                    authority_current=authority_current)
+            target_key = (intent.allowed_locations[0].region,
+                          intent.physical_cluster_uid)
+            preflight_error = preflight_batch.preflights[target_key].error
+            if preflight_error is not None:
+                reason, detail, preflight_authority_current = (
+                    self._reserved_fill_preflight_failure(preflight_error))
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent, reason, detail))
+                authority_current = (authority_current and
+                                     preflight_authority_current)
+                continue
+            # Version notification does not take the manager lock, so check
+            # its lock-free signal again immediately before every durable
+            # persistence attempt. The launch seam then rechecks it under the
+            # notification lock around the transaction.
+            if self._reserved_fill_has_newer_pending_version(plan):
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        SUPERSEDED_POLICY,
+                        'a newer service version is pending application'))
+                return self._reserved_fill_commit_result(
+                    plan, accepted, deferred, authority_current=False)
+            try:
+                launch_result = self._scale_up_one_locked(
+                    self._reserved_fill_override(intent),
+                    used_replica_ids,
+                    existing_replica_infos,
+                    provider_phase_admission=phase_admission,
+                    require_preinitialized_physical_fence=True)
+            except (exceptions.ProviderPhaseBusyError,
+                    exceptions.ProviderPhaseTimeoutError):
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        PROVIDER_QUEUE_BACKPRESSURE,
+                        'provider admission became busy before row '
+                        'persistence'))
+                return self._reserved_fill_commit_result(
+                    plan,
+                    accepted,
+                    deferred,
+                    authority_current=authority_current)
+            except (exceptions.KubernetesPhysicalClusterFenceBusyError,
+                    exceptions.KubernetesPhysicalClusterIdentityError) as error:
+                reason, detail, target_authority_current = (
+                    self._reserved_fill_preflight_failure(error))
+                deferred.append(
+                    reserved_fill_planner.DeferredFillIntent(
+                        intent, reason, detail))
+                authority_current = (authority_current and
+                                     target_authority_current)
+                continue
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning('Reserved-fill row admission failed closed: '
+                               f'{common_utils.format_exception(error)}')
+                deferred.extend(
+                    self._reserved_fill_deferred_tail(
+                        plan, index, reserved_fill_planner.DeferredFillReason.
+                        PROVIDER_QUEUE_BACKPRESSURE,
+                        'the durable launch seam was temporarily unavailable'))
+                return self._reserved_fill_commit_result(
+                    plan,
+                    accepted,
+                    deferred,
+                    authority_current=authority_current)
+            if launch_result is None:
+                authority_failure = (
+                    self._reserved_fill_manager_authority_failure(plan))
+                if authority_failure is not None:
+                    reason, detail = authority_failure
+                    deferred.extend(
+                        self._reserved_fill_deferred_tail(
+                            plan, index, reason, detail))
+                    return self._reserved_fill_commit_result(
+                        plan, accepted, deferred, authority_current=False)
+                elif time.time() >= intent.valid_until:
+                    reason = (reserved_fill_planner.DeferredFillReason.
+                              STALE_OBSERVATION)
+                    detail = ('the carried capacity observation expired at '
+                              'row persistence')
+                    deferred.append(
+                        reserved_fill_planner.DeferredFillIntent(
+                            intent, reason, detail))
+                    authority_current = False
+                    continue
+                else:
+                    try:
+                        current_epoch = reserved_capacity_broker.current_epoch(
+                            intent.pool_key)
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Reserved-fill pool epoch could not be read after '
+                            'row rejection: %s',
+                            common_utils.format_exception(error))
+                        deferred.append(
+                            reserved_fill_planner.DeferredFillIntent(
+                                intent, reserved_fill_planner.
+                                DeferredFillReason.CHANGED_EPOCH,
+                                'the pool epoch could not be revalidated at '
+                                'row persistence'))
+                        authority_current = False
+                        continue
+                    if current_epoch != intent.pool_epoch:
+                        deferred.append(
+                            reserved_fill_planner.DeferredFillIntent(
+                                intent, reserved_fill_planner.
+                                DeferredFillReason.CHANGED_EPOCH,
+                                'the pool epoch changed at row persistence'))
+                        authority_current = False
+                        continue
+                    try:
+                        ordinary_sequence = (
+                            pool_capacity_observation.
+                            PoolCapacityObservationRepository(
+                            ).read_ordinary_admission_sequence())
+                    except Exception as error:  # pylint: disable=broad-except
+                        reason = (reserved_fill_planner.DeferredFillReason.
+                                  ADMISSION_SEQUENCE_CHANGED)
+                        detail = ('ordinary zero-cost admission authority '
+                                  'could not be verified after row rejection: '
+                                  f'{common_utils.format_exception(error)}')
+                        deferred.extend(
+                            self._reserved_fill_deferred_tail(
+                                plan, index, reason, detail))
+                        return self._reserved_fill_commit_result(
+                            plan, accepted, deferred, authority_current=False)
+                    else:
+                        if ordinary_sequence != (
+                                intent.ordinary_zero_cost_admission_sequence):
+                            reason = (reserved_fill_planner.DeferredFillReason.
+                                      ADMISSION_SEQUENCE_CHANGED)
+                            detail = ('ordinary zero-cost admission advanced '
+                                      'before the row transaction')
+                            deferred.extend(
+                                self._reserved_fill_deferred_tail(
+                                    plan, index, reason, detail))
+                            return self._reserved_fill_commit_result(
+                                plan,
+                                accepted,
+                                deferred,
+                                authority_current=False)
+                        else:
+                            reason = (reserved_fill_planner.DeferredFillReason.
+                                      PROVIDER_QUEUE_BACKPRESSURE)
+                            detail = ('the v2 durable launch seam did not '
+                                      'accept a replica row')
+                            deferred.append(
+                                reserved_fill_planner.DeferredFillIntent(
+                                    intent, reason, detail))
+                            continue
+            accepted.append(
+                reserved_fill_planner.AcceptedFillIntent(
+                    intent.idempotency_key, launch_result.replica_id))
+            remaining_headroom -= intent_cost
+        return self._reserved_fill_commit_result(
+            plan, accepted, deferred, authority_current=authority_current)
+
     def scale_up(self,
                  resources_override: dict[str, Any] | None = None) -> None:
-        phase_context: contextlib.AbstractContextManager[
-            provider_phase.ProviderPhaseAdmission | None]
         if _is_protocol_v2_fill_override(resources_override):
-            phase_context = provider_phase.provider_phase(
-                provider_phase.ProviderPhaseMode.V2_FENCED)
-        else:
-            phase_context = contextlib.nullcontext(None)
-        # Blocking provider admission must precede the manager mutex. The
-        # selected exact physical capture is lower in this hierarchy and is
-        # acquired only after the v2 location has been chosen.
-        with phase_context as phase_admission:
-            with self.lock:
-                if self._update_recovery_required:
-                    return
-                if self._spot_placer is not None:
-                    self._spot_placer.refresh_workspace_policy()
-                launch_kwargs: dict[str, Any] = {}
-                if phase_admission is not None:
-                    launch_kwargs['provider_phase_admission'] = phase_admission
-                self._scale_up_one_locked(
-                    resources_override,
-                    serve_state.get_replica_ids(self._service_name),
-                    **launch_kwargs)
+            # Typed protocol-v2 fills are admitted only through
+            # ``accept_reserved_fill()``.  Keeping their complete plan and
+            # receipt boundary intact prevents this compatibility method from
+            # bypassing ordinary-demand serialization.
+            raise ValueError('Protocol-v2 fill requires typed plan admission.')
+        self.scale_up_batch([resources_override])
 
     def scale_up_batch(
         self,
@@ -6773,46 +9027,88 @@ class SkyPilotReplicaManager(ReplicaManager):
             info.status_property.wait_for_idle_before_termination = False
             self._persist_replica(replica_id, info)
             launch_thread = legacy_runtime.launch_thread_pool[replica_id]
+            bound_ordinary_launch = bool(
+                isinstance(launch_thread, _ReplicaLaunchThread) and
+                launch_thread.bound_ordinary_launch)
             if launch_thread.is_alive():
                 legacy_runtime.replica_to_launch_cancelled[replica_id] = True
-                wait_deadline = (time.monotonic() +
-                                 _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
-                timeout_reached = False
-                while True:
-                    # Launch request id found. cancel it.
-                    if replica_id in legacy_runtime.replica_to_request_id:
-                        request_id = legacy_runtime.replica_to_request_id[
-                            replica_id]
-                        sdk.api_cancel(request_id)
-                        break
-                    if replica_id not in legacy_runtime.replica_to_launch_cancelled:
-                        # Indicates that the cancellation was received.
-                        break
-                    if not launch_thread.is_alive():
-                        # It's possible that the launch thread immediately
-                        # finished after we check. Exit the loop now.
-                        break
-                    remaining = wait_deadline - time.monotonic()
-                    if remaining <= 0:
-                        timeout_reached = True
-                        break
-                    time.sleep(min(0.1, remaining))
-                if timeout_reached:
-                    logger.warning(
-                        'Failed to cancel launch request for replica '
-                        f'{replica_id} after '
-                        f'{_WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS} seconds. '
-                        'Force waiting the launch thread to finish.')
+                if bound_ordinary_launch:
+                    # Deliver cancellation from the manager thread before
+                    # joining. The waiter may still be inside the provider's
+                    # shared guard; waiting for it before this direct
+                    # row-locked cancel would make the provider and join
+                    # depend cyclically on each other.
+                    self._request_bound_ordinary_launch_cancel_for_teardown(
+                        info)
+                    launch_thread.join()
                 else:
-                    logger.info('Interrupted launch thread for replica '
-                                f'{replica_id} and deleted the cluster.')
-                launch_thread.join()
+                    wait_deadline = (time.monotonic() +
+                                     _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS)
+                    timeout_reached = False
+                    while True:
+                        # Launch request id found. cancel it.
+                        if replica_id in legacy_runtime.replica_to_request_id:
+                            request_id = legacy_runtime.replica_to_request_id[
+                                replica_id]
+                            sdk.api_cancel(request_id)
+                            break
+                        if (replica_id not in
+                                legacy_runtime.replica_to_launch_cancelled):
+                            # Indicates that the cancellation was received.
+                            break
+                        if not launch_thread.is_alive():
+                            # The launch may finish between the map checks.
+                            break
+                        remaining = wait_deadline - time.monotonic()
+                        if remaining <= 0:
+                            timeout_reached = True
+                            break
+                        time.sleep(min(0.1, remaining))
+                    if timeout_reached:
+                        logger.warning(
+                            'Failed to cancel launch request for replica '
+                            f'{replica_id} after '
+                            f'{_WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS} seconds. '
+                            'Force waiting the launch thread to finish.')
+                    else:
+                        logger.info('Interrupted launch thread for replica '
+                                    f'{replica_id} and deleted the cluster.')
+                    launch_thread.join()
             else:
                 logger.info(f'Launch thread for replica {replica_id} '
                             'already finished. Delete the cluster now.')
+            if bound_ordinary_launch:
+                if isinstance(launch_thread.exception,
+                              _ReplicaLaunchOwnershipLostError):
+                    raise launch_thread.exception
+                if isinstance(launch_thread.exception,
+                              _BoundOrdinaryLaunchUnresolvedError):
+                    raise launch_thread.exception
+                # Handles a controller crash after the local worker completed
+                # but before its caller observed projection, and is a no-op
+                # after the normal exact reducer cleared the pointer.
+                fresh_info = serve_state.get_replica_info_from_id(
+                    self._service_name, replica_id)
+                if fresh_info is None:
+                    raise _BoundOrdinaryLaunchUnresolvedError(
+                        f'Bound teardown lost replica row {replica_id}.')
+                self._settle_bound_ordinary_launch_for_teardown(fresh_info)
             legacy_runtime.launch_thread_pool.pop(replica_id)
             legacy_runtime.replica_to_request_id.pop(replica_id)
             legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
+
+        # Recovery may observe a durable SHUTTING_DOWN row before rebuilding a
+        # local launch waiter. Resolve its exact association before any log or
+        # provider operation; direct down/delete is forbidden while the API
+        # execution generation is active or ambiguous.
+        binding_authority = self._ordinary_launch_binding_authority
+        if (binding_authority is not None and binding_authority.binding_mode
+                == ordinary_launch_binding.BindingMode.BOUND):
+            bound_teardown_info = serve_state.get_replica_info_from_id(
+                self._service_name, replica_id)
+            if bound_teardown_info is not None:
+                self._settle_bound_ordinary_launch_for_teardown(
+                    bound_teardown_info)
 
         if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
@@ -9257,14 +11553,135 @@ class SkyPilotReplicaManager(ReplicaManager):
             self._persist_spot_placement_state_if_dirty()
 
         completed_launches: list[tuple[int, ReplicaInfo, bool]] = []
+        bound_completed_launches: list[tuple[int, ReplicaInfo, bool, bool]] = []
+        bound_pre_effect_retries: list[tuple[int, ReplicaInfo,
+                                             _ReplicaLaunchThread]] = []
         superseded_launch_infos: list[tuple[int, ReplicaInfo]] = []
         capacity_launch_failures: set[int] = set()
         quota_launch_failures: set[int] = set()
+        bound_capacity_launch_failures: set[int] = set()
+        bound_quota_launch_failures: set[int] = set()
         for replica_id, t in finished_launches:
             info = launch_infos.get(replica_id)
             assert info is not None, replica_id
-            if info.status == serve_state.ReplicaStatus.PENDING:
+            bound_ordinary_launch = bool(
+                isinstance(t, _ReplicaLaunchThread) and t.bound_ordinary_launch)
+            if (info.status == serve_state.ReplicaStatus.PENDING and
+                (not bound_ordinary_launch or t.ident is None)):
+                # A thread is not alive before its first ``start()``.  Route
+                # every never-started durable PENDING row through admission
+                # before looking at bound-request completion; otherwise a
+                # freshly queued bound launch is mistaken for a finished
+                # worker and can be reduced or discarded without ever
+                # reaching the provider.  A started bound worker may project
+                # a retry back to PENDING, so its non-null thread identity
+                # must still reach bound completion handling below.
                 pending_launches.append((replica_id, t, info))
+                continue
+            if bound_ordinary_launch:
+                ownership_lost = isinstance(t.exception,
+                                            _ReplicaLaunchOwnershipLostError)
+                remaining = request_postgres.inspect_bound_ordinary_launch(
+                    self._service_name, replica_id, info.replica_record_id)
+                unresolved = bool(
+                    isinstance(t.exception, _BoundOrdinaryLaunchUnresolvedError)
+                    or remaining is not None)
+                if ownership_lost:
+                    logger.info(
+                        'Discarding bound ordinary-launch worker for replica '
+                        '%s after controller ownership loss.', replica_id)
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
+                    continue
+                if unresolved:
+                    if (remaining is not None and
+                            _bound_projection_classification(remaining)
+                            == 'AMBIGUOUS'):
+                        logger.error(
+                            'Retaining finished bound ordinary-launch worker '
+                            'for replica %s: its exact association is durably '
+                            'ambiguous (%s).', replica_id, t.exception)
+                        continue
+                    # A transport failure can happen before admission commits,
+                    # or after a commit whose response was lost.  Replace the
+                    # finished worker while this controller is still live:
+                    # the stable submission ID adopts an existing pointer or
+                    # safely performs the never-committed first admission.
+                    retry_request_id = (
+                        legacy_runtime.replica_to_request_id.get(replica_id))
+                    legacy_runtime.launch_thread_pool.pop(replica_id)
+                    legacy_runtime.replica_to_request_id.pop(replica_id)
+                    legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                    legacy_runtime.replica_to_logical_launch_fence.pop(
+                        replica_id)
+                    if info.status in (serve_state.ReplicaStatus.PENDING,
+                                       serve_state.ReplicaStatus.PROVISIONING):
+                        try:
+                            redriven = (
+                                self.
+                                _redrive_bound_ordinary_launch_after_pre_effect(
+                                    info))
+                        except Exception as error:  # pylint: disable=broad-except
+                            logger.warning(
+                                'Could not locally re-drive unresolved bound '
+                                'launch for replica %s: %s', replica_id,
+                                common_utils.format_exception(error))
+                            redriven = False
+                        if not redriven:
+                            # Retain a retry owner.  A later refresh repeats
+                            # the exact stable admission without waiting for a
+                            # controller restart.
+                            legacy_runtime.launch_thread_pool[replica_id] = t
+                    elif (info.status == serve_state.ReplicaStatus.SHUTTING_DOWN
+                         ):
+                        # Teardown can persist INTERRUPTED and then lose the
+                        # final admission acknowledgement while joining this
+                        # worker.  The finished unresolved marker is no longer
+                        # an executable owner, but dropping it without
+                        # rebuilding teardown would strand the durable row: a
+                        # live controller does not rerun startup recovery.
+                        status = info.status_property
+                        is_scale_down = (status.is_scale_down or
+                                         status.preempted)
+                        purge = status.purged
+                        try:
+                            self._terminate_replica(
+                                replica_id,
+                                sync_down_logs=not (is_scale_down or purge),
+                                replica_drain_delay_seconds=0,
+                                is_scale_down=is_scale_down,
+                                purge=purge,
+                                in_flight_drain_cap_seconds=(
+                                    status.drain_cap_seconds))
+                        except Exception as error:  # pylint: disable=broad-except
+                            logger.warning(
+                                'Could not locally re-drive teardown after '
+                                'unresolved bound launch for replica %s; '
+                                'retaining its retry owner: %s', replica_id,
+                                common_utils.format_exception(error))
+                            legacy_runtime.launch_thread_pool[replica_id] = t
+                            if retry_request_id is not None:
+                                legacy_runtime.replica_to_request_id[
+                                    replica_id] = retry_request_id
+                    continue
+                if isinstance(t.exception,
+                              _BoundOrdinaryLaunchPreEffectTerminalError):
+                    assert isinstance(t, _ReplicaLaunchThread)
+                    bound_pre_effect_retries.append((replica_id, info, t))
+                    continue
+                superseded = isinstance(t.exception,
+                                        _ReplicaLaunchSupersededError)
+                error_in_sky_launch = t.format_exc is not None
+                if isinstance(t.exception, _ReplicaLaunchCapacityError):
+                    if t.exception.reason == 'quota':
+                        bound_quota_launch_failures.add(replica_id)
+                    else:
+                        bound_capacity_launch_failures.add(replica_id)
+                bound_completed_launches.append(
+                    (replica_id, info, error_in_sky_launch, superseded))
                 continue
             if replica_id in superseded_launches:
                 superseded_launch_infos.append((replica_id, info))
@@ -9370,6 +11787,63 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # controller then performs one ordinary target-fenced
                 # autoscaler tick.
                 self._scale_reconciliation_event.set()
+            for replica_id, info, _ in completed_launches:
+                self._emit_ordinary_launch_handoff_event(
+                    info,
+                    ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+                    legacy_runtime.replica_to_request_id.get(replica_id))
+
+        # Bound reducers have already committed ReplicaInfo, exact paid-pool
+        # feedback, pointer clearing, and retention-pin release in one
+        # transaction. They release claims for terminal outcomes, while a
+        # non-cancelled PRE_EFFECT terminal keeps its exact claim for the next
+        # generation. Re-running the legacy batch here would apply the same
+        # economic outcome twice and could overwrite the typed projection with
+        # a stale pre-reducer snapshot.
+        if bound_completed_launches or bound_pre_effect_retries:
+            if (bound_capacity_launch_failures or bound_quota_launch_failures):
+                self._scale_reconciliation_event.set()
+            for replica_id, info, _, _ in bound_completed_launches:
+                self._emit_ordinary_launch_handoff_event(
+                    info,
+                    ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+                    legacy_runtime.replica_to_request_id.get(replica_id))
+            for replica_id, info, _ in bound_pre_effect_retries:
+                self._emit_ordinary_launch_handoff_event(
+                    info,
+                    ordinary_launch_handoff.EventKind.SERVE_RESULT_PROJECTED,
+                    legacy_runtime.replica_to_request_id.get(replica_id))
+
+        # Projection made these exact rows PENDING and cleared their old
+        # association pointer. Replace the completed local worker with a fresh
+        # recovery-style admission: the stable submission identity plus the
+        # settled predecessor makes the request transaction allocate
+        # generation+1, and the retained paid claim is reused exactly. If
+        # local reconstruction is temporarily unavailable, keep the completed
+        # marker so the next refresh retries without teardown.
+        for replica_id, info, old_thread in bound_pre_effect_retries:
+            legacy_runtime.launch_thread_pool.pop(replica_id)
+            legacy_runtime.replica_to_request_id.pop(replica_id)
+            legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+            legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
+            try:
+                retry_enqueued = (
+                    self._redrive_bound_ordinary_launch_after_pre_effect(info))
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Could not enqueue generation+1 bound ordinary launch '
+                    'for replica %s; retaining the pending retry marker: %s',
+                    replica_id, common_utils.format_exception(error))
+                retry_enqueued = False
+            if not retry_enqueued:
+                # _launch_replica either installs a complete fresh worker or
+                # installs none. Preserve a retry owner if admission deferred.
+                if replica_id not in legacy_runtime.launch_thread_pool:
+                    legacy_runtime.launch_thread_pool[replica_id] = old_thread
+                continue
+            logger.info(
+                'Queued generation+1 bound ordinary launch for replica %s '
+                'after exact pre-effect settlement.', replica_id)
 
         # Retire v2 failures before any ordinary log/drain provider work. The
         # worker remains registered until its row outcome has been persisted;
@@ -9410,6 +11884,25 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._terminate_replica(replica_id,
                                         sync_down_logs=True,
                                         replica_drain_delay_seconds=0)
+
+        for replica_id, info, error_in_sky_launch, superseded in (
+                bound_completed_launches):
+            if error_in_sky_launch:
+                # Keep the finished worker registered until teardown proves
+                # the exact request pointer is clear. Supersession is a
+                # scale-down decision; a launch failure keeps the historical
+                # failure record under existing Serve semantics.
+                self._terminate_replica(
+                    replica_id,
+                    sync_down_logs=not superseded,
+                    replica_drain_delay_seconds=0,
+                    is_scale_down=superseded,
+                    in_flight_drain_cap_seconds=(0 if superseded else None))
+            else:
+                legacy_runtime.launch_thread_pool.pop(replica_id)
+                legacy_runtime.replica_to_request_id.pop(replica_id)
+                legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
+                legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
 
         if pending_launches:
             if self._spot_placer is not None:
@@ -9566,9 +12059,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # This replica is now provisioning; reflect it locally
                     # instead of re-scanning the DB on the next replica.
                     in_flight += 1
-                    info.status_property.sky_launch_status = (
-                        common_utils.ProcessStatus.RUNNING)
-                    self._persist_replica(replica_id, info)
+                    if (isinstance(t, _ReplicaLaunchThread) and
+                            t.bound_ordinary_launch):
+                        # The child may admit and project before this parent
+                        # bookkeeping write.  Update only the latest locked
+                        # SCHEDULED row while its scalar pointer is still
+                        # active; a completed projection wins permanently.
+                        serve_state.mark_bound_replica_launch_running_if_active(
+                            self._service_name, replica_id,
+                            info.replica_record_id)
+                    else:
+                        info.status_property.sky_launch_status = (
+                            common_utils.ProcessStatus.RUNNING)
+                        self._persist_replica(replica_id, info)
                 for replica_id, t, info in down_to_admit:
                     if concurrent_downs >= _MAX_CONCURRENT_DOWNS_PER_SERVICE:
                         break

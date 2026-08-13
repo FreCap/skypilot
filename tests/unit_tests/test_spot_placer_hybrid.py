@@ -279,7 +279,6 @@ run: echo hi
         # pylint: disable=import-outside-toplevel
         import sky
         from sky.clouds import kubernetes as kubernetes_cloud
-        from sky.utils import resources_utils
 
         task = sky.Task.from_yaml_str("""
 resources:
@@ -292,25 +291,20 @@ run: echo hi
                             'get_workspace_allowed_clouds',
                             lambda workspace, **_: ['Kubernetes'])
 
-        def _kubernetes_feasible(self, resources, num_nodes=1):
-            del num_nodes
+        def _allowed_contexts(_cls, silent=False):
+            del silent
             assert (spot_placer.skypilot_config.get_active_workspace() ==
                     'research')
-            launchable = resources.copy(cloud=self)
-            return resources_utils.FeasibleResources([launchable], [], None)
+            return ['research-ctx']
 
         monkeypatch.setattr(kubernetes_cloud.Kubernetes,
+                            'existing_allowed_contexts',
+                            classmethod(_allowed_contexts))
+        live_feasibility = mock.MagicMock(side_effect=AssertionError(
+            'declarative Kubernetes catalog must not query live capacity'))
+        monkeypatch.setattr(kubernetes_cloud.Kubernetes,
                             'get_feasible_launchable_resources',
-                            _kubernetes_feasible)
-
-        def _make_launchables(resources, **_):
-            assert (spot_placer.skypilot_config.get_active_workspace() ==
-                    'research')
-            return [resources.copy(region='research-ctx', zone=None)]
-
-        monkeypatch.setattr(spot_placer.resources_utils,
-                            'make_launchables_for_valid_region_zones',
-                            _make_launchables)
+                            live_feasibility)
 
         locations = spot_placer._get_possible_location_from_task(
             task, workspace='research')
@@ -318,6 +312,66 @@ run: echo hi
         assert len(locations) == 1
         assert str(locations[0].cloud) == 'Kubernetes'
         assert locations[0].region == 'research-ctx'
+        assert locations[0].accelerators == {'A100-80GB': 1}
+        live_feasibility.assert_not_called()
+
+    def test_scale_to_zero_exact_gpu_shapes_remain_in_catalog(
+            self, monkeypatch):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import kubernetes as kubernetes_cloud
+
+        task = sky.Task.from_yaml_str("""
+resources:
+  any_of:
+    - infra: k8s/east
+      accelerators: A100:1
+      use_spot: false
+    - infra: k8s/east
+      accelerators: A100-80GB:1
+      use_spot: false
+    - infra: k8s/phx
+      accelerators: H200:1
+      use_spot: false
+run: echo hi
+""")
+        monkeypatch.setattr(spot_placer.sky_check,
+                            'get_workspace_allowed_clouds',
+                            lambda *_args, **_kwargs: ['Kubernetes'])
+        monkeypatch.setattr(
+            kubernetes_cloud.Kubernetes, 'existing_allowed_contexts',
+            classmethod(lambda _cls, silent=False: ['east', 'phx']))
+        monkeypatch.setattr(
+            kubernetes_cloud.Kubernetes, 'get_feasible_launchable_resources',
+            mock.MagicMock(side_effect=AssertionError(
+                'live node capacity is not catalog authority')))
+
+        catalog = spot_placer.PlacementCatalog.from_task(task,
+                                                         workspace='research')
+
+        assert {(location.region,
+                 tuple(sorted((location.accelerators or {}).items())))
+                for location, _ in catalog.entries} == {
+                    ('east', (('A100', 1),)),
+                    ('east', (('A100-80GB', 1),)),
+                    ('phx', (('H200', 1),)),
+                }
+
+    @pytest.mark.parametrize('cpus', ['4+', None])
+    def test_declarative_gpu_shape_normalizes_ratio_memory(self, cpus):
+        # pylint: disable=import-outside-toplevel
+        import sky
+        from sky.clouds import kubernetes as kubernetes_cloud
+
+        resources = sky.Resources(cloud=kubernetes_cloud.Kubernetes(),
+                                  accelerators={'H200': 1},
+                                  cpus=cpus,
+                                  memory='4x')
+
+        instance_type = (kubernetes_cloud.Kubernetes.
+                         get_declarative_instance_type(resources))
+
+        assert instance_type == '4CPU--16GB--H200:1'
 
     def test_persisted_catalog_is_projected_onto_workspace_policy(
             self, monkeypatch):
@@ -991,8 +1045,18 @@ class TestEphemeralStoragePerLocation:
 
         monkeypatch.setattr(aws_cloud.AWS, 'get_feasible_launchable_resources',
                             _capture)
+        monkeypatch.setattr(
+            kubernetes_cloud.Kubernetes, 'existing_allowed_contexts',
+            classmethod(lambda _cls, silent=False: ['research-ctx']))
+
+        def _capture_declarative(cls, resources):
+            del cls
+            captured.append(resources)
+            return '4CPU--16GB--A100:1'
+
         monkeypatch.setattr(kubernetes_cloud.Kubernetes,
-                            'get_feasible_launchable_resources', _capture)
+                            'get_declarative_instance_type',
+                            classmethod(_capture_declarative))
         task = sky.Task.from_yaml_str("""
 resources:
   cpus: 4+

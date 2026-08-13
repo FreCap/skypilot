@@ -29,6 +29,27 @@ def test_version_admin_api_allows_auth_disabled_local_server():
     server._require_admin(request)
 
 
+@pytest.mark.asyncio
+async def test_binding_admin_api_forwards_exact_mode_and_incarnation():
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None))
+    result = {
+        'binding_mode': 'bound',
+        'binding_epoch': 6,
+    }
+    with mock.patch.object(server.serve_utils,
+                           'set_ordinary_launch_binding_mode_encoded',
+                           return_value=result) as transition:
+        response = await server.set_ordinary_launch_binding_mode(
+            request,
+            'svc',
+            mode='bound',
+            expected_service_hash='service-hash',
+            expected_binding_epoch=5)
+
+    assert response == result
+    transition.assert_called_once_with('svc', 'bound', 'service-hash', 5)
+
+
 def test_serve_request_retains_submitted_yaml_before_api_processing():
     task = mock.sentinel.task
     body = payloads.ServeUpBody(task='service:\n  min_replicas: 2\n',
@@ -75,6 +96,9 @@ def test_version_history_marks_elected_and_active_versions():
                                    (1003.5 if version == 3 else None),
                                'quarantine_reason':
                                    ('invalid port' if version == 3 else None),
+                               'controller_job_projection': None,
+                               'controller_work_cache': None,
+                               'worker_placement_projections': None,
                            } for version in (1, 2, 3)]), \
          mock.patch.object(server.debug_dump_helpers,
                            'redact_task_yaml',
@@ -91,6 +115,9 @@ def test_version_history_marks_elected_and_active_versions():
         'created_by': 'user-3',
         'quarantined_at': 1003.5,
         'quarantine_reason': 'invalid port',
+        'controller_job_identity': None,
+        'controller_work_cache': None,
+        'worker_placement_identities': None,
         'policy': 'policy-3',
         'elected': True,
         'active': True,
@@ -102,6 +129,9 @@ def test_version_history_marks_elected_and_active_versions():
         'created_by': 'user-2',
         'quarantined_at': None,
         'quarantine_reason': None,
+        'controller_job_identity': None,
+        'controller_work_cache': None,
+        'worker_placement_identities': None,
         'policy': 'policy-2',
         'elected': False,
         'active': True,
@@ -113,6 +143,9 @@ def test_version_history_marks_elected_and_active_versions():
         'created_by': 'user-1',
         'quarantined_at': None,
         'quarantine_reason': None,
+        'controller_job_identity': None,
+        'controller_work_cache': None,
+        'worker_placement_identities': None,
         'policy': 'policy-1',
         'elected': False,
         'active': False,

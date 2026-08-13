@@ -1,98 +1,222 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: feature and durable executor/provider-fence PRs are merged and deployed;
-the production PostgreSQL cutover, protocol-v2 activation, and pool-identity
-RBAC are complete; measured-capacity PR #1269, UID-race PR #1271, shared-round
-replay PR #1272, launch-guard race PR #1274, and exact-card/provider-phase/
-workspace corrective PR #1275 and phase-scope hotfix #1280 are merged and
-deployed. Durable-round bootstrap PR #1278 is merged but not yet deployed.
-Live PHX canaries proved H200 scheduling, zero-cost accounting, and hub-to-PHX
-connectivity. A later live refill cycle exposed two corrective invariants now
-implemented here: an identity-stable pool retains non-launching shelter across
-a forward service-generation transition, and a downscale-held actuator may
-reuse materialized compatible supply only for the fresh owned source subset.
-The post-merge audit of PR #1422 found that its timestamp-based stale-epoch
-reauthorization could both reuse capacity consumed by an ordinary replica and
-double-debit a row already included by the broker.  The corrective contract is
-therefore strict epoch fencing; durable stale-decision reauthorization remains
-an open design gate.  The post-merge audit of PR #1424 also found that its
-numeric actionable-list cursor advanced on empty waves and changed meaning as
-pool eligibility changed.  Follow-up PR #1433 merged the stable-identity
-emitted-wave correction as merge `96a56fe069c621df18ec13e8dfadaa305f9da6ea`
-(head `7c8c71f1348ab2cb4276aa237ecee950d74e7e58`).  Its detached-wave premise was
-still partially false: a same-order generation/UID/epoch successor could let
-stale fill or globally coupled shelter suppression escape and could leave the
-aggregate target projection stale.  The sequential audit correction in this
-change adds the all-or-nothing authority commit seam below.  Its merge,
-artifact publication, deployment, and live verification remain pending.
-Sustained live verification and compatibility-cleanup merge gates remain open.
+Status: Serve046, its separately packaged Boltz reclaim policy, and the local
+Serve047 final-state cleanup restack are implemented after the identity-free
+worker-partition correction. Automated validation and three consecutive exact
+adversarial reviews are complete. Platform prerequisites remain; the feature
+is not deployed or activated, and the cleanup remains blocked on its documented
+live final-state gate
 
-Last updated: 2026-08-11
+Last updated: 2026-08-13
 
-Canonical owner: this file. The implementation, rollout evidence, and the
-stacked compatibility-removal change must stay synchronized with this
-contract.
+Canonical owner: this file
 
-Merged feature PR [#1261](https://github.com/boltz-bio/skypilot/pull/1261) is
-the revision-035 rollout change. Draft cleanup PR
-[#1263](https://github.com/boltz-bio/skypilot/pull/1263) is stacked directly
-above it in GitHub stack #1264 and must remain blocked until the cleanup gates
-in this design pass.
+Rollout policy: generation-fenced fix forward, no capacity-consuming canary,
+and no supported demotion after fleet activation
 
-## Summary
+## Decision summary
 
-Before protocol v2, `reserved_capacity_fill` accepted only one Kubernetes
-context per service. Its durable claim, controller cache, autoscaler snapshot,
-demand gate, and launch override also each held only one pool. Removing the
-validator alone would have overwritten one context with another, multiplied
-service-wide policy, and allowed a grant measured in one cluster to launch or
-shelter a replica in a different cluster.
+The steady-state reserved-fill path is:
 
-This change partitions a service's zero-cost Kubernetes locations into one
-broker pool per context. Each `(service, pool)` edge has an independent claim,
-round, feed, grant, snapshot, damping state, and launch fence. The service's
-existing floor, utilization policy, demand target, `max_replicas`, and fill
-headroom remain global. A deterministic allocator divides that one global
-budget among its pool edges before the existing cross-service broker allocates
-capacity within each pool.
+```text
+concurrent physical-pool observation
+  -> immutable PostgreSQL observation generations
+  -> immutable per-version worker/Kueue projection and canonical digest
+  -> deployment-policy authorization of the exact projected claim set
+  -> broker round with exact observation provenance
+  -> one authenticated service-wide allocation map
+  -> the ordinary autoscaler reconciliation coordinator
+  -> pure typed fill plan
+  -> locked durable capacity admission and replica-row acceptance
+  -> exact accepted/deferred commit receipt
+  -> exact projection revalidation and deployment-policy authorization at the
+     terminal provider boundary
+  -> one-way Pod materialization boundary and fresh authority around every
+     bounded post-Pod runtime or workload effect
+  -> existing asynchronous launch path
+```
 
-The public YAML is unchanged. Adding a second Kubernetes context to a service
-that already enables `reserved_capacity_fill` opts that service into the new
-behavior.
+The target correction removes the two root causes of the 2026-08-11 underfill:
+
+1. Physical-capacity reads no longer wait behind slow replica actuation while
+   their conservative freshness timestamp expires.
+2. Planned fill capacity is no longer counted as spent unless the replica
+   manager returns a receipt for the exact rows that became durable.
+
+The terminal PostgreSQL insert is also an admission ledger, not a passive
+recording step. Under the service-owner and replica-row locks it re-parses the
+authenticated map, rejects an intent replay, recomputes the durable service
+ceiling, and spends one physical pool/card slot. A delayed or concurrent
+caller therefore cannot oversubscribe capacity that an in-memory planner once
+observed.
+
+One PostgreSQL selector changes the whole writer fleet from the compatibility
+path to the sequenced path. The transition is one way. After activation, an
+unavailable or invalid allocation map withholds new fill; it never falls back
+to the old speculative launch path. Ordinary demand reconciliation continues.
+
+This is a fix-forward deployment. We do not run a GPU, service, or BCL canary
+and do not retain a second operator-selectable happy path. A problem after
+activation is repaired by deploying a successor image and authorizing one new
+gate generation through the same command and transaction used for first
+activation. The prior generation then fails closed.
+
+Code rollout and gate activation are separate operations. The image may be
+rolled out while the gate remains `LEGACY_ACTIVE`. Activation is withheld if
+the deployment cannot prove that inference and BCL/research workloads share a
+Kueue preemption domain; Kubernetes Pod priority by itself is not that proof.
+
+A final integration audit found that the first implementation bound the
+server-owned Pod PriorityClass but still resolved the Kueue LocalQueue from
+mutable launch-time configuration and copied the task-owned
+`resources.priority_class` into Kueue's WorkloadPriorityClass label. Claim and
+launch scopes also omitted the committed service version and worker-projection
+digest. That split ownership could attest Pod priority `-1000/Never` while
+submitting a differently prioritized Kueue Workload, and a service update could
+reuse the old claim generation. The steady-state correction is worker
+placement projection protocol v2: one immutable version record owns namespace,
+service account, explicit Pod Identity role or explicit identity-free state,
+Pod priority, accelerator scheduling, LocalQueue, and WorkloadPriorityClass.
+Its canonical digest and service version are fenced through every durable
+stage. No reserved-fill-specific parallel projection is introduced.
+
+The production inference partition intentionally has no AWS Pod Identity
+association. Protocol v2 therefore treats `pod_identity_role_arn: null` as a
+closed, hash-bound negative identity contract, not as a missing projection.
+Protocol v1 retains its historical non-null role requirement. The deployment
+policy receives the nullable value in every typed projected admission and must
+attest either the exact role association or its absence for the projected
+namespace/service-account pair. This keeps identity-bearing and identity-free
+partitions on the same canonical projection path without inventing a sentinel
+role or a deployment-specific compatibility branch.
+
+## Historical context and incident evidence
+
+Multi-pool protocol v2 and its physical-cluster identity fences predate this
+correction. Historical protocol work includes PR
+[#1261](https://github.com/boltz-bio/skypilot/pull/1261), its draft protocol-v1
+cleanup PR [#1263](https://github.com/boltz-bio/skypilot/pull/1263), and the
+later detached-authority correction in PR #1440 (`c964b5480`). Those changes
+made multiple physical Kubernetes pools representable and fail closed, but did
+not solve the lock convoy or receipt-less partial admission described here.
+The ordinary-launch prerequisites for this correction merged as
+[#1434](https://github.com/boltz-bio/skypilot/pull/1434) and
+[#1435](https://github.com/boltz-bio/skypilot/pull/1435).
+
+Production inspection on 2026-08-11 found server `1.1.1243` at `2d2c67efb`.
+The A100 pool remained underfilled while the protocol-v2 broker repeatedly
+published 34 free slots. Those snapshots reached the autoscaler 181--250
+seconds after their conservative source timestamps, beyond the existing
+180-second authority horizon. Physical polling and slow manager/provider work
+were serialized by `_actuation_epoch_lock`.
+
+The same investigation found that
+`Autoscaler._apply_reserved_capacity_fill_v2()` reduced its in-memory feed for
+every decision it emitted, while `ReplicaManager.scale_up_batch()` could accept
+only a prefix and returned no accepted-prefix receipt. A deferred tail was
+therefore neither durable nor eligible for immediate replanning.
+
+The broker's successful, UID-fenced publication of free A100 capacity is
+positive evidence that the live identity-read permission and reserved-cluster
+module deployment were not the underfill cause. RBAC drift should still be
+reconciled declaratively, but neither a permission change nor a larger timeout
+fixes these two defects.
+
+## Prior-plan reconciliation and intentional departures
+
+This file remains the one canonical design. Its detailed pre-implementation
+state is preserved immutably at commit
+`dbaad6213b582ae1b2e3bb364d6cc5e55bd7d311` and can be inspected with:
+
+```bash
+git show dbaad6213b582ae1b2e3bb364d6cc5e55bd7d311:\
+docs/designs/serve-multi-pool-reserved-capacity-fill.md
+```
+
+That revision is historical evidence, not an alternate contract or operator
+runbook. The implementation audit deliberately replaced these planned
+mechanisms before activation:
+
+| Superseded plan | Canonical implemented contract | Reason |
+|---|---|---|
+| One composite `(physical UID, accelerator set)` pool per context | One atomic `(physical UID, exact accelerator card)` edge; authenticated aliases are bounded query routes | Heterogeneous A100/H200 supply, width, and failure must remain independent without multiplying physical capacity. |
+| Slot-valued provider observations | Raw exact-card GPU counts plus an exact presence set; the broker converts once using `broker_slot_width` | Claimant width is service policy, not physical evidence; converting at observation time caused ambiguous or double conversion. |
+| Advance a capacity counter when observation begins | Snapshot three non-advancing commit counters: total admission, ordinary admission, and first-success materialization | Observation start is not a capacity-consuming event. Commit order, rather than wall time, closes admission and provider-visibility races. |
+| Direct single-context broker polling under the actuation path | Bounded concurrent observation cohorts, per-edge alias failover, immutable PostgreSQL results, and post-commit notification | Provider latency must not consume observation freshness or serialize unrelated physical pools. |
+| Ordered-prefix receipt | A bijective sparse receipt: pool-local failures skip only their intents; global authority loss defers the remaining ordered tail | One unavailable cluster must not starve an independent cluster, while service-wide fences remain atomic. |
+| A new durable intent state machine, provider scheduler, mutation arbiter, and debt path | Durable replica-row acceptance is the receipt boundary; accepted rows use the existing asynchronous launch/request path | A second scheduler and actuator would create another happy path and duplicate lifecycle ownership. |
+| Pod `PriorityClass`, task-owned Kueue priority, mutable launch-time queue resolution, or activation-time attestation as sufficient reclaim proof | The immutable worker projection is the sole admission owner; one entry-point-loaded deployment policy must prove and durably identify the shared Kueue domain, then authorize every sequenced claim set and terminal provider launch against the exact service version and projection digest | Kueue can withhold higher-priority BCL Pods before kube-scheduler priority can act, and a one-time census or Pod-only identity cannot govern later claims, service updates, or restarted executors. |
+| External release supervisor, phase-0 authority reset, bootstrap/maintenance modes, capacity canary, rollback, and fixed 24-hour soak | Full immutable split-role rollout at `LEGACY_ACTIVE`, exact activation prerequisites, then generation-fenced fix forward; no capacity canary or supported demotion | The Serve045 gate/reclaim receipt plus Serve046 version/projection binding form one smaller fail-closed transition and match the current lightly used service. |
+| Provider-progress status as launch authority | Provider-free `reserved_fill_reconciliation` diagnostics derived from authenticated allocation and durable rows | Observability must not perform provider I/O or become a second authorization source. |
+
+Rejected alternatives remain rejected: increasing the 180-second TTL hides the
+lock convoy; a finite `provision_timeout` cannot distinguish initialization
+from capacity exhaustion; a fallback planner or actuator duplicates authority;
+an external scheduler/supervisor duplicates lifecycle ownership; Pod priority
+alone does not prove Kueue reclaim; and a canary or rollback protocol is not
+required for this fix-forward rollout.
 
 ## Goals
 
-- Let one SkyServe service borrow idle reserved GPUs from multiple Kubernetes
-  clusters at the same time.
-- Keep `floor_replicas`, utilization gating, and `max_replicas` service-wide;
-  adding a context must not multiply any of them.
-- Preserve the existing one-pool behavior and YAML contract.
-- Isolate pool observation, staleness, grant damping, demand admission,
-  scale-down shelter, and epoch fencing.
-- Pin every fill launch to the exact pool whose feed authorized it, including
-  when two contexts expose the same accelerator name.
-- Roll out with an additive PostgreSQL schema and a fail-closed path back to a
-  one-pool binary.
+- Fill idle, zero-cost Kubernetes GPU capacity from every eligible physical
+  pool of one service without multiplying its service-wide policy.
+- Preserve the conservative 180-second capacity-authority horizon.
+- Query independent Kubernetes contexts concurrently and outside slow
+  actuation locks.
+- Publish only a complete service-wide planner input authenticated against the
+  current service owner, claim generation, pool rounds, physical identities,
+  and exact observations.
+- Use the same autoscaler decision tick for demand, scale-down shelter, and
+  reserved fill, with one reconciliation coordinator and no lost wakeup.
+- Debit ordinary demand and already accepted fill before producing new fill
+  intents.
+- Count capacity as spent and advance pool rotation only from a validated
+  durable commit receipt.
+- Revalidate the exact intent, current service ceiling, and remaining
+  aggregate and accelerator-card feed in the same transaction that inserts
+  each sequenced fill row.
+- Keep every fill launch pinned to a zero-cost location in the exact physical
+  pool and accelerator class that authorized it.
+- Preserve and mechanically respect the deployment-owned Kueue admission and
+  preemption contract under which BCL work may reclaim preemptible inference
+  slots.
+- Make worker placement projection v2 the only owner of projected Kubernetes
+  admission: task inputs cannot select Pod priority, LocalQueue, or
+  WorkloadPriorityClass, and launch rendering cannot reread those values from
+  mutable configuration.
+- Bind the exact deployment reclaim-policy identity into PostgreSQL, allocation
+  authentication, replica provenance, and the terminal provider launch fence,
+  together with the committed service version and complete worker-projection
+  digest; a missing, legacy, ambiguous, stale, or differently identified
+  policy or projection fails closed.
+- End with the sequenced path as the only launch path and a concrete stacked
+  removal change for the compatibility code.
 
 ## Non-goals
 
-- User-configurable per-context floors, weights, or preferences. Stable task
-  resource order is the initial pool order; an optional policy can be designed
-  later without changing this contract.
-- Combining disjoint accelerator groups inside one Kubernetes context. All
-  zero-cost accelerator names in a context remain one physical pool group.
-- Parallel Kubernetes observations in the first release. Protocol v2 retains
-  the existing global broker lock and lease. A later cleanup may shard them
-  after protocol v1 is removed.
-- Treating two kubeconfig aliases as independent capacity. The new pool claim
-  records a Kubernetes cluster UID and rejects overlapping aliases when that
-  identity is available. A context whose physical identity cannot be verified
-  does not participate in multi-pool fill; ordinary demand placement remains
-  available.
+- No new YAML, SDK, or CLI service policy field.
+- No increase to the observation freshness horizon and no postdating of a slow
+  provider read.
+- No inference from `provision_timeout` that a Kubernetes request is either
+  initializing or out of capacity.
+- No paid fallback. A reserved-fill intent is zero-cost-only and is skipped if
+  its exact zero-cost location cannot be proved.
+- No fixed readiness SLA for a 200-replica wave. Durable admission is bounded;
+  provider scheduling, image pull, setup, and readiness retain their real
+  latencies.
+- No capacity-consuming canary, shadow planner, dual actuator, per-service
+  rollout flag, or supported post-activation demotion.
+- No caller-selectable Kubernetes namespace, service account, PriorityClass,
+  LocalQueue, WorkloadPriorityClass, toleration, or BCL priority policy. The
+  existing deployment-owned values move into one immutable projection and are
+  reasserted; this feature does not choose new priority semantics.
+- No status-side provider calls, mutation authority, or new provider-progress
+  scheduler. Diagnostics are a read-only projection of already authenticated
+  PostgreSQL authority and exact durable replica attribution.
 
 ## Public contract
 
-The existing forms remain valid:
+The existing policy forms remain unchanged:
 
 ```yaml
 service:
@@ -111,1646 +235,2182 @@ service:
       utilization_gate: true
 ```
 
-For fill-enabled services, zero-cost Kubernetes candidates are grouped by
-context. Within each context:
+Zero-cost Kubernetes candidates are grouped by physical pool. The steady-state
+atomic identity is one physical Kubernetes cluster UID plus one exact
+accelerator card; the access context and replica width are carried separately.
+A single context offering `A100: 1` and `H200: N` therefore produces two
+independent, deterministically ordered edges. The repeated context is valid:
+only an overlap on the same physical UID/card is ambiguous. Context aliases
+that prove the same UID/card cannot multiply one physical pool, and aliases
+that disagree on width for that exact card fail closed.
+The deployment policy enforces the same atom invariant through one shared
+claim-set validator used by both activation and every later claim replacement:
+it accepts multiple edges sharing an access context, attests that context once,
+and rejects only a second claim on the same
+`(physical_cluster_uid, exact_card)` atom before provider calls.
+The typed admission for that atom also carries the normalized accelerator
+scheduling tuple: label key, sorted label values, and extended-resource key.
+Activation, every claim-set replacement, and every terminal launch must match
+that tuple exactly against a disjoint code-owned card contract. A logical card
+cannot own a flavor or scheduling tuple already owned by another logical card.
 
-- all configured accelerator names form one broker pool;
-- every physical-backend candidate must use the same positive whole GPU count;
-- logical-replica candidates must continue to use exactly one GPU.
+The existing service-wide meanings remain authoritative:
 
-Independent physical-backend contexts may use different per-replica GPU
-counts. Non-Kubernetes and paid candidates are unaffected.
+- `floor_replicas` is one total fill floor, not one floor per context.
+- `weight` is relative between services sharing a pool. If a second service
+  with the same weight joins, the broker shares eligible capacity according to
+  both services' floors, weights, holdings, and caps; setting both weights to
+  `1000` is equivalent to setting both to `1`.
+- `utilization_gate` measures service demand once and bounds the same global
+  fill budget.
+- `max_replicas` is a hard service-wide ceiling across versions and pools.
+- Ordinary demand has priority in the service headroom calculation and in the
+  allocation-local pool/card debits.
 
-The policy fields retain these meanings:
-
-- `floor_replicas` is one total floor across all of the service's pools;
-- `weight` is the service's relative weight on every pool edge;
-- `utilization_gate` observes the service once and governs the same global
-  fill budget;
-- fill headroom is `max(0, max_replicas - demand_target)` across all pools;
-- the final number of nonterminal replicas across every version and location
-  never exceeds `max_replicas` because of fill.
+`kubernetes.provision_timeout` is not changed by this feature. In particular,
+`-1` may remain the correct choice for preemptible reserved capacity that
+should wait rather than fail the service. A finite timeout such as 30 seconds
+is not used as a capacity classifier. The observer records explicit success or
+typed blackout evidence, while ordinary replica/provider states continue to
+describe initialization and launch progress. The indefinite-wait liveness
+guarantee applies to the instrumented built-in Kubernetes reserved-fill path,
+whose passive scheduling/readiness waits hold no authority guard. Opaque
+provisioners are not eligible for protocol-v2 reserved fill: v2 requires the
+in-tree Kubernetes create/adopt/attest boundary so success has an unambiguous
+one-way Pod-materialization transition.
 
 ## Architecture and invariants
 
-### Pool discovery and identity
+### 1. Provider-free observation ledger
 
-The poller builds an ordered `FillPoolSpec` for each Kubernetes context. It
-contains the context, canonical accelerator shapes, matching zero-cost
-locations, broker key, and the Kubernetes `kube-system` namespace UID used as
-a non-secret physical-cluster identity.
+`sky/serve/pool_capacity_observer.py` owns physical-pool reads. For one
+observation tick it:
 
-Protocol-v2 pool keys are versioned and use the physical UID plus canonical
-accelerator set. They never share a round with protocol-v1 context keys. The
-access context remains a separate claim field used only to query and launch.
-An overlapping live claim reached through a second context alias therefore
-joins the same physical pool instead of being counted twice. If one service
-configures two aliases of the same physical pool, the first task-resource
-position is the deterministic survivor and the duplicate edge is rejected.
+- builds an immutable target from pool key, physical UID, every authenticated
+  access-context route, and the exact accelerator card;
+- rejects service configurations with more than eight resolved exact-card
+  `(physical UID, card)` edges, then starts the bounded independent pool
+  queries concurrently; each edge independently accepts at most eight
+  authenticated access-context routes;
+- passes each query an absolute deadline (45 seconds by default);
+- rotates the first alias attempted, gives each remaining alias a fair share of
+  the remaining root deadline, and emits a typed pool-local blackout only after
+  every authenticated route fails; and
+- commits either raw exact-card GPU success with the winning route or a typed
+  pool-local blackout; and
+- notifies reconciliation only after the completed row is durable.
 
-Physical identity is cached for at most one poll interval. Lookup uses a
-bounded read of the `kube-system` namespace UID. A failed lookup withdraws only
-that edge and feeds it zero; it never substitutes the context string as
-identity. The protocol-v2 broker also runs its realtime availability listing
-inside a capture pinned to that edge's expected UID. A context retarget during
-measurement is therefore a blackout, never capacity evidence that can grant
-or drain holdings belonging to the prior physical cluster. A standalone fill
-launch takes blocking `V2_FENCED` admission before the manager lock. A fleet
-batch retains one manager-lock acquisition, selects each exact carried
-location provider-free, and takes a zero-wait `V2_FENCED` admission for each
-item only at its physical-capture/persist seam. FIFO prevents a later item from
-barging once an ambient waiter queues. The batch also refuses to wait for a
-same-context physical-fence initializer while holding the manager lock. Phase
-or initializer contention defers that item before a durable row or launch
-thread exists. An admitted item activates the exact `(context, UID)` physical
-capture and retains both authorities through the atomic
-`persist_fill_replica` transaction and construction/freeze of the queued
-launch tuple and thread arguments, then releases them before starting or
-submitting the asynchronous launch thread; it never performs an ambient forced
-UID refresh. Its durable API launch context then carries seven fields:
-protocol, pool key, service generation, physical UID, Kubernetes context, and
-exact accelerator name/count. Presence of any one requires all seven, a
-complete normal Serve owner fence, and a controller-originated request.
-Protocol must be exact integer `2`; generation and count must be positive
-exact integers (not booleans); strings must be nonempty; and the parsed v2 pool
-key must encode the same UID and contain the canonical accelerator. API ingress
-rejects every partial, malformed, contradictory, or non-Serve tuple before
-scheduling a request. Absence of all seven is ordinary demand or protocol v1
-and performs no physical-identity read. The tuple is copied into the immutable
-PostgreSQL request body and must survive request/executor restart without
-consulting controller memory. API ingress independently validates and
-atomically commits the carried tuple to that immutable request body without
-relying on the earlier controller authority. Each API execution attempt
-acquires a fresh phase and physical fence around registration, provisioning,
-runtime bootstrap, file sync, setup, and job submission. Exact-equivalent
-lower-level Kubernetes provisioning retries remain inside that one immutable
-capture; the provisioner still revalidates the carried context and shape
-immediately before every provider mutation. A scheduler-level retry unwinds
-the complete execution scope before waiting and acquires a fresh phase and
-capture on its next invocation. The tuple is bound to the same service
-incarnation as the normal owner fence. Round epoch is intentionally absent:
-the epoch is consumed by the atomic `persist_fill_replica` transaction, after
-which that durable pending row is the reservation carried into launch.
+The observer does not allocate, plan, mutate replicas, or hold the controller's
+actuation lock during provider I/O. A slow or failed pool cannot serialize a
+healthy sibling. The provider adapter must consume the same absolute batch
+deadline, bound its blocking Kubernetes calls to the remaining time, and free
+executor capacity after timeout; a wrapper-only timeout is insufficient.
+Exact-card edges in the same context join one in-progress physical-UID capture
+under that deadline rather than interpreting their shared initializer as
+capacity failure. Accelerator names returned by the provider are case-folded
+only after rejecting collisions, and the catalog's negative forbidden-read
+sentinel becomes a typed permission blackout.
 
-After request recovery, admin policy, and optimization, the executor requires
-the final selected resources to retain the exact Kubernetes context and shape.
-That early check is not the last placement authority: immediately before every
-provider attempt, the retrying provisioner revalidates the attempt's selected
-resources against the durable tuple. The attempt must still use Kubernetes,
-the exact context, and the canonical accelerator name/count. A mismatch is a
-terminal request cancellation before provider-side actuation; it is never
-eligible for retry or failover. Thus an internal retry, optimizer alternative,
-or admin-policy alternative cannot leave the fenced context or shape after the
-executor's final-plan check. The executor also activates a process-local
-provider fence for that context/expected UID across provisioning, runtime
-bootstrap, workdir sync, setup, and job submission. Fence activation captures
-one immutable, least-readable kubeconfig target, reads its `kube-system`
-Namespace UID, and admits the scope only when it matches the durable UID.
-External exec-auth contexts retain their captured exec credential contract but
-cannot change endpoint; the synthetic in-cluster region and the provider's
-normalized `None` context resolve to the same fenced target.
+`PoolCapacityObservationRepository` is PostgreSQL-only. The canonical
+`begin_observations()` boundary locks the event sequencer once, locks the
+requested pool rows in sorted order, and atomically acquires every independently
+due, unleased pool in a cohort. Busy or not-due members are skipped without
+starving healthy siblings; their prior completed evidence remains independently
+bounded by its own freshness deadline. Every returned lease shares one capture
+of:
 
-Every Kubernetes API wrapper used by the operation, including calls from its
-Pod-creation thread pool, borrows the capture-pinned raw client. Transparent
-refresh cannot reread the ambient kubeconfig while a fence is active. Client
-replacement waits for outstanding call leases, while calls sharing one proved
-client remain concurrent; the fence must not serialize multi-Pod creation by
-holding a refresh mutex across each network call. Every external-context
-`kubectl` command path, including exec, port-forward, and rsync, receives the
-same capture-pinned kubeconfig rather than the ambient context. In-cluster
-commands retain explicit `--kubeconfig /dev/null` isolation and the fixed
-service-account endpoint/token mount, while `None` resolves to the active
-in-cluster fence for API-client verification. Conflicting simultaneous
-expected UIDs for one context fail closed. Retargeting between observation, enqueue,
-restart, policy, optimization, client refresh, provider actuation, runtime
-bootstrap, setup, or job submission therefore cannot mutate or deliver data to
-a different physical cluster. Concurrent UID reads never publish out of
-generation order. A superseded successful read returns the newer generation's
-live cache value when one is already published; otherwise both forced and non-
-forced callers may return their own independently successful read without
-publishing it. Generations order lookup starts, not read completion, so
-discarding that value is not a stronger identity proof: it spuriously
-withdraws the pool edge on observation and refuses every matching launch
-guard. A failed or empty read still returns no identity, and the exact launch
-capture independently proves the carried UID before provider mutation.
-Ordinary demand placement remains available.
+- a per-pool observation generation and lease token;
+- the global all-zero-cost admission high-water;
+- the global ordinary-zero-cost admission high-water;
+- the global first-successful-launch materialization high-water;
+- a conservative `observed_at` at query start; and
+- `valid_until = observed_at + 180 seconds` under current defaults.
 
-The process registry is deliberately conservative while a capture is active:
-an unleased same-context provider call, or a leased call that attempts a
-second context, fails closed instead of borrowing the capture or falling back
-to ambient configuration. Explicitly supported fan-out propagates the lease.
-An unrelated ordinary request that overlaps this short scope may therefore
-retry after the scope retires; outside an active scope its historical ambient
-behavior is unchanged.
+Starting an observation advances none of the event counters. Observation
+generation identifies a provider read; admission and materialization counters
+identify replica-row commits that can invalidate or contextualize that read.
+Only the ordinary-admission counter must match across the old and new pool
+evidence combined into a service-wide allocation. The total admission and
+materialization counters remain per-pool debit boundaries, so skipped older
+evidence is safe when its exact provenance is retained. Repository and target
+validation both enforce the eight-edge bound; route validation separately
+enforces the eight-alias-per-edge bound. There is no silent chunking that could
+reintroduce staggered ordinary-admission prefixes.
 
-Fleet work that can consult mutable Kubernetes authority must make that retry
-boundary explicit. A mixed legacy/protocol-v2 status or probe batch is
-partitioned: all v2 rows run with exact propagated leases while their owners
-are live; only after those owners retire may Kubernetes or unknown ordinary
-work enter `AMBIENT_LEGACY`. The two gated modes may remain internally parallel
-but never overlap. Exact non-Kubernetes operations explicitly enumerated below
-may run outside either mode only when they consume the same prefetched durable
-handle, or an exact UUID-and-handle-predicated record, and cannot re-resolve
-provider identity by name. The v2 phase includes result classification,
-preemption refresh, and teardown that can consult Kubernetes authority;
-joining only the initial futures is insufficient. Shared provider-free
-reduction may run afterward, but no deferred v2 Kubernetes call may escape its
-lease. Malformed v2 rows remain identity-uncertain and are never downgraded.
-One round performs one UID proof per physical v2 pool.
+Completion verifies the latest lease and identity and writes a SHA-256 over
+the complete identity, sequence, payload, legacy projection, and timestamps.
+A success stores physical GPU counts, never service-specific replica slots.
+The exact-card count remains present even at zero; the separate canonical
+presence set distinguishes a present-but-full card from a card that is absent
+from the physical cluster. The winning access context must belong to the
+immutable route set acquired in the lease and is persisted as observation
+provenance.
 
-Each OS process that can issue Kubernetes-authority-bearing work (API,
-controller, or executor) has a provider-phase gate with exact modes
-`V2_FENCED` and `AMBIENT_LEGACY`.
-Same-mode callers may overlap. Fresh callers
-receive FIFO tickets: after an opposite-mode ticket queues, later same-mode
-callers cannot barge, and the next maximal same-mode prefix becomes one cohort
-when the active cohort drains. A root admission may explicitly authorize
-already-planned child workers to join its exact process/PID/boot/epoch-bound
-cohort; an ordinary thread or copied/stale admission cannot. The root closes
-child admission before exit and already-admitted children drain first.
-Same-mode nesting on one thread is reentrant, cross-mode nesting is rejected,
-and cancellation or timeout removes the waiter and wakes the next turn. An
-expired opposite-mode FIFO barrier is pruned even while a compatible cohort is
-still active; a now-compatible queue prefix joins that same epoch, while the
-first live opposite waiter remains an absolute barrier. Every blocking
-acquisition has one 30-second absolute monotonic deadline and fails closed with
-a typed phase-timeout error. An `after_in_child` fork hook replaces
-the condition, queue, active phase, admissions, and thread-local state without
-touching a possibly inherited locked mutex. The composed physical-fence
-registry performs the same child reset for its lock, condition, active and
-initializer maps, failure generations, and `ContextVar`; it never unlinks a
-parent-owned captured kubeconfig from the child.
+A transient physical-UID discovery failure retains the last proven
+context-to-UID edge instead of deleting fleet-wide capacity topology. This is
+not stale launch authority: every provider observation and every admitted
+launch still re-proves that UID through the captured Kubernetes client. A
+retargeted context therefore fails its identity fence, while another alias for
+the same physical pool may continue the observation.
 
-Blocking acquisition order is provider phase, `self.lock`, then lower-level
-resources, physical-UID-cache, and broker locks. Existing probe/refresher
-atomic read-modify-write cycles and the batched v2 persist seam are deliberate
-exceptions: while continuously holding `self.lock`, they may use only a
-zero-time `try_enter`. A try never queues, sleeps, joins an initializing
-physical fence, or barges past a queued opposite phase. Failure skips that
-provider sub-operation, partition, or one unpersisted launch immediately. It
-cannot publish readiness, absence, preemption, identity-mismatch, cleanup, or
-capacity-reservation evidence and is not recorded as physical-identity
-uncertainty; unchanged work is retried next round. A busy batch item stops the
-entire remaining wave so the manager lock is released to the newly admitted
-opposite root instead of churning later decisions beneath that root.
+A timed-out, superseded, malformed, permission-denied, identity-mismatched, or
+otherwise failed query grants no capacity. A newer completed blackout prevents
+fallback to an older success. A newer in-progress generation does not erase
+the last completed result until it completes.
 
-The autoscaler interleaves protocol-v2 fill decisions in stable configured
-pool order.  It remembers the stable identity of the pool that actually
-emitted the prior wave's first decision; the next wave starts after that pool
-in the complete ordered pool map and only then filters pools with no spendable
-feed.  A tick that emits no fill decision does not consume a fairness turn.
-The identity is carried across an in-process autoscaler state transfer only
-when it is a string naming a pool in the validated restored map.  Anchored-pool
-removal, protocol demotion, fill disablement, a malformed or unknown anchor,
-and a full controller restart reset it.  Thus a continuously running controller
-gives every continuously actionable pool a first-admission opportunity within
-at most one emitted wave per pool in the validated map, without adding provider
-or database calls; ordering remains linear in the number of pools.  A detached
-decision wave also captures the ordered-map revision.  If pool membership or
-ordering changes, or a lifecycle reset removes and then re-adds the same pool
-identity, the stale wave is discarded before the replica manager and may
-neither suppress ordinary work, mutate the replacement feed, nor recreate the
-cleared rotation anchor; the caller's ordinary decisions remain unchanged.  If
-any live pool's generation, physical UID, or broker epoch differs without a
-map-order change, the complete detached overlay is likewise discarded and the
-caller's exact ordinary decisions are restored.  Target/headroom partitioning
-and demand/shelter coverage couple every pool, so no unchanged peer's detached
-subset is independently committable.  Rollback aligns the aggregate target
-projection with the replacement live per-pool targets but does not debit feed
-or advance the rotation anchor; a fresh tick retries the complete map within
-one decision interval.  A same-authority timestamp or damping refresh remains
-committable.  Only after every authority tuple matches does the first emitted
-fill decision's pool advance the rotation anchor.  This is an in-method commit
-seam for shelter suppression, fill decisions, feed, targets, and rotation
-state; production serialization through the controller's actuation-epoch lock
-and the manager's durable broker fences remains authoritative across method
-return and actuation.  Dynamic-state loading builds an unpublished replacement
-autoscaler under the routing and actuation locks. Concurrent mutation of the
-same autoscaler during `load_dynamic_states` is outside the supported lifecycle
-contract.
+The fixed-rate poll remains 60 seconds. The correction is event-driven after a
+publication: it does not wait for the former autoscaler polling interval or
+for unrelated actuation, but it cannot discover capacity before the next
+physical observation tick.
 
-There is deliberately no exclusive manager-wide reconciliation round: one
-unreachable job-status SSH call must not block readiness or the refresher that
-admits already-enqueued launches and downs. Job status takes every blocking
-phase outside `self.lock`, partitions strict v2 rows before gated ordinary work,
-and passes admission to every phased worker. An ordinary SSH worker may run
-unphased only when the same prefetched durable record supplies an exact
-`CloudVmRayResourceHandle` with a real non-Kubernetes `Cloud`, and the backend
-consumes that object without a name lookup. Success reduction is provider-free.
-If an unphased fetch raises `CommandError`, fresh provider-backed preemption
-classification acquires `AMBIENT_LEGACY` before the manager lock, then re-reads
-the replica under the lock; a row that changed to v2 is deferred to the next
-strict round.
-Missing, malformed, fake-cloud, or Kubernetes handles stay ambient. Probe and
-refresher retain one continuous `self.lock` acquisition for their whole round,
-preserving their existing atomicity against scale, update, and other pickled-
-row writers. They therefore use only try admission while that lock is held.
+### 2. Commit-order sequencing for zero-cost admission and materialization
 
-One probe performs its provider-free fleet/cluster snapshot, durable handle
-shape checks, tick-spec reset, process-guard prune, and route-registry prune
-exactly once. It then runs the complete v2 subset under try-`V2_FENCED` and one
-physical owner per `(context, UID)`, joins every readiness/status/liveness
-future, finishes preemption classification, reduction, persistence, and inline
-teardown, and retires all owners. Only then does the complete ordinary subset
-run under try-`AMBIENT_LEGACY`. A denied subset contributes its original,
-unchanged rows to the provider-free ordered final merge. One-time state is not
-reset, pruned, persisted, or finalized once per subset.
+The protocol singleton has three deliberately separate counters:
 
-The refresher similarly tries v2 work before ordinary work while retaining its
-one lock acquisition. Wait-for-idle URL resolution leaves its tracker
-untouched when admission is busy. Inline log sync and drain-URL lookup are
-best-effort: phase busy skips log sync or uses the existing bounded drain wait,
-then still schedules the separately fenced down. A phase-busy result must not
-be handled after a completed launch/down worker has been removed from its
-runtime registry, so it cannot strand cleanup. Recovery paths that already
-hold `self.lock` follow the same try-only/no-evidence rule. Boot recovery
-consumes phase busy as an ordinary deferral inside its reconciliation pass; it
-must not raise into the generic 30-second retry sleep while retaining
-`self.lock`.
+- `zero_cost_admission_sequence` is the total commit order for every accepted
+  zero-cost replica row. It provides row attribution and replay diagnostics.
+- `ordinary_zero_cost_admission_sequence` is the cross-service invalidation
+  generation for ordinary demand. Ordinary capacity is not broker-partitioned,
+  so a commit by any service invalidates every allocation map based on the old
+  generation. Reserved-fill commits do not advance this counter because their
+  capacity is already partitioned by authenticated broker grants.
+- `zero_cost_materialization_sequence` is the total commit order for the first
+  persisted successful `sky.launch` of every zero-cost row. It closes the
+  interval between row admission and provider-visible occupancy without using
+  `created_at`, readiness, or an inferred provisioning timeout.
 
-An asynchronous launch HTTP request never holds a phase. Before persisting a v2
-fill launch, the carried override is classified provider-free and the exact
-`(context, UID)` physical fence proves the pin under the standalone-blocking or
-batch-try admission described above; ambient force-refresh is not used. Failure
-returns before row persistence or request submission. A deferred down worker
-waits for drain with neither lock. Each v2 retry independently enters
-`V2_FENCED`, selects the workspace, creates a fresh physical proof, and performs
-the provider mutation. An ordinary action-aware retry may bypass the Kubernetes
-phase only when its exact UUID-predicated cluster snapshot proves a real non-
-Kubernetes cloud and `core.down` retains both that UUID and the classified raw
-serialized-handle fingerprint. The backend re-proves the same handle under its
-two action locks before provider effects; a same-UUID handle rotation retries
-from fresh classification. Legacy/name-only, missing, malformed, fake-cloud,
-and Kubernetes cleanup remains
-`AMBIENT_LEGACY`. Every retry reclassifies; all paths release phase/fence before
-backoff and never reuse the originating round's proof.
+Each observation snapshots all three counters without advancing any of them.
+An allocation publication is valid only when every included observation
+captured the same ordinary high-water and that value still equals the locked
+protocol singleton. A reader repeats the exact-equality check; a newer ordinary
+commit makes the map stale instead of trying to repair it with application
+clocks.
 
-Paths without manager state use the process phase directly. These include cold
-and warm load-balancer route synchronization, standalone active-URL reads,
-full API service-status serialization (including multi-service fanout), and
-reserved-capacity observations. They run complete v2 groups before ordinary
-rows and never turn a phase timeout into negative evidence. A load-balancer
-route-sync phase timeout aborts that synchronization with 503 and publishes no
-new mapping or warm-cache state; it cannot produce a successful mapping with
-the timed-out rows omitted. Standalone/API status may report identity unknown
-but never physical absence. The v2 poller enters `V2_FENCED` before
-`run_round_if_stale`, so it never waits for the phase from inside the broker
-callback/lock; legacy/shared-demand observations enter `AMBIENT_LEGACY` under
-the same rule. A phase-owning poller makes broker-lock admission zero-wait. If
-another poller/controller owns the lock, this cycle feeds no new capacity and
-retires its process phase immediately; if it acquires the lock, the exact
-observation and publication remain one protected round. One driven v2
-observation creates one physical proof for its pool.
+In `SEQUENCED_ACTIVE`, an ordinary zero-cost insert atomically advances both
+counters and stores its database-assigned total sequence on `ReplicaInfo`. A
+typed fill insert carries the allocation's ordinary high-water, requires it to
+still equal the locked singleton, and only then advances the total counter.
+The manager performs that final revalidation and row insert while participating
+in the same global demand-admission lock as ordinary placement. Provider
+preflight stays outside that lock. This closes both directions of the race:
+ordinary demand cannot commit between fill revalidation and persistence, and a
+fill cannot consume stale evidence while an ordinary placement transaction is
+in flight.
 
-Interactive log follow is the bounded-operation exception. It uses a dedicated
-streaming fence which does not acquire or hold a process phase. A v2 row still
-validates its durable handle and holds the immutable physical fence for the
-whole stream; it may join an existing same-UID capture, while conflicting UID
-or initializer admission fails closed. An ordinary follow remains ungated and
-the central adaptor rejects any unleased collision. Streaming bytes cannot
-publish lifecycle evidence. Consequently a long v2 follow can make ordinary
-same-context reconciliation retry until the operator stops it, but it cannot
-monopolize the fair phase gate. Bounded/non-follow tails use their normal phase
-for the complete read.
+The pure planner still debits ordinary decisions from the same reconciliation
+tick before they have committed. A target-less or otherwise ambiguous decision
+is conservatively debited against every compatible map-local pool, with each
+debit capped by that pool's authenticated feed. The broker also performs one
+complete row snapshot across claimant and nonclaimant services. For a sequenced
+observation, a compatible nonterminal zero-cost row debits observed free when
+its admission is newer than the observation admission high-water, its first
+successful launch is newer than the observation materialization high-water, or
+either marker is missing or malformed. A row whose valid admission and
+materialization markers are both no newer than the observation is left to the
+provider measurement and is not double-debited. This prevents two services
+from spending one observed slot without making broker-disjoint fill commits
+invalidate each other.
 
-An independent broker UID discovery that encounters the typed
-owner-or-initializer collision waits at most 30 seconds for that context to
-become ambient again, using one absolute monotonic deadline across capture
-replacement races, and then re-reads the UID from fresh ambient credentials.
-The retry retains its original lookup generation and follows the same
-publication rule: a forced or non-forced caller can report its successful
-post-wait read without stealing cache ownership when the newer generation has
-not yet published, while an available newer live cache value wins.
-It performs this wait without a broker/cache lock and only when the caller has
-no fence token, so it cannot deadlock its own scope. Owner and initializer
-retirement wake waiters. Other identity errors, a timeout, a context mismatch,
-or an owner failure still withdraw that pool and never borrow the expected UID,
-capture target, client, or token. This prevents a valid pool from flapping
-merely because legacy reconciliation overlapped a v2 batch without weakening
-the process-global fail-closed rule.
+Physical placement, not economic classification, determines whether a replica
+can race a pool observation. Sequenced scans therefore include every
+Kubernetes row whose current access context and accelerator match the pool,
+plus rows with complete immutable pool provenance and conservative same-card
+fallbacks for unattributed zero-cost/fill rows on retired aliases. This rule is
+durable across replica rewrites: serialization upgrades a pre-v11 row to the
+latest record version but cannot reconstruct its historical `is_zero_cost`
+truth. A false cost flag can therefore never make a physically matching row
+disappear from the debit. Until every Kubernetes launch row carries immutable
+physical-UID attribution, an unattributed same-card row on another context may
+be using a retired alias and is conservatively debited from every compatible
+v2 pool. A row on a non-Kubernetes cloud is excluded unless its persisted pool
+provenance still makes this pool plausible. This conservative occupancy
+accounting is not a second launch path and is intentionally retained by cleanup
+PR #1452. A separate future stack may persist the physical UID on ordinary
+placement, migrate live ordinary rows as they are authoritatively refreshed,
+and remove same-card duplication only after no nonterminal zero-cost row lacks
+that identity for one complete observation horizon. Neither this feature nor
+#1452 claims that removal.
 
-The durable physical fence continues after launch for every alias-sensitive
-replica lifecycle read. Endpoint discovery, readiness routing, job-status SSH,
-candidate/recovery status, interruption detection, drain registration, status
-serialization, active-route enumeration, and interactive replica log tailing
-must reconstruct the protocol-v2 context/UID authority before contacting
-Kubernetes. A durable cluster handle used by those reads must also remain a
-Kubernetes handle for the same cluster name and context. An identity or handle
-mismatch produces unknown/off-route evidence; it is never reclassified as
-preemption, application failure, an absent job, or a valid replacement
-endpoint. The load-balancer controller
-re-gates both cold and warm route-cache entries on every synchronization. If
-no protocol-v2 replica can prove its physical identity, its verified-ready
-count is zero and the empty mapping explicitly retires prior routes rather
-than triggering the generic spurious-empty safeguard.
+The complete replica snapshot is part of spendable sequenced authority. A
+grouped enumeration, query, or decode failure rejects the new observation and
+does not publish a successor round; the previous round remains bounded by its
+original freshness deadline. The legacy callback path retains its historical
+per-service fallback only while the durable selector remains in
+`LEGACY_ACTIVE`.
 
-Lifecycle reconciliation batches this verification by durable
-`(Kubernetes context, physical cluster UID)`. One synchronization or probe
-round captures and verifies each physical pool once; nested per-replica reads
-reuse that active capture. Parallel worker calls enter the fence inside the
-worker (`ContextVar` state is not implicitly inherited by legacy thread pools)
-and concurrent scopes for the same pool coalesce on one initializer.
-Consequently a 1,000-replica pool does not issue 1,000 namespace UID reads per
-probe interval.
+The materialization marker is assigned only after the provider operation has
+reported success, in the same PostgreSQL transaction that projects the locked
+terminal request evidence and ordinarily first persists
+`sky_launch_status == SUCCEEDED`. If teardown already made `INTERRUPTED`
+absorbing, the reducer passes the exact provider-success bit separately so it
+can stamp materialization without reviving the replica. A pre-effect
+cancellation passes false and cannot stamp it. The marker is never written
+before provider visibility. A provider query that overlaps the bind-to-marker interval may
+already exclude the pod while the sequence rule also debits it. That is a
+deliberate conservative underfill for at most the current observation round:
+the next observation snapshots the committed marker and leaves the row to the
+provider measurement. The opposite, oversubscribing because a launch became
+visible after the query started, is not allowed.
 
-Cleanup is bound to the same physical authority. Immediate failed-launch
-cleanup and every later log-sync/down retry for a protocol-v2 fill reconstruct
-the exact context/UID fence from durable launch and replica state before any
-provider or command-runner call. This applies equally to ordinary replica
-retirement, interrupted-fill recovery, failed-controller cleanup,
-failed-service purge, and orphan purge. A missing, partial, unreadable, or
-mismatched identity performs no cleanup through that alias; the replica and
-cluster rows stay visible as cleanup-uncertain and retry only under a matching
-capture. Provider identity is independent from the SkyPilot cluster-row
-generation: cleanup also snapshots the nonempty durable `cluster_hash`, unless
-an action-owned `cluster_record_uuid` is available, in which case that UUID is
-authoritative. The chosen UUID-or-hash fence is revalidated after acquiring
-both cluster locks and again after status refresh, before request cancellation,
-credential checks, status/provider calls, or row removal. The service-owner
-continuation guard is likewise rechecked under those locks. Exact cleanup
-skips name-only launch-request cancellation, pre-lock and post-lock
-`force_unlock`, and pre-lock teardown hooks because each can otherwise affect a
-queued or already-created same-name successor. Final legacy row removal uses
-the same `cluster_hash`; action cleanup uses its exact UUID and handle. A
-missing SkyPilot cluster record is not independent proof that a
-protocol-v2 provider object is absent, so bulk scale-down and service-purge
-absence fast paths retain that row and prevent parent deletion. Partial
-resources on the original cluster can therefore remain until its identity is
-restored or an operator independently proves absence and explicitly purges
-them, but the replacement cluster is never used as cleanup evidence or mutated
-by name.
+Occupancy is reconciled in the same slot and accelerator units carried by the
+provider observation. Complete pool-key/physical-UID provenance dominates a
+retired access alias or a later claim-width change: a queued old row can still
+bind to that physical pool, so its historical GPU count is converted to the
+current width's slot equivalent. Partial, legacy, or shapeless zero-cost rows
+debit every plausible same-card pool/card until their physical identity is
+known. Exact-card debits are subtracted from that exact card before feed
+partitioning; an A100 row can never make the broker withhold H200 while leaving
+A100 launch authority. Rows proven physically off-pool are excluded; a paid
+classification alone is not physical absence and cannot override an exact
+placement match.
 
-Cleanup also carries an exact durable SkyPilot cluster-record generation. A
-resource-action record UUID is authoritative when present; a nonempty legacy
-cluster hash is the fail-closed fallback for older/null-action rows. The
-backend acquires both the cluster-status and resource-operation locks without
-force-unlocking either one, re-proves that exact UUID or hash before the first
-tunnel, credential, status, or provider interaction, and proves it again after
-status refresh. Exact cleanup suppresses pre-lock teardown hooks and both
-pre-lock and under-lock name-wide request cancellation, since any of those
-could affect a queued same-name successor. Final database removal uses the
-same UUID or hash predicate. A missing, rotated, or changed generation and an
-owner-continuation failure therefore perform no teardown effect and leave the
-replica cleanup-uncertain for later reconciliation.
+A `SHUTTING_DOWN` or `FAILED_CLEANUP` zero-cost row remains cleanup-unproven
+occupancy. A successful launch status or durable materialization marker is
+enough to conserve fill entitlement. Independently, every such row whose event
+markers do not prove it preceded the observation debits the provider snapshot,
+including an interrupted launch with a missing or malformed materialization
+marker: the pod may have bound immediately before cancellation while its
+success reducer lost the race. Fill rows also participate in the same-map
+planner replay debit and service `max_replicas` headroom until physical cleanup
+deletes the row or transitions it to a cleanup-proven terminal state. This
+prevents one allocation map from re-spending a slot during graceful drain or an
+ambiguous cancellation.
 
-The control-plane identity on every configured pool must therefore have the
-exact cluster-scoped permission `get` on the core `namespaces` resource with
-`resourceNames: ["kube-system"]`. It does not need namespace `list`, mutation,
-or access to any other Namespace object. The chart renders this rule directly
-in its API ClusterRole for an in-cluster candidate; putting it only in the
-default `rbac.clusterRules` value would let `helm upgrade --reuse-values`
-silently retain the old incomplete list. The reusable spoke workspace-pool
-RBAC module owns the same grant for remote pool identities alongside its
-existing cluster-wide read contract. Externally managed kubeconfig identities
-must receive an equivalent grant from their operator.
+All PostgreSQL replica writers that may insert a zero-cost row or persist its
+first successful launch use one SQL lock order:
 
-Workspace eligibility is evaluated on the effective merged configuration. If
-a workspace inherits global `kubernetes.allowed_contexts`, materializing an
-explicit workspace list that equals the inherited set, or retains every
-inherited context and adds another context, is an equivalent or additive
-change. It is safe in the presence of active resources for the same reason as
-an already-explicit list growth: no running context is removed. A finite list
-may also broaden to `all`. Conversely, inherited `all` or legacy unrestricted
-behavior may not materialize a finite list around active resources, and a
-finite effective set may not lose a context. Other Kubernetes fields and all
-other workspace fields remain part of the ordinary active-resource guard; an
-empty `kubernetes: {}` produced only by extracting `allowed_contexts` is
-normalized away for comparison and never persisted as a semantic change.
+```text
+zero-cost event sequencer
+  -> protocol/lifecycle/service authority
+  -> sorted pool/claim authority where applicable
+  -> replica row
+```
 
-Validation resolves the effective current and proposed values from one
-immutable request snapshot: a workspace-only update uses the same snapshotted
-top-level default on both sides, while a whole-config update uses the current
-snapshot for the current side and the submitted configuration for the proposed
-side. The write must reject or revalidate if the snapshotted workspace or
-top-level default changed before the file-lock-protected commit. User-access
-validation still runs when an equivalent/additive context change is combined
-with a private/allowed-user change. The comparison must not reject safe
-materialization merely because the current workspace-local field is absent.
+The bound-request reducer takes the sequencer mutex at transaction entry,
+before it can inspect the service and replica to learn whether the launch is
+zero-cost. Stale whole-row updates merge the immutable database-assigned event
+markers from the locked row, so a retry cannot erase or replace either one.
 
-An operator must verify both
-`kubectl auth can-i get namespace/kube-system` and a nonempty `.metadata.uid`
-through every configured context before expecting a protocol-v2 edge to become
-authoritative. This feature-specific preflight must not become a general
-Kubernetes credential-check requirement: ordinary demand placement does not
-need it. Missing permission is a safe pool-local blackout, not a reason to
-weaken identity to a context name or another alias-sensitive value.
+Replica state version 17 persists the complete typed fill attribution:
 
-There is at most one pool edge for a service in a context. Overlapping but
-non-identical accelerator groups remain invalid across services and are also
-invalid for two edges of one service.
+- allocation generation, input hash, and claim generation;
+- observation generation and sequence;
+- intent idempotency key; and
+- reconciliation-gate generation and the exact three-part reclaim-policy
+  identity for that generation;
+- the SHA-256 digest of the exact protocol-v2 worker placement projection that
+  owns Kubernetes and Kueue admission for this replica;
+- database-assigned zero-cost admission sequence; and
+- database-assigned first-success materialization sequence, once launched.
 
-Claimants sharing one physical pool must also use one replica-slot width. The
-width used by the most claimants wins deterministically, with the smaller
-width winning a tie. Protocol v1 retains its historical behavior of deleting
-losing claims. Under protocol v2, a losing edge remains in its authoritative
-complete service set at the same generation but receives round-local zero
-grant/feed authority. Its differently-scaled poller cannot drive the shared
-capacity query; a matching-width poller publishes the durable round with the
-complete generation map and explicit zero entries for every loser. Thus a
-width conflict blackouts only that pool edge and cannot generation-fence a
-healthy sibling pool or create a delete/re-add heartbeat loop.
+The six historical allocation/observation/intent fields are all present or all
+absent. The five gate/policy/projection fields are likewise all present or all
+absent and require the historical tuple. A v15 row with only the historical
+tuple remains readable, but it cannot authorize a sequenced launch; that
+terminal fence requires the complete successor tuple to match current durable
+authority. Worktree-only v16 was never merged or deployed and is not a durable
+compatibility format. The
+materialization marker is null before launch success and a positive integer
+afterward. Missing event attribution is a conservative debit in sequenced
+rounds, and only fully attributed current rows count as same-allocation replay
+debits.
 
-### Durable claims and compatibility
+### 2a. Durable reclaim authorization receipt
 
-Serve schema revision 035 adds three PostgreSQL tables:
+Serve045 is a forward-only successor to Serve044. It adds a nullable reclaim
+receipt to the PostgreSQL protocol-authority singleton. The receipt contains:
 
-- `reserved_fill_protocol_state`, a singleton durable activation gate whose
-  initial protocol is v1 and whose audit evidence records the common writer
-  image digest, canonical API/controller Deployment generation/UID
-  inventories, and the combined pod/process inventory count/SHA-256;
-- `reserved_fill_service_claim_sets`, one authoritative set marker and global
-  budget/governor row per service; and
-- `reserved_fill_pool_claims`, primary-keyed by `(service_name, pool_key)`,
-  carrying the current edge fields, access context, physical UID, and service
-  generation.
+- `reclaim_fleet_bundle_sha256`, `reclaim_policy_revision`, and
+  `reclaim_provider_inventory_sha256`, which form the typed
+  `ReclaimPolicyIdentity`;
+- `reclaim_claim_scope_count` and `reclaim_claim_scope_sha256`;
+- `reclaim_evidence_sha256` and `reclaim_authorized_at`; and
+- the existing protocol-v2 writer proof: image digest, Deployment generation
+  and UID, and Pod inventory count and digest.
 
-Revision 035 also adds `claim_generations`, `protocol_version`, and nullable
-`feed_by_accelerator` to each pool round. The latter is a JSON map from service
-to its exact-card portion of the already-arbitrated feed. `NULL` means an old
-writer/round had no exact-card metadata; a present empty service map is
-authoritative zero shaped feed. Migration copies legacy claims into
-generation-zero normalized rows and
-marks their service sets `migration_shadow`. Shadows are never authoritative:
-while the protocol is v1, every new binary runs the behaviorally identical
-legacy one-pool path and reads only `reserved_fill_claims`. Its only additive
-decision field is the internal carried protocol used by the activation fence.
+The reconciliation-gate constraint is closed: reclaim fields are null in
+`LEGACY_ACTIVE`; a `SEQUENCED_ACTIVE` row has one complete well-formed receipt
+and protocol version 2. First activation is `LEGACY_ACTIVE ->
+SEQUENCED_ACTIVE` at exactly `generation + 1`. Fix-forward reauthorization is
+`SEQUENCED_ACTIVE -> SEQUENCED_ACTIVE`, also at exactly `generation + 1`, with
+a different complete evidence digest. Exact receipt replay is an
+application-level no-op: it changes neither generation nor timestamp.
+Demotion, generation jumps, partial edits, and same-generation authority edits
+are rejected by an `ENABLE ALWAYS` trigger. Serve044 remains historical
+migration authority and is not rewritten.
 
-Protocol v2 cannot be activated merely by submitting a multi-context spec or
-setting an environment variable. A separate zero-argument operator action runs
-inside an API pod and accepts no rollout identity or proof. Under the global
-broker lock it requires exact Serve schema head 035 and protocol v1, reads the
-fixed mounted in-cluster service-account token, and rejects malformed, legacy,
-or otherwise unbound tokens without complete nested namespace, Pod name, and
-Pod UID claims. It loads an explicit in-cluster API client, requires that
-client's installed bearer credential to equal those exact token bytes, disables
-credential refresh, and shares that client across all Core and Apps reads. A
-token rotation between identity parsing and client binding therefore fails
-closed instead of decoupling identity from Kubernetes authentication.
+Policy or writer rotation therefore uses no alternate protocol, feature flag,
+or in-place identity edit. The operator converges the full fleet, reruns the
+same `activate` authorization command, and atomically replaces the receipt in
+a successor generation. The transaction clears every authenticated allocation
+map. Already durable rows remain conservative occupancy, while queued requests
+carrying the old generation fail the terminal provider fence. This is the one
+canonical fix-forward path.
 
-The action reads the token-bound Pod by claimed namespace/name, requires its
-live UID to match, and follows the immutable controller-owner chain
-Pod -> ReplicaSet -> Deployment, checking every name and UID. From that
-authenticated API Deployment's chart-owned literal `SKYPILOT_RELEASE_NAME`,
-literal `SKYPILOT_API_SERVER_ROLE`, fixed name, and Helm instance label it
-mechanically discovers the complete writer topology. Compatibility mode
-requires exactly the API Deployment with role `all` and rejects separate
-controller or executor Deployments. HA mode requires the same API Deployment
-with role `api` plus the exact sibling controller and executor Deployments with
-roles `controller` and `executor`. Their images may be independently
-configured, but every live immutable digest must equal the API digest before
-activation.
+`reclaim_provider_inventory_sha256` fingerprints the immutable allowed fleet
+and enforcement inventory owned by the bundle. It must not hash live Pods, the
+current claim census, or another naturally changing observation; those values
+are activation/authorization evidence and would make an immutable identity
+drift without an explicit protocol transition.
 
-Every discovered Deployment and Pod container must also carry the literal
-`SKYPILOT_API_REQUEST_BACKEND=postgres` and literal
-`SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS=true`. The latter is an
-explicit protocol-v2 preparation mode; its chart value defaults false so
-existing PostgreSQL plugins retain their compatibility contract unless an
-operator prepares this feature. Schema 008 existing in the shared
-PostgreSQL catalog is not by itself proof that request execution uses it: a
-release inheriting the chart's SQLite request-store default must fail
-activation and demotion attestation. Protocol v2 therefore cannot activate
-until the one-way request-store cutover has completed for the entire writer
-fleet. The literal environment value is necessary but not sufficient because
-a server plugin can replace the request storage or queue factory after process
-startup. Every server-instance lease therefore also records the fully qualified
-runtime types of the resolved storage backend and queue factory, plus an
-`execution_quiescence_capable` bit that is true only for the exact built-in
-PostgreSQL storage and queue implementations. Activation and demotion require
-the expected type identities and true capability from every API, controller,
-and executor lease. A plugin override remains available to protocol-v1
-deployments while preparation mode is false. Preparation mode and an already
-active protocol-v2 gate both require the built-ins. Plugins load independently in MAIN, UVICORN,
-and EXECUTOR process contexts, so every one of those contexts also validates
-the exact built-in PostgreSQL storage and queue immediately after plugin
-installation and exits before accepting or executing work on any mismatch.
-The MAIN lease is rollout evidence; it is not treated as evidence about a
-different process context. An executor child adopts the main process's clean
-server-environment snapshot into both its process snapshot and its fresh-child
-`os.environ` before loading or validating plugins, so a request-scoped
-environment mutation at lazy worker spawn cannot suppress the PostgreSQL check
-and then leave a custom backend installed.
+Serve046 is the forward-only admission-binding successor to Serve045. It adds
+the committed `service_version` to each authoritative claim set and the exact
+closed `worker_projection_sha256_by_accelerator` mapping to every normalized
+claim edge. The application
+requires both for a sequenced set, locks the immutable version row, selects the
+exact `(context, accelerator, count)` worker projection for every card,
+validates protocol v2 with non-null Kueue admission, and recomputes every digest
+before claim persistence. The mapping has exactly one case-folded accelerator
+key for every edge accelerator and no extras. This remains correct for the
+canonical one-card edge while safely authenticating an older composite edge;
+one scalar edge digest cannot identify multiple candidates. Legacy-active
+compatibility rows may keep the version and mapping null; they cannot publish a
+sequenced allocation or authorize a sequenced launch.
 
-The action reads every discovered Deployment, every Pod in the release
-namespace, and every recent `all`/`api`/`controller`/`executor`
-server-instance lease in the shared PostgreSQL database twice. Each Deployment
-must retain the same
-generation/resourceVersion/UID and exact pod UID/resourceVersion cohort. Every
-Deployment controller must have observed its generation; desired replicas
-must be positive; current, updated, ready, and available counts must all equal
-desired; and unavailable must be zero. Every selected Pod must be
-non-terminating, Running, Ready, carry the same chart/release/role identity,
-and have its fixed `skypilot-api`, `skypilot-controller`, or
-`skypilot-executor` container ready at one common immutable imageID digest. A
-nonterminal same-release database migration Pod or an unattested same-release
-request-serving or writer Pod blocks activation.
+Allocation-map schema 5 hash-binds the gate generation, all three policy
+identity fields, the committed service version, and each edge's exact
+accelerator-to-worker-projection-digest mapping. A `FillIntent` narrows that map
+to the one selected accelerator digest, and a sequenced replica row persists
+that scalar as part of its immutable fill attribution.
+The protocol-v2 API launch fence carries it into the durable request row. The
+fill-persistence transaction revalidates the allocation, current gate
+generation, exact identity, idempotency key, service ceiling, and remaining
+aggregate and per-card feed before accepting the row. This makes the
+activation proof, broker claim, allocation, row, and provider effect one
+traceable authority chain rather than independent checks.
 
-The database inventory closes the independently deployed and cross-namespace
-process hole: every recent `all`, `api`, `controller`, or `executor` lease,
-including unready or draining leases until the request backend's full stale
-horizon expires, must map one-to-one by role, Pod name, and Pod UID to the
-attested Pods. The server instance ID must itself equal that Downward-API Pod
-UID, and the runtime backend capability fields must retain their expected
-values. Thus an old process in another release or namespace, or a process whose
-plugin replaced a request backend, blocks activation even though the
-token-bound Kubernetes Role cannot enumerate or inspect it. Both complete
-reads include the Deployment, Pod, database-process, and resolved-backend
-identities and must be identical.
-All Kubernetes reads use the bounded timeout and the one no-refresh client.
-The exact token-bound Pod name and UID must be present in both verified API
-cohorts; caller arguments, Downward API environment, and generic `HOSTNAME`
-never supply activation identity.
+### 3. Broker provenance and authenticated allocation map
 
-The singleton has dialect-portable database checks requiring proof fields to
-be all-null or all-present and requiring every v2 row to carry a structurally
-valid complete proof. The action records the common digest, canonical
-API/controller/executor Deployment generation/UID inventories, and deterministic
-combined pod/process inventory count/SHA-256 while atomically advancing
-`reserved_fill_protocol_state`. Until that durable gate is v2, a multi-context
-poller withdraws normalized claims, feeds zero fill, and reports the exact
-activation error. This mechanically separates the complete writer rollout
-from feature activation.
+In compatibility mode, the protocol-v2 broker may still query a provider
+inside its old round path. In `SEQUENCED_ACTIVE`, it consumes only a fresh
+completed observation and calls
+`run_round_from_committed_observation()`. The committed round stores the exact
+observation generation, admission sequence, materialization sequence, and
+payload digest as one nullable-all-or-present tuple. Publication revalidates
+that tuple against the digest-valid observation while holding the event
+sequencer, and allocation reads repeat the exact match; an in-memory
+provenance value that was not durably persisted cannot authorize fill.
 
-On its first protocol-v2 heartbeat, a new controller atomically adopts its
-shadow. Under the exact existing global broker lock, and only after acquiring
-that lock (never while holding a database transaction), one owner-fenced
+The broker is the only raw-GPU-to-replica-slot conversion boundary. It chooses
+one deterministic authenticated claim width for a physical UID/card, divides
+the committed exact-card GPU count once, and persists that `broker_slot_width`
+beside both the converted observation and per-service feed. Claims with a
+different width remain in the authoritative claim set but receive explicit
+zero launch and shelter authority for that round; they cannot reinterpret or
+double-convert another claimant's slot count. Allocation publication
+recomputes the conversion from the exact committed raw observation and rejects
+any mismatch. Old observation payload schemas are not silently inferred as raw
+GPU authority and fail closed.
+
+During the pre-activation image rollout, legacy broker rounds retain their
+existing exact-card envelope bytes and do not emit the new slot-width metadata.
+The width key first appears in committed-observation rounds after gate
+activation has proved exact writer convergence. This avoids mixed-binary epoch churn
+without adding a second sequenced representation.
+
+`ReservedFillAllocationRepository` is the sole durable adapter from broker
+rounds to the pure planner. It publishes a map only if every claimed pool has a
+complete `PoolFillSnapshot` and all of these still agree in one PostgreSQL
 transaction:
 
-1. locks the service owner, including `resource_scope`, and the service
-   claim-set row; protocol v2 requires the scope to be nonempty and equal the
-   expected service hash before publishing any edge. An owner-valid unscoped
-   or mismatched service atomically withdraws its prior normalized edges,
-   claim-set row, and legacy projection so it cannot absorb pool grants it is
-   unable to launch, and its in-process grant cache is cleared;
-2. retains the existing generation for an identical semantic heartbeat, or
-   allocates a new globally monotonic generation from the protocol singleton
-   for every semantic change (including edge removal and disable/re-enable);
-3. writes the authoritative complete edge set for that generation;
-4. deletes normalized edges absent from the new set;
-5. writes the service-global budget and utilization state; and
-6. writes the stable first edge as the legacy projection.
+- protocol v2 and the current reconciliation-gate generation;
+- service hash, resource scope, and controller owner;
+- service claim-set generation and ordered edge topology;
+- sorted pool round identities, epochs, grants, feeds, and exact-card feeds;
+- physical cluster UIDs and access contexts; and
+- latest fresh completed observation provenance.
 
-Readers select by the durable protocol gate, never by opportunistic fallback:
-v1 reads only legacy rows; v2 reads only complete, unexpired
-`authoritative_v2` sets whose normalized rows match the declared generation
-and edge count. A missing, shadow, corrupt, or expired set under v2 contributes
-no claim and feeds zero. The two representations are never unioned. Legacy
-heartbeat, move, or delete activity therefore cannot invent a second edge
-after v2 adoption, and a migration shadow cannot mask a fresher legacy
-heartbeat. The compatibility projection always retains the protocol-v1
-context-plus-accelerator pool key; it never copies the normalized
-physical-UID key.
+The canonical lock order is protocol, service, sorted pool rounds, claim set
+and edges, then exact observations. The map hash covers the complete ordered
+map. A no-op republication returns the existing generation. A semantic claim
+replacement clears the old map before a successor can be published. Readers
+revalidate the current rounds, claim set, owner, gate, and freshness rather
+than trusting the stored JSON alone.
 
-Disable and teardown delete the set, all normalized edges, and the legacy row
-in the same owner-fenced transaction. Reconciliation of a removed pool deletes
-that normalized pair and advances the complete set generation. Prune, overlap
-rejection, and deletion take the same global broker lock before their
-transaction and preserve the representation invariant. A confirmed
-protocol-v2 phantom retains its edge and generation while publishing zero
-authority, as described below. The lock order is always broker lock, then
-database transaction/row locks; no path reverses it or holds the lock during a
-caller-owned transaction.
+The first shipped allocation-map wire schema is explicitly versioned as 5;
+the version is both persisted and covered by its authentication hash. Earlier
+worktree-only schemas 3 and 4 and earlier shapes were never merged, deployed,
+or activation-capable,
+so they are rejected as unknown durable state instead of creating a permanent
+compatibility decoder. This preserves one canonical map path from the first
+production release.
 
-The compatibility projection is transitional. A stacked cleanup PR removes
-the legacy read/write path only after every production process uses revision
-035, every live fill service has normalized claims, multi-pool canaries pass,
-and the old-image rollback window is explicitly closed.
+The closed top-level schema contains exactly `schema_version = 5`,
+`allocation_generation`, `allocation_input_sha256`,
+`allocation_claim_generation`,
+`service_version`,
+`ordinary_zero_cost_admission_sequence_high_water`,
+`reconciliation_gate_generation`, `reclaim_fleet_bundle_sha256`,
+`reclaim_policy_revision`, `reclaim_provider_inventory_sha256`, and
+`pool_snapshots`.
+Each ordered snapshot contains exactly `protocol_version`, `pool_key`,
+`physical_cluster_uid`, `service_generation`,
+`worker_projection_sha256_by_accelerator`, `edge_cap`,
+`broker_slot_width`, `free_slots`, `free_slots_by_accelerator`, `grant`,
+`grant_epoch`, `observation_generation`, `observation_sequence`,
+`ordinary_zero_cost_admission_sequence`, `valid_until`, and
+`zero_cost_location_keys`. The hash covers the schema version, ordering, and
+every authoritative input field; `allocation_input_sha256` stores that hash.
+Missing or unknown fields and any schema other than 5 fail closed.
+Materialization provenance is authenticated by the allocation's exact
+observation/round join and is not duplicated into this map.
 
-### Service-global budget partition
+Allocation-map schema 5, worker placement projection protocol 2, internal
+observation-authority payload schema 3, and PostgreSQL Serve schema 046 are
+independent version domains. Equality of their
+numbers carries no compatibility meaning.
 
-Before publishing claims, the poller reads replica rows once and attributes
-fill holdings to pools by their complete persisted origin tuple (pool key,
-immutable launch generation, and physical UID). An older positive launch
-generation remains valid while it is no newer than the service's current
-generation. If any origin field is present, a partial tuple, unknown pool,
-future generation, UID mismatch, or placement outside the claimed pool fails
-closed and receives no holding or scale-down shelter. Exact location matching
-is used only when all three fields are absent on a genuinely legacy row.
+Observation access context is query-route provenance, not physical-pool
+identity. Several contexts may alias one physical UID and accelerator set. A
+current physical-pool observation may authorize service edges reached through
+those aliases once every edge independently proves that same physical UID; map
+publication must not require the observer's chosen context string to equal
+every claim's service-edge context. Each accepted intent remains pinned to its
+own authenticated service-edge context.
 
-Let `H = max(0, max_replicas - demand_target)`. Utilization gating is advanced
-exactly once per service heartbeat and persisted on the service claim-set row,
-using the existing dwell, bounded-step, boot-hold, blindness, and actuation
-rules. It produces one global utilization ceiling `U`; with the gate disabled,
-`U = H`. The allocatable budget is `G = min(H, U)`. Edge broker rows carry no
-independent utilization governor. A deterministic pure allocator produces
-edge caps and floors with these invariants:
+Ordinary zero-cost rows currently persist their Kubernetes context and exact
+accelerator shape, but not the context's physical-cluster UID. The sequenced
+occupancy scan therefore conservatively debits such a row against every v2
+pool with the same accelerator card and per-replica width, regardless of
+context alias. Physically disjoint same-card pools may underfill; they cannot
+oversubscribe. This compatibility duplication is not a second placement path.
+The steady-state follow-up is to persist the physical UID on ordinary
+placement, migrate live ordinary rows as they are authoritatively refreshed,
+then remove the same-card duplication after no nonterminal zero-cost row lacks
+that identity for one complete observation horizon.
 
-```text
-sum(edge_cap) <= G <= H
-sum(edge_floor) <= min(service_floor, G)
-edge_floor <= edge_cap
-sum(edge utilization entitlement) <= U
-```
+Publication is all-or-nothing across a service's pools. If one edge is missing,
+stale, blacked out, malformed, or concurrently replaced, no new complete map is
+published. A previously published map is also rejected by `read_current()` as
+soon as any of its authority moves or expires.
 
-The exact allocation algorithm is:
+### 4. One reconciliation coordinator and pure planning
 
-1. Iterate pools in stable task-resource order. Give each pool
-   `min(holdings, remaining G)` first. If holdings exceed `G`, later pools lose
-   cap first; the global max/headroom reduction always wins over blackout
-   stickiness.
-2. Define a pool's capacity hint as follows. A successful round no older than
-   the configured staleness limit contributes `holdings + last_observed_free`.
-   A never-observed, launchable pool contributes `holdings + 1`, permitting a
-   one-slot discovery probe. A stale/blackout pool contributes
-   `max(holdings, previous_edge_cap)`, clipped by remaining `G`. A benched pool
-   contributes holdings only.
-3. Distribute residual `G` by equal-weight capped water filling up to
-   `max(0, hint - assigned)`. Integer remainder goes to stable pool order.
-   Capacity beyond all hints remains unallocated; it is not guessed. After a
-   successful probe, the next heartbeat may expand that pool from its measured
-   hint.
-4. Set `F = min(service_floor, G)`. In stable order assign
-   `edge_floor = min(edge_cap, remaining F)` until `F` is exhausted. Thus the
-   existing/first context remains the primary floor holder and overflow moves
-   only when that edge cannot carry it.
+`ScaleReconcileCoordinator` is the single consumer for autoscaler work. It
+coalesces notifications with a monotonic in-process generation, compares the
+generation before waiting, and performs a bounded five-second recovery reread
+even if an in-process notification is lost. The controller rereads durable
+state on every pass. Provider calls and slow manager actions run without the
+coordinator condition lock or the actuation-generation lock.
 
-The utilization sample and release clock exist only on the service-set row.
-Measurement blackout never creates feed, and it cannot preserve authority
-above a reduced `H` or `U`: the new service generation immediately invalidates
-old grants. A global release step may be computed while a pool is blind, but
-the actuation gate prevents another step until the prior cap is reflected in
-aggregate holdings; there is no banked multi-step drop on recovery.
+The controller takes a short optimistic actuation generation before planning
+and revalidates it before each mutation. An update moves that generation to an
+odd transition value, so stale work cannot publish into the successor runtime.
 
-The semantic input hash covers protocol, ordered pool identities and shapes,
-physical UIDs, edge cap/floor, global `H`/`U`, and policy. An identical
-heartbeat retains its generation; any semantic change draws the next value
-from the singleton's global counter. Disable does not reset that counter, and
-same-name service recreation therefore cannot reuse an old generation.
-Heartbeat-only or round-local holdings/feed changes do not advance it.
+Once the durable gate is `SEQUENCED_ACTIVE`, the controller enters
+`Autoscaler.sequenced_reserved_fill_planning()`. The existing autoscaler still
+computes ordinary demand, scale-down shelter, and the legacy status projection,
+but it emits no legacy fill launch and does not spend feed or advance rotation.
+A missing or unreadable authenticated map means zero new fill for that pass;
+there is no fallback.
 
-### Broker isolation
+`ReservedFillPlanner` is database- and provider-free. From one immutable map it
+computes deterministic, exact pool/card intents after applying:
 
-Claims, allocation lookups, grant cache entries, reconciliation removal, and
-prune reports use `(service_name, pool_key)` identities. Pool rounds remain
-keyed by `pool_key`, and their JSON grants/feeds remain service-keyed because a
-service has at most one edge in a pool. Each published service entry also
-carries the exact authoritative service generation used to compute it.
+- service-global `max_replicas` headroom in the configured physical or logical
+  capacity unit;
+- ordinary demand debits;
+- durable nonterminal fill rows from the same allocation map; and
+- the last receipt-proven rotation anchor.
 
-For every pool `p`:
+Planning mutates no feed, fairness cursor, or replica state. Its deterministic
+idempotency key is correlation and replay-debit evidence; the database-assigned
+replica row and returned receipt remain the commit boundary.
 
-```text
-sum(feed[p, service]) <= observed_free[p]
-sum(feed_by_accelerator[p, service].values()) <= feed[p, service]
-grant[p, service] <= edge_cap[p, service]
-```
+### 5. Concurrent multi-cluster preflight and commit receipt
 
-When the provider reports an exact-card split, the broker validates that it
-sums to the aggregate observation and contains only cards in the physical pool
-identity. It deterministically partitions the service feeds over that split
-and fences an exact-card-only redistribution by advancing the pool epoch. A
-malformed present split is a measurement blackout; malformed persisted shaped
-feed authorizes zero launches. Rounds written before the nullable field exists
-retain their aggregate compatibility behavior.
+`SkyPilotReplicaManager.accept_reserved_fill()` validates the typed plan and
+manager/service owner before provider admission. It then acquires one fenced
+provider phase and starts one physical-UID capture thread per distinct
+`(Kubernetes context, physical UID)` pair. Independent contexts initialize in
+parallel. A same-context initializer already in progress returns typed
+backpressure instead of blocking the whole wave. The preflight deadline is 45
+seconds for the whole batch, measured from one shared absolute deadline, and is
+unrelated to `kubernetes.provision_timeout`. Per-context waits and thread joins
+must consume only the remaining batch budget.
 
-Measured capacity may override a zero-cost placement bench only after the
-measurement belongs to a successfully published broker round. Query callbacks
-never update a controller-local placer: a writer that loses the lease-token
-publish race, or whose observation is rejected as malformed, phantom, or
-blackout, supplies no placement evidence. Both the writer and every peer that
-reads the fresh shared round reconstruct the same optional observation through
-the ordinary `Allocation` reader and apply it only to that poller's locations
-for the exact pool. Protocol v1 retains its one-context invariant; protocol v2
-uses the exact `FillPoolSpec.locations` for the returned `pool_key`. Capacity
-from one physical pool or accelerator card therefore cannot release a bench in
-another.
+After all distinct-pool preflights report, one manager critical section
+acquires the global demand-capacity reservation lock and revalidates service
+ownership, current version, service-global headroom, pool epochs, observation
+expiry, and physical identities. Intents are admitted in plan order while both
+locks remain held through the existing protocol-v2 replica-row transaction.
+That transaction independently revalidates the ordinary admission generation,
+gate, allocation identity, round provenance, fresh observation, claim topology,
+and owner before assigning the total zero-cost admission sequence. The
+in-process lock order is manager then demand reservation; provider preflight
+holds neither. Inside PostgreSQL, the zero-cost event sequencer is acquired
+before lifecycle/service, round, claim, and replica rows, matching ordinary
+admission and launch-result writers.
 
-This committed-round dissemination uses no schema change. The existing
-`feed_by_accelerator` outer JSON object carries an additional reserved key,
-`$skypilot-observed-free-v1`, whose value is the validated, normalized raw
-per-card observation. The `$` prefix cannot collide with a valid service name.
-Normal per-service shaped-feed entries remain present, including for protocol
-v1 rounds, so an older reader ignores the extra key while continuing to find
-its own entry. The aggregate value and observation time remain in
-`last_observed_free` and `last_observed_free_ts`; the latter is the conservative
-pre-query snapshot time, not a post-query timestamp. A bench at or after that
-time therefore still wins.
+`FillCommitResult` is a bijective receipt that accounts for every planned
+intent exactly once as accepted or deferred. A pool-local identity or preflight
+failure produces a sparse receipt and does not starve healthy independent
+contexts; a service-global owner, version, sequence, headroom, or provider-phase
+failure defers the remaining ordered tail. Each accepted entry names its intent
+hash and durable replica ID. The controller advances pool rotation only from
+durably accepted rows. If authority remains current while any intent is
+deferred, the controller immediately coalesces another reconciliation pass.
 
-The service shaped-feed entry and reserved observation entry are parsed and
-validated independently. A malformed service entry retains the existing
-protocol-v2 fail-closed zero-launch behavior. A missing or malformed reserved
-entry suppresses only measured bench release; it cannot invalidate a valid
-service allocation. The reserved map accepts only canonical cards from the
-pool identity, nonnegative integer counts (never booleans), no case-folded
-duplicates, and a sum equal to the persisted aggregate. Old rounds without the
-reserved entry provide no measured bench override and recover on the next
-successfully published round.
+This avoids `N * provision_timeout` cluster initialization. For a 200-intent
+wave across two Kubernetes clusters, the two physical-cluster captures begin in
+parallel, then the manager persists every independently admissible intent and
+returns an exact sparse receipt. Receipt acceptance proves durable replica-row
+admission, not provider completion or readiness. Launch workers and the existing
+request machinery proceed asynchronously. Readiness may still be
+gradual because Kubernetes scheduling, image pulls, setup, model loading, the
+provider phase, and executor capacity are real limits; the feature does not
+claim all 200 become ready at once.
 
-The reserved observation is metadata, not additional launch allocation. It is
-removed before comparing shaped service feeds for epoch advancement. A raw
-measurement change above an unchanged service cap therefore does not churn the
-pool epoch or fence queued launches. Any change to a service feed, its exact
-card allocation, protocol/generation metadata, lease state, or blackout of
-positive authority retains the existing epoch fence.
+### 6. BCL reclaim invariant
 
-A failed, stale, benched, or phantom pool feeds zero only for that pool. It
-does not erase another healthy edge of the same service. A pool epoch change
-fences only launches stamped for that pool.  Every decision stamped with a
-superseded epoch fails closed before location selection and row persistence,
-even when a newer round currently has positive feed for the same service,
-generation, physical UID, or accelerator card.  The final row persist retains
-its atomic epoch/generation/UID/owner checks for a round that changes after the
-early check.
+Reserved fill remains zero-cost-only and uses the server/workspace-owned
+preemptible inference placement. Worker placement projection protocol v2 is
+the single admission owner. Each candidate adds
+`projection_version: 2` and either `kueue_admission: null` or the exact closed
+mapping `{local_queue_name, workload_priority_class_name}`. Namespace, service
+account, Pod PriorityClass name/value/preemption policy, accelerator scheduling,
+LocalQueue, and WorkloadPriorityClass are frozen together when the service
+version is committed. `require_managed` is derived from non-null Kueue
+admission; it is not separately caller-selectable.
 
-Provider `snapshot_time` and replica `created_at` are wall-clock observations,
-not a durable admission order.  They cannot prove whether the broker's later
-row scan included a replica, and clocks on different controllers may disagree.
-Consequently no launch may adopt a newer epoch by subtracting rows ordered by
-those timestamps.  A future live reauthorization protocol requires a
-PostgreSQL-backed, round-scoped admission ledger or equivalent monotonic commit
-boundary consumed transactionally by every fill and ordinary zero-cost
-admission, including mixed-version rollout fencing.  That protocol is outside
-this corrective change.
+Protocol v2 also owns the scheduler and actual binding seam. The immutable
+candidate freezes `scheduler_name` from only the server-owned context/workspace
+Pod configuration, defaults it to `default-scheduler`, and binds it through the
+candidate digest and typed reclaim-policy view. Final rendering removes any
+caller/restored `spec.nodeName` and installs exactly the projected scheduler.
+The create response and a still-gated Pod must remain unbound; an admitted or
+post-wait bound Pod is freshly joined to its exact Node, whose projected
+accelerator label key/value must match the immutable candidate. Frozen affinity
+without this bound-Node proof is not sufficient reclaim or capacity evidence
+because direct `nodeName` binding bypasses the scheduler.
 
-After the existing consecutive-observation threshold confirms a protocol-v2
-phantom, the broker publishes explicit zero grant/feed authority for that pool
-but retains the complete normalized claim set and its service generation. It
-must not remove the edge mid service poll: doing so would advance the global
-service fence, invalidate sibling rounds already driven in that poll, and let
-the next configured heartbeat re-add the edge in an endless generation-churn
-loop. Protocol v1 retains its legacy claim-removal behavior.
+The LocalQueue is resolved from the service workspace's server-owned
+`kubernetes.kueue.local_queue_name`/`kubernetes.quota.queue`. The
+WorkloadPriorityClass is resolved only from the new server-owned
+`serve_worker_kueue_workload_priority_class_name`. A managed queue without that
+class, a class without a queue, or request-owned `resources.priority_class`,
+`kubernetes.kueue`, or `kubernetes.quota.queue` makes a projected version or
+launch fail closed. The full validated candidate has one deterministic
+canonical JSON SHA-256 digest. Mutable launch-time configuration is never
+reread for a projected worker.
 
-If driving one protocol-v2 round raises or times out, that edge publishes feed
-zero, launch grant zero, and no epoch. It may retain only its prior grant from
-the same pool key and physical UID, at the same or an older service generation,
-clipped to the current edge cap, as non-launching `shelter_grant`; a peer
-pool's successful round remains usable. A future prior generation, changed UID,
-or absent pool carries nothing. The complete-map swap removes deleted edges,
-while the UID prevents a replacement physical cluster from inheriting shelter.
-Thus a headroom or policy change may invalidate all launch authority without
-turning a transient first-round provider timeout into destructive teardown of
-healthy holdings.
+The reclaim boundary is Kueue, not Pod priority alone. A Kubernetes
+PriorityClass at `-1000` with `preemptionPolicy: Never` keeps inference below
+ordinary scheduler work, but it cannot make a Kueue-gated BCL gang reclaim an
+unmanaged inference Pod: Kueue may refuse to admit and therefore never create
+the higher-priority Pods while unmanaged inference occupies the topology. This
+is the root cause recorded in
+`docs/designs/kubernetes-kueue-fail-closed-pods.md`.
 
-Consecutive failed forward generations may relay that same shelter, but each
-relay is non-increasing and re-clipped to the current edge cap; shrinking to
-zero cannot regrow when a later cap expands. This is an intentional
-availability-first failure mode for already-materialized zero-cost holdings:
-it can delay their retirement while provider proof remains unavailable, but it
-cannot authorize a launch. Disabling fill or losing the live placer withdraws
-the claim and clears the process-local pool map even when the durable removal
-must be retried. A later same-key re-add therefore starts with zero shelter.
-Malformed live or restored protocol, generation, physical UID, composite pool
-identity, cap, feed, grant, shelter, or epoch supplies no edge authority.
+Activation therefore requires deployment evidence for every reserved
+inference context that:
 
-Round freshness is conditional on generation equality. If the caller's claim
-generation is absent or differs from `claim_generations` in an otherwise fresh
-round, the broker must drive a new round; it may not return the old grant. A
-protocol-v2 pool always publishes an integer grant capped by its edge cap,
-including the one-claimant case. The historical `grant=None` fast path exists
-only in protocol v1.
+- the inference namespace has an active LocalQueue selected by server-owned
+  SkyPilot configuration;
+- its ClusterQueue admits that namespace and shares a reviewed preemption
+  domain with BCL/research workloads;
+- lower inference workload priority and higher BCL/research priority are
+  enforced in that domain;
+- SkyPilot's strict plain-Pod path can read the queue objects and fails closed
+  unless the admission response attests `managed=true`, the exact queue, and
+  the Kueue scheduling gate; and
+- the deployment's fail-closed admission policy prevents an unmanaged direct
+  inference Pod from bypassing that path.
 
-### Autoscaler state and actuation
+The evidence and enforcement boundary is one
+`ReservedFillReclaimPolicy`. It is a code-owned, typed deployment extension,
+not an environment variable, operator boolean, or JSON assertion. Python
+entry-point group `skypilot.reserved_fill_reclaim_policy` must resolve exactly
+one implementation; zero or multiple implementations fail closed. The generic
+distribution intentionally installs none.
 
-The autoscaler stores immutable per-pool snapshots in a map keyed by
-`pool_key`. Each `PoolFillState` owns its locations, physical UID,
-authoritative service generation, partitioned edge cap, raw and damped feed,
-optional service-specific exact-card feed, timestamp, grant, and epoch. The
-poller publishes a complete map atomically;
-free-slot increase damping, staleness, occupancy debit, and emission-time
-spending run independently per pool. A service-generation change atomically
-invalidates every old pool feed and launch grant. A pool remains at feed zero
-until a round carrying that exact generation arrives, and its local grant is
-always clamped to its edge cap. Non-launching shelter is independent: on a
-failed first round, an unchanged pool key and physical UID may carry the older
-shelter forward as described above. A complete-map edge removal and an
-operator disable are lifecycle boundaries: both delete its process-local
-shelter, so re-creation cannot inherit the removed claim's entitlement.
-Live ingestion and dynamic restore accept authority only when the composite v2
-key is canonical and its physical UID, finite timestamp no more than one stale
-window in the future, and nonempty Kubernetes location set form one exact
-identity. Every edge uses one context;
-every location has one positive whole-GPU shape; the location cards exactly
-cover the key's canonical cards at one width; and any shaped feed is a subset
-of those cards. A complete map uses each context once and keeps accelerator
-sets pairwise disjoint for aliases of one physical UID. Any live feed or grant
-also carries a positive epoch. Invalid live snapshots are rejected; invalid
-restored edges are omitted, while a cross-edge or mixed-generation restore
-conflict drops the complete map instead of choosing authority by serialized
-order.
+The required interface contract is
+`GLOBAL_FLEET_CLAIM_ADMISSION_AND_LAUNCH_FENCES_V2`. It supersedes the
+worktree-only V1 contract, whose scope did not prove immutable Kueue admission.
+V1 may remain parseable solely for an explicit historical diagnostic, but it
+is rejected by activation, reauthorization, claim, and launch validation. The
+activation evidence hash uses schema 2 and includes this exact V2 enum. An old
+policy cannot become activation-ready merely by echoing a newly extended Python
+scope: it must return V2 evidence under a correspondingly reviewed policy
+identity and full-fleet bundle. Any already active experimental generation
+would require normal fix-forward reauthorization, which advances the gate and
+invalidates its allocation maps.
 
-Existing aggregate `fill_free_slots`, `fill_snapshot_age`, and `fill_target`
-status fields remain compatibility projections. Additive per-pool status is
-reported separately. A legacy dynamic-state dump is admitted as one anonymous
-pool only when it represents a single context; ambiguous state restores
-locations for scale-down protection but grants no launchable feed.
+### Boltz deployment policy bundle
 
-Protocol-v2 dynamic state persists only each pool's last real grant as a
-`shelter_grant`. Loading it restores conservative scale-down shelter but always
-sets feed to zero and epoch to absent, so a controller restart cannot replay a
-launch entitlement. A fresh generation-matching broker round is required
-before scale-up resumes.
+Boltz implements this interface in the separate
+`boltz-skypilot-reserved-fill-reclaim-policy` distribution under
+`boltz/reserved_fill_reclaim_policy/`. The generic SkyPilot wheel remains
+entry-point-free. The Boltz overlay builds and installs the generic wheel and
+the deployment-policy wheel independently, then verifies that the combined
+image exposes exactly one `skypilot.reserved_fill_reclaim_policy` entry point.
+The overlay release version stamps the policy revision; any policy-code change
+therefore rotates durable policy identity even if the fleet JSON is unchanged.
 
-Scale-down shelter is pool-local. A pool may shelter only zero-cost rows
-attributed to that pool, up to its live target or restored `shelter_grant` and
-after the global demand coverage attribution described below. Demand-placed
-rows remain ordinary demand first, but may become opportunistic shelter when
-demand falls, matching protocol-v1 behavior. Aggregate `max_replicas` remains
-the last launch guard.
+The package embeds one strict JSON fleet bundle. Unknown or duplicate keys are
+rejected. Its normalized semantic sections are hashed independently with
+domain-separated SHA-256 prefixes: the admission/reclaim contract produces
+`fleet_bundle_sha256`, while physical/provider inventory produces
+`provider_inventory_sha256`. Reordering contexts, flavors, or quota rows does
+not rotate either identity. The package caches only temporary AssumeRole
+credentials; it never caches Kubernetes or AWS attestation results.
 
-Every brokered fill scale-up carries:
+The initial public inference contract is service-name-agnostic. A second
+service, including one with traffic weight 1000, uses the same claim and launch
+path if its immutable projection matches this bundle. No service allowlist or
+second scheduling path exists. The exact shared object contract is:
 
-- its protocol version;
-- its pool key;
-- its pool round epoch; and
-- the exact pickleable location set belonging to that pool.
+| Contract | East | PHX |
+|---|---|---|
+| Context | `prod_research_cluster_eks` | `phx_research_cluster_eks` |
+| Physical cluster UID | `14de98b4-cb7b-4f82-beb7-6f754a96f1dd` | `ba2dcdca-2a0d-447f-ad8a-31849a63c1d5` |
+| Namespace / service account | `rescluster-k8s-prod-east1-preemptible-inference` / `skypilot-pool-sa` | same |
+| Pod Identity | absent | absent |
+| LocalQueue (spoke-module-owned) | `default` | `default` |
+| ClusterQueue (Kueue-chart-owned) | `skyserve-inference-borrowed` | same |
+| WorkloadPriorityClass (Kueue-chart-owned) | `skyserve-inference-low` | same |
+| Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
+| Scheduler | `gpu-binpack-scheduler` | same |
+| GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
+| Exact worker accelerator scheduling | `A100`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`, `nvidia.com/gpu`; `A100-80GB`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu` | `H200`: `nvidia.com/gpu.product=NVIDIA-H200`, `nvidia.com/gpu` |
 
-Protocol-v2 decisions additionally carry the authoritative service generation,
-physical-cluster UID, and an exact accelerator shape when exact-card telemetry
-is available. Protocol v1 retains its legacy context-key authority and does not
-claim normalized generation or physical-UID provenance.
+The inference ClusterQueue has zero nominal GPU quota in the same cohort as
+the research queue. Its per-flavor borrowing limits are bounded by research's
+nominal GPU quota, and it has no preemption permission of its own. The research
+queue must retain `reclaimWithinCohort: Any`. The policy proves the exact
+LocalQueue target, both current Active ClusterQueues, cohort, namespace
+selectors, GPU flavor quotas, preemption policies, provider-owned
+ResourceFlavor instance selectors, WorkloadPriorityClass, Pod PriorityClass,
+immutable custom scheduler deployment, current Kueue controller, Pod
+integration,
+`AssignQueueLabelsForPods: true`, and the Deny queue-name admission-policy
+binding. It does not infer Pod admission from a webhook configuration name:
+for both the mutating and validating configurations it requires exactly one
+named Pod webhook with the reviewed core/v1 Pod operations, Kueue service
+name/namespace/path/port, nonempty CA bundle, admission review version,
+selectors, side effects, timeout, match and failure policies, plus the
+mutating reinvocation policy. Any missing rule or endpoint drift fails
+activation and every later policy check. HyperPod remains the sole owner of its
+ResourceFlavors: the attestor proves each flavor's exact provider-owned
+instance selector, then cross-binds that selector to the GPU product label and
+`nvidia.com/gpu` capacity on the current physical cluster's Nodes. It requires
+at least one non-deleting Node for every reviewed flavor and rejects every
+non-deleting Node of that shape whose product or GPU capacity differs. Node
+readiness and allocatable occupancy remain physical-observation inputs, so a
+temporarily initializing Node is not misclassified as policy drift. The
+inference namespace UID and physical cluster UID are immutable inventory;
+replace either only by shipping a new bundle and normal fix-forward
+reauthorization.
 
-The replica manager consumes those internal fields before constructing
-`Resources`, intersects them with current active zero-cost locations, and
-skips with no row or thread if the intersection is empty or does not match the
-pool. When exact-card metadata is present, every emitted override carries the
-measured card and its exact per-replica GPU count; the manager independently
-requires both the selected location and final persisted resource override to
-match that shape. It then re-reads the physical UID through that context. It
-never falls through to a different zero-cost context or paid capacity. The
-launch thread also carries an early protocol-v2 guard. Immediately before
-every `sdk.launch` attempt, after any launch-pool queue delay, that guard again
-requires the exact pinned Kubernetes context/card/count and force-refreshes
-the context's physical UID. It prevents a known-stale request from being
-enqueued; it is not provider-actuation proof. The durable tuple and
-provider-fenced executor path above remain authoritative across queueing,
-request recovery, policy/optimizer changes, and Kubernetes client refresh.
-Protocol-v2 fill is admitted only when the service's nonempty durable
-`resource_scope` equals its service-incarnation hash; its replica cluster name
-must be the deterministic name for that exact service scope and replica ID.
-This makes the cluster name an incarnation identity rather than the reusable
-legacy `{service}-{replica}` name. Because protocol selection is global, an
-existing pre-scope service has reserved fill inactive after protocol-v2
-activation until it is recreated with an incarnation scope; it cannot keep
-emitting protocol-v1 fill independently.
-An interrupted `PENDING` or `PROVISIONING` fill row is never recovery-re-driven.
-The new controller classifies every interrupted row from its durable pool key,
-service generation, and physical-cluster UID. A complete, internally
-consistent protocol-v2 tuple uses the strong PostgreSQL history barrier; a
-genuine protocol-v1 tuple with no physical UID and its historical null/zero
-service generation uses the compatibility active-request barrier; any partial
-or contradictory tuple fails recovery
-closed. Mixed waves run both barriers before any row is torn down. The
-controller batches each partition, snapshots every relevant API launch request
-for those exact replica clusters, and retains the exact request IDs through
-cancellation. A terminal request status alone is not
-quiescence: PostgreSQL cancellation publishes `CANCELLED` before the remote
-executor necessarily observes its heartbeat and stops the handler. Revision
-008 therefore adds `execution_quiescence_required` plus nullable
-`execution_quiesced_generation` and `execution_quiesced_at` request columns.
-Old rows and inserts from API007 writers default to not required at the
-PostgreSQL server; the canonical SQLAlchemy schema retains that server default
-so schema-created compatibility tables and raw inserts have the same contract.
-Every version-70 queue claim sets required and clears the prior receipt. This
-avoids treating legacy signal delivery as proof without retaining all
-pre-version-70 request history forever. The
-generation field is the durable proof that one exact request execution has
-stopped running effect-bearing handler code; the existing legacy
-`cancel_acknowledged_at` signal-delivery timestamp is explicitly insufficient.
-Cancellation may publish quiescence
-atomically only while its locked row is still `PENDING` and has the matching
-durable delivery, because the terminal transition then prevents
-`try_mark_running` from winning. `WAITING` is not sufficient: a broken shared
-process pool can publish and requeue `WAITING`, clearing its claim/worker,
-before every surviving handler is known stopped. `WAITING` therefore requires
-an existing exact wrapper receipt. A `RUNNING` row is never inferred quiescent
-from a null PID. Otherwise the owning executor publishes the proof, fenced by
-request ID, execution generation, claim token, and worker instance. The
-executing worker publishes it
-only at the end of its own effect-bearing cleanup, for any terminal outcome.
-The monitor may retry that write after `Future.result()` returns normally or
-after it receives the wrapper's explicitly serialized `ExecutionRetryableError`;
-the latter fallback runs before the monitor changes the row to `WAITING` or
-requeues it. Both outcomes prove that exact wrapper invocation returned. The
-monitor must not acknowledge `BrokenProcessPool` or another ambiguous Future
-exception: CPython can break unrelated pending futures before every process in
-the shared pool has exited, and this pool deliberately has no safe task-to-PID
-map. A claimed version-70 request is never automatically requeued after
-`BrokenProcessPool`, regardless of its ordinary retry flag. Requeueing would
-create a second execution generation whose later receipt could mask the still-
-running first generation. The request instead becomes terminal-but-unproven,
-and recovery retains the replica until the exact old invocation is reconciled.
-Ordinary capacity retries raised by a live wrapper remain unchanged.
+AWS absence is a positive proof, not an omitted check. For each context the
+plugin uses the hub writer's Pod Identity session to assume the exact spoke
+roles `skypilot-rf-b6ca6363ec70-audit` in east and
+`skypilot-rf-fe7c6c421c88-audit` in PHX. The spoke module derives these
+collision-resistant identities from the exact cluster and partition. Each
+role is read-only and limited
+to `eks:DescribeCluster`, `eks:ListPodIdentityAssociations`, and
+`eks:DescribePodIdentityAssociation` on the exact cluster and its association
+resources. The spoke trust names the single current hub Pod Identity writer
+role, permits only `sts:AssumeRole` plus the required `sts:TagSession`, and
+requires its transitive `eks-cluster-arn`, `kubernetes-namespace`, and
+`kubernetes-service-account` session tags. The chart renders API, controller,
+and executor writers with the same `skypilot-api-sa`; a chart test must keep
+that invariant true. Every proof describes the exact active EKS cluster,
+paginates the filtered association index with cycle detection, and requires
+zero associations for the public inference service account. A non-null future
+bundle instead requires exactly one summary plus one exact described
+association, including role, null target role, ARN, and owner agreement. The
+Kubernetes proof independently rejects an IRSA annotation on the service
+account.
 
-The receipt proves completion of the exact wrapper/handler invocation, not
-exit of its reusable ProcessPool PID. Durable handlers must not detach
-effect-bearing Python threads; cancellation runs the wrapper's child-process
-cleanup before it publishes the receipt. The worker's SIGTERM interruption
-gate is one-shot and exact-claim-addressed. Before signalling, the owning
-executor creates a mode-0600 cancellation marker whose path includes a digest
-of the PID, request ID, execution generation, and claim token. The active
-wrapper independently derives and holds that path. Its signal handler raises
-`KeyboardInterrupt` only when the marker for its current invocation exists,
-atomically consumes that marker, and disarms the gate first. The sender first
-verifies through the local process table that the PID is a titled ProcessPool
-executor direct child of the current server process and refuses a PID already
-observed as unrelated. This matches production, where the short and long
-RequestWorker dispatchers are threads rather than OS processes. It then holds
-the exact request row lock across
-marker creation, `os.kill`, and the signal-delivery write, and does not signal
-an invocation that already has its exact receipt. A successful wrapper receipt
-takes that same lock before its
-Future can return and its ProcessPool PID can be reused. Thus a wrapper-first
-race normally observes the receipt and sends no signal, while a sender-first
-race keeps generation A in its wrapper until signal delivery commits. If the
-receipt write fails or the worker crashes, the exact marker remains the fence:
-a generation-A marker is ignored by a replacement worker running generation B.
-A non-SkyPilot process could theoretically acquire the PID between the process-
-table check and `os.kill`; closing that operating-system TOCTOU completely
-would require persisting a process birth identity or using a Linux pidfd. That
-pre-existing, same-container race is outside this rollout's exact SkyPilot-
-worker reuse guarantee.
-A duplicate signal during A's cleanup is ignored. The next invocation installs
-its distinct path immediately before handler execution, and wrapper exit clears
-only its own marker. Marker removal is best effort: an unlink error cannot turn
-an otherwise completed wrapper Future into an ambiguous failure and suppress
-its receipt; claim-addressed paths make a residual marker inert and bounded-age
-pruning removes it later. Receipt publication is additionally guarded by an
-explicit wrapper-local completion flag. Cancellation sets that flag only after
-child-process cleanup returns successfully; cleanup failure leaves it false
-and the exceptional Future cannot publish the monitor fallback. Tests cover delayed
-PID reuse, locked sender/wrapper ordering, a duplicate while cleanup is blocked,
-and cleanup failure. Literal retirement of every reusable worker process is
-neither required nor claimed.
+Activation runs both provider domains for both contexts concurrently under the
+caller's single absolute five-second deadline. Claim authorization does the
+same for every distinct requested context, and launch authorization runs AWS
+and Kubernetes concurrently for its one context. Static identity, pool-key,
+projection, accelerator, and admission mismatches fail before provider I/O.
+All network calls use the remaining deadline, one-attempt client retries, and a
+shared cancellation event. Raw provider payloads and credential material never
+enter errors or proof output.
 
-Before cancellation the controller captures each retained exact request ID and
-`execution_generation`. It polls those IDs including terminal rows, and
-requires every terminal target to report
-`execution_quiesced_generation == captured_generation`. This also covers a
-handler that wins the terminal race with `SUCCEEDED` or `FAILED`; status alone
-never proves quiescence. The generation proof is a mixed-rollout capability
-fence: an old executor may still write the legacy cancellation timestamp, but
-cannot populate the new column. A missing row, null/mismatched generation, an
-old server response without the fields, an unexpected identity/status,
-timeout, transport error, or ownership change is uncertainty: the durable
-replica rows remain and the recovery pass retries.
-
-An active-only discovery is insufficient because another controller or caller
-can already have published `CANCELLED` while the remote handler still runs.
-Interrupted-fill recovery therefore uses an additive API-version-70,
-POST/body-backed status filter that reads all request statuses for the whole
-set of validated incarnation-scoped replica cluster names in one PostgreSQL
-query. The server itself applies the exact `sky.launch` request-name allowlist;
-callers cannot supply arbitrary internal request names. This internal mode is
-accepted only from the current PostgreSQL controller generation proven by the
-server's existing origin middleware (or a loopback compatibility caller), is
-absent from the legacy GET endpoint, and uses a scalar PostgreSQL projection.
-Unrelated request history and large launch payloads are therefore neither
-transferred nor decoded.
-There is deliberately no request-age cutoff: wall-clock age is not execution
-or identity proof, and every retained required/unproved request for the exact
-incarnation-scoped cluster name remains relevant. The body transport also
-carries the retained exact request IDs during polling, so
-large waves cannot overflow ingress URL/header limits or degrade into one
-database query per ID; exact polling uses one primary-key `IN` query. Revision
-008 adds a partial `(cluster_name, status)` index only for receipt-required
-rows whose exact generation is still unproved; the query combines those rows
-with the existing active-status index instead of scanning either unrelated
-terminal history or the growing set of successfully proved requests. It
-captures every matching launch generation,
-cancels the active subset, and requires the generation proof from both that
-subset and matching requests that were already terminal.
-The API request retention predicate keeps any required terminal generation
-whose quiescence proof is null or mismatched, so request GC cannot erase the
-only evidence while its handler may still mutate; pre-version-70 rows remain
-subject to the existing retention policy. Comprehensive discovery ignores
-non-required terminal legacy history but requires the bit and exact receipt for
-every active protocol-v2 target. This history mode is required for
-protocol-v2 interrupted fill; compatibility teardown retains active-only
-discovery for local/SQLite and pre-version-70 deployments.
-Only after this barrier completes and a fresh active-request scan remains empty
-does recovery recheck provider inventory, schedule immediate teardown for the
-whole batch, and let the broker refill opportunistic slots under fresh
-authority. Ordinary demand recovery is unchanged.
-
-The selected replica persists `reserved_fill_pool_key`,
-`reserved_fill_service_generation`, and
-`reserved_fill_physical_cluster_uid`; the final transaction verifies that
-the carried and round protocol equal the durable gate, plus the authoritative
-service generation, matching live composite claim, round generation, pool
-epoch, and selected physical identity. A protocol-v1 decision queued
-immediately before v2 activation (or a v2 decision queued before demotion)
-therefore cannot persist afterward.
-
-The advisory lock is not itself treated as a durable fence: PostgreSQL may
-drop its dedicated session while the process still believes the lock is held.
-Before a fill-row persist uses its ordinary ORM connection, it advances the
-existing global lease epoch on the exact advisory-lock session and carries that
-token into the replica transaction. The transaction locks and validates that
-epoch before inserting. Every replacement round advances the same epoch before
-its replica scan. If the persist transaction locks the token first, the
-replacement blocks and subsequently scans the committed row; if the replacement
-advances first, the stale persist writes nothing. The persist token does not
-refresh lease expiry, which remains evidence of a completed broker round.
-The local SQLite/FileLock path retains its historical mutex-only behavior and
-does not touch the PostgreSQL lease token. The replica transaction determines
-this exception from its database dialect: every PostgreSQL persist rejects a
-missing or non-positive token even if distributed-lock auto-detection
-transiently returned a FileLock.
-
-This service-generation predicate is the cross-pool fence. Repartitioning
-budget from pool A to B invalidates every queued A and B decision from the old
-generation before either can persist, even when one pool's previous round is
-otherwise fresh.
-
-Demand placement reads a `(service, pool)` grant cache. Saturation excludes
-only that pool's zero-cost locations. One saturated context cannot close an
-unrelated context that still has entitlement.
-
-Scale-down shelter preserves protocol-v1 behavior unchanged. Under protocol
-v2, let `T_i` be each pool target after ordinary decisions reserve their free
-slots, and `D` the demand target. Attribute `min(D, sum(T_i))` units of demand
-coverage across `T_i` in stable pool order. Pool `i` receives shelter quota
-`Q_i = T_i - coverage_i`, proving
-`sum(Q_i) = max(0, sum(T_i) - D)`, the existing aggregate v1 surplus. Victim
-suppression is performed independently per pool, from the tail of that pool's
-ordered zero-cost victims, while preserving the original global output order.
-
-When the existing exact-card demand map is complete, the same equation is
-applied independently per exact card before stable pool allocation. When it is
-incomplete, the aggregate equation above is used, exactly as v1 falls back to
-aggregate shelter. With one pool both paths produce the identical v1 quota and
-victim suffix for every origin and victim order; paid rows, fill-origin rows
-currently serving demand, and demand-origin zero-cost rows neither add nor
-subtract a second copy of demand. With several pools, every `Q_i` can shelter
-only victims physically attributed to `i`, so another pool's grant cannot
-shelter them.
-
-## Deployment and rollback
-
-1. Merge revision 035, normalized claims, pool-aware runtime, the durable
-   launch tuple/provider fence, and tests while
-   the durable protocol gate remains v1. Protocol-v1 one-pool behavior is
-   unchanged and multi-context fill remains mechanically inactive.
-2. Upgrade every API/controller/executor role to the fenced image, then apply
-   the reusable spoke workspace-pool RBAC module (or equivalent
-   operator-managed RBAC) to every remote candidate. An already-active v2
-   deployment must keep remote UID reads denied until all roles run the fenced
-   image. If it already has an authorized in-cluster fill candidate, disable
-   fill before the Helm upgrade because the chart RBAC and image change are
-   applied together; re-enable it only after rollout verification. This avoids
-   either mixed direction: a new controller with an old executor that ignores
-   the tuple, or an old controller that omits it for a new executor.
-
-   Verify the control-plane subject can get exactly the `kube-system`
-   Namespace and read its nonempty UID through each configured context. Keep
-   this permission in the same declarative ownership path as the rest of the
-   pool RBAC. A separately named live ClusterRole and binding may serve as a
-   fix-forward bridge, but must not take ownership of or patch the declarative
-   system's existing roles. Remove the binding first and prove UID reads remain
-   healthy through the declarative grants before removing the bridge role.
-3. Complete the supported one-way API request-store cutover to PostgreSQL, run
-   the migration Job, wait for its Pod to become terminal, then replace every
-   API/controller/executor process. Resource
-   action authority remains explicitly disabled during the 034-to-035 mixed
-   rollout: old code recognizes only 034 evidence, new code recognizes only
-   freshly produced 035 evidence, and neither may promote from evidence
-   produced for the other schema head.
-   The `blocked` cutover phase admits only the configured and resolved legacy
-   SQLite runtime so it can drain; it rejects a normal PostgreSQL runtime until
-   the importer atomically commits `cutover-complete`. The import Job invokes
-   the importer directly and therefore does not need to start a server runtime.
-   Once the shared cutover gate records `cutover-complete`, every server role
-   resolves its actual request storage backend before database recovery and
-   refuses startup unless it is the exact built-in PostgreSQL backend. This
-   turns a later declarative or plugin-driven regression to SQLite into an
-   explicit rollout outage instead of allowing stale-source reads or recovery
-   against the frozen one-way source. This runtime fence does not make an
-   out-of-band Helm value declarative; operators must still prevent a later
-   configuration apply from reverting `requestStore.backend`.
-   Enable the chart's built-in execution-quiescence backend guard as part of
-   the PostgreSQL runtime rollout. The chart value is deliberately optional
-   in the generated schema and renders as `false` when absent so an existing
-   release upgraded with Helm `--reuse-values` remains backward compatible;
-   the PostgreSQL cutover must nevertheless set it explicitly to `true`.
-   Once the durable broker gate is v2, MAIN
-   startup for the `all`, `api`, `controller`, and `executor` roles
-   independently requires that preparation flag and exact built-ins, so a
-   later new-code rollout cannot silently disable the guard. The proposed
-   resource-action authority-worker role was retired before activation and is
-   absent; reserved-fill has no separate authority-role exception to this
-   protocol gate.
-4. Verify healthy legacy rounds, then run the zero-argument explicit activation
-   action inside an API pod. The action takes the global broker lock,
-   mechanically verifies exact Serve schema head 035, exact API-request schema
-   head 008, plus stable all-ready API and, in HA mode, controller and executor
-   Deployment/pod cohorts at one immutable digest with a literal PostgreSQL
-   request backend and literal execution-quiescence preparation flag. It also
-   requires every database-wide recent process lease
-   to resolve to the exact built-in PostgreSQL request storage and queue
-   implementations, advertise execution-quiescence capability, and equal
-   those Pods;
-   wait at least the server-instance stale horizon after retiring an old or
-   draining release before retrying. The action derives its proof and performs
-   the one-row gate transaction. Verify the durable protocol gate reads v2 and
-   contains the common digest, canonical Deployment generation/UID
-   inventories, and combined pod/process inventory count/hash.
-5. Let every live fill controller atomically adopt an authoritative v2 claim
-   set. Verify generation/edge-count integrity, integer grants, and fresh 035
-   reserved-fill evidence. The retired dedicated authority mode cannot be
-   re-enabled.
-6. Before materializing PHX eligibility, deploy the phase-scope hotfix to every
-   API/controller/executor process and prove one immutable digest. While normal
-   load-balancer sync, job-status, readiness, and broker pollers remain active,
-   exercise both production failure shapes: enqueue a multi-item protocol-v2
-   fill batch (at least ten decisions) and complete at least one exact-UUID
-   ordinary GCP teardown attempt. Observe the GCP operation without an
-   `AMBIENT_LEGACY` owner and observe each v2 admission retire after at most one
-   physical proof/persist seam; a queued ambient waiter must run before a later
-   batch item can barge. Then observe at least three complete 60-second broker
-   intervals with advancing broker generations/refill rows, successful route
-   sync, and no provider-phase timeout, route-sync 503, controller-failed
-   transition, healthy-edge withdrawal, or physical-identity uncertainty.
-   Every process must retain the same hotfix digest throughout.
-7. Update the inference workspace from its inherited east context to an
-   explicit east-plus-PHX list through the validated workspace API. Deploy the
-   config-snapshot update protocol described in
-   `docs/designs/serve-controller-config-refresh.md` to every API/controller
-   process, then submit
-   a fresh immutable `boltz-l4-fleet` version. The API must stage the
-   policy-admitted controller projection under the durable service workspace;
-   the controller must build that version's catalog under the staged snapshot,
-   atomically commit the version/catalog and sanitized HA recovery generation,
-   and only then install and reload it. An old controller fails capability
-   preflight before version allocation. A restart is a verification step, not
-   the mechanism that refreshes config. Confirm two claims, independent rounds,
-   exact-context/UID east and PHX canaries, restart persistence, and the global
-   cap.
-8. Keep the stacked cleanup PR blocked until the observation window and
-   rollback gate below pass.
-
-Normal rollback must happen while the v2 image still runs: disable fill (or
-remove every secondary context), wait for pending v2 launches to be fenced and
-for secondary normalized claims to disappear, then run the zero-argument
-`python -m sky.serve.reserved_capacity_demotion` action inside an API pod. The
-action takes the same global broker lock, requires exact schema head 035 and
-API-request schema head 008, and uses its mounted pod-bound token to double-read
-and attest the complete stable API/controller/executor writer rollout. It
-accepts no operator-supplied rollout identity.
-
-Under that lock, demotion takes PostgreSQL table locks that also exclude an old
-v1 writer unaware of the protocol singleton. In one transaction it inventories
-every authoritative set, refuses any multi-edge, malformed, stale-generation,
-or incomplete set, and refuses every legacy-only row. It rebuilds the complete
-legacy row for each valid single edge (including missing or divergent
-projections), rereads the exact projection inventory, and only then flips the
-durable gate to v1. A projection write or final validation failure rolls back
-both the rebuild and gate. Verify the command reports protocol v1 before rolling
-back the image. Demotion need not discover in-memory pending launches: the
-atomic carried-protocol predicate fences every queued v2 persist as soon as the
-gate changes. The additive tables remain.
-
-An emergency old-image rollback against an active multi-context spec promises
-only that the old controller emits no new multi-context fill. It cannot delete
-normalized claims and zero/stale feed may continue sheltering existing rows;
-it is not a supported drain procedure. Operators must restore the v2 image and
-perform the explicit disable/demote sequence above.
-
-Rolling back the phase-scope hotfix while #1275's mixed legacy/v2 behavior
-remains active is unsupported: it restores the multi-item and non-Kubernetes
-cleanup phase convoys that caused 30-second timeouts and transient controller
-failure. Fix forward, or disable fill and drain pending work under the hotfix
-before reverting. Rolling below #1275 while legacy and v2 rows coexist is
-additionally unsupported because it restores the provider-call collision that
-can withdraw a healthy edge. The explicit east-plus-PHX workspace superset may
-remain because it removes no eligible context.
-
-Revision 035 advances resource-action activation evidence to exact revision
-035. Evidence from revision 034 is invalid for new code and is not silently
-re-labeled. Authority stays disabled for the entire mixed-image rollout and
-is re-enabled only from fresh 035 evidence. Rolling back the image while the
-database remains at 035 likewise requires authority to remain disabled,
-because the old validator cannot recognize current evidence.
-
-API request revision 008 is retained-additive and intentionally has no schema
-downgrade. Removing its required/proven quiescence fields could erase the fact
-that a terminal request still has executing code, while removing its runtime
-capability fields could invalidate the proof used to activate protocol v2.
-Application rollback therefore leaves the API request schema at 008, as the
-existing retained-additive migration policy does for earlier durable request
-kernel revisions.
-
-The cleanup PR may merge only after:
-
-- all production API, controller, and executor processes have run the new image for the
-  documented rollback window;
-- every live legacy claim has an equivalent normalized edge;
-- east-only and east-plus-PHX services have completed update and restart
-  canaries;
-- same-accelerator cross-context launch fencing has been observed; and
-- operators explicitly accept that rollback to a pre-035 image requires
-  removing multi-context fill first.
-
-## Verification
-
-Automated coverage must include:
-
-- bool/object/old-pickle configuration compatibility;
-- multi-context validation with per-context physical widths and logical
-  one-GPU enforcement;
-- populated PostgreSQL 034-to-035 upgrade, retained legacy rows, composite
-  edge upserts, old-style legacy upserts after migration, and re-upgrade;
-- one-to-two-to-one edge replacement and disable cleanup;
-- same-service claims in two pools without overwrite;
-- migration-shadow versus legacy-heartbeat races, legacy move/delete versus
-  v2 adoption, owner rotation, and atomic set-plus-projection failure;
-- protocol-v2 activation rejection for either schema mismatch, any non-
-  PostgreSQL writer request backend, a plugin-overridden storage backend or
-  queue factory, an incomplete or mixed-image
-  API/controller/executor rollout, a missing or independently
-  overridden controller or executor, a changing double-read cohort, an active migration Pod, an
-  unattested same-release writer Pod, an extra/unready/draining database
-  writer lease, an invalid Pod -> ReplicaSet -> Deployment UID chain,
-  malformed/unbound or swapped in-cluster tokens, spoofed caller/environment
-  identity, or an already-active gate, plus successful compatibility and HA
-  persisted derived evidence;
-- a completed one-way cutover marker rejects process startup when the resolved
-  request storage is SQLite or plugin-overridden, while the pre-cutover
-  `blocked` phase permits only the configured/resolved legacy process to drain
-  and rejects an early PostgreSQL server start;
-- MAIN-, UVICORN-, and EXECUTOR-only plugin backend overrides each fail their
-  process context before work begins when preparation mode is enabled; v1 with
-  preparation disabled retains plugin compatibility; active v2 rejects a new
-  MAIN process with preparation disabled; and direct API008-to-007 downgrade
-  is rejected without dropping columns or changing the schema head;
-- zero-argument v2-to-v1 demotion with token-bound stable-writer attestation,
-  exact projection rebuild, multi-edge/malformed/legacy-only rejection, and
-  atomic projection-failure rollback;
-- overlap rejection, including kube-context aliases sharing one physical UID;
-- mixed-width protocol-v1 claim deletion plus protocol-v2 pool-local zero
-  authority without edge deletion, generation churn, or sibling invalidation;
-- per-pool grant, feed, damping, staleness, phantom, bench, epoch, cache, and
-  removal isolation;
-- a service-generation advance followed by one pool's provider timeout: the
-  unchanged pool/physical UID retains clipped shelter while grant, feed, and
-  epoch stay zero, the healthy sibling advances independently, and the live
-  production shape suppresses every prior-generation H200 fill victim without
-  suppressing paid victims or emitting a failed-pool launch;
-- repeated failed generations monotonically clip shelter, complete-map removal
-  and disable/re-enable reset it to zero, and malformed live or dynamic-state
-  authority is rejected;
-- downscale-held backed reassignment uses only materialized supply and only the
-  fresh no-supply source subset, preserving unrelated held exact-card retries
-  and restoring same-card cold authority if the alternative supply vanishes;
-- committed measured-capacity dissemination to two independent pollers sharing
-  one fresh round, with one provider query and identical exact-pool/card bench
-  release for both controllers;
-- no measured bench release from a lease-CAS-lost writer, invalid exact-card
-  split, phantom, or blackout, and conservative pre-query observation-time
-  ordering against a concurrent or newer bench;
-- protocol-v1 one-context and protocol-v2 multi-pool/card observation
-  isolation through the actual broker-cycle paths, including a fresh-round
-  reader that never invokes its query callback;
-- old rounds without the reserved observation entry, old readers presented
-  with the additive reserved key, independently malformed service and
-  observation entries, and raw-observation-only changes that do not advance
-  the pool epoch while real service feed/card changes still do;
-- service-global floor/cap conservation and deterministic over-cap drain;
-- global utilization-cap conservation, including need=1 across two pools;
-- headroom shrink during a pool blackout and a stale-round cap-repartition
-  race with concurrent replica persistence;
-- real-PostgreSQL protocol-v2 advisory-session termination after a persist
-  token is minted, with the replacement paused after its replica scan and
-  before publish while the stale persist proves it cannot land inside that
-  window;
-- one replica-table read and one utilization sample per service poll cycle;
-- identical H200 names in two contexts with exact-context launch selection;
-- complete launch-origin attribution in both autoscaler shelter and broker
-  occupancy scans: older/current tuples remain valid, while partial, future,
-  UID/context/exact-shape-mismatched tuples fail closed and only genuinely legacy
-  rows retain the legacy placement fallback;
-- all-or-none durable launch-tuple validation at ingress, including each
-  missing/mistyped field, non-Serve origin, pool/UID/card contradictions, and
-  immutable PostgreSQL request-body round-trip across executor restart;
-- replica JSON persistence preserves an exact boolean fill marker: integer,
-  string, partial, and contradictory values fail closed after durable-row
-  deserialization rather than being truthiness-coerced into legacy or v2;
-- context retargeting before persistence and after enqueue, plus final-plan
-  context/card/count changes from admin policy or optimization. Executor
-  rejection invokes neither backend provisioning nor a provider call;
-- retry/failover after a matching initial plan, where a later provisioning
-  attempt selects another context or accelerator shape. The mismatched attempt
-  terminates before any provider call and cannot fail over again;
-- provider-fence races after the executor's initial read, including a positive
-  kubeconfig refresh interval, a second Kubernetes API wrapper, concurrent
-  Pod-creation thread-pool calls without serialization, the normalized
-  in-cluster context, capture-pinned `kubectl` exec/rsync, and simultaneous
-  conflicting UIDs for one context;
-- mixed same-context legacy/protocol-v2 job-status and complete probe rounds
-  run all v2 status, endpoint, candidate/route-status, liveness, preemption,
-  and teardown provider work before every gated Kubernetes or unknown tokenless
-  legacy provider call; the explicitly audited exact non-Kubernetes operations
-  above may overlap without consulting Kubernetes authority;
-  futures and exceptional/early-return paths fully join and retire owners,
-  malformed v2 rows never enter the legacy phase, shared reduction preserves
-  fleet state, and one UID proof is performed per v2 pool per round;
-- provider-phase tests cover same-mode overlap, FIFO cohort/no-barging order,
-  bounded timeout removal, an expired opposite barrier admitting queued
-  active-mode followers into the same epoch without bypassing a live barrier,
-  same-mode reentrancy, cross-mode rejection, explicit child admission and
-  drain, stale/copied admission rejection, cancellation cleanup, phase-gate
-  fork-while-held reset, and physical-registry fork-while-owner/initializer-held
-  reset without deleting the parent's capture;
-- blocking Kubernetes/unknown job status acquires phase before `self.lock` yet
-  leaves probe and mutation refresh able to run while an SSH worker hangs. An
-  exact prefetched GCP handle performs its slow SSH call without excluding a v2
-  Kubernetes phase; a GCP `CommandError` regression proves fresh preemption
-  classification takes ambient admission before `self.lock`. Arbitrary cloud
-  objects remain ambient. Probe, refresher, and locked recovery use only
-  immediate try admission. An active opposite
-  phase, or a same-mode/same-context physical initializer after successful
-  phase try, makes those locked paths return promptly with unchanged rows, no
-  negative/identity-uncertain evidence, a released manager lock, and a
-  successful next-round retry;
-- one mixed probe resets its tick memo and prunes process/route registries once,
-  runs complete admitted v2 work before ordinary work, joins every future and
-  inline teardown before phase retirement, merges denied partitions unchanged,
-  and never duplicates persistence or finalization;
-- refresher tests partition wait-for-idle URL and optional log/drain reads,
-  leave trackers and completed-worker ownership recoverable on phase busy, and
-  still schedule the independently fenced down without treating phase busy as
-  cleanup or physical-identity uncertainty;
-- boot recovery under an active opposite phase completes its acquired-lock
-  handshake, leaves exact rows retryable, and does not enter the generic
-  30-second exception backoff while holding `self.lock`;
-- a standalone v2 scale-up takes blocking phase admission before the manager
-  lock. A v2 batch retains one manager-lock acquisition and each item takes a
-  zero-wait phase plus zero-wait physical-initializer admission only at its
-  capture/persist seam. In one real sequence item 1 owns v2, an ambient waiter
-  queues, item 1 retires, ambient enters, and item 2 stops the remaining wave
-  without a row/thread/list/ID leak; it is retried later. Busy/identity failure
-  persists no row and registers no thread.
-  Deferred down waits for drain first, takes a fresh phase/workspace/UID proof
-  on every Kubernetes retry, and exact action-aware GCP cleanup bypasses the
-  Kubernetes phase while retaining its UUID plus raw-handle fingerprint;
-  same-UUID handle change retries provider classification, while name-only,
-  fake, unknown, and Kubernetes cleanup remains ambient. Every path releases
-  phase/fence during backoff;
-- cold/warm LB route sync, standalone active URLs, API status serialization and
-  fanout partition complete v2 groups before ordinary rows; a phase timeout
-  aborts route sync with 503 and publishes no mapping/cache update, while status
-  yields unknown rather than stale or negative evidence;
-- interactive v2 follow holds its immutable physical fence but no process
-  phase, ordinary colliding follow fails closed, and bounded/non-follow tails
-  hold the normal phase for their complete read;
-- v2 broker observations enter the process phase before the broker callback,
-  never while its round lock is already held, use zero-wait broker-lock
-  admission while the phase is live, and perform one UID proof for each driven
-  physical pool; legacy/shared-demand observations use the ambient phase under
-  the same rules;
-- broker UID discovery waits only for the typed active owner/initializer
-  collision, wakes on successful or failed retirement, survives repeated
-  capture replacement with one 30-second absolute deadline, rejects a caller
-  carrying a fence token, rereads fresh ambient credentials, and fails closed
-  without cache fallback on timeout or non-collision identity errors;
-- retargeting during restart drain, ordinary drain registration, endpoint
-  discovery, status serialization, warm and cold load-balancer route sync,
-  job-status SSH, candidate status, and interruption detection yields no
-  provider call, READY evidence, stale retained route, preemption, or cleanup
-  through the replacement cluster; a multi-replica round performs one UID
-  verification per physical pool rather than one per replica;
-- a physical-identity failure after partial launch never invokes an unfenced
-  immediate terminate or later down/log-sync worker. The durable row remains
-  cleanup-uncertain while the alias is mismatched, and a restored matching
-  identity permits the exact fenced cleanup retry;
-- failed-controller, failed-service, orphan-purge, interrupted-fill, and bulk
-  scale-down paths retain protocol-v2 rows when cluster-record or physical
-  absence is unproven, and do not finalize parent deletion around them;
-- a stale cleanup blocked behind cluster locks cannot run hooks, cancel
-  requests, force-unlock, refresh status, contact the provider, or remove state
-  after either its resource-action UUID or legacy cluster hash has been
-  replaced; both identities are re-proved after status refresh and final
-  removal remains generation-predicated;
-- cleanup blocked on cluster locks revalidates the action UUID, or the
-  nonempty legacy `cluster_hash` fallback, plus service ownership before any
-  hook, request cancellation, force-unlock, credential/status read, provider
-  mutation, or row removal. Same-name row recreation, action-UUID rotation,
-  and service-owner takeover therefore leave the successor untouched and the
-  stale row cleanup-uncertain;
-- recovery of interrupted fill rows schedules batched teardown without a
-  second launch, including an already-accepted launch whose cluster record is
-  initially absent: terminal cancellation without executor acknowledgement is
-  insufficient, the exact request-generation barrier waits for durable handler
-  quiescence, arbitrarily old required history is still included, mixed v1/v2
-  waves run separate compatibility/strong barriers before any teardown, and
-  malformed scope/protocol, missing, old-server, timeout, or ownership
-  uncertainty retains every row while ordinary demand recovery remains
-  unchanged, plus delayed same-PID delivery cannot cancel the next invocation
-  and a broken pool cannot create a masking execution generation;
-- no row/thread on malformed, removed, benched, or superseded pool launches;
-- a stale protocol-v2 epoch fails closed before placement and persistence even
-  when the current same-generation/same-UID aggregate or exact-card feed is
-  positive; ordinary and cross-service post-snapshot rows, broker debit
-  overlap, malformed/NaN/future timestamps, and aggregate/exact authority
-  transitions cannot reauthorize it; the unchanged final persist fence still
-  rejects a round or ownership change after the early check;
-- workspace allowed-context validation covers inherited finite-list equality
-  materialization and supersets, explicit finite-list supersets, list-to-`all`,
-  empty-block normalization, and combined user-access checks; removals,
-  inherited `all`/unrestricted-to-list, unrelated field changes, and a changed
-  current snapshot before commit remain blocked around active resources;
-- pool-local demand saturation and scale-down shelter;
-- legacy dynamic-state load and new per-pool dump/load; and
-- unchanged aggregate status plus additive per-pool status; and
-- the chart API ClusterRole and reusable spoke RBAC module each grant only
-  `get` on the named `kube-system` Namespace for physical-cluster identity,
-  without namespace `list` or mutation, including a chart upgrade that reuses
-  values from a pre-feature release.
-
-Focused validation commands:
+The deployment preflight is machine-readable:
 
 ```bash
-pytest -q tests/unit_tests/test_reserved_fill_broker.py
-pytest -q tests/unit_tests/test_reserved_capacity_fill.py
-pytest -q tests/unit_tests/test_serve_replica_managers.py
-pytest -q tests/unit_tests/test_sky/workspaces/test_workspace_management.py
-pytest -q tests/unit_tests/test_spot_placer_hybrid.py
-pytest -q tests/unit_tests/test_concurrency_autoscaler.py
-pytest -q tests/unit_tests/test_reserved_fill_broker_pg.py
-bash format.sh --files <changed-python-files>
-git diff --check
+python -m boltz_reserved_fill_reclaim_policy
 ```
 
-Local pre-PR evidence on 2026-08-04: the feature-focused suite completed with
-1,547 passed, 54 environment-dependent skips (including PostgreSQL/Docker),
-and 28 passing subtests using the supported Kubernetes client 35.0.0; all 133
-affected Helm unit tests passed;
-repository mypy completed with no issues across 883 files; pylint scored
-10.00/10; dashboard lint completed with no warnings; and `git diff --check`
-passed.
+It prints exactly one JSON object. Successful preflight and the structured
+activation, claim, and launch log payloads use schema 1 with `operation`,
+`success`, the V2 `contract`, all three identity fields, completion time, and
+one record per attested context. Each AWS record includes
+`association_count`, `expected_role_arn`, and the explicit boolean
+`identity_absence_proven`; each Kubernetes record includes the physical and
+namespace UIDs, exact queue names, IRSA-absence result,
+`assign_queue_labels_for_pods`, and per-flavor non-deleting Node counts plus
+reviewed product/capacity. Failed CLI preflight returns exit 1 and only
+`{"schema_version":1,"operation":"preflight","success":false,
+"error_code":"ATTESTATION_FAILED"}`. Runtime activation and authorization
+fail closed with `ReclaimAttestationError`.
 
-Final pre-push safety validation on 2026-08-04 reran the complete affected
-activation, demotion, broker, multi-pool state, replica-manager, request
-executor, request wire/storage, server route, and SDK transport suite
-successfully. Focused real-process regressions prove the production thread-
-dispatcher ProcessPool ownership topology and prove marker-cleanup I/O errors
-cannot suppress a quiescence receipt. The changed production Python passes
-mypy across 883 files and pylint at 10.00/10. Follow-up adversarial regressions
-prove exact backend enforcement independently in MAIN, UVICORN, and EXECUTOR
-plugin contexts, active-v2 startup enforcement, clean child-environment
-restoration, exact SQLite/blocked and PostgreSQL/completed cutover ordering,
-and retained API008 downgrade rejection. The generated chart schema matches
-the values contract and the full local Helm run passes all 313 tests across 20
-suites.
-Docker is unavailable locally, so real-PostgreSQL execution remains a required
-CI gate rather than being reported as local evidence.
+Rollout is fix-forward. Apply and attest the IAM, namespace/service-account,
+queue, priority, admission-policy, Kueue configuration, and server projection
+first; remove the east unmanaged inference Pods and its drifted Pod Identity
+association before activation. Then build one immutable two-wheel Boltz image,
+deploy it to the complete writer fleet, run the JSON preflight, and invoke the
+normal activation command. A correction ships a successor bundle/image and
+uses the same reauthorization command to advance the generation; it does not
+reopen legacy activation or introduce a rollback-only happy path.
 
-Hotfix pre-PR validation on 2026-08-04 reran the complete affected executor,
-provider-fence, Kubernetes adaptor/command, controller, replica lifecycle,
-strict-drain, status, and teardown suite successfully. The one excluded
-unchanged fixture asserts that mode `000` makes a file unreadable and cannot
-hold when pytest itself runs as root; every other test in that backend file,
-including the new under-lock UUID/hash races, passed. The full chart suite
-passed all 315 tests, the reusable spoke RBAC module passed all 12 Terraform
-tests, and the checked-in formatter gate completed with mypy clean across 883
-files and production pylint at 10.00/10. Shell syntax, Python compilation,
-Terraform formatting, and `git diff --check` also passed. Independent
-adversarial review found no remaining release blocker in the lifecycle-wide
-physical-cluster or cluster-generation fence.
+The one interface owns three operations:
 
-#1275 pre-PR validation on 2026-08-04 passed 555 focused broker,
-reserved-capacity, workspace, physical-fence, executor, and replica-contract
-tests plus 62 subtests. After updating three stale provider-phase test doubles,
-the broad affected Serve suite passed all 908 tests plus 23 subtests. Repository
-mypy completed with no issues across 884 source files, YAPF and isort completed,
-Python compilation and `git diff --check` passed. Its exact-head review and
-required CI reported no release blocker. Subsequent production evidence below
-invalidated that concurrency acceptance; these results are historical and do
-not close the phase-scope hotfix gate.
+1. activation attestation enumerates the exact current durable claim edges and
+   returns the immutable fleet-bundle, policy-revision, and provider-inventory
+   identity under the V2 claim/admission/launch contract;
+2. every sequenced complete claim-set replacement authorizes its exact
+   normalized requested edges, committed service version, and typed projected
+   admissions against the stored identity; and
+3. every sequenced launch authorizes its exact service, claim generation,
+   physical UID, service version, complete worker-projection digest, namespace,
+   service account, projected scheduler, Pod-priority contract, LocalQueue,
+   WorkloadPriorityClass, accelerator, and width against the identity carried
+   by the durable launch fence.
 
-Production diagnosis on 2026-08-04 separated three independent refill
-failures. Merged PR #1269 lets a successfully observed zero-cost location
-override an older placement bench, and merged PR #1271 keeps concurrent
-non-forced UID observations from discarding their own successful reads. Helm
-revision 333 deployed both as release `1.1.1095`. A post-deploy broker sample
-then proved the residual shared-reader gap: the east pool persisted 102 free
-slots and a 100-replica `boltz-l4-fleet` feed while the service reported one
-fill holding and continued paid placement. The controller that read the fresh
-shared round without driving its query callback did not receive #1269's local
-placer observation. The committed-round observation metadata and reader-side
-application in this corrective change close that owner/peer asymmetry without
-cross-pool or cross-card leakage.
+The typed policy view is derived from the worker projection; it is not another
+persisted projection schema. It includes the exact nullable Pod Identity role,
+so a policy must verify positive identity and identity-free admission with the
+same interface. A claim edge stores only its exact closed
+accelerator-to-digest map beside its existing normalized identity. The full
+source remains the immutable version row. Claim replacement locks that row and
+recomputes every edge map before commit. A version or admission-only change
+therefore changes the semantic hash, advances the claim generation, and
+invalidates the prior allocation even when pool topology and capacity policy
+are unchanged.
 
-PR #1272 subsequently merged an aggregate reader-side replay of that shared
-round. This branch retains #1272's owner/peer repair but carries the committed
-observation through the ordinary `Allocation` result with a validated exact-
-card map. That prevents aggregate A100-family capacity from releasing a full
-peer card in the same context, rejects malformed or CAS-lost evidence, and
-keeps v1 one-context and v2 exact-pool behavior aligned.
+Provider and Kubernetes reads for activation and claims complete before the
+broker and PostgreSQL row locks are acquired. Launch authorization completes
+before the fleet-wide reclaim guard and before any PostgreSQL transaction or
+row lock. Reserved fill cannot also carry the ordinary bound-launch context.
+For built-in Kubernetes reserved fill, every provider-mutation factory call
+acquires the service-owner guard, obtains a fresh deployment-policy ticket,
+then acquires the fleet guard, revalidates exact durable authority, performs
+one bounded mutation, and releases all three before any passive wait. Ordinary
+bound launches and opaque provisioners retain their existing whole-call
+service guard. The deployment policy call receives one absolute five-second
+monotonic deadline and must be cancellation-aware; a result returned after
+that deadline is rejected before any authority lock or mutation. No path
+acquires the per-service guard after the fleet-wide reclaim guard, so the lock
+order remains acyclic. The returned typed authorization is short-lived and
+exact-scope. The
+claim transaction locks and revalidates the current gate generation and
+identity plus the exact normalized edges, version row, projections, and
+digests before persistence. Allocation publication and replica insertion
+repeat the locked version/digest comparison. At launch, the executor reloads
+the exact committed version projection, verifies the protocol-v2 digest carried
+by the durable fence, and obtains a fresh exact authorization immediately
+before the provider guard. Inside that guard it revalidates the typed
+authorization, durable launch fence, current claim edge, current version row,
+and generation-bound gate identity before yielding to provider mutation. A
+restarted executor with a missing plugin, a differently identified bundle, a
+stale version or digest, or a partial fence cannot launch.
 
-PR #1274 subsequently repaired the other half of the UID race: a forced
-launch-guard read that completed successfully but lost cache publication had
-also returned `None`, causing every otherwise matching fill launch to be
-reported as a physical-UID mismatch. This branch inherits #1274 and extends its
-same successful-read rule through the bounded physical-fence-retirement retry;
-failures and genuine mismatches remain closed.
+Kubernetes deploy-variable generation receives the selected persisted
+projection. It takes the LocalQueue and WorkloadPriorityClass only from
+`kueue_admission`, sets the provider's required-managed contract, and never
+uses `resources.priority_class` for a projected worker. The post-merge and
+legacy-YAML-restore enforcement step reasserts both the provider fields and the
+exact Pod labels/priority fields. The provisioner continues to preflight the
+projected LocalQueue and attest the admitted Pod; any mutation of queue,
+WorkloadPriorityClass, namespace, service account, Pod priority, or accelerator
+shape fails closed before workload execution.
 
-Helm revision 335 deployed release `1.1.1097`, which includes both #1272 and
-#1274. This supersedes the revision-333 deployment state above without closing
-the remaining exact-card, provider-phase, or inherited-workspace gates in this
-corrective change.
+The terminal reclaim guard covers each bounded Kubernetes compute-mutation
+window, including provider-internal create retries that can submit the
+Kueue-managed workload and immediate rejection cleanup for an admitted Pod
+whose projected identity changed.  The built-in Kubernetes provisioner
+receives the canonical provider-effect guard from the backend and enters it at
+the per-Pod create/retry boundary for reserved fill; it does not
+rely on an outer guard around the opaque bulk-provision call. Every normal,
+AppArmor-retry, and 409 replacement create attempt reacquires
+separately. Force-remove and rejected-identity delete/read attempts also
+reacquire separately, with all retry sleeps outside the guard. Every successful
+create response is checked
+for the exact queue, WorkloadPriorityClass, admission scheduling gate,
+namespace, service account, Pod priority, and accelerator shape before that
+guarded call returns. Existing Pods are reattested against their current Kueue
+lifecycle state: an admitted Pod may have had the gate removed, but must retain
+the exact managed/queue/WorkloadPriorityClass labels, Kueue's managed finalizer,
+`podset=role-hash`, and the exact LocalQueue/ClusterQueue outputs bound at
+preflight. `AssignQueueLabelsForPods` is therefore a deployment prerequisite.
+A label-only Pod without either the create-response gate or the complete
+post-admission binding is rejected and deleted under fresh authority.
 
-Corrective PR #1275 merged as `57a0283ffb4a817d0bebed6f934cdededc726b57`
-after all 30 required checks passed. Release `1.1.1099` was published and
-deployed as Helm revision 336 on 2026-08-05. Runtime inspection confirmed the
-exact commit/version, exact-card A100 versus A100-80GB broker observations, and
-refill progress; `boltz-l4-fleet` returned to READY without an API/controller
-pod restart.
+Passive scheduling and readiness waits on this reserved-fill built-in
+Kubernetes path never hold the per-service or fleet-wide advisory guard. After
+the wait, every Pod is fresh-read and its complete admitted identity reattested
+in one new guard epoch before provisioning can return. The fresh object must
+remain `Running` and retain the exact UID captured by the all-containers-
+running observation; same-name replacement and still-gated objects fail
+closed. In
+particular, a correctly Kueue-pending Pod
+with `provision_timeout: -1` may wait indefinitely without blocking a service
+version mutation, controller takeover, or reclaim-policy reauthorization.
+Any later provider mutation or retry must enter a fresh guard, obtain a fresh
+policy authorization, and revalidate the durable fence. If authority changed
+while a Pod was pending, the stale request cannot perform another create or
+destructive retry; durable controller reconciliation owns eventual cleanup of
+the old replica.  A failure after entering this instrumented path does not run
+opaque request-owned teardown; it returns a terminal reserved-fill fence and
+the durable replica owner performs exact cleanup. This mutation/wait split is
+the one canonical reserved-fill built-in Kubernetes path, including
+protocol-v2-fenced requests emitted while `LEGACY_ACTIVE`. Fence-less
+historical requests remain on the opaque whole-call path. An opaque
+protocol-v2 provisioner is rejected before provider mutation; only the in-tree
+Kubernetes provisioner can produce the exact create/adopt attestation required
+to enter the materialized tail.
 
-That live run also found a release blocker in #1275's phase scope. Four
-ordinary GCP `core.down` retries held `AMBIENT_LEGACY` across multi-minute cloud
-operations, and one ten-item v2 scale batch held `V2_FENCED` across every UID
-proof and row persist. Controller broker, job-status, and load-balancer callers
-then exceeded the 30-second phase deadline; the service transiently reported
-controller failure before self-healing. Process stack samples confirmed bounded
-head-of-line blocking rather than a leaked mutex. They also exposed a gate
-liveness edge: after an opposite FIFO waiter timed out, a compatible follower
-could remain stranded behind its removed barrier until all original roots
-retired. The phase-scope hotfix in this design addresses those exact findings;
-revision 336 is not final acceptance evidence.
+Pre-Pod auxiliary bootstrap and object-storage construction cannot occupy a
+reserved accelerator slot and remain outside the reclaim guard. The successful
+in-tree bulk/adoption return is the single one-way materialization boundary.
+It is recorded before deploy-variable generation or any other local tail can
+fail. From that point, every error is normalized to a terminal reserved-fill
+fence: no capacity classification, cross-placement failover, or broad
+request-owned teardown is permitted. Config-hash reuse is disabled for v2, so
+an existing Pod re-enters the same current Kueue/projection adoption
+attestation rather than inferring identity from cached configuration.
 
-Phase-scope hotfix pre-PR validation on 2026-08-05 passed the complete 803-test
-affected selection covering the provider gate, refill/broker, replica manager,
-action-aware teardown, core fingerprint, and backend handle-change contracts.
-The exact concurrency/fingerprint regression subset also passed after rebasing
-onto merged PR #1277 / release `1.1.1100`. The checked-in formatter completed
-with mypy clean across 884 source files, production pylint at 10.00/10, and
-dashboard lint/format clean. Three independent implementation, test, and
-canonical-design reviews found no remaining release blocker. Required GitHub
-checks on the final PR head remain the merge gate.
+Post-Pod runtime preparation, internal file mounting, Ray/skylet startup,
+workdir and file-mount synchronization, task setup, autostop/hook mutation,
+port reconciliation, and job submission each run under a fresh bounded
+service/policy/fleet guard. Passive Kueue scheduling and readiness waits remain
+outside every guard. A missing guard fails closed; terminal cursor restoration
+and other best-effort reporting cannot replace the typed materialized result.
+Ordinary bound requests retain their existing authority path.
 
-Required feature CI on the preceding code-bearing head `1357dec79` completed
-all 32 checks successfully. The mandatory unit job ran with
-`SKYPILOT_REQUIRE_SERVE_POSTGRES=1` and completed with 14,467 passed, 1
-xfailed, 197 warnings, and 103 subtests passed. Phase-scope hotfix #1280 is now
-merged and deployed; those counts are historical evidence, not a current
-release identity. Follow-up #1433 merged at the weakened head above after its
-31 reported relevant checks passed, but before the audit's final adversarial
-gate; those checks did not cover epoch-blackout, remove/re-add, or globally
-coupled shelter races. The sequential correction containing this design must
-pass every relevant GitHub check on its exact final head, including the
-PostgreSQL Serve suite. Its local focused/broad test counts,
-formatter/type/lint results, and exact-head adversarial review must be recorded
-in the PR before merge and in audit state after the gate completes.
+The asynchronous request boundary has one exact execution-quiescence protocol.
+Every claimed invocation retains generation, claim token, worker instance,
+outer-guardian Linux PID, and `/proc/<pid>/stat` process-start ticks until the
+exact process-family boundary finishes effect-bearing handler code and cleanup
+and publishes its receipt. API-request schema 010 has not been deployed, so
+this identity has one universal meaning from its first rollout; no historical
+schema-010 handler-PID rows exist. Lease expiry, controller handoff, signal
+delivery, guardian absence, and process-pool failure revoke authority but are
+not quiescence proof. They cannot make the request replayable. PID signalling
+uses a pidfd and repeats the guardian's process-birth check, so PID reuse cannot
+target another invocation. A schema-010 guardian PID disappearing without its
+exact receipt remains fail closed; local PID absence never synthesizes family
+quiescence.
 
-Sequential-correction pre-PR validation on 2026-08-11 passed 227 reserved-fill
-tests (80 subtests), 49 refresh-row contract tests, 113 autoscaler contract
-tests (7 subtests), 459 replica-manager tests, 261 broker/persist/activation/
-spec tests, and 488 concurrency/controller tests (15 subtests).  The checked-in
-formatter completed with mypy clean across 895 source files, production pylint
-at 10.00/10, and dashboard lint/format clean; the production dashboard build
-also completed.  Three alternating 21-sample end-to-end runs at 100 and 1,000
-pools showed unchanged call counts and median-of-medians deltas of +0.007 ms
-and -0.057 ms versus merged #1433, respectively.  No provider, broker,
-database, catalog, or network call was added.
+The parent Future monitor is the durable receipt-delivery owner. The child
+wrapper never writes an execution receipt: its return only reaches an inner
+warden, and cancellation, retry, or failure can still require descendant
+drain after that return. Durable PostgreSQL claims use one disposable
+per-invocation execution path; reusable `ProcessPoolExecutor` workers and
+forgotten broken-pool shutdown threads are removed. The retained
+`BurstableExecutor` capacity interface owns one finite set of these
+invocations, so a full lane leaves work durably queued instead of claiming an
+unbounded hidden backlog.
 
-Phase-scope acceptance requires both active convoy exercises from deployment
-step 6 and the sustained no-timeout/progress window. Feature acceptance
-additionally requires two live pool claims for `boltz-l4-fleet`, a successful
-PHX H200 replica canary whose persisted location is PHX, unchanged east serving
-health, no paid spill from a fill decision, and an observed total fleet no
-larger than the configured `max_replicas`.
+Each invocation has a dedicated two-level process boundary: a minimal outer
+guardian and an inner warden. Both become Linux child subreapers before the
+inner warden spawns the handler as leader of a new session/process group. The
+outer guardian PID and process-start ticks are published before handler
+admission and remain the durable claim identity. Both owners are outside the
+handler group, and bidirectional lifetime pipes make
+each owner drain if the owner on the other side dies. If the inner warden is
+hard-killed, its complete orphaned family, including children that called
+`setsid()`, reparents to the per-invocation outer guardian instead of joining a
+process-global orphan set. If the outer guardian is hard-killed, the inner
+warden observes EOF and drains its family. API-parent death makes the outer
+guardian drain. This per-invocation kernel ancestry boundary is canonical;
+the API process is not used as a shared fallback subreaper because concurrent
+families would become indistinguishable after reparenting.
+
+The handler remains alive, or remains an unreaped zombie, as the exact family
+root until descendant drain is complete. The direct-child guardian is not
+reaped until its authenticated completion and durable receipt are accepted.
+Every outcome, including normal success, terminates and reaps every descendant
+before the handler root is released. A finite API invocation may not hand a
+long-lived child to durable state: runtime daemons and managed-job controller
+slots are the explicit runtime-owned abstractions for long-lived work. The
+inner warden repeatedly terminates and reaps adopted descendants; the outer
+guardian independently requires a stable empty family before it reports
+completion and permits the exact handler to be reaped. Cancellation targets
+the exact direct-child guardian, which treats `SIGTERM` as a drain request
+rather than exiting. An unreadable
+identity, a surviving child, or a termination timeout keeps the guardian,
+warden, and claim unquiesced. Best-effort psutil enumeration is never receipt
+proof. Graceful shutdown requests the same guardian-owned convergence protocol
+instead of killing an untracked process. The parent Future becomes complete
+only after the outer boundary reports typed outcome plus exact family absence;
+only then may its monitor publish the first execution receipt.
+
+The execution result is a closed typed outcome: `SUCCEEDED`, `PRE_EFFECT`,
+`CANCELLED`, `RETRYABLE`, or `FAILED`. Every outcome requires the warden's and
+guardian's complete descendant-absence proof. This turns arbitrary handler
+threads, double forks, and `setsid()` descendants into one ownership boundary
+instead of relying on a racy process-tree snapshot or a success-only child
+handoff exception.
+
+Every outer-boundary Future outcome proves both that the submitted callable
+returned and that its required family drain completed. Transported wrapper or
+result-serialization exceptions are closed typed outcomes and enter one
+idempotent receipt loop with bounded backoff and no terminal give-up. The loop
+ends only when the exact receipt is accepted or a database read proves that the
+exact generation/token/worker identity no longer requires it. Abrupt guardian
+or warden loss without the surviving peer's stable-empty proof remains
+ambiguous and uses local family convergence; a cancelled-before-admission
+invocation uses the claimed pre-effect proof below. Result monitors are
+registered before their thread starts, removed only after durable convergence,
+and joined after executor shutdown. Role ownership cannot be released while
+one is still delivering a receipt.
+
+Monitor setup is transactional: registration precedes `Thread.start()`, a
+start failure runs the monitor synchronously, and an outermost `finally`
+removes the exact registration. Executor startup likewise returns ownership
+only after the queue server and every worker have started; any partial failure
+stops and joins all earlier components before propagating. No effect owner can
+exist outside the runtime's returned ownership aggregate.
+
+Receipt delivery and outcome reconciliation are one parent-owned convergence
+protocol, not independent fire-and-forget callbacks. A normal return preserves
+the wrapper's already-fenced terminal result. `ExecutionRetryableError`
+atomically consumes the exact parent-proven family result into the request's
+`RUNNING -> WAITING` transition, clears the claim, and publishes one queue
+delivery with a database-clock `available_at`. The transaction deliberately
+ignores lease age: the exact generation, token, worker, live origin,
+uncancelled row, and claimed queue delivery are its authority. The Future
+monitor acknowledges the boundary and releases finite executor capacity
+immediately after that handoff; it never sleeps while retaining a process
+boundary. Any other transported callable exception is terminalized as the
+exact claim's failure without overwriting a terminal child result, then
+receives the same durable receipt.
+Each database mutation is generation/token/worker fenced and idempotent, and a
+transient failure retries the incomplete convergence rather than abandoning a
+RUNNING row.
+
+A locked claimed request in `PENDING` or `WAITING` with no PID has not crossed
+the guarded `RUNNING` transition; revoking that exact generation is canonical
+pre-effect proof and must atomically publish its exact generation-bound
+quiescence receipt before cancellation, dispatcher failure, worker loss, or
+shutdown can remove or terminalize its delivery. This applies uniformly to
+ordinary and provider-reserved dispatch. A `RUNNING` request with a
+nullable legacy API009 process identity remains ambiguous and fails closed.
+For a terminal request whose family lost all receipt publishers after result
+persistence, the result remains terminal but retention stays pinned; process
+absence does not close it and no terminal request is reopened. Exact boundary
+receipt closure accepts every replay policy, including `NEVER` and
+provider-mutating handlers, because it cannot schedule an invocation; it is
+also association-agnostic, so a bound ordinary launch can close retention
+after persisting its immutable result. `READ_ONLY` and `RECONCILE` policy may
+record retry intent after owner loss, but any execution-quiescence-required
+claim becomes replayable only after the exact boundary receipt. Rows that
+never entered this protocol may retain their existing policy recovery because
+they have no admitted effect family.
+
+There is intentionally no local PID-death observer or `/proc`-absence reducer.
+It would have no authorizing fact once the recorded PID names the outer
+guardian: abrupt guardian absence can precede the inner warden's drain. The
+outer guardian, inner warden, and parent result monitor are the only receipt
+publishers, and each may publish only after authenticated stable-empty proof.
+
+Graceful role shutdown first stops all request dispatchers from claiming and
+then converges every owned disposable boundary and receipt monitor. Executor
+shutdown must return explicit per-guardian reaped or absent proof after its
+receipt; a kill-helper timeout or a still-live boundary is a fail-stop result
+and cannot be treated as drain completion. Controller shutdown first stops
+runtime-daemon supervisors and proves their process groups absent; a generic
+child kill must not race or replace the subsystem-specific supervisors. The
+controller may release its leadership session, and an executor/all role may
+release its instance lease, only after this sequence completes. Any timed-out
+or failed supervisor, guardian, monitor, or queue join enters a not-Ready
+convergence loop while retaining the leadership and instance sessions. It
+retries authoritative drain and never exits merely to drop the PostgreSQL
+session; only complete effect-owner absence permits ownership release.
+
+API-request schema 010 adds the process-birth identity required by this
+contract. Whole-Pod hard death of a finite API request intentionally remains
+fail-closed: Kubernetes 404, force deletion, or same-name replacement does not
+prove that containers on a partitioned node stopped, and an invocation is not
+replayed across an unattested executable-image or handler-contract change.
+Cross-Pod request replay is not implemented as a parallel happy path. A future
+change may recover it only with a durable claim-bound executable contract and
+authoritative effect-stop fence.
+
+Perpetual controller maintenance loops are not finite API requests and must not
+depend on an invocation receipt that can disappear with their owner Pod. The
+steady state therefore removes every registered internal-daemon handler and
+daemon queue submission path. The daemon specifications remain in
+`sky.server.daemons`, but the elected controller runtime owns them directly:
+
+1. after controller leadership is established, it retires every request and
+   queue row whose ID is in the versioned historical-daemon allowlist before
+   stale-claim fencing or generic request re-enqueue can decode or deliver one;
+2. it evaluates each specification's `should_skip` predicate once for that
+   leadership term and starts every selected daemon as a dedicated subprocess;
+3. the subprocess starts a new Linux session/process group and enters through a
+   `-S`, minimal standard-library launcher. Before importing any SkyPilot or
+   handler module, the launcher receives the expected parent PID and
+   process-start ticks, arms `PR_SET_PDEATHSIG`, re-reads both parent
+   identities, becomes non-dumpable, and forks a minimal fail-stop guardian
+   that kills the complete owned process group. The guardian immediately
+   closes the capability transport and every inherited descriptor except its
+   private control channel, reasserts non-dumpability, independently
+   revalidates both process identities, and never installs controller
+   authority. Only after that race-free
+   effect-admission check does it restore the startup-captured clean server
+   environment, load the executor plugin context, establish the system
+   execution context, write the existing per-daemon log, and run the existing
+   blocking event loop;
+4. one runtime supervisor restarts an unexpectedly exited subprocess with
+   bounded backoff, while cancellation sends `SIGTERM` to the owned process
+   group, escalates to `SIGKILL` after a bound, reaps the exact child, and does
+   not return until the process group no longer exists;
+5. the minimal launcher makes parent death terminate the complete owned
+   process group, including daemon grandchildren. A minimal guardian outside
+   the daemon group and a launcher-side guardian-liveness monitor form a
+   two-way fail-stop contract: supervisor/launcher death makes the guardian
+   drain the group, while guardian death makes the launcher kill its own group.
+   Neither an unmonitored guardian nor parent-death signalling of only the
+   launcher is sufficient; and
+6. controller shutdown cancels and joins those supervisors before releasing
+   the outer leadership session, so a graceful leadership handoff cannot leave
+   a locally owned daemon behind. A bounded join may escalate process-group
+   termination, but failure to prove the group absent keeps leadership release
+   fail closed.
+
+The split controller's `ControllerLeaderLease` remains the outer fleet fence.
+It sets the generation environment and completes legacy-row retirement before
+stale-claim fencing. PostgreSQL `all` mode always uses the same lease,
+regardless of whether managed-job consolidation is enabled, because its mixed
+request queue can claim controller-class Serve and Jobs handlers even when no
+fixed managed-job slot is active. It establishes that generation, opaque
+origin capability, and loss monitor before it starts either execution class;
+when managed-job consolidation is enabled, it also starts the fixed slots
+before either class. It is a packaging compatibility mode, not a second
+authority protocol. It attaches that exact generation to every
+controller-class request claim; no PostgreSQL role admits a controller claim
+whose generation is null. Normal-class requests remain outside this controller
+generation fence. The combined process passes its owner explicitly through
+the startup-maintenance and controller-claim boundaries rather than publishing
+the generic controller identity process-wide to normal request work. Under one
+legacy-daemon transition session it performs generation-fenced allowlist
+retirement, fences nullable and prior-generation controller claims, and then
+performs generation-fenced request recovery before starting any background
+daemon, managed-job slot, or request worker. SQLite `all` mode uses the same
+runtime interfaces
+with one private owner-only authority file bound to an exact local PID and
+process-start tick. Before any request recovery, decoding, re-enqueue, or
+daemon startup, each mode retires the explicit historical IDs. Failure keeps
+the role from serving. Each runtime daemon then uses its existing singleton
+lock; local SQLite remains single-process and retires the same allowlist before
+local recovery.
+SkyServe and pool refresh retain
+their existing, independently probed consolidation locks because those locks
+fence controller recovery effects, not merely process scheduling. The other
+maintenance events are overlap-tolerant by their existing resource locks or
+idempotent database/telemetry operations. A PostgreSQL session can be released
+server-side before its former owner observes the failure, so a singleton lock
+alone is never described as proof that arbitrary old effects stopped.
+
+The managed-job refresh loop and controller capacity are also explicit
+controller-runtime ownership. A controller generation starts one fixed set of
+runtime-owned `ManagedJobControllerSlotSupervisor`s. Each numbered slot owns
+one local guardian handle and one disposable `ControllerManager` process
+family; it starts at runtime admission, polls for work even when the queue is
+empty, and is never created by an API request, `submit_jobs()`, a PID-file
+scan, or another controller process. The slot count is computed once from the
+existing controller parallelism policy at generation startup. Each manager
+still multiplexes the existing bounded jobs-per-worker capacity, so the
+topology remains bounded at the current 2,000-job fleet ceiling rather than
+creating one process or request per job.
+
+Managed-job schema 028 adds nullable `controller_slot_id` and
+`controller_slot_attempt` columns plus a non-null
+`controller_slot_quiescing` column with a database default of false. The
+migration rejects an already adopted nullable quiescence shape instead of
+silently retaining a schema weaker than the runtime invariant. A slot attempt
+is a fresh UUID for each disposable manager birth. `WAITING -> LAUNCHING`
+atomically stores the exact
+`(controller_instance_id, controller_generation, controller_slot_id,
+controller_slot_attempt)` tuple under the existing shared leadership-row lock.
+Every controller-owned state transition, cleanup decision, and reservation of
+a new provider effect compares that whole tuple. Controller-originated nested
+API actions carry it as internal admission metadata. Normal service-account or
+loopback authentication remains mandatory; a separate 256-bit opaque
+controller capability authenticates the claimed outer origin, and only its
+SHA-256 digest is durable. The elected controller runtime installs the raw
+value in a PID-bound process-local registry, removes every raw/path environment
+representation, and becomes non-dumpable before it spawns owned work. It
+captures one canonical RequestWorker environment with the generic controller
+pair and every managed-job owner/job/slot field removed. Controller-class
+request handlers receive their durable outer pair only for local database
+fencing; without an authenticated managed origin and process-local capability,
+that pair emits no controller-origin SDK headers. Trusted runtime daemons
+receive the nonsecret outer pair as explicit launcher arguments and the raw
+capability through a fresh one-shot inherited pipe on every restart, install
+both before plugin/daemon effects, and never recover them from the neutral
+RequestWorker snapshot. The managed-runtime owner published by PostgreSQL
+`all` mode alone does not authorize controller-origin SDK headers, even while
+the process-local capability exists; a normal combined-process coroutine
+therefore remains ordinary work. A complete managed attempt context or the
+generic pair installed at a trusted daemon/controller boundary is required.
+The runtime also passes the value explicitly to the slot
+supervisor, which transports it to
+each disposable manager through one-shot inherited pipes across both guardian
+owners. Transfer handles are redeemed immediately by a non-dumpable boundary
+owner; raw authority is then relayed only through close-on-exec descriptors, so
+pre-admission cancellation cannot strand it in a parent resource sharer. The
+manager starts through a `-S`, standard-library-only bootstrap, becomes
+non-dumpable, consumes and closes its descriptor, and installs the same
+PID-bound registry before enabling site packages or importing SkyPilot,
+plugins, or lifecycle code. It removes all transport state before it can
+execute a user event callback. Every
+runtime-daemon birth or restart similarly runs through a `-S`,
+standard-library-only bootstrap, receives a fresh one-shot descriptor and
+explicit nonsecret outer owner pair, then becomes non-dumpable, consumes and
+closes the descriptor, and installs process-local authority before enabling
+site packages or importing `setproctitle`, SkyPilot, or plugins. It then
+installs the outer pair before the first SkyPilot import.
+
+A disposable request handler receives a fresh descriptor only when its queue
+claim carries the complete, transactionally verified five-field managed-job
+origin. The handler rechecks that tuple against the durable request, installs
+it as bounded request context, and resets that context after execution. A
+controller-class request without that origin receives no raw authority. An
+exec child has no process-local registry, and neither the runtime,
+guardian/warden, daemon, manager, handler, nor callback environment or argv
+contains the raw capability. Registry clearing is PID-bound and exact-owner
+scoped: a fork child fails closed, and cleanup never clears unrelated process
+authority. This boundary isolates the new internal controller authority; it
+does not claim that historical user or service credentials are absent from
+callback environments. Caller-supplied
+origin headers are stripped case-insensitively before server-owned values are
+installed. The API persists
+the complete five-field job/outer/slot tuple and accepts creation, queue claim,
+and guarded `RUNNING` admission only while the live outer generation and exact
+non-quiescing slot attempt own the job. PostgreSQL always locks outer
+leadership, job, request, then queue in that order. A stale process can
+therefore neither mutate durable job state nor ask the API tier to begin a new
+provider effect after its slot is replaced. User cancellation remains its
+separate durable intent path.
+
+Each slot uses the same two-owner shape as a finite request: a local outer
+guardian and inner subreaper warden surround the manager session. The runtime
+does not publish, interpret, or compact a shared PID inventory: Linux PIDs,
+process-start ticks, and guardian handles are Pod-local supervision evidence,
+not cross-Pod authority. If a slot manager exits unexpectedly, its local
+supervisor first converges and reaps that exact process family. It then closes
+nested admission by setting `controller_slot_quiescing`, terminalizes
+unadmitted deliveries with pre-effect receipts, cancels admitted deliveries,
+and waits for every exact API guardian receipt. Only after both proofs may it
+reset every non-`INACTIVE`, non-`DONE` job carrying the dead slot attempt,
+rotate the attempt UUID, and start the replacement. A row whose task family is
+already terminal returns to `WAITING` as cleanup-only lifecycle work; a row
+with a nonterminal task returns to the ordinary execution path. Any uncertain
+local or nested family drain keeps
+the controller generation not Ready and retains leadership rather than
+resetting or replacing the slot. A whole-Pod or outer-leadership loss is
+recovered differently: the successor generation first closes every stale
+exact nested origin and waits for its receipts, then resets every non-
+`INACTIVE`, non-`DONE` prior-generation row and only then admits its fixed
+slots. A terminal task family is again cleanup-only, never workload recovery.
+Schema 010 and slot schema 028 are first-rollout additions. A fully nullable
+pre-slot row may be adopted exactly once only after the successor owns fresh
+outer leadership and a locked request-store query proves that no request row
+for that job carries any managed-job origin. A partial job slot identity, a
+partial nested-request origin, or any nested origin associated with that
+nullable job is ambiguous and fails closed. No successor invents an origin,
+interprets a foreign PID, or needs a shared PID inventory to do so.
+
+Managed-job provider mutations have one path. Launch, recovery, cancel,
+cluster teardown, pool cancellation, status confirmation, and ephemeral
+storage deletion enter through SDK-created API requests while the exact
+per-job context is active. The fixed-slot manager is the sole cleanup owner:
+after exact stale-attempt quiescence, terminal task families are claimed as
+cleanup-only work and run the ordinary complete manager cleanup without
+constructing `JobController`, relaunching a workload, or changing its terminal
+task outcome. Cleanup failure retains the exact claim and retries by phase;
+`DONE` is an exact-attempt, non-quiescing, all-tasks-terminal commit after
+cleanup and token revocation succeed. The outer refresh reconciler is
+observation-only for every complete fixed-slot row and performs no provider or
+storage effect. It retains only the narrow pre-slot PID terminalization needed
+during the first image rollout and defers its resulting terminal row to the
+same cleanup-only manager path. There is no refresh-owned or operator-owned
+second cleanup authority.
+
+Startup creates the refresh owner and every fixed slot transactionally before
+the controller role becomes Ready or starts controller-class request workers.
+Shutdown first prevents new refresh, slot, and request claims. The exact
+refresh thread reaches effect quiescence while retaining its thread-local
+consolidation lock; request boundaries and slot guardians then drain and join.
+The main thread finally asks the refresh owner to release its own lock, joins
+it, and only then releases outer controller leadership. Any bounded join may
+report current failure, but subsequent convergence iterations re-run the
+authoritative liveness and cleanup checks while retaining ownership. A cached
+timeout, logged best-effort kill, PID-file deletion, or one-shot process-tree
+snapshot is never a handoff boundary.
+
+This is the sole managed-job controller happy path. The historical
+`JOB_CONTROLLER_PID_PATH` inventory, `get_alive_controllers()`,
+`start_controller()`, request-triggered `maybe_start_controllers()`, and their
+polling/cutover machinery are deleted in the feature change rather than kept as
+a compatibility branch. Rows written before slot schema 028 are nullable only
+for migration. A new runtime always advances the outer generation before
+recovery, applies the locked no-associated-origin proof above, handles each
+eligible row once as stale lifecycle ownership, and never decodes it as a
+current slot claim. The stacked cleanup removes this nullable adoption rule
+after one complete fleet rollout and a database proof that no non-`INACTIVE`,
+non-`DONE` pre-slot row remains.
+
+Shutdown convergence is live and retryable. A bounded background/task join can
+record its current failure, but the next convergence iteration must re-run
+authoritative liveness and cleanup checks; it cannot replay a cached timeout as
+permanent failure after the effect has disappeared. Every retry keeps the role
+not Ready and retains the outer PostgreSQL ownership sessions.
+
+The historical allowlist comprises the six daemon IDs in the current source
+plus the retired `managed-job-status-refresh-daemon`; arbitrary user request
+IDs ending in `-daemon` are never deleted. This is one execution path, not a
+daemon-specific replay exception. Daemon
+rows are excluded from API status, cancellation, shutdown, request retention,
+and execution-quiescence logic because the new runtime never creates them. A
+narrow legacy-row retirement helper is the only transition artifact. The
+stacked cleanup removes that helper, the historical ID allowlist, recognizer
+for historical supported-handler names with the `daemon:` prefix, and pickle
+compatibility stubs after one full controller-fleet rollout and a PostgreSQL
+query proves zero rows for every allowlisted ID for at least one
+controller-instance stale window. Request IDs are never classified by a
+`-daemon` suffix. Rolling back to a binary that recreates daemon requests is
+unsupported;
+operational recovery is fix-forward with a successor image.
+
+Activation and active reauthorization similarly perform external attestation
+first, then predicate-lock and revalidate the exact PostgreSQL claim scope
+under the same-session broker and fleet locks before atomically binding the
+complete evidence and writer receipt in the gate CAS. On first activation,
+every PENDING or PROVISIONING row is locked and decoded. Non-fill rows are
+ignored only after a current decode; every queued fill must be an exact current
+ReplicaInfo v17 record whose scalar columns agree, service version equals the
+locked committed version, projection digest matches the locked claim
+admission, and policy tuple names the successor generation. Worktree-only v16,
+a stale version or digest, a partial policy tuple, or any decode/proof failure
+blocks activation. READY legacy rows remain readable. On active rotation,
+old allocation maps are invalidated and the successor generation terminally
+fences queued old requests. An activation-time census without the ongoing
+claim and launch methods is insufficient. The deployment must preserve the
+currently authorized policy identity and its external enforcement while
+requests bearing that generation can execute.
+
+First activation may attest a legacy-null claim version/digest pair by deriving
+it from the locked current protocol-v2 version. Activation does not mutate the
+claim. The canonical sequenced claim heartbeat must refresh that row with
+Serve046 version and digest fields before schema-5 allocation publication can
+resume.
+
+Therefore the preparatory feature image may run at `LEGACY_ACTIVE`, but it
+cannot activate `SEQUENCED_ACTIVE`: `activate` fails before broker-lock
+acquisition or gate mutation when no unique plugin exists. Read-only `status`
+continues to work. The Boltz deployment must ship the canonical policy and its
+Kueue bundle before activation. This is an explicit open gate, not an operator
+bypass or a claim that the current east1 or Phoenix topology is reclaimable.
+
+Historical worker projection v1 rows remain readable only for ordinary launch
+during the pre-activation transition. They cannot participate in a sequenced
+claim, allocation, fill admission, or terminal launch. After all active service
+versions are recommitted with protocol v2 and production has remained
+`SEQUENCED_ACTIVE` through the documented cleanup gate, stacked cleanup PR
+#1452 removes the v1 ordinary-launch decoder and its transition tests. New
+writes always use v2; no compatibility setting can create a v1 projection.
+
+When this external contract holds, a fill intent cannot spill to a paid
+candidate, Kueue can evict lower-priority inference Workloads before admitting
+BCL/research work, and SkyServe's existing preemption handling reconciles the
+reclaimed replica away. A subsequent physical observation reduces free supply,
+so no new map can spend a slot while BCL owns it.
+
+`provision_timeout: -1` neither creates nor weakens the reclaim contract. It
+only permits a correctly Kueue-managed inference Workload to remain pending.
+This implementation launches no GPU or BCL canary. Existing deployment
+evidence or a separately authorized Kueue rollout must satisfy the contract
+before activation. If it does not, the new image may deploy but the gate stays
+`LEGACY_ACTIVE`.
+
+## What is implemented and what is not
+
+### Present in the current worktree
+
+- PostgreSQL Serve044 observation, sequencing, provenance, allocation, and
+  fail-closed gate columns; Serve044 follows the upstream Serve043 placement-
+  projection migration without rewriting historical migration authority.
+  Forward-only Serve045 adds the complete generation-bound reclaim receipt and
+  exact activation/reauthorization guard. Forward-only Serve046 adds committed
+  service version and closed accelerator-to-projection digest maps.
+- `reserved_fill_projection_authority.py` is the canonical adapter from one
+  immutable worker projection to typed reclaim admission. New writes emit
+  homogeneous explicit projection protocol v2; sequenced paths require
+  non-null typed Kueue admission. Protocol v2 supports both an exact AWS role
+  ARN and an explicit null identity contract, and the value is hash-bound and
+  exposed to the deployment policy. Protocol v1 remains only as the historical
+  ordinary-launch decoder pending cleanup PR #1452.
+- API capability 77 advertises projection protocol v2; allocation-map schema 5
+  binds service version and the closed digest map; ReplicaInfo v17 persists the
+  selected scalar digest. Historical v15 records remain readable but cannot
+  pass a sequenced launch fence, and worktree-only v16 is not a durable format.
+- Concurrent provider-free pool observer and typed blackouts.
+- Committed-observation broker rounds and complete authenticated maps.
+- Ordinary zero-cost commit sequencing and complete v17 attribution.
+- Lost-wakeup-free controller coordinator and optimistic actuation generation.
+- Pure planner, autoscaler adapter, manager sparse receipt, and receipt-driven
+  rotation.
+- Fleet transition CLI requiring protocol v2, Serve046, API010, an exact stable
+  split-role `api`/`controller`/`executor` writer cohort on one immutable image
+  digest, and one entry-point-loaded deployment reclaim policy. The same
+  command reauthorizes active fix-forward generations. The generic build has
+  no policy plugin and deliberately blocks authorization before broker lock or
+  CAS.
+- Provider-free reconciliation diagnostics derived from current authenticated
+  schema-5 allocation, its exact durable observations, and exact-version/
+  projection v17 replica rows.
+- An exact v17 queued-effect proof at first activation and per-mutation
+  Kubernetes guards with immediate create-response attestation, guard-free
+  passive waits, and durable-owner cleanup after a terminal fence.
+
+None of the above is merged, deployed, or activated as of this update. The
+implementation and owner-death/request-liveness integration are complete in
+this worktree. The exact non-PostgreSQL and serial PostgreSQL validation passes
+and three consecutive adversarial reviews are recorded below. Remote CI on the
+published exact successor must pass before merge.
+
+### Runtime audit corrections implemented and frozen for review
+
+The runtime audits found additional correctness and bounded-progress defects.
+The current worktree now:
+
+1. conservatively debits a target-less ordinary `SCALE_UP` against every
+   compatible authenticated pool/card feed, clipped independently per feed;
+2. uses one absolute deadline for the complete multi-context physical preflight
+   batch, including cancellation, release, and thread joins; bounds provider
+   root child-drain on exit; and keeps an incompatible provider phase closed
+   out until any non-cooperative child actually releases;
+3. propagates one cancellation-aware absolute deadline through Kubernetes
+   client admission, fence capture, RPC timeouts, retries, and parsing
+   checkpoints so timed-out work releases observer capacity; and
+4. treats observation access context as authenticated acquisition provenance,
+   while allocation consumption joins aliases by physical UID, pool key, and
+   accelerator identity and independently revalidates each service-edge launch
+   context; and
+5. separates all-zero-cost row attribution from the global ordinary-demand
+   invalidation generation, requires exact generation equality at allocation
+   read and fill commit, and joins final fill persistence to the shared demand
+   lock. This prevents a service-B ordinary commit from racing a service-A fill
+   while allowing broker-disjoint fill commits to proceed independently;
+6. snapshots an independent global first-success materialization sequence in
+   every observation, stamps each zero-cost row transactionally on its first
+   successful launch persistence, and uses admission plus materialization event
+   order instead of wall-clock or readiness guesses for sequenced occupancy;
+7. treats the complete grouped replica snapshot as part of sequenced spendable
+   authority, rejecting the new round on enumeration, query, or decode failure
+   rather than optimistically skipping an unread service; and
+8. includes ordinary zero-cost rows owned by nonclaimant services in sequenced
+   occupancy, with conservative same-card/same-width duplication until
+   ordinary placement persists physical-cluster UID attribution;
+9. observes raw exact-card GPU counts independent of claimant width, converts
+   them exactly once under the broker's authenticated deterministic width, and
+   publishes the width as allocation and diagnostic provenance;
+10. treats same-context heterogeneous cards as disjoint physical UID/card
+    edges with deterministic unique positions, while still rejecting a
+    duplicate exact-card edge or conflicting exact-card alias width;
+11. keeps last-proven UID topology across transient discovery failures and
+    tries authenticated context aliases under one fair bounded query deadline,
+    persisting only the winning route; and
+12. initializes distinct physical captures in parallel outside the manager
+    lock, retains each successful capture through every join-only persistence
+    seam, rechecks pending service versions before and at the row transaction,
+    and returns sparse receipts for pool-local failures; and
+13. makes same-context exact-card observers join one UID initializer, rejects
+    case-folded provider-card collisions, and preserves permission-denied
+    evidence instead of intermittently blacking out a sibling card as generic
+    provider failure; and
+14. replaces the activation-only reclaim boundary with one uniquely loaded
+    policy whose immutable identity is bound by Serve045, whose current
+    service version/projection is bound by Serve046, and which is enforced at
+    each sequenced claim transaction and terminal provider launch, while a
+    complete successor receipt supports active fix-forward reauthorization;
+    and
+15. makes the final sequenced replica insert the durable capacity-spend
+    boundary: under the locked current service specification and sorted
+    replica rows it rejects service-wide intent replay, enforces physical
+    aggregate/per-card feed, and enforces the physical-or-logical
+    `max_replicas` unit before advancing the admission sequence; and
+16. binds Serve046 service version and projection-v2 Kueue identity through
+    claims, schema-5 maps, v17 rows, activation, status, and terminal launch,
+    while splitting built-in Kubernetes mutation guards from passive `-1`
+    scheduling/readiness waits; and
+17. retains exact finite-request generation/token/worker/guardian-PID/process-
+    birth identity until real process-family quiescence, routes pre-effect
+    revocation through the sole replay reducer, fences every signal against PID
+    reuse, preserves terminal results, and leaves guardian or whole-Pod death
+    without a receipt fail-closed instead of treating deletion or lease age as
+    process-stop evidence; and
+18. removes perpetual controller daemons from the API request/replay protocol,
+    retires legacy daemon rows before request recovery, and supervises one
+    parent-death-fenced subprocess per selected daemon under controller/runtime
+    singleton ownership with bounded termination and exact child reaping; and
+19. closes Kubernetes direct-binding as a parallel placement path by removing
+    projected `nodeName`, freezing and attesting the exact server-owned
+    scheduler, rejecting webhook or gated-Pod binding, and requiring a fresh
+    exact bound-Node accelerator-label join before admitted adoption or
+    post-wait success; and
+20. closes finite-request liveness under graceful shutdown: every claimed
+    PID-less pre-effect terminalization publishes an exact receipt, terminal
+    results remain pinned until a boundary-authored receipt, and leadership or
+    instance ownership remains held until guardians and durable Future-receipt
+    monitors are quiescent; and
+21. replaces reusable/untracked request-process ownership with one disposable
+    per-invocation outer-guardian/inner-warden subreaper boundary, publishes no
+    receipt until its exact family is absent, makes startup and monitor
+    registration transactional, makes daemon guardians mutually fail-stop,
+    and replaces managed-job PID-file spawning with fixed runtime-owned slots
+    whose generation/slot-attempt fence covers every state and provider-effect
+    boundary and whose exact families participate in the same
+    retry-until-proven-absent ownership handoff; and
+22. makes deployment attestation use the same physical-UID/card atom as the
+    broker so east's A100-40 and A100-80 edges may share one context without
+    duplicating capacity, binds activation and later claim replacement to one
+    shared atom validator, and binds both Kueue Pod webhooks to their exact
+    reviewed rules and service endpoints rather than trusting object names;
+    and
+23. carries the normalized accelerator label key, sorted label values, and
+    resource key in every typed reclaim admission, requires their exact
+    code-owned match at activation, claim, and terminal launch, and makes the
+    east A100-40 and A100-80 bundle contracts disjoint.
+
+Regression tests exist for corrections 1--23, including owner-death,
+request-liveness, legacy-row retirement, runtime-daemon supervision,
+scheduler/bound-Node admission, capability bootstrap, and fixed managed-job
+slot ownership. The complete non-PostgreSQL matrix, changed-source lint, and
+Terraform module tests pass. The exact serial PostgreSQL freeze and corrected
+deployment-policy matrix pass, and all three restarted consecutive adversarial
+reviews passed without findings.
+
+The audit also proved that BCL reclaim is a deployment prerequisite rather
+than a Pod-priority property. A read-only production audit on 2026-08-13 found
+that both east and PHX lack the inference `default` LocalQueue,
+`skyserve-inference-borrowed` ClusterQueue, and
+`skyserve-inference-low` WorkloadPriorityClass. Both already have the exact
+Pod PriorityClass at value -1000 with `preemptionPolicy: Never`, and both
+research ClusterQueues are Active with `reclaimWithinCohort: Any`. East's
+research GPU quotas are nominal 64/264 with borrowing limits 0/0; PHX is
+nominal 512 with borrowing limit 512. The inference service accounts have no
+IRSA annotation. East has one Pod Identity association,
+`a-rsvzwdtaesxvxorkh` to `research-dropzone-irsa`, but it belongs to the
+separate research namespace/service account; PHX has no association. The
+plugin filters and paginates by the exact projected inference namespace and
+service account, so the unrelated east research identity is preserved while
+the inference identity-free absence proof still requires zero exact matches.
+
+HyperPod's live ResourceFlavors are provider-owned and intentionally omit GPU
+product labels. East exposes 8 non-deleting `ml.p4d.24xlarge` Nodes with 8
+A100-40GB GPUs each and 33 `ml.p4de.24xlarge` Nodes with 8 A100-80GB GPUs each;
+PHX exposes 64 `ml.p5e.48xlarge` Nodes with 8 H200 GPUs each. The east
+ResourceFlavor selectors are the live beta/stable/HyperPod labels for p4d and
+beta/HyperPod labels for p4de; PHX has beta/stable/HyperPod labels for p5e.
+The queue-name Deny policy and binding are absent in east and present in PHX;
+Kueue webhooks fail closed in both. A direct 2026-08-13 east read additionally
+confirmed that the new exact mutating and validating Pod-webhook contracts
+match the live v0.18 objects; PHX must pass the same code-owned v0.19 contract
+through deployment preflight before activation. The current hub writer is forbidden from
+reading the required Namespace, ServiceAccount, queue, priority, flavor, Node,
+scheduler, controller, and admission objects in both spokes. These are exact
+platform IAM/RBAC and object gates; SkyPilot core does not duplicate their
+ownership.
+
+### Status actually exposed
+
+The public server API version is 77. Reserved-fill reconciliation status keeps
+its independent minimum capability at 76; immutable worker placement
+projection requires API 77 plus projection protocol 2. These are distinct from
+the PostgreSQL API-request schema revision 010 required for activation. The
+controller's `/autoscaler/info` response always contains a nested
+`reserved_fill_reconciliation` object. The user-facing service status copies
+the same object when `with_target_num_replicas` is requested.
+
+The stable top-level fields are:
+
+| Field | Meaning |
+|---|---|
+| `enabled` | Whether reserved-capacity fill is enabled for this service. |
+| `authority_mode` | `disabled`, `legacy`, `sequenced`, or `unavailable`. Once selected, `sequenced` remains visible even if its map is missing or stale; diagnostics never imply a legacy fallback. |
+| `allocation_current` | Whether a complete authenticated allocation map is current. |
+| `allocation_generation` | Current map generation, or `null`. |
+| `allocation_input_sha256` | Current map content hash, or `null`. |
+| `allocation_claim_generation` | Claim-set generation authenticated by the current map, or `null`. |
+| `reconciliation_gate_generation` | Current sequenced gate generation authenticated by the map, or `null`. |
+| `reclaim_policy_identity` | The three durable reclaim-policy identity fields when sequenced, or `null`; this is metadata, not permission to launch. |
+| `pools` | Mapping keyed by canonical physical pool key. |
+
+Each pool in a current allocation exposes:
+
+| Field | Meaning |
+|---|---|
+| `physical_cluster_uid` | Physical Kubernetes identity fenced by the allocation. |
+| `kubernetes_context` | Access context carried separately from physical identity. |
+| `service_generation` | Broker service generation in the authenticated edge. |
+| `observation_generation` | Exact durable observation generation used by the map. |
+| `observation_sequence` | Exact global zero-cost sequence at observation start. |
+| `observation_valid_until` | Conservative authority expiry timestamp. |
+| `observation_available` | Whether the exact durable observation payload was available to the diagnostic read. |
+| `broker_slot_width` | Authenticated GPU width used by the broker's one and only raw-GPU-to-slot conversion. |
+| `observed_free_gpus` and `observed_free_gpus_by_accelerator` | Raw physical supply from that exact observation; `null` if the optional diagnostic read fails. |
+| `observed_free_slots` and `observed_free_slots_by_accelerator` | Diagnostic conversion of that raw observation using `broker_slot_width`; this is not additional authority. |
+| `spendable_slots` and `spendable_slots_by_accelerator` | Broker-published feed in the current allocation, bounded and split before planner replay debits; it is neither a live provider total nor a guaranteed remaining tail. |
+| `grant` and `edge_cap` | Authenticated service allocation bounds. |
+| `current_allocation_admitted_replicas` | Nonterminal reserved-fill rows carrying the exact schema-5 allocation identity, service version, selected-card worker-projection digest, observation provenance, typed intent, and positive database admission sequence; `null` if the optional progress read fails. This is not total pool or service holdings. |
+| `current_allocation_ready_replicas` | Ready subset of those exact current-allocation rows; `null` if the optional progress read fails. This is not total pool or service readiness. |
+
+The projection never queries a provider and never authorizes a launch. Failure
+to inspect the reconciliation selector yields `authority_mode: unavailable`.
+Failure of an optional exact-observation or replica-progress read preserves
+`authority_mode: sequenced` and the current allocation metadata while returning
+`false`/`null` for the unavailable detail. The endpoint remains healthy in
+either case.
+
+## Implementation phases and intentional departures
+
+| Phase | Scope | State |
+|---|---|---|
+| 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
+| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze and three consecutive adversarial reviews pass. |
+| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze and three consecutive adversarial reviews pass. |
+| 2a | Full-fleet combined feature-and-policy image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
+| 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separately packaged plugin, strict bundle, Node cross-attestation, unique entry point, and reusable least-privilege spoke audit boundary are integrated into the one feature image and focused tests pass. They are not upstream-merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
+| 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; the combined image cannot activate until the deployment policy and live attestation gates pass. |
+| 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | Reauthored and tested in the exact restack; it remains draft and merge-gated below. |
+
+Durable acceptance hands rows to the existing asynchronous launch path, and
+status projects the same allocation/observation evidence used by
+reconciliation; neither is a second source of launch authority.
+
+## Deployment, activation, and fix-forward reauthorization
+
+### Preconditions
+
+Before changing the gate:
+
+1. Run the complete required test suite and three passing adversarial reviews
+   against this exact file and code revision.
+2. Merge the feature only after its stacked cleanup PR has been authored and
+   linked as described below; the cleanup remains draft and merge-gated.
+3. Build and push one immutable image from the merged feature commit. The image
+   contains both the generic Serve implementation and the separately packaged,
+   unique Boltz policy plugin; there is no preparatory generic-only deployment
+   or second policy-image happy path.
+4. Record the live Helm release name, namespace, chart revision, complete
+   release values, rendered role topology, and immutable image identities for
+   diagnosis, but use fix forward rather than Helm rollback.
+5. Review one direct Helm upgrade that preserves the live release values and
+   changes only the full-fleet runtime image for this rollout. Do not change
+   the PostgreSQL target, credentials, persistent storage, role topology,
+   namespace, reserved-pool infrastructure, or Kueue policy in the same
+   upgrade.
+6. API-request schema 010 and the managed-job slot columns have not shipped.
+   Apply their additive migrations before target-image Pods become Ready. The
+   ordinary controller leader handoff is the only cutover: the old leader stops
+   claims and drains its request workers and controller processes before
+   releasing leadership; the new image advances the outer generation, recovers
+   nullable or prior-generation managed-job rows as stale ownership, then
+   transactionally starts its fixed slot supervisors. Verify that no old-image
+   controller lease or controller process remains before calling the
+   controller cohort converged. There is no shared PID-file migration, Recreate
+   flag, or alternate scheduler path to activate or later remove.
+7. After the current all-role Pod converges on the combined image, use the
+   separately reviewed Rainier migration stack to replace it with the full
+   split-role `api`, `controller`, and `executor` cohort on that same immutable
+   image and shared RWX state. Wait for every role to be Ready. This is a fleet
+   rollout, not a capacity canary. The gate remains `LEGACY_ACTIVE` throughout
+   both image and topology convergence.
+8. Verify public server API capability 77, API-request schema 010, Serve schema
+   046, worker placement projection protocol 2, allocation-map schema 5,
+   replica state 17, and reserved-fill protocol v2. Confirm every active
+   reserved-fill service version has exact protocol-v2 worker projections;
+   historical v1 projections cannot pass activation-ready claim checks.
+   Confirm every queued PENDING/PROVISIONING fill row is an exact current v17
+   record bound to the locked current service version, claim projection digest,
+   and successor policy tuple; drain any legacy, stale, or undecodable row.
+9. Prove the deployment-owned Kueue LocalQueue, ClusterQueue namespace
+   selection, shared preemption domain, workload priorities, strict SkyPilot
+   configuration, RBAC, and fail-closed admission contract for every reserved
+   inference context. Pod priority alone does not pass this gate. Launch no GPU
+   or BCL verification workload for this rollout.
+10. Prove that every split-role Pod runs the one combined immutable image and
+    that the unique Boltz policy entry point resolves from its separately
+    packaged wheel. Re-run the exact fleet/schema/policy status proof before
+    activation. A fix-forward image is required only to correct a defect; it
+    replaces the complete fleet and does not create another supported path.
+
+The live Helm release is the deployment authority. A platform repository pin,
+Terraform/Terragrunt state, or open platform PR is neither a prerequisite nor
+evidence of the deployed SkyPilot version. Before applying, capture `helm get
+values` and `helm get manifest`, resolve the exact `api`, `controller`, and
+`executor` Deployments, and review the rendered diff. Upgrade the existing
+release with the repository chart and `--reuse-values`, setting the immutable
+image for every role that has an explicit override. Any unintended namespace,
+ingress, PVC, database, authentication, Secret, service-account, role-topology,
+or other persistent-resource change blocks the apply. Post-deploy evidence is
+the live Helm revision, immutable image digest, rollout state, schema status,
+and non-compute health checks—not a repository tag or PR alone.
+
+The separately owned Kueue contract is a different deployment change. It may
+proceed through its own reviewed authority only after the east and Phoenix
+inference partitions, exact RBAC, server queue configuration, fail-closed
+admission, and the code-owned policy plugin are implemented and reviewed. It
+is not smuggled into the runtime-image Helm upgrade and does not block
+deploying the combined image safely at `LEGACY_ACTIVE`; it does block
+activation.
+
+### Mechanical activation
+
+Run the transition command from the deployed control-plane environment that
+has the central PostgreSQL URI and the chart's Kubernetes inventory access:
+
+```bash
+python -m sky.serve.reserved_fill_reconciliation_transition status --json
+python -m sky.serve.reserved_fill_reconciliation_transition activate
+python -m sky.serve.reserved_fill_reconciliation_transition status --json
+```
+
+Activation fails unless all of the following are true:
+
+- the database is central PostgreSQL;
+- reserved-fill protocol version is exactly 2;
+- Serve and API-request schema revisions are exactly 046 and 010;
+- Kubernetes and PostgreSQL inventory attest exactly the split roles
+  `api`, `controller`, and `executor`, with no compatibility `all` writer;
+- all attested writer pods are Ready and all recent process leases match that
+  exact pod cohort; and
+- every writer Deployment uses one immutable image digest; and
+- exactly one deployment-installed `ReservedFillReclaimPolicy` returns fresh
+  typed evidence for the exact current claims and the global future-claim and
+  terminal-launch enforcement contract. The activation CAS binds its exact
+  fleet-bundle, policy-revision, and provider-inventory identity. The generic
+  feature image always fails this check.
+
+On one PostgreSQL session, authorization acquires the broker and fleet advisory
+locks, opens the SQL transaction, predicate-locks claim scope, and performs one
+generation-fenced CAS. First activation changes `LEGACY_ACTIVE` to
+`SEQUENCED_ACTIVE`; subsequent fix-forward runs retain `SEQUENCED_ACTIVE` and
+advance one generation. A retry with the exact receipt is idempotent. There is
+no demotion command, and the PostgreSQL guard rejects a transition back to
+legacy.
+
+### Fix-forward behavior
+
+After `SEQUENCED_ACTIVE`:
+
+- old or mixed writers are not a supported target;
+- a controller that cannot read the gate or current map suppresses new fill;
+- ordinary demand and existing serving replicas continue through their
+  existing paths;
+- existing legacy fill rows remain readable and may be sheltered or cleaned up,
+  but cannot authorize new sequenced capacity; and
+- a defect is repaired by deploying a newer full-fleet image and invoking the
+  same authorization command. A changed writer/policy receipt advances the
+  gate exactly once and invalidates old allocation maps; an exact retry does
+  nothing. Durable observation and occupancy history remain in place.
+
+No rollback or canary protocol is promised. The safe failure mode is temporary
+reserved-capacity underfill, not duplicate fill or paid spill.
+
+## Manual verification after activation
+
+No step below creates compute.
+
+1. Confirm the transition status reports protocol 2,
+   `SEQUENCED_ACTIVE`, Serve046, API010, and the exact expected durable reclaim
+   identity.
+   Confirm the full fleet reports public server API capability 77 and worker
+   placement projection protocol 2.
+2. Confirm every claimed physical pool is producing completed `SUCCESS` or
+   explicit `BLACKOUT` observation generations, with no success used past its
+   `valid_until`.
+3. Confirm a fill-enabled service publishes a nonzero allocation generation
+   only when every current edge has matching round and observation provenance;
+   confirm schema 5 carries the current gate generation, committed service
+   version, exact accelerator-to-worker-projection-digest map per edge, and
+   durable reclaim identity.
+4. Confirm newly accepted fill replica rows carry the full allocation,
+   observation, intent, reclaim identity, service version, exact worker
+   projection digest, and positive
+   `zero_cost_admission_sequence` tuple.
+   After its first successful launch persistence, confirm the row also carries
+   one immutable positive `zero_cost_materialization_sequence`.
+5. Confirm an ordinary zero-cost row created after allocation publication
+   advances both admission counters, makes that allocation unreadable, and
+   causes any stale fill persistence attempt to write no row. Confirm a peer
+   fill advances only the total counter and does not invalidate a map at the
+   same ordinary-demand high-water. Confirm first launch success advances only
+   the materialization counter and that retrying the same success preserves
+   the row's original marker.
+6. Confirm `/autoscaler/info` reports `authority_mode: sequenced`, a current
+   allocation generation/hash/claim generation, and one exact-provenance pool
+   record per authenticated edge. Confirm the same nested object is propagated
+   through service status when target replica counts are requested.
+7. For an existing service already spanning two reserved contexts, confirm
+   observations for both contexts overlap in wall time and new rows remain
+   pinned to their authorizing context/physical UID. Do not deploy a synthetic
+   service to manufacture this evidence.
+8. Confirm every new fill replica remains on a configured zero-cost location
+   and no ordinary paid cloud request was created by the fill path.
+9. Passively inspect the inference LocalQueue, its active ClusterQueue and
+   namespace selector, shared BCL/research preemption policy, effective
+   workload priorities, managed inference Workload evidence, and fail-closed
+   admission policy; confirm this rollout did not mutate them. Verify from
+   logs/metrics that the unique policy authorized each new sequenced claim and
+   launch under the same identity, without launching a synthetic workload.
+10. Confirm service version convergence and ordinary request handling remain
+    healthy. A missing map should stop only new fill, not fail the service.
+
+## Verification plan and evidence
+
+### Required automated commands
+
+```bash
+uv run --no-sync pytest -q \
+  tests/unit_tests/test_pool_capacity_observation.py \
+  tests/unit_tests/test_pool_capacity_observer.py \
+  tests/unit_tests/test_reserved_fill_planner.py \
+  tests/unit_tests/test_reserved_fill_manager_receipt.py \
+  tests/unit_tests/test_reserved_fill_autoscaler_adapter.py \
+  tests/unit_tests/test_reserved_fill_status.py \
+  tests/unit_tests/test_reserved_fill_reclaim_attestation.py \
+  tests/unit_tests/test_reserved_fill_reclaim_policy_unit.py \
+  tests/unit_tests/test_reserved_fill_execution_fence.py \
+  tests/unit_tests/test_reserved_fill_reconciliation_transition.py \
+  tests/unit_tests/test_serve_platform_projection.py \
+  tests/unit_tests/kubernetes/test_provision.py \
+  tests/unit_tests/test_sky/provision/test_provision_cluster_incarnation.py \
+  tests/unit_tests/test_sky/provision/test_provisioner_pause.py \
+  tests/unit_tests/test_sky/test_failover_classification.py \
+  tests/unit_tests/test_backend_utils.py \
+  tests/unit_tests/test_sky/clouds/test_kubernetes.py \
+  tests/unit_tests/test_serve_scale_reconciliation.py \
+  tests/unit_tests/test_serve_controller.py \
+  tests/unit_tests/test_serve_controller_event_loop.py \
+  tests/unit_tests/test_reserved_capacity_fill.py \
+  tests/unit_tests/test_reserved_fill_broker.py \
+  tests/unit_tests/test_serve_cleanup_recovery_script_order.py \
+  tests/unit_tests/test_serve_ordinary_launch_binding.py \
+  tests/unit_tests/test_serve_replica_api.py \
+  tests/unit_tests/test_serve_replica_managers.py \
+  tests/unit_tests/test_serve_replica_record_contract.py \
+  tests/unit_tests/test_serve_utils.py \
+  tests/unit_tests/test_interrupt_request_for_retry.py \
+  tests/unit_tests/test_sky/server/requests/test_executor.py \
+  tests/unit_tests/test_sky/server/requests/test_process.py \
+  tests/unit_tests/test_api_requests_postgres_schema.py \
+  tests/unit_tests/test_orphaned_inflight_requests.py \
+  tests/unit_tests/test_server_request_recovery.py \
+  tests/unit_tests/test_sky/server/requests/test_internal_daemon_submission.py \
+  tests/unit_tests/test_sky/server/test_daemons.py \
+  tests/unit_tests/test_sky/server/test_runtime.py \
+  tests/unit_tests/test_sky/server/test_runtime_daemons.py \
+  tests/unit_tests/test_batch_recovery.py \
+  tests/unit_tests/test_jobs_utils.py \
+  tests/unit_tests/test_managed_job_controller_restart_race.py \
+  tests/unit_tests/test_sky/jobs/test_scheduler.py \
+  tests/unit_tests/test_sky/jobs/test_controller.py \
+  tests/unit_tests/test_sky/jobs/test_controller_attempt_fencing.py \
+  tests/unit_tests/test_sky/jobs/test_controller_ownership.py \
+  tests/unit_tests/test_sky/jobs/test_controller_slots.py \
+  tests/unit_tests/test_sky/jobs/test_jobs_state.py \
+  tests/unit_tests/test_sky/jobs/test_managed_job_refresh_thread.py \
+  tests/unit_tests/test_sky/client/test_service_account_auth.py \
+  tests/unit_tests/test_sky/utils/test_controller_capability.py
+
+SKYPILOT_TEST_POSTGRES_URL=postgresql:///postgres \
+  uv run --no-sync pytest -q -n 0 \
+  tests/unit_tests/test_api_requests_pg.py \
+  tests/unit_tests/test_batch_recovery_pg.py \
+  tests/unit_tests/test_pool_capacity_observation_pg.py \
+  tests/unit_tests/test_reserved_fill_allocation_pg.py \
+  tests/unit_tests/test_reserved_fill_broker_pg.py \
+  tests/unit_tests/test_reserved_fill_terminal_fence_pg.py \
+  tests/unit_tests/test_reserved_fill_multi_pool_state.py \
+  tests/unit_tests/test_serve_ordinary_launch_handoff_schema_041_pg.py \
+  tests/unit_tests/test_serve_placement_normalization_schema_040_pg.py \
+  tests/unit_tests/test_serve_resource_action_schema_033_pg.py \
+  tests/unit_tests/test_serve_resource_action_schema_038_pg.py \
+  tests/unit_tests/test_serve_resource_action_schema_039_pg.py \
+  tests/unit_tests/test_serve_resource_action_state_pg.py \
+  tests/unit_tests/test_serve_resource_actions_pg.py \
+  tests/unit_tests/test_serve_system_recovery_persistence_pg.py
+```
+
+PostgreSQL tests must run against real PostgreSQL with repository-default xdist
+explicitly disabled (`-n 0`); parallel schema migration fixtures can otherwise
+exhaust a small server's shared lock table without exercising feature
+correctness. Formatting, typing, lint, and diff integrity must also pass for
+every changed file.
+
+The automated policy tests cover zero and multiple entry points, malformed or
+stale typed evidence, identity mismatch, a claim change between external proof
+and locked persistence, an activation change between attestation and CAS,
+missing policy after executor restart, partial/forged launch fences, and a
+policy mismatch immediately before provider mutation. They also prove that
+all policy/provider reads occur outside broker, service-authority, and database
+locks and that `LEGACY_ACTIVE` retains its bounded compatibility behavior.
+Kubernetes tests cover fresh authorization for normal/AppArmor/409 create
+attempts and rejection cleanup, immediate create-response attestation,
+guard-free passive `provision_timeout: -1` waits, terminal cancellation, and
+durable-owner cleanup instead of opaque request teardown. PostgreSQL activation
+tests prove exact v17 queued authority and reject v16, stale service versions,
+and stale projection digests. Request tests cover exact outer-guardian
+receipts, pre-effect pidless claims, ambiguous RUNNING legacy claims, PID reuse
+and pidfd signalling, abrupt-boundary deferral, terminal result preservation,
+and the absence of any PID-death receipt shortcut. They cover ordinary and
+provider-reserved claimed `PENDING`/`WAITING` cancellation and
+dispatcher-no-Future races; and prove terminal boundary-receipt closure for
+`NEVER`, `READ_ONLY`, and `RECONCILE`, including a bound ordinary launch,
+without reopening terminal work. They also inject PostgreSQL loss before the
+parent receipt write, prove the parent monitor retries to durable convergence,
+cover transported callable and result-serialization exceptions as typed
+outcomes, and prove shutdown joins all receipt monitors. Disposable-boundary
+tests kill the inner warden while a `setsid()` grandchild is live, kill the
+outer guardian while the inner family is live, and race cancellation against
+handler return; no Future or receipt becomes visible until the
+surviving owner drains the exact family and the handler root is safely reaped.
+Capability qualification proves fresh-FD delivery for every manager, daemon
+restart, and verified managed-origin handler; no grant for an origin-less
+controller-class request; non-dumpability before raw authority or plugin
+access; absence of the bearer from environment and argv; exec/fork fail-closed
+behavior; exact scoped cleanup; and pre-admission cancellation without a
+stranded transfer-handle duplicate.
+They also prove that Pod deletion,
+replacement, lease age, and signal delivery do not synthesize quiescence.
+Runtime-daemon tests additionally cover retirement before generic re-enqueue,
+no daemon handler registration or queue delivery, exact selected-daemon
+inventory, isolated child restart, parent-death setup, clean environment and
+system context initialization, bounded `SIGTERM`/`SIGKILL` shutdown, and child
+and grandchild group reaping before graceful controller leadership release.
+Shutdown tests prove every request guardian is explicitly receipt-complete and
+reaped/absent (including a simulated kill/join timeout), and make an incomplete
+background/supervisor join fail closed before leadership or instance-lease
+release. Real-PostgreSQL tests
+seed queued, claimed, and terminal legacy daemon rows and prove that only those
+rows are retired under the current controller generation while ordinary
+requests survive.
+Managed-job slot tests cover fixed eager slot birth, empty-queue polling,
+transactional four-field claim publication, exact-slot state and nested-action
+fencing, local slot crash and complete family drain before exact-attempt reset,
+replacement-attempt rotation, stale outer-generation recovery after whole-Pod
+loss, graceful refresh/slot/request drain ordering, and the absence of any
+PID-file, request-triggered controller spawn, or shared-PID decoder.
+
+### Evidence recorded so far
+
+- Historical live diagnosis: repeated UID-fenced 34-slot A100 publications,
+  with 181--250-second age at autoscaler consumption.
+- Implementation tests exist for concurrent observation, pool-local blackout,
+  generation-fenced activation/reauthorization CAS, ordinary zero-cost
+  sequencing, map authentication and
+  current-round revalidation, deterministic planning, same-map replay debit,
+  parallel multi-context preflight, exact sparse receipt, lost wakeups, and
+  sequenced-controller selection. Status tests cover exact durable-provenance
+  joins, legacy/unavailable shapes, optional diagnostic failure,
+  endpoint fail-closed fallback, and service-status propagation.
+- Added tests prove same-tick `target=None` ordinary-demand debit, one shared
+  multi-context preflight deadline, release of observer capacity after a
+  timed-out Kubernetes query, access-context alias consumption with preserved
+  UID/context fences, and alias de-duplication without physical-pool double
+  counting.
+- Real-PostgreSQL regressions prove a service-B ordinary row invalidates
+  service A's published map and rejects its stale fill transaction with no row,
+  while a broker-partitioned peer fill advances only total row attribution and
+  remains valid input to a later observation at the unchanged ordinary
+  high-water.
+- Additional real-PostgreSQL regressions prove protocol-first zero-cost writes
+  do not form a sequencer/service crossed-lock deadlock; a pre-observation
+  unbound ordinary nonclaimant is debited; a launch materializing during an
+  observation remains debited; a pre-observation materialization is not
+  double-debited; and post-observation admission is ordered correctly even
+  when its application timestamp is older. A grouped replica decode failure
+  rejects sequenced occupancy instead of publishing optimistic capacity.
+- Historical pre-projection-v2 validation on 2026-08-12 passed its focused
+  policy, Serve045, broker, non-PostgreSQL, format, mypy, pylint, dashboard, and
+  Prettier checks. Those counts do not certify the current Serve046 worktree.
+- The final 2026-08-13 non-PostgreSQL matrix passed all 3,298 tests across the
+  50 documented files in 83 seconds after formatting. Its first run exposed
+  and the implementation corrected one backend integration regression: the
+  historical optional planner/DAG input must remain optional for a successful
+  reserved-fill Kubernetes adoption while the post-materialization authority
+  guard is carried forward. The focused regression and complete rerun pass.
+- After the exact accelerator-scheduling correction, the final complete
+  non-PostgreSQL rerun on code/design revision
+  `123c16762aea510d34db74f52c0c27e733fbb07d` passed all 3,384 tests across the
+  same documented 50-file matrix with zero failures or skips in 93.733
+  seconds. The retained JUnit artifact is
+  `/tmp/feature-nonpg-123c16762-rerun.xml`, SHA-256
+  `c0afd4330fa7d5ef500f49e52d54abd3a8033c97c1b1c656360bf07e294d6092`.
+- Changed-source pylint passes at 10.00/10 and `git diff --check` is clean.
+  Changed-source mypy has only the same pre-existing `backend_utils.py`
+  overload diagnostic present on `origin/improvements`; the repository mypy
+  target reaches six unrelated baseline/environment diagnostics in unchanged
+  files. No feature-owned typing diagnostic remains.
+- On the exact corrected behavior tree
+  `688521ffd6cce0838b55c98fbb1196584116fc70`, Terraform 1.15.8 validates both
+  changed spoke modules. The final EKS module at audit-boundary revision
+  `3af32dfdcd1ca9b27985e53e990d9f9efd256d58`, including its separate
+  collision-resistant role, exact transitive-tag trust, derived queue grant,
+  and clean invalid-partition failures, passes all 48 tests. The RBAC module
+  passes all 20 tests from its explicit `terraform-tests` directory.
+- The final serial real-PostgreSQL matrix passed all 618 tests across the 15
+  documented files with zero failures, errors, or skips. Repository-default
+  xdist was disabled; four ordered chunks each exited zero, with an aggregate
+  wall time of 1,252 seconds (20m52s) and aggregate JUnit test time of
+  1,221.896 seconds. The exact code revision was
+  `688521ffd6cce0838b55c98fbb1196584116fc70`; the four retained JUnit artifacts
+  are `/tmp/feature-pg-chunk1-688521ffd.R57qNi.xml` (206 tests),
+  `/tmp/feature-pg-chunk2-688521ffd.HiL1jE.xml` (211 tests),
+  `/tmp/feature-pg-chunk3-688521ffd.MoLBSj.xml` (80 tests), and
+  `/tmp/feature-pg-chunk4-688521ffd.Ax9kzJ.xml` (121 tests). Process audits
+  proved one pytest owner throughout each chunk and no PostgreSQL pytest
+  remained after the freeze.
+- The exact post-accelerator-correction serial real-PostgreSQL rerun on
+  revision `123c16762aea510d34db74f52c0c27e733fbb07d` passed the same 618 tests
+  with zero failures, errors, or skips in 1,345.917 seconds. It used one pytest
+  process and the required real PostgreSQL server. The retained JUnit artifact
+  is `/tmp/feature-pg-123c16762.xml`, SHA-256
+  `19101b79676824822e55f4fdf9c9c2299ae8792944aa59e8c673bc934a0229ac`.
+- The publication CI correction changes only static contracts and preserves
+  the three-times-reviewed behavior: it replaces deprecated typing/import
+  forms, freezes the already-narrowed observation repository in its callback,
+  records existing dynamic factory and cookie contracts for the type checker,
+  moves blocking runtime-daemon path setup to one worker-thread helper, and
+  narrows the existing lifecycle-removal locator without changing its
+  obligation. Exact Ruff, basedpyright, mypy, lifecycle-removal, formatting,
+  import-order, changed-source pylint, and focused regression checks pass on
+  the corrected tree. The callback freeze also removes a latent loop
+  late-binding ambiguity while retaining the reviewed repository identity.
+- On integrated implementation revision
+  `244cc34fbfb61ba719691b33c92f93d039ef610f`, the corrected separate Boltz
+  plugin and generic policy interface pass all 113 tests in the focused
+  superset across policy, packaging,
+  overlay-manifest, release-version, attestation, and generic-interface
+  suites. Ruff, targeted mypy, changed-source pylint at 10.00/10, JSON parsing,
+  Python compilation, formatting, and `git diff --check` also pass. The
+  repository-wide mypy step reaches one unrelated baseline diagnostic in
+  unchanged `sky/server/common.py`; targeted feature mypy is clean. New tests
+  reject a
+  missing or mismatched Node inventory, selector/product/capacity drift, and a
+  deleting-only flavor while accepting a non-Ready initializing Node.
+- On correction revision `70cb55a2fb003a4cd9665c5f3118c2b923a1f6ea`, the
+  integrated policy/interface superset passes 121/121. New tests accept the two
+  east exact-card edges in one context, reject a duplicate physical UID/card
+  atom before provider calls, and reject missing Pod rules or drift in webhook
+  operations, endpoint, CA bundle, and namespace selection. Ruff and targeted
+  mypy pass, pylint is 10.00/10, JSON and Python compilation pass, and the exact
+  live east mutating and validating objects pass the same validator.
+- On behavior revision `f4a8aa8d003f256e5c2b621ca29461d75f84fdcd`,
+  activation and later claim replacement call the same exact-card atom
+  validator. The integrated policy/interface superset passes 123/123; new
+  activation tests accept east's distinct A100-40/A100-80 claims in one
+  context and reject a duplicated physical UID/card atom before provider
+  calls. Ruff and targeted mypy pass, pylint is 10.00/10, formatting and
+  `git diff --check` pass.
+- On correction revision `bfbd6cbe0a9f22487d035f9149ac673ca4dacd95`,
+  the fix after failed review round 1 carries the exact Kubernetes
+  accelerator scheduling atom through the typed admission and rejects drift in
+  its label key, label values, or resource key before provider calls at claim,
+  activation, and launch. The strict bundle rejects cross-card flavor or
+  scheduling overlap, and its east A100 contract now owns only the 40GB
+  product. The integrated policy/interface superset passes 132/132; Ruff and
+  targeted mypy pass, pylint is 10.00/10, JSON parsing, compilation,
+  formatting, and `git diff --check` pass.
+- The post-correction local Serve047 implementation restack at `1efa6b284`
+  passes 58/58
+  focused final-state, cleanup-presence, manager-receipt,
+  reconciliation-transition, and status tests; the combined policy superset
+  passes 134/134; and its required real-PostgreSQL Serve047 schema suite passes
+  12/12 with zero skips against the isolated local PostgreSQL server.
+  These reruns supplement the complete cleanup freeze recorded below; the
+  final cleanup OID will change when it is rebased over review-record-only
+  feature commits, without changing its tested implementation tree.
+- No merge commit, deployment revision, activation result, live GPU fill, or
+  BCL preemption result is claimed in this document yet.
+
+### Adversarial review record
+
+The implementation is not merge-ready until three consecutive reviews pass
+against the exact current file and code. A finding that changes behavior must
+update this file before the next round.
+
+One non-counting review attempt on feature `b93db03fb` and cleanup
+`1094b9ded` failed. It found that the deployment policy rejected valid
+same-context exact-card edges and that webhook attestation trusted names
+without proving Pod admission rules or the Kueue endpoint. Revision
+`70cb55a2f` fixes both findings and adds the fail-closed coverage above. The
+consecutive sequence therefore restarts from round 1.
+
+The first restarted round on feature `9baca9dca` and cleanup `cae4abd87`
+also failed and does not count. It found that the policy ticket bound only the
+logical accelerator name and count, while terminal launch used an accelerator
+label/resource tuple absent from that ticket. East's bundle also let logical
+`a100` name both 40GB and 80GB products. The correction above binds the exact
+scheduling atom end to end and makes logical card contracts disjoint. The
+consecutive sequence restarts from round 1 again.
+
+| Round | Revision reviewed | Result | Material findings/fixes |
+|---|---|---|---|
+| 1 | feature/design `123c16762aea510d34db74f52c0c27e733fbb07d`; stacked Serve047 cleanup `bc2725c54149d14bc4e90edb2df24af5efccd789` | pass | No material or non-material findings. The review traced the exact normalized accelerator label key, sorted values, and resource through projection, activation, claim replacement, durable receipt/scope hashing, terminal authorization, rendering, Pod admission/adoption, and bound-Node proof. It also found no oversubscription, stale-authority, paid-spill, duplicate-happy-path, or BCL reclaim regression, and confirmed Serve047 leaves one forward-only two-state authorization path. |
+| 2 | feature/design `a0fe24207854cdc3f98a4d2a879cc9dce4bfa0f7`; stacked Serve047 cleanup `175e04e8376d8507c9d08428f2f2a34516df8b2e`; design SHA-256 `b6037bab7e8de936aa5d447b7547f7ea2faf012395bfb36ccc1eb8006cecf486` | pass | No material or non-material findings. Independent review reverified the terminal PostgreSQL admission ledger, exact projection-to-Node accelerator scheduling atom, disjoint physical-card contracts, fail-closed zero-cost launch, live-attested bounded Kueue borrowing and BCL/research reclaim, and Serve047's sole forward authorization path. All non-design blobs remained byte-identical to round 1. |
+| 3 | feature/design `cea111a5ddcf7f84e7426d75920e23cae7d33b65`; stacked Serve047 cleanup `c4a46c2debe54a832916cd64408c8306a50dc266`; feature design SHA-256 `fb9a88be168ac3a951a51c053f054a86d97ad5f363504c005a4c1be10bd2d398`; cleanup design SHA-256 `793fc1b5000f3d2ec46da066798645c9e36fc703f4faade9ef4fbc35bc4a89e5` | pass | No material or non-material findings. Final independent review reconfirmed bounded generation-fenced observation, complete terminal admission revalidation, exact-card zero-cost-only launch, projection and deployment-policy identity, zero-nominal inference borrowing with research reclaim, and Serve047's two-state forward-only authority. Every non-design blob remained byte-identical to round 2. |
+
+Reviews should be pragmatic and fix-forward oriented. They must reject an
+oversubscription, stale-authority, duplicate-happy-path, paid-spill, or BCL
+priority regression, but should not require a canary or a general rollback
+system.
+
+## Transitional code and stacked removal path
+
+The feature PR is stacked with a cleanup PR before the feature is marked
+ready. The stack is:
+
+1. Feature PR [#1451](https://github.com/boltz-bio/skypilot/pull/1451),
+   `feat/serve-event-driven-reserved-fill`: additive observation ledger,
+   authenticated allocation, sequenced planner/receipt, activation and active
+   reauthorization, compatibility path, and transition tests.
+2. Draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452),
+   `cleanup/serve-sequenced-reserved-fill`: final steady state with the
+   standalone protocol activation/demotion and legacy launch paths deleted.
+   It retains `reserved_fill_reconciliation_transition status/activate` as the
+   sole first-authorization and reauthorization surface and remains blocked
+   until the merge gate below is met.
+
+Exact feature and cleanup commit IDs are recorded after the final review-record
+commit and final cleanup rebase. The local PR #1452 implementation has been
+restacked onto the frozen feature, reauthored for Serve046/projection v2 and
+the controller-runtime transition removals, and rerun against the integrated
+policy tree. The old remote cleanup tip remains stale and is not deployment or
+merge evidence. Any earlier remote cleanup tip is stale evidence after the
+final exact successor is published. Historical cleanup PR #1263 is not this correction's removal
+PR.
+
+The cleanup uses a new forward-only Serve047 migration; it never edits or
+renumbers historical Serve044, Serve045, or Serve046. Serve047 preserves the
+Serve045 reclaim receipt/generation and every Serve046 service-version and
+projection-digest column and constraint. It replaces the Serve045 gate check,
+default, and `ENABLE ALWAYS` trigger with the protocol-v2-only final two-state
+domain: `UNAUTHORIZED` with a completely null authorization receipt, or
+`SEQUENCED_ACTIVE` with a complete Serve045 receipt. Under the migration lock,
+a well-formed null-receipt
+`LEGACY_ACTIVE` bootstrap row becomes `UNAUTHORIZED` without changing its
+generation; a valid active row and receipt are preserved byte-for-byte; a
+partial or malformed shape aborts migration. Thus a fresh database is inert,
+and a migrated but not-yet-authorized database has no legacy actuator.
+`UNAUTHORIZED` permits ordinary reconciliation but suppresses every
+reserved-fill provider observation, allocation, and launch effect. It still
+maintains provider-free protocol-v2 service claims and immutable worker
+projections, so the canonical command has a complete current claim scope to
+attest on first authorization. Before the protocol-v1 decoder is removed,
+migration mechanically rejects any active protocol-v1 worker projection. The
+same canonical command authorizes `UNAUTHORIZED` to
+`SEQUENCED_ACTIVE` at exactly `generation + 1` and reauthorizes
+`SEQUENCED_ACTIVE` after a fix-forward rollout; cleanup does not introduce a
+second bootstrap actuator.
+
+The cleanup change removes, rather than perpetuates:
+
+- the `LEGACY_ACTIVE` provider-query branch in protocol-v2 broker cycles;
+- legacy fill launch emission and emission-time feed/rotation spending from
+  `_apply_reserved_capacity_fill_v2()`;
+- direct-call poller compatibility that lacks an actuation-generation fence
+  and therefore holds the old broad lock;
+- new-admission tolerance for an unattributed protocol-v2 fill tuple after the
+  legacy fleet has drained;
+- the worker-projection protocol-v1 ordinary-launch decoder and its transition
+  tests after every active version and launch has remained on protocol v2 for
+  the removal horizon;
+- obsolete autoscaler/manager fill signaling methods superseded by
+  `ScaleReconcileCoordinator`; and
+- the nullable pre-slot managed-job adoption decoder, queries, and transition
+  tests after its fleet horizon; and
+- `LEGACY_REQUEST_DAEMON_IDS`, the legacy `daemon:` supported-handler census
+  and transition lock, row-retirement methods and startup calls, retired
+  daemon pickle symbols, and their transition tests after their stale-writer
+  horizon. The fixed-slot managed-job supervisors and runtime-daemon
+  subprocess supervisors remain. Historical controller PID inventory and
+  cutover helpers are already deleted by the feature and are not claimed again
+  by cleanup.
+
+Cleanup explicitly retains the canonical `status` plus
+authorization/reauthorization command, its `_read_stable_writer_rollout`
+attestation, and `get` access to ReplicaSets. Pod -> ReplicaSet -> Deployment
+identity is part of every first authorization and fix-forward reauthorization,
+not transition-only code. Read-only historical row decoding may remain only
+where durable terminal data still requires it; the protocol-v1 ordinary worker
+projection decoder does not remain after its gate passes.
+
+The cleanup PR's exact merge gate is:
+
+1. the feature PR is merged and the full split-role fleet is running its image;
+2. production reports `SEQUENCED_ACTIVE` and cannot demote;
+3. at least three consecutive observation periods complete without a stale
+   writer overwriting a successor, a map-authentication failure caused by
+   current code, or a receipt-accounting error;
+4. at least one controller restart and one ordinary service update complete on
+   the sequenced path;
+5. every nonterminal protocol-v2 fill row is fully attributed, or every
+   remaining unattributed legacy row has become terminal and stayed absent for
+   one complete 180-second authority horizon;
+6. no new fill row appears without a positive database-assigned admission
+   sequence after activation;
+7. ordinary traffic, no-paid-spill, `max_replicas`, two-context concurrency,
+   and the deployment-owned Kueue reclaim contract pass; and
+8. every active service version uses worker projection protocol v2 and no
+   ordinary launch has consumed the v1 decoder for one complete 180-second
+   authority horizon; and
+9. after one complete controller-fleet rollout, no non-`INACTIVE`, non-`DONE`
+   managed-job row has a null or partial slot identity; separately, for one
+   complete controller-instance stale window, no allowlisted daemon ID exists
+   in request, queue, or retention state and no live/recent writer advertises
+   a legacy `daemon:` handler; and
+10. the cleanup branch's final-state tests pass with the compatibility code
+    physically absent, while fresh-install `UNAUTHORIZED` authorization and
+    active fix-forward reauthorization both pass through the same command and
+    require the stable Pod -> ReplicaSet -> Deployment owner chain. Tests also
+    prove chart RBAC retains `get` on ReplicaSets, the protocol-v1 worker
+    projection decoder is physically absent, and schema-5 allocations plus
+    v17 replica attribution still round-trip and fence correctly.
+
+This gate is intentionally short and fix-forward compatible. It proves the
+old path is no longer needed without imposing a 24-hour soak or a GPU/BCL
+canary. If it fails, fix the feature or cleanup branch forward; do not reopen
+legacy activation.
 
 ## Open gates
 
-- Required feature and durable provider-fence CI passed. Helm revision 336 and
-  release `1.1.1099` from `57a0283ff` are historical rollout evidence; they do
-  not identify the current live release. A 2026-08-11 read-only endpoint check
-  reported server `1.1.1227` at
-  `fd909e0c534045ca21381e9f6ce79da141f145f7`, but the audit environment
-  lacked the production Kubernetes context needed to verify the Helm revision,
-  chart, image tag, and digest. Fetch those values from the live release before
-  any rollout or rollback. Follow-up #1433 is merged but is not an acceptable
-  rollout identity until the sequential detached-authority correction passes
-  exact-head CI and review, merges, and receives artifact publication,
-  deployment, and behavior-specific verification.
-- Historical live version 51 acceptance retained serving health and
-  demonstrated exact-card committed observation/refill behavior, but revision
-  336 transiently entered controller failure under the phase convoy described
-  above. Hotfix #1280 is merged and deployed. Sustained acceptance evidence for
-  the current release remains open: actively pass both convoy exercises in
-  deployment step 6, then complete at least three broker intervals with
-  progressing broker/LB/job-status work and no provider-phase timeout, 503
-  route sync, or controller-failed transition.
-- The no-platform-PR production bridge is a separately named ClusterRole and
-  ClusterRoleBinding, `skypilot-physical-cluster-identity-reader`, on east and
-  PHX, bound to EKS group
-  `rescluster-k8s-prod-east1-preemptible-inference`. It remains an explicit
-  drift item until both platform pool roots consume the fixed module. At that
-  point remove the bridge binding, prove both exact UID reads still pass, and
-  then remove the bridge role.
-- The existing SkyPilot Helm release is the control-plane deployment and
-  rollback authority. The boltz-platform pin is independent infrastructure: do
-  not require, modify, wait for, or apply it for a SkyPilot application rollout.
-  This audit did not verify the live Helm revision, chart version, image tag, or
-  image digest; inspect those exact release values before and after any rollout.
-- The PHX H200 candidate has not yet been restored to `boltz-l4-fleet`.
-  Isolated exact-context and two-pool canaries passed, including an H200 replica
-  and HTTP 200 from Rainier, but versions 51--53 retained east-only placement
-  catalogs because the controller config was frozen. The atomic config refresh,
-  fresh production version, restart-persistence check, exact two-edge claim,
-  H200 model endpoint check, and east regression check remain open.
-- Draft compatibility cleanup PR #1263 is authored in stack #1264 and must
-  remain blocked until the rollout gates above pass.
-- PR #1422's stale-epoch liveness premise remains unresolved after restoring
-  strict safety fencing.  Any replacement must first add and roll out the
-  durable admission-order contract described above, prove mixed-version
-  fail-closed behavior, and include cross-service race, restart, large-fleet
-  call-count, and timing evidence.
+- Merge the feature stack.
+- Build and deploy one immutable image to the complete split-role fleet with a
+  reviewed direct Helm upgrade using `--reuse-values`; verify the rendered
+  change and live rollout preserve all existing release values and persistent
+  resources.
+- Record the pre-activation writer/image/schema proof.
+- Deploy and attest the separately owned Kueue inference queue/preemption
+  contract for every reserved context; current east1 evidence does not pass.
+- Deploy the combined immutable image containing the code-owned
+  `ReservedFillReclaimPolicy` from the separately packaged
+  `boltz-skypilot-reserved-fill-reclaim-policy` wheel and its ongoing
+  claim-admission and launch fence. The policy
+  must consume and authorize the projected `scheduler_name` and nullable Pod
+  Identity role together with the existing namespace, service-account,
+  priority, Kueue, and accelerator fields. For the identity-free inference
+  partition it must positively prove that no Pod Identity association exists;
+  null is not permission to skip the check.
+  Converge the full split-role fleet on that one digest and repeat the
+  pre-activation proof; no generic assertion bypass or generic-only image path
+  exists.
+- Perform initial activation and non-compute manual verification; later policy
+  or writer changes use the same command for one successor generation.
+- After the documented removal gate passes, merge the cleanup PR.
+
+Until those gates are recorded, this document must not describe the correction
+as merged, deployed, activated, or proven by live capacity.

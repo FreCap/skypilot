@@ -108,6 +108,58 @@ _SAME_SERVICE_STALE_PLACEHOLDER_PROOF_FIELDS = (
 _STALE_PLACEHOLDER_NULL_COLUMNS = (
     placement_normalization_manifest.STALE_PLACEHOLDER_NULL_COLUMNS)
 _PREDECESSOR_RECEIPT_SCHEMA = 'skyserve-predecessor-receipt-inventory-v1'
+# This operator authenticates and runs against exactly Serve040.  Keep its
+# service projection frozen at that revision so later canonical metadata
+# columns are never emitted into SQL against the historical schema.
+_REVISION_040_SERVICE_COLUMN_NAMES = (
+    'name',
+    'workspace',
+    'controller_job_id',
+    'controller_port',
+    'load_balancer_port',
+    'status',
+    'uptime',
+    'policy',
+    'auto_restart',
+    'requested_resources',
+    'requested_resources_str',
+    'current_version',
+    'active_versions',
+    'load_balancing_policy',
+    'tls_encrypted',
+    'pool',
+    'controller_pid',
+    'hash',
+    'resource_action_mode',
+    'resource_action_mode_changed_at',
+    'resource_action_candidate_epoch',
+    'resource_action_candidate_policy_sha256',
+    'resource_action_candidate_binding_sha256',
+    'lifecycle_epoch',
+    'resource_scope',
+    'entrypoint',
+    'controller_ip',
+    'placement_normalization_requested_run_id',
+    'placement_normalization_loaded_run_id',
+    'placement_normalization_loaded_image_commit',
+    'placement_normalization_loaded_controller_pid',
+    'placement_normalization_loaded_controller_ip',
+    'placement_normalization_loaded_boot_id',
+    'placement_normalization_loaded_at',
+    'logical_replica_semantics',
+    'lb_ha_enabled',
+    'lb_active_slot',
+    'lb_cutover_generation',
+    'lb_pending_slot',
+    'lb_cutover_phase',
+    'lb_drain_started_at',
+    'lb_demand_handoff_generation',
+    'lb_demand_handoff_snapshot',
+    'lb_demand_handoff_complete_at',
+    'lb_last_demand_snapshot',
+    'spot_placement_state',
+    'cost_rebalance_state',
+)
 _POD_UID_ENV_VAR = 'SKYPILOT_POD_UID'
 _ROLLING_UPDATE_ENV_VAR = 'SKYPILOT_ROLLING_UPDATE_ENABLED'
 _RETIREMENT_REASON = (
@@ -143,6 +195,12 @@ _SUPPORTED_NORMALIZATION_SOURCES = frozenset({
     Classification.FIELDLESS_SUPPORTED,
     Classification.EXPLICIT_V1,
 })
+
+
+def _revision_040_service_columns() -> tuple[sqlalchemy.Column[Any], ...]:
+    """Return the canonical service projection owned by Serve040."""
+    return tuple(serve_state.services_table.c[name]
+                 for name in _REVISION_040_SERVICE_COLUMN_NAMES)
 
 
 class ApplyMode(enum.Enum):
@@ -769,12 +827,16 @@ def _require_contract_matches_parent(analysis: RawSpecAnalysis,
 def _scan_inventory(
         session: orm.Session,
         row_bound: int) -> tuple[list[_RowWork], dict[str, dict[str, Any]]]:
+    version_table = serve_state.version_specs_table
+    frozen_columns = [
+        version_table.c[column]
+        for column in placement_normalization_manifest.VERSION_SPEC_COLUMNS
+    ]
     version_rows = [
         dict(row) for row in session.execute(
-            sqlalchemy.select(serve_state.version_specs_table).order_by(
-                serve_state.version_specs_table.c.service_name, serve_state.
-                version_specs_table.c.version).limit(row_bound +
-                                                     1)).mappings().all()
+            sqlalchemy.select(*frozen_columns).order_by(
+                version_table.c.service_name, version_table.c.version).limit(
+                    row_bound + 1)).mappings().all()
     ]
     if len(version_rows) > row_bound:
         raise NormalizationBlocker(
@@ -788,7 +850,7 @@ def _scan_inventory(
     if service_names:
         service_rows = {
             str(row['name']): dict(row) for row in session.execute(
-                sqlalchemy.select(serve_state.services_table).where(
+                sqlalchemy.select(*_revision_040_service_columns()).where(
                     serve_state.services_table.c.name.in_(
                         service_names))).mappings().all()
         }
@@ -2277,7 +2339,7 @@ def _predecessor_receipt_evidence(
         table.c.placement_normalization_loaded_at,
     )
     receipt_services = session.execute(
-        sqlalchemy.select(table).where(
+        sqlalchemy.select(*_revision_040_service_columns()).where(
             sqlalchemy.or_(
                 *(column.isnot(None) for column in receipt_columns))).order_by(
                     table.c.name).limit(row_bound + 1)).mappings().all()

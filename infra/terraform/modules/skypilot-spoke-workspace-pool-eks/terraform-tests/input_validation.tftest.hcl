@@ -82,9 +82,15 @@ run "kueue_is_a_backward_compatible_noop_by_default" {
       length(kubernetes_manifest.partition_kueue_policy) == 0 &&
       length(kubernetes_manifest.partition_kueue_binding) == 0 &&
       output.kueue_local_queues == {} &&
-      module.rbac["training"].kueue == null
+      module.rbac["training"].kueue == null &&
+      length(data.aws_caller_identity.current) == 0 &&
+      length(aws_iam_role.reserved_fill_reclaim_audit) == 0 &&
+      length(aws_eks_access_entry.reserved_fill_reclaim_audit) == 0 &&
+      length(kubernetes_cluster_role_v1.reserved_fill_reclaim_audit) == 0 &&
+      output.reserved_fill_reclaim_audit_role_arn == null &&
+      output.reserved_fill_reclaim_audit_caller_policy_statement == null
     )
-    error_message = "Omitting partition.kueue must create no Kueue reads, resources, admission policy, or RBAC."
+    error_message = "Omitting Kueue and the reclaim audit must preserve the backward-compatible no-op contract."
   }
 }
 
@@ -113,6 +119,127 @@ run "rejects_a_blank_cluster_queue_name" {
       kueue = {
         local_queue_name   = "training"
         cluster_queue_name = ""
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "accepts_a_63_character_cluster_queue_dns_label" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }]
+  }
+
+  override_data {
+    target = data.kubernetes_resource.partition_cluster_queue["training"]
+    values = {
+      object = {
+        metadata = {
+          generation = 1
+          name       = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+        spec = {
+          namespaceSelector = {}
+        }
+        status = {
+          conditions = [{
+            observedGeneration = 1
+            status             = "True"
+            type               = "Active"
+          }]
+        }
+      }
+    }
+  }
+
+  assert {
+    condition     = kubernetes_manifest.partition_local_queue["training"].manifest["spec"]["clusterQueue"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    error_message = "A 63-character DNS-1123 label must remain a valid ClusterQueue name."
+  }
+}
+
+run "rejects_a_dotted_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training.reserved"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_an_uppercase_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "Training"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_an_underscore_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training_reserved"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_an_overlength_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }]
+  }
+
+  expect_failures = [var.partitions]
+}
+
+run "rejects_a_trailing_hyphen_cluster_queue_name" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "training"
+      kueue = {
+        local_queue_name   = "training"
+        cluster_queue_name = "training-"
       }
     }]
   }

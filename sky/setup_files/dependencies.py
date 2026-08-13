@@ -177,7 +177,10 @@ aws_dependencies = [
 # changed dict openapi_types from 'dict(K, V)' to 'dict[K, V]'. Pin away
 # from 36.x until upstream resolves these.
 kubernetes_dependencies = [
-    'kubernetes>=20.0.0,!=32.0.0,<36.0.0',
+    # Strict worker attestation requires typed scheduling-gate, DRA claim, and
+    # Pod-level resource fields. The complete model first ships in 32.0.1;
+    # 32.0.0 also has an authentication regression.
+    'kubernetes>=32.0.1,<36.0.0',
     'websockets',
     'python-dateutil',
 ]

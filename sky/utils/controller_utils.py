@@ -16,10 +16,9 @@ from sky import global_user_state
 from sky import resources
 from sky import sky_logging
 from sky import skypilot_config
+from sky.adaptors import common as adaptors_common
 from sky.jobs import constants as managed_job_constants
 from sky.jobs import state as managed_job_state
-from sky.serve import constants as serve_constants
-from sky.serve import serve_state
 from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import plugin_utils
@@ -44,9 +43,16 @@ if typing.TYPE_CHECKING:
 
     from sky import task as task_lib
     from sky.backends import cloud_vm_ray_backend
+    from sky.serve import constants as serve_constants
+    from sky.serve import serve_state
 else:
-    from sky.adaptors import common as adaptors_common
     psutil = adaptors_common.LazyImport('psutil')
+    # Importing a submodule through ``sky.serve`` eagerly executes its public
+    # package initializer.  controller_utils is itself imported while
+    # ``sky.jobs`` is initializing, so eager Serve initialization closes a
+    # jobs -> controller_utils -> serve -> request-payloads -> serve cycle.
+    serve_constants = adaptors_common.LazyImport('sky.serve.constants')
+    serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -254,6 +260,91 @@ def shared_controller_vars_to_fill(
     return vars_to_fill
 
 
+_CONTROLLER_WORKSPACE_KUBERNETES_KEYS = (
+    'namespace',
+    'remote_identity',
+    'auto_mounts',
+    'serve_controller_context',
+    'serve_controller_work_cache',
+    'serve_controller_lb_data_plane_auth',
+    'serve_controller_priority_class_name',
+)
+_CONTROLLER_CONTEXT_KUBERNETES_KEYS = (
+    'namespace',
+    'remote_identity',
+    'auto_mounts',
+    'serve_controller_work_cache',
+    'serve_controller_lb_data_plane_auth',
+    'serve_controller_priority_class_name',
+)
+
+
+def _controller_pod_config_projection(value: Any) -> dict[str, Any] | None:
+    """Retain only controller identity fields from server-owned pod config."""
+    if not isinstance(value, dict):
+        return None
+    pod_spec = value.get('spec')
+    if not isinstance(pod_spec, dict):
+        return None
+    projected_spec = {
+        key: copy.deepcopy(pod_spec[key])
+        for key in ('serviceAccountName',)
+        if key in pod_spec
+    }
+    if not projected_spec:
+        return None
+    return {'spec': projected_spec}
+
+
+def _controller_kubernetes_scope_projection(
+        value: Any, *, context_scope: bool) -> dict[str, Any]:
+    """Project the Kubernetes values consumed by controller projections."""
+    if not isinstance(value, dict):
+        return {}
+    keys = (_CONTROLLER_CONTEXT_KUBERNETES_KEYS
+            if context_scope else _CONTROLLER_WORKSPACE_KUBERNETES_KEYS)
+    projected = {}
+    for key in keys:
+        if key not in value:
+            continue
+        configured = value[key]
+        if key == 'serve_controller_lb_data_plane_auth':
+            if not isinstance(configured, dict):
+                continue
+            configured = {
+                field: copy.deepcopy(configured[field])
+                for field in ('secret_name', 'secret_key')
+                if field in configured
+            }
+        else:
+            configured = copy.deepcopy(configured)
+        projected[key] = configured
+    pod_config = _controller_pod_config_projection(value.get('pod_config'))
+    if pod_config is not None:
+        projected['pod_config'] = pod_config
+    return projected
+
+
+def _controller_workspace_projection(
+        value: Any, controller_context: str | None) -> dict[str, Any]:
+    """Return a minimal, non-credential controller workspace snapshot."""
+    if not isinstance(value, dict):
+        return {}
+    kubernetes_config = value.get('kubernetes')
+    projected_kubernetes = _controller_kubernetes_scope_projection(
+        kubernetes_config, context_scope=False)
+    if isinstance(kubernetes_config, dict) and controller_context is not None:
+        context_configs = kubernetes_config.get('context_configs')
+        if isinstance(context_configs, dict):
+            context_config = context_configs.get(controller_context)
+            if isinstance(context_config, dict):
+                projected_kubernetes['context_configs'] = {
+                    controller_context: _controller_kubernetes_scope_projection(
+                        context_config, context_scope=True)
+                }
+    return {'kubernetes': projected_kubernetes}
+
+
 def controller_config_snapshot(local_user_config: dict[str, Any],
                                workspace: str | None = None) -> dict[str, Any]:
     """Return the config a controller process is allowed to consume.
@@ -281,13 +372,41 @@ def controller_config_snapshot(local_user_config: dict[str, Any],
             workspace = active_workspace
     workspaces = config.get('workspaces')
     if workspace is not None and isinstance(workspaces, dict):
+        controller_workspace = (
+            skypilot_config.get_effective_workspace_region_config_from_snapshot(
+                config_snapshot=config,
+                cloud='kubernetes',
+                keys=('serve_controller_workspace',),
+                workspace=workspace,
+                default_value=None))
+        controller_context = None
+        if (isinstance(controller_workspace, str) and controller_workspace and
+                controller_workspace != workspace):
+            resolved_context = (
+                skypilot_config.
+                get_effective_workspace_region_config_from_snapshot(
+                    config_snapshot=config,
+                    cloud='kubernetes',
+                    keys=('serve_controller_context',),
+                    workspace=controller_workspace,
+                    default_value=None))
+            if isinstance(resolved_context, str) and resolved_context:
+                controller_context = resolved_context
         workspace_config = workspaces.get(workspace)
         if isinstance(workspace_config, dict):
             workspace_config.pop('allowed_users', None)
             workspace_config.pop('private', None)
-        config['workspaces'] = ({
+        projected_workspaces = ({
             workspace: workspace_config
         } if workspace_config is not None else {})
+        if (isinstance(controller_workspace, str) and controller_workspace and
+                controller_workspace != workspace):
+            controller_workspace_config = workspaces.get(controller_workspace)
+            if isinstance(controller_workspace_config, dict):
+                projected_workspaces[controller_workspace] = (
+                    _controller_workspace_projection(
+                        controller_workspace_config, controller_context))
+        config['workspaces'] = projected_workspaces
     return config
 
 

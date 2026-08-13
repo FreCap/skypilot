@@ -7,12 +7,17 @@ from collections.abc import AsyncGenerator
 from collections.abc import Callable
 from collections.abc import Coroutine
 from collections.abc import Generator
+from collections.abc import Mapping
 import contextlib
+import dataclasses
 import datetime
+import enum
+import math
 import os
 import signal
 import threading
 import time
+import typing
 from typing import Any
 import uuid
 
@@ -22,12 +27,17 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
 import sky
+from sky import backends
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.events import api_models as event_api_models
+from sky.jobs import controller_fencing as managed_job_controller_fencing
+from sky.serve import constants as serve_constants
 from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server.events import emission as event_emission
 from sky.server.events import models as event_models
+from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import postgres_schema
 from sky.server.requests import preconditions
@@ -35,11 +45,21 @@ from sky.server.requests import registry as request_registry
 from sky.server.requests import requests as requests_lib
 from sky.server.requests import storage as request_storage
 from sky.server.requests.queues import base as queue_base
+from sky.utils import controller_capability
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
+if typing.TYPE_CHECKING:
+    from sky.serve import ordinary_launch_binding as ordinary_launch_binding_lib
+    from sky.serve import replica_managers
+
 logger = sky_logging.init_logger(__name__)
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
+serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
+serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
+managed_job_state_schema = adaptors_common.LazyImport('sky.jobs.state_schema')
 
 REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 POSTGRES_REQUEST_BACKEND = 'postgres'
@@ -59,18 +79,147 @@ ROLE_DRAIN_MARKER_PATH = '/var/run/skypilot/draining'
 _CLAIM_LEASE_SECONDS = 30
 _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
 _MAX_EXPIRED_CLAIMS_PER_SWEEP = 100
-# Ten claim leases after a request finished with no live lease, an
-# acknowledgement from its own executor can no longer be in flight.
-_ORPHANED_QUIESCENCE_GRACE_SECONDS = 300
-_MAX_ORPHANED_QUIESCENCE_PER_SWEEP = 100
+_GRACEFUL_SHUTDOWN_RETRY_REASON = (
+    'Graceful server shutdown requested; waiting for exact execution '
+    'quiescence before exposing retry.')
 _INSTANCE_HEARTBEAT_INTERVAL_SECONDS = 5
 # Public because operational safety checks outside the request backend must
 # use the same freshness boundary as the instance registry itself.
 INSTANCE_STALE_AFTER_SECONDS = 20
+ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS = 70
 _VALID_SERVER_ROLES = frozenset({'all', 'api', 'executor', 'controller'})
 _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
 _CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
 _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
+_LEGACY_DAEMON_TRANSITION_LOCK_ID = ('skypilot:runtime-daemon-transition:v1')
+_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE = uuid.UUID(
+    '58a82cb0-534c-5a5d-bb5d-681759e60469')
+_BOUND_CANCEL_QUIESCENCE_WAIT_SECONDS = 5.0
+_BOUND_CANCEL_QUIESCENCE_POLL_SECONDS = 0.1
+_LEGACY_ORDINARY_LAUNCH_HANDLER_NAME = 'sky.execution:launch'
+_LEGACY_ORDINARY_LAUNCH_PAYLOAD_TYPE = (
+    'sky.server.requests.payloads:LaunchBody')
+
+# This is intentionally a closed map.  API009 exposes only the distinct bound
+# ordinary-launch handler as provider-mutating queue work.  When another typed
+# provider handler is persisted, adding its enum member and mapping here makes
+# both the reserved selector and the generic exclusion advance together.
+_PROVIDER_MUTATION_HANDLER_KINDS = {
+    ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME:
+        queue_base.ProviderMutationRequestKind.BOUND_ORDINARY_LAUNCH,
+}
+_PROVIDER_MUTATION_HANDLER_NAMES = tuple(
+    _PROVIDER_MUTATION_HANDLER_KINDS.keys())
+if frozenset(_PROVIDER_MUTATION_HANDLER_KINDS.values()) != frozenset(
+        queue_base.ProviderMutationRequestKind):
+    raise RuntimeError('PostgreSQL provider-mutation classification is not '
+                       'exhaustive.')
+
+
+@dataclasses.dataclass(frozen=True)
+class BoundOrdinaryLaunchRequestFacts:
+    """Locked request, delivery, claim, result, and quiescence evidence."""
+
+    association_id: uuid.UUID
+    request_id: str
+    exists: bool
+    status: requests_lib.RequestStatus | None
+    terminal_cause: event_api_models.EventCause | None
+    execution_generation: int | None
+    claim_token: uuid.UUID | None
+    worker_instance_id: uuid.UUID | None
+    lease_expires_at: datetime.datetime | None
+    claim_exists: bool
+    claim_active: bool
+    claim_expired: bool
+    queue_exists: bool
+    queue_delivery_state: str | None
+    queue_claim_generation: int | None
+    execution_quiescence_required: bool
+    execution_quiesced_generation: int | None
+    execution_quiesced_at: datetime.datetime | None
+    quiescent: bool
+    retention_pin_active: bool
+    return_value: Any
+    error: Any
+    error_decode_failed: bool
+
+
+class OrdinaryLaunchReductionDisposition(str, enum.Enum):
+    ADOPT_ACTIVE = 'ADOPT_ACTIVE'
+    WAIT_QUIESCENCE = 'WAIT_QUIESCENCE'
+    PROJECTED = 'PROJECTED'
+    PRE_EFFECT_TERMINAL = 'PRE_EFFECT_TERMINAL'
+    AMBIGUOUS = 'AMBIGUOUS'
+
+
+@dataclasses.dataclass(frozen=True)
+class ServerPodIdentity:
+    """Pod identity captured once before request environment overrides."""
+
+    name: str
+    namespace: str
+    uid: str
+    ip: str | None
+
+    @classmethod
+    def from_environment(cls) -> ServerPodIdentity:
+        """Capture the role supervisor's deployment-provided identity once."""
+        return cls(name=(os.environ.get('SKYPILOT_POD_NAME') or
+                         os.environ.get('HOSTNAME') or '').strip(),
+                   namespace=os.environ.get('SKYPILOT_POD_NAMESPACE',
+                                            '').strip(),
+                   uid=os.environ.get('SKYPILOT_POD_UID', '').strip(),
+                   ip=os.environ.get('POD_IP'))
+
+
+@dataclasses.dataclass(frozen=True)
+class BoundOrdinaryLaunchProjectionInput:
+    """Typed terminal result supplied to an atomic ReplicaInfo projector."""
+
+    context: ordinary_launch_binding_lib.BoundLaunchContext
+    request: BoundOrdinaryLaunchRequestFacts
+    locked_replica_info: replica_managers.ReplicaInfo
+    status: requests_lib.RequestStatus
+    cause: event_api_models.EventCause
+    service_job_id: int | None
+    pre_effect_terminal: bool
+    cancel_reason: str | None
+    paid_capacity_pool_key: str | None
+
+
+class BoundOrdinaryLaunchReplicaProjector(typing.Protocol):
+    """Persist one exact terminal ordinary-launch projection."""
+
+    # pylint: disable=unnecessary-ellipsis
+
+    def __call__(
+        self,
+        connection: sqlalchemy.engine.Connection,
+        projection: BoundOrdinaryLaunchProjectionInput,
+    ) -> bool:
+        """Persist the exact ReplicaInfo and any typed paid-pool outcome."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class OrdinaryLaunchReduction:
+    """Controller-visible outcome of one exact association inspection."""
+
+    context: ordinary_launch_binding_lib.BoundLaunchContext
+    disposition: OrdinaryLaunchReductionDisposition
+    request: BoundOrdinaryLaunchRequestFacts
+    service_job_id: int | None
+    cancel_reason: str | None
+    projected: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class BoundOrdinaryLaunchCancelTarget:
+    """Non-authorizing pointer snapshot used only to address exact cancel."""
+
+    context: ordinary_launch_binding_lib.BoundLaunchContext
+    cancel_reason: str | None
 
 
 def _is_owned_executor_process(pid: int) -> bool:
@@ -97,6 +246,48 @@ def _is_owned_executor_process(pid: int) -> bool:
         return False
 
 
+def _signal_exact_executor_process(pid: int, expected_start_time_ticks: int,
+                                   signum: int) -> bool:
+    """Signal only the kernel process bound to PID and procfs birth identity."""
+    pidfd_open = getattr(os, 'pidfd_open', None)
+    pidfd_send_signal = getattr(signal, 'pidfd_send_signal', None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        logger.warning('Exact executor signalling requires Linux pidfds; '
+                       'cancellation is failing closed.')
+        return False
+    try:
+        pidfd = pidfd_open(pid, 0)  # pylint: disable=not-callable
+    except (OSError, ProcessLookupError) as e:
+        logger.info(f'Exact executor PID {pid} is unavailable: {e}')
+        return False
+    try:
+        observed_start_time: int
+        try:
+            observed_start_time = (
+                request_storage.read_linux_process_start_time_ticks(pid))
+        except (OSError, ValueError) as e:
+            logger.warning(f'Could not attest executor PID {pid}: {e}')
+            return False
+        if observed_start_time != expected_start_time_ticks:
+            logger.warning('Refusing to signal reused executor PID '
+                           f'{pid}: expected start ticks '
+                           f'{expected_start_time_ticks}, observed '
+                           f'{observed_start_time}.')
+            return False
+        if not _is_owned_executor_process(pid):
+            logger.warning(f'Refusing to signal PID {pid}: it is not this '
+                           'dispatcher\'s executor child.')
+            return False
+        try:
+            pidfd_send_signal(pidfd, signum, None, 0)  # pylint: disable=not-callable
+        except (OSError, ProcessLookupError) as e:
+            logger.info(f'Exact executor PID {pid} exited before signal: {e}')
+            return False
+        return True
+    finally:
+        os.close(pidfd)
+
+
 def role_is_draining() -> bool:
     """Return whether Kubernetes has started the pod drain interval."""
     return os.path.exists(ROLE_DRAIN_MARKER_PATH)
@@ -104,6 +295,7 @@ def role_is_draining() -> bool:
 
 _METADATA = postgres_schema.metadata
 REQUESTS = postgres_schema.REQUESTS
+REQUEST_RETENTION_PINS = postgres_schema.REQUEST_RETENTION_PINS
 RESOURCE_ACTIONS = postgres_schema.RESOURCE_ACTIONS
 RESOURCE_ACTION_ATTEMPTS = postgres_schema.RESOURCE_ACTION_ATTEMPTS
 QUEUE = postgres_schema.QUEUE
@@ -123,6 +315,28 @@ _DATETIME_FIELDS = frozenset({
     'cancel_acknowledged_at',
     'execution_quiesced_at',
 })
+_MANAGED_JOB_ORIGIN_FIELDS = (
+    'managed_job_id',
+    'managed_job_controller_instance_id',
+    'managed_job_controller_generation',
+    'managed_job_controller_slot_id',
+    'managed_job_controller_slot_attempt',
+)
+_MANAGED_JOB_ORIGIN_UUID_FIELDS = (
+    'managed_job_controller_instance_id',
+    'managed_job_controller_slot_attempt',
+)
+_MANAGED_JOB_ACTIVE_SCHEDULE_STATES = (
+    'LAUNCHING',
+    'ALIVE',
+    'ALIVE_WAITING',
+    'ALIVE_BACKOFF',
+)
+_MANAGED_JOB_QUIESCE_REASON = (
+    'The owning managed-job controller slot stopped; waiting for exact '
+    'nested-request execution quiescence.')
+
+ORDINARY_LAUNCH_RETENTION_PIN_KIND = 'serve-ordinary-launch.v1'
 
 
 def ensure_server_instance_id() -> str:
@@ -190,6 +404,27 @@ def _resolved_request_backend_capability() -> tuple[str, str, bool]:
     return storage_type, queue_type, capable
 
 
+def _ordinary_launch_binding_process_capable(role: str,
+                                             backend_capable: bool) -> bool:
+    """Whether this exact process implements its API009 protocol duties."""
+    if not backend_capable:
+        return False
+    registered = {
+        registration.name
+        for registration in request_registry.registered_handlers()
+    }
+    if ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME not in (
+            registered):
+        return False
+    # API processes own admission and retention GC but intentionally claim no
+    # handlers. Executors/all-role processes must advertise the distinct local
+    # handler before they can participate in a bound-launch fleet.
+    if role in ('all', 'executor'):
+        return (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME
+                in _supported_handlers(role))
+    return True
+
+
 def execution_quiescence_backend_guard_enabled() -> bool:
     return os.environ.get(EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR) == 'true'
 
@@ -222,6 +457,7 @@ class ServerInstanceLease:
         heartbeat_interval_seconds: float = (
             _INSTANCE_HEARTBEAT_INTERVAL_SECONDS),
         stale_after_seconds: float = INSTANCE_STALE_AFTER_SECONDS,
+        pod_identity: ServerPodIdentity | None = None,
     ) -> None:
         self.role = _validate_server_role(role)
         self.instance_id = ensure_server_instance_id()
@@ -235,11 +471,20 @@ class ServerInstanceLease:
         self._thread: threading.Thread | None = None
         self._state_lock = threading.Lock()
         self._heartbeat_lock = threading.Lock()
+        self._pod_identity = (pod_identity or
+                              ServerPodIdentity.from_environment())
+
+    @property
+    def pod_identity(self) -> ServerPodIdentity:
+        """Return the immutable identity used by every lease heartbeat."""
+        return self._pod_identity
 
     def _values(self, *, include_started_at: bool) -> dict[str, Any]:
         now = sqlalchemy.func.clock_timestamp()
         storage_type, queue_type, quiescence_capable = (
             _resolved_request_backend_capability())
+        binding_capable = _ordinary_launch_binding_process_capable(
+            self.role, quiescence_capable)
         with self._state_lock:
             ready = self._ready
             draining = self._draining
@@ -251,9 +496,9 @@ class ServerInstanceLease:
         values: dict[str, Any] = {
             'instance_id': uuid.UUID(self.instance_id),
             'role': self.role,
-            'pod_name': os.environ.get('HOSTNAME'),
-            'pod_uid': os.environ.get('SKYPILOT_POD_UID'),
-            'pod_ip': os.environ.get('POD_IP'),
+            'pod_name': self._pod_identity.name or None,
+            'pod_uid': self._pod_identity.uid or None,
+            'pod_ip': self._pod_identity.ip,
             'version': sky.__version__,
             'heartbeat_at': now,
             'draining_at': now if draining else None,
@@ -264,6 +509,10 @@ class ServerInstanceLease:
             'request_storage_backend': storage_type,
             'request_queue_backend': queue_type,
             'execution_quiescence_capable': quiescence_capable,
+            # Legacy/plugin processes and binaries without the distinct local
+            # handler retain the API009 false default so mixed fleets fail
+            # admission closed.
+            'ordinary_launch_binding_capable': binding_capable,
         }
         if include_started_at:
             values['started_at'] = now
@@ -394,6 +643,64 @@ def current_instance_is_ready() -> bool:
                         seconds=INSTANCE_STALE_AFTER_SECONDS))).scalar_one())
 
 
+def ordinary_launch_binding_fleet_capable(
+    *,
+    connection: sqlalchemy.engine.Connection | None = None,
+    quiescence_seconds: float = (
+        ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS),
+) -> bool:
+    """Whether every live launch participant advertises API009 binding.
+
+    Every recent ``all|api|executor|controller`` process must advertise it,
+    including non-ready and draining processes whose workers or retention GC
+    may not yet have quiesced. Separately, at least one ready, non-draining API
+    acceptor and ordinary executor must exist. Rollout waits a full stale
+    rollout-quiescence window before excluding an old process.
+    """
+    if (isinstance(quiescence_seconds, bool) or
+            not isinstance(quiescence_seconds, (int, float)) or
+            not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
+        raise ValueError('quiescence_seconds must be finite and non-negative.')
+    engine = initialize_and_get_db()
+
+    def _read(active_connection: sqlalchemy.engine.Connection) -> bool:
+        rows = active_connection.execute(
+            sqlalchemy.select(
+                SERVER_INSTANCES.c.instance_id, SERVER_INSTANCES.c.role,
+                SERVER_INSTANCES.c.ready, SERVER_INSTANCES.c.draining_at,
+                SERVER_INSTANCES.c.supported_handlers,
+                SERVER_INSTANCES.c.ordinary_launch_binding_capable).where(
+                    SERVER_INSTANCES.c.role.in_(
+                        ('all', 'api', 'executor', 'controller')),
+                    SERVER_INSTANCES.c.heartbeat_at
+                    >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                        seconds=quiescence_seconds))).mappings().all()
+        acceptors = [
+            row for row in rows
+            if row['ready'] and row['draining_at'] is None and row['role'] in (
+                'all', 'api')
+        ]
+        executors = [
+            row for row in rows
+            if row['ready'] and row['draining_at'] is None and row['role'] in (
+                'all', 'executor')
+        ]
+        for row in rows:
+            if not bool(row['ordinary_launch_binding_capable']):
+                return False
+            if row['role'] in ('all', 'executor'):
+                handlers = row['supported_handlers']
+                if (not isinstance(handlers, list) or ordinary_launch_request.
+                        BOUND_ORDINARY_LAUNCH_HANDLER_NAME not in handlers):
+                    return False
+        return bool(acceptors and executors)
+
+    if connection is not None:
+        return _read(connection)
+    with engine.connect() as owned_connection:
+        return _read(owned_connection)
+
+
 def recent_legacy_controller_consumers(quiescence_seconds: float) -> list[str]:
     """Return recent all/executor instances that can claim controller work.
 
@@ -426,6 +733,66 @@ def recent_legacy_controller_consumers(quiescence_seconds: float) -> list[str]:
     return blockers
 
 
+def recent_legacy_daemon_handler_instances(
+        quiescence_seconds: float = INSTANCE_STALE_AFTER_SECONDS) -> list[str]:
+    """Return recent processes that advertise a retired daemon handler."""
+    if (isinstance(quiescence_seconds, bool) or
+            not isinstance(quiescence_seconds, (int, float)) or
+            not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
+        raise ValueError('Daemon transition quiescence must be finite and '
+                         'non-negative.')
+    engine = initialize_and_get_db()
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(
+                SERVER_INSTANCES.c.instance_id,
+                SERVER_INSTANCES.c.supported_handlers).where(
+                    SERVER_INSTANCES.c.heartbeat_at >=
+                    sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                        seconds=quiescence_seconds))).mappings().all()
+    blockers = []
+    for row in rows:
+        advertised = row['supported_handlers']
+        if (not isinstance(advertised, list) or any(
+                isinstance(handler, str) and handler.startswith('daemon:')
+                for handler in advertised)):
+            blockers.append(str(row['instance_id']))
+    return blockers
+
+
+@contextlib.contextmanager
+def legacy_daemon_transition(*,
+                             poll_seconds: float = 1
+                            ) -> Generator[None, None, None]:
+    """Hold the one-way legacy-daemon cutover around startup mutations.
+
+    The caller performs generation-fenced row retirement, stale-claim fencing,
+    and request recovery while this coordination session is held. The lock is
+    not proof that arbitrary effects in an old process stopped, so the server
+    instance stale window remains the admission gate before yielding.
+    """
+    if poll_seconds <= 0:
+        raise ValueError('Daemon transition poll interval must be positive.')
+    transition_lock = locks.PostgresLock(_LEGACY_DAEMON_TRANSITION_LOCK_ID)
+    transition_lock.acquire()
+    try:
+        while True:
+            if not transition_lock.is_session_alive():
+                raise RuntimeError('Legacy daemon transition lock was lost.')
+            blockers = recent_legacy_daemon_handler_instances()
+            if not blockers:
+                break
+            logger.info('Waiting for legacy internal-daemon executors to '
+                        f'become stale: {len(blockers)} instance(s).')
+            time.sleep(poll_seconds)
+        yield
+        if not transition_lock.is_session_alive():
+            raise RuntimeError('Legacy daemon transition lock was lost during '
+                               'startup recovery.')
+    finally:
+        transition_lock.release()
+
+
 def _utc_datetime(timestamp: float | None) -> datetime.datetime | None:
     if timestamp is None:
         return None
@@ -442,11 +809,113 @@ def _request_values_for_db(request: requests_lib.Request) -> dict[str, Any]:
     values = request.durable_values()
     for field in _DATETIME_FIELDS:
         values[field] = _utc_datetime(values.get(field))
-    for field in ('claim_token', 'worker_instance_id'):
+    present_origin_fields = tuple(field for field in _MANAGED_JOB_ORIGIN_FIELDS
+                                  if values.get(field) is not None)
+    if present_origin_fields and len(present_origin_fields) != len(
+            _MANAGED_JOB_ORIGIN_FIELDS):
+        missing_fields = sorted(
+            set(_MANAGED_JOB_ORIGIN_FIELDS) - set(present_origin_fields))
+        raise ValueError('Managed-job request origin must be entirely absent '
+                         'or contain all five fields; missing '
+                         f'{missing_fields}.')
+    if present_origin_fields:
+        for field, minimum in (('managed_job_id',
+                                1), ('managed_job_controller_generation', 1),
+                               ('managed_job_controller_slot_id', 0)):
+            value = values[field]
+            if (isinstance(value, bool) or not isinstance(value, int) or
+                    value < minimum):
+                raise ValueError(f'{field} must be an integer greater than or '
+                                 f'equal to {minimum}, got {value!r}.')
+    for field in ('claim_token', 'worker_instance_id',
+                  *_MANAGED_JOB_ORIGIN_UUID_FIELDS):
         if values.get(field) is not None:
-            values[field] = uuid.UUID(str(values[field]))
+            try:
+                values[field] = uuid.UUID(str(values[field]))
+            except (AttributeError, TypeError, ValueError) as e:
+                raise ValueError(f'{field} must be a UUID, got '
+                                 f'{values[field]!r}.') from e
     values['updated_at'] = sqlalchemy.func.clock_timestamp()
     return values
+
+
+def _managed_job_origin(
+    values: Mapping[str, Any],
+) -> tuple[int, uuid.UUID, int, int, uuid.UUID] | None:
+    """Decode one complete immutable managed-job request origin."""
+    raw = tuple(values.get(field) for field in _MANAGED_JOB_ORIGIN_FIELDS)
+    if all(value is None for value in raw):
+        return None
+    if any(value is None for value in raw):
+        raise ValueError('Managed-job request origin is incomplete.')
+    try:
+        job_id = int(typing.cast(Any, raw[0]))
+        instance_id = uuid.UUID(str(raw[1]))
+        generation = int(typing.cast(Any, raw[2]))
+        slot_id = int(typing.cast(Any, raw[3]))
+        attempt = uuid.UUID(str(raw[4]))
+    except (TypeError, ValueError) as e:
+        raise ValueError('Managed-job request origin is malformed.') from e
+    if job_id <= 0 or generation <= 0 or slot_id < 0:
+        raise ValueError('Managed-job request origin has invalid values.')
+    return job_id, instance_id, generation, slot_id, attempt
+
+
+def _lock_live_controller_leadership(
+    connection: sqlalchemy.engine.Connection,) -> Mapping[str, Any] | None:
+    """Lock the singleton live outer-controller row, independent of owner."""
+    return connection.execute(
+        sqlalchemy.select(CONTROLLER_LEADERSHIP).where(
+            CONTROLLER_LEADERSHIP.c.leadership_key ==
+            _CONTROLLER_LEADERSHIP_KEY,
+            CONTROLLER_LEADERSHIP.c.released_at.is_(None),
+            _controller_session_locks_are_live()).with_for_update(
+                read=True)).mappings().one_or_none()
+
+
+def _lock_managed_job_origin(
+    connection: sqlalchemy.engine.Connection,
+    values: Mapping[str, Any],
+    *,
+    require_admission: bool,
+) -> bool:
+    """Lock and validate outer owner then exact managed-job attempt.
+
+    This is the canonical prefix for nested-request creation, queue claim, and
+    RUNNING admission.  Callers acquire request and queue locks only after it.
+    """
+    origin = _managed_job_origin(values)
+    if origin is None:
+        return True
+    job_id, instance_id, generation, slot_id, attempt = origin
+    leadership = _lock_live_controller_leadership(connection)
+    if (leadership is None or leadership['instance_id'] != instance_id or
+            int(leadership['generation']) != generation):
+        return False
+    job_info = managed_job_state_schema.job_info_table
+    conditions: tuple[Any, ...] = (
+        job_info.c.spot_job_id == job_id,
+        job_info.c.controller_instance_id == str(instance_id),
+        job_info.c.controller_generation == generation,
+        job_info.c.controller_slot_id == slot_id,
+        job_info.c.controller_slot_attempt == str(attempt),
+    )
+    if require_admission:
+        conditions += (
+            job_info.c.controller_slot_quiescing.is_(False),
+            job_info.c.schedule_state.in_(_MANAGED_JOB_ACTIVE_SCHEDULE_STATES),
+        )
+    return connection.execute(
+        sqlalchemy.select(
+            job_info.c.spot_job_id).where(*conditions).with_for_update(
+                read=True)).scalar_one_or_none() == (job_id)
+
+
+def _same_managed_job_origin(left: Mapping[str, Any],
+                             right: Mapping[str, Any]) -> bool:
+    return all(
+        left.get(field) == right.get(field)
+        for field in _MANAGED_JOB_ORIGIN_FIELDS)
 
 
 def _request_from_mapping(
@@ -455,6 +924,12 @@ def _request_from_mapping(
     for field in _DATETIME_FIELDS:
         values[field] = _timestamp(values.get(field))
     return requests_lib.Request.from_durable_values(values)
+
+
+def request_from_mapping(
+        mapping: sqlalchemy.engine.RowMapping) -> requests_lib.Request:
+    """Decode a complete durable row for same-database binding checks."""
+    return _request_from_mapping(mapping)
 
 
 _SCALAR_REQUEST_PROJECTION_FIELDS = (
@@ -496,6 +971,10 @@ def _request_from_scalar_mapping(
             int(values['execution_quiesced_generation']) if
             values.get('execution_quiesced_generation') is not None else None),
         execution_quiesced_at=_timestamp(values.get('execution_quiesced_at')),
+        execution_process_start_time_ticks=(
+            int(values['execution_process_start_time_ticks'])
+            if values.get('execution_process_start_time_ticks') is not None else
+            None),
     )
 
 
@@ -540,7 +1019,12 @@ async def _get_async_engine() -> sqlalchemy_async.AsyncEngine:
 
 
 def _controller_owner_from_environment() -> tuple[str, int] | None:
-    """Return the split-role controller owner, or None in compatibility mode."""
+    """Return one request-scoped split-controller owner, if present.
+
+    PostgreSQL ``all`` mode passes its runtime owner explicitly to startup
+    maintenance. It must not publish that identity process-wide because the
+    same process also executes normal-class requests.
+    """
     role = os.environ.get(SERVER_ROLE_ENV_VAR, 'all')
     if role == 'all':
         return None
@@ -666,39 +1150,29 @@ def _lock_current_controller_leadership(
             lock=True)).scalar_one_or_none() is not None
 
 
-async def _lock_environment_controller_leadership(
-        connection: sqlalchemy_async.AsyncConnection) -> None:
-    """Serialize a controller-maintenance write with generation advancement."""
-    owner = _controller_owner_from_environment()
-    if owner is None:
-        return
-    result = await connection.execute(
-        _current_controller_leadership_statement(*owner, lock=True))
-    if result.scalar_one_or_none() is None:
-        raise RuntimeError('Controller leadership changed before the durable '
-                           'maintenance write.')
-
-
 class ControllerLeaderLease:
     """Dedicated-session controller leadership with a durable generation."""
 
     def __init__(self, instance_id: str | None = None) -> None:
         self.instance_id = instance_id or ensure_server_instance_id()
         self.generation: int | None = None
+        self._origin_capability: str | None = None
         self._generation_lock_key: int | None = None
         self._lock = locks.PostgresLock(_CONTROLLER_LEADER_LOCK_ID, timeout=0)
 
-    def _advance_generation(self, connection: Any) -> tuple[int, int]:
+    def _advance_generation(self, connection: Any,
+                            capability_digest: bytes) -> tuple[int, int]:
         cursor = connection.cursor()
         try:
             cursor.execute(
                 """
                 INSERT INTO api_controller_leadership (
                     leadership_key, generation, instance_id,
-                    lock_backend_pid, generation_lock_key, acquired_at,
-                    heartbeat_at, released_at
+                    lock_backend_pid, generation_lock_key,
+                    origin_capability_sha256, acquired_at, heartbeat_at,
+                    released_at
                 )
-                VALUES (%s, 1, %s::uuid, pg_backend_pid(), 0,
+                VALUES (%s, 1, %s::uuid, pg_backend_pid(), 0, %s,
                         clock_timestamp(), clock_timestamp(), NULL)
                 ON CONFLICT (leadership_key) DO UPDATE SET
                     generation =
@@ -706,11 +1180,14 @@ class ControllerLeaderLease:
                     instance_id = EXCLUDED.instance_id,
                     lock_backend_pid = pg_backend_pid(),
                     generation_lock_key = 0,
+                    origin_capability_sha256 =
+                        EXCLUDED.origin_capability_sha256,
                     acquired_at = clock_timestamp(),
                     heartbeat_at = clock_timestamp(),
                     released_at = NULL
                 RETURNING generation
-                """, (_CONTROLLER_LEADERSHIP_KEY, self.instance_id))
+                """, (_CONTROLLER_LEADERSHIP_KEY, self.instance_id,
+                      capability_digest))
             generation = int(cursor.fetchone()[0])
             generation_lock_key = locks.postgres_lock_key(
                 f'{_CONTROLLER_GENERATION_LOCK_PREFIX}{generation}')
@@ -754,16 +1231,28 @@ class ControllerLeaderLease:
         except locks.LockTimeout:
             return False
         try:
+            capability = controller_capability.generate()
+            capability_digest = controller_capability.digest(capability)
             generation, generation_lock_key = self._lock.run_in_lock_session(
-                self._advance_generation)
+                lambda connection: self._advance_generation(
+                    connection, capability_digest))
             self.generation = generation
             self._generation_lock_key = generation_lock_key
+            self._origin_capability = capability
         except BaseException:
+            self._origin_capability = None
             self._lock.release()
             raise
         logger.info('Acquired API controller leadership generation '
                     f'{self.generation} as {self.instance_id}.')
         return True
+
+    @property
+    def origin_capability(self) -> str:
+        """Return this live generation's raw, process-local authority."""
+        if self.generation is None or self._origin_capability is None:
+            raise RuntimeError('Controller leadership is not acquired.')
+        return self._origin_capability
 
     def heartbeat(self) -> bool:
         """Prove the lock session and refresh only this durable generation."""
@@ -866,6 +1355,7 @@ class ControllerLeaderLease:
         self._lock.release()
         self.generation = None
         self._generation_lock_key = None
+        self._origin_capability = None
 
 
 def controller_leadership_is_current(instance_id: str, generation: int) -> bool:
@@ -875,6 +1365,28 @@ def controller_leadership_is_current(instance_id: str, generation: int) -> bool:
         return connection.execute(
             _current_controller_leadership_statement(
                 instance_id, generation)).scalar_one_or_none() is not None
+
+
+def controller_origin_capability_is_current(instance_id: str, generation: int,
+                                            capability: str) -> bool:
+    """Authenticate one controller origin against its live generation row."""
+    try:
+        capability_digest = controller_capability.digest(capability)
+        canonical_instance_id = str(uuid.UUID(instance_id))
+        parsed_generation = int(generation)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (canonical_instance_id != instance_id or parsed_generation <= 0 or
+            isinstance(generation, bool)):
+        return False
+    engine = initialize_and_get_db()
+    with engine.connect() as connection:
+        statement = sqlalchemy.select(CONTROLLER_LEADERSHIP.c.generation).where(
+            _controller_leadership_is_current_predicate(
+                uuid.UUID(canonical_instance_id), parsed_generation),
+            CONTROLLER_LEADERSHIP.c.origin_capability_sha256 ==
+            capability_digest)
+        return connection.execute(statement).scalar_one_or_none() is not None
 
 
 def fence_stale_controller_claims(instance_id: str,
@@ -909,27 +1421,36 @@ def fence_stale_controller_claims(instance_id: str,
                 request_registry.ReplayPolicy.READ_ONLY,
                 request_registry.ReplayPolicy.RECONCILE)
             if replayable:
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == row['request_id']).values(
-                            status=requests_lib.RequestStatus.WAITING.value,
-                            pid=None,
-                            claim_token=None,
-                            worker_instance_id=None,
-                            controller_generation=None,
-                            lease_expires_at=None,
-                            heartbeat_at=None,
-                            status_msg='Controller leadership changed; '
-                            'reconciling',
-                            updated_at=now))
-                connection.execute(
-                    sqlalchemy.update(QUEUE).where(
-                        QUEUE.c.request_id == row['request_id']).values(
-                            delivery_state='queued',
-                            claim_generation=None,
-                            available_at=now,
-                            updated_at=now))
-                replayed += 1
+                if row['pid'] is None:
+                    if _requeue_locked_pre_effect_claim(
+                            connection,
+                            row,
+                            status_msg=('Controller leadership changed before '
+                                        'execution admission; reconciling'),
+                            interrupted_reason=(
+                                'Controller leadership changed before the '
+                                'exact claim crossed its guarded RUNNING '
+                                'transition.')):
+                        replayed += 1
+                    continue
+                result = connection.execute(
+                    sqlalchemy.update(REQUESTS).
+                    where(REQUESTS.c.request_id == row['request_id']).values(
+                        # Replay policy permits a later invocation; it does
+                        # not prove that the old one stopped. Keep its exact
+                        # owner and claimed delivery intact until that
+                        # wrapper publishes generation-bound quiescence.
+                        cancel_requested_at=sqlalchemy.func.coalesce(
+                            REQUESTS.c.cancel_requested_at, now),
+                        execution_quiescence_required=True,
+                        should_retry=True,
+                        status_msg=('Controller leadership changed; '
+                                    'waiting for execution quiescence'),
+                        interrupted_reason=(
+                            'Controller leadership changed; replay is '
+                            'deferred until the exact execution stops.'),
+                        updated_at=now))
+                replayed += int(result.rowcount == 1)
                 continue
             transitioned = _terminalize_locked_request(
                 connection,
@@ -937,11 +1458,12 @@ def fence_stale_controller_claims(instance_id: str,
                 status=requests_lib.RequestStatus.CANCELLED,
                 cause=event_api_models.EventCause.CONTROLLER_LEADERSHIP_LOST,
                 values={
-                    'pid': None,
-                    'claim_token': None,
-                    'worker_instance_id': None,
-                    'lease_expires_at': None,
-                    'heartbeat_at': None,
+                    # Retain the exact old-owner tombstone so its dispatcher
+                    # can observe controller-generation revocation, signal the
+                    # effect-bearing wrapper, and publish a real quiescence
+                    # receipt. Request retention owns eventual identity GC.
+                    'cancel_requested_at': now,
+                    'execution_quiescence_required': True,
                     'should_retry': True,
                     'finished_at': now,
                     'interrupted_reason':
@@ -959,6 +1481,7 @@ def fence_stale_controller_claims(instance_id: str,
                                                          reconciliation_at=now,
                                                          updated_at=now))
             interrupted += 1
+        _requeue_quiesced_replayable_requests(connection)
     return {'replayed': replayed, 'interrupted': interrupted}
 
 
@@ -1055,20 +1578,273 @@ def _queue_values(request: requests_lib.Request) -> dict[str, Any]:
     }
 
 
+def _requeue_quiesced_replayable_requests(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    request_id: str | None = None,
+) -> int:
+    """Consume exact quiescence into the one canonical replay queue path.
+
+    Lease expiry and controller handoff revoke an invocation, but never prove
+    that its effect-bearing wrapper stopped.  Those paths retain the claimed
+    delivery and complete owner tuple.  This reducer is the only path that may
+    erase that tuple and make a replayable request executable again, and it does
+    so only while consuming the exact generation's durable receipt.
+
+    Terminal requests are never reopened.
+    """
+    exact_receipt = sqlalchemy.and_(
+        REQUESTS.c.execution_quiescence_required,
+        REQUESTS.c.execution_quiesced_generation ==
+        REQUESTS.c.execution_generation,
+        REQUESTS.c.execution_quiesced_at.is_not(None))
+    active_barrier = sqlalchemy.and_(
+        REQUESTS.c.status.in_([
+            status.value
+            for status in requests_lib.RequestStatus.active_statuses()
+        ]), REQUESTS.c.cancel_requested_at.is_not(None), exact_receipt)
+    shutdown_retry = sqlalchemy.and_(
+        REQUESTS.c.status.in_([
+            status.value
+            for status in requests_lib.RequestStatus.active_statuses()
+        ]), exact_receipt,
+        REQUESTS.c.interrupted_reason == _GRACEFUL_SHUTDOWN_RETRY_REASON)
+    replayable_handler_names = tuple(
+        name for registration in request_registry.registered_handlers()
+        if registration.replay_policy in (
+            request_registry.ReplayPolicy.READ_ONLY,
+            request_registry.ReplayPolicy.RECONCILE)
+        for name in (registration.name, *registration.aliases))
+    statement = sqlalchemy.select(REQUESTS).where(
+        sqlalchemy.or_(
+            shutdown_retry,
+            sqlalchemy.and_(
+                active_barrier,
+                REQUESTS.c.handler_name.in_(replayable_handler_names))))
+    if request_id is not None:
+        statement = statement.where(REQUESTS.c.request_id == request_id)
+    else:
+        statement = statement.order_by(
+            REQUESTS.c.updated_at).limit(_MAX_EXPIRED_CLAIMS_PER_SWEEP)
+    rows = connection.execute(
+        statement.with_for_update(skip_locked=True)).mappings().all()
+    replayed = 0
+    now = sqlalchemy.func.clock_timestamp()
+    for row in rows:
+        try:
+            registration = request_registry.resolve_handler(row['handler_name'])
+        except ValueError:
+            # A removed plugin cannot be reconstructed safely by this
+            # build.  Retain its evidence for operator reconciliation.
+            continue
+        policy = registration.replay_policy
+        status = requests_lib.RequestStatus(str(row['status']))
+        if status in requests_lib.RequestStatus.finished_status():
+            continue
+        graceful_shutdown_retry = (
+            row['interrupted_reason'] == _GRACEFUL_SHUTDOWN_RETRY_REASON)
+        if (not graceful_shutdown_retry and
+                policy not in (request_registry.ReplayPolicy.READ_ONLY,
+                               request_registry.ReplayPolicy.RECONCILE)):
+            continue
+
+        queue_row = connection.execute(
+            sqlalchemy.select(QUEUE).where(
+                QUEUE.c.request_id ==
+                row['request_id']).with_for_update()).mappings().one_or_none()
+        generation = int(row['execution_generation'])
+        if graceful_shutdown_retry:
+            if (queue_row is None or queue_row['delivery_state'] != 'claimed' or
+                    queue_row['claim_generation'] != generation or
+                    row['claim_token'] is None or
+                    row['worker_instance_id'] is None or
+                    row['lease_expires_at'] is None):
+                continue
+            if _terminalize_locked_request(
+                    connection,
+                    row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=event_api_models.EventCause.GRACEFUL_SHUTDOWN_RETRY,
+                    values={
+                        'should_retry': True,
+                        'finished_at': now,
+                        'status_msg': None,
+                    }):
+                replayed += 1
+            continue
+        if (queue_row is None or queue_row['delivery_state'] != 'claimed' or
+                queue_row['claim_generation'] != generation or
+                row['claim_token'] is None or
+                row['worker_instance_id'] is None or
+                row['lease_expires_at'] is None):
+            continue
+        next_status = requests_lib.RequestStatus.WAITING
+
+        result = connection.execute(
+            sqlalchemy.update(REQUESTS).where(
+                REQUESTS.c.request_id == row['request_id'],
+                REQUESTS.c.execution_generation == generation,
+                REQUESTS.c.status == status.value,
+                REQUESTS.c.execution_quiescence_required,
+                REQUESTS.c.execution_quiesced_generation == generation,
+                REQUESTS.c.execution_quiesced_at.is_not(None)).values(
+                    status=next_status.value,
+                    terminal_cause=None,
+                    return_value=None,
+                    error=None,
+                    pid=None,
+                    execution_process_start_time_ticks=None,
+                    claim_token=None,
+                    worker_instance_id=None,
+                    controller_generation=None,
+                    lease_expires_at=None,
+                    heartbeat_at=None,
+                    cancel_requested_at=None,
+                    cancel_acknowledged_at=None,
+                    execution_quiescence_required=False,
+                    execution_quiesced_generation=None,
+                    execution_quiesced_at=None,
+                    should_retry=False,
+                    finished_at=None,
+                    status_msg=None,
+                    interrupted_reason=None,
+                    updated_at=now))
+        if result.rowcount != 1:
+            continue
+        queue_result = connection.execute(
+            sqlalchemy.update(QUEUE).where(
+                QUEUE.c.request_id == row['request_id'],
+                QUEUE.c.delivery_state == 'claimed',
+                QUEUE.c.claim_generation == generation).values(
+                    delivery_state='queued',
+                    claim_generation=None,
+                    available_at=now,
+                    updated_at=now))
+        if queue_result.rowcount != 1:
+            raise RuntimeError('Replay barrier lost its locked delivery.')
+        replayed += 1
+    return replayed
+
+
+def _requeue_locked_pre_effect_claim(
+    connection: sqlalchemy.engine.Connection,
+    row: Mapping[str, Any],
+    *,
+    status_msg: str,
+    interrupted_reason: str,
+) -> bool:
+    """Prove and replay one locked claim that never entered RUNNING.
+
+    A claimed row with no PID has not crossed ``try_mark_running()``.  While
+    both the request and delivery are locked, revoking that exact generation
+    before recording its quiescence receipt makes every late child admission
+    lose the claim predicates.  This is therefore authoritative pre-effect
+    proof, shared by worker loss, lease expiry, and controller handoff.
+    """
+    if (row['pid'] is not None or
+            row['execution_process_start_time_ticks'] is not None or
+            row['claim_token'] is None or row['worker_instance_id'] is None or
+            row['lease_expires_at'] is None or
+            row['delivery_state'] != 'claimed' or
+            row['claim_generation'] != row['execution_generation'] or
+            requests_lib.RequestStatus(str(row['status']))
+            not in requests_lib.RequestStatus.executable_statuses()):
+        return False
+    generation = int(row['execution_generation'])
+    now = sqlalchemy.func.clock_timestamp()
+    receipt = connection.execute(
+        sqlalchemy.update(REQUESTS).where(
+            REQUESTS.c.request_id == row['request_id'],
+            REQUESTS.c.status.in_([
+                status.value
+                for status in requests_lib.RequestStatus.executable_statuses()
+            ]),
+            REQUESTS.c.execution_generation == generation,
+            REQUESTS.c.claim_token == row['claim_token'],
+            REQUESTS.c.worker_instance_id == row['worker_instance_id'],
+            REQUESTS.c.lease_expires_at == row['lease_expires_at'],
+            REQUESTS.c.pid.is_(None),
+            REQUESTS.c.execution_process_start_time_ticks.is_(None),
+        ).values(cancel_requested_at=sqlalchemy.func.coalesce(
+            REQUESTS.c.cancel_requested_at, now),
+                 execution_quiescence_required=True,
+                 execution_quiesced_generation=generation,
+                 execution_quiesced_at=now,
+                 should_retry=True,
+                 status_msg=status_msg,
+                 interrupted_reason=interrupted_reason,
+                 updated_at=now))
+    if receipt.rowcount != 1:
+        return False
+    replayed = _requeue_quiesced_replayable_requests(connection,
+                                                     request_id=str(
+                                                         row['request_id']))
+    if replayed != 1:
+        raise RuntimeError('Pre-effect proof did not reach the canonical '
+                           'replay reducer.')
+    return True
+
+
+def _terminalize_stale_managed_job_request(
+    connection: sqlalchemy.engine.Connection,
+    row: Mapping[str, Any],
+) -> bool:
+    """Consume one locked stale nested delivery as exact pre-effect work."""
+    if _managed_job_origin(row) is None:
+        return False
+    status = requests_lib.RequestStatus(str(row['status']))
+    if status not in requests_lib.RequestStatus.executable_statuses():
+        return False
+    if (row['pid'] is not None or
+            row['execution_process_start_time_ticks'] is not None):
+        return False
+    generation = int(row['execution_generation'])
+    now = sqlalchemy.func.clock_timestamp()
+    return _terminalize_locked_request(
+        connection,
+        row,
+        status=requests_lib.RequestStatus.CANCELLED,
+        cause=event_api_models.EventCause.CONTROLLER_LEADERSHIP_LOST,
+        values={
+            'cancel_requested_at': now,
+            'execution_quiescence_required': True,
+            'execution_quiesced_generation': generation,
+            'execution_quiesced_at': now,
+            'should_retry': False,
+            'finished_at': now,
+            'status_msg': 'Managed-job controller attempt is no longer current.',
+            'interrupted_reason': _MANAGED_JOB_QUIESCE_REASON,
+        })
+
+
 def _insert_request_and_queue(
     connection: sqlalchemy.engine.Connection,
     request: requests_lib.Request,
     *,
     resource_action_id: uuid.UUID | None = None,
     resource_action_attempt: int | None = None,
+    ordinary_launch_association_id: uuid.UUID | None = None,
 ) -> bool:
     """Insert one request and its queue row in the caller's transaction."""
     if ((resource_action_id is None) != (resource_action_attempt is None)):
         raise ValueError('Resource-action request correlation requires both '
                          'an action ID and an attempt number.')
     values = _request_values_for_db(request)
+    if not _lock_managed_job_origin(connection, values, require_admission=True):
+        raise request_storage.ManagedJobRequestQuiescenceError(
+            'Managed-job nested request creation lost its exact controller '
+            'attempt authority.')
+    legacy_service_name = _legacy_ordinary_launch_service_name(values)
+    if legacy_service_name is not None:
+        # Promotion owns the exclusive side of this service-scoped transaction
+        # lock before it scans legacy requests.  Taking the shared side before
+        # INSERT closes the admission phantom without table locks (which can
+        # deadlock a queue claimant's ROW SHARE -> ROW EXCLUSIVE upgrade).
+        ordinary_launch_binding.lock_legacy_request_admission_in_connection(
+            connection, legacy_service_name)
     values['resource_action_id'] = resource_action_id
     values['resource_action_attempt'] = resource_action_attempt
+    values['ordinary_launch_association_id'] = (ordinary_launch_association_id)
     result = connection.execute(
         postgresql.insert(REQUESTS).values(**values).on_conflict_do_nothing(
             index_elements=[REQUESTS.c.request_id]).returning(
@@ -1080,6 +1856,141 @@ def _insert_request_and_queue(
                 **_queue_values(request)).on_conflict_do_nothing(
                     index_elements=[QUEUE.c.request_id]))
     return inserted
+
+
+def _legacy_ordinary_launch_service_name(
+        values: Mapping[str, Any]) -> str | None:
+    """Return the exact service scope for one valid legacy launch payload."""
+    if (values.get('handler_name') != _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME or
+            values.get('payload_type') != _LEGACY_ORDINARY_LAUNCH_PAYLOAD_TYPE):
+        return None
+    payload_json = values.get('payload_json')
+    if (not isinstance(payload_json, dict) or
+            payload_json.get('is_launched_by_sky_serve_controller')
+            is not True):
+        return None
+    context = payload_json.get('extra_launch_context')
+    if not isinstance(context, dict):
+        return None
+    service_name = context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+    if not isinstance(service_name, str) or not service_name:
+        return None
+    return service_name
+
+
+def _validate_retention_pin(pin_kind: str, pin_id: uuid.UUID) -> None:
+    if not isinstance(pin_kind, str) or not 1 <= len(pin_kind) <= 128:
+        raise ValueError('Retention pin kind must contain 1-128 characters.')
+    if not isinstance(pin_id, uuid.UUID):
+        raise ValueError('Retention pin ID must be a UUID.')
+
+
+def insert_request_retention_pin_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    request_id: str,
+    pin_kind: str,
+    pin_id: uuid.UUID,
+) -> None:
+    """Insert one active retention pin in the caller's transaction."""
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('A retention pin requires a request ID.')
+    _validate_retention_pin(pin_kind, pin_id)
+    connection.execute(
+        sqlalchemy.insert(REQUEST_RETENTION_PINS).values(request_id=request_id,
+                                                         pin_kind=pin_kind,
+                                                         pin_id=pin_id))
+
+
+def delete_request_retention_pin_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    request_id: str,
+    pin_kind: str,
+    pin_id: uuid.UUID,
+) -> bool:
+    """Delete one exact active pin after its owner durably settles."""
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('A retention pin requires a request ID.')
+    _validate_retention_pin(pin_kind, pin_id)
+    result = connection.execute(
+        sqlalchemy.delete(REQUEST_RETENTION_PINS).where(
+            REQUEST_RETENTION_PINS.c.request_id == request_id,
+            REQUEST_RETENTION_PINS.c.pin_kind == pin_kind,
+            REQUEST_RETENTION_PINS.c.pin_id == pin_id))
+    return result.rowcount == 1
+
+
+def request_retention_pin_is_active_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    request_id: str,
+    pin_kind: str,
+    pin_id: uuid.UUID,
+) -> bool:
+    """Return whether one exact active pin exists without taking a lock."""
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('A retention pin requires a request ID.')
+    _validate_retention_pin(pin_kind, pin_id)
+    result = connection.execute(
+        sqlalchemy.select(sqlalchemy.literal(True)).where(
+            sqlalchemy.exists().where(
+                REQUEST_RETENTION_PINS.c.request_id == request_id,
+                REQUEST_RETENTION_PINS.c.pin_kind == pin_kind,
+                REQUEST_RETENTION_PINS.c.pin_id ==
+                pin_id))).scalar_one_or_none()
+    return bool(result)
+
+
+def validate_bound_ordinary_launch_claim_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    association_id: uuid.UUID,
+    claim: request_storage.ExecutionClaim,
+) -> bool:
+    """Lock and validate the exact request/queue/pin effect authority.
+
+    Serve calls this only after locking its association. The function then
+    follows the global suffix order: request, queue, retention pin. A valid
+    claim proves only request-executor authority; Serve still owns the replica
+    and effect-phase fence.
+    """
+    if (not isinstance(association_id, uuid.UUID) or
+            claim.worker_instance_id is None):
+        return False
+    try:
+        claim_token = uuid.UUID(claim.claim_token)
+        worker_instance_id = uuid.UUID(claim.worker_instance_id)
+    except (TypeError, ValueError):
+        return False
+    row = connection.execute(
+        sqlalchemy.select(REQUESTS.c.request_id).join(
+            QUEUE, QUEUE.c.request_id == REQUESTS.c.request_id).where(
+                REQUESTS.c.request_id == claim.request_id,
+                REQUESTS.c.handler_name ==
+                ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME,
+                REQUESTS.c.ordinary_launch_association_id == association_id,
+                REQUESTS.c.status == requests_lib.RequestStatus.RUNNING.value,
+                REQUESTS.c.execution_generation == claim.execution_generation,
+                REQUESTS.c.claim_token == claim_token,
+                REQUESTS.c.worker_instance_id == worker_instance_id,
+                REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
+                REQUESTS.c.execution_quiescence_required,
+                QUEUE.c.delivery_state == 'claimed',
+                QUEUE.c.claim_generation == claim.execution_generation).
+        with_for_update()).scalar_one_or_none()
+    if row is None:
+        return False
+    pin = connection.execute(
+        sqlalchemy.select(REQUEST_RETENTION_PINS.c.pin_id).where(
+            REQUEST_RETENTION_PINS.c.pin_kind ==
+            ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+            REQUEST_RETENTION_PINS.c.pin_id == association_id,
+            REQUEST_RETENTION_PINS.c.request_id ==
+            claim.request_id).with_for_update()).scalar_one_or_none()
+    return pin == association_id
+
+
+def _request_has_no_active_retention_pin() -> sqlalchemy.ColumnElement[bool]:
+    return ~sqlalchemy.exists().where(
+        REQUEST_RETENTION_PINS.c.request_id == REQUESTS.c.request_id)
 
 
 def _request_is_retention_safe() -> sqlalchemy.ColumnElement[bool]:
@@ -1098,7 +2009,1344 @@ def _request_is_retention_safe() -> sqlalchemy.ColumnElement[bool]:
             REQUESTS.c.execution_quiesced_generation ==
             REQUESTS.c.execution_generation,
             REQUESTS.c.execution_quiesced_at.is_not(None)))
-    return sqlalchemy.and_(action_is_safe, execution_is_safe)
+    return sqlalchemy.and_(action_is_safe, execution_is_safe,
+                           _request_has_no_active_retention_pin())
+
+
+def insert_bound_request_and_queue_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    request: requests_lib.Request,
+    *,
+    ordinary_launch_association_id: uuid.UUID,
+) -> bool:
+    """Insert one bound request and queue row in the caller transaction."""
+    if not request.should_enqueue:
+        raise ValueError('Bound request insertion must enqueue atomically.')
+    if request.retryable:
+        raise ValueError('Bound request execution cannot use generic retry.')
+    if not isinstance(ordinary_launch_association_id, uuid.UUID):
+        raise ValueError('Bound request association ID must be a UUID.')
+    registration = request_registry.registration_for_handler(request.entrypoint)
+    if registration.name != (
+            ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME):
+        raise ValueError('A bound request requires the distinct ordinary '
+                         'launch handler.')
+    inserted = _insert_request_and_queue(
+        connection,
+        request,
+        ordinary_launch_association_id=ordinary_launch_association_id)
+    if inserted:
+        insert_request_retention_pin_in_transaction(
+            connection, request.request_id, ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+            ordinary_launch_association_id)
+    return inserted
+
+
+def _validate_existing_bound_request_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    request: requests_lib.Request,
+    identity: ordinary_launch_binding_lib.BindingIdentity,
+    admission: ordinary_launch_binding_lib.BindingAdmission,
+) -> None:
+    """Lock and verify the API half of one exact admission retry."""
+    request_row = connection.execute(
+        sqlalchemy.select(REQUESTS).where(
+            REQUESTS.c.request_id ==
+            request.request_id).with_for_update()).mappings().one_or_none()
+    if request_row is None:
+        if admission.expects_active_request:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Unsettled binding has no correlated API request.')
+        return
+
+    expected = _request_values_for_db(request)
+    immutable_columns = (
+        'request_id',
+        'name',
+        'handler_name',
+        'payload_type',
+        'payload_format',
+        'payload_version',
+        'payload_json',
+        'execution_class',
+        'cluster_name',
+        'schedule_type',
+        'user_id',
+        'ignore_return_value',
+        'retryable',
+    )
+    if (request_row['ordinary_launch_association_id'] != identity.association_id
+            or any(request_row[column] != expected[column]
+                   for column in immutable_columns)):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Existing API request does not match the exact binding intent.')
+
+    # Global cross-lineage lock suffix: request, queue, then active pin.
+    queue_row = connection.execute(
+        sqlalchemy.select(QUEUE).where(
+            QUEUE.c.request_id ==
+            request.request_id).with_for_update()).mappings().one_or_none()
+    active = (str(request_row['status']) in {
+        status.value for status in requests_lib.RequestStatus.active_statuses()
+    })
+    if active and queue_row is None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Active bound API request has no durable queue delivery.')
+    if not active and queue_row is not None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Terminal bound API request retained a queue delivery.')
+    if queue_row is not None:
+        expected_queue = _queue_values(request)
+        queue_columns = (
+            'schedule_type',
+            'ignore_return_value',
+            'retryable',
+            'precondition_type',
+            'precondition_payload',
+            'precondition_deadline',
+        )
+        if (queue_row['delivery_state'] not in ('queued', 'claimed') or
+                any(queue_row[column] != expected_queue[column]
+                    for column in queue_columns)):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Existing queue delivery does not match the bound request.')
+        if ((queue_row['delivery_state'] == 'queued')
+                != (queue_row['claim_generation'] is None)):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Existing bound queue claim state is inconsistent.')
+        if (queue_row['delivery_state'] == 'claimed' and
+                int(queue_row['claim_generation']) != int(
+                    request_row['execution_generation'])):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Existing bound queue generation is inconsistent.')
+
+    pin_row = connection.execute(
+        sqlalchemy.select(REQUEST_RETENTION_PINS).where(
+            REQUEST_RETENTION_PINS.c.pin_kind ==
+            ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+            REQUEST_RETENTION_PINS.c.pin_id == identity.association_id).
+        with_for_update()).mappings().one_or_none()
+    if admission.expects_active_request:
+        if (pin_row is None or pin_row['request_id'] != request.request_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Unsettled binding has no exact active retention pin.')
+    elif pin_row is not None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Settled binding retained an active request pin.')
+
+
+def bind_and_enqueue_ordinary_launch(
+    request: requests_lib.Request,
+    identity: ordinary_launch_binding_lib.BindingIdentity,
+) -> ordinary_launch_binding_lib.BindingAdmission:
+    """Atomically create or verify both halves of a bound Serve launch."""
+    if request.request_id != identity.request_id:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Request ID does not match the server-derived binding identity.')
+    if request.retryable or not request.should_enqueue:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound ordinary launch requires one non-retryable queue delivery.')
+    registration = request_registry.registration_for_handler(request.entrypoint)
+    if registration.name != (
+            ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound ordinary launch requires its distinct durable handler.')
+    _, _, backend_capable = _resolved_request_backend_capability()
+    if not backend_capable:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Ordinary launch binding requires the built-in PostgreSQL '
+            'request and queue backends.')
+
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Ordinary launch binding requires central PostgreSQL state.')
+    with engine.begin() as connection:
+        if not ordinary_launch_binding_fleet_capable(connection=connection):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+                'Ordinary launch binding is waiting for one fully capable '
+                'API/executor fleet stale window.')
+        admission = ordinary_launch_binding.insert_or_get_locked(
+            connection, identity)
+        if (admission.association_id != str(identity.association_id) or
+                admission.request_id != identity.request_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Serve admission returned a different deterministic identity.')
+        ordinary_launch_binding.install_bound_context(
+            request.request_body, identity, admission.launch_generation)
+        if admission.created:
+            inserted = insert_bound_request_and_queue_in_transaction(
+                connection,
+                request,
+                ordinary_launch_association_id=identity.association_id)
+            if not inserted:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'New Serve association collided with an API request ID.')
+        else:
+            _validate_existing_bound_request_in_transaction(
+                connection, request, identity, admission)
+        return admission
+
+
+def _bound_context_from_association(
+    association: Mapping[str, Any],
+) -> ordinary_launch_binding_lib.BoundLaunchContext:
+    """Build the immutable controller view without trusting process state."""
+    return ordinary_launch_binding.BoundLaunchContext(
+        association_id=uuid.UUID(str(association['association_id'])),
+        request_id=str(association['request_id']),
+        service_name=str(association['service_name']),
+        replica_id=int(association['replica_id']),
+        replica_record_id=uuid.UUID(str(association['replica_record_id'])),
+        launch_generation=int(association['launch_generation']),
+        input_digest=str(association['input_digest']),
+    )
+
+
+def _lock_bound_request_evidence(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+) -> tuple[BoundOrdinaryLaunchRequestFacts, Mapping[str, Any] | None,
+           Mapping[str, Any] | None, Mapping[str, Any] | None]:
+    """Lock the request/queue/pin suffix after Serve authority is locked."""
+    request_row = connection.execute(
+        sqlalchemy.select(REQUESTS).where(
+            REQUESTS.c.request_id ==
+            context.request_id).with_for_update()).mappings().one_or_none()
+    queue_row = connection.execute(
+        sqlalchemy.select(QUEUE).where(
+            QUEUE.c.request_id ==
+            context.request_id).with_for_update()).mappings().one_or_none()
+    pin_row = connection.execute(
+        sqlalchemy.select(REQUEST_RETENTION_PINS).where(
+            REQUEST_RETENTION_PINS.c.pin_kind ==
+            ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+            REQUEST_RETENTION_PINS.c.pin_id ==
+            context.association_id).with_for_update()).mappings().one_or_none()
+    if pin_row is not None and pin_row['request_id'] != context.request_id:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Association retention pin names a different API request.')
+    if request_row is None:
+        facts = BoundOrdinaryLaunchRequestFacts(
+            association_id=context.association_id,
+            request_id=context.request_id,
+            exists=False,
+            status=None,
+            terminal_cause=None,
+            execution_generation=None,
+            claim_token=None,
+            worker_instance_id=None,
+            lease_expires_at=None,
+            claim_exists=False,
+            claim_active=False,
+            claim_expired=False,
+            queue_exists=queue_row is not None,
+            queue_delivery_state=(None if queue_row is None else str(
+                queue_row['delivery_state'])),
+            queue_claim_generation=(None if queue_row is None or
+                                    queue_row['claim_generation'] is None else
+                                    int(queue_row['claim_generation'])),
+            execution_quiescence_required=False,
+            execution_quiesced_generation=None,
+            execution_quiesced_at=None,
+            quiescent=False,
+            retention_pin_active=pin_row is not None,
+            return_value=None,
+            error=None,
+            error_decode_failed=False)
+        return facts, None, queue_row, pin_row
+    if (request_row['handler_name']
+            != ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME or
+            request_row['ordinary_launch_association_id']
+            != context.association_id):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Correlated request does not name the bound ordinary handler.')
+
+    generation = int(request_row['execution_generation'])
+    claim_token = request_row['claim_token']
+    worker_instance_id = request_row['worker_instance_id']
+    lease_expires_at = request_row['lease_expires_at']
+    queue_claimed = bool(queue_row is not None and
+                         queue_row['delivery_state'] == 'claimed')
+    queue_generation = (None if queue_row is None or
+                        queue_row['claim_generation'] is None else int(
+                            queue_row['claim_generation']))
+    claim_exists = bool(claim_token is not None or
+                        worker_instance_id is not None or
+                        lease_expires_at is not None or queue_claimed)
+    database_now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    status = requests_lib.RequestStatus(str(request_row['status']))
+    exact_owner_shape = bool(claim_token is not None and
+                             worker_instance_id is not None and
+                             lease_expires_at is not None and generation > 0)
+    # Before terminalization the queue delivery is part of the exact claim.
+    # A terminal transition atomically deletes that delivery but deliberately
+    # retains its token/worker/lease so the real owner can still acknowledge
+    # quiescence from its finally block.  Both shapes identify one exact
+    # generation; no other terminal request shape may use lease expiry as
+    # evidence.
+    exact_claim_shape = bool(
+        exact_owner_shape and
+        ((status in requests_lib.RequestStatus.active_statuses() and
+          queue_claimed and queue_generation == generation and
+          (status != requests_lib.RequestStatus.RUNNING or
+           request_row['pid'] is not None)) or
+         (status in requests_lib.RequestStatus.finished_status() and
+          queue_row is None)))
+    claim_active = bool(
+        status in requests_lib.RequestStatus.active_statuses() and
+        exact_claim_shape and lease_expires_at > database_now)
+    claim_expired = bool(exact_claim_shape and lease_expires_at <= database_now)
+    quiesced_generation = request_row['execution_quiesced_generation']
+    quiesced_at = request_row['execution_quiesced_at']
+    raw_cause = request_row['terminal_cause']
+    terminal_cause = (None if raw_cause is None else
+                      event_api_models.EventCause(str(raw_cause)))
+    decoded_error = None
+    error_decode_failed = False
+    if request_row['error'] is not None:
+        try:
+            candidate_error = _request_from_mapping(
+                typing.cast(sqlalchemy.engine.RowMapping,
+                            request_row)).get_error()
+            if (not isinstance(candidate_error, dict) or
+                    set(candidate_error) != {'object', 'type', 'message'} or
+                    not isinstance(candidate_error.get('object'), BaseException)
+                    or candidate_error.get('type') != type(
+                        candidate_error['object']).__name__ or
+                    candidate_error.get('message') != str(
+                        candidate_error['object'])):
+                error_decode_failed = True
+            else:
+                decoded_error = candidate_error
+        except Exception:  # pylint: disable=broad-except
+            # This is pure decoding of bytes already read under the row lock;
+            # database transport failures happen before this narrow block.
+            # Preserve the distinction so the reducer can durably fail closed
+            # instead of retrying a corrupt terminal row forever.
+            error_decode_failed = True
+    facts = BoundOrdinaryLaunchRequestFacts(
+        association_id=context.association_id,
+        request_id=context.request_id,
+        exists=True,
+        status=status,
+        terminal_cause=terminal_cause,
+        execution_generation=generation,
+        claim_token=claim_token,
+        worker_instance_id=worker_instance_id,
+        lease_expires_at=lease_expires_at,
+        claim_exists=claim_exists,
+        claim_active=claim_active,
+        claim_expired=claim_expired,
+        queue_exists=queue_row is not None,
+        queue_delivery_state=(None if queue_row is None else str(
+            queue_row['delivery_state'])),
+        queue_claim_generation=queue_generation,
+        execution_quiescence_required=bool(
+            request_row['execution_quiescence_required']),
+        execution_quiesced_generation=(None if quiesced_generation is None else
+                                       int(quiesced_generation)),
+        execution_quiesced_at=quiesced_at,
+        quiescent=((quiesced_generation == generation and
+                    quiesced_at is not None) or
+                   (not request_row['execution_quiescence_required'] and
+                    generation == 0 and not claim_exists)),
+        retention_pin_active=pin_row is not None,
+        return_value=request_row['return_value'],
+        error=decoded_error,
+        error_decode_failed=error_decode_failed)
+    return facts, request_row, queue_row, pin_row
+
+
+def read_bound_ordinary_launch_request_facts_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    association_id: uuid.UUID,
+    request_id: str,
+) -> BoundOrdinaryLaunchRequestFacts:
+    """Read exact request facts under the canonical request lock suffix.
+
+    A cross-layer caller must lock Serve lifecycle/service/pool/replica/
+    association authority before calling this function.
+    """
+    if not isinstance(association_id, uuid.UUID):
+        raise ValueError('association_id must be a UUID.')
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError('request_id must be non-empty text.')
+    context = ordinary_launch_binding.BoundLaunchContext(
+        association_id=association_id,
+        request_id=request_id,
+        service_name='_request-facts-only',
+        replica_id=1,
+        replica_record_id=uuid.UUID(int=0),
+        launch_generation=1,
+        input_digest='_request-facts-only')
+    facts, _, _, _ = _lock_bound_request_evidence(connection, context)
+    return facts
+
+
+def _bound_association_for_replica(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> Mapping[str, Any] | None:
+    association = ordinary_launch_binding.get_for_replica(
+        service_name, replica_id, replica_record_id)
+    return typing.cast(Mapping[str, Any] | None, association)
+
+
+def stable_bound_ordinary_launch_submission_id(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> str:
+    """Derive a retry-stable submission UUID from durable generation state."""
+    try:
+        record_uuid = uuid.UUID(replica_record_id)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(
+            'replica_record_id must be a canonical UUID string.') from error
+    if str(record_uuid) != replica_record_id:
+        raise ValueError('replica_record_id must be a canonical UUID string.')
+    if isinstance(replica_id,
+                  bool) or not isinstance(replica_id, int) or replica_id < 1:
+        raise ValueError('replica_id must be a positive integer.')
+    engine = initialize_and_get_db()
+    with engine.connect() as connection:
+        latest = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                submission_id, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.launch_generation,
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                resolution, ordinary_launch_binding.
+                ordinary_launch_associations_table.c.cancel_reason).where(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.service_name == service_name,
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.replica_id == replica_id,
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.replica_record_id == record_uuid).
+            order_by(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                launch_generation.desc()).limit(1)).mappings().one_or_none()
+    if latest is None:
+        generation = 1
+    else:
+        resolution = ordinary_launch_binding.Resolution(
+            str(latest['resolution']))
+        if resolution in ordinary_launch_binding.UNSETTLED_RESOLUTIONS:
+            return str(latest['submission_id'])
+        if resolution != ordinary_launch_binding.Resolution.PRE_EFFECT_TERMINAL:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'A post-effect projected launch cannot admit a successor for '
+                'the same replica record.')
+        if latest['cancel_reason'] is not None:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'A cancelled pre-effect launch cannot admit a successor for '
+                'the same replica record.')
+        generation = int(latest['launch_generation']) + 1
+    material = f'{service_name}\0{replica_id}\0{record_uuid}\0{generation}'
+    return str(uuid.uuid5(_ORDINARY_LAUNCH_SUBMISSION_NAMESPACE, material))
+
+
+def inspect_bound_ordinary_launch(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> OrdinaryLaunchReduction | None:
+    """Return a non-authorizing adoption snapshot without advisory guards.
+
+    This snapshot may become stale immediately and never grants provider or
+    projection permission. Avoiding the shared advisory guard is essential:
+    exact cancellation must remain addressable even if an exclusive ownership
+    transfer is contending behind opaque provider work.
+    """
+    association = _bound_association_for_replica(service_name, replica_id,
+                                                 replica_record_id)
+    if association is None:
+        return None
+    context = _bound_context_from_association(association)
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        locked = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        facts, _, _, _ = _lock_bound_request_evidence(connection, context)
+    resolution = ordinary_launch_binding.Resolution(str(locked['resolution']))
+    if resolution == ordinary_launch_binding.Resolution.AMBIGUOUS:
+        disposition = OrdinaryLaunchReductionDisposition.AMBIGUOUS
+    elif (facts.exists and
+          facts.status in requests_lib.RequestStatus.active_statuses() and
+          ((facts.queue_delivery_state == 'queued' and
+            facts.queue_claim_generation is None and not facts.claim_exists) or
+           (facts.queue_delivery_state == 'claimed' and facts.claim_active and
+            facts.queue_claim_generation == facts.execution_generation))):
+        disposition = OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE
+    elif facts.exists:
+        disposition = OrdinaryLaunchReductionDisposition.WAIT_QUIESCENCE
+    else:
+        disposition = OrdinaryLaunchReductionDisposition.AMBIGUOUS
+    service_job_id = locked['service_job_id']
+    return OrdinaryLaunchReduction(
+        context=_bound_context_from_association(association),
+        disposition=disposition,
+        request=facts,
+        service_job_id=(None
+                        if service_job_id is None else int(service_job_id)),
+        cancel_reason=locked.get('cancel_reason'),
+        projected=False)
+
+
+def lookup_bound_ordinary_launch_cancel_target(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> BoundOrdinaryLaunchCancelTarget | None:
+    """Resolve an exact cancellation address without advisory authority.
+
+    This snapshot grants no mutation permission. It exists so teardown can
+    address the direct canonical-row-lock cancel transaction even when opaque
+    provider work owns shared authority. That transaction re-locks and
+    revalidates every lifecycle/service/replica/association predicate.
+    """
+    association = _bound_association_for_replica(service_name, replica_id,
+                                                 replica_record_id)
+    if association is None:
+        return None
+    cancel_reason = association.get('cancel_reason')
+    if cancel_reason is not None and (not isinstance(cancel_reason, str) or
+                                      not cancel_reason):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound cancellation target has a malformed durable reason.')
+    return BoundOrdinaryLaunchCancelTarget(
+        context=_bound_context_from_association(association),
+        cancel_reason=cancel_reason)
+
+
+def _terminal_evidence(
+    facts: BoundOrdinaryLaunchRequestFacts,
+) -> ordinary_launch_binding_lib.TerminalEvidence:
+    if (facts.status not in requests_lib.RequestStatus.finished_status() or
+            facts.terminal_cause is None or
+            facts.execution_generation is None or not facts.quiescent):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound terminal evidence is incomplete or not quiescent.')
+    return ordinary_launch_binding.TerminalEvidence(
+        status=ordinary_launch_binding.TerminalStatus(facts.status.value),
+        cause=facts.terminal_cause.value,
+        execution_generation=facts.execution_generation,
+        quiescence_required=True,
+        quiesced_generation=facts.execution_quiesced_generation,
+        quiesced_at=facts.execution_quiesced_at)
+
+
+def _request_service_job_id(request_row: Mapping[str, Any],
+                            expected_cluster_name: str) -> int | None:
+    if request_row['status'] != requests_lib.RequestStatus.SUCCEEDED.value:
+        return None
+    try:
+        request = _request_from_mapping(
+            typing.cast(sqlalchemy.engine.RowMapping, request_row))
+        result = request.get_return_value()
+    except Exception as e:  # pylint: disable=broad-except
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Succeeded bound launch has a malformed or mismatched exact '
+            'service-job result.') from e
+    if (not isinstance(result, tuple) or len(result) != 2 or
+            isinstance(result[0], bool) or not isinstance(result[0], int) or
+            result[0] < 1 or
+            not isinstance(result[1], backends.CloudVmRayResourceHandle) or
+            result[1].cluster_name != expected_cluster_name):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Succeeded bound launch has a malformed or mismatched exact '
+            'service-job result.')
+    return result[0]
+
+
+def _reduction_result(
+    disposition: OrdinaryLaunchReductionDisposition,
+    facts: BoundOrdinaryLaunchRequestFacts,
+    association: Mapping[str, Any],
+    *,
+    projected: bool = False,
+) -> OrdinaryLaunchReduction:
+    service_job_id = association['service_job_id']
+    return OrdinaryLaunchReduction(
+        context=_bound_context_from_association(association),
+        disposition=disposition,
+        request=facts,
+        service_job_id=(None
+                        if service_job_id is None else int(service_job_id)),
+        cancel_reason=association.get('cancel_reason'),
+        projected=projected)
+
+
+def _controller_authority_matches_reduction(
+    association: Mapping[str, Any],
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    return bool(
+        isinstance(authority,
+                   ordinary_launch_binding.ControllerBindingAuthority) and
+        authority.capable is True and
+        authority.binding_mode == ordinary_launch_binding.BindingMode.BOUND and
+        authority.service_name == association['service_name'] and
+        authority.service_hash == association['service_hash'] and
+        authority.service_workspace == association['service_workspace'] and
+        authority.service_lifecycle_epoch
+        == association['service_lifecycle_epoch'] and
+        authority.binding_epoch == association['service_binding_epoch'] and
+        authority.controller_incarnation
+        == association['owner_controller_incarnation'] and
+        authority.controller_owner_epoch
+        == association['owner_controller_epoch'])
+
+
+def _paid_capacity_claim_is_exact(
+    connection: sqlalchemy.engine.Connection,
+    association: Mapping[str, Any],
+) -> bool:
+    claims = serve_state_schema.paid_capacity_claims_table
+    rows = connection.execute(
+        sqlalchemy.select(claims.c.service_hash, claims.c.pool_key).where(
+            claims.c.service_name == association['service_name'],
+            claims.c.replica_id == association['replica_id'])).all()
+    pool_key = association['paid_capacity_pool_key']
+    if pool_key is None:
+        return not rows
+    pools = serve_state_schema.paid_capacity_pools_table
+    pool_exists = connection.execute(
+        sqlalchemy.select(sqlalchemy.literal(True)).where(
+            sqlalchemy.exists().where(
+                pools.c.pool_key == pool_key))).scalar_one_or_none()
+    replica_pool_key = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.replicas_table.c.paid_capacity_pool_key).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                association['service_name'],
+                serve_state_schema.replicas_table.c.replica_id ==
+                association['replica_id'])).scalar_one_or_none()
+    return bool(pool_exists and replica_pool_key == pool_key and
+                len(rows) == 1 and rows[0][0] == association['service_hash'] and
+                rows[0][1] == pool_key)
+
+
+def _mark_reduction_ambiguous(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    association: Mapping[str, Any],
+    facts: BoundOrdinaryLaunchRequestFacts,
+    code: str,
+) -> OrdinaryLaunchReduction:
+    if association[
+            'resolution'] != ordinary_launch_binding.Resolution.AMBIGUOUS.value:
+        ordinary_launch_binding.mark_ambiguous_in_connection(
+            connection, context, code)
+    return _reduction_result(OrdinaryLaunchReductionDisposition.AMBIGUOUS,
+                             facts, association)
+
+
+def _startup_request_facts(
+    facts: BoundOrdinaryLaunchRequestFacts,
+) -> ordinary_launch_binding_lib.RequestStartupFacts:
+    return ordinary_launch_binding.RequestStartupFacts(
+        exists=facts.exists,
+        status=(None if facts.status is None else facts.status.value),
+        queue_exists=facts.queue_exists,
+        execution_generation=facts.execution_generation,
+        claim_exists=facts.claim_exists,
+        quiescent=facts.quiescent)
+
+
+def _settle_projected_paid_capacity_claim_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    association: Mapping[str, Any],
+    *,
+    pre_effect: bool,
+) -> bool:
+    """Retain only a non-cancelled pre-effect retry's exact paid claim."""
+    if pre_effect and association['cancel_reason'] is None:
+        return True
+    return (ordinary_launch_binding.
+            release_projected_paid_capacity_claim_in_connection(
+                connection, context))
+
+
+def reduce_bound_ordinary_launch_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> OrdinaryLaunchReduction:
+    """Reduce one exact bound request under canonical cross-layer locks."""
+    # The terminal result may be the first provider-visible success of a
+    # zero-cost replica. Acquire the global event sequencer before the
+    # lifecycle/service/replica/association authority below; the projector
+    # reuses this transaction-owned lock only when a stamp is required.
+    serve_state.lock_zero_cost_protocol_for_bound_launch_projection(connection)
+    association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+        connection, context)
+    facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+        connection, context)
+    if not _controller_authority_matches_reduction(association, authority):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Controller reduction authority is stale or belongs to another '
+            'service incarnation.')
+    if association[
+            'resolution'] == ordinary_launch_binding.Resolution.AMBIGUOUS.value:
+        return _reduction_result(OrdinaryLaunchReductionDisposition.AMBIGUOUS,
+                                 facts, association)
+    if not _paid_capacity_claim_is_exact(connection, association):
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts, 'paid-capacity-claim-mismatch')
+    if not facts.exists:
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts, 'correlated-request-missing')
+    if facts.error_decode_failed:
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts, 'request-error-malformed')
+    if not facts.retention_pin_active:
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts, 'request-retention-pin-missing')
+
+    exact_expired_claim = bool(
+        facts.execution_generation is not None and
+        facts.execution_generation > 0 and facts.claim_token is not None and
+        facts.worker_instance_id is not None and
+        facts.lease_expires_at is not None and facts.claim_expired and
+        ((facts.status in requests_lib.RequestStatus.active_statuses() and
+          facts.queue_delivery_state == 'claimed' and
+          facts.queue_claim_generation == facts.execution_generation) or
+         (facts.status in requests_lib.RequestStatus.finished_status() and
+          not facts.queue_exists and not facts.quiescent)))
+    if exact_expired_claim:
+        if association['effect_phase'] != (
+                ordinary_launch_binding.EffectPhase.NOT_STARTED.value):
+            if facts.status in requests_lib.RequestStatus.active_statuses():
+                assert request_row is not None
+                now = sqlalchemy.func.clock_timestamp()
+                transitioned = _terminalize_locked_request(
+                    connection,
+                    request_row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=(event_api_models.EventCause.EXECUTION_LEASE_EXPIRED),
+                    values={
+                        # Provider I/O may still be blocked while holding
+                        # cluster locks. Revoke it durably, retain exact owner
+                        # identity for marker-gated interruption, and wait for
+                        # the wrapper's real quiescence receipt.
+                        'cancel_requested_at': now,
+                        'execution_quiescence_required': True,
+                        'should_retry': False,
+                        'finished_at': now,
+                        'interrupted_reason':
+                            ('Execution lease expired after the bound ordinary '
+                             'launch crossed its provider-effect boundary.'),
+                    })
+                if not transitioned:
+                    raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                        'Expired effectful bound request terminalization lost '
+                        'its exact row.')
+                facts, request_row, queue_row, _ = (
+                    _lock_bound_request_evidence(connection, context))
+            return _mark_reduction_ambiguous(
+                connection, context, association, facts,
+                'expired-claim-after-provider-effect')
+        assert request_row is not None
+        # The distinct bound handler is excluded from the generic queue
+        # reaper. At NOT_STARTED the expired exact owner cannot acquire the
+        # association/provider fence, so this reducer is the sole authority
+        # that may publish its generation-bound quiescence proof. Retain the
+        # owner identity so a late genuine acknowledgement remains idempotent.
+        now = sqlalchemy.func.clock_timestamp()
+        if facts.status in requests_lib.RequestStatus.active_statuses():
+            terminal_values: dict[str, Any] = {
+                'should_retry': True,
+                'finished_at': now,
+                'execution_quiescence_required': True,
+                'interrupted_reason':
+                    ('Execution lease expired before the bound ordinary '
+                     'launch crossed its provider-effect boundary.'),
+            }
+            if not facts.quiescent:
+                terminal_values.update({
+                    'execution_quiesced_generation': facts.execution_generation,
+                    'execution_quiesced_at': now,
+                })
+            transitioned = _terminalize_locked_request(
+                connection,
+                request_row,
+                status=requests_lib.RequestStatus.CANCELLED,
+                cause=event_api_models.EventCause.EXECUTION_LEASE_EXPIRED,
+                values=terminal_values)
+            if not transitioned:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Expired bound request terminalization lost its exact '
+                    'row.')
+        else:
+            # Explicit cancellation (or normal executor terminalization) has
+            # already removed the queue delivery. Complete only the missing
+            # proof while matching the retained exact owner generation.
+            completed = connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == context.request_id,
+                    REQUESTS.c.execution_generation ==
+                    facts.execution_generation,
+                    REQUESTS.c.claim_token == facts.claim_token,
+                    REQUESTS.c.worker_instance_id == facts.worker_instance_id,
+                    REQUESTS.c.lease_expires_at
+                    <= sqlalchemy.func.clock_timestamp(),
+                    REQUESTS.c.status.in_([
+                        status.value for status in
+                        requests_lib.RequestStatus.finished_status()
+                    ]), REQUESTS.c.execution_quiesced_generation.is_(None),
+                    REQUESTS.c.execution_quiesced_at.is_(None)).
+                values(execution_quiescence_required=True,
+                       execution_quiesced_generation=facts.execution_generation,
+                       execution_quiesced_at=now,
+                       updated_at=now))
+            if completed.rowcount != 1:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'Expired terminal bound request lost its exact owner '
+                    'evidence.')
+        facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+
+    classification = ordinary_launch_binding.classify_startup(
+        association, _startup_request_facts(facts))
+    if classification == ordinary_launch_binding.StartupClassification.ADOPT_ACTIVE:
+        if (facts.queue_delivery_state not in ('queued', 'claimed') or
+            (facts.queue_delivery_state == 'queued' and
+             facts.queue_claim_generation is not None) or
+            (facts.queue_delivery_state == 'claimed' and
+             (facts.queue_claim_generation != facts.execution_generation or
+              not facts.claim_active))):
+            return _mark_reduction_ambiguous(connection, context, association,
+                                             facts,
+                                             'request-delivery-claim-mismatch')
+        return _reduction_result(
+            OrdinaryLaunchReductionDisposition.ADOPT_ACTIVE, facts, association)
+    if classification == ordinary_launch_binding.StartupClassification.WAIT_QUIESCENCE:
+        if facts.terminal_cause is None:
+            return _mark_reduction_ambiguous(connection, context, association,
+                                             facts,
+                                             'request-terminal-cause-missing')
+        return _reduction_result(
+            OrdinaryLaunchReductionDisposition.WAIT_QUIESCENCE, facts,
+            association)
+    if classification == ordinary_launch_binding.StartupClassification.AMBIGUOUS:
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts,
+                                         'request-startup-state-ambiguous')
+    if classification == ordinary_launch_binding.StartupClassification.SETTLED:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'A settled association cannot retain its replica pointer.')
+
+    if (classification == ordinary_launch_binding.StartupClassification.
+            PRE_EFFECT_TERMINALIZE and
+            facts.status in requests_lib.RequestStatus.active_statuses()):
+        assert request_row is not None
+        now = sqlalchemy.func.clock_timestamp()
+        transitioned = _terminalize_locked_request(
+            connection,
+            request_row,
+            status=requests_lib.RequestStatus.CANCELLED,
+            cause=event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED,
+            values={
+                'cancel_requested_at': now,
+                'execution_quiescence_required': True,
+                'execution_quiesced_generation': 0,
+                'execution_quiesced_at': now,
+                'finished_at': now,
+                'interrupted_reason':
+                    ('Bound ordinary launch lost its generation-zero queue '
+                     'before any provider effect.'),
+            })
+        if not transitioned:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Pre-effect request terminalization lost its exact row.')
+        facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+    if (facts.status not in requests_lib.RequestStatus.finished_status() or
+            queue_row is not None):
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts,
+                                         'request-terminal-delivery-mismatch')
+    if facts.terminal_cause is None:
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts,
+                                         'request-terminal-cause-missing')
+    if not facts.quiescent:
+        return _reduction_result(
+            OrdinaryLaunchReductionDisposition.WAIT_QUIESCENCE, facts,
+            association)
+    assert request_row is not None
+    try:
+        request_service_job_id = _request_service_job_id(
+            request_row, str(association['cluster_name']))
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        return _mark_reduction_ambiguous(
+            connection, context, association, facts,
+            'service-job-result-malformed-or-mismatched')
+    recorded_job_id = association['service_job_id']
+    if (request_service_job_id is not None and
+            request_service_job_id != recorded_job_id):
+        return _mark_reduction_ambiguous(connection, context, association,
+                                         facts, 'service-job-result-mismatch')
+
+    reduced = ordinary_launch_binding.record_terminal_in_connection(
+        connection, context, _terminal_evidence(facts))
+    if reduced == ordinary_launch_binding.StartupClassification.AMBIGUOUS:
+        return _reduction_result(OrdinaryLaunchReductionDisposition.AMBIGUOUS,
+                                 facts, association)
+    if reduced == ordinary_launch_binding.StartupClassification.REDUCE_TERMINAL:
+        if recorded_job_id is None:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Recorded service-job phase has no exact job ID.')
+        service_job_id = int(recorded_job_id)
+        pre_effect = False
+        disposition = OrdinaryLaunchReductionDisposition.PROJECTED
+    elif reduced == ordinary_launch_binding.StartupClassification.PRE_EFFECT_TERMINALIZE:
+        service_job_id = None
+        pre_effect = True
+        disposition = OrdinaryLaunchReductionDisposition.PRE_EFFECT_TERMINAL
+    else:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            f'Unexpected terminal reduction {reduced.value}.')
+
+    locked_replica_info = (
+        serve_state.read_replica_for_bound_ordinary_launch_in_transaction(
+            connection, context.service_name, context.replica_id,
+            str(context.replica_record_id), context.association_id))
+    projection = BoundOrdinaryLaunchProjectionInput(
+        context=context,
+        request=facts,
+        locked_replica_info=locked_replica_info,
+        status=facts.status,
+        cause=facts.terminal_cause,
+        service_job_id=service_job_id,
+        pre_effect_terminal=pre_effect,
+        cancel_reason=association.get('cancel_reason'),
+        paid_capacity_pool_key=association['paid_capacity_pool_key'])
+    if project_replica_result(connection, projection) is not True:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Replica result persistence lost its exact row identity.')
+    # The projection callback may update paid-pool feedback, but claim release
+    # belongs to the reducer and must remain pending through final Serve
+    # revalidation.
+    if not _paid_capacity_claim_is_exact(connection, association):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Replica projection changed paid-capacity claim identity.')
+    projected = ordinary_launch_binding.project_from_request(
+        connection,
+        context,
+        pre_effect_terminal=pre_effect,
+        service_job_id=service_job_id,
+        release_pin=lambda conn, request_id, association_id:
+        (delete_request_retention_pin_in_transaction(
+            conn, request_id, ORDINARY_LAUNCH_RETENTION_PIN_KIND, association_id
+        )))
+    if not projected:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Exact ordinary launch result was not projectable.')
+    # A non-cancelled pre-effect settlement is a retry boundary, not a demand
+    # completion boundary.  Keep its exact paid claim through the pointer
+    # clear so generation+1 can atomically snapshot the same claim.  Exact
+    # teardown/supersession records cancel_reason before reduction and, like
+    # every post-effect terminal result, releases the claim here.
+    if not _settle_projected_paid_capacity_claim_in_transaction(
+            connection, context, association, pre_effect=pre_effect):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Exact projected paid-capacity claim was not releasable.')
+    return OrdinaryLaunchReduction(
+        context=context,
+        disposition=disposition,
+        request=facts,
+        service_job_id=service_job_id,
+        cancel_reason=association.get('cancel_reason'),
+        projected=True)
+
+
+def reduce_bound_ordinary_launch(
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> OrdinaryLaunchReduction:
+    """Own and commit one exact reducer transaction."""
+    # Canonical lifecycle/service/replica/association/request/queue/pin row
+    # locks are the reducer authority. Do not queue for the exclusive advisory
+    # guard here: an expired provider owner may still hold its shared session,
+    # while this transaction only (a) settles NOT_STARTED ownership that can no
+    # longer pass the live-lease provider fence, (b) records post-effect
+    # ambiguity, or (c) projects an exact terminal quiescence receipt produced
+    # after the handler left its provider guard. Owner transfer takes the same
+    # row locks and is revalidated below.
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        return reduce_bound_ordinary_launch_in_transaction(
+            connection,
+            context,
+            authority,
+            project_replica_result=project_replica_result)
+
+
+def _commit_bound_ordinary_launch_cancel_intent(
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    reason: str,
+) -> None:
+    """Commit Serve-owned cancel intent before touching the API request."""
+    # Cancellation must not wait for the shared opaque-provider guard.  A
+    # retry-until-up provider call can hold that guard indefinitely, while the
+    # request cancellation below is what interrupts its executor.  Canonical
+    # lifecycle/service/replica/association row locks still serialize this
+    # intent with phase advance and projection exactly.
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if not _controller_authority_matches_reduction(association, authority):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Bound cancellation authority belongs to another controller '
+                'incarnation.')
+        if association[
+                'resolution'] == ordinary_launch_binding.Resolution.AMBIGUOUS.value:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'An ambiguous association cannot authorize cancellation.')
+        if association['resolution'] == (
+                ordinary_launch_binding.Resolution.RESULT_RECORDED.value):
+            return
+        ordinary_launch_binding.request_cancel_in_connection(
+            connection, context, reason)
+
+
+def _cancel_bound_ordinary_launch_request_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+) -> BoundOrdinaryLaunchRequestFacts:
+    """Publish exact request cancellation after Serve intent is durable."""
+    facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+        connection, context)
+    if request_row is None or facts.status in (
+            requests_lib.RequestStatus.finished_status()):
+        return facts
+    assert facts.execution_generation is not None
+    no_execution_owner = bool(not facts.claim_exists and
+                              (queue_row is None or
+                               (queue_row['delivery_state'] == 'queued' and
+                                queue_row['claim_generation'] is None)))
+    now = sqlalchemy.func.clock_timestamp()
+    values: dict[str, Any] = {
+        'cancel_requested_at': now,
+        'execution_quiescence_required': True,
+        'finished_at': now,
+    }
+    if no_execution_owner:
+        values.update({
+            'execution_quiesced_generation': facts.execution_generation,
+            'execution_quiesced_at': now,
+        })
+    transitioned = _terminalize_locked_request(
+        connection,
+        request_row,
+        status=requests_lib.RequestStatus.CANCELLED,
+        cause=event_api_models.EventCause.EXPLICIT_CANCEL,
+        values=values)
+    if not transitioned:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Bound request cancellation lost its exact request row.')
+    # The owning executor polls durable status and publishes its exact
+    # generation acknowledgement from its finally block.  A claimed request
+    # therefore remains WAIT_QUIESCENCE; this transaction never invents proof.
+    updated, _, _, _ = _lock_bound_request_evidence(connection, context)
+    return updated
+
+
+def cancel_bound_ordinary_launch_request(
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    reason: str,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> OrdinaryLaunchReduction:
+    """Commit cancel intent, deliver it exactly, then reduce if quiescent."""
+    request_bound_ordinary_launch_cancel(context, authority, reason)
+    return reduce_bound_ordinary_launch(
+        context, authority, project_replica_result=project_replica_result)
+
+
+def request_bound_ordinary_launch_cancel(
+    context: ordinary_launch_binding_lib.BoundLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    reason: str,
+) -> BoundOrdinaryLaunchRequestFacts:
+    """Durably deliver exact cancellation before provider quiescence."""
+    _commit_bound_ordinary_launch_cancel_intent(context, authority, reason)
+    engine = initialize_and_get_db()
+    with engine.begin() as connection:
+        return _cancel_bound_ordinary_launch_request_in_transaction(
+            connection, context)
+
+
+def _legacy_ordinary_launch_requests_drained_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+) -> bool:
+    """Close generic admission and prove this service's legacy drain."""
+    # The promotion transaction already owns the exclusive per-service launch
+    # authority lock. Every valid legacy admission takes its shared side before
+    # INSERT (see ``_insert_request_and_queue``), so there is no request phantom:
+    # an earlier admission commits before promotion acquires authority and is
+    # scanned here; a later admission waits for bound mode and then fails its
+    # legacy effect fence. Avoid table locks here: a claimant owns row locks
+    # before upgrading to ROW EXCLUSIVE for its status write, which would form a
+    # lock cycle if promotion held a compatible SHARE lock while waiting for
+    # that same row.
+    rows = connection.execute(
+        sqlalchemy.select(REQUESTS).where(
+            REQUESTS.c.handler_name == _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME,
+            REQUESTS.c.payload_type == _LEGACY_ORDINARY_LAUNCH_PAYLOAD_TYPE,
+            REQUESTS.c.payload_json['is_launched_by_sky_serve_controller'].
+            as_boolean().is_(True)).order_by(
+                REQUESTS.c.request_id).with_for_update()).mappings().all()
+    for row in rows:
+        payload_json = row['payload_json']
+        if not isinstance(payload_json, dict):
+            return False
+        context = payload_json.get('extra_launch_context')
+        if not isinstance(context, dict):
+            return False
+        candidate_service = context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if not isinstance(candidate_service, str) or not candidate_service:
+            return False
+        if candidate_service != service_name:
+            continue
+        status = requests_lib.RequestStatus(str(row['status']))
+        if status not in requests_lib.RequestStatus.finished_status():
+            return False
+        if (row['execution_quiescence_required'] is not True or
+                row['execution_generation'] is None or
+                row['execution_quiesced_generation']
+                != row['execution_generation'] or
+                row['execution_quiesced_at'] is None):
+            return False
+        queue_exists = connection.execute(
+            sqlalchemy.select(sqlalchemy.literal(True)).where(
+                sqlalchemy.exists().where(
+                    QUEUE.c.request_id ==
+                    row['request_id']))).scalar_one_or_none()
+        if queue_exists:
+            return False
+    return True
+
+
+def _bound_ordinary_launch_requests_clear_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+) -> bool:
+    """Prove every settled association has copied, unpinned request state."""
+    associations = connection.execute(
+        sqlalchemy.select(
+            ordinary_launch_binding.ordinary_launch_associations_table).where(
+                ordinary_launch_binding.ordinary_launch_associations_table.c.
+                service_name == service_name).order_by(
+                    ordinary_launch_binding.ordinary_launch_associations_table.
+                    c.request_id)).mappings().all()
+    for association in associations:
+        if association['resolution'] not in tuple(
+                value.value
+                for value in ordinary_launch_binding.SETTLED_RESOLUTIONS):
+            return False
+        context = _bound_context_from_association(association)
+        facts, _, queue_row, pin_row = _lock_bound_request_evidence(
+            connection, context)
+        if pin_row is not None or queue_row is not None:
+            return False
+        if not facts.exists:
+            # Request GC is permitted only after the association copied exact
+            # terminal evidence and released its pin.
+            if (association['terminal_status'] is None or
+                    association['terminal_cause'] is None or
+                    association['terminal_execution_generation'] is None or
+                    association['execution_quiesced_at'] is None):
+                return False
+            continue
+        if (facts.status not in requests_lib.RequestStatus.finished_status() or
+                facts.terminal_cause is None or not facts.quiescent or
+                association['terminal_status'] != facts.status.value or
+                association['terminal_cause'] != facts.terminal_cause.value or
+                association['terminal_execution_generation']
+                != facts.execution_generation or
+                association['execution_quiesced_generation']
+                != facts.execution_quiesced_generation):
+            return False
+    return True
+
+
+def _transition_authority_is_current(
+    connection: sqlalchemy.engine.Connection,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    expected_mode: ordinary_launch_binding_lib.BindingMode,
+) -> bool:
+    row = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.services_table,
+            serve_state_schema.service_lifecycle_fences_table.c.epoch.label(
+                '_fence_epoch')).join(
+                    serve_state_schema.service_lifecycle_fences_table,
+                    serve_state_schema.service_lifecycle_fences_table.c.name ==
+                    serve_state_schema.services_table.c.name).where(
+                        serve_state_schema.services_table.c.name ==
+                        authority.service_name)).mappings().one_or_none()
+    return bool(
+        row is not None and row['hash'] == authority.service_hash and
+        row['workspace'] == authority.service_workspace and
+        row['lifecycle_epoch'] == authority.service_lifecycle_epoch and
+        row['_fence_epoch'] == authority.service_lifecycle_epoch and
+        row['controller_incarnation'] == authority.controller_incarnation and
+        row['controller_owner_epoch'] == authority.controller_owner_epoch and
+        row['ordinary_launch_binding_capable'] is True and
+        row['ordinary_launch_binding_mode'] == expected_mode.value and
+        row['ordinary_launch_binding_mode'] == authority.binding_mode.value and
+        row['ordinary_launch_binding_epoch'] == authority.binding_epoch)
+
+
+def _ordinary_launch_binding_participants_quiesced_in_transaction(
+    connection: sqlalchemy.engine.Connection,) -> bool:
+    """Close participant-heartbeat phantoms before promotion."""
+    connection.execute(
+        sqlalchemy.text('LOCK TABLE api_server_instances IN SHARE MODE'))
+    return ordinary_launch_binding_fleet_capable(
+        connection=connection,
+        quiescence_seconds=(
+            ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS))
+
+
+def promote_ordinary_launch_binding_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
+    """Explicitly promote one service under fleet and legacy-drain barriers."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        epoch = ordinary_launch_binding.promote_service_in_connection(
+            connection,
+            service_name=authority.service_name,
+            controller_incarnation=authority.controller_incarnation,
+            controller_owner_epoch=authority.controller_owner_epoch,
+            expected_binding_epoch=authority.binding_epoch,
+            participant_barrier_passed=lambda conn:
+            (_transition_authority_is_current(
+                conn, authority, ordinary_launch_binding.BindingMode.LEGACY) and
+             _ordinary_launch_binding_participants_quiesced_in_transaction(conn
+                                                                          )),
+            legacy_requests_drained=lambda conn:
+            (_legacy_ordinary_launch_requests_drained_in_transaction(
+                conn, authority.service_name)))
+        session.commit()
+        return epoch
+
+
+def demote_ordinary_launch_binding_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
+    """Explicitly demote after every bound generation is fully settled."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        epoch = ordinary_launch_binding.demote_service_in_connection(
+            connection,
+            service_name=authority.service_name,
+            controller_incarnation=authority.controller_incarnation,
+            controller_owner_epoch=authority.controller_owner_epoch,
+            expected_binding_epoch=authority.binding_epoch,
+            request_barrier_clear=lambda conn:
+            (_transition_authority_is_current(
+                conn, authority, ordinary_launch_binding.BindingMode.BOUND
+            ) and _bound_ordinary_launch_requests_clear_in_transaction(
+                conn, authority.service_name) and
+             _legacy_ordinary_launch_requests_drained_in_transaction(
+                 conn, authority.service_name)))
+        session.commit()
+        return epoch
+
+
+def gc_bound_ordinary_launch_tombstones_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    limit: int = 100,
+) -> int:
+    """Collect settled associations only after proving request-layer absence.
+
+    Selection, the request/pin absence predicates, and deletion share one
+    transaction.  In particular, no caller-supplied boolean can stand in for
+    request-layer evidence that may change between a check and the DELETE.
+    """
+    # API009 deliberately upgrades independently of Serve042.  Request GC
+    # remains usable during either migration order and before the Serve
+    # relation exists.
+    relation_exists = connection.execute(
+        sqlalchemy.text(
+            "SELECT to_regclass('serve_ordinary_launch_associations') "
+            'IS NOT NULL')).scalar_one()
+    if not relation_exists:
+        return 0
+    if (isinstance(limit, bool) or not isinstance(limit, int) or
+            not 1 <= limit <= ordinary_launch_binding.MAX_GC_BATCH_SIZE):
+        raise ValueError('limit must be 1-'
+                         f'{ordinary_launch_binding.MAX_GC_BATCH_SIZE}.')
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    request_reference_exists = sqlalchemy.exists().where(
+        sqlalchemy.or_(
+            REQUESTS.c.request_id == associations.c.request_id,
+            REQUESTS.c.ordinary_launch_association_id ==
+            associations.c.association_id))
+    pin_reference_exists = sqlalchemy.exists().where(
+        sqlalchemy.or_(
+            REQUEST_RETENTION_PINS.c.request_id == associations.c.request_id,
+            sqlalchemy.and_(
+                REQUEST_RETENTION_PINS.c.pin_kind ==
+                ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+                REQUEST_RETENTION_PINS.c.pin_id ==
+                associations.c.association_id)))
+    replica_reference_exists = sqlalchemy.exists().where(
+        serve_state_schema.replicas_table.c.ordinary_launch_association_id ==
+        associations.c.association_id)
+    candidate_rows = connection.execute(
+        sqlalchemy.select(associations.c.association_id).where(
+            associations.c.resolution.in_(
+                tuple(
+                    value.value
+                    for value in ordinary_launch_binding.SETTLED_RESOLUTIONS)),
+            associations.c.pin_released_at.is_not(None),
+            associations.c.tombstone_not_before
+            <= sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
+            ~request_reference_exists, ~pin_reference_exists).order_by(
+                associations.c.tombstone_not_before,
+                associations.c.association_id).limit(limit).with_for_update(
+                    skip_locked=True)).scalars().all()
+    if not candidate_rows:
+        return 0
+    result = connection.execute(
+        sqlalchemy.delete(associations).where(
+            associations.c.association_id.in_(candidate_rows),
+            associations.c.resolution.in_(
+                tuple(
+                    value.value
+                    for value in ordinary_launch_binding.SETTLED_RESOLUTIONS)),
+            associations.c.pin_released_at.is_not(None),
+            associations.c.tombstone_not_before
+            <= sqlalchemy.func.clock_timestamp(), ~replica_reference_exists,
+            ~request_reference_exists, ~pin_reference_exists))
+    return result.rowcount
 
 
 def _request_filter_statement(
@@ -1168,16 +3416,9 @@ def _controller_claim_is_current() -> sqlalchemy.ColumnElement[bool]:
     current_leadership = sqlalchemy.exists().where(
         _controller_leadership_is_current_predicate(
             REQUESTS.c.worker_instance_id, REQUESTS.c.controller_generation))
-    # The single-process ``all`` role is the rollback-compatible mode. It
-    # predates controller generations and deliberately keeps its historical
-    # unfenced controller execution until the split-role cutover is complete.
-    compatibility_claim = sqlalchemy.false()
-    if os.environ.get(SERVER_ROLE_ENV_VAR, 'all') == 'all':
-        compatibility_claim = REQUESTS.c.controller_generation.is_(None)
     return sqlalchemy.or_(
         REQUESTS.c.execution_class
         != request_registry.ExecutionClass.CONTROLLER.value,
-        compatibility_claim,
         sqlalchemy.and_(REQUESTS.c.controller_generation.is_not(None),
                         current_leadership))
 
@@ -1264,7 +3505,35 @@ def _terminalize_locked_request(
         return False
 
     terminal_values = dict(values)
+    # A claimed executable row with no process identity has not crossed the
+    # guarded RUNNING transition.  Because this request row is locked, taking
+    # the matching delivery lock makes terminalization and exact quiescence one
+    # atomic pre-effect proof.  Centralizing the rule here covers cancellation,
+    # dispatcher submission failure, leadership loss, and claim expiry without
+    # maintaining parallel terminalization paths.
+    if (delete_queue and existing_status
+            in requests_lib.RequestStatus.executable_statuses() and
+            request_row['pid'] is None and
+            request_row['execution_process_start_time_ticks'] is None and
+            request_row['claim_token'] is not None and
+            request_row['worker_instance_id'] is not None and
+            request_row['lease_expires_at'] is not None):
+        delivery = connection.execute(
+            sqlalchemy.select(
+                QUEUE.c.delivery_state, QUEUE.c.claim_generation).where(
+                    QUEUE.c.request_id == request_row['request_id']).
+            with_for_update()).mappings().one_or_none()
+        if (delivery is not None and delivery['delivery_state'] == 'claimed' and
+                delivery['claim_generation']
+                == request_row['execution_generation']):
+            terminal_values.update({
+                'execution_quiescence_required': True,
+                'execution_quiesced_generation': int(
+                    request_row['execution_generation']),
+                'execution_quiesced_at': sqlalchemy.func.clock_timestamp(),
+            })
     terminal_values['status'] = status.value
+    terminal_values['terminal_cause'] = cause.value
     terminal_values['updated_at'] = sqlalchemy.func.clock_timestamp()
     result = connection.execute(
         sqlalchemy.update(REQUESTS).where(
@@ -1337,12 +3606,19 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     def _claim_predicates(
             self, execution_generation: int, claim_token: uuid.UUID
     ) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
+        return (*self._claim_identity_predicates(
+            execution_generation, claim_token), REQUESTS.c.lease_expires_at
+                > sqlalchemy.func.clock_timestamp(),
+                _controller_claim_is_current())
+
+    def _claim_identity_predicates(
+            self, execution_generation: int, claim_token: uuid.UUID
+    ) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
+        """Match one durable owner without treating lease age as identity."""
         return (
             REQUESTS.c.execution_generation == execution_generation,
             REQUESTS.c.claim_token == claim_token,
             REQUESTS.c.worker_instance_id == uuid.UUID(self._instance_id),
-            REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
-            _controller_claim_is_current(),
         )
 
     def _update_event_context(
@@ -1535,97 +3811,36 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         async with engine.begin() as connection:
             return await connection.run_sync(_insert_request_and_queue, request)
 
-    async def create_or_refresh_internal_daemon_async(
-            self, request: requests_lib.Request) -> bool:
-        request.should_enqueue = True
-        engine = await _get_async_engine()
-        values = _request_values_for_db(request)
-        async with engine.begin() as connection:
-            await _lock_environment_controller_leadership(connection)
-            result = await connection.execute(
-                postgresql.insert(REQUESTS).values(
-                    **values).on_conflict_do_nothing(
-                        index_elements=[REQUESTS.c.request_id]).returning(
-                            REQUESTS.c.request_id))
-            inserted = result.scalar_one_or_none() is not None
-            if inserted:
-                await connection.execute(
-                    postgresql.insert(QUEUE).values(
-                        **_queue_values(request)).on_conflict_do_nothing(
-                            index_elements=[QUEUE.c.request_id]))
-                return True
-
-            result = await connection.execute(
-                sqlalchemy.select(REQUESTS.c.status).where(
-                    REQUESTS.c.request_id ==
-                    request.request_id).with_for_update())
-            existing_status = result.scalar_one()
-            terminal = existing_status in {
-                status.value
-                for status in requests_lib.RequestStatus.finished_status()
-            }
-            refreshed_values: dict[str, Any] = {
-                'name': values['name'],
-                'handler_name': values['handler_name'],
-                'payload_type': values['payload_type'],
-                'payload_format': values['payload_format'],
-                'payload_version': values['payload_version'],
-                'producer_version': values['producer_version'],
-                'payload_json': values['payload_json'],
-                'execution_class': values['execution_class'],
-                'schedule_type': values['schedule_type'],
-                'updated_at': sqlalchemy.func.clock_timestamp(),
-            }
-            if terminal:
-                refreshed_values.update({
-                    'status': requests_lib.RequestStatus.PENDING.value,
-                    'return_value': None,
-                    'error': None,
-                    'pid': None,
-                    'status_msg': None,
-                    'should_retry': False,
-                    'finished_at': None,
-                    'claim_token': None,
-                    'worker_instance_id': None,
-                    'controller_generation': None,
-                    'lease_expires_at': None,
-                    'heartbeat_at': None,
-                    'cancel_requested_at': None,
-                    'cancel_acknowledged_at': None,
-                    # Re-enqueue is not execution admission. A v70 claim (or
-                    # cancellation) opts the revived generation into the
-                    # exact-quiescence contract.
-                    'execution_quiescence_required': False,
-                    'execution_quiesced_generation': None,
-                    'execution_quiesced_at': None,
-                    'interrupted_reason': None,
-                })
-            await connection.execute(
-                sqlalchemy.update(REQUESTS).where(
-                    REQUESTS.c.request_id == request.request_id).values(
-                        **refreshed_values))
-            if terminal:
-                await connection.execute(
-                    sqlalchemy.delete(QUEUE).where(
-                        QUEUE.c.request_id == request.request_id))
-                await connection.execute(
-                    postgresql.insert(QUEUE).values(**_queue_values(request)))
-                return True
-        return False
-
-    async def delete_orphan_internal_daemons_async(
+    def retire_legacy_internal_daemon_rows(
         self,
-        internal_daemons: list[daemons.InternalRequestDaemon],
-    ) -> None:
-        keep_ids = [daemon.id for daemon in internal_daemons]
-        engine = await _get_async_engine()
-        statement = sqlalchemy.delete(REQUESTS).where(
-            REQUESTS.c.request_id.like('%-daemon'))
-        if keep_ids:
-            statement = statement.where(REQUESTS.c.request_id.not_in(keep_ids))
-        async with engine.begin() as connection:
-            await _lock_environment_controller_leadership(connection)
-            await connection.execute(statement)
+        *,
+        controller_owner: tuple[str, int] | None = None,
+    ) -> int:
+        """Retire allowlisted daemon rows under current controller ownership."""
+        engine = initialize_and_get_db()
+        daemon_ids = sorted(daemons.LEGACY_REQUEST_DAEMON_IDS)
+        owner = (controller_owner if controller_owner is not None else
+                 _controller_owner_from_environment())
+        if owner is None:
+            raise RuntimeError('Legacy daemon retirement requires an active '
+                               'controller generation.')
+        with engine.begin() as connection:
+            if not _lock_current_controller_leadership(connection, *owner):
+                raise RuntimeError('Controller leadership changed before '
+                                   'legacy daemon retirement.')
+            connection.execute(
+                sqlalchemy.delete(REQUEST_RETENTION_PINS).where(
+                    REQUEST_RETENTION_PINS.c.request_id.in_(daemon_ids)))
+            connection.execute(
+                sqlalchemy.delete(QUEUE).where(
+                    QUEUE.c.request_id.in_(daemon_ids)))
+            result = connection.execute(
+                sqlalchemy.delete(REQUESTS).where(
+                    REQUESTS.c.request_id.in_(daemon_ids)))
+        if result.rowcount:
+            logger.info('Retired '
+                        f'{result.rowcount} legacy internal daemon row(s).')
+        return int(result.rowcount)
 
     def query_requests(
         self, req_filter: requests_lib.RequestTaskFilter
@@ -1658,6 +3873,13 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                     REQUESTS.c.request_id.in_(request_ids),
                     _request_is_retention_safe()))
 
+    async def gc_request_owned_tombstones(self) -> int:
+        """Collect one bounded Serve association batch under request locks."""
+        engine = await _get_async_engine()
+        async with engine.begin() as connection:
+            return await connection.run_sync(
+                gc_bound_ordinary_launch_tombstones_in_transaction)
+
     async def update_status_async(self, request_id: str,
                                   status: requests_lib.RequestStatus) -> None:
         if status in requests_lib.RequestStatus.finished_status():
@@ -1687,30 +3909,85 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                          request_id: str,
                          pid: int | None,
                          execution_generation: int = 0,
-                         claim_token: str | None = None) -> bool:
-        engine = initialize_and_get_db()
-        statement = sqlalchemy.update(REQUESTS).where(
-            REQUESTS.c.request_id == request_id,
-            REQUESTS.c.status.in_([
-                status.value
-                for status in requests_lib.RequestStatus.executable_statuses()
-            ]))
+                         claim_token: str | None = None,
+                         process_start_time_ticks: int | None = None) -> bool:
         if claim_token is not None:
-            statement = statement.where(*self._claim_predicates(
-                execution_generation, uuid.UUID(claim_token)))
-        else:
-            # Direct coroutine execution is allowed only for requests that
-            # were intentionally created without a durable queue delivery.
-            statement = statement.where(~sqlalchemy.exists().where(
-                QUEUE.c.request_id == REQUESTS.c.request_id))
-        statement = statement.values(
-            status=requests_lib.RequestStatus.RUNNING.value,
-            pid=pid,
-            status_msg=None,
-            heartbeat_at=sqlalchemy.func.clock_timestamp(),
-            updated_at=sqlalchemy.func.clock_timestamp())
+            if (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or
+                    process_start_time_ticks is None or
+                    isinstance(process_start_time_ticks, bool) or
+                    not isinstance(process_start_time_ticks, int) or
+                    process_start_time_ticks <= 0):
+                raise ValueError('A durable running claim requires positive '
+                                 'PID and process start-time identity.')
+        elif process_start_time_ticks is not None:
+            raise ValueError('An unclaimed request cannot persist durable '
+                             'process start-time identity.')
+        token = uuid.UUID(claim_token) if claim_token is not None else None
+        engine = initialize_and_get_db()
         with engine.begin() as connection:
-            result = connection.execute(statement)
+            # The first read is deliberately only an immutable-origin hint.
+            # Authority is acquired below in global order: outer leadership,
+            # managed-job row, request row, then queue row.
+            snapshot = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
+                    REQUESTS.c.request_id ==
+                    request_id)).mappings().one_or_none()
+            if snapshot is None:
+                return False
+            if snapshot['execution_class'] == (
+                    request_registry.ExecutionClass.CONTROLLER.value):
+                controller_generation = snapshot['controller_generation']
+                if (controller_generation is None or
+                        not _lock_current_controller_leadership(
+                            connection, str(snapshot['worker_instance_id']),
+                            int(controller_generation))):
+                    return False
+            if not _lock_managed_job_origin(
+                    connection, snapshot, require_admission=True):
+                return False
+            row = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
+                    REQUESTS.c.request_id ==
+                    request_id).with_for_update()).mappings().one_or_none()
+            if row is None or not _same_managed_job_origin(snapshot, row):
+                return False
+            status = requests_lib.RequestStatus(str(row['status']))
+            if status not in requests_lib.RequestStatus.executable_statuses():
+                return False
+            predicates: list[sqlalchemy.ColumnElement[bool]] = [
+                REQUESTS.c.request_id == request_id,
+                REQUESTS.c.status == status.value,
+            ]
+            if token is not None:
+                queue_row = connection.execute(
+                    sqlalchemy.select(QUEUE).where(
+                        QUEUE.c.request_id ==
+                        request_id).with_for_update()).mappings().one_or_none()
+                if (queue_row is None or
+                        queue_row['delivery_state'] != 'claimed' or
+                        queue_row['claim_generation'] != execution_generation):
+                    return False
+                predicates.extend(
+                    self._claim_predicates(execution_generation, token))
+            else:
+                if _managed_job_origin(row) is not None:
+                    # Managed-job nested work always uses the disposable
+                    # request boundary; an API-process coroutine has no exact
+                    # process-family receipt protocol.
+                    return False
+                if connection.execute(
+                        sqlalchemy.select(QUEUE.c.request_id).where(
+                            QUEUE.c.request_id == request_id).with_for_update()
+                ).scalar_one_or_none() is not None:
+                    return False
+            result = connection.execute(
+                sqlalchemy.update(REQUESTS).where(*predicates).values(
+                    status=requests_lib.RequestStatus.RUNNING.value,
+                    pid=pid,
+                    execution_process_start_time_ticks=process_start_time_ticks,
+                    status_msg=None,
+                    heartbeat_at=sqlalchemy.func.clock_timestamp(),
+                    updated_at=sqlalchemy.func.clock_timestamp()))
             if result.rowcount == 1:
                 _mark_controller_action_state(connection, request_id,
                                               self._instance_id, 'running')
@@ -1742,7 +4019,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
 
     def interrupt_cancelled_claim(
             self, claim: request_storage.ExecutionClaim) -> bool:
-        """Deliver durable cancellation intent to this owning executor.
+        """Interrupt one exact local invocation after durable revocation.
 
         ``cancel_acknowledged_at`` retains its legacy signal-delivery meaning.
         Only ``acknowledge_execution_quiescence`` can publish proof that the
@@ -1751,48 +4028,51 @@ class PostgresRequestBackend(request_storage.RequestBackend):
         engine = initialize_and_get_db()
         claim_token = uuid.UUID(claim.claim_token)
         with engine.begin() as connection:
+            claimed_delivery = sqlalchemy.exists().where(
+                QUEUE.c.request_id == claim.request_id,
+                QUEUE.c.delivery_state == 'claimed',
+                QUEUE.c.claim_generation == claim.execution_generation)
+            revoked_running = sqlalchemy.and_(
+                REQUESTS.c.status == requests_lib.RequestStatus.RUNNING.value,
+                sqlalchemy.or_(
+                    REQUESTS.c.lease_expires_at
+                    <= sqlalchemy.func.clock_timestamp(), ~claimed_delivery,
+                    ~_controller_claim_is_current()))
+            cancelled_unquiesced = sqlalchemy.and_(
+                REQUESTS.c.status == requests_lib.RequestStatus.CANCELLED.value,
+                REQUESTS.c.cancel_requested_at.is_not(None))
             row = connection.execute(
                 sqlalchemy.select(
-                    REQUESTS.c.pid, REQUESTS.c.execution_quiesced_generation,
+                    REQUESTS.c.pid,
+                    REQUESTS.c.execution_process_start_time_ticks,
+                    REQUESTS.c.execution_quiesced_generation,
                     REQUESTS.c.execution_quiesced_at).where(
                         REQUESTS.c.request_id == claim.request_id,
-                        *self._claim_predicates(claim.execution_generation,
-                                                claim_token), REQUESTS.c.status
-                        == requests_lib.RequestStatus.CANCELLED.value,
-                        REQUESTS.c.cancel_requested_at.is_not(None),
-                        REQUESTS.c.cancel_acknowledged_at.is_(
-                            None)).with_for_update()).first()
-            if row is None or row.pid is None:
+                        *self._claim_identity_predicates(
+                            claim.execution_generation, claim_token),
+                        REQUESTS.c.execution_quiescence_required,
+                        sqlalchemy.or_(
+                            revoked_running,
+                            cancelled_unquiesced)).with_for_update()).first()
+            if row is None:
                 return False
             if (row.execution_quiesced_generation == claim.execution_generation
                     and row.execution_quiesced_at is not None):
                 return True
-            pid = int(row.pid)
-            if not _is_owned_executor_process(pid):
-                logger.warning(
-                    f'Refusing to signal request {claim.request_id}: PID '
-                    f'{pid} is not this dispatcher\'s executor child.')
+            if (row.pid is None or
+                    row.execution_process_start_time_ticks is None):
                 return False
-            marker = request_storage.arm_execution_cancellation(pid, claim)
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                # The process already observed an equivalent termination
-                # event. This remains only signal-delivery acknowledgement;
-                # it is not execution-quiescence proof.
-                request_storage.clear_execution_cancellation(marker)
-            except OSError as e:
-                request_storage.clear_execution_cancellation(marker)
-                logger.warning(
-                    f'Failed to interrupt cancelled request '
-                    f'{claim.request_id} owned by {self._instance_id}: {e}')
+            pid = int(row.pid)
+            if not _signal_exact_executor_process(
+                    pid, int(row.execution_process_start_time_ticks),
+                    signal.SIGTERM):
                 return False
             result = connection.execute(
                 sqlalchemy.update(REQUESTS).where(
                     REQUESTS.c.request_id == claim.request_id,
-                    *self._claim_predicates(claim.execution_generation,
-                                            claim_token),
-                    REQUESTS.c.cancel_requested_at.is_not(None)).values(
+                    *self._claim_identity_predicates(claim.execution_generation,
+                                                     claim_token),
+                    REQUESTS.c.execution_quiescence_required).values(
                         cancel_acknowledged_at=(
                             sqlalchemy.func.clock_timestamp()),
                         updated_at=sqlalchemy.func.clock_timestamp()))
@@ -1814,37 +4094,661 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                         REQUESTS.c.claim_token == claim_token,
                         REQUESTS.c.worker_instance_id == uuid.UUID(
                             self._instance_id),
-                        REQUESTS.c.execution_quiescence_required,
-                        sqlalchemy.or_(
-                            REQUESTS.c.status ==
-                            requests_lib.RequestStatus.RUNNING.value,
-                            REQUESTS.c.status.in_([
-                                status.value for status in
-                                requests_lib.RequestStatus.finished_status()
-                            ]))).with_for_update()).first()
+                        REQUESTS.c.execution_quiescence_required).
+                with_for_update()).first()
             if row is None:
                 return False
             if (row.execution_quiesced_generation is not None or
                     row.execution_quiesced_at is not None):
-                return (row.execution_quiesced_generation
-                        == claim.execution_generation and
-                        row.execution_quiesced_at is not None)
-            result = connection.execute(
-                sqlalchemy.update(REQUESTS).where(
+                acknowledged = (row.execution_quiesced_generation
+                                == claim.execution_generation and
+                                row.execution_quiesced_at is not None)
+                if not acknowledged:
+                    return False
+            else:
+                # Preserve the complete claim identity as a tombstone until a
+                # replay reducer atomically consumes this receipt. NEVER claims
+                # retain it until normal request GC removes the terminal row.
+                result = connection.execute(
+                    sqlalchemy.update(REQUESTS).where(
+                        REQUESTS.c.request_id == claim.request_id,
+                        REQUESTS.c.execution_generation ==
+                        claim.execution_generation,
+                        REQUESTS.c.claim_token == claim_token,
+                        REQUESTS.c.worker_instance_id == uuid.UUID(
+                            self._instance_id),
+                        REQUESTS.c.execution_quiesced_generation.is_(None),
+                        REQUESTS.c.execution_quiesced_at.is_(None)).values(
+                            execution_quiesced_generation=(
+                                claim.execution_generation),
+                            execution_quiesced_at=(
+                                sqlalchemy.func.clock_timestamp()),
+                            updated_at=sqlalchemy.func.clock_timestamp()))
+                if result.rowcount != 1:
+                    return False
+            _requeue_quiesced_replayable_requests(connection,
+                                                  request_id=claim.request_id)
+            return True
+
+    def quiesce_managed_job_slot_requests(
+            self,
+            identity: request_storage.ManagedJobControllerSlotIdentity,
+            *,
+            timeout_seconds: float = 60.0,
+            poll_seconds: float = 0.1) -> int:
+        """Close one slot's nested admission and await exact receipts."""
+        return self._quiesce_managed_job_attempt_requests(
+            identity[:2],
+            identity,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds)
+
+    def _quiesce_managed_job_attempt_requests(self, authority_owner: tuple[
+        str, int], identity: request_storage.ManagedJobControllerSlotIdentity,
+                                              *, timeout_seconds: float,
+                                              poll_seconds: float) -> int:
+        """Quiesce one target attempt under a current outer authority."""
+        if (len(identity) != 4 or isinstance(identity[1], bool) or
+                not isinstance(identity[1], int) or identity[1] <= 0 or
+                isinstance(identity[2], bool) or
+                not isinstance(identity[2], int) or identity[2] < 0):
+            raise ValueError('Managed-job slot identity is malformed.')
+        try:
+            instance_id = uuid.UUID(identity[0])
+            attempt = uuid.UUID(identity[3])
+        except (TypeError, ValueError) as e:
+            raise ValueError('Managed-job slot identity is malformed.') from e
+        if (not isinstance(timeout_seconds,
+                           (int, float)) or isinstance(timeout_seconds, bool) or
+                not math.isfinite(timeout_seconds) or timeout_seconds < 0 or
+                not isinstance(poll_seconds, (int, float)) or
+                isinstance(poll_seconds, bool) or
+                not math.isfinite(poll_seconds) or poll_seconds <= 0):
+            raise ValueError('Managed-job quiescence timing is invalid.')
+        generation = identity[1]
+        slot_id = identity[2]
+        engine = initialize_and_get_db()
+        deadline = time.monotonic() + float(timeout_seconds)
+        affected_request_ids: set[str] = set()
+        signal_failures: set[str] = set()
+        while True:
+            signal_targets: list[tuple[str, int, int, int, uuid.UUID,
+                                       uuid.UUID]] = []
+            pending: list[str] = []
+            with engine.begin() as connection:
+                if not _lock_current_controller_leadership(
+                        connection, authority_owner[0], authority_owner[1]):
+                    raise request_storage.ManagedJobRequestQuiescenceError(
+                        'Outer controller leadership changed during nested '
+                        'request quiescence.')
+                job_info = managed_job_state_schema.job_info_table
+                job_rows = connection.execute(
+                    sqlalchemy.select(job_info.c.spot_job_id).where(
+                        job_info.c.controller_instance_id == str(instance_id),
+                        job_info.c.controller_generation == generation,
+                        job_info.c.controller_slot_id == slot_id,
+                        job_info.c.controller_slot_attempt ==
+                        str(attempt)).order_by(
+                            job_info.c.spot_job_id).with_for_update()).all()
+                job_ids = [int(row.spot_job_id) for row in job_rows]
+                if job_ids:
+                    result = connection.execute(
+                        sqlalchemy.update(job_info).where(
+                            job_info.c.spot_job_id.in_(job_ids),
+                            job_info.c.controller_instance_id == str(
+                                instance_id),
+                            job_info.c.controller_generation == generation,
+                            job_info.c.controller_slot_id == slot_id,
+                            job_info.c.controller_slot_attempt == str(attempt)).
+                        values(controller_slot_quiescing=True))
+                    if result.rowcount != len(job_ids):
+                        raise request_storage.ManagedJobRequestQuiescenceError(
+                            'Managed-job ownership changed while closing '
+                            'nested request admission.')
+                rows = connection.execute(
+                    sqlalchemy.select(REQUESTS).where(
+                        REQUESTS.c.managed_job_controller_instance_id ==
+                        instance_id,
+                        REQUESTS.c.managed_job_controller_generation ==
+                        generation,
+                        REQUESTS.c.managed_job_controller_slot_id == slot_id,
+                        REQUESTS.c.managed_job_controller_slot_attempt ==
+                        attempt).order_by(REQUESTS.c.request_id).
+                    with_for_update()).mappings().all()
+                for row in rows:
+                    request_id = str(row['request_id'])
+                    affected_request_ids.add(request_id)
+                    status = requests_lib.RequestStatus(str(row['status']))
+                    generation_id = int(row['execution_generation'])
+                    quiesced = bool(row['execution_quiescence_required'] and
+                                    row['execution_quiesced_generation']
+                                    == generation_id and
+                                    row['execution_quiesced_at'] is not None)
+                    if quiesced:
+                        connection.execute(
+                            sqlalchemy.delete(QUEUE).where(
+                                QUEUE.c.request_id == request_id))
+                        continue
+                    connection.execute(
+                        sqlalchemy.select(QUEUE).where(
+                            QUEUE.c.request_id == request_id).with_for_update()
+                    ).mappings().one_or_none()
+                    pre_effect = bool(
+                        status
+                        in requests_lib.RequestStatus.executable_statuses() and
+                        row['pid'] is None and
+                        row['execution_process_start_time_ticks'] is None)
+                    if pre_effect:
+                        now = sqlalchemy.func.clock_timestamp()
+                        if not _terminalize_locked_request(
+                                connection,
+                                row,
+                                status=requests_lib.RequestStatus.CANCELLED,
+                                cause=(event_api_models.EventCause.
+                                       CONTROLLER_LEADERSHIP_LOST),
+                                values=
+                            {
+                                'cancel_requested_at': now,
+                                'execution_quiescence_required': True,
+                                'execution_quiesced_generation': generation_id,
+                                'execution_quiesced_at': now,
+                                'should_retry': False,
+                                'finished_at': now,
+                                'status_msg': _MANAGED_JOB_QUIESCE_REASON,
+                                'interrupted_reason': _MANAGED_JOB_QUIESCE_REASON,
+                            }):
+                            raise request_storage.ManagedJobRequestQuiescenceError(
+                                'Lost a locked pre-effect nested request.')
+                        continue
+                    if status not in requests_lib.RequestStatus.finished_status(
+                    ):
+                        now = sqlalchemy.func.clock_timestamp()
+                        if not _terminalize_locked_request(
+                                connection,
+                                row,
+                                status=requests_lib.RequestStatus.CANCELLED,
+                                cause=(event_api_models.EventCause.
+                                       CONTROLLER_LEADERSHIP_LOST),
+                                values=
+                            {
+                                'cancel_requested_at': now,
+                                'execution_quiescence_required': True,
+                                'should_retry': False,
+                                'finished_at': now,
+                                'status_msg': _MANAGED_JOB_QUIESCE_REASON,
+                                'interrupted_reason': _MANAGED_JOB_QUIESCE_REASON,
+                            },
+                                delete_queue=True):
+                            raise request_storage.ManagedJobRequestQuiescenceError(
+                                'Lost a locked running nested request.')
+                    else:
+                        connection.execute(
+                            sqlalchemy.update(REQUESTS).where(
+                                REQUESTS.c.request_id == request_id,
+                                REQUESTS.c.execution_generation == generation_id
+                            ).values(
+                                cancel_requested_at=sqlalchemy.func.coalesce(
+                                    REQUESTS.c.cancel_requested_at,
+                                    sqlalchemy.func.clock_timestamp()),
+                                execution_quiescence_required=True,
+                                should_retry=False,
+                                status_msg=_MANAGED_JOB_QUIESCE_REASON,
+                                interrupted_reason=_MANAGED_JOB_QUIESCE_REASON,
+                                updated_at=sqlalchemy.func.clock_timestamp()))
+                    if (row['pid'] is None or
+                            row['execution_process_start_time_ticks'] is None or
+                            row['claim_token'] is None or
+                            row['worker_instance_id'] is None):
+                        pending.append(request_id)
+                        continue
+                    signal_targets.append(
+                        (request_id, int(row['pid']),
+                         int(row['execution_process_start_time_ticks']),
+                         generation_id, uuid.UUID(str(row['claim_token'])),
+                         uuid.UUID(str(row['worker_instance_id']))))
+                    pending.append(request_id)
+            for (request_id, pid, start_ticks, generation_id, claim_token,
+                 worker_instance_id) in signal_targets:
+                if worker_instance_id != uuid.UUID(self._instance_id):
+                    # A remote executor observes the durable CANCELLED row on
+                    # its next claim heartbeat and signals its exact local PID.
+                    continue
+                if not _signal_exact_executor_process(pid, start_ticks,
+                                                      signal.SIGTERM):
+                    signal_failures.add(request_id)
+                    continue
+                with engine.begin() as connection:
+                    connection.execute(
+                        sqlalchemy.update(REQUESTS).where(
+                            REQUESTS.c.request_id == request_id,
+                            REQUESTS.c.execution_generation == generation_id,
+                            REQUESTS.c.claim_token == claim_token,
+                            REQUESTS.c.worker_instance_id == worker_instance_id,
+                        ).values(cancel_acknowledged_at=(
+                            sqlalchemy.func.clock_timestamp()),
+                                 updated_at=sqlalchemy.func.clock_timestamp()))
+            if not pending:
+                return len(affected_request_ids)
+            if time.monotonic() >= deadline:
+                details = ', '.join(sorted(set(pending) | signal_failures))
+                raise request_storage.ManagedJobRequestQuiescenceError(
+                    'Timed out waiting for exact managed-job nested request '
+                    f'quiescence: {details}.')
+            time.sleep(float(poll_seconds))
+
+    def quiesce_stale_managed_job_requests(self,
+                                           current_owner: tuple[str, int],
+                                           *,
+                                           timeout_seconds: float = 60.0,
+                                           poll_seconds: float = 0.1) -> int:
+        """Quiesce every exact nested attempt before stale-job reset."""
+        try:
+            current_instance = uuid.UUID(current_owner[0])
+            current_generation = int(current_owner[1])
+        except (IndexError, TypeError, ValueError) as e:
+            raise ValueError('Current managed-job owner is malformed.') from e
+        if current_generation <= 0:
+            raise ValueError('Current managed-job generation must be positive.')
+        engine = initialize_and_get_db()
+        job_info = managed_job_state_schema.job_info_table
+        target_identities: set[
+            request_storage.ManagedJobControllerSlotIdentity] = set()
+        with engine.begin() as connection:
+            if not _lock_current_controller_leadership(
+                    connection, str(current_instance), current_generation):
+                raise request_storage.ManagedJobRequestQuiescenceError(
+                    'Current outer controller leadership is not live.')
+            stale_jobs = connection.execute(
+                sqlalchemy.select(job_info).where(
+                    job_info.c.schedule_state.is_not(None),
+                    job_info.c.schedule_state.not_in(('INACTIVE', 'DONE')),
+                    sqlalchemy.or_(
+                        job_info.c.controller_instance_id.is_(None),
+                        job_info.c.controller_generation.is_(None),
+                        job_info.c.controller_slot_id.is_(None),
+                        job_info.c.controller_slot_attempt.is_(None),
+                        job_info.c.controller_instance_id
+                        != str(current_instance),
+                        job_info.c.controller_generation != current_generation,
+                    )).order_by(job_info.c.spot_job_id).with_for_update()
+            ).mappings().all()
+            stale_job_ids = [int(row['spot_job_id']) for row in stale_jobs]
+            legacy_job_ids: list[int] = []
+            for row in stale_jobs:
+                try:
+                    identity = (managed_job_controller_fencing.
+                                persisted_job_attempt_identity(
+                                    row, (str(current_instance),
+                                          current_generation)))
+                except ValueError as e:
+                    raise request_storage.ManagedJobRequestQuiescenceError(
+                        f'Managed job {row["spot_job_id"]} has unsafe prior '
+                        'controller identity.') from e
+                if identity is None:
+                    legacy_job_ids.append(int(row['spot_job_id']))
+                else:
+                    target_identities.add(identity)
+            if stale_job_ids:
+                connection.execute(
+                    sqlalchemy.update(job_info).where(
+                        job_info.c.spot_job_id.in_(stale_job_ids)).values(
+                            controller_slot_quiescing=True))
+            if legacy_job_ids:
+                correlated_legacy_requests = connection.execute(
+                    sqlalchemy.select(
+                        REQUESTS.c.request_id, REQUESTS.c.managed_job_id).where(
+                            REQUESTS.c.managed_job_id.in_(legacy_job_ids)).
+                    order_by(REQUESTS.c.managed_job_id,
+                             REQUESTS.c.request_id).with_for_update()).all()
+                if correlated_legacy_requests:
+                    details = ', '.join(f'{row.managed_job_id}:{row.request_id}'
+                                        for row in correlated_legacy_requests)
+                    raise request_storage.ManagedJobRequestQuiescenceError(
+                        'Cannot adopt pre-slot managed jobs with correlated '
+                        f'nested requests: {details}.')
+            # Include retained nested tombstones even when their job has
+            # already become terminal or a prior failed reset cleared it.
+            request_origins = connection.execute(
+                sqlalchemy.select(
+                    REQUESTS.c.managed_job_controller_instance_id,
+                    REQUESTS.c.managed_job_controller_generation,
+                    REQUESTS.c.managed_job_controller_slot_id,
+                    REQUESTS.c.managed_job_controller_slot_attempt).
+                where(
+                    REQUESTS.c.managed_job_id.is_not(None),
+                    sqlalchemy.or_(
+                        REQUESTS.c.managed_job_controller_instance_id.is_(None),
+                        REQUESTS.c.managed_job_controller_generation.is_(None),
+                        REQUESTS.c.managed_job_controller_slot_id.is_(None),
+                        REQUESTS.c.managed_job_controller_slot_attempt.is_(
+                            None), REQUESTS.c.managed_job_controller_instance_id
+                        != current_instance,
+                        REQUESTS.c.managed_job_controller_generation
+                        != current_generation)).distinct()).all()
+            for row in request_origins:
+                if any(value is None for value in row):
+                    raise request_storage.ManagedJobRequestQuiescenceError(
+                        'A stale nested request has an incomplete origin.')
+                target_identities.add(
+                    (str(row.managed_job_controller_instance_id),
+                     int(row.managed_job_controller_generation),
+                     int(row.managed_job_controller_slot_id),
+                     str(row.managed_job_controller_slot_attempt)))
+        affected = 0
+        deadline = time.monotonic() + float(timeout_seconds)
+        for identity in sorted(target_identities):
+            remaining = max(0.0, deadline - time.monotonic())
+            affected += self._quiesce_managed_job_attempt_requests(
+                (str(current_instance), current_generation),
+                identity,
+                timeout_seconds=remaining,
+                poll_seconds=poll_seconds)
+        return affected
+
+    def converge_execution_completion(
+            self,
+            claim: request_storage.ExecutionClaim,
+            error: BaseException | None = None,
+            terminal_cause: str = 'handler_failed') -> bool:
+        """Atomically settle a parent-proven outcome and exact receipt."""
+        try:
+            cause = event_api_models.EventCause(terminal_cause)
+        except ValueError as e:
+            raise ValueError('Invalid execution completion cause.') from e
+        engine = initialize_and_get_db()
+        claim_token = uuid.UUID(claim.claim_token)
+        worker_instance_id = uuid.UUID(claim.worker_instance_id or
+                                       self._instance_id)
+        with engine.begin() as connection:
+            row = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
                     REQUESTS.c.request_id == claim.request_id,
                     REQUESTS.c.execution_generation ==
                     claim.execution_generation,
                     REQUESTS.c.claim_token == claim_token,
+                    REQUESTS.c.worker_instance_id == worker_instance_id).
+                with_for_update()).mappings().one_or_none()
+            if row is None or not row['execution_quiescence_required']:
+                # Exact identity was consumed, superseded, or garbage-collected.
+                return False
+            status = requests_lib.RequestStatus(str(row['status']))
+            if (error is not None and
+                    status in requests_lib.RequestStatus.active_statuses()):
+                request = _request_from_mapping(row)
+                request.status = requests_lib.RequestStatus.FAILED
+                request.finished_at = time.time()
+                request.set_error(error)
+                values = _request_values_for_db(request)
+                values.pop('request_id')
+                transitioned = _terminalize_locked_request(
+                    connection,
+                    row,
+                    status=requests_lib.RequestStatus.FAILED,
+                    cause=cause,
+                    values=values,
+                    extra_predicates=(
+                        REQUESTS.c.execution_generation ==
+                        claim.execution_generation,
+                        REQUESTS.c.claim_token == claim_token,
+                        REQUESTS.c.worker_instance_id == worker_instance_id,
+                    ))
+                if not transitioned:
+                    # The row is locked, so losing this exact transition means
+                    # the durable identity no longer belongs to this monitor.
+                    return False
+                _mark_controller_action_state(connection, claim.request_id,
+                                              str(worker_instance_id), 'failed')
+
+            receipt = connection.execute(
+                sqlalchemy.select(
+                    REQUESTS.c.execution_quiesced_generation,
+                    REQUESTS.c.execution_quiesced_at).where(
+                        REQUESTS.c.request_id == claim.request_id,
+                        REQUESTS.c.execution_generation ==
+                        claim.execution_generation,
+                        REQUESTS.c.claim_token == claim_token,
+                        REQUESTS.c.worker_instance_id == worker_instance_id,
+                        REQUESTS.c.execution_quiescence_required).
+                with_for_update()).first()
+            if receipt is None:
+                return False
+            if (receipt.execution_quiesced_generation is not None or
+                    receipt.execution_quiesced_at is not None):
+                if (receipt.execution_quiesced_generation
+                        != claim.execution_generation or
+                        receipt.execution_quiesced_at is None):
+                    return False
+            else:
+                result = connection.execute(
+                    sqlalchemy.update(REQUESTS).where(
+                        REQUESTS.c.request_id == claim.request_id,
+                        REQUESTS.c.execution_generation ==
+                        claim.execution_generation,
+                        REQUESTS.c.claim_token == claim_token,
+                        REQUESTS.c.worker_instance_id == worker_instance_id,
+                        REQUESTS.c.execution_quiesced_generation.is_(None),
+                        REQUESTS.c.execution_quiesced_at.is_(None)).values(
+                            execution_quiesced_generation=(
+                                claim.execution_generation),
+                            execution_quiesced_at=(
+                                sqlalchemy.func.clock_timestamp()),
+                            updated_at=sqlalchemy.func.clock_timestamp()))
+                if result.rowcount != 1:
+                    return False
+            _requeue_quiesced_replayable_requests(connection,
+                                                  request_id=claim.request_id)
+            return True
+
+    def handoff_execution_retry(self, claim: request_storage.ExecutionClaim,
+                                status_msg: str,
+                                retry_wait_seconds: float) -> bool:
+        """Atomically consume one exact family proof into delayed delivery."""
+        if (not isinstance(retry_wait_seconds, (int, float)) or
+                isinstance(retry_wait_seconds, bool) or
+                not math.isfinite(retry_wait_seconds) or
+                retry_wait_seconds < 0):
+            raise ValueError(
+                'Retry delay must be a finite non-negative number.')
+        claim_token = uuid.UUID(claim.claim_token)
+        worker_instance_id = uuid.UUID(claim.worker_instance_id or
+                                       self._instance_id)
+        engine = initialize_and_get_db()
+        with engine.begin() as connection:
+            preview = connection.execute(
+                sqlalchemy.select(
+                    REQUESTS.c.execution_class,
+                    REQUESTS.c.controller_generation,
+                    *(REQUESTS.c[field]
+                      for field in _MANAGED_JOB_ORIGIN_FIELDS)).where(
+                          REQUESTS.c.request_id == claim.request_id,
+                          REQUESTS.c.execution_generation ==
+                          claim.execution_generation,
+                          REQUESTS.c.claim_token == claim_token,
+                          REQUESTS.c.worker_instance_id ==
+                          worker_instance_id)).mappings().one_or_none()
+            if preview is None:
+                return False
+            if preview['execution_class'] == (
+                    request_registry.ExecutionClass.CONTROLLER.value):
+                controller_generation = preview['controller_generation']
+                if (controller_generation is None or
+                        not _lock_current_controller_leadership(
+                            connection, str(worker_instance_id),
+                            int(controller_generation))):
+                    return False
+            if not _lock_managed_job_origin(
+                    connection, preview, require_admission=True):
+                return False
+            row = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
+                    REQUESTS.c.request_id == claim.request_id,
+                    REQUESTS.c.execution_generation ==
+                    claim.execution_generation,
+                    REQUESTS.c.claim_token == claim_token,
+                    REQUESTS.c.worker_instance_id == worker_instance_id,
+                    REQUESTS.c.execution_quiescence_required).with_for_update()
+            ).mappings().one_or_none()
+            if row is None or not _same_managed_job_origin(preview, row):
+                return False
+            delivery = connection.execute(
+                sqlalchemy.select(QUEUE).where(
+                    QUEUE.c.request_id == claim.request_id).with_for_update()
+            ).mappings().one_or_none()
+            if (requests_lib.RequestStatus(str(
+                    row['status'])) != requests_lib.RequestStatus.RUNNING or
+                    row['cancel_requested_at'] is not None or
+                    delivery is None or
+                    delivery['delivery_state'] != 'claimed' or
+                    delivery['claim_generation'] != claim.execution_generation):
+                return False
+            # Exact identity plus the parent-observed Future result is the
+            # authority to consume this receipt.  Lease age is deliberately
+            # irrelevant: a retry delay equal to the lease must not strand a
+            # completed generation before this transaction can run.
+            if (row['execution_class'] != preview['execution_class'] or
+                    row['controller_generation']
+                    != preview['controller_generation']):
+                return False
+            now = sqlalchemy.func.clock_timestamp()
+            result = connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == claim.request_id, REQUESTS.c.status
+                    == requests_lib.RequestStatus.RUNNING.value,
+                    REQUESTS.c.execution_generation ==
+                    claim.execution_generation,
+                    REQUESTS.c.claim_token == claim_token,
+                    REQUESTS.c.worker_instance_id == worker_instance_id,
+                    REQUESTS.c.execution_quiescence_required,
+                    REQUESTS.c.cancel_requested_at.is_(None)).values(
+                        status=requests_lib.RequestStatus.WAITING.value,
+                        terminal_cause=None,
+                        return_value=None,
+                        error=None,
+                        pid=None,
+                        execution_process_start_time_ticks=None,
+                        claim_token=None,
+                        worker_instance_id=None,
+                        controller_generation=None,
+                        lease_expires_at=None,
+                        heartbeat_at=None,
+                        cancel_requested_at=None,
+                        cancel_acknowledged_at=None,
+                        execution_quiescence_required=False,
+                        execution_quiesced_generation=None,
+                        execution_quiesced_at=None,
+                        should_retry=False,
+                        finished_at=None,
+                        status_msg=status_msg,
+                        interrupted_reason=None,
+                        updated_at=now))
+            if result.rowcount != 1:
+                return False
+            delivery_result = connection.execute(
+                sqlalchemy.update(QUEUE).where(
+                    QUEUE.c.request_id == claim.request_id,
+                    QUEUE.c.delivery_state == 'claimed',
+                    QUEUE.c.claim_generation == claim.execution_generation).
+                values(
+                    delivery_state='queued',
+                    claim_generation=None,
+                    available_at=(
+                        now +
+                        datetime.timedelta(seconds=float(retry_wait_seconds))),
+                    updated_at=now))
+            if delivery_result.rowcount != 1:
+                raise RuntimeError('Retry handoff lost its locked delivery.')
+            return True
+
+    def interrupt_request_for_shutdown_retry(self, request_id: str) -> bool:
+        """Record retry intent, then signal only the exact Linux process."""
+        engine = initialize_and_get_db()
+        signal_target: tuple[int, int,
+                             request_storage.ExecutionClaim] | None = (None)
+        with engine.begin() as connection:
+            row = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
+                    REQUESTS.c.request_id ==
+                    request_id).with_for_update()).mappings().one_or_none()
+            if row is None:
+                return False
+            status = requests_lib.RequestStatus(str(row['status']))
+            if status in requests_lib.RequestStatus.finished_status():
+                return False
+            delivery = connection.execute(
+                sqlalchemy.select(QUEUE).where(
+                    QUEUE.c.request_id ==
+                    request_id).with_for_update()).mappings().one_or_none()
+            generation = int(row['execution_generation'])
+            queued_pre_effect = bool(
+                status in requests_lib.RequestStatus.executable_statuses() and
+                row['pid'] is None and delivery is not None and
+                ((delivery['delivery_state'] == 'queued' and
+                  delivery['claim_generation'] is None) or
+                 (delivery['delivery_state'] == 'claimed' and
+                  delivery['claim_generation'] == generation)))
+            now = sqlalchemy.func.clock_timestamp()
+            if queued_pre_effect:
+                return _terminalize_locked_request(
+                    connection,
+                    row,
+                    status=requests_lib.RequestStatus.CANCELLED,
+                    cause=(event_api_models.EventCause.GRACEFUL_SHUTDOWN_RETRY),
+                    values={
+                        'cancel_requested_at': now,
+                        'execution_quiescence_required': True,
+                        'execution_quiesced_generation': generation,
+                        'execution_quiesced_at': now,
+                        'should_retry': True,
+                        'finished_at': now,
+                    })
+            if (status is not requests_lib.RequestStatus.RUNNING or
+                    delivery is None or
+                    delivery['delivery_state'] != 'claimed' or
+                    delivery['claim_generation'] != generation or
+                    row['pid'] is None or
+                    row['execution_process_start_time_ticks'] is None or
+                    row['claim_token'] is None or
+                    str(row['worker_instance_id']) != self._instance_id):
+                return False
+            claim = request_storage.ExecutionClaim(
+                request_id, generation, str(row['claim_token']),
+                str(row['worker_instance_id']))
+            connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == request_id,
+                    REQUESTS.c.execution_generation == generation,
+                    REQUESTS.c.claim_token == row['claim_token'],
+                    REQUESTS.c.worker_instance_id ==
+                    row['worker_instance_id']).values(
+                        cancel_requested_at=sqlalchemy.func.coalesce(
+                            REQUESTS.c.cancel_requested_at, now),
+                        execution_quiescence_required=True,
+                        should_retry=False,
+                        status_msg=('Graceful shutdown is waiting for exact '
+                                    'execution quiescence'),
+                        interrupted_reason=_GRACEFUL_SHUTDOWN_RETRY_REASON,
+                        updated_at=now))
+            signal_target = (int(row['pid']),
+                             int(row['execution_process_start_time_ticks']),
+                             claim)
+        assert signal_target is not None
+        pid, process_start_time_ticks, claim = signal_target
+        if not _signal_exact_executor_process(pid, process_start_time_ticks,
+                                              signal.SIGTERM):
+            return False
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(REQUESTS).where(
+                    REQUESTS.c.request_id == request_id,
+                    REQUESTS.c.execution_generation == generation,
+                    REQUESTS.c.claim_token == uuid.UUID(claim.claim_token),
                     REQUESTS.c.worker_instance_id == uuid.UUID(
-                        self._instance_id),
-                    REQUESTS.c.execution_quiesced_generation.is_(None),
-                    REQUESTS.c.execution_quiesced_at.is_(None)).values(
-                        execution_quiesced_generation=(
-                            claim.execution_generation),
-                        execution_quiesced_at=(
+                        self._instance_id), REQUESTS.c.interrupted_reason ==
+                    _GRACEFUL_SHUTDOWN_RETRY_REASON).values(
+                        cancel_acknowledged_at=(
                             sqlalchemy.func.clock_timestamp()),
                         updated_at=sqlalchemy.func.clock_timestamp()))
-            return result.rowcount == 1
+        return True
 
     def set_request_finished(self,
                              request_id: str,
@@ -1944,7 +4848,12 @@ class PostgresRequestBackend(request_storage.RequestBackend):
             for status in requests_lib.RequestStatus.active_statuses()
         ]
         statement = sqlalchemy.select(REQUESTS).where(
-            REQUESTS.c.status.in_(active), REQUESTS.c.name != 'sky.api_cancel')
+            REQUESTS.c.status.in_(active),
+            REQUESTS.c.name != 'sky.api_cancel',
+            # Correlated bound launches require Serve association cancellation
+            # and request terminalization in one transaction.  Generic API
+            # cancellation cannot safely invent or omit that durable intent.
+            REQUESTS.c.ordinary_launch_association_id.is_(None))
         if request_ids is not None:
             statement = statement.where(REQUESTS.c.request_id.in_(request_ids))
         if user_id is not None:
@@ -1961,12 +4870,7 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                                           row['request_id'] for row in rows
                                       ]))).mappings().all()
             deliveries = {row['request_id']: row for row in delivery_rows}
-            database_now = connection.execute(
-                sqlalchemy.select(
-                    sqlalchemy.func.clock_timestamp())).scalar_one()
             for row in rows:
-                if daemons.is_daemon_request_id(row['request_id']):
-                    continue
                 delivery = deliveries.get(row['request_id'])
                 matching_delivery = (delivery is not None and (
                     (delivery['delivery_state'] == 'queued' and
@@ -2013,25 +4917,14 @@ class PostgresRequestBackend(request_storage.RequestBackend):
                                                  reconciliation_at=now,
                                                  updated_at=now))
                 if (not execution_is_quiescent and row['pid'] is not None and
-                        row['claim_token'] is not None and
+                        row['execution_process_start_time_ticks'] is not None
+                        and row['claim_token'] is not None and
                         str(row['worker_instance_id']) == self._instance_id and
-                        row['lease_expires_at'] is not None and
-                        row['lease_expires_at'] > database_now and
-                        _is_owned_executor_process(int(row['pid']))):
-                    claim = request_storage.ExecutionClaim(
-                        row['request_id'], int(row['execution_generation']),
-                        str(row['claim_token']))
-                    marker = request_storage.arm_execution_cancellation(
-                        int(row['pid']), claim)
-                    try:
-                        os.kill(int(row['pid']), signal.SIGTERM)
-                    except ProcessLookupError:
-                        request_storage.clear_execution_cancellation(marker)
-                    except OSError as error:
-                        request_storage.clear_execution_cancellation(marker)
-                        logger.warning(f'Failed to interrupt cancelled request '
-                                       f'{row["request_id"]} owned by '
-                                       f'{self._instance_id}: {error}')
+                        row['lease_expires_at'] is not None):
+                    if not _signal_exact_executor_process(
+                            int(row['pid']),
+                            int(row['execution_process_start_time_ticks']),
+                            signal.SIGTERM):
                         continue
                     connection.execute(
                         sqlalchemy.update(REQUESTS).where(
@@ -2141,14 +5034,26 @@ class PostgresRequestBackend(request_storage.RequestBackend):
     def reset_on_startup(self) -> None:
         initialize_and_get_db()
 
-    def recover_on_startup(self) -> bool:
+    def recover_on_startup(
+        self,
+        *,
+        controller_owner: tuple[str, int] | None = None,
+    ) -> bool:
         """Validate durable state without wiping or re-enqueueing rows."""
+        owner = (controller_owner if controller_owner is not None else
+                 _controller_owner_from_environment())
+        if owner is None:
+            raise RuntimeError('Request recovery requires an active '
+                               'controller generation.')
         engine = initialize_and_get_db()
         active = [
             status.value
             for status in requests_lib.RequestStatus.active_statuses()
         ]
         with engine.begin() as connection:
+            if not _lock_current_controller_leadership(connection, *owner):
+                raise RuntimeError('Controller leadership changed before '
+                                   'request recovery.')
             # Coroutine requests intentionally have no queue delivery. They
             # cannot survive loss of the all-role compatibility process, so
             # preserve the row and surface a retry instead of silently
@@ -2187,6 +5092,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
         *,
         execution_classes: frozenset[str] | None = None,
         controller_generation: int | None = None,
+        supported_handler_names: frozenset[str] | None = None,
     ):
         self._schedule_type = schedule_type
         self._instance_id = ensure_server_instance_id()
@@ -2201,22 +5107,39 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                              f'{sorted(execution_classes - valid_classes)}')
         if (execution_classes is not None and
                 request_registry.ExecutionClass.CONTROLLER.value
-                in execution_classes and controller_generation is None and
-                os.environ.get(SERVER_ROLE_ENV_VAR, 'all') != 'all'):
+                in execution_classes and controller_generation is None):
             raise ValueError('A controller-scoped queue requires an active '
                              'controller generation.')
         self._execution_classes = execution_classes
         self._controller_generation = controller_generation
+        role = os.environ.get(SERVER_ROLE_ENV_VAR, 'all')
+        self._supported_handler_names = (frozenset(_supported_handlers(role))
+                                         if supported_handler_names is None else
+                                         supported_handler_names)
 
     def _role_predicates(self) -> tuple[sqlalchemy.ColumnElement[bool], ...]:
-        predicates: list[sqlalchemy.ColumnElement[bool]] = []
+        # Handler filtering is repeated in candidate selection, locked claim,
+        # and the guarded request UPDATE because observing a queue row never
+        # grants execution authority by itself.
+        predicates: list[sqlalchemy.ColumnElement[bool]] = [
+            REQUESTS.c.handler_name.in_(self._supported_handler_names)
+        ]
         if self._execution_classes is not None:
             predicates.append(
                 REQUESTS.c.execution_class.in_(self._execution_classes))
-        if self._controller_generation is not None:
-            predicates.append(sqlalchemy.exists().where(
-                _controller_leadership_is_current_predicate(
-                    uuid.UUID(self._instance_id), self._controller_generation)))
+        controller_class = request_registry.ExecutionClass.CONTROLLER.value
+        if self._controller_generation is None:
+            # An unscoped queue without outer authority remains usable for
+            # normal work, but is never capable of admitting controller work.
+            predicates.append(REQUESTS.c.execution_class != controller_class)
+        else:
+            predicates.append(
+                sqlalchemy.or_(
+                    REQUESTS.c.execution_class != controller_class,
+                    sqlalchemy.exists().where(
+                        _controller_leadership_is_current_predicate(
+                            uuid.UUID(self._instance_id),
+                            self._controller_generation))))
         return tuple(predicates)
 
     def _lock_controller_leadership(
@@ -2288,6 +5211,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                     _controller_claim_is_current()).values(
                         status=requests_lib.RequestStatus.WAITING.value,
                         pid=None,
+                        execution_process_start_time_ticks=None,
                         claim_token=None,
                         worker_instance_id=None,
                         controller_generation=None,
@@ -2309,108 +5233,89 @@ class PostgresQueueBackend(queue_base.QueueBackend):
     async def put_async(self, item: queue_base.QueueItemLike) -> None:
         await asyncio.to_thread(self.put, item)
 
-    def _reap_orphaned_execution_quiescence(
-            self, connection: sqlalchemy.engine.Connection) -> None:
-        """Publish quiescence no surviving owner can ever acknowledge.
-
-        Only the exact worker that claimed an execution generation may call
-        ``acknowledge_execution_quiescence``. When that worker dies mid-flight
-        its lease lapses, so nothing is left running effect-bearing code -- but
-        the row keeps ``execution_quiescence_required`` with no acknowledgement
-        forever. Every barrier waiting on it then blocks permanently: serve's
-        interrupted reserved-fill recovery wedges its whole replica manager,
-        which stops all reconciliation for the service.
-
-        An expired lease is the same proof of lost execution authority that
-        ``_reap_expired_claims`` already acts on. Wait a wide grace period past
-        the finish so an owner's own in-flight acknowledgement always wins,
-        then record the quiescence the dead owner cannot.
-        """
-        now = sqlalchemy.func.clock_timestamp()
-        stale_after = now - datetime.timedelta(
-            seconds=_ORPHANED_QUIESCENCE_GRACE_SECONDS)
-        orphaned = sqlalchemy.select(REQUESTS.c.request_id).where(
-            REQUESTS.c.status.in_([
-                status.value
-                for status in requests_lib.RequestStatus.finished_status()
-            ]),
-            REQUESTS.c.execution_quiescence_required,
-            REQUESTS.c.execution_quiesced_at.is_(None),
-            REQUESTS.c.execution_generation.is_not(None),
-            REQUESTS.c.finished_at.is_not(None),
-            REQUESTS.c.finished_at < stale_after,
-            # A live lease is the only thing that can still be executing, and
-            # its holder is the only party allowed to publish the proof.
-            sqlalchemy.or_(REQUESTS.c.lease_expires_at.is_(None),
-                           REQUESTS.c.lease_expires_at < now),
-        ).limit(_MAX_ORPHANED_QUIESCENCE_PER_SWEEP)
-        result = connection.execute(
-            sqlalchemy.update(REQUESTS).where(
-                REQUESTS.c.request_id.in_(orphaned)).values(
-                    execution_quiesced_generation=(
-                        REQUESTS.c.execution_generation),
-                    execution_quiesced_at=now,
-                    updated_at=now))
-        if result.rowcount:
-            logger.info(f'Recorded execution quiescence for {result.rowcount} '
-                        'terminal request(s) whose executor is gone.')
-
     def _reap_expired_claims(self,
                              connection: sqlalchemy.engine.Connection) -> None:
         now = sqlalchemy.func.clock_timestamp()
         rows = connection.execute(
-            sqlalchemy.select(REQUESTS, QUEUE).join(
-                QUEUE, QUEUE.c.request_id == REQUESTS.c.request_id).where(
-                    QUEUE.c.schedule_type == self._schedule_type,
-                    QUEUE.c.delivery_state == 'claimed',
-                    REQUESTS.c.lease_expires_at
-                    < sqlalchemy.func.clock_timestamp(),
-                    *self._role_predicates()).limit(
+            sqlalchemy.select(REQUESTS, QUEUE).
+            join(QUEUE, QUEUE.c.request_id == REQUESTS.c.request_id).where(
+                QUEUE.c.schedule_type == self._schedule_type,
+                QUEUE.c.delivery_state == 'claimed',
+                # The association-aware reducer is the sole expiry
+                # authority for bound ordinary launches. It knows whether
+                # the durable effect fence was crossed; the generic reaper
+                # cannot safely distinguish pre-effect from ambiguous I/O.
+                REQUESTS.c.ordinary_launch_association_id.is_(None),
+                REQUESTS.c.status.in_([
+                    status.value
+                    for status in requests_lib.RequestStatus.active_statuses()
+                ]),
+                REQUESTS.c.cancel_requested_at.is_(None),
+                REQUESTS.c.lease_expires_at < sqlalchemy.func.clock_timestamp(),
+                *self._role_predicates()).order_by(
+                    REQUESTS.c.lease_expires_at, QUEUE.c.sequence).limit(
                         _MAX_EXPIRED_CLAIMS_PER_SWEEP).with_for_update(
                             skip_locked=True)).mappings().all()
         for row in rows:
-            registration = request_registry.resolve_handler(row['handler_name'])
-            replayable = registration.replay_policy in (
-                request_registry.ReplayPolicy.READ_ONLY,
-                request_registry.ReplayPolicy.RECONCILE)
-            if replayable:
-                connection.execute(
-                    sqlalchemy.update(REQUESTS).where(
-                        REQUESTS.c.request_id == row['request_id']).values(
-                            status=requests_lib.RequestStatus.WAITING.value,
-                            pid=None,
-                            claim_token=None,
-                            worker_instance_id=None,
-                            controller_generation=None,
-                            lease_expires_at=None,
-                            heartbeat_at=None,
-                            status_msg='Execution owner lost; reconciling',
-                            updated_at=now))
-                connection.execute(
-                    sqlalchemy.update(QUEUE).where(
-                        QUEUE.c.request_id == row['request_id']).values(
-                            delivery_state='queued',
-                            claim_generation=None,
-                            available_at=now,
-                            updated_at=now))
+            try:
+                registration = request_registry.resolve_handler(
+                    row['handler_name'])
+            except ValueError:
+                replayable = False
             else:
+                replayable = registration.replay_policy in (
+                    request_registry.ReplayPolicy.READ_ONLY,
+                    request_registry.ReplayPolicy.RECONCILE)
+            if replayable:
+                if row['pid'] is None:
+                    if _requeue_locked_pre_effect_claim(
+                            connection,
+                            row,
+                            status_msg=(
+                                'Execution lease expired before execution '
+                                'admission; reconciling'),
+                            interrupted_reason=(
+                                'Execution lease expired before the exact claim '
+                                'crossed its guarded RUNNING transition.')):
+                        continue
+                connection.execute(
+                    sqlalchemy.update(REQUESTS).
+                    where(REQUESTS.c.request_id == row['request_id']).values(
+                        # Expiry revokes the generation; it is not stop
+                        # proof. Keep the claimed delivery and exact owner
+                        # tuple until its wrapper publishes quiescence.
+                        cancel_requested_at=sqlalchemy.func.coalesce(
+                            REQUESTS.c.cancel_requested_at, now),
+                        execution_quiescence_required=True,
+                        should_retry=True,
+                        status_msg=('Execution lease expired; waiting for '
+                                    'execution quiescence'),
+                        interrupted_reason=(
+                            'Execution lease expired; replay is deferred '
+                            'until the exact execution stops.'),
+                        updated_at=now))
+            else:
+                terminal_values: dict[str, Any] = {
+                    # Lease expiry revokes mutation authority but is not
+                    # evidence that the executor or its children stopped.
+                    # Retain the complete claim tombstone even after the
+                    # wrapper publishes generation-bound quiescence: the
+                    # claim schema makes token/worker/lease atomic, and row
+                    # retention is the one canonical identity cleanup path.
+                    'cancel_requested_at': now,
+                    'execution_quiescence_required': True,
+                    'should_retry': True,
+                    'finished_at': now,
+                    'interrupted_reason':
+                        ('Execution lease expired with an ambiguous mutating '
+                         'outcome.'),
+                }
                 transitioned = _terminalize_locked_request(
                     connection,
                     row,
                     status=requests_lib.RequestStatus.CANCELLED,
                     cause=(event_api_models.EventCause.EXECUTION_LEASE_EXPIRED),
-                    values={
-                        'pid': None,
-                        'claim_token': None,
-                        'worker_instance_id': None,
-                        'lease_expires_at': None,
-                        'heartbeat_at': None,
-                        'should_retry': True,
-                        'finished_at': now,
-                        'interrupted_reason':
-                            ('Execution lease expired with an ambiguous '
-                             'mutating outcome.'),
-                    })
+                    values=terminal_values)
                 if not transitioned:
                     continue
                 if row['execution_class'] == (
@@ -2424,33 +5329,45 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                                  'running'])).values(state='ambiguous',
                                                      reconciliation_at=now,
                                                      updated_at=now))
+        _requeue_quiesced_replayable_requests(connection)
+
+    @staticmethod
+    def _provider_mutation_predicate(
+            provider_mutation: bool) -> sqlalchemy.ColumnElement[bool]:
+        if provider_mutation:
+            return REQUESTS.c.handler_name.in_(_PROVIDER_MUTATION_HANDLER_NAMES)
+        return REQUESTS.c.handler_name.not_in(_PROVIDER_MUTATION_HANDLER_NAMES)
 
     def _candidate(
-        self, connection: sqlalchemy.engine.Connection
+        self,
+        connection: sqlalchemy.engine.Connection,
+        *,
+        provider_mutation: bool,
+        request_id: str | None = None,
     ) -> sqlalchemy.engine.RowMapping | None:
         statement = sqlalchemy.select(
-            QUEUE, REQUESTS.c.execution_class,
+            QUEUE, REQUESTS.c.execution_class, REQUESTS.c.handler_name,
+            *(REQUESTS.c[field] for field in _MANAGED_JOB_ORIGIN_FIELDS),
             sqlalchemy.func.clock_timestamp().label('_database_now')).join(
                 REQUESTS, REQUESTS.c.request_id == QUEUE.c.request_id).where(
                     QUEUE.c.schedule_type == self._schedule_type,
                     QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
                     <= sqlalchemy.func.clock_timestamp(),
+                    self._provider_mutation_predicate(provider_mutation),
                     *self._role_predicates())
+        if request_id is not None:
+            statement = statement.where(QUEUE.c.request_id == request_id)
         return connection.execute(
             statement.order_by(QUEUE.c.priority.desc(),
                                QUEUE.c.sequence).limit(1)).mappings().first()
 
-    def get(self) -> queue_base.QueueItem | None:
+    def _claim_candidate(
+        self,
+        candidate: sqlalchemy.engine.RowMapping,
+        *,
+        provider_mutation: bool,
+    ) -> queue_base.QueueItem | None:
         engine = initialize_and_get_db()
-        with engine.begin() as connection:
-            if not self._lock_controller_leadership(connection):
-                return None
-            self._reap_expired_claims(connection)
-            self._reap_orphaned_execution_quiescence(connection)
-            candidate = self._candidate(connection)
-        if candidate is None:
-            return None
-
         met = True
         status_msg = None
         precondition_error: BaseException | None = None
@@ -2469,16 +5386,33 @@ class PostgresQueueBackend(queue_base.QueueBackend):
         with engine.begin() as connection:
             if not self._lock_controller_leadership(connection):
                 return None
-            locked = connection.execute(
-                sqlalchemy.select(QUEUE, REQUESTS).join(
-                    REQUESTS,
-                    REQUESTS.c.request_id == QUEUE.c.request_id).where(
-                        QUEUE.c.request_id == candidate['request_id'],
-                        QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
-                        <= sqlalchemy.func.clock_timestamp(),
-                        *self._role_predicates()).with_for_update(
-                            skip_locked=True)).mappings().first()
-            if locked is None:
+            managed_job_origin_current = _lock_managed_job_origin(
+                connection, candidate, require_admission=True)
+            # `_lock_controller_leadership()` above acquired any controller
+            # outer lock before this managed-job outer/job prefix.  No outer
+            # lock may be upgraded after the job row is locked.
+            request_row = connection.execute(
+                sqlalchemy.select(REQUESTS).where(
+                    REQUESTS.c.request_id == candidate['request_id'],
+                    self._provider_mutation_predicate(provider_mutation),
+                    *self._role_predicates()).with_for_update(
+                        skip_locked=True)).mappings().first()
+            if request_row is None:
+                return None
+            queue_row = connection.execute(
+                sqlalchemy.select(QUEUE).where(
+                    QUEUE.c.request_id == candidate['request_id'],
+                    QUEUE.c.delivery_state == 'queued', QUEUE.c.available_at
+                    <= sqlalchemy.func.clock_timestamp()).with_for_update(
+                        skip_locked=True)).mappings().first()
+            if queue_row is None:
+                return None
+            locked = dict(queue_row)
+            locked.update(dict(request_row))
+            if not _same_managed_job_origin(candidate, locked):
+                return None
+            if not managed_job_origin_current:
+                _terminalize_stale_managed_job_request(connection, locked)
                 return None
             if precondition_error is not None:
                 request = _request_from_mapping(locked)
@@ -2542,6 +5476,9 @@ class PostgresQueueBackend(queue_base.QueueBackend):
             result = connection.execute(
                 claim_statement.values(
                     execution_generation=generation,
+                    terminal_cause=None,
+                    pid=None,
+                    execution_process_start_time_ticks=None,
                     claim_token=token,
                     worker_instance_id=uuid.UUID(self._instance_id),
                     controller_generation=controller_generation,
@@ -2575,6 +5512,7 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                            CONTROLLER_RESERVATION_CONFLICT),
                     values={
                         'pid': None,
+                        'execution_process_start_time_ticks': None,
                         'claim_token': None,
                         'worker_instance_id': None,
                         'lease_expires_at': None,
@@ -2594,12 +5532,76 @@ class PostgresQueueBackend(queue_base.QueueBackend):
                         delivery_state='claimed',
                         claim_generation=generation,
                         updated_at=sqlalchemy.func.clock_timestamp()))
+            managed_job_origin = None
+            if locked['managed_job_id'] is not None:
+                managed_job_origin = (
+                    int(locked['managed_job_id']),
+                    str(locked['managed_job_controller_instance_id']),
+                    int(locked['managed_job_controller_generation']),
+                    int(locked['managed_job_controller_slot_id']),
+                    str(locked['managed_job_controller_slot_attempt']),
+                )
             return queue_base.QueueItem(request_id=candidate['request_id'],
                                         ignore_return_value=bool(
                                             locked['ignore_return_value']),
                                         retryable=bool(locked['retryable']),
                                         execution_generation=generation,
-                                        claim_token=str(token))
+                                        claim_token=str(token),
+                                        worker_instance_id=self._instance_id,
+                                        managed_job_origin=managed_job_origin)
+
+    def peek_provider_mutation(
+            self) -> queue_base.ProviderMutationCandidate | None:
+        """Read a bound provider request without claiming its queue row."""
+        engine = initialize_and_get_db()
+        with engine.connect() as connection:
+            candidate = self._candidate(connection, provider_mutation=True)
+        if candidate is None:
+            return None
+        kind = _PROVIDER_MUTATION_HANDLER_KINDS.get(candidate['handler_name'])
+        if kind is None:
+            raise RuntimeError(
+                'Provider mutation handler classification drifted.')
+        return queue_base.ProviderMutationCandidate(
+            request_id=candidate['request_id'], kind=kind)
+
+    def claim_provider_mutation(
+        self, candidate: queue_base.ProviderMutationCandidate
+    ) -> queue_base.QueueItem | None:
+        """Claim one exact provider request after process-slot reservation."""
+        if not isinstance(candidate, queue_base.ProviderMutationCandidate):
+            raise ValueError('Invalid provider mutation candidate.')
+        if not isinstance(candidate.kind,
+                          queue_base.ProviderMutationRequestKind):
+            raise ValueError('Invalid provider mutation candidate kind.')
+        engine = initialize_and_get_db()
+        with engine.connect() as connection:
+            observed = self._candidate(connection,
+                                       provider_mutation=True,
+                                       request_id=candidate.request_id)
+        if observed is None:
+            return None
+        if (_PROVIDER_MUTATION_HANDLER_KINDS.get(observed['handler_name'])
+                is not candidate.kind):
+            return None
+        return self._claim_candidate(observed, provider_mutation=True)
+
+    def get(self) -> queue_base.QueueItem | None:
+        """Claim generic work; provider mutations use the reserved path."""
+        engine = initialize_and_get_db()
+        with engine.begin() as connection:
+            if not self._lock_controller_leadership(connection):
+                return None
+            self._reap_expired_claims(connection)
+            # Lease expiry revokes future mutation authority, but does not
+            # prove that an already-running handler/process has stopped. Only
+            # the exact execution owner may publish generation-bound
+            # quiescence; timeout-based synthesis could otherwise authorize a
+            # bound reducer while opaque provider I/O is still running.
+            candidate = self._candidate(connection, provider_mutation=False)
+        if candidate is None:
+            return None
+        return self._claim_candidate(candidate, provider_mutation=False)
 
     def qsize(self) -> int:
         engine = initialize_and_get_db()
@@ -2623,12 +5625,15 @@ class PostgresQueueFactory(queue_base.QueueBackendFactory):
         *,
         execution_classes: frozenset[str] | None = None,
         controller_generation: int | None = None,
+        supported_handler_names: frozenset[str] | None = None,
     ) -> None:
         self._execution_classes = execution_classes
         self._controller_generation = controller_generation
+        self._supported_handler_names = supported_handler_names
 
     def create_queue(self, schedule_type: str) -> queue_base.QueueBackend:
         return PostgresQueueBackend(
             schedule_type,
             execution_classes=self._execution_classes,
-            controller_generation=self._controller_generation)
+            controller_generation=self._controller_generation,
+            supported_handler_names=self._supported_handler_names)

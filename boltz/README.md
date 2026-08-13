@@ -28,6 +28,23 @@ release patch from every first-parent commit after the recorded `1.1.19` epoch. 
 stamps that version consistently into Python metadata, CLI/API/dashboard output, the image, and the
 chart.
 
+### Reserved-fill reclaim policy
+
+The overlay also builds and installs the separate
+`boltz-skypilot-reserved-fill-reclaim-policy` wheel. The generic SkyPilot wheel intentionally has no
+deployment-policy entry point. Before activating reserved-capacity fill, run the complete fleet
+preflight from the built image:
+
+```bash
+python -m boltz_reserved_fill_reclaim_policy
+```
+
+Success prints one schema-1 JSON object and exits zero. Failure prints one redacted schema-1 JSON
+object and exits nonzero. The preflight is expected to fail until both Kubernetes contexts match the
+code-owned queue, priority, admission, scheduler, Kueue, accelerator, and Pod Identity inventory.
+The exact contract and fix-forward deployment sequence are maintained in
+`docs/designs/serve-multi-pool-reserved-capacity-fill.md`.
+
 ### Enabling pushes (one-time)
 
 Create an OIDC role in the gitops-hub account (255203429798) trusting `boltz-bio/skypilot`, with ECR

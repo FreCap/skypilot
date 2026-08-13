@@ -60,6 +60,47 @@ AWS_EFA_RESOURCE_KEY = 'vpc.amazonaws.com/efa'
 _PREEMPTION_GRACE_CAP_SECONDS = 600
 
 
+def get_service_account_name(
+    context: str,
+    cluster_config_overrides: dict[str, Any] | None = None,
+    workspace: str | None = None,
+) -> str:
+    """Resolve the effective service account for one Kubernetes context."""
+    if cluster_config_overrides is None:
+        cluster_config_overrides = {}
+    remote_identity = skypilot_config.get_effective_workspace_region_config(
+        cloud='kubernetes',
+        region=context,
+        keys=('remote_identity',),
+        default_value=schemas.get_default_remote_identity('kubernetes'),
+        workspace=workspace,
+        override_configs=cluster_config_overrides)
+
+    if isinstance(remote_identity, dict):
+        service_account_name = None
+        for pattern, candidate in remote_identity.items():
+            if fnmatch.fnmatchcase(context, str(pattern)):
+                service_account_name = candidate
+                break
+        if service_account_name is None:
+            raise ValueError(f'Context {context!r} not found in remote '
+                             'identities from config.yaml')
+    else:
+        service_account_name = remote_identity
+
+    default_identity_values = {
+        schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value,
+        schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value,
+        schemas.RemoteIdentityOptions.NO_UPLOAD.value,
+    }
+    if service_account_name in default_identity_values:
+        return kubernetes_utils.DEFAULT_SERVICE_ACCOUNT_NAME
+    if not isinstance(service_account_name, str) or not service_account_name:
+        raise ValueError('Kubernetes remote identity must resolve to a '
+                         'non-empty service account name.')
+    return service_account_name
+
+
 def _compute_preemption_hook_timeout(
         hooks: list[dict[str, Any]] | None) -> int | None:
     """Sum of timeouts for all preemption-event hooks, capped.
@@ -565,6 +606,50 @@ class Kubernetes(clouds.Cloud):
         return virtual_instance_type
 
     @classmethod
+    def get_declarative_instance_type(
+            cls, resources: 'resources_lib.Resources') -> str:
+        """Materialize a requested shape without querying live capacity."""
+        if resources.instance_type is not None:
+            return resources.instance_type
+        default_instance_type = cls.get_default_instance_type(
+            cpus=resources.cpus,
+            memory=resources.memory,
+            disk_tier=resources.disk_tier,
+            local_disk=resources.local_disk,
+            region=resources.region,
+            zone=resources.zone,
+            use_spot=resources.use_spot,
+            max_hourly_cost=resources.max_hourly_cost)
+        accelerators = resources.accelerators
+        if accelerators is None:
+            return default_instance_type
+        if len(accelerators) != 1:
+            raise ValueError('Kubernetes resources require exactly one '
+                             'accelerator shape.')
+        accelerator_type, accelerator_count = next(iter(accelerators.items()))
+        if ' ' in accelerator_type:
+            raise ValueError('Kubernetes accelerator names cannot contain '
+                             'spaces.')
+        parsed_default = (kubernetes_utils.KubernetesInstanceType.
+                          from_instance_type(default_instance_type))
+        cpus = parsed_default.cpus
+        if resources.cpus is None:
+            cpus = cls._DEFAULT_NUM_VCPUS_WITH_GPU * accelerator_count
+        if resources.memory is None:
+            memory = cpus * cls._DEFAULT_MEMORY_CPU_RATIO_WITH_GPU
+        elif resources.memory.endswith('x'):
+            # The CPU count may have been raised from the CPU-only default to
+            # the GPU default above, so evaluate ratios against the final
+            # declarative CPU count.
+            memory = float(resources.memory[:-1]) * cpus
+        else:
+            # get_default_instance_type() has already normalized absolute and
+            # minimum (``+``) forms.
+            memory = parsed_default.memory
+        return kubernetes_utils.KubernetesInstanceType.from_resources(
+            cpus, memory, accelerator_count, accelerator_type).name
+
+    @classmethod
     def get_accelerators_from_instance_type(
         cls,
         instance_type: str,
@@ -677,6 +762,7 @@ class Kubernetes(clouds.Cloud):
         num_nodes: int,
         dryrun: bool = False,
         volume_mounts: list['volume_lib.VolumeMount'] | None = None,
+        worker_placement_projection: dict[str, Any] | None = None,
     ) -> dict[str, str | None]:
         del zones  # Unused.
         if region is None:
@@ -700,8 +786,9 @@ class Kubernetes(clouds.Cloud):
         # Clamp resource requests to node allocatable capacity so that
         # pods can schedule even when the request matches a node's total
         # capacity (which exceeds allocatable due to system overhead).
-        cpus, mem = kubernetes_utils.adjust_resources_to_allocatable(
-            cpus, mem, context, dryrun=dryrun)
+        if worker_placement_projection is None:
+            cpus, mem = kubernetes_utils.adjust_resources_to_allocatable(
+                cpus, mem, context, dryrun=dryrun)
         # Optionally populate accelerator information.
         acc_type = k.accelerator_type
         acc_count = k.accelerator_count
@@ -709,6 +796,21 @@ class Kubernetes(clouds.Cloud):
             acc_type, acc_count = normalize_tpu_accelerator_name(acc_type)
         else:
             acc_count = acc_count or 0
+        if worker_placement_projection is not None:
+            if (worker_placement_projection.get('kubernetes_context') != context
+                    or str(worker_placement_projection.get(
+                        'accelerator_name')).lower() != str(acc_type).lower() or
+                    worker_placement_projection.get('accelerator_count')
+                    != acc_count):
+                raise ValueError('Worker placement projection does not match '
+                                 'the Kubernetes deployment candidate.')
+        projection_version = (
+            worker_placement_projection.get('projection_version')
+            if worker_placement_projection is not None else None)
+        if projection_version is not None and projection_version != 2:
+            raise ValueError('Unsupported worker placement projection '
+                             f'version {projection_version!r}.')
+        is_v2_worker_projection = projection_version == 2
 
         def _get_image_id(resources: 'resources_lib.Resources') -> str:
             container_image = resources.extract_docker_image()
@@ -740,17 +842,23 @@ class Kubernetes(clouds.Cloud):
 
         # If GPU/TPUs are requested, set node label to match the GPU/TPU type.
         if acc_count > 0 and acc_type is not None:
-            (k8s_acc_label_key, k8s_acc_label_values, k8s_topology_label_key,
-             k8s_topology_label_value) = (
-                 kubernetes_utils.get_accelerator_label_key_values(
-                     context, acc_type, acc_count))
-            if (k8s_acc_label_key ==
-                    kubernetes_utils.GKELabelFormatter.TPU_LABEL_KEY):
-                tpu_requested = True
-                k8s_resource_key = kubernetes_utils.TPU_RESOURCE_KEY
-            else:
+            if worker_placement_projection is None:
+                (k8s_acc_label_key, k8s_acc_label_values,
+                 k8s_topology_label_key, k8s_topology_label_value) = (
+                     kubernetes_utils.get_accelerator_label_key_values(
+                         context, acc_type, acc_count))
                 k8s_resource_key = kubernetes_utils.get_gpu_resource_key(
                     context)
+            else:
+                scheduling = worker_placement_projection[
+                    'accelerator_scheduling']
+                k8s_acc_label_key = scheduling['label_key']
+                k8s_acc_label_values = list(scheduling['label_values'])
+                k8s_resource_key = scheduling['resource_key']
+            if (worker_placement_projection is None and k8s_acc_label_key
+                    == kubernetes_utils.GKELabelFormatter.TPU_LABEL_KEY):
+                tpu_requested = True
+                k8s_resource_key = kubernetes_utils.TPU_RESOURCE_KEY
         else:
             # If no GPUs are requested, we set NVIDIA_VISIBLE_DEVICES=none to
             # maintain GPU isolation. This is to override the default behavior
@@ -769,44 +877,13 @@ class Kubernetes(clouds.Cloud):
                 avoid_label_keys = None
         port_mode = network_utils.get_port_mode(None, context)
 
-        remote_identity = skypilot_config.get_effective_workspace_region_config(
-            # TODO(kyuds): Support SSH node pools as well.
-            cloud='kubernetes',
-            region=context,
-            keys=('remote_identity',),
-            default_value=schemas.get_default_remote_identity('kubernetes'),
-            override_configs=resources.cluster_config_overrides)
-
-        if isinstance(remote_identity, dict):
-            # If remote_identity is a dict, match the current context against
-            # patterns using fnmatch (consistent with AWS/GCP behavior).
-            k8s_service_account_name = None
-            for pattern, sa_name in remote_identity.items():
-                if fnmatch.fnmatchcase(context, str(pattern)):
-                    k8s_service_account_name = sa_name
-                    break
-            if k8s_service_account_name is None:
-                err_msg = (f'Context {context!r} not found in '
-                           'remote identities from config.yaml')
-                raise ValueError(err_msg)
+        # TODO(kyuds): Support SSH node pools as well.
+        if worker_placement_projection is None:
+            k8s_service_account_name = get_service_account_name(
+                context, resources.cluster_config_overrides)
         else:
-            # If remote_identity is not a dict, use
-            k8s_service_account_name = remote_identity
-
-        lc = schemas.RemoteIdentityOptions.LOCAL_CREDENTIALS.value
-        sa = schemas.RemoteIdentityOptions.SERVICE_ACCOUNT.value
-        no_upload = schemas.RemoteIdentityOptions.NO_UPLOAD.value
-
-        if k8s_service_account_name in (lc, sa, no_upload):
-            # Use the default service account if remote identity is not set.
-            # For LOCAL_CREDENTIALS, this is for in-cluster authentication
-            # which needs a serviceaccount (specifically for SSH node pools
-            # which uses in-cluster authentication internally, and we would
-            # like to support exec-auth when the user is also using SSH infra)
-            # For NO_UPLOAD, we don't upload credentials but still need a
-            # service account for pod creation.
-            k8s_service_account_name = (
-                kubernetes_utils.DEFAULT_SERVICE_ACCOUNT_NAME)
+            k8s_service_account_name = worker_placement_projection[
+                'service_account_name']
 
         fuse_device_required = bool(resources.requires_fuse)
 
@@ -861,37 +938,56 @@ class Kubernetes(clouds.Cloud):
                 keys=('high_availability', 'storage_class_name'),
                 default_value=None))
 
-        # An API-server-configured queue is an operator-owned admission
-        # boundary, so request overrides cannot redirect it.  A legacy
-        # request-provided queue on an otherwise queue-less server is still
-        # accepted, but it also activates strict management below.
-        k8s_kueue_require_managed = (
-            skypilot_config.get_effective_kueue_require_managed(
-                # TODO(kyuds): Support SSH node pools as well.
-                cloud='kubernetes',
-                region=context))
-        queue_override_configs = (None if k8s_kueue_require_managed else
-                                  resources.cluster_config_overrides)
-        k8s_kueue_local_queue_name = (skypilot_config.get_effective_queue_name(
-            cloud='kubernetes',
-            region=context,
-            override_configs=queue_override_configs))
-        # Defense in depth for request-provided queues and older config
-        # resolvers: no effective queue is ever allowed to remain best effort.
-        k8s_kueue_require_managed = (k8s_kueue_require_managed or
-                                     bool(k8s_kueue_local_queue_name))
-        if (k8s_kueue_require_managed and not k8s_kueue_local_queue_name):
-            raise ValueError(
-                'kubernetes.kueue.require_managed is true for context '
-                f'{context!r}, but no Kueue LocalQueue is configured. Set '
-                'kubernetes.kueue.local_queue_name (or '
-                'kubernetes.quota.queue) in the API server config.')
+        if is_v2_worker_projection:
+            # V2 freezes the complete Kueue admission pair at version commit.
+            # Never consult mutable server or request configuration here.
+            assert worker_placement_projection is not None
+            kueue_admission = worker_placement_projection['kueue_admission']
+            if kueue_admission is None:
+                k8s_kueue_local_queue_name = None
+                k8s_kueue_workload_priority_class_name = None
+                k8s_kueue_require_managed = False
+            else:
+                k8s_kueue_local_queue_name = kueue_admission['local_queue_name']
+                k8s_kueue_workload_priority_class_name = kueue_admission[
+                    'workload_priority_class_name']
+                k8s_kueue_require_managed = True
+        else:
+            # An API-server-configured queue is an operator-owned admission
+            # boundary, so request overrides cannot redirect it.  A legacy
+            # request-provided queue on an otherwise queue-less server is
+            # still accepted, but it also activates strict management below.
+            k8s_kueue_require_managed = (
+                skypilot_config.get_effective_kueue_require_managed(
+                    # TODO(kyuds): Support SSH node pools as well.
+                    cloud='kubernetes',
+                    region=context))
+            queue_override_configs = (None if k8s_kueue_require_managed else
+                                      resources.cluster_config_overrides)
+            k8s_kueue_local_queue_name = (
+                skypilot_config.get_effective_queue_name(
+                    cloud='kubernetes',
+                    region=context,
+                    override_configs=queue_override_configs))
+            # Defense in depth for request-provided queues and older config
+            # resolvers: no effective queue is ever allowed to remain best
+            # effort.
+            k8s_kueue_require_managed = (k8s_kueue_require_managed or
+                                         bool(k8s_kueue_local_queue_name))
+            if (k8s_kueue_require_managed and not k8s_kueue_local_queue_name):
+                raise ValueError(
+                    'kubernetes.kueue.require_managed is true for context '
+                    f'{context!r}, but no Kueue LocalQueue is configured. Set '
+                    'kubernetes.kueue.local_queue_name (or '
+                    'kubernetes.quota.queue) in the API server config.')
+            k8s_kueue_workload_priority_class_name = (
+                resources.priority_class if k8s_kueue_require_managed else None)
 
         # Check DWS configuration for GKE.
         (enable_flex_start, enable_flex_start_queued_provisioning,
          max_run_duration_seconds) = gcp_utils.get_dws_config(
-             context, k8s_kueue_local_queue_name,
-             resources.cluster_config_overrides)
+             context, k8s_kueue_local_queue_name, None
+             if is_v2_worker_projection else resources.cluster_config_overrides)
         if enable_flex_start_queued_provisioning or enable_flex_start:
             # DWS is only supported in GKE, check the autoscaler type.
             autoscaler_type = skypilot_config.get_effective_region_config(
@@ -930,11 +1026,14 @@ class Kubernetes(clouds.Cloud):
             default_value=timeout,
             override_configs=resources.cluster_config_overrides)
 
-        namespace = kubernetes_utils.get_namespace(
-            context=context,
-            override_configs=resources.cluster_config_overrides,
-            cloud=cloud_config_str,
-        )
+        if worker_placement_projection is None:
+            namespace = kubernetes_utils.get_namespace(
+                context=context,
+                override_configs=resources.cluster_config_overrides,
+                cloud=cloud_config_str,
+            )
+        else:
+            namespace = worker_placement_projection['namespace']
 
         # Detect hostNetwork before the template is rendered so the probe
         # env vars can be wired into deploy_vars. Two independent paths put
@@ -980,9 +1079,7 @@ class Kubernetes(clouds.Cloud):
             'k8s_fuse_device_required': fuse_device_required,
             'k8s_kueue_local_queue_name': k8s_kueue_local_queue_name,
             'k8s_kueue_require_managed': k8s_kueue_require_managed,
-            'k8s_kueue_workload_priority_class_name':
-                (resources.priority_class if k8s_kueue_require_managed else None
-                ),
+            'k8s_kueue_workload_priority_class_name': k8s_kueue_workload_priority_class_name,
             # Namespace to run the fusermount-server daemonset in
             'k8s_skypilot_system_namespace': _SKYPILOT_SYSTEM_NAMESPACE,
             'k8s_fusermount_shared_dir': kubernetes_fuse.FUSERMOUNT_SHARED_DIR,
@@ -1183,45 +1280,10 @@ class Kubernetes(clouds.Cloud):
                 resource_list.append(r)
             return resource_list
 
-        # Currently, handle a filter on accelerators only.
-        accelerators = resources.accelerators
-
-        default_instance_type = Kubernetes.get_default_instance_type(
-            cpus=resources.cpus,
-            memory=resources.memory,
-            disk_tier=resources.disk_tier,
-            local_disk=resources.local_disk,
-            region=resources.region,
-            zone=resources.zone,
-            use_spot=resources.use_spot,
-            max_hourly_cost=resources.max_hourly_cost)
-
-        if accelerators is None:
-            # For CPU only clusters, need no special handling
-            chosen_instance_type = default_instance_type
-        else:
-            assert len(accelerators) == 1, resources
-            # GPUs requested - build instance type.
-            acc_type, acc_count = list(accelerators.items())[0]
-            # If acc_type contains spaces, return empty list since Kubernetes
-            # does not support spaces in label values
-            if ' ' in acc_type:
-                return resources_utils.FeasibleResources([], [], None)
-
-            # Parse into KubernetesInstanceType
-            k8s_instance_type = (kubernetes_utils.KubernetesInstanceType.
-                                 from_instance_type(default_instance_type))
-
-            gpu_task_cpus = k8s_instance_type.cpus
-            if resources.cpus is None:
-                gpu_task_cpus = self._DEFAULT_NUM_VCPUS_WITH_GPU * acc_count
-            # Special handling to bump up memory multiplier for GPU instances
-            gpu_task_memory = (float(resources.memory.strip('+')) if
-                               resources.memory is not None else gpu_task_cpus *
-                               self._DEFAULT_MEMORY_CPU_RATIO_WITH_GPU)
-            chosen_instance_type = (
-                kubernetes_utils.KubernetesInstanceType.from_resources(
-                    gpu_task_cpus, gpu_task_memory, acc_count, acc_type).name)
+        try:
+            chosen_instance_type = self.get_declarative_instance_type(resources)
+        except ValueError:
+            return resources_utils.FeasibleResources([], [], None)
         # Check the availability of the specified instance type in all contexts.
         available_regions = self.regions_with_offering(
             chosen_instance_type,

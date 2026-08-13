@@ -6,11 +6,36 @@ import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.ext import asyncio as sql_async
 
+from sky.jobs import controller_fencing
 from sky.jobs.state_schema import job_info_table
 from sky.jobs.state_schema import spot_table
 from sky.jobs.state_storage import db_manager as _db_manager
 from sky.utils import common_utils
 from sky.utils.db import retries as db_retries
+
+
+def _lock_controller_job_write(session: orm.Session, job_id: int) -> None:
+    """Fence controller-owned pool metadata to its exact job attempt."""
+    identity = controller_fencing.get_current_slot_identity()
+    if identity is not None:
+        controller_fencing.lock_current_job_attempt(session, job_id, identity)
+        return
+    owner = controller_fencing.get_current_owner()
+    if owner is not None:
+        controller_fencing.lock_current_owner(session, owner)
+
+
+async def _lock_controller_job_write_async(session: sql_async.AsyncSession,
+                                           job_id: int) -> None:
+    """Async counterpart of :func:`_lock_controller_job_write`."""
+    identity = controller_fencing.get_current_slot_identity()
+    if identity is not None:
+        await controller_fencing.lock_current_job_attempt_async(
+            session, job_id, identity)
+        return
+    owner = controller_fencing.get_current_owner()
+    if owner is not None:
+        await controller_fencing.lock_current_owner_async(session, owner)
 
 
 @db_retries.retry
@@ -68,6 +93,7 @@ def set_current_cluster_name(job_id: int, current_cluster_name: str) -> None:
     """Set the current cluster name for a job."""
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _lock_controller_job_write(session, job_id)
         session.query(job_info_table).filter(
             job_info_table.c.spot_job_id == job_id).update(
                 {job_info_table.c.current_cluster_name: current_cluster_name})
@@ -95,6 +121,7 @@ def set_job_infra(job_id: int,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _lock_controller_job_write(session, job_id)
         update_values: dict[Any, Any] = {}
         if cloud is not None:
             update_values[job_info_table.c.cloud] = cloud
@@ -131,6 +158,7 @@ def update_job_full_resources(job_id: int,
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
+        _lock_controller_job_write(session, job_id)
         session.execute(
             sqlalchemy.update(spot_table).where(
                 spot_table.c.spot_job_id == job_id).values(
@@ -143,6 +171,7 @@ async def set_job_id_on_pool_cluster_async(job_id: int,
     """Set the job id on the pool cluster for a job."""
     engine = await _db_manager.get_async_engine()
     async with sql_async.AsyncSession(engine) as session:
+        await _lock_controller_job_write_async(session, job_id)
         await session.execute(
             sqlalchemy.update(job_info_table).
             where(job_info_table.c.spot_job_id == job_id).values({

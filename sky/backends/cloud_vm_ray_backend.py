@@ -71,11 +71,13 @@ from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.slurm import utils as slurm_utils
 from sky.serve import constants as serve_constants
 from sky.serve import reserved_capacity
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import system_oom_recovery as serve_system_oom_recovery
 from sky.serve import system_oom_recovery_observability
 from sky.server import common as server_common
 from sky.server.requests import requests as requests_lib
+from sky.server.requests import storage as request_storage
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -108,6 +110,8 @@ from sky.utils import yaml_utils
 from sky.utils.plugin_extensions import ExternalFailureSource
 
 metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
 serve_placement_history = adaptors_common.LazyImport(
     'sky.serve.placement_history')
 
@@ -494,6 +498,27 @@ classify_resources_unavailable_error = (
     capacity_policy.classify_resources_unavailable_error)
 _is_quota_error = capacity_policy._is_quota_error  # pylint: disable=protected-access
 _canonical_accelerators = capacity_policy._canonical_accelerators  # pylint: disable=protected-access
+
+
+def _reserved_fill_kubernetes_provider_effect_guard_factory(
+    cloud: clouds.Cloud,
+    bulk_provision_fn: typing.Callable[..., Any],
+    builtin_bulk_provision_fn: typing.Callable[..., Any] | None,
+    guard_factory: provision_common.ProviderEffectGuardFactory,
+    *,
+    reserved_fill: bool,
+) -> provision_common.ProviderEffectGuardFactory | None:
+    """Select the instrumented built-in Kubernetes reserved-fill path."""
+    if (reserved_fill and builtin_bulk_provision_fn is not None and
+            bulk_provision_fn is builtin_bulk_provision_fn and
+            isinstance(cloud, clouds.Kubernetes) and
+            not isinstance(cloud, clouds.SSH)):
+        return guard_factory
+    return None
+
+
+_RESERVED_FILL_POD_MATERIALIZED_KEY = '_reserved_fill_pod_materialized'
+
 _capacity_cache_cloud_name = capacity_policy._capacity_cache_cloud_name  # pylint: disable=protected-access
 _capacity_cache_account = capacity_policy._capacity_cache_account  # pylint: disable=protected-access
 _capacity_cache_key = capacity_policy._capacity_cache_key  # pylint: disable=protected-access
@@ -809,16 +834,54 @@ class RetryingVmProvisioner:
             if fence is not None:
                 reserved_capacity.validate_protocol_v2_launch_resources(
                     fence, resources)
+                cloud = resources.cloud
+                assert cloud is not None
+                if (cloud.PROVISIONER_VERSION
+                        != clouds.ProvisionerVersion.SKYPILOT):
+                    raise ValueError('Reserved-fill Kubernetes requires the '
+                                     'attested in-tree provisioner path.')
         except ValueError as error:
             raise reserved_capacity.ReservedFillLaunchFenceError(
                 'Reserved-fill retry candidate changed its fenced '
                 'Kubernetes context or accelerator shape.') from error
+
+    def _validate_binding_excluded_request_identity(self) -> None:
+        """Bind a system-recovery exclusion to this exact executor claim."""
+        try:
+            excluded = serve_state.normalize_binding_excluded_launch_context(
+                self._extra_launch_context)
+        except (TypeError, ValueError) as error:
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'SkyServe binding-excluded launch context is malformed.'
+            ) from error
+        if (excluded is None or excluded.get(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY)
+                != serve_constants.
+                ORDINARY_LAUNCH_BINDING_EXCLUDED_SYSTEM_RECOVERY_PROFILE):
+            return
+        claim = request_storage.active_execution_claim()
+        if (claim is None or claim.request_id != excluded.get(
+                serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REQUEST_ID_KEY)
+           ):
+            raise exceptions.ServeReplicaLaunchFenceError(
+                'System-recovery excluded authority does not belong to the '
+                'active request execution claim.')
 
     def _validate_service_replica_launch_fence(self) -> None:
         """Fail closed if this Serve request lost durable launch authority."""
         if self._workload_type not in ('service', 'pool'):
             return
         launch_context = self._extra_launch_context
+        if ordinary_launch_binding.has_bound_launch_context(launch_context):
+            try:
+                ordinary_launch_binding.require_active_provider_effect_authorization(
+                    launch_context)
+            except Exception as error:
+                raise exceptions.ServeReplicaLaunchFenceError(
+                    'Bound SkyServe execution has no exact active '
+                    'association authority.') from error
+            return
+        self._validate_binding_excluded_request_identity()
         if not any(key in launch_context
                    for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
             # Preserve compatibility for pre-fence persisted requests.  Once a
@@ -837,8 +900,150 @@ class RetryingVmProvisioner:
                 'Refusing a SkyServe replica launch after its durable '
                 'service generation changed.')
 
+    def _reserved_fill_reclaim_authorization(
+        self,
+        launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
+    ) -> tuple[bool, reserved_fill_reclaim_attestation.ReclaimLaunchScope |
+               None, reserved_fill_reclaim_attestation.
+               ReclaimLaunchAuthorization | None]:
+        """Bind the durable row, then mint a fresh deployment-policy ticket."""
+        try:
+            fence = reserved_capacity.parse_protocol_v2_launch_fence(
+                self._extra_launch_context)
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill provider policy fence is malformed.') from error
+        durable_replica = (None if launch_snapshot is None else
+                           launch_snapshot.durable_replica_info)
+        durable_reserved_fill = bool(durable_replica is not None and
+                                     durable_replica.reserved_fill is True)
+        if fence is None:
+            return durable_reserved_fill, None, None
+        if not durable_reserved_fill:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill provider policy fence has no exact durable '
+                'replica row.')
+        assert durable_replica is not None
+        try:
+            reserved_capacity.validate_protocol_v2_launch_fence_against_replica(
+                fence, durable_replica)
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill provider policy fence changed from its '
+                'durable replica row.') from error
+        service_name = self._extra_launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        if not isinstance(service_name, str) or not service_name:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill provider policy fence has no service name.')
+        if not fence.policy_bound:
+            return True, None, None
+        try:
+            projections = self._extra_launch_context.get(
+                serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
+            _, projected_admission = (
+                reserved_capacity.require_reclaim_worker_projection(
+                    fence, projections))
+            scope = reserved_fill_reclaim_attestation.ReclaimLaunchScope(
+                service_name=service_name,
+                service_version=fence.service_version,
+                pool_key=fence.pool_key,
+                service_generation=fence.service_generation,
+                physical_cluster_uid=fence.physical_cluster_uid,
+                kubernetes_context=fence.kubernetes_context,
+                accelerator=fence.accelerator,
+                accelerator_count=fence.accelerator_count,
+                projected_admission=projected_admission)
+            identity = reserved_fill_reclaim_attestation.ReclaimPolicyIdentity(
+                fleet_bundle_sha256=typing.cast(
+                    str, fence.reclaim_fleet_bundle_sha256),
+                policy_revision=typing.cast(str, fence.reclaim_policy_revision),
+                provider_inventory_sha256=typing.cast(
+                    str, fence.reclaim_provider_inventory_sha256))
+            gate_generation = typing.cast(int,
+                                          fence.reconciliation_gate_generation)
+            policy = reserved_fill_reclaim_attestation.require_unique_policy()
+            (reserved_fill_reclaim_attestation.require_exact_policy_identity)(
+                policy, identity)
+            policy_deadline = (reserved_fill_reclaim_attestation.
+                               new_policy_operation_deadline())
+            authorization = policy.authorize_launch(
+                scope,
+                expected_identity=identity,
+                expected_gate_generation=gate_generation,
+                deadline_monotonic=policy_deadline)
+            (reserved_fill_reclaim_attestation.
+             require_policy_operation_completed)(policy_deadline)
+            (reserved_fill_reclaim_attestation.
+             require_exact_launch_authorization)(
+                 authorization,
+                 expected_identity=identity,
+                 expected_gate_generation=gate_generation,
+                 expected_scope=scope)
+        except Exception as error:  # pylint: disable=broad-except
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Deployment reclaim policy refused the reserved-fill '
+                'provider effect.') from error
+        return True, scope, authorization
+
+    @contextlib.contextmanager
+    def _reserved_fill_reclaim_provider_guard(
+        self,
+        launch_snapshot: serve_state.ServiceReplicaLaunchFenceSnapshot | None,
+    ) -> typing.Iterator[None]:
+        """Hold fleet gate authority across one terminal provider effect."""
+        (durable_reserved_fill, scope, authorization
+        ) = self._reserved_fill_reclaim_authorization(launch_snapshot)
+        if not durable_reserved_fill:
+            yield
+            return
+        provider_started = False
+        try:
+            with serve_state.reserved_fill_reclaim_gate_authority_guard(
+                    shared=True) as gate_guard:
+                if not (serve_state.
+                        reserved_fill_reclaim_gate_authority_guard_is_valid(
+                            gate_guard)):
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill reclaim guard lost its database '
+                        'session before the provider operation.')
+                if not serve_state.reserved_fill_reclaim_launch_authority_holds(
+                        scope, authorization, self._extra_launch_context):
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill reclaim authority changed before the '
+                        'provider operation.')
+                provider_started = True
+                yield
+                if not (serve_state.
+                        reserved_fill_reclaim_gate_authority_guard_is_valid(
+                            gate_guard)):
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill reclaim guard became indeterminate '
+                        'during the provider operation.')
+        except reserved_capacity.ReservedFillLaunchFenceError:
+            raise
+        except Exception as error:
+            if provider_started:
+                raise
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Unable to hold reserved-fill reclaim authority across the '
+                'provider operation.') from error
+
     @contextlib.contextmanager
     def _service_replica_launch_provider_guard(self) -> typing.Iterator[None]:
+        """Hold fleet reclaim and per-service authority across provider I/O."""
+        # Canonical order: existing service (or already-held association)
+        # authority, a fresh five-second policy ticket, then the fleet gate
+        # immediately around provider mutation.
+        with self._service_replica_launch_provider_owner_guard(
+        ) as launch_snapshot:
+            with self._reserved_fill_reclaim_provider_guard(launch_snapshot):
+                yield
+
+    @contextlib.contextmanager
+    def _service_replica_launch_provider_owner_guard(
+        self,
+    ) -> typing.Iterator[serve_state.ServiceReplicaLaunchFenceSnapshot | None]:
         """Keep one durable Serve fence valid across an opaque cloud call.
 
         Built-in provisioners and legacy ``ray up`` can perform their own
@@ -848,12 +1053,41 @@ class RetryingVmProvisioner:
         database writer wait until the whole provider operation returns.
         """
         if self._workload_type not in ('service', 'pool'):
-            yield
+            yield None
             return
         launch_context = self._extra_launch_context
+        if ordinary_launch_binding.has_bound_launch_context(launch_context):
+            # execution._execute_dag() owns one association guard across the
+            # entire provider-bearing tail.  Re-entering the legacy PID/IP
+            # guard would reject every valid bound request because its queued
+            # body intentionally carries impossible PID/IP sentinels.  A
+            # strict contextvar check prevents a forged or directly invoked
+            # bound context from using this bypass.
+            try:
+                ordinary_launch_binding.require_active_provider_effect_authorization(
+                    launch_context)
+            except Exception as error:
+                raise exceptions.ServeReplicaLaunchFenceError(
+                    'Bound SkyServe provider I/O has no exact active '
+                    'association authority.') from error
+            provider_completed = False
+            try:
+                yield None
+                provider_completed = True
+            finally:
+                if provider_completed:
+                    try:
+                        ordinary_launch_binding.require_active_provider_effect_authorization(
+                            launch_context)
+                    except Exception as error:
+                        raise exceptions.ServeReplicaLaunchFenceError(
+                            'Bound SkyServe association authority became '
+                            'indeterminate during provider I/O.') from error
+            return
+        self._validate_binding_excluded_request_identity()
         if not any(key in launch_context
                    for key in serve_constants.REPLICA_LAUNCH_FENCE_KEYS):
-            yield
+            yield None
             return
         service_name = launch_context.get(
             serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
@@ -876,7 +1110,20 @@ class RetryingVmProvisioner:
                         'SkyServe replica launch authority became indeterminate '
                         'before the provider operation started.')
                 self._validate_service_replica_launch_fence()
-                yield
+                launch_snapshot = None
+                if (any(key in launch_context for key in
+                        serve_constants.RESERVED_FILL_LAUNCH_FENCE_KEYS) or
+                        serve_constants.
+                        ORDINARY_LAUNCH_BINDING_EXCLUDED_PROFILE_KEY
+                        in launch_context):
+                    launch_snapshot = (
+                        serve_state.service_replica_launch_fence_snapshot(
+                            launch_context))
+                    if launch_snapshot is None:
+                        raise exceptions.ServeReplicaLaunchFenceError(
+                            'Unable to bind SkyServe provider authority to '
+                            'its exact durable replica row.')
+                yield launch_snapshot
                 provider_completed = True
                 if not serve_state.service_replica_launch_authority_guard_is_valid(
                         guard):
@@ -1333,6 +1580,9 @@ class RetryingVmProvisioner:
                         volume_mounts=volume_mounts,
                         cloud_specific_failover_overrides=failover_overrides,
                         extra_template_variables=extra_vars,
+                        worker_placement_projections=self._extra_launch_context.
+                        get(serve_constants.
+                            REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY),
                     )
                 except exceptions.ResourcesUnavailableError as e:
                     # Failed due to catalog issue, e.g. image not found, or
@@ -1365,7 +1615,12 @@ class RetryingVmProvisioner:
                         f'invalid cloud config: {common_utils.format_exception(e)}'
                     )
 
-                if ('config_hash' in config_dict and skip_if_config_hash_matches
+                reserved_fill_fence = (
+                    reserved_capacity.parse_protocol_v2_launch_fence(
+                        self._extra_launch_context))
+                if (reserved_fill_fence is None and
+                        'config_hash' in config_dict and
+                        skip_if_config_hash_matches
                         == config_dict['config_hash']):
                     logger.debug(
                         'Skipping provisioning of cluster with matching '
@@ -1474,6 +1729,7 @@ class RetryingVmProvisioner:
                                 to_provision.ports))
                         if to_provision.cloud.OPEN_PORTS_VERSION
                         <= clouds.OpenPortsVersion.LAUNCH_ONLY else None)
+                    reserved_fill_pod_materialized = False
                     try:
                         controller = controller_utils.Controllers.from_name(
                             cluster_name)
@@ -1512,26 +1768,87 @@ class RetryingVmProvisioner:
                             assert self._active_cluster_hash is not None
                             bulk_provision_kwargs['cluster_incarnation'] = (
                                 self._active_cluster_hash)
+                        reserved_fill_fence = (
+                            reserved_capacity.parse_protocol_v2_launch_fence(
+                                self._extra_launch_context))
+                        split_guard_factory = (
+                            _reserved_fill_kubernetes_provider_effect_guard_factory(
+                                to_provision.cloud,
+                                bulk_provision_fn,
+                                builtin_bulk_provision_fn,
+                                self._service_replica_launch_provider_guard,
+                                reserved_fill=(reserved_fill_fence
+                                               is not None)))
+                        if (reserved_fill_fence is not None and
+                                split_guard_factory is None):
+                            raise reserved_capacity.ReservedFillLaunchFenceError(
+                                'Protocol-v2 reserved fill requires the '
+                                'instrumented in-tree Kubernetes provisioner; '
+                                'an opaque replacement cannot attest Pod '
+                                'admission or the materialization boundary.')
+                        if split_guard_factory is not None:
+                            # The in-tree Kubernetes provisioner exposes exact
+                            # bounded mutation windows. Inject the canonical
+                            # guard there so an indefinitely Kueue-pending Pod
+                            # holds no service/fleet advisory-lock session.
+                            bulk_provision_kwargs[
+                                'provider_effect_guard_factory'] = (
+                                    split_guard_factory)
                         # Recheck at the terminal provider boundary as well as
                         # at each outer retry iteration. This protects against
                         # future in-attempt planning changes being inserted
                         # between those layers.
                         self._validate_reserved_fill_candidate(to_provision)
-                        with self._service_replica_launch_provider_guard():
+                        if split_guard_factory is not None:
                             provision_record = bulk_provision_fn(
                                 to_provision.cloud, region, zones,
                                 resources_utils.ClusterName(
                                     cluster_name, handle.cluster_name_on_cloud),
                                 **bulk_provision_kwargs)
+                        else:
+                            with self._service_replica_launch_provider_guard():
+                                provision_record = bulk_provision_fn(
+                                    to_provision.cloud, region, zones,
+                                    resources_utils.ClusterName(
+                                        cluster_name,
+                                        handle.cluster_name_on_cloud),
+                                    **bulk_provision_kwargs)
+                        if reserved_fill_fence is not None:
+                            # A successful protocol-v2 Kubernetes bulk call
+                            # means its exact Pod now exists or was adopted.
+                            # Persist that one-way transition before any local
+                            # deploy-variable work can fail: every later error
+                            # must bypass capacity failover and broad teardown.
+                            reserved_fill_pod_materialized = True
+                            config_dict[
+                                _RESERVED_FILL_POD_MATERIALIZED_KEY] = True
+                            with self._service_replica_launch_provider_guard():
+                                pass
                         # NOTE: We will handle the logic of '_ensure_cluster_ray_started'
                         # in 'provision_utils.post_provision_runtime_setup()' in the
                         # caller.
-                        resources_vars = (
-                            to_provision.cloud.make_deploy_resources_variables(
+                        worker_projection = backend_utils._select_worker_projection(  # pylint: disable=protected-access
+                            to_provision.cloud, region, to_provision,
+                            self._extra_launch_context.get(
+                                serve_constants.
+                                REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY))
+                        if worker_projection is None:
+                            resources_vars = to_provision.cloud.make_deploy_resources_variables(
                                 to_provision,
                                 resources_utils.ClusterName(
                                     cluster_name, handle.cluster_name_on_cloud),
-                                region, zones, num_nodes))
+                                region, zones, num_nodes)
+                        else:
+                            assert isinstance(to_provision.cloud,
+                                              clouds.Kubernetes)
+                            resources_vars = to_provision.cloud.make_deploy_resources_variables(
+                                to_provision,
+                                resources_utils.ClusterName(
+                                    cluster_name, handle.cluster_name_on_cloud),
+                                region,
+                                zones,
+                                num_nodes,
+                                worker_placement_projection=worker_projection)
                         config_dict['provision_record'] = provision_record
                         config_dict['resources_vars'] = resources_vars
                         config_dict['handle'] = handle
@@ -1597,14 +1914,23 @@ class RetryingVmProvisioner:
                         # it as provider capacity loss or clean up/fail over
                         # through a target that may have changed.
                         raise
-                    except provision_common.StopFailoverError:
+                    except provision_common.StopFailoverError as error:
+                        if reserved_fill_pod_materialized:
+                            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                                error, phase='post-create provisioning')
                         with ux_utils.print_exception_no_traceback():
                             raise
-                    except exceptions.InconsistentHighAvailabilityError:
+                    except exceptions.InconsistentHighAvailabilityError as error:
+                        if reserved_fill_pod_materialized:
+                            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                                error, phase='post-create provisioning')
                         # No teardown happens for this error.
                         with ux_utils.print_exception_no_traceback():
                             raise
-                    except exceptions.ExecutionPausedError:
+                    except exceptions.ExecutionPausedError as error:
+                        if reserved_fill_pod_materialized:
+                            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                                error, phase='post-create provisioning')
                         # Pausing to wait on an external condition: keep the
                         # resources for resume, do not tear down or fail over.
                         raise
@@ -1614,12 +1940,18 @@ class RetryingVmProvisioner:
                         # alias whose physical target no longer matches the
                         # durable reserved-fill request.
                         raise
-                    except exceptions.RequestCancelled:
+                    except exceptions.RequestCancelled as error:
+                        if reserved_fill_pod_materialized:
+                            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                                error, phase='post-create provisioning')
                         # A generation/owner fence is terminal.  In particular,
                         # do not classify it as capacity, clean up/fail over,
                         # or retry a provider call under another placement.
                         raise
                     except config_lib.KubernetesError as e:
+                        if reserved_fill_pod_materialized:
+                            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                                e, phase='post-create provisioning')
                         provision_failures.append(e)
                         if e.insufficent_resources:
                             insufficient_resources = e.insufficent_resources
@@ -1653,6 +1985,9 @@ class RetryingVmProvisioner:
                             error=e)
                         continue
                     except Exception as e:  # pylint: disable=broad-except
+                        if reserved_fill_pod_materialized:
+                            reserved_capacity.raise_protocol_v2_materialized_launch_error(
+                                e, phase='post-create provisioning')
                         provision_failures.append(e)
                         capacity_reason = _classify_capacity_error(
                             to_provision.cloud, e)
@@ -3434,7 +3769,7 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
     NAME = 'cloudvmray'
 
     # Backward compatibility, with the old name of the handle.
-    ResourceHandle = CloudVmRayResourceHandle  # type: ignore
+    ResourceHandle: type[backends.ResourceHandle] = CloudVmRayResourceHandle
 
     def __init__(self):
         self.run_timestamp = sky_logging.get_run_timestamp()
@@ -3462,6 +3797,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._fresh_provision_evidence_lease: (
             backend_system_oom_recovery.FreshProvisionEvidenceLease |
             None) = None
+        self._reserved_fill_tail_guard_required = False
+        self._reserved_fill_pod_materialized = False
+        self._reserved_fill_materialized_guard_factory: (
+            provision_common.ProviderEffectGuardFactory | None) = None
         # Optional planner (via register_info): used under the per-cluster lock
         # to produce a fresh concrete plan when neither a reusable snapshot nor
         # a caller plan is available.
@@ -3476,6 +3815,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
     def register_info(self, **kwargs) -> None:
         self._reset_fresh_provision_evidence()
+        self._reserved_fill_tail_guard_required = False
+        self._reserved_fill_pod_materialized = False
+        self._reserved_fill_materialized_guard_factory = None
         self._dag = kwargs.pop('dag', self._dag)
         self._optimize_target = kwargs.pop(
             'optimize_target',
@@ -3485,6 +3827,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         self._dump_final_script = kwargs.pop('dump_final_script', False)
         self._is_managed = kwargs.pop('is_managed', False)
         self._extra_launch_context = kwargs.pop('extra_launch_context', {})
+        try:
+            self._reserved_fill_tail_guard_required = (
+                reserved_capacity.parse_protocol_v2_launch_fence(
+                    self._extra_launch_context) is not None)
+        except ValueError as error:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill launch context is malformed.') from error
         self._is_launched_by_jobs_controller = kwargs.pop(
             'is_launched_by_jobs_controller', False)
         self._workload_type = kwargs.pop('workload_type', 'cluster')
@@ -3492,6 +3841,25 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # reusable snapshot/caller plan exists. Keeps optimizer in upper layer.
         self._planner = kwargs.pop('planner', self._planner)
         assert not kwargs, f'Unexpected kwargs: {kwargs}'
+
+    def checkpoint_reserved_fill_materialized_authority(self) -> None:
+        """Revalidate one materialized v2 launch with fresh authority."""
+        with self.reserved_fill_materialized_effect_guard():
+            pass
+
+    @contextlib.contextmanager
+    def reserved_fill_materialized_effect_guard(self) -> typing.Iterator[None]:
+        """Hold fresh v2 authority across one bounded post-Pod effect."""
+        if not self._reserved_fill_tail_guard_required:
+            yield
+            return
+        factory = self._reserved_fill_materialized_guard_factory
+        if not self._reserved_fill_pod_materialized or factory is None:
+            raise reserved_capacity.ReservedFillLaunchFenceError(
+                'Reserved-fill backend has no authoritative post-Pod effect '
+                'guard.')
+        with factory():  # pylint: disable=not-callable
+            yield
 
     def _reset_fresh_provision_evidence(self) -> int:
         """Invalidate prior evidence and return the new binding generation."""
@@ -3917,6 +4285,8 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         skip_unnecessary_provisioning: bool = False,
     ) -> tuple[CloudVmRayResourceHandle | None, bool]:
         evidence_generation = self._reset_fresh_provision_evidence()
+        self._reserved_fill_pod_materialized = False
+        self._reserved_fill_materialized_guard_factory = None
         with contextlib.ExitStack() as lock_stack:
             lock_stack.enter_context(
                 lock_events.DistributedLockEvent(lock_id,
@@ -3978,8 +4348,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 try:
                     retry_provisioner = RetryingVmProvisioner(
                         self.log_dir,
-                        self._dag,  # type: ignore[arg-type]
-                        self._optimize_target,  # type: ignore[arg-type]
+                        typing.cast('dag.Dag', self._dag),
+                        typing.cast(common.OptimizeTarget,
+                                    self._optimize_target),
                         self._requested_features,
                         local_wheel_path,
                         wheel_hash,
@@ -4071,6 +4442,52 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         raise exceptions.ResourcesUnavailableError(
                             error_message + '\n' + str(e),
                             failover_history=e.failover_history) from None
+            protocol_v2_fence = None
+            if self._reserved_fill_tail_guard_required:
+                try:
+                    protocol_v2_fence = (
+                        reserved_capacity.parse_protocol_v2_launch_fence(
+                            self._extra_launch_context))
+                except ValueError as error:
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill launch context is malformed.') from error
+                if protocol_v2_fence is None:
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill post-Pod guard lost its protocol fence.')
+            materialized_by_bulk = config_dict.pop(
+                _RESERVED_FILL_POD_MATERIALIZED_KEY, False)
+            # A successful v2 bulk/adoption call enters the canonical post-Pod
+            # tail. Protocol v2 deliberately disables config-hash skipping so
+            # reuse must pass the same current Pod/Kueue/projection attestation
+            # as a fresh create; authority alone is not identity proof.
+            self._reserved_fill_pod_materialized = bool(
+                self._reserved_fill_tail_guard_required and
+                materialized_by_bulk)
+            if self._reserved_fill_pod_materialized:
+                if retry_provisioner is None:
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill post-Pod guard owner is unavailable.')
+                guard_factory = getattr(
+                    retry_provisioner, '_service_replica_launch_provider_guard',
+                    None)
+                if not callable(guard_factory):
+                    raise reserved_capacity.ReservedFillLaunchFenceError(
+                        'Reserved-fill provisioner did not expose its '
+                        'canonical post-Pod effect guard.')
+                self._reserved_fill_materialized_guard_factory = guard_factory
+            lock_stack.enter_context(
+                reserved_capacity.
+                protocol_v2_materialized_launch_error_boundary(
+                    self._reserved_fill_pod_materialized,
+                    phase='post-create runtime and cluster finalization'))
+            if (self._reserved_fill_tail_guard_required and
+                    not self._reserved_fill_pod_materialized and not dryrun):
+                raise reserved_capacity.ReservedFillLaunchFenceError(
+                    'Reserved-fill provisioner returned without proving its '
+                    'Pod materialization boundary.')
+            if self._reserved_fill_pod_materialized:
+                self.checkpoint_reserved_fill_materialized_authority()
+
             if dryrun:
                 handle = global_user_state.get_handle_from_cluster_name(
                     cluster_name)
@@ -4138,7 +4555,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                         provision_record=provision_record,
                         custom_resource=resources_vars.get('custom_resources'),
                         log_dir=self.log_dir,
-                        existing_cluster_hash=cluster_hash)
+                        existing_cluster_hash=cluster_hash,
+                        provider_effect_guard_factory=(
+                            self._reserved_fill_materialized_guard_factory))
+                self.checkpoint_reserved_fill_materialized_authority()
                 # We use the IPs from the cluster_info to update_cluster_ips,
                 # when the provisioning is done, to make sure the cluster IPs
                 # are up-to-date.
@@ -4156,9 +4576,10 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
                 handle.launched_resources = handle.launched_resources.copy(
                     region=provision_record.region, zone=provision_record.zone)
 
-                self._update_after_cluster_provisioned(
-                    handle, to_provision_config.prev_handle, task,
-                    prev_cluster_status, config_hash, cluster_hash)
+                with self.reserved_fill_materialized_effect_guard():
+                    self._update_after_cluster_provisioned(
+                        handle, to_provision_config.prev_handle, task,
+                        prev_cluster_status, config_hash, cluster_hash)
                 self._bind_fresh_provision_evidence(provision_evidence_lease,
                                                     evidence_generation)
                 return handle, False
@@ -4221,11 +4642,13 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
 
             # For backward compatibility and robustness of skylet, it is checked
             # and restarted if necessary.
-            self.check_skylet_running(handle)
+            with self.reserved_fill_materialized_effect_guard():
+                self.check_skylet_running(handle)
 
-            self._update_after_cluster_provisioned(
-                handle, to_provision_config.prev_handle, task,
-                prev_cluster_status, config_hash, cluster_hash)
+            with self.reserved_fill_materialized_effect_guard():
+                self._update_after_cluster_provisioned(
+                    handle, to_provision_config.prev_handle, task,
+                    prev_cluster_status, config_hash, cluster_hash)
             self._bind_fresh_provision_evidence(provision_evidence_lease,
                                                 evidence_generation)
             return handle, False
@@ -4241,6 +4664,9 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         if cluster_config_overrides:
             provider_config['cluster_config_overrides'] = (
                 cluster_config_overrides)
+        # The sole call site is inside the guarded
+        # _update_after_cluster_provisioned() finalization phase. Do not nest
+        # another policy ticket/advisory-lock session here.
         provision_lib.open_ports(repr(cloud), handle.cluster_name_on_cloud,
                                  handle.launched_resources.ports,
                                  provider_config)

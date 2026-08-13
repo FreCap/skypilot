@@ -66,6 +66,29 @@ class TestCleanServerEnvCapture:
         finally:
             os.environ.pop('SKY_TEST_IDEMPOTENT', None)
 
+    def test_capture_scrubs_all_controller_authority(self):
+        authority = {
+            name: f'sensitive-{index}' for index, name in enumerate(
+                clean_env_module._CONTROLLER_AUTHORITY_ENV_VARS)
+        }
+        original = {name: os.environ.get(name) for name in authority}
+        try:
+            os.environ.update(authority)
+
+            clean_env_module.capture_clean_server_env()
+
+            snapshot = clean_env_module.get_clean_server_env()
+            assert snapshot is not None
+            assert authority.keys().isdisjoint(snapshot)
+            assert all(
+                os.environ[name] == value for name, value in authority.items())
+        finally:
+            for name, value in original.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
     def test_get_returns_copy_not_reference(self):
         clean_env_module.capture_clean_server_env()
         snap1 = clean_env_module.get_clean_server_env()

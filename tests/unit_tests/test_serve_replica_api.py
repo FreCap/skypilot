@@ -40,12 +40,25 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     owner_scoped_request_access_version = (
         server_constants.MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION)
     assert owner_scoped_request_access_version == 73
+    ordinary_launch_binding_version = (
+        server_constants.MIN_ORDINARY_LAUNCH_BINDING_API_VERSION)
+    assert ordinary_launch_binding_version == 74
+    placement_projection_version = (
+        server_constants.MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION)
+    assert placement_projection_version == 77
+    reserved_fill_status_version = (
+        server_constants.
+        MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION)
+    assert reserved_fill_status_version == 76
     assert (server_constants.MIN_SERVE_DASHBOARD_REPLICA_READS_API_VERSION
             < server_constants.API_VERSION)
     assert execution_quiescence_version < pricing_version
     assert pricing_version < public_capacity_version
     assert public_capacity_version < owner_scoped_request_access_version
-    assert server_constants.API_VERSION == owner_scoped_request_access_version
+    assert owner_scoped_request_access_version < ordinary_launch_binding_version
+    assert ordinary_launch_binding_version < reserved_fill_status_version
+    assert reserved_fill_status_version < placement_projection_version
+    assert server_constants.API_VERSION == placement_projection_version
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

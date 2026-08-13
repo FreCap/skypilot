@@ -8,6 +8,7 @@ leader-aware routing.
 # effects). Disable for the file.
 # pylint: disable=invalid-name,protected-access
 import contextlib
+import copy
 import hashlib
 import json
 import pickle
@@ -161,6 +162,52 @@ def _config_snapshot(config: bytes,
     return (config, hashlib.sha256(config).hexdigest(), snapshot_character * 64)
 
 
+def _placement_projection_args() -> dict[str, object]:
+    """Return a complete valid set of immutable placement projections."""
+    worker_role = 'arn:aws:iam::123456789012:role/skyserve-worker-east'
+    return {
+        'controller_job_projection': {
+            'workspace': 'controller',
+            'kubernetes_context': 'controller-east',
+            'namespace': 'controller-system',
+            'service_account_name': 'controller-sa',
+            'priority_class_name': None,
+            'lb_data_plane_auth': {
+                'secret_name': 'skypilot-serve-lb-data-plane-auth',
+                'secret_key': 'tokens',
+                'mount_path': ('/etc/skypilot/serve-auth/lb-data-plane/tokens'),
+            },
+        },
+        'controller_work_cache': {
+            'kind': 'empty_dir',
+            'mount_path': '/mnt/controller-work',
+            'required_bytes': 100,
+            'required_inodes': 10,
+            'size_limit_bytes': 200,
+        },
+        'worker_placement_projections': [{
+            'candidate_id': 'kubernetes-0000',
+            'kubernetes_context': 'east',
+            'namespace': 'inference',
+            'service_account_name': 'worker-sa',
+            'priority_class_name': 'preemptible-inference-low',
+            'priority_value': -1000,
+            'preemption_policy': 'Never',
+            'pod_identity_role_arn': worker_role,
+            'accelerator_name': 'H200',
+            'accelerator_count': 1,
+            'accelerator_scheduling': {
+                'label_key': 'nvidia.com/gpu.product',
+                'label_values': ['NVIDIA-H200'],
+                'resource_key': 'nvidia.com/gpu',
+            },
+            'cache': {
+                'kind': 'none',
+            },
+        }],
+    }
+
+
 def _insert_placement_normalization_run(engine,
                                         run_id: uuid.UUID,
                                         *,
@@ -266,6 +313,8 @@ def _insert_placement_normalization_row(
                 serve_state.version_specs_table.c.service_name == service_name,
                 serve_state.version_specs_table.c.version ==
                 version)).mappings().one()
+        version_row = placement_contract_normalization._frozen_version_row(
+            version_row)
         result_columns = {
             column: _placement_normalization_value_sha256(value)
             for column, value in version_row.items()
@@ -364,7 +413,8 @@ def _insert_protocol4_terminal_receipt_state(
 
     rows = []
     for version in range(1, 5):
-        persisted = _read_version_row(engine, service_name, version)
+        persisted = placement_contract_normalization._frozen_version_row(
+            _read_version_row(engine, service_name, version))
         analysis, classification = (
             placement_contract_normalization._classify_version_row(persisted))
         facts = {
@@ -590,6 +640,17 @@ def test_protocol4_current_inventory_query_projects_frozen_columns() -> None:
         query.compile().params.values())
 
 
+def test_protocol4_scan_inventory_projects_frozen_columns(
+        _mock_serve_db) -> None:
+    assert _add_minimal_service('svc-scan-frozen')
+    with orm.Session(_mock_serve_db) as session:
+        rows, _ = placement_contract_normalization._scan_inventory(session, 10)
+
+    row = next(row for row in rows if row.identity == ('svc-scan-frozen', 1))
+    assert tuple(
+        row.original) == (placement_normalization_manifest.VERSION_SPEC_COLUMNS)
+
+
 _VERSIONED_HA_SCRIPT = (
     f'{serve_constants.VERSIONED_HA_CONFIG_RECOVERY_MARKER}\n'
     'export SKYPILOT_CONFIG=/tmp/config.yaml.v2\n'
@@ -687,6 +748,7 @@ def _insert_orphan_service_row(engine, name: str, pool: bool = False):
             requested_resources_str='1x[CPU:1+]',
             pool=int(pool),
             controller_pid=12345,
+            controller_incarnation=uuid.uuid4(),
             hash='orphan',
             entrypoint='entry'))
         session.commit()
@@ -1154,6 +1216,8 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             'launch_shadow_sample_id': launch_shadow_coverage_id,
             'down_shadow_sample_id': down_shadow_coverage_id,
             'resource_action_spec_identity_sha256': None,
+            'ordinary_launch_association_id': uuid.UUID(int=replica_id * 100 + 7
+                                                       ),
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(_mock_serve_db) as session:
@@ -1534,10 +1598,17 @@ def test_elected_version_migration_backfills_latest_committed_version(
     engine = create_engine(f'sqlite:///{tmp_path / "old-serve.db"}')
     monkeypatch.setattr(migration_utils, 'SERVE_NON_POSTGRES_VERSION', '013')
     serve_state.create_table(engine)
+    legacy_metadata = sqlalchemy.MetaData()
+    legacy_services = sqlalchemy.Table('services',
+                                       legacy_metadata,
+                                       autoload_with=engine)
+    legacy_version_specs = sqlalchemy.Table('version_specs',
+                                            legacy_metadata,
+                                            autoload_with=engine)
     with engine.begin() as connection:
-        connection.execute(serve_state.services_table.insert().values(
-            name='svc', current_version=1))
-        connection.execute(serve_state.version_specs_table.insert(), [{
+        connection.execute(legacy_services.insert().values(name='svc',
+                                                           current_version=1))
+        connection.execute(legacy_version_specs.insert(), [{
             'service_name': 'svc',
             'version': 1,
             'spec': pickle.dumps(None),
@@ -1887,6 +1958,82 @@ def test_committed_version_content_is_immutable_and_retryable(_mock_serve_db):
         'svc-immutable', 2, _service_spec('different'), 'value: different')
     assert conflict_result is serve_state.VersionCommitResult.CONTENT_CONFLICT
     assert _read_version_row(_mock_serve_db, 'svc-immutable', 2) == original_row
+
+
+def test_identical_projection_retry_is_idempotent_at_db_boundary(
+        _mock_serve_db):
+    service_name = 'svc-projection-retry'
+    yaml_content = 'value: projected'
+    projections = _placement_projection_args()
+    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
+    assert serve_state.add_version(service_name) == 2
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('projected'),
+                                              yaml_content, **projections)
+            is serve_state.VersionCommitResult.COMMITTED)
+    row_before = _read_version_row(_mock_serve_db, service_name, 2)
+
+    assert (serve_state.add_or_update_version(
+        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
+        **copy.deepcopy(projections))
+            is serve_state.VersionCommitResult.IDEMPOTENT_RETRY)
+    assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
+
+
+@pytest.mark.parametrize('projection_name', [
+    'controller_job_projection',
+    'controller_work_cache',
+    'worker_placement_projections',
+])
+def test_projection_drift_conflicts_and_preserves_committed_row(
+        _mock_serve_db, projection_name):
+    service_name = f'svc-projection-conflict-{projection_name}'
+    yaml_content = 'value: projected'
+    projections = _placement_projection_args()
+    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
+    assert serve_state.add_version(service_name) == 2
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('projected'),
+                                              yaml_content, **projections)
+            is serve_state.VersionCommitResult.COMMITTED)
+    row_before = _read_version_row(_mock_serve_db, service_name, 2)
+    changed = copy.deepcopy(projections)
+    if projection_name == 'controller_job_projection':
+        changed[projection_name]['namespace'] = 'different-controller-system'
+    elif projection_name == 'controller_work_cache':
+        changed[projection_name]['size_limit_bytes'] = 300
+    else:
+        changed[projection_name][0]['accelerator_name'] = 'H100'
+
+    assert (serve_state.add_or_update_version(
+        service_name, 2, _v2_service_spec('rebuilt-on-retry'), yaml_content,
+        **changed) is serve_state.VersionCommitResult.CONTENT_CONFLICT)
+    assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
+
+
+def test_identical_yaml_retry_cannot_backfill_legacy_null_projections(
+        _mock_serve_db):
+    service_name = 'svc-legacy-null-projections'
+    yaml_content = 'value: legacy'
+    assert _add_minimal_service(service_name, spec=_v2_service_spec('initial'))
+    assert serve_state.add_version(service_name) == 2
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('legacy'),
+                                              yaml_content)
+            is serve_state.VersionCommitResult.COMMITTED)
+    row_before = _read_version_row(_mock_serve_db, service_name, 2)
+    assert all(row_before[column] is None for column in (
+        'controller_job_projection',
+        'controller_work_cache',
+        'worker_placement_projections',
+    ))
+
+    assert (serve_state.add_or_update_version(service_name, 2,
+                                              _v2_service_spec('legacy-retry'),
+                                              yaml_content,
+                                              **_placement_projection_args())
+            is serve_state.VersionCommitResult.CONTENT_CONFLICT)
+    assert _read_version_row(_mock_serve_db, service_name, 2) == row_before
 
 
 def test_new_service_and_version_writes_require_raw_v2_state(_mock_serve_db):
@@ -4821,6 +4968,9 @@ class TestRecoveryVersionSelection:
             'created_by': 'alice',
             'quarantined_at': None,
             'quarantine_reason': None,
+            'controller_job_projection': None,
+            'controller_work_cache': None,
+            'worker_placement_projections': None,
         }, {
             'version': 2,
             'spec': 'spec-2',
@@ -4830,6 +4980,9 @@ class TestRecoveryVersionSelection:
             'created_by': 'bob',
             'quarantined_at': None,
             'quarantine_reason': None,
+            'controller_job_projection': None,
+            'controller_work_cache': None,
+            'worker_placement_projections': None,
         }]
 
     def test_quarantine_is_durable_and_applicable_snapshot_skips_it(

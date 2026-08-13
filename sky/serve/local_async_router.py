@@ -130,6 +130,7 @@ class LocalAsyncRouter:
         probe_cache_seconds: float = 0.25,
         reservation_grace_seconds: float = 1.0,
         retriable_status_codes: Iterable[int] = (429,),
+        release_and_relay_responses: Mapping[int, str] | None = None,
         max_sticky_requests: int = 10000,
         client_max_size: int = 1024**2,
     ) -> None:
@@ -159,6 +160,18 @@ class LocalAsyncRouter:
                for code in self._retriable_status_codes):
             raise ValueError(
                 'Retriable status codes must be between 100 and 599.')
+        self._release_and_relay_responses = dict(release_and_relay_responses or
+                                                 {})
+        if any(not isinstance(code, int) or isinstance(code, bool) or code < 400
+               or code > 599 or not isinstance(state, str) or not state
+               for code, state in self._release_and_relay_responses.items()):
+            raise ValueError(
+                'Release-and-relay responses require a 400..599 status and '
+                'nonempty state.')
+        if (self._retriable_status_codes &
+                self._release_and_relay_responses.keys()):
+            raise ValueError('Retriable and release-and-relay status codes '
+                             'must be disjoint.')
         if max_sticky_requests < 1:
             raise ValueError('max_sticky_requests must be at least 1.')
         self._max_sticky_requests = max_sticky_requests
@@ -304,6 +317,31 @@ class LocalAsyncRouter:
                 response = await self._request_child(
                     child_index, request.method, request.rel_url.raw_path_qs,
                     body, request.headers, self._request_timeout_seconds)
+                release_state = None
+                response_payload = None
+                if response is not None:
+                    release_state = self._release_and_relay_responses.get(
+                        response.status)
+                    if release_state is not None:
+                        response_payload = _strict_response_json(response)
+                if (response is not None and release_state is not None and
+                        isinstance(submitted_id, str) and
+                        response_payload is not None and
+                        set(response_payload) == {'state', 'request_id'} and
+                        response_payload.get('state') == release_state and
+                        response_payload.get('request_id') == submitted_id):
+                    try:
+                        await self._release_rejected_request(
+                            child_index, token, submitted_id)
+                    except asyncio.CancelledError:
+                        # The response proves this worker did not accept the
+                        # request. Finish removing both local claims before
+                        # propagating cancellation.
+                        await self._complete_rejected_request_release(
+                            child_index, token, submitted_id)
+                        raise
+                    reservation_finalized = True
+                    return _relay(response)
                 if (response is not None and
                         response.status in self._retriable_status_codes):
                     try:
@@ -849,6 +887,22 @@ def _response_json(response: _ChildResponse) -> Mapping[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _strict_response_json(response: _ChildResponse) -> Mapping[str, Any] | None:
+    """Parse one JSON object while rejecting duplicate member names."""
+
+    def _object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+        payload = dict(pairs)
+        if len(payload) != len(pairs):
+            raise ValueError('Response JSON contains duplicate member names.')
+        return payload
+
+    try:
+        payload = json.loads(response.body, object_pairs_hook=_object)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _request_id(payload: Mapping[str, Any],
                 response: _ChildResponse | None) -> str | None:
     if response is not None:
@@ -911,6 +965,12 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help='Explicit pre-dispatch rejection status. Defaults to 429.')
     parser.add_argument(
+        '--release-and-relay-response',
+        action='append',
+        help=('Exact CODE:STATE pre-dispatch response that releases local '
+              'ownership and is relayed without trying another worker. The '
+              'JSON body must contain exactly state and matching request_id.'))
+    parser.add_argument(
         '--max-sticky-requests',
         type=int,
         default=10000,
@@ -939,6 +999,24 @@ def _resolve_upstreams(args: argparse.Namespace) -> Sequence[str]:
     ]
 
 
+def _parse_release_and_relay_responses(
+        values: Sequence[str] | None) -> dict[int, str]:
+    result: dict[int, str] = {}
+    for value in values or ():
+        code_text, separator, state = value.partition(':')
+        try:
+            code = int(code_text)
+        except ValueError as error:
+            raise ValueError(
+                'Release-and-relay response must use CODE:STATE.') from error
+        if (not separator or not state or code < 400 or code > 599 or
+                code in result):
+            raise ValueError('Release-and-relay response must use one unique '
+                             '400..599 CODE:STATE value.')
+        result[code] = state
+    return result
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     if args.port < 1 or args.port > 65535:
@@ -958,6 +1036,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         retriable_status_codes=(args.retriable_status_code
                                 if args.retriable_status_code is not None else
                                 (429,)),
+        release_and_relay_responses=_parse_release_and_relay_responses(
+            args.release_and_relay_response),
         max_sticky_requests=args.max_sticky_requests,
         client_max_size=args.client_max_size_mib * 1024**2,
     )
