@@ -1,9 +1,11 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: Serve046 implementation and its exact automated freeze are complete;
-the separate Boltz reclaim-policy plugin is implemented and corrected against
-the 2026-08-13 live provider topology; platform prerequisites and three
-restarted adversarial reviews remain; not merged, deployed, or activated
+Status: Serve046, its separately packaged Boltz reclaim policy, and the local
+Serve047 final-state cleanup restack are implemented after the identity-free
+worker-partition correction. Automated validation is complete; the remote
+cleanup PR still needs its final reviewed restack, and platform prerequisites
+and three restarted adversarial reviews remain; not merged, deployed, or
+activated
 
 Last updated: 2026-08-13
 
@@ -1753,7 +1755,7 @@ either case.
 | 2a | Full-fleet combined feature-and-policy image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
 | 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separately packaged plugin, strict bundle, Node cross-attestation, unique entry point, and reusable least-privilege spoke audit boundary are integrated into the one feature image and focused tests pass. They are not upstream-merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
 | 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; the combined image cannot activate until the deployment policy and live attestation gates pass. |
-| 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | The stale draft is not mergeable as written; it must be reauthored from the exact frozen feature revision and remains merge-gated below. |
+| 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | Reauthored and tested in the local exact restack; the remote draft is still stale until the final reviewed OID is published and remains merge-gated below. |
 
 Durable acceptance hands rows to the existing asynchronous launch path, and
 status projects the same allocation/observation evidence used by
@@ -2148,6 +2150,13 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   reject a
   missing or mismatched Node inventory, selector/product/capacity drift, and a
   deleting-only flavor while accepting a non-Ready initializing Node.
+- The post-integration local Serve047 restack at `4200b43fb` passes 58/58
+  focused final-state, cleanup-presence, manager-receipt,
+  reconciliation-transition, and status tests; the combined policy superset
+  passes 115/115; and its real-PostgreSQL Serve047 schema suite passes 12/12.
+  These reruns supplement the complete cleanup freeze recorded below; the
+  final cleanup OID will change when it is rebased over review-record-only
+  feature commits, without changing its tested implementation tree.
 - No merge commit, deployment revision, activation result, live GPU fill, or
   BCL preemption result is claimed in this document yet.
 
@@ -2184,13 +2193,13 @@ ready. The stack is:
    sole first-authorization and reauthorization surface and remains blocked
    until the merge gate below is met.
 
-Exact feature and cleanup commit IDs are recorded after the final feature
-rebase and cleanup restack. PR #1452 must be restacked onto the frozen/squashed
-feature, reauthored for Serve046/projection v2 and the controller-runtime
-transition removals, and pass its final-state tests before either OID is
-recorded. The stale cleanup commits are design input only and must not be
-blindly rebased or cherry-picked. Historical cleanup PR #1263 is not this
-correction's removal PR.
+Exact feature and cleanup commit IDs are recorded after the final review-record
+commit and final cleanup rebase. The local PR #1452 implementation has been
+restacked onto the frozen feature, reauthored for Serve046/projection v2 and
+the controller-runtime transition removals, and rerun against the integrated
+policy tree. The old remote cleanup tip remains stale and is not deployment or
+merge evidence. Historical cleanup PR #1263 is not this correction's removal
+PR.
 
 The cleanup uses a new forward-only Serve047 migration; it never edits or
 renumbers historical Serve044, Serve045, or Serve046. Serve047 preserves the
