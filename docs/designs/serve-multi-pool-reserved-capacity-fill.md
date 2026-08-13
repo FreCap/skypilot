@@ -1577,8 +1577,8 @@ before activation. If it does not, the new image may deploy but the gate stays
 None of the above is merged, deployed, or activated as of this update. The
 implementation and owner-death/request-liveness integration are complete in
 this worktree. The exact non-PostgreSQL and serial PostgreSQL validation passes
-and three consecutive adversarial reviews are recorded below. Only the final
-evidence-only successor publication and remote CI remain before merge.
+and three consecutive adversarial reviews are recorded below. Remote CI on the
+published exact successor must pass before merge.
 
 ### Runtime audit corrections implemented and frozen for review
 
