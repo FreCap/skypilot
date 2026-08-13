@@ -823,6 +823,110 @@ identity and full-fleet bundle. Any already active experimental generation
 would require normal fix-forward reauthorization, which advances the gate and
 invalidates its allocation maps.
 
+### Boltz deployment policy bundle
+
+Boltz implements this interface in the separate
+`boltz-skypilot-reserved-fill-reclaim-policy` distribution under
+`boltz/reserved_fill_reclaim_policy/`. The generic SkyPilot wheel remains
+entry-point-free. The Boltz overlay builds and installs the generic wheel and
+the deployment-policy wheel independently, then verifies that the combined
+image exposes exactly one `skypilot.reserved_fill_reclaim_policy` entry point.
+The overlay release version stamps the policy revision; any policy-code change
+therefore rotates durable policy identity even if the fleet JSON is unchanged.
+
+The package embeds one strict JSON fleet bundle. Unknown or duplicate keys are
+rejected. Its normalized semantic sections are hashed independently with
+domain-separated SHA-256 prefixes: the admission/reclaim contract produces
+`fleet_bundle_sha256`, while physical/provider inventory produces
+`provider_inventory_sha256`. Reordering contexts, flavors, or quota rows does
+not rotate either identity. The package caches only temporary AssumeRole
+credentials; it never caches Kubernetes or AWS attestation results.
+
+The initial public inference contract is service-name-agnostic. A second
+service, including one with traffic weight 1000, uses the same claim and launch
+path if its immutable projection matches this bundle. No service allowlist or
+second scheduling path exists. The exact shared object contract is:
+
+| Contract | East | PHX |
+|---|---|---|
+| Context | `prod_research_cluster_eks` | `phx_research_cluster_eks` |
+| Physical cluster UID | `14de98b4-cb7b-4f82-beb7-6f754a96f1dd` | `ba2dcdca-2a0d-447f-ad8a-31849a63c1d5` |
+| Namespace / service account | `rescluster-k8s-prod-east1-preemptible-inference` / `skypilot-pool-sa` | same |
+| Pod Identity | absent | absent |
+| LocalQueue (spoke-module-owned) | `default` | `default` |
+| ClusterQueue (Kueue-chart-owned) | `skyserve-inference-borrowed` | same |
+| WorkloadPriorityClass (Kueue-chart-owned) | `skyserve-inference-low` | same |
+| Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
+| Scheduler | `gpu-binpack-scheduler` | same |
+| GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
+| Exact observed product labels | `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB` and `NVIDIA-A100-SXM4-80GB` | `nvidia.com/gpu.product=NVIDIA-H200` |
+
+The inference ClusterQueue has zero nominal GPU quota in the same cohort as
+the research queue. Its per-flavor borrowing limits are bounded by research's
+nominal GPU quota, and it has no preemption permission of its own. The research
+queue must retain `reclaimWithinCohort: Any`. The policy proves the exact
+LocalQueue target, both current Active ClusterQueues, cohort, namespace
+selectors, GPU flavor quotas, preemption policies, ResourceFlavor instance and
+GPU-product labels, WorkloadPriorityClass, Pod PriorityClass, immutable custom
+scheduler deployment, current Kueue controller, Pod integration,
+`AssignQueueLabelsForPods: true`, fail-closed Kueue webhooks, and the Deny
+queue-name admission-policy binding. The inference namespace UID and physical
+cluster UID are immutable inventory; replace either only by shipping a new
+bundle and normal fix-forward reauthorization.
+
+AWS absence is a positive proof, not an omitted check. For each context the
+plugin uses the hub writer's Pod Identity session to assume the exact spoke
+role `skypilot-reserved-fill-reclaim-audit`. That role is read-only and limited
+to `eks:DescribeCluster`, `eks:ListPodIdentityAssociations`, and
+`eks:DescribePodIdentityAssociation` on the exact cluster and its association
+resources. The spoke trust names the single current hub Pod Identity writer
+role and requires its transitive `eks-cluster-arn`, `kubernetes-namespace`, and
+`kubernetes-service-account` session tags. The chart renders API, controller,
+and executor writers with the same `skypilot-api-sa`; a chart test must keep
+that invariant true. Every proof describes the exact active EKS cluster,
+paginates the filtered association index with cycle detection, and requires
+zero associations for the public inference service account. A non-null future
+bundle instead requires exactly one summary plus one exact described
+association, including role, null target role, ARN, and owner agreement. The
+Kubernetes proof independently rejects an IRSA annotation on the service
+account.
+
+Activation runs both provider domains for both contexts concurrently under the
+caller's single absolute five-second deadline. Claim authorization does the
+same for every distinct requested context, and launch authorization runs AWS
+and Kubernetes concurrently for its one context. Static identity, pool-key,
+projection, accelerator, and admission mismatches fail before provider I/O.
+All network calls use the remaining deadline, one-attempt client retries, and a
+shared cancellation event. Raw provider payloads and credential material never
+enter errors or proof output.
+
+The deployment preflight is machine-readable:
+
+```bash
+python -m boltz_reserved_fill_reclaim_policy
+```
+
+It prints exactly one JSON object. Successful preflight and the structured
+activation, claim, and launch log payloads use schema 1 with `operation`,
+`success`, the V2 `contract`, all three identity fields, completion time, and
+one record per attested context. Each AWS record includes
+`association_count`, `expected_role_arn`, and the explicit boolean
+`identity_absence_proven`; each Kubernetes record includes the physical and
+namespace UIDs, exact queue names, IRSA-absence result, and
+`assign_queue_labels_for_pods`. Failed CLI preflight returns exit 1 and only
+`{"schema_version":1,"operation":"preflight","success":false,
+"error_code":"ATTESTATION_FAILED"}`. Runtime activation and authorization
+fail closed with `ReclaimAttestationError`.
+
+Rollout is fix-forward. Apply and attest the IAM, namespace/service-account,
+queue, priority, admission-policy, Kueue configuration, and server projection
+first; remove the east unmanaged inference Pods and its drifted Pod Identity
+association before activation. Then build one immutable two-wheel Boltz image,
+deploy it to the complete writer fleet, run the JSON preflight, and invoke the
+normal activation command. A correction ships a successor bundle/image and
+uses the same reauthorization command to advance the generation; it does not
+reopen legacy activation or introduce a rollback-only happy path.
+
 The one interface owns three operations:
 
 1. activation attestation enumerates the exact current durable claim edges and
@@ -2142,8 +2246,10 @@ legacy activation.
 - Record the pre-activation writer/image/schema proof.
 - Deploy and attest the separately owned Kueue inference queue/preemption
   contract for every reserved context; current east1 evidence does not pass.
-- Ship its code-owned `ReservedFillReclaimPolicy` and ongoing claim-admission
-  and launch fence in a second immutable Boltz deployment bundle. The policy
+- Deploy the code-owned `ReservedFillReclaimPolicy` from the separate
+  `boltz-skypilot-reserved-fill-reclaim-policy` wheel and its ongoing
+  claim-admission and launch fence in a second immutable Boltz deployment
+  bundle. The policy
   must consume and authorize the projected `scheduler_name` and nullable Pod
   Identity role together with the existing namespace, service-account,
   priority, Kueue, and accelerator fields. For the identity-free inference
