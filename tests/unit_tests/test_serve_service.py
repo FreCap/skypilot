@@ -1361,7 +1361,7 @@ def test_start_releases_port_lock_before_readiness_wait():
 
 
 def test_legacy_recovery_backfills_catalog_once():
-    task = mock.Mock()
+    task = mock.Mock(resources=[])
     service_spec = types.SimpleNamespace(
         placement_contract=placement_policy.resolve_fresh_contract(
             placement_policy.SPOT_HEDGE_PLACER, pool=False))

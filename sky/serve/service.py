@@ -39,6 +39,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.data import data_utils
 from sky.serve import constants
 from sky.serve import controller
+from sky.serve import kubernetes_identity
 from sky.serve import lb_k8s
 from sky.serve import maintenance
 from sky.serve import ordinary_launch_binding
@@ -1805,6 +1806,14 @@ def _prepare_placement_catalog(
                                                          workspace=workspace)
     assert built_catalog is not None
     candidate_catalog = built_catalog.to_dict()
+    missing_shapes = kubernetes_identity.catalog_missing_task_shapes(
+        task, candidate_catalog)
+    if missing_shapes:
+        raise ValueError(
+            f'Placement catalog for {service_name!r} omits declared '
+            f'Kubernetes shape(s) {sorted(missing_shapes)}. Every exact '
+            'context/accelerator/count must be retained independently of '
+            'current live capacity.')
     if not is_recovery:
         return candidate_catalog
 
@@ -2195,6 +2204,25 @@ def _start(service_name: str,
         recovery_version=recovery_version)
 
     if not is_recovery:
+        if service_spec.placement_contract.enabled:
+            controller_job_projection = (
+                kubernetes_identity.build_controller_job_projection(
+                    task, workspace=workspace))
+            controller_work_cache = (
+                kubernetes_identity.build_controller_work_cache_projection(
+                    task, workspace=workspace))
+            worker_placement_projections = (
+                kubernetes_identity.build_worker_placement_projections(
+                    task,
+                    workspace=workspace,
+                    placement_catalog=placement_catalog))
+            storage_broker = (
+                kubernetes_identity.build_storage_broker_projection(
+                    workspace=workspace))
+        else:
+            (controller_job_projection, controller_work_cache,
+             worker_placement_projections, storage_broker) = (None, None, None,
+                                                              None)
         with filelock.FileLock(controller_utils.get_resources_lock_path()):
             if not controller_utils.can_start_new_process(task.service.pool):
                 cleanup_storage(yaml_content, resource_scope)
@@ -2237,7 +2265,11 @@ def _start(service_name: str,
                     controller_config=initial_controller_config,
                     controller_config_digest=(initial_controller_config_digest),
                     controller_config_snapshot_id=(
-                        initial_controller_config_snapshot_id))
+                        initial_controller_config_snapshot_id),
+                    controller_job_projection=controller_job_projection,
+                    controller_work_cache=controller_work_cache,
+                    worker_placement_projections=worker_placement_projections,
+                    storage_broker=storage_broker)
             except (serve_state.OrphanedReplicaRecordsError,
                     serve_state.OrphanedStorageCleanupIntentsError,
                     serve_state.OrphanedVersionRecordsError):

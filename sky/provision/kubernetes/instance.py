@@ -1174,6 +1174,192 @@ def _validate_cluster_name_annotations(pods: dict[str, Any], cluster_name: str,
                 f'{annotated_name!r}, not requested cluster {cluster_name!r}.')
 
 
+_NO_SERVE_WORKER_IDENTITY_ATTESTATION = object()
+_SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS = 3
+
+
+def _delete_admitted_serve_worker_and_confirm_absent(
+        pod_name: str, namespace: str, context: str | None) -> None:
+    """Force-delete an unsafe admitted Pod and prove it left the API."""
+    core_api = kubernetes.core_api(context)
+    last_observation = 'the Pod remained visible'
+    for attempt in range(_SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS):
+        delete_error = None
+        try:
+            core_api.delete_namespaced_pod(
+                pod_name,
+                namespace,
+                grace_period_seconds=0,
+                _request_timeout=config_lib.DELETION_TIMEOUT)
+        except Exception as e:  # pylint: disable=broad-except
+            delete_error = common_utils.format_exception(e)
+        try:
+            core_api.read_namespaced_pod(
+                pod_name, namespace, _request_timeout=kubernetes.API_TIMEOUT)
+        except kubernetes.api_exception() as e:
+            if e.status == 404:
+                return
+            last_observation = common_utils.format_exception(e)
+        except Exception as e:  # pylint: disable=broad-except
+            last_observation = common_utils.format_exception(e)
+        else:
+            last_observation = ('the Pod remained visible'
+                                if delete_error is None else
+                                f'delete failed ({delete_error}) and the Pod '
+                                'remained visible')
+        if attempt + 1 < _SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS:
+            time.sleep(POLL_INTERVAL)
+    raise config_lib.KubernetesError(
+        'Failed to confirm deletion of unsafe admitted SkyServe worker Pod '
+        f'{namespace}/{pod_name} after '
+        f'{_SERVE_WORKER_IDENTITY_CLEANUP_ATTEMPTS} attempts; last cleanup '
+        f'observation: {last_observation}.')
+
+
+def _reject_admitted_serve_worker_identity(pod: Any, namespace: str,
+                                           context: str | None,
+                                           identity_name: str, actual: object,
+                                           expected: object) -> None:
+    """Delete, prove absence, and reject a Pod with changed identity."""
+    pod_name = pod.metadata.name
+    cleanup_error = None
+    try:
+        _delete_admitted_serve_worker_and_confirm_absent(
+            pod_name, namespace, context)
+    except Exception as e:  # pylint: disable=broad-except
+        cleanup_error = common_utils.format_exception(e)
+        logger.error(
+            'Failed to confirm absence of a SkyServe worker Pod with an '
+            'unexpected %s: %s', identity_name, cleanup_error)
+    cleanup_detail = (' Its absence was confirmed.'
+                      if cleanup_error is None else
+                      ' Cleanup could not confirm Pod absence and provisioning '
+                      f'will fail closed: {cleanup_error}')
+    raise config_lib.KubernetesError(
+        f'Admitted SkyServe worker Pod {namespace}/{pod_name} has '
+        f'{identity_name} {actual!r}; expected {expected!r}. The Pod was '
+        'rejected to enforce the immutable platform placement contract.'
+        f'{cleanup_detail}')
+
+
+def _attest_serve_worker_priority_class(
+    pod: Any,
+    namespace: str,
+    context: str | None,
+    expected_priority_class_name: object,
+    expected_priority_value: object = _NO_SERVE_WORKER_IDENTITY_ATTESTATION,
+    expected_preemption_policy: object = _NO_SERVE_WORKER_IDENTITY_ATTESTATION
+) -> None:
+    """Reject a worker whose admitted priority contract is unexpected."""
+    if (expected_priority_class_name is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        return
+    actual_priority_class_name = getattr(pod.spec, 'priority_class_name', None)
+    checks = [('priority class', actual_priority_class_name,
+               expected_priority_class_name)]
+    # Kubernetes materializes a no-class Pod as numeric priority zero and may
+    # default preemptionPolicy. A null class contract attests only the absence
+    # of a named class; non-null projected classes freeze all three semantics.
+    if (expected_priority_class_name is not None and expected_priority_value
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        checks.append(
+            ('numeric priority', getattr(pod.spec, 'priority',
+                                         None), expected_priority_value))
+    if (expected_priority_class_name is not None and expected_preemption_policy
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        checks.append(
+            ('preemption policy', getattr(pod.spec, 'preemption_policy',
+                                          None), expected_preemption_policy))
+    for identity_name, actual, expected in checks:
+        if actual != expected:
+            _reject_admitted_serve_worker_identity(pod, namespace, context,
+                                                   identity_name, actual,
+                                                   expected)
+
+
+def _attest_serve_worker_service_account(
+        pod: Any, namespace: str, context: str | None,
+        expected_service_account_name: object) -> None:
+    """Reject an admitted worker Pod whose service account is unexpected."""
+    if (expected_service_account_name is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        return
+    actual_service_account_name = getattr(pod.spec, 'service_account_name',
+                                          None)
+    if actual_service_account_name == expected_service_account_name:
+        return
+    _reject_admitted_serve_worker_identity(pod, namespace, context,
+                                           'service account',
+                                           actual_service_account_name,
+                                           expected_service_account_name)
+
+
+def _attest_serve_worker_accelerator_scheduling(
+    pod: Any,
+    namespace: str,
+    context: str | None,
+    expected_label_key: object,
+    expected_label_values: object,
+    expected_resource_key: object,
+    expected_accelerator_count: object,
+) -> None:
+    """Reject admission mutations that weaken frozen accelerator placement."""
+    if expected_label_key is _NO_SERVE_WORKER_IDENTITY_ATTESTATION:
+        return
+    containers = getattr(pod.spec, 'containers', None)
+    ray_nodes = ([] if not isinstance(containers, list) else [
+        container for container in containers
+        if getattr(container, 'name', None) == 'ray-node'
+    ])
+    resource_contract_matches = False
+    if len(ray_nodes) == 1:
+        resources = getattr(ray_nodes[0], 'resources', None)
+        requests = getattr(resources, 'requests', None)
+        limits = getattr(resources, 'limits', None)
+        if isinstance(requests, Mapping) and isinstance(limits, Mapping):
+            actual_request = requests.get(expected_resource_key)
+            actual_limit = limits.get(expected_resource_key)
+            expected_quantity = str(expected_accelerator_count)
+            resource_contract_matches = (str(actual_request)
+                                         == expected_quantity and
+                                         str(actual_limit) == expected_quantity)
+
+    affinity = getattr(pod.spec, 'affinity', None)
+    node_affinity = getattr(affinity, 'node_affinity', None)
+    required = getattr(node_affinity,
+                       'required_during_scheduling_ignored_during_execution',
+                       None)
+    terms = getattr(required, 'node_selector_terms', None)
+    affinity_contract_matches = False
+    if isinstance(terms, list) and terms:
+        affinity_contract_matches = True
+        for term in terms:
+            expressions = getattr(term, 'match_expressions', None)
+            matching = ([] if not isinstance(expressions, list) else [
+                expression for expression in expressions
+                if getattr(expression, 'key', None) == expected_label_key
+            ])
+            if (len(matching) != 1 or
+                    getattr(matching[0], 'operator', None) != 'In' or getattr(
+                        matching[0], 'values', None) != expected_label_values):
+                affinity_contract_matches = False
+                break
+    if resource_contract_matches and affinity_contract_matches:
+        return
+    actual = {
+        'ray_node_container_count': len(ray_nodes),
+        'resource_contract_matches': resource_contract_matches,
+        'affinity_contract_matches': affinity_contract_matches,
+    }
+    expected = {
+        'label_key': expected_label_key,
+        'label_values': expected_label_values,
+        'resource_key': expected_resource_key,
+        'accelerator_count': expected_accelerator_count,
+    }
+    _reject_admitted_serve_worker_identity(pod, namespace, context,
+                                           'accelerator scheduling contract',
+                                           actual, expected)
+
+
 @timeline.event
 def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                  config: common.ProvisionConfig) -> common.ProvisionRecord:
@@ -1200,6 +1386,54 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         kueue_local_queue_name)
     kueue_workload_priority_class_name = provider_config.get(
         'kueue_workload_priority_class_name')
+    serve_worker_expected_priority_class_name = provider_config.get(
+        'serve_worker_expected_priority_class_name',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_priority_value = provider_config.get(
+        'serve_worker_expected_priority_value',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_preemption_policy = provider_config.get(
+        'serve_worker_expected_preemption_policy',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_service_account_name = provider_config.get(
+        'serve_worker_expected_service_account_name',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_accelerator_label_key = provider_config.get(
+        'serve_worker_expected_accelerator_label_key',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_accelerator_label_values = provider_config.get(
+        'serve_worker_expected_accelerator_label_values',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_accelerator_resource_key = provider_config.get(
+        'serve_worker_expected_accelerator_resource_key',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_accelerator_count = provider_config.get(
+        'serve_worker_expected_accelerator_count',
+        _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    priority_attestation_presence = tuple(
+        value is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION
+        for value in (serve_worker_expected_priority_class_name,
+                      serve_worker_expected_priority_value,
+                      serve_worker_expected_preemption_policy))
+    if any(priority_attestation_presence
+          ) and not all(priority_attestation_presence):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker priority attestation must include '
+            'class name, numeric value, and preemption policy together.')
+    accelerator_attestation_values = (
+        serve_worker_expected_accelerator_label_key,
+        serve_worker_expected_accelerator_label_values,
+        serve_worker_expected_accelerator_resource_key,
+        serve_worker_expected_accelerator_count)
+    accelerator_attestation_presence = tuple(
+        value is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION
+        for value in accelerator_attestation_values)
+    if any(accelerator_attestation_presence
+          ) and not all(accelerator_attestation_presence):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker accelerator attestation must '
+            'include label key, label values, resource key, and count '
+            'together.')
     if kueue_require_managed:
         if not kueue_local_queue_name:
             raise config_lib.KubernetesError(
@@ -1211,6 +1445,65 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                 'not high-availability Deployment-owned Pods.')
         _preflight_required_kueue_local_queue(namespace, context,
                                               kueue_local_queue_name)
+    if (serve_worker_expected_priority_class_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
+            serve_worker_expected_priority_class_name is not None and
+        (not isinstance(serve_worker_expected_priority_class_name, str) or
+         not serve_worker_expected_priority_class_name)):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker expected priority class must be a '
+            'non-empty string or null.')
+    if (serve_worker_expected_priority_value
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
+        (serve_worker_expected_priority_value is not None and
+         (type(serve_worker_expected_priority_value) is not int or
+          serve_worker_expected_priority_value < -2147483648 or
+          serve_worker_expected_priority_value > 1000000000))):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker expected numeric priority must be '
+            'a Kubernetes priority integer or null.')
+    if (serve_worker_expected_preemption_policy
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
+            serve_worker_expected_preemption_policy
+            not in (None, 'Never', 'PreemptLowerPriority')):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker expected preemption policy must be '
+            'Never, PreemptLowerPriority, or null.')
+    if (serve_worker_expected_priority_class_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
+        ((serve_worker_expected_priority_class_name
+          is None) != (serve_worker_expected_priority_value is None) or
+         (serve_worker_expected_priority_class_name
+          is None) != (serve_worker_expected_preemption_policy is None))):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker priority class, numeric value, and '
+            'preemption policy must be configured together.')
+    if (serve_worker_expected_service_account_name
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION and
+        (not isinstance(serve_worker_expected_service_account_name, str) or
+         not serve_worker_expected_service_account_name)):
+        raise config_lib.KubernetesError(
+            'The rendered SkyServe worker expected service account must be a '
+            'non-empty string.')
+    if all(accelerator_attestation_presence):
+        if (not isinstance(serve_worker_expected_accelerator_label_key, str) or
+                not serve_worker_expected_accelerator_label_key or
+                not isinstance(serve_worker_expected_accelerator_resource_key,
+                               str) or
+                not serve_worker_expected_accelerator_resource_key or
+                not isinstance(serve_worker_expected_accelerator_label_values,
+                               list) or
+                not serve_worker_expected_accelerator_label_values or
+                len(serve_worker_expected_accelerator_label_values) > 16 or
+                any(not isinstance(value, str) or not value
+                    for value in serve_worker_expected_accelerator_label_values)
+                or len(set(serve_worker_expected_accelerator_label_values))
+                != len(serve_worker_expected_accelerator_label_values) or
+                type(serve_worker_expected_accelerator_count) is not int or
+                serve_worker_expected_accelerator_count < 1):
+            raise config_lib.KubernetesError(
+                'The rendered SkyServe worker accelerator attestation is '
+                'invalid.')
 
     tags = ray_tag_filter(cluster_name_on_cloud)
 
@@ -1329,6 +1622,21 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         for existing_pod in running_pods.values():
             _attest_required_kueue_pod(existing_pod, namespace, context,
                                        kueue_local_queue_name)
+    for existing_pod in running_pods.values():
+        _attest_serve_worker_priority_class(
+            existing_pod, namespace, context,
+            serve_worker_expected_priority_class_name,
+            serve_worker_expected_priority_value,
+            serve_worker_expected_preemption_policy)
+        _attest_serve_worker_service_account(
+            existing_pod, namespace, context,
+            serve_worker_expected_service_account_name)
+        _attest_serve_worker_accelerator_scheduling(
+            existing_pod, namespace, context,
+            serve_worker_expected_accelerator_label_key,
+            serve_worker_expected_accelerator_label_values,
+            serve_worker_expected_accelerator_resource_key,
+            serve_worker_expected_accelerator_count)
     head_pod_name = _get_head_pod_name(running_pods)
     running_pod_statuses = [{
         pod.metadata.name: pod.status.phase
@@ -1366,7 +1674,13 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     limits = pod_spec['spec']['containers'][0].get('resources',
                                                    {}).get('limits')
     if limits is not None:
-        gpu_resource_key = kubernetes_utils.get_gpu_resource_key(context)
+        if (serve_worker_expected_accelerator_resource_key
+                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+            gpu_resource_key = kubernetes_utils.get_gpu_resource_key(context)
+        else:
+            assert isinstance(serve_worker_expected_accelerator_resource_key,
+                              str)
+            gpu_resource_key = serve_worker_expected_accelerator_resource_key
         needs_gpus = limits.get(gpu_resource_key, 0) > 0
         needs_gpus_nvidia = limits.get(
             kubernetes_utils.SUPPORTED_GPU_RESOURCE_KEYS['nvidia'], 0) > 0
@@ -1525,6 +1839,21 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         if head_pod_name is None and _is_head(pod):
             head_pod_name = pod.metadata.name
     pods = valid_pods
+    for admitted_pod in pods:
+        _attest_serve_worker_priority_class(
+            admitted_pod, namespace, context,
+            serve_worker_expected_priority_class_name,
+            serve_worker_expected_priority_value,
+            serve_worker_expected_preemption_policy)
+        _attest_serve_worker_service_account(
+            admitted_pod, namespace, context,
+            serve_worker_expected_service_account_name)
+        _attest_serve_worker_accelerator_scheduling(
+            admitted_pod, namespace, context,
+            serve_worker_expected_accelerator_label_key,
+            serve_worker_expected_accelerator_label_values,
+            serve_worker_expected_accelerator_resource_key,
+            serve_worker_expected_accelerator_count)
 
     # The running_pods may include Pending Pods, so we add them to the pods
     # list to wait for scheduling and running

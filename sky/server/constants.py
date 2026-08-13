@@ -10,7 +10,7 @@ from sky.skylet import constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 74  # Durable ordinary SkyServe launch request binding
+API_VERSION = 75  # SkyServe placement and storage-broker projection API
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -140,6 +140,11 @@ MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
 # Minimum API version with the private atomic ordinary-launch binding endpoint.
 MIN_ORDINARY_LAUNCH_BINDING_API_VERSION = 74
 ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
+
+# Minimum API version whose Serve version-history response exposes immutable
+# cross-context placement and storage-broker projections. Consumers must also
+# require placement_projection_protocol_version == 1.
+MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 75
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies

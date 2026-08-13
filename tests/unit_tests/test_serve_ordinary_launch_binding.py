@@ -609,7 +609,7 @@ def test_decoded_replica_authority_rejects_every_special_profile(
                                       require_launch_authorized=True)
 
 
-def test_api009_serve042_lineage_and_sqlite_stays_at_serve037(
+def test_api009_serve043_lineage_and_sqlite_stays_at_serve037(
         tmp_path: pathlib.Path) -> None:
     sqlite = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "serve.db"}')
     api_config = migration_utils.get_alembic_config(
@@ -620,10 +620,13 @@ def test_api009_serve042_lineage_and_sqlite_stays_at_serve037(
     serve_scripts = alembic_script.ScriptDirectory.from_config(serve_config)
 
     assert api_scripts.get_heads() == ['009']
-    assert serve_scripts.get_heads() == ['042']
+    assert serve_scripts.get_heads() == ['043']
+    assert serve_scripts.get_revision('043').down_revision == '042'
     assert serve_scripts.get_revision('042').down_revision == '041'
     assert migration_utils.serve_target_version(sqlite) == '037'
     assert server_constants.MIN_ORDINARY_LAUNCH_BINDING_API_VERSION == 74
+    assert server_constants.MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION == 75
+    assert server_constants.API_VERSION == 75
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)
@@ -640,7 +643,7 @@ def test_api009_serve042_lineage_and_sqlite_stays_at_serve037(
         binding.ordinary_launch_associations_table.name)
 
 
-def test_runtime_metadata_keeps_serve042_columns() -> None:
+def test_runtime_metadata_keeps_serve043_columns() -> None:
     assert 'controller_incarnation' in serve_state_schema.services_table.c
     assert 'ordinary_launch_binding_mode' in serve_state_schema.services_table.c
     assert ('ordinary_launch_association_id'
@@ -648,6 +651,12 @@ def test_runtime_metadata_keeps_serve042_columns() -> None:
     assert list(binding.ordinary_launch_associations_table.c.keys())[:3] == [
         'association_id', 'submission_id', 'tenant_scope'
     ]
+    assert {
+        'controller_job_projection',
+        'controller_work_cache',
+        'worker_placement_projections',
+        'storage_broker',
+    }.issubset(serve_state_schema.version_specs_table.c.keys())
 
 
 def test_controller_authority_stays_legacy_on_sqlite(tmp_path: pathlib.Path,

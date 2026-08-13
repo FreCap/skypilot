@@ -1252,6 +1252,7 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
                                keys,
                                region,
                                default_value=None,
+                               workspace=None,
                                override_configs=None):
             config_calls.append({
                 'cloud': cloud,
@@ -1351,6 +1352,7 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
                                          region,
                                          keys,
                                          default_value=None,
+                                         workspace=None,
                                          override_configs=None):
             if keys == ('set_pod_resource_limits',):
                 return set_pod_resource_limits_value
@@ -1706,6 +1708,7 @@ class TestKubernetesMakeDeployResourcesVariables(unittest.TestCase):
                                          region,
                                          keys,
                                          default_value=None,
+                                         workspace=None,
                                          override_configs=None):
             if keys == ('set_pod_resource_limits',):
                 return False

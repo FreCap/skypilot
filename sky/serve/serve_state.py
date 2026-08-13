@@ -54,6 +54,7 @@ from sky.utils.db import migration_utils
 if typing.TYPE_CHECKING:
     from sqlalchemy.engine import row
 
+    from sky.serve import kubernetes_identity
     from sky.serve import placement_contract_normalization
     from sky.serve import replica_managers
     from sky.serve import resource_action_state
@@ -61,6 +62,8 @@ if typing.TYPE_CHECKING:
 else:
     placement_contract_normalization = adaptors_common.LazyImport(
         'sky.serve.placement_contract_normalization')
+    kubernetes_identity = adaptors_common.LazyImport(
+        'sky.serve.kubernetes_identity')
     replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
     resource_action_state = adaptors_common.LazyImport(
         'sky.serve.resource_action_state')
@@ -125,6 +128,43 @@ create_table = serve_state_schema.create_table
 _db_manager = serve_state_schema._db_manager  # pylint: disable=protected-access
 ensure_tables_initialized = serve_state_schema.ensure_tables_initialized
 get_database_engine = serve_state_schema.get_database_engine
+
+_PLACEMENT_PROJECTION_COLUMN_NAMES = frozenset({
+    'controller_job_projection',
+    'controller_work_cache',
+    'worker_placement_projections',
+    'storage_broker',
+})
+
+
+def _placement_projection_columns_available(
+        engine: sqlalchemy.engine.Engine) -> bool:
+    """Preserve officially supported Serve037 local SQLite databases."""
+    if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return True
+    column_names = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('version_specs')
+    }
+    return _PLACEMENT_PROJECTION_COLUMN_NAMES <= column_names
+
+
+def _require_projection_columns_if_nonnull(
+    engine: sqlalchemy.engine.Engine,
+    controller_job_projection: dict[str, Any] | None,
+    controller_work_cache: dict[str, Any] | None,
+    worker_placement_projections: list[dict[str, Any]] | None,
+    storage_broker: dict[str, Any] | None,
+) -> bool:
+    available = _placement_projection_columns_available(engine)
+    if (not available and
+            any(value is not None
+                for value in (controller_job_projection, controller_work_cache,
+                              worker_placement_projections, storage_broker))):
+        raise RuntimeError('Immutable Serve placement projections require '
+                           'central PostgreSQL schema revision 043.')
+    return available
+
 
 RESERVED_FILL_PROTOCOL_V1 = 1
 RESERVED_FILL_PROTOCOL_V2 = 2
@@ -556,6 +596,39 @@ def _serialize_current_service_spec(
     return pickle.dumps(spec, protocol=4)
 
 
+def _validated_placement_projections(
+    controller_job_projection: dict[str, Any] | None,
+    controller_work_cache: dict[str, Any] | None,
+    worker_placement_projections: list[dict[str, Any]] | None,
+    storage_broker: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[dict[str, Any]] |
+           None, dict[str, Any] | None]:
+    """Validate and copy immutable platform projections at the DB boundary."""
+    controller = kubernetes_identity.validate_controller_job_projection(
+        controller_job_projection)
+    controller_cache = (
+        kubernetes_identity.validate_controller_work_cache_projection(
+            controller_work_cache))
+    workers = kubernetes_identity.validate_worker_placement_projections(
+        worker_placement_projections)
+    broker = kubernetes_identity.validate_storage_broker_projection(
+        storage_broker)
+    if workers is not None and broker is not None:
+        broker_role_values = broker['authenticated_worker_role_arns']
+        assert isinstance(broker_role_values, list)
+        broker_roles = set(broker_role_values)
+        unrelated_roles = sorted({
+            worker['pod_identity_role_arn']
+            for worker in workers
+            if worker['pod_identity_role_arn'] not in broker_roles
+        })
+        if unrelated_roles:
+            raise ValueError('Every projected worker Pod Identity role must be '
+                             'listed by the immutable storage broker; '
+                             f'unrelated roles: {unrelated_roles!r}.')
+    return controller, controller_cache, workers, broker
+
+
 @_with_reserved_fill_broker_lock
 def add_service(name: str,
                 controller_job_id: int,
@@ -579,7 +652,12 @@ def add_service(name: str,
                 placement_catalog: dict[str, Any] | None = None,
                 controller_config: bytes | None = None,
                 controller_config_digest: str | None = None,
-                controller_config_snapshot_id: str | None = None) -> bool:
+                controller_config_snapshot_id: str | None = None,
+                controller_job_projection: dict[str, Any] | None = None,
+                controller_work_cache: dict[str, Any] | None = None,
+                worker_placement_projections: list[dict[str, Any]] |
+                None = None,
+                storage_broker: dict[str, Any] | None = None) -> bool:
     """Atomically add a service and its initial version to the database.
 
     The `services` row and the initial `version_specs` row (at
@@ -599,7 +677,15 @@ def add_service(name: str,
     controller_config_snapshot = _validate_controller_config_snapshot(
         controller_config, controller_config_digest,
         controller_config_snapshot_id)
+    (controller_job_projection, controller_work_cache,
+     worker_placement_projections,
+     storage_broker) = (_validated_placement_projections(
+         controller_job_projection, controller_work_cache,
+         worker_placement_projections, storage_broker))
     engine = _db_manager.get_engine()
+    projection_columns_available = _require_projection_columns_if_nonnull(
+        engine, controller_job_projection, controller_work_cache,
+        worker_placement_projections, storage_broker)
     lb_ha_enabled = bool(spec.lb_high_availability)
     if (lb_ha_enabled and
             engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value):
@@ -722,6 +808,12 @@ def add_service(name: str,
                     lb_demand_handoff_complete_at=None,
                     lb_last_demand_snapshot=None))
             initial_version_created_at = time.time()
+            projection_values = ({
+                'controller_job_projection': controller_job_projection,
+                'controller_work_cache': controller_work_cache,
+                'worker_placement_projections': worker_placement_projections,
+                'storage_broker': storage_broker,
+            } if projection_columns_available else {})
             version_insert_stmt = insert_func(version_specs_table).values(
                 service_name=name,
                 version=constants.INITIAL_VERSION,
@@ -737,6 +829,7 @@ def add_service(name: str,
                 controller_config_snapshot_id=(
                     None if controller_config_snapshot is None else
                     controller_config_snapshot[2]),
+                **projection_values,
                 created_at=initial_version_created_at,
                 # Fresh registration establishes v1 as the controller's
                 # bootstrap baseline. Persist that fact independently of
@@ -757,6 +850,12 @@ def add_service(name: str,
                             version_insert_stmt.excluded.submitted_yaml_content,
                         'placement_catalog':
                             version_insert_stmt.excluded.placement_catalog,
+                        **({
+                            'controller_job_projection': version_insert_stmt.excluded.controller_job_projection,
+                            'controller_work_cache': version_insert_stmt.excluded.controller_work_cache,
+                            'worker_placement_projections': version_insert_stmt.excluded.worker_placement_projections,
+                            'storage_broker': version_insert_stmt.excluded.storage_broker,
+                        } if projection_columns_available else {}),
                         'controller_config':
                             version_insert_stmt.excluded.controller_config,
                         'controller_config_digest':
@@ -5557,6 +5656,10 @@ def add_or_update_version(
     controller_config_snapshot_id: str | None = None,
     legacy_controller_config_snapshot: ControllerConfigSnapshot | None = None,
     legacy_controller_applied_version: int | None = None,
+    controller_job_projection: dict[str, Any] | None = None,
+    controller_work_cache: dict[str, Any] | None = None,
+    worker_placement_projections: list[dict[str, Any]] | None = None,
+    storage_broker: dict[str, Any] | None = None,
 ) -> VersionCommitResult:
     """Commit a version placeholder once, or accept an identical retry.
 
@@ -5567,6 +5670,15 @@ def add_or_update_version(
     controller_config_snapshot = _validate_controller_config_snapshot(
         controller_config, controller_config_digest,
         controller_config_snapshot_id)
+    (controller_job_projection, controller_work_cache,
+     worker_placement_projections,
+     storage_broker) = (_validated_placement_projections(
+         controller_job_projection, controller_work_cache,
+         worker_placement_projections, storage_broker))
+    engine = _db_manager.get_engine()
+    projection_columns_available = _require_projection_columns_if_nonnull(
+        engine, controller_job_projection, controller_work_cache,
+        worker_placement_projections, storage_broker)
     legacy_controller_config_snapshot = (
         _validate_legacy_controller_config_snapshot(
             legacy_controller_config_snapshot))
@@ -5643,7 +5755,13 @@ def add_or_update_version(
                 version_specs_table.c.controller_config_snapshot_id,
                 version_specs_table.c.submitted_yaml_content,
                 version_specs_table.c.retired_at,
-                version_specs_table.c.created_at).where(
+                version_specs_table.c.created_at,
+                *([
+                    version_specs_table.c.controller_job_projection,
+                    version_specs_table.c.controller_work_cache,
+                    version_specs_table.c.worker_placement_projections,
+                    version_specs_table.c.storage_broker,
+                ] if projection_columns_available else [])).where(
                     version_specs_table.c.service_name == service_name,
                     version_specs_table.c.version == version)).fetchone()
         # A retired history row deliberately resembles an interrupted
@@ -5654,6 +5772,15 @@ def add_or_update_version(
             session.rollback()
             return VersionCommitResult.CONTENT_CONFLICT
         identical_retry = existing is not None and existing[0] == yaml_content
+        projection_conflict = (identical_retry and
+                               projection_columns_available and
+                               (existing[8] != controller_job_projection or
+                                existing[9] != controller_work_cache or
+                                existing[10] != worker_placement_projections or
+                                existing[11] != storage_broker))
+        if projection_conflict:
+            session.rollback()
+            return VersionCommitResult.CONTENT_CONFLICT
         if existing is not None and existing[
                 0] is not None and not identical_retry:
             session.rollback()
@@ -5759,6 +5886,12 @@ def add_or_update_version(
             return VersionCommitResult.LB_HA_CONFLICT
         committed_version_created_at = (existing[7]
                                         if identical_retry else time.time())
+        projection_values = ({
+            'controller_job_projection': controller_job_projection,
+            'controller_work_cache': controller_work_cache,
+            'worker_placement_projections': worker_placement_projections,
+            'storage_broker': storage_broker,
+        } if projection_columns_available else {})
         if existing is None:
             assert serialized_spec is not None
             session.execute(version_specs_table.insert().values(
@@ -5776,6 +5909,7 @@ def add_or_update_version(
                 controller_config_snapshot_id=(
                     None if controller_config_snapshot is None else
                     controller_config_snapshot[2]),
+                **projection_values,
                 created_at=committed_version_created_at))
         elif existing[0] is None:
             # `add_version` reserves a NULL-YAML placeholder. The service-row
@@ -5800,6 +5934,7 @@ def add_or_update_version(
                         controller_config_snapshot_id=(
                             None if controller_config_snapshot is None else
                             controller_config_snapshot[2]),
+                        **projection_values,
                         created_at=committed_version_created_at))
             if filled_placeholder.rowcount != 1:
                 session.rollback()
@@ -5909,6 +6044,36 @@ def get_placement_catalog(service_name: str,
                 version_specs_table.c.service_name == service_name,
                 version_specs_table.c.version == version)).fetchone()
     return result[0] if result is not None else None
+
+
+def get_placement_projection_record(
+    service_name: str,
+    version: int,
+) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None,
+           list[dict[str, Any]] | None, dict[str, Any] | None]:
+    """Return existence and immutable platform projections for one version."""
+    engine = _db_manager.get_engine()
+    if not _placement_projection_columns_available(engine):
+        with orm.Session(engine) as session:
+            exists = session.execute(
+                sqlalchemy.select(version_specs_table.c.version).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.yaml_content.isnot(None))).fetchone()
+        return exists is not None, None, None, None, None
+    with orm.Session(engine) as session:
+        result = session.execute(
+            sqlalchemy.select(
+                version_specs_table.c.controller_job_projection,
+                version_specs_table.c.controller_work_cache,
+                version_specs_table.c.worker_placement_projections,
+                version_specs_table.c.storage_broker).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.yaml_content.isnot(None))).fetchone()
+    if result is None:
+        return False, None, None, None, None
+    return True, result[0], result[1], result[2], result[3]
 
 
 def get_version_controller_config(
@@ -6186,6 +6351,8 @@ def get_system_recovery_authorization_snapshot(
 def get_version_records(service_name: str) -> list[dict[str, Any]]:
     """Gets committed version contents and provenance in one query."""
     engine = _db_manager.get_engine()
+    projection_columns_available = _placement_projection_columns_available(
+        engine)
     with orm.Session(engine) as session:
         rows = session.execute(
             sqlalchemy.select(
@@ -6197,6 +6364,12 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
                 version_specs_table.c.created_by,
                 version_specs_table.c.quarantined_at,
                 version_specs_table.c.quarantine_reason,
+                *([
+                    version_specs_table.c.controller_job_projection,
+                    version_specs_table.c.controller_work_cache,
+                    version_specs_table.c.worker_placement_projections,
+                    version_specs_table.c.storage_broker,
+                ] if projection_columns_available else []),
             ).where(
                 version_specs_table.c.service_name == service_name,
                 version_specs_table.c.yaml_content.isnot(None),
@@ -6210,6 +6383,16 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
         'created_by': row.created_by,
         'quarantined_at': row.quarantined_at,
         'quarantine_reason': row.quarantine_reason,
+        'controller_job_projection': (row.controller_job_projection if
+                                      projection_columns_available else None),
+        'controller_work_cache':
+            (row.controller_work_cache if projection_columns_available else None
+            ),
+        'worker_placement_projections':
+            (row.worker_placement_projections
+             if projection_columns_available else None),
+        'storage_broker':
+            (row.storage_broker if projection_columns_available else None),
     } for row in rows]
 
 

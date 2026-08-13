@@ -632,6 +632,33 @@ SKIPPED_CLIENT_OVERRIDE_KEYS: list[tuple[str, ...]] = [
     # enable or disable this fail-closed server policy.
     ('kubernetes', 'kueue', 'require_managed'),
     ('kubernetes', 'context_configs', '*', 'kueue', 'require_managed'),
+    # Serve controller placement, worker identity/cache attestation, and the
+    # registered-volume attachment they rely on are platform contracts. A
+    # remote client must never replace them with campaign-local assertions.
+    ('kubernetes', 'serve_controller_workspace'),
+    ('kubernetes', 'serve_controller_context'),
+    ('kubernetes', 'serve_controller_work_cache'),
+    ('kubernetes', 'serve_controller_lb_data_plane_auth'),
+    ('kubernetes', 'serve_worker_cache'),
+    ('kubernetes', 'serve_worker_priority_class_name'),
+    ('kubernetes', 'serve_worker_priority_value'),
+    ('kubernetes', 'serve_worker_preemption_policy'),
+    ('kubernetes', 'serve_worker_accelerator_scheduling'),
+    ('kubernetes', 'serve_worker_pod_identity_role_arn'),
+    ('kubernetes', 'auto_mounts'),
+    ('kubernetes', 'context_configs', '*', 'serve_controller_work_cache'),
+    ('kubernetes', 'context_configs', '*',
+     'serve_controller_lb_data_plane_auth'),
+    ('kubernetes', 'context_configs', '*', 'serve_worker_cache'),
+    ('kubernetes', 'context_configs', '*', 'serve_worker_priority_class_name'),
+    ('kubernetes', 'context_configs', '*', 'serve_worker_priority_value'),
+    ('kubernetes', 'context_configs', '*', 'serve_worker_preemption_policy'),
+    ('kubernetes', 'context_configs', '*',
+     'serve_worker_accelerator_scheduling'),
+    ('kubernetes', 'context_configs', '*',
+     'serve_worker_pod_identity_role_arn'),
+    ('kubernetes', 'context_configs', '*', 'auto_mounts'),
+    ('serve', 'storage_broker'),
     # TODO(kevin,tian): Override the whole controller config once our test
     # infrastructure supports setting dynamic server side configs.
     # Tests that are affected:

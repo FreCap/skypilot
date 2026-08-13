@@ -6,6 +6,7 @@ import enum
 import fastapi
 
 from sky import sky_logging
+from sky.serve import kubernetes_identity
 from sky.serve import serve_dashboard
 from sky.serve import serve_history
 from sky.serve import serve_state
@@ -90,6 +91,18 @@ def _service_version_history(service_name: str) -> dict:
             'created_by': version_record['created_by'],
             'quarantined_at': version_record['quarantined_at'],
             'quarantine_reason': version_record['quarantine_reason'],
+            'controller_job_identity':
+                kubernetes_identity.validate_controller_job_projection(
+                    version_record.get('controller_job_projection')),
+            'controller_work_cache':
+                kubernetes_identity.validate_controller_work_cache_projection(
+                    version_record.get('controller_work_cache')),
+            'worker_placement_identities':
+                kubernetes_identity.validate_worker_placement_projections(
+                    version_record.get('worker_placement_projections')),
+            'storage_broker':
+                kubernetes_identity.validate_storage_broker_projection(
+                    version_record.get('storage_broker')),
             'policy':
                 (spec.autoscaling_policy_str() if spec is not None else None),
             'elected': version == elected_version,
@@ -97,6 +110,8 @@ def _service_version_history(service_name: str) -> dict:
         })
     return {
         'service_name': service_name,
+        'placement_projection_protocol_version':
+            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION,
         'elected_version': elected_version,
         'active_versions': active_versions,
         'versions': versions,
