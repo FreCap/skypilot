@@ -87,6 +87,10 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if not isinstance(accelerator, Mapping):
             raise reclaim.ReclaimAttestationError(
                 'The projected accelerator is not allowlisted in this context.')
+        expected_scheduling = reclaim.ReclaimAcceleratorScheduling(
+            label_key=accelerator['product_label_key'],
+            label_values=tuple(sorted(accelerator['product_label_values'])),
+            resource_key=accelerator['resource_name'])
         priority = context['priority_class']
         if (admission.namespace != context['namespace'] or
                 admission.service_account_name
@@ -100,7 +104,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 admission.local_queue_name != context['local_queue_name'] or
                 admission.workload_priority_class_name
                 != context['workload_priority_class_name'] or
-                admission.accelerator_count != accelerator['count']):
+                admission.accelerator_count != accelerator['count'] or
+                admission.accelerator_scheduling != expected_scheduling):
             raise reclaim.ReclaimAttestationError(
                 'The projected admission does not match the reviewed fleet '
                 'bundle.')

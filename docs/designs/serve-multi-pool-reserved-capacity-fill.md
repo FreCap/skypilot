@@ -248,6 +248,11 @@ claim-set validator used by both activation and every later claim replacement:
 it accepts multiple edges sharing an access context, attests that context once,
 and rejects only a second claim on the same
 `(physical_cluster_uid, exact_card)` atom before provider calls.
+The typed admission for that atom also carries the normalized accelerator
+scheduling tuple: label key, sorted label values, and extended-resource key.
+Activation, every claim-set replacement, and every terminal launch must match
+that tuple exactly against a disjoint code-owned card contract. A logical card
+cannot own a flavor or scheduling tuple already owned by another logical card.
 
 The existing service-wide meanings remain authoritative:
 
@@ -867,7 +872,7 @@ second scheduling path exists. The exact shared object contract is:
 | Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
 | Scheduler | `gpu-binpack-scheduler` | same |
 | GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
-| Exact observed product labels | `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB` and `NVIDIA-A100-SXM4-80GB` | `nvidia.com/gpu.product=NVIDIA-H200` |
+| Exact worker accelerator scheduling | `A100`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`, `nvidia.com/gpu`; `A100-80GB`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu` | `H200`: `nvidia.com/gpu.product=NVIDIA-H200`, `nvidia.com/gpu` |
 
 The inference ClusterQueue has zero nominal GPU quota in the same cohort as
 the research queue. Its per-flavor borrowing limits are bounded by research's
@@ -1672,9 +1677,14 @@ The current worktree now:
     broker so east's A100-40 and A100-80 edges may share one context without
     duplicating capacity, binds activation and later claim replacement to one
     shared atom validator, and binds both Kueue Pod webhooks to their exact
-    reviewed rules and service endpoints rather than trusting object names.
+    reviewed rules and service endpoints rather than trusting object names;
+    and
+23. carries the normalized accelerator label key, sorted label values, and
+    resource key in every typed reclaim admission, requires their exact
+    code-owned match at activation, claim, and terminal launch, and makes the
+    east A100-40 and A100-80 bundle contracts disjoint.
 
-Regression tests exist for corrections 1--22, including owner-death,
+Regression tests exist for corrections 1--23, including owner-death,
 request-liveness, legacy-row retirement, runtime-daemon supervision,
 scheduler/bound-Node admission, capability bootstrap, and fixed managed-job
 slot ownership. The complete non-PostgreSQL matrix, changed-source lint, and
@@ -2183,6 +2193,15 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   context and reject a duplicated physical UID/card atom before provider
   calls. Ruff and targeted mypy pass, pylint is 10.00/10, formatting and
   `git diff --check` pass.
+- The correction after failed review round 1 carries the exact Kubernetes
+  accelerator scheduling atom through the typed admission and rejects drift in
+  its label key, label values, or resource key before provider calls at claim,
+  activation, and launch. The strict bundle rejects cross-card flavor or
+  scheduling overlap, and its east A100 contract now owns only the 40GB
+  product. The integrated policy/interface superset passes 132/132; Ruff and
+  targeted mypy pass, pylint is 10.00/10, JSON parsing, compilation,
+  formatting, and `git diff --check` pass. The exact correction revision is
+  recorded after the behavior commit below.
 - The post-correction local Serve047 implementation restack at `dec0766a2`
   passes 58/58
   focused final-state, cleanup-presence, manager-receipt,
@@ -2208,9 +2227,17 @@ without proving Pod admission rules or the Kueue endpoint. Revision
 `70cb55a2f` fixes both findings and adds the fail-closed coverage above. The
 consecutive sequence therefore restarts from round 1.
 
+The first restarted round on feature `9baca9dca` and cleanup `cae4abd87`
+also failed and does not count. It found that the policy ticket bound only the
+logical accelerator name and count, while terminal launch used an accelerator
+label/resource tuple absent from that ticket. East's bundle also let logical
+`a100` name both 40GB and 80GB products. The correction above binds the exact
+scheduling atom end to end and makes logical card contracts disjoint. The
+consecutive sequence restarts from round 1 again.
+
 | Round | Revision reviewed | Result | Material findings/fixes |
 |---|---|---|---|
-| 1 | pending restart over correction `70cb55a2f`, its exact design successor, and the newly restacked cleanup | pending | Historical and failed attempts do not count. |
+| 1 | pending restart over the exact accelerator-scheduling correction, its design successor, and the newly restacked cleanup | pending | Historical and failed attempts do not count. |
 | 2 | pending | pending | pending |
 | 3 | pending | pending | pending |
 

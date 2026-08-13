@@ -57,7 +57,7 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
         'resource_name': 'nvidia.com/gpu',
     }
     assert east['accelerators']['a100']['product_label_values'] == [
-        'NVIDIA-A100-SXM4-40GB', 'NVIDIA-A100-SXM4-80GB'
+        'NVIDIA-A100-SXM4-40GB'
     ]
     assert phx['accelerators']['h200']['product_label_values'] == [
         'NVIDIA-H200'
@@ -156,7 +156,14 @@ def _admission(context: dict,
         local_queue_name=context['local_queue_name'],
         workload_priority_class_name=context['workload_priority_class_name'],
         accelerator=accelerator,
-        accelerator_count=context['accelerators'][accelerator]['count'])
+        accelerator_count=context['accelerators'][accelerator]['count'],
+        accelerator_scheduling=reclaim.ReclaimAcceleratorScheduling(
+            label_key=(
+                context['accelerators'][accelerator]['product_label_key']),
+            label_values=tuple(
+                sorted(context['accelerators'][accelerator]
+                       ['product_label_values'])),
+            resource_key=context['accelerators'][accelerator]['resource_name']))
 
 
 def _edge(context: dict, accelerator: str = 'h200') -> reclaim.ReclaimClaimEdge:
@@ -323,6 +330,103 @@ def test_static_admission_mismatch_makes_no_provider_calls(monkeypatch):
                                    expected_gate_generation=1,
                                    deadline_monotonic=time.monotonic() + 5)
     provider_calls.assert_not_called()
+
+
+@pytest.mark.parametrize(('field', 'value'), ((
+    'label_key',
+    'node.kubernetes.io/instance-type',
+), ('label_values',
+    ('NVIDIA-A100-SXM4-80GB',)), ('resource_key', 'example.com/gpu')))
+def test_accelerator_scheduling_mismatch_makes_no_provider_calls(
+        monkeypatch, field, value):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    provider_calls = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    admission = _admission(context, 'h200')
+    scheduling = dataclasses.replace(admission.accelerator_scheduling,
+                                     **{field: value})
+    admission = dataclasses.replace(admission,
+                                    accelerator_scheduling=scheduling)
+    edge = dataclasses.replace(_edge(context),
+                               projected_admissions=(admission,))
+    scope = reclaim.ReclaimClaimSetScope(service_name='service',
+                                         service_incarnation='incarnation',
+                                         service_version=1,
+                                         semantic_hash='semantic',
+                                         edges=(edge,))
+
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='reviewed fleet bundle'):
+        policy.authorize_claim_set(scope,
+                                   expected_identity=policy.policy_identity(),
+                                   expected_gate_generation=1,
+                                   deadline_monotonic=time.monotonic() + 5)
+    provider_calls.assert_not_called()
+
+
+def test_activation_rejects_accelerator_scheduling_mismatch(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    provider_calls = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    claim = _claim(context, 'a100')
+    admission = dataclasses.replace(
+        claim.projected_admissions[0],
+        accelerator_scheduling=reclaim.ReclaimAcceleratorScheduling(
+            label_key='nvidia.com/gpu.product',
+            label_values=('NVIDIA-A100-SXM4-80GB',),
+            resource_key='nvidia.com/gpu'))
+    claim = dataclasses.replace(claim, projected_admissions=(admission,))
+
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='reviewed fleet bundle'):
+        policy.attest_activation((claim,),
+                                 writer_image_digest='sha256:' + 'b' * 64,
+                                 deadline_monotonic=time.monotonic() + 5)
+    provider_calls.assert_not_called()
+
+
+def test_launch_rejects_accelerator_scheduling_mismatch(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    provider_calls = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    admission = dataclasses.replace(
+        _admission(context, 'h200'),
+        accelerator_scheduling=reclaim.ReclaimAcceleratorScheduling(
+            label_key='nvidia.com/gpu.product',
+            label_values=('NVIDIA-H100',),
+            resource_key='nvidia.com/gpu'))
+    scope = reclaim.ReclaimLaunchScope(
+        service_name='service',
+        service_version=1,
+        pool_key=json.dumps(['v2', context['physical_cluster_uid'], 'h200']),
+        service_generation=1,
+        physical_cluster_uid=context['physical_cluster_uid'],
+        kubernetes_context=context['kubernetes_context'],
+        accelerator='h200',
+        accelerator_count=1,
+        projected_admission=admission)
+
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='reviewed fleet bundle'):
+        policy.authorize_launch(scope,
+                                expected_identity=policy.policy_identity(),
+                                expected_gate_generation=1,
+                                deadline_monotonic=time.monotonic() + 5)
+    provider_calls.assert_not_called()
+
+
+def test_bundle_rejects_overlapping_exact_card_contracts():
+    document = _bundle_document()
+    accelerators = document['fleet']['contexts'][0]['accelerators']
+    accelerators['a100']['flavors'] = ['ml.p4de.24xlarge']
+    accelerators['a100']['product_label_values'] = ['NVIDIA-A100-SXM4-80GB']
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='overlaps the exact card contract'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
 def test_activation_attests_whole_fleet_with_zero_current_claims(monkeypatch):

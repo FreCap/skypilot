@@ -88,6 +88,26 @@ class ReclaimPolicyIdentity:
 
 
 @dataclasses.dataclass(frozen=True, order=True)
+class ReclaimAcceleratorScheduling:
+    """Normalized Kubernetes scheduling atom for one logical accelerator."""
+
+    label_key: str
+    label_values: tuple[str, ...]
+    resource_key: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_text(self.label_key, 'accelerator label_key')
+        _require_nonempty_text(self.resource_key, 'accelerator resource_key')
+        if (type(self.label_values) is not tuple or not self.label_values or
+                any(
+                    type(value) is not str or not value
+                    for value in self.label_values) or
+                tuple(sorted(set(self.label_values))) != self.label_values):
+            raise ValueError('accelerator label_values must be unique sorted '
+                             'nonempty text.')
+
+
+@dataclasses.dataclass(frozen=True, order=True)
 class ReclaimProjectedAdmission:
     """Exact immutable Kubernetes/Kueue admission for one worker candidate."""
 
@@ -104,6 +124,7 @@ class ReclaimProjectedAdmission:
     workload_priority_class_name: str
     accelerator: str
     accelerator_count: int
+    accelerator_scheduling: ReclaimAcceleratorScheduling
 
     def __post_init__(self) -> None:
         _require_sha256(self.worker_projection_sha256,
@@ -135,6 +156,9 @@ class ReclaimProjectedAdmission:
             raise ValueError('preemption_policy must be Never or '
                              'PreemptLowerPriority.')
         _require_positive_int(self.accelerator_count, 'accelerator_count')
+        if not isinstance(self.accelerator_scheduling,
+                          ReclaimAcceleratorScheduling):
+            raise ValueError('accelerator_scheduling must be typed.')
         object.__setattr__(self, 'accelerator', self.accelerator.casefold())
 
 
@@ -153,10 +177,25 @@ def projected_admission_from_worker_projection(
     priority_class_name = projection.get('priority_class_name')
     priority_value = projection.get('priority_value')
     preemption_policy = projection.get('preemption_policy')
+    accelerator_scheduling = projection.get('accelerator_scheduling')
     if (not isinstance(priority_class_name, str) or
             type(priority_value) is not int or
             not isinstance(preemption_policy, str)):
         raise ValueError('Sequenced reclaim requires projected Pod priority.')
+    if (not isinstance(accelerator_scheduling, Mapping) or
+            set(accelerator_scheduling)
+            != {'label_key', 'label_values', 'resource_key'} or
+            not isinstance(accelerator_scheduling.get('label_key'), str) or
+            not isinstance(accelerator_scheduling.get('resource_key'), str) or
+            not isinstance(accelerator_scheduling.get('label_values'), list) or
+            any(not isinstance(value, str)
+                for value in accelerator_scheduling['label_values'])):
+        raise ValueError('Sequenced reclaim requires projected accelerator '
+                         'scheduling.')
+    scheduling = ReclaimAcceleratorScheduling(
+        label_key=accelerator_scheduling['label_key'],
+        label_values=tuple(sorted(accelerator_scheduling['label_values'])),
+        resource_key=accelerator_scheduling['resource_key'])
     return ReclaimProjectedAdmission(
         worker_projection_sha256=worker_projection_sha256,
         kubernetes_context=typing.cast(str,
@@ -176,6 +215,7 @@ def projected_admission_from_worker_projection(
             str, kueue_admission.get('workload_priority_class_name')),
         accelerator=typing.cast(str, projection.get('accelerator_name')),
         accelerator_count=typing.cast(int, projection.get('accelerator_count')),
+        accelerator_scheduling=scheduling,
     )
 
 

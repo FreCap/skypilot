@@ -83,6 +83,10 @@ def _admission(
         workload_priority_class_name='inference-low',
         accelerator=accelerator,
         accelerator_count=1,
+        accelerator_scheduling=attestation.ReclaimAcceleratorScheduling(
+            label_key='nvidia.com/gpu.product',
+            label_values=('NVIDIA-A100-SXM4-80GB',),
+            resource_key='nvidia.com/gpu'),
     )
 
 
@@ -102,6 +106,20 @@ def _claim(context: str = 'research') -> attestation.ReservedContextClaim:
 def test_projected_admission_rejects_invalid_pod_identity_role() -> None:
     with pytest.raises(ValueError, match='AWS IAM role ARN'):
         dataclasses.replace(_admission(), pod_identity_role_arn='not-an-arn')
+
+
+def test_projected_admission_requires_typed_accelerator_scheduling() -> None:
+    with pytest.raises(ValueError,
+                       match='accelerator_scheduling must be typed'):
+        dataclasses.replace(_admission(), accelerator_scheduling=None)
+
+
+def test_accelerator_scheduling_requires_canonical_label_values() -> None:
+    with pytest.raises(ValueError, match='unique sorted nonempty text'):
+        attestation.ReclaimAcceleratorScheduling(
+            label_key='nvidia.com/gpu.product',
+            label_values=('NVIDIA-H200', 'NVIDIA-A100-SXM4-80GB'),
+            resource_key='nvidia.com/gpu')
 
 
 def _evidence(
@@ -256,9 +274,9 @@ def test_activation_receipt_projection_is_deterministic() -> None:
     assert first.identity == _evidence(claims).identity
     assert first.claim_scope_count == 2
     assert first.claim_scope_sha256 == (
-        'e82a3712b3338d5f51db381b8d2b6334f7531966ddb26fefa17fb56134647ed1')
+        '5c9d7b3121d21d0f4cfe69e69fffa9cc5122ce495362b78166b868f46ac89e9b')
     assert first.evidence_sha256 == (
-        'e288e49eafc559c56bfaab8bb458c6fd67e4c3d8a838cebb099493720c709bcf')
+        'a96074f69933c8bf91e13cde0b2f629e974267dabc6bec5eebc6cb7533662f1a')
 
 
 @pytest.mark.parametrize(

@@ -141,6 +141,8 @@ def _validate_fleet_context(value: object, path: str) -> None:
     accelerators = _mapping(context['accelerators'], f'{path}.accelerators')
     if not accelerators:
         raise BundleValidationError(f'{path}.accelerators must not be empty.')
+    claimed_flavors: dict[str, str] = {}
+    claimed_products: dict[tuple[str, str, str], str] = {}
     for accelerator, raw_contract in accelerators.items():
         if _text(accelerator,
                  f'{path}.accelerators key') != accelerator.casefold():
@@ -169,10 +171,28 @@ def _validate_fleet_context(value: object, path: str) -> None:
         if len(contract['flavors']) != len(set(contract['flavors'])):
             raise BundleValidationError(
                 f'{path}.accelerators.{accelerator}.flavors must be unique.')
+        if len(contract['product_label_values']) != len(
+                set(contract['product_label_values'])):
+            raise BundleValidationError(
+                f'{path}.accelerators.{accelerator}.product_label_values '
+                'must be unique.')
         if len(contract['flavors']) != len(contract['product_label_values']):
             raise BundleValidationError(
                 f'{path}.accelerators.{accelerator} must bind each flavor '
                 'to one observed product value.')
+        for flavor, product in zip(contract['flavors'],
+                                   contract['product_label_values']):
+            previous = claimed_flavors.get(flavor)
+            scheduling_atom = (contract['product_label_key'], product,
+                               contract['resource_name'])
+            previous_product = claimed_products.get(scheduling_atom)
+            if previous is not None or previous_product is not None:
+                owner = previous or previous_product
+                raise BundleValidationError(
+                    f'{path}.accelerators.{accelerator} overlaps the exact '
+                    f'card contract owned by {owner}.')
+            claimed_flavors[flavor] = accelerator
+            claimed_products[scheduling_atom] = accelerator
 
     priority = _mapping(context['priority_class'], f'{path}.priority_class')
     _exact_keys(priority, {'name', 'preemption_policy', 'value'},

@@ -86,6 +86,13 @@ def test_projected_admission_exposes_frozen_pod_identity_contract() -> None:
     assert admission.pod_identity_role_arn is None
 
 
+def test_projected_admission_exposes_frozen_accelerator_scheduling() -> None:
+    assert _projected_admission().accelerator_scheduling == (
+        reclaim.ReclaimAcceleratorScheduling(label_key='nvidia.com/gpu.product',
+                                             label_values=('NVIDIA-H200',),
+                                             resource_key='nvidia.com/gpu'))
+
+
 @pytest.fixture(autouse=True)
 def _valid_reclaim_gate_guard(monkeypatch):
     monkeypatch.setattr(serve_state,
