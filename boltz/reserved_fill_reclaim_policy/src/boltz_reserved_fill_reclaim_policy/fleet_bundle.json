@@ -160,7 +160,7 @@
         },
         "eks": {
           "account_id": "421498156696",
-          "audit_role_arn": "arn:aws:iam::421498156696:role/skypilot-reserved-fill-reclaim-audit",
+          "audit_role_arn": "arn:aws:iam::421498156696:role/skypilot-rf-b6ca6363ec70-audit",
           "cluster_arn": "arn:aws:eks:us-east-1:421498156696:cluster/sagemaker-hyperpod-eks-cluster",
           "cluster_name": "sagemaker-hyperpod-eks-cluster",
           "region": "us-east-1"
@@ -236,7 +236,7 @@
         },
         "eks": {
           "account_id": "400920695547",
-          "audit_role_arn": "arn:aws:iam::400920695547:role/skypilot-reserved-fill-reclaim-audit",
+          "audit_role_arn": "arn:aws:iam::400920695547:role/skypilot-rf-fe7c6c421c88-audit",
           "cluster_arn": "arn:aws:eks:us-west-2:400920695547:cluster/sagemaker-hyperpod-eks-cluster-phx",
           "cluster_name": "sagemaker-hyperpod-eks-cluster-phx",
           "region": "us-west-2"

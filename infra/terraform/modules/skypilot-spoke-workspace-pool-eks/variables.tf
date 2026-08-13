@@ -39,6 +39,107 @@ variable "controller_role_arn" {
   }
 }
 
+variable "reserved_fill_reclaim_audit" {
+  description = <<-EOT
+    Optional least-privilege attestation boundary for a deployment-owned
+    reserved-fill reclaim policy. When configured, the module creates one
+    spoke-account IAM role trusted only by the control-plane role carrying the
+    exact EKS Pod Identity source tags, maps that role through a separate EKS
+    access entry, and binds it to read-only Kubernetes rules for the reviewed
+    partition, Kueue topology, scheduler, provider-owned flavors, and Nodes.
+
+    partition_namespace must name one configured partition with both priority
+    and Kueue contracts. The module derives its Namespace, ServiceAccount,
+    LocalQueue, inference ClusterQueue, and Pod PriorityClass rather than
+    accepting duplicate values. External operator-owned ClusterQueues and
+    other objects are listed explicitly and remain exact-name reads. The IAM
+    role and Kubernetes group are deterministically unique to the target
+    cluster and partition. The caller must separately grant AssumeRole and
+    TagSession on the returned role ARN. Node inventory is necessarily a
+    cluster-wide list because Kubernetes RBAC cannot restrict list by labels.
+  EOT
+  type = object({
+    partition_namespace = string
+
+    source_identity = object({
+      eks_cluster_arn = string
+      namespace       = string
+      service_account = string
+    })
+
+    external_cluster_queue_names   = set(string)
+    workload_priority_class_names  = set(string)
+    resource_flavor_names          = set(string)
+    scheduler_namespace            = string
+    scheduler_deployment_name      = string
+    kueue_namespace                = string
+    kueue_deployment_name          = string
+    kueue_config_map_name          = string
+    admission_policy_names         = set(string)
+    admission_policy_binding_names = set(string)
+    validating_webhook_names       = set(string)
+    mutating_webhook_names         = set(string)
+  })
+  default = null
+
+  validation {
+    condition = var.reserved_fill_reclaim_audit == null ? true : (
+      can(regex("^arn:[a-z0-9-]+:eks:[a-z0-9-]+:[0-9]{12}:cluster/[0-9A-Za-z][0-9A-Za-z_-]*$", var.reserved_fill_reclaim_audit.source_identity.eks_cluster_arn)) &&
+      can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", var.reserved_fill_reclaim_audit.source_identity.namespace)) &&
+      length(var.reserved_fill_reclaim_audit.source_identity.namespace) <= 63 &&
+      can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", var.reserved_fill_reclaim_audit.source_identity.service_account)) &&
+      length(var.reserved_fill_reclaim_audit.source_identity.service_account) <= 253 &&
+      alltrue([
+        for label in split(".", var.reserved_fill_reclaim_audit.source_identity.service_account) :
+        length(label) >= 1 && length(label) <= 63 &&
+        can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+      ])
+    )
+    error_message = "reserved_fill_reclaim_audit source_identity must contain an exact EKS cluster ARN and valid namespace/service-account names."
+  }
+
+  validation {
+    condition = var.reserved_fill_reclaim_audit == null ? true : alltrue([
+      length(var.reserved_fill_reclaim_audit.external_cluster_queue_names) > 0,
+      length(var.reserved_fill_reclaim_audit.workload_priority_class_names) > 0,
+      length(var.reserved_fill_reclaim_audit.resource_flavor_names) > 0,
+      length(var.reserved_fill_reclaim_audit.admission_policy_names) > 0,
+      length(var.reserved_fill_reclaim_audit.admission_policy_binding_names) > 0,
+      length(var.reserved_fill_reclaim_audit.validating_webhook_names) > 0,
+      length(var.reserved_fill_reclaim_audit.mutating_webhook_names) > 0,
+      alltrue([
+        for value in concat(
+          [
+            var.reserved_fill_reclaim_audit.partition_namespace,
+            var.reserved_fill_reclaim_audit.scheduler_namespace,
+            var.reserved_fill_reclaim_audit.scheduler_deployment_name,
+            var.reserved_fill_reclaim_audit.kueue_namespace,
+            var.reserved_fill_reclaim_audit.kueue_deployment_name,
+            var.reserved_fill_reclaim_audit.kueue_config_map_name,
+          ],
+          tolist(var.reserved_fill_reclaim_audit.external_cluster_queue_names),
+          tolist(var.reserved_fill_reclaim_audit.workload_priority_class_names),
+          tolist(var.reserved_fill_reclaim_audit.resource_flavor_names),
+          tolist(var.reserved_fill_reclaim_audit.admission_policy_names),
+          tolist(var.reserved_fill_reclaim_audit.admission_policy_binding_names),
+          tolist(var.reserved_fill_reclaim_audit.validating_webhook_names),
+          tolist(var.reserved_fill_reclaim_audit.mutating_webhook_names),
+          ) : (
+          value == trimspace(value) &&
+          length(value) <= 253 &&
+          can(regex("^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$", value)) &&
+          alltrue([
+            for label in split(".", value) :
+            length(label) >= 1 && length(label) <= 63 &&
+            can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+          ])
+        )
+      ]),
+    ])
+    error_message = "reserved_fill_reclaim_audit exact object inventories must be nonempty canonical Kubernetes DNS names."
+  }
+}
+
 variable "partitions" {
   description = <<-EOT
     Workload partitions to register. Each item creates namespaced RBAC and can

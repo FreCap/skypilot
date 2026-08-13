@@ -886,11 +886,15 @@ reauthorization.
 
 AWS absence is a positive proof, not an omitted check. For each context the
 plugin uses the hub writer's Pod Identity session to assume the exact spoke
-role `skypilot-reserved-fill-reclaim-audit`. That role is read-only and limited
+roles `skypilot-rf-b6ca6363ec70-audit` in east and
+`skypilot-rf-fe7c6c421c88-audit` in PHX. The spoke module derives these
+collision-resistant identities from the exact cluster and partition. Each
+role is read-only and limited
 to `eks:DescribeCluster`, `eks:ListPodIdentityAssociations`, and
 `eks:DescribePodIdentityAssociation` on the exact cluster and its association
 resources. The spoke trust names the single current hub Pod Identity writer
-role and requires its transitive `eks-cluster-arn`, `kubernetes-namespace`, and
+role, permits only `sts:AssumeRole` plus the required `sts:TagSession`, and
+requires its transitive `eks-cluster-arn`, `kubernetes-namespace`, and
 `kubernetes-service-account` session tags. The chart renders API, controller,
 and executor writers with the same `skypilot-api-sa`; a chart test must keep
 that invariant true. Every proof describes the exact active EKS cluster,
@@ -2106,8 +2110,10 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   target reaches six unrelated baseline/environment diagnostics in unchanged
   files. No feature-owned typing diagnostic remains.
 - On the exact formatted behavior tree `a909cd4cc`, Terraform 1.15.8 validates
-  both changed spoke modules. The EKS module passes all 43 tests and the RBAC
-  module passes all 20 tests from their explicit `terraform-tests`
+  both changed spoke modules. The final EKS module, including the separate
+  collision-resistant reclaim-audit role, exact transitive-tag trust, derived
+  queue grant, and clean invalid-partition failures, passes all 48 tests; the
+  RBAC module passes all 20 tests from their explicit `terraform-tests`
   directories.
 - The final serial real-PostgreSQL matrix passed all 618 tests across the 15
   documented files in four chunks on exact behavior revision `688521ffd`.

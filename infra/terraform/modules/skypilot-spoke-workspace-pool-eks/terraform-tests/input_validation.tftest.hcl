@@ -82,9 +82,15 @@ run "kueue_is_a_backward_compatible_noop_by_default" {
       length(kubernetes_manifest.partition_kueue_policy) == 0 &&
       length(kubernetes_manifest.partition_kueue_binding) == 0 &&
       output.kueue_local_queues == {} &&
-      module.rbac["training"].kueue == null
+      module.rbac["training"].kueue == null &&
+      length(data.aws_caller_identity.current) == 0 &&
+      length(aws_iam_role.reserved_fill_reclaim_audit) == 0 &&
+      length(aws_eks_access_entry.reserved_fill_reclaim_audit) == 0 &&
+      length(kubernetes_cluster_role_v1.reserved_fill_reclaim_audit) == 0 &&
+      output.reserved_fill_reclaim_audit_role_arn == null &&
+      output.reserved_fill_reclaim_audit_caller_policy_statement == null
     )
-    error_message = "Omitting partition.kueue must create no Kueue reads, resources, admission policy, or RBAC."
+    error_message = "Omitting Kueue and the reclaim audit must preserve the backward-compatible no-op contract."
   }
 }
 
