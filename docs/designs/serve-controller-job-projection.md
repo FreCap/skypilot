@@ -153,9 +153,9 @@ descriptor exactly:
 
 ```json
 {
-  "endpoint": "https://storage-broker.int.boltz.bio/v2/grants",
+  "endpoint": "https://storage-broker.int.boltz.bio/v3/grants",
   "audience": "boltz-skyserve-worker",
-  "api_version": 2,
+  "api_version": 3,
   "grant_uri_prefix": "s3://boltz-skyserve-grants/prod",
   "authenticated_worker_role_arns": [
     "arn:aws:iam::123456789012:role/skyserve-worker-east",
@@ -175,7 +175,10 @@ and table-bucket name forms; the authority cannot silently name a different S3
 resource type. The
 worker-role array is ordered, non-empty, duplicate-free, and every entry is an
 IAM role ARN; it binds a grant to the finite set of ambient worker principals
-authorized across the service's regions. `api_version` is exactly 2. The
+authorized across the service's regions. `api_version` is exactly 3. Version 3
+is the clean-cutover contract that requires server-owned, atomic cumulative
+campaign transfer reservations before byte-moving authorization; version 2's
+per-grant accounting cannot establish the campaign-wide transfer ceiling. The
 object never contains a bearer token, secret, temporary credentials, signed
 URL, or grant.
 Clients require SkyPilot API >= 75 as well as placement protocol 1 before

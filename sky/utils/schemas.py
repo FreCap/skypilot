@@ -1347,7 +1347,7 @@ _SERVE_STORAGE_BROKER_SCHEMA = {
             'minLength': 1,
         },
         'api_version': {
-            'const': 2,
+            'const': 3,
         },
         'grant_uri_prefix': {
             'type': 'string',

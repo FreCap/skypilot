@@ -321,8 +321,8 @@ def validate_storage_broker_projection(
     grant_prefix = _strict_nonempty_string(value['grant_uri_prefix'],
                                            'Storage-broker grant_uri_prefix')
     grant_prefix = _validate_s3_prefix(grant_prefix)
-    if type(value['api_version']) is not int or value['api_version'] != 2:
-        raise ValueError('Storage-broker api_version must be exactly 2.')
+    if type(value['api_version']) is not int or value['api_version'] != 3:
+        raise ValueError('Storage-broker api_version must be exactly 3.')
     role_arns = value['authenticated_worker_role_arns']
     if (not isinstance(role_arns, list) or not 1 <= len(role_arns) <= 16):
         raise ValueError('Storage-broker authenticated_worker_role_arns must '
@@ -343,7 +343,7 @@ def validate_storage_broker_projection(
         'endpoint': endpoint,
         'audience': _strict_nonempty_string(value['audience'],
                                             'Storage-broker audience'),
-        'api_version': 2,
+        'api_version': 3,
         'grant_uri_prefix': grant_prefix,
         'authenticated_worker_role_arns': validated_role_arns,
         'kms_key_id': _strict_nonempty_string(value['kms_key_id'],
