@@ -53,7 +53,8 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert public_capacity_version < owner_scoped_request_access_version
     assert owner_scoped_request_access_version < ordinary_launch_binding_version
     assert ordinary_launch_binding_version < placement_projection_version
-    assert server_constants.API_VERSION == placement_projection_version
+    assert placement_projection_version < server_constants.API_VERSION
+    assert server_constants.API_VERSION == 76
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():
