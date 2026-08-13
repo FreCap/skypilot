@@ -170,6 +170,24 @@ def _edge(context: dict, accelerator: str = 'h200') -> reclaim.ReclaimClaimEdge:
         projected_admissions=(admission,))
 
 
+def _claim(context: dict,
+           accelerator: str,
+           *,
+           projection_sha256: str = 'a' * 64) -> reclaim.ReservedContextClaim:
+    edge = _edge(context, accelerator)
+    admission = dataclasses.replace(edge.projected_admissions[0],
+                                    worker_projection_sha256=projection_sha256)
+    return reclaim.ReservedContextClaim(
+        service_name='service',
+        service_version=1,
+        service_generation=1,
+        pool_key=edge.pool_key,
+        access_context=edge.access_context,
+        physical_cluster_uid=edge.physical_cluster_uid,
+        accelerator_names=edge.accelerator_names,
+        projected_admissions=(admission,))
+
+
 def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
     return policy_lib._ContextProof(
         aws=aws_attestation.PodIdentityProof(
@@ -321,6 +339,41 @@ def test_activation_attests_whole_fleet_with_zero_current_claims(monkeypatch):
     assert not evidence.claimed_contexts
     assert evidence.identity == policy.policy_identity()
     assert attest.call_args.args[0] == policy._bundle.contexts
+
+
+def test_activation_accepts_multiple_cards_in_one_context(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    attest = mock.Mock(side_effect=_fake_attest(policy))
+    monkeypatch.setattr(policy, '_attest_contexts', attest)
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    claims = tuple(
+        sorted((_claim(context, 'a100'), _claim(context, 'a100-80gb'))))
+
+    evidence = policy.attest_activation(claims,
+                                        writer_image_digest='sha256:' +
+                                        'b' * 64,
+                                        deadline_monotonic=time.monotonic() + 5)
+
+    assert evidence.claimed_contexts == claims
+    assert attest.call_args.args[0] == policy._bundle.contexts
+
+
+def test_activation_rejects_duplicate_physical_card_atom(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    provider_calls = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    claims = tuple(
+        sorted((_claim(context, 'a100'),
+                _claim(context, 'a100', projection_sha256='b' * 64))))
+
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='same physical accelerator pool twice'):
+        policy.attest_activation(claims,
+                                 writer_image_digest='sha256:' + 'b' * 64,
+                                 deadline_monotonic=time.monotonic() + 5)
+    provider_calls.assert_not_called()
 
 
 def test_provider_domains_and_contexts_start_concurrently(monkeypatch):

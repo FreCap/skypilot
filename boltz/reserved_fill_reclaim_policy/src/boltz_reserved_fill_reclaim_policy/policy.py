@@ -182,6 +182,24 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                     'The claim admission and access context disagree.')
         return edge.access_context
 
+    def _require_claim_edges(
+        self,
+        edges: Sequence[reclaim.ReclaimClaimEdge |
+                        reclaim.ReservedContextClaim],
+    ) -> tuple[str, ...]:
+        context_names: list[str] = []
+        physical_card_atoms: set[tuple[str, str]] = set()
+        for edge in edges:
+            context_names.append(self._require_edge(edge))
+            edge_atoms = {(edge.physical_cluster_uid, accelerator)
+                          for accelerator in edge.accelerator_names}
+            if physical_card_atoms.intersection(edge_atoms):
+                raise reclaim.ReclaimAttestationError(
+                    'One service cannot claim the same physical accelerator '
+                    'pool twice.')
+            physical_card_atoms.update(edge_atoms)
+        return tuple(sorted(set(context_names)))
+
     def _provider_job(self, context_name: str, domain: str,
                       deadline_monotonic: float,
                       cancellation: threading.Event) -> object:
@@ -324,8 +342,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if (_IMAGE_DIGEST_RE.fullmatch(writer_image_digest) is None):
             raise reclaim.ReclaimAttestationError(
                 'Activation requires an immutable writer image digest.')
-        for claim in claimed_contexts:
-            self._require_edge(claim)
+        self._require_claim_edges(claimed_contexts)
         # Activation always proves the whole static fleet, including contexts
         # with no current claim, so the one-way gate authorizes future claims.
         proofs = self._attest_contexts(self._bundle.contexts,
@@ -360,19 +377,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if not isinstance(scope, reclaim.ReclaimClaimSetScope):
             raise reclaim.ReclaimAttestationError(
                 'The claim authorization scope is not typed.')
-        context_names: list[str] = []
-        physical_card_atoms: set[tuple[str, str]] = set()
-        for edge in scope.edges:
-            context_names.append(self._require_edge(edge))
-            edge_atoms = {(edge.physical_cluster_uid, accelerator)
-                          for accelerator in edge.accelerator_names}
-            if physical_card_atoms.intersection(edge_atoms):
-                raise reclaim.ReclaimAttestationError(
-                    'One service cannot claim the same physical accelerator '
-                    'pool twice.')
-            physical_card_atoms.update(edge_atoms)
-        proofs = self._attest_contexts(tuple(sorted(set(context_names))),
-                                       deadline_monotonic)
+        context_names = self._require_claim_edges(scope.edges)
+        proofs = self._attest_contexts(context_names, deadline_monotonic)
         completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimClaimAuthorization(
