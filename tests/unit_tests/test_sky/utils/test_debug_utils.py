@@ -2072,6 +2072,16 @@ class TestRequestBodyAllowlistCoverage:
         # Recipe content: YAML content similar to tasks
         'sky.recipes.create',
         'sky.recipes.update',
+        # Transition-only decoder names for retired request-backed daemons.
+        # Runtime supervisors do not persist RequestBody rows for these names;
+        # Serve047 removes the decoder symbols after the stale-writer gate.
+        'sky.status-refresh',
+        'sky.volume-refresh',
+        'sky.managed-job-status-refresh',
+        'sky.sky-serve-status-refresh',
+        'sky.pool-status-refresh',
+        'sky.server-heartbeat',
+        'sky.expired-token-cleanup',
     }
 
     def test_all_request_names_covered(self):

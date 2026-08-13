@@ -300,7 +300,10 @@ def test_parallel_size_short():
     # Test with limited memory
     blocking_size = 1
     mem_size_gb = 3
-    expected = config._get_min_short_workers()
+    # Request-backed daemons no longer consume short workers. The remaining
+    # memory therefore admits two finite API workers above the one-worker
+    # floor.
+    expected = 2
     assert config._max_short_worker_parallism(mem_size_gb,
                                               blocking_size) == expected
 
