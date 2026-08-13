@@ -2202,11 +2202,11 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   product. The integrated policy/interface superset passes 132/132; Ruff and
   targeted mypy pass, pylint is 10.00/10, JSON parsing, compilation,
   formatting, and `git diff --check` pass.
-- The post-correction local Serve047 implementation restack at `dec0766a2`
+- The post-correction local Serve047 implementation restack at `1efa6b284`
   passes 58/58
   focused final-state, cleanup-presence, manager-receipt,
   reconciliation-transition, and status tests; the combined policy superset
-  passes 125/125; and its required real-PostgreSQL Serve047 schema suite passes
+  passes 134/134; and its required real-PostgreSQL Serve047 schema suite passes
   12/12 with zero skips against the isolated local PostgreSQL server.
   These reruns supplement the complete cleanup freeze recorded below; the
   final cleanup OID will change when it is rebased over review-record-only
