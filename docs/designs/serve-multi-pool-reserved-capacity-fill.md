@@ -2,10 +2,10 @@
 
 Status: Serve046, its separately packaged Boltz reclaim policy, and the local
 Serve047 final-state cleanup restack are implemented after the identity-free
-worker-partition correction. Automated validation is complete; the remote
-cleanup PR still needs its final reviewed restack, and platform prerequisites
-and three restarted adversarial reviews remain; not merged, deployed, or
-activated
+worker-partition correction. Automated validation and three consecutive exact
+adversarial reviews are complete. The remote feature and cleanup PR heads still
+need their final evidence-only successor publication and CI, and platform
+prerequisites remain; not merged, deployed, or activated
 
 Last updated: 2026-08-13
 
@@ -1576,9 +1576,9 @@ before activation. If it does not, the new image may deploy but the gate stays
 
 None of the above is merged, deployed, or activated as of this update. The
 implementation and owner-death/request-liveness integration are complete in
-this worktree. The final serial PostgreSQL validation passes on the exact code
-revision recorded below; three consecutive adversarial reviews remain before
-merge.
+this worktree. The exact non-PostgreSQL and serial PostgreSQL validation passes
+and three consecutive adversarial reviews are recorded below. Only the final
+evidence-only successor publication and remote CI remain before merge.
 
 ### Runtime audit corrections implemented and frozen for review
 
@@ -1779,8 +1779,8 @@ either case.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
-| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze passes; restarted review pending. |
-| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze passes; restarted review pending. |
+| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze and three consecutive adversarial reviews pass. |
+| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze and three consecutive adversarial reviews pass. |
 | 2a | Full-fleet combined feature-and-policy image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
 | 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separately packaged plugin, strict bundle, Node cross-attestation, unique entry point, and reusable least-privilege spoke audit boundary are integrated into the one feature image and focused tests pass. They are not upstream-merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
 | 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; the combined image cannot activate until the deployment policy and live attestation gates pass. |
@@ -2143,6 +2143,13 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   historical optional planner/DAG input must remain optional for a successful
   reserved-fill Kubernetes adoption while the post-materialization authority
   guard is carried forward. The focused regression and complete rerun pass.
+- After the exact accelerator-scheduling correction, the final complete
+  non-PostgreSQL rerun on code/design revision
+  `123c16762aea510d34db74f52c0c27e733fbb07d` passed all 3,384 tests across the
+  same documented 50-file matrix with zero failures or skips in 93.733
+  seconds. The retained JUnit artifact is
+  `/tmp/feature-nonpg-123c16762-rerun.xml`, SHA-256
+  `c0afd4330fa7d5ef500f49e52d54abd3a8033c97c1b1c656360bf07e294d6092`.
 - Changed-source pylint passes at 10.00/10 and `git diff --check` is clean.
   Changed-source mypy has only the same pre-existing `backend_utils.py`
   overload diagnostic present on `origin/improvements`; the repository mypy
@@ -2167,6 +2174,12 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   `/tmp/feature-pg-chunk4-688521ffd.Ax9kzJ.xml` (121 tests). Process audits
   proved one pytest owner throughout each chunk and no PostgreSQL pytest
   remained after the freeze.
+- The exact post-accelerator-correction serial real-PostgreSQL rerun on
+  revision `123c16762aea510d34db74f52c0c27e733fbb07d` passed the same 618 tests
+  with zero failures, errors, or skips in 1,345.917 seconds. It used one pytest
+  process and the required real PostgreSQL server. The retained JUnit artifact
+  is `/tmp/feature-pg-123c16762.xml`, SHA-256
+  `19101b79676824822e55f4fdf9c9c2299ae8792944aa59e8c673bc934a0229ac`.
 - On integrated implementation revision
   `244cc34fbfb61ba719691b33c92f93d039ef610f`, the corrected separate Boltz
   plugin and generic policy interface pass all 113 tests in the focused
@@ -2239,7 +2252,7 @@ consecutive sequence restarts from round 1 again.
 |---|---|---|---|
 | 1 | feature/design `123c16762aea510d34db74f52c0c27e733fbb07d`; stacked Serve047 cleanup `bc2725c54149d14bc4e90edb2df24af5efccd789` | pass | No material or non-material findings. The review traced the exact normalized accelerator label key, sorted values, and resource through projection, activation, claim replacement, durable receipt/scope hashing, terminal authorization, rendering, Pod admission/adoption, and bound-Node proof. It also found no oversubscription, stale-authority, paid-spill, duplicate-happy-path, or BCL reclaim regression, and confirmed Serve047 leaves one forward-only two-state authorization path. |
 | 2 | feature/design `a0fe24207854cdc3f98a4d2a879cc9dce4bfa0f7`; stacked Serve047 cleanup `175e04e8376d8507c9d08428f2f2a34516df8b2e`; design SHA-256 `b6037bab7e8de936aa5d447b7547f7ea2faf012395bfb36ccc1eb8006cecf486` | pass | No material or non-material findings. Independent review reverified the terminal PostgreSQL admission ledger, exact projection-to-Node accelerator scheduling atom, disjoint physical-card contracts, fail-closed zero-cost launch, live-attested bounded Kueue borrowing and BCL/research reclaim, and Serve047's sole forward authorization path. All non-design blobs remained byte-identical to round 1. |
-| 3 | pending | pending | pending |
+| 3 | feature/design `cea111a5ddcf7f84e7426d75920e23cae7d33b65`; stacked Serve047 cleanup `c4a46c2debe54a832916cd64408c8306a50dc266`; feature design SHA-256 `fb9a88be168ac3a951a51c053f054a86d97ad5f363504c005a4c1be10bd2d398`; cleanup design SHA-256 `793fc1b5000f3d2ec46da066798645c9e36fc703f4faade9ef4fbc35bc4a89e5` | pass | No material or non-material findings. Final independent review reconfirmed bounded generation-fenced observation, complete terminal admission revalidation, exact-card zero-cost-only launch, projection and deployment-policy identity, zero-nominal inference borrowing with research reclaim, and Serve047's two-state forward-only authority. Every non-design blob remained byte-identical to round 2. |
 
 Reviews should be pragmatic and fix-forward oriented. They must reject an
 oversubscription, stale-authority, duplicate-happy-path, paid-spill, or BCL
