@@ -32,6 +32,8 @@ class _FakeWorker:
     running: int = 0
     ready: bool = True
     predict_statuses: list[int] = dataclasses.field(default_factory=list)
+    predict_rejection_state: str | None = None
+    predict_rejection_body: bytes | None = None
     predict_delay: float = 0
     capacity_delay: float = 0
     compress_predict_response: bool = False
@@ -77,6 +79,17 @@ class _FakeWorker:
                 await asyncio.sleep(self.predict_delay)
             if self.predict_statuses:
                 status = self.predict_statuses.pop(0)
+                if self.predict_rejection_body is not None:
+                    return web.Response(body=self.predict_rejection_body,
+                                        status=status,
+                                        content_type='application/json')
+                if self.predict_rejection_state is not None:
+                    return web.json_response(
+                        {
+                            'state': self.predict_rejection_state,
+                            'request_id': payload['request_id'],
+                        },
+                        status=status)
                 return web.json_response({'status': 'rejected'}, status=status)
             if self.running >= self.capacity:
                 return web.json_response({'status': 'busy'}, status=429)
@@ -242,6 +255,82 @@ async def test_retries_only_explicit_capacity_rejections() -> None:
             })
             assert response.status == 200
             assert [worker.predicts for worker in workers] == [1, 1]
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.asyncio
+async def test_release_and_relay_does_not_redispatch_same_body() -> None:
+    workers = [
+        _FakeWorker(predict_statuses=[425],
+                    predict_rejection_state='signed_capability_expired'),
+        _FakeWorker(),
+    ]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(
+        worker_servers,
+        release_and_relay_responses={425: 'signed_capability_expired'},
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                'action': 'async_predict',
+                'request_id': 'job-expired',
+            }
+            expired = await _post(session, router_server, payload)
+            assert expired.status == 425
+            assert await expired.json() == {
+                'state': 'signed_capability_expired',
+                'request_id': 'job-expired',
+            }
+            assert [worker.predicts for worker in workers] == [1, 0]
+
+            retried = await _post(session, router_server, payload)
+            assert retried.status == 200
+            assert (await retried.json())['request_id'] == 'job-expired'
+            assert [worker.predicts for worker in workers] == [1, 1]
+    finally:
+        await router_server.close()
+        await asyncio.gather(*(server.close() for server in worker_servers))
+
+
+@pytest.mark.parametrize('body', [
+    b'{"status":"rejected"}',
+    (b'{"state":"signed_capability_expired",'
+     b'"request_id":"job-malformed-expiry","extra":true}'),
+    (b'{"state":"signed_capability_expired",'
+     b'"request_id":"different-request"}'),
+    (b'{"state":"signed_capability_expired",'
+     b'"state":"signed_capability_expired",'
+     b'"request_id":"job-malformed-expiry"}'),
+])
+@pytest.mark.asyncio
+async def test_release_and_relay_requires_exact_body(body: bytes) -> None:
+    workers = [
+        _FakeWorker(predict_statuses=[425], predict_rejection_body=body),
+        _FakeWorker()
+    ]
+    worker_servers = [await _start_worker(worker) for worker in workers]
+    router_server = await _start_router(
+        worker_servers,
+        release_and_relay_responses={425: 'signed_capability_expired'},
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            response = await _post(session, router_server, {
+                'action': 'async_predict',
+                'request_id': 'job-malformed-expiry',
+            })
+            assert response.status == 425
+            assert [worker.predicts for worker in workers] == [1, 0]
+
+            duplicate = await _post(session, router_server, {
+                'action': 'async_predict',
+                'request_id': 'job-malformed-expiry',
+            })
+            assert duplicate.status == 502
+            assert [worker.predicts for worker in workers] == [1, 0]
     finally:
         await router_server.close()
         await asyncio.gather(*(server.close() for server in worker_servers))
@@ -914,6 +1003,32 @@ def test_rejects_duplicate_upstreams() -> None:
     {
         'retriable_status_codes': (429.5,)
     },
+    {
+        'release_and_relay_responses': {
+            True: 'expired'
+        }
+    },
+    {
+        'release_and_relay_responses': {
+            425.5: 'expired'
+        }
+    },
+    {
+        'release_and_relay_responses': {
+            200: 'accepted'
+        }
+    },
+    {
+        'release_and_relay_responses': {
+            425: ''
+        }
+    },
+    {
+        'retriable_status_codes': (425,),
+        'release_and_relay_responses': {
+            425: 'expired'
+        }
+    },
 ])
 def test_rejects_invalid_runtime_limits(kwargs) -> None:
     with pytest.raises(ValueError):
@@ -938,6 +1053,35 @@ def test_cli_builds_contiguous_local_upstreams() -> None:
         'http://127.0.0.1:9002',
         'http://127.0.0.1:9003',
     ]
+
+
+def test_cli_accepts_release_and_relay_responses() -> None:
+    args = local_async_router._parser().parse_args([
+        '--upstream-count',
+        '1',
+        '--async-path',
+        _ASYNC_PATH,
+        '--readiness-path',
+        _READINESS_PATH,
+        '--release-and-relay-response',
+        '425:signed_capability_expired',
+    ])
+    assert local_async_router._parse_release_and_relay_responses(
+        args.release_and_relay_response) == {
+            425: 'signed_capability_expired'
+        }
+
+
+@pytest.mark.parametrize('value', [
+    'invalid',
+    '200:accepted',
+    '99:expired',
+    '600:expired',
+    '425:',
+])
+def test_cli_rejects_invalid_release_and_relay_response(value: str) -> None:
+    with pytest.raises(ValueError, match='CODE:STATE'):
+        local_async_router._parse_release_and_relay_responses([value])
 
 
 def test_cli_rejects_mixed_upstream_forms() -> None:
