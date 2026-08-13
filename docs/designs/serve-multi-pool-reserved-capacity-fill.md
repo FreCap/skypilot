@@ -879,18 +879,22 @@ instance selector, then cross-binds that selector to the GPU product label and
 at least one non-deleting Node for every reviewed flavor and rejects every
 non-deleting Node of that shape whose product or GPU capacity differs. Node
 readiness and allocatable occupancy remain physical-observation inputs, so a
-temporarily
-initializing Node is not misclassified as policy drift. The inference
-namespace UID and physical cluster UID are immutable inventory; replace either
-only by shipping a new bundle and normal fix-forward reauthorization.
+temporarily initializing Node is not misclassified as policy drift. The
+inference namespace UID and physical cluster UID are immutable inventory;
+replace either only by shipping a new bundle and normal fix-forward
+reauthorization.
 
 AWS absence is a positive proof, not an omitted check. For each context the
 plugin uses the hub writer's Pod Identity session to assume the exact spoke
-role `skypilot-reserved-fill-reclaim-audit`. That role is read-only and limited
+roles `skypilot-rf-b6ca6363ec70-audit` in east and
+`skypilot-rf-fe7c6c421c88-audit` in PHX. The spoke module derives these
+collision-resistant identities from the exact cluster and partition. Each
+role is read-only and limited
 to `eks:DescribeCluster`, `eks:ListPodIdentityAssociations`, and
 `eks:DescribePodIdentityAssociation` on the exact cluster and its association
 resources. The spoke trust names the single current hub Pod Identity writer
-role and requires its transitive `eks-cluster-arn`, `kubernetes-namespace`, and
+role, permits only `sts:AssumeRole` plus the required `sts:TagSession`, and
+requires its transitive `eks-cluster-arn`, `kubernetes-namespace`, and
 `kubernetes-service-account` session tags. The chart renders API, controller,
 and executor writers with the same `skypilot-api-sa`; a chart test must keep
 that invariant true. Every proof describes the exact active EKS cluster,
@@ -1744,11 +1748,11 @@ either case.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
-| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze passes; review pending. |
-| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze passes; review pending. |
-| 2a | Full-fleet feature-image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
-| 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separate plugin, strict bundle, Node cross-attestation, and unique entry point are implemented at `9de8484f5`; all 95 focused tests pass. They are not merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
-| 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; intentionally impossible in the generic feature build. |
+| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze passes; restarted review pending. |
+| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze passes; restarted review pending. |
+| 2a | Full-fleet combined feature-and-policy image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
+| 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separately packaged plugin, strict bundle, Node cross-attestation, unique entry point, and reusable least-privilege spoke audit boundary are integrated into the one feature image and focused tests pass. They are not upstream-merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
+| 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; the combined image cannot activate until the deployment policy and live attestation gates pass. |
 | 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | The stale draft is not mergeable as written; it must be reauthored from the exact frozen feature revision and remains merge-gated below. |
 
 Durable acceptance hands rows to the existing asynchronous launch path, and
@@ -1765,7 +1769,10 @@ Before changing the gate:
    against this exact file and code revision.
 2. Merge the feature only after its stacked cleanup PR has been authored and
    linked as described below; the cleanup remains draft and merge-gated.
-3. Build and push one immutable image from the merged feature commit.
+3. Build and push one immutable image from the merged feature commit. The image
+   contains both the generic Serve implementation and the separately packaged,
+   unique Boltz policy plugin; there is no preparatory generic-only deployment
+   or second policy-image happy path.
 4. Record the live Helm release name, namespace, chart revision, complete
    release values, rendered role topology, and immutable image identities for
    diagnosis, but use fix forward rather than Helm rollback.
@@ -1784,10 +1791,12 @@ Before changing the gate:
    controller lease or controller process remains before calling the
    controller cohort converged. There is no shared PID-file migration, Recreate
    flag, or alternate scheduler path to activate or later remove.
-7. Wait for the full split-role `api`, `controller`, and `executor` cohort to
-   be Ready on the same immutable image. This is a fleet rollout, not a
-   capacity canary. The gate remains `LEGACY_ACTIVE` throughout image
-   convergence.
+7. After the current all-role Pod converges on the combined image, use the
+   separately reviewed Rainier migration stack to replace it with the full
+   split-role `api`, `controller`, and `executor` cohort on that same immutable
+   image and shared RWX state. Wait for every role to be Ready. This is a fleet
+   rollout, not a capacity canary. The gate remains `LEGACY_ACTIVE` throughout
+   both image and topology convergence.
 8. Verify public server API capability 77, API-request schema 010, Serve schema
    046, worker placement projection protocol 2, allocation-map schema 5,
    replica state 17, and reserved-fill protocol v2. Confirm every active
@@ -1801,11 +1810,11 @@ Before changing the gate:
    configuration, RBAC, and fail-closed admission contract for every reserved
    inference context. Pod priority alone does not pass this gate. Launch no GPU
    or BCL verification workload for this rollout.
-10. Build and deploy a second immutable full-fleet image containing the unique
-   Boltz policy plugin after that deployment-owned Kueue contract passes. Wait
-   for every split-role writer to converge on its digest and re-run the exact
-   fleet/schema/policy status proof before activation. The preparatory generic
-   feature image remains safe at `LEGACY_ACTIVE` but is never activation-ready.
+10. Prove that every split-role Pod runs the one combined immutable image and
+    that the unique Boltz policy entry point resolves from its separately
+    packaged wheel. Re-run the exact fleet/schema/policy status proof before
+    activation. A fix-forward image is required only to correct a defect; it
+    replaces the complete fleet and does not create another supported path.
 
 The live Helm release is the deployment authority. A platform repository pin,
 Terraform/Terragrunt state, or open platform PR is neither a prerequisite nor
@@ -1823,8 +1832,9 @@ The separately owned Kueue contract is a different deployment change. It may
 proceed through its own reviewed authority only after the east and Phoenix
 inference partitions, exact RBAC, server queue configuration, fail-closed
 admission, and the code-owned policy plugin are implemented and reviewed. It
-is not smuggled into the generic runtime-image Helm upgrade and does not block
-deploying that image safely at `LEGACY_ACTIVE`.
+is not smuggled into the runtime-image Helm upgrade and does not block
+deploying the combined image safely at `LEGACY_ACTIVE`; it does block
+activation.
 
 ### Mechanical activation
 
@@ -2109,8 +2119,11 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   files. No feature-owned typing diagnostic remains.
 - On the exact corrected behavior tree
   `688521ffd6cce0838b55c98fbb1196584116fc70`, Terraform 1.15.8 validates both
-  changed spoke modules. The EKS module passes all 43 tests and the RBAC module
-  passes all 20 tests from their explicit `terraform-tests` directories.
+  changed spoke modules. The final EKS module at audit-boundary revision
+  `3af32dfdcd1ca9b27985e53e990d9f9efd256d58`, including its separate
+  collision-resistant role, exact transitive-tag trust, derived queue grant,
+  and clean invalid-partition failures, passes all 48 tests. The RBAC module
+  passes all 20 tests from its explicit `terraform-tests` directory.
 - The final serial real-PostgreSQL matrix passed all 618 tests across the 15
   documented files with zero failures, errors, or skips. Repository-default
   xdist was disabled; four ordered chunks each exited zero, with an aggregate
@@ -2123,9 +2136,9 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   `/tmp/feature-pg-chunk4-688521ffd.Ax9kzJ.xml` (121 tests). Process audits
   proved one pytest owner throughout each chunk and no PostgreSQL pytest
   remained after the freeze.
-- The corrected separate Boltz plugin at
-  `9de8484f5516eafccbe4788c7ef21957ed728650` passes all 95 focused tests across
-  the policy, packaging, overlay-manifest, release-version, and generic-policy
+- The corrected separate Boltz plugin and generic policy interface pass all
+  113 tests in the focused superset across policy, packaging,
+  overlay-manifest, release-version, attestation, and generic-interface
   suites. Ruff, targeted mypy, changed-source pylint at 10.00/10, JSON parsing,
   Python compilation, and `git diff --check` also pass. New tests reject a
   missing or mismatched Node inventory, selector/product/capacity drift, and a
@@ -2141,7 +2154,7 @@ update this file before the next round.
 
 | Round | Revision reviewed | Result | Material findings/fixes |
 |---|---|---|---|
-| 1 | pending restart over behavior `688521ffd`, plugin `9de8484f5`, and this exact design | pending | The historical PASS at documentation `1e8ddf095` is superseded and does not count: exact live ResourceFlavor and research-quota evidence materially corrected the deployment-policy contract. |
+| 1 | pending restart over the integrated feature/plugin/audit revision and this exact design | pending | The historical PASS at documentation `1e8ddf095` is superseded and does not count: exact live ResourceFlavor and research-quota evidence materially corrected the deployment-policy contract. |
 | 2 | pending | pending | pending |
 | 3 | pending | pending | pending |
 
@@ -2268,9 +2281,9 @@ legacy activation.
 
 ## Open gates
 
-- Freeze the reviewed canonical-design evidence commit over exact behavior
-  revision `688521ffd6cce0838b55c98fbb1196584116fc70` and corrected policy revision
-  `9de8484f5516eafccbe4788c7ef21957ed728650`.
+- Freeze the integrated feature/plugin/audit revision and this exact canonical
+  design over Serve046 behavior revision
+  `688521ffd6cce0838b55c98fbb1196584116fc70`.
 - Complete and record three consecutive adversarial review passes.
 - Restack cleanup PR #1452 as the Serve047 successor over the frozen Serve046
   feature, including protocol-v1 projection-decoder removal and the enumerated
@@ -2283,17 +2296,18 @@ legacy activation.
 - Record the pre-activation writer/image/schema proof.
 - Deploy and attest the separately owned Kueue inference queue/preemption
   contract for every reserved context; current east1 evidence does not pass.
-- Deploy the code-owned `ReservedFillReclaimPolicy` from the separate
+- Deploy the combined immutable image containing the code-owned
+  `ReservedFillReclaimPolicy` from the separately packaged
   `boltz-skypilot-reserved-fill-reclaim-policy` wheel and its ongoing
-  claim-admission and launch fence in a second immutable Boltz deployment
-  bundle. The policy
+  claim-admission and launch fence. The policy
   must consume and authorize the projected `scheduler_name` and nullable Pod
   Identity role together with the existing namespace, service-account,
   priority, Kueue, and accelerator fields. For the identity-free inference
   partition it must positively prove that no Pod Identity association exists;
   null is not permission to skip the check.
-  Converge the full split-role fleet on that digest and repeat the
-  pre-activation proof; no generic assertion bypass exists.
+  Converge the full split-role fleet on that one digest and repeat the
+  pre-activation proof; no generic assertion bypass or generic-only image path
+  exists.
 - Perform initial activation and non-compute manual verification; later policy
   or writer changes use the same command for one successor generation.
 - After the documented removal gate passes, merge the cleanup PR.

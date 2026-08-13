@@ -90,6 +90,18 @@ for f in "${root_module_files[@]}"; do
 done
 echo "   ${#root_module_files[@]} tracked setup.py py_module source(s)"
 
+# The reclaim policy is intentionally a second distribution. The generic
+# SkyPilot wheel must keep zero deployment-policy entry points; the Boltz image
+# composes exactly one reviewed implementation alongside it.
+policy_files=()
+while IFS= read -r f; do [ -n "$f" ] && policy_files+=("$f"); done < <(
+  git ls-tree -r --name-only HEAD -- 'boltz/reserved_fill_reclaim_policy')
+if [ "${#policy_files[@]}" -eq 0 ]; then
+  echo "error: deployment reclaim-policy package is missing" >&2
+  exit 1
+fi
+echo "   ${#policy_files[@]} tracked deployment reclaim-policy source(s)"
+
 # Informational only (does NOT gate the file set): compare the fork tree
 # against the base image's installed sky/ files so the log shows how much of
 # the wheel we shadow and how much the fork adds. Doubles as a sanity check
@@ -152,6 +164,10 @@ for f in "${template_files[@]}"; do
   mkdir -p "$ctx/$(dirname "$f")"
   cp "$f" "$ctx/$f"
 done
+for f in "${policy_files[@]}"; do
+  mkdir -p "$ctx/$(dirname "$f")"
+  cp "$f" "$ctx/$f"
+done
 
 # The wheel replaces the base package, so stamp the source-tree placeholders
 # before building it. There is no .git directory in the final image from which
@@ -192,6 +208,44 @@ if replacements != 1:
     raise RuntimeError(f'could not stamp __version__ in {path}')
 path.write_text(content, encoding='utf-8')
 PY
+
+# The policy revision is the overlay release, not a manually maintained
+# constant. Any implementation change therefore rotates the durable policy
+# identity even when the static fleet JSON is unchanged.
+OVERLAY_VERSION="$SKYPILOT_VERSION" \
+  python3 - \
+    "$ctx/boltz/reserved_fill_reclaim_policy/pyproject.toml" \
+    "$ctx/boltz/reserved_fill_reclaim_policy/src/boltz_reserved_fill_reclaim_policy/__init__.py" <<'PY'
+import os
+from pathlib import Path
+import re
+import sys
+
+version = os.environ['OVERLAY_VERSION']
+pyproject = Path(sys.argv[1])
+content = pyproject.read_text(encoding='utf-8')
+content, replacements = re.subn(
+    r'^version = "0\.0\.0"$',
+    f'version = "{version}"',
+    content,
+    count=1,
+    flags=re.MULTILINE)
+if replacements != 1:
+    raise RuntimeError(f'could not stamp policy version in {pyproject}')
+pyproject.write_text(content, encoding='utf-8')
+
+package = Path(sys.argv[2])
+content = package.read_text(encoding='utf-8')
+content, replacements = re.subn(
+    r"^__version__ = '0\.0\.0'$",
+    f"__version__ = '{version}'",
+    content,
+    count=1,
+    flags=re.MULTILINE)
+if replacements != 1:
+    raise RuntimeError(f'could not stamp policy revision in {package}')
+package.write_text(content, encoding='utf-8')
+PY
 echo ">> Stamped overlay identity: version ${SKYPILOT_VERSION}, commit ${overlay_commit}, checked in ${overlay_commit_timestamp}, build ${overlay_build}"
 
 # Ship ONLY the static export (out/) — never node_modules/.next; the server
@@ -220,6 +274,7 @@ docker run --rm --platform "$PLATFORM" \
   "$TAG" python -c "
 import importlib.metadata, inspect, os
 import skypilot_serve_system_oom_recovery_authorization
+import boltz_reserved_fill_reclaim_policy
 import sky
 import sky.serve.controller, sky.serve.replica_managers, sky.serve.load_balancer
 from sky.utils import controller_utils
@@ -232,6 +287,15 @@ assert hasattr(controller_utils, 'in_flight_launch_count')
 assert 'in_flight' in inspect.signature(controller_utils.can_provision).parameters
 assert sky.__version__ == '${SKYPILOT_VERSION}', sky.__version__
 assert importlib.metadata.version('skypilot-nightly') == sky.__version__
+assert importlib.metadata.version(
+    'boltz-skypilot-reserved-fill-reclaim-policy') == sky.__version__
+entries = tuple(importlib.metadata.entry_points().select(
+    group='skypilot.reserved_fill_reclaim_policy'))
+assert len(entries) == 1, entries
+assert entries[0].name == 'boltz'
+policy = entries[0].load()()
+assert policy.policy_identity().policy_revision == (
+    'boltz-reserved-fill-reclaim-policy/' + sky.__version__)
 index = os.path.join(server_constants.DASHBOARD_DIR, 'index.html')
 assert os.path.isfile(index), f'dashboard missing from image: {index}'
 print('overlay verify OK')"

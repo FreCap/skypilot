@@ -1,0 +1,292 @@
+{
+  "schema_version": 1,
+  "fleet": {
+    "contexts": [
+      {
+        "accelerators": {
+          "a100": {
+            "count": 1,
+            "flavors": [
+              "ml.p4d.24xlarge",
+              "ml.p4de.24xlarge"
+            ],
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_values": [
+              "NVIDIA-A100-SXM4-40GB",
+              "NVIDIA-A100-SXM4-80GB"
+            ],
+            "resource_name": "nvidia.com/gpu"
+          },
+          "a100-80gb": {
+            "count": 1,
+            "flavors": [
+              "ml.p4de.24xlarge"
+            ],
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_values": [
+              "NVIDIA-A100-SXM4-80GB"
+            ],
+            "resource_name": "nvidia.com/gpu"
+          }
+        },
+        "kubernetes_context": "prod_research_cluster_eks",
+        "local_queue_name": "default",
+        "namespace": "rescluster-k8s-prod-east1-preemptible-inference",
+        "physical_cluster_uid": "14de98b4-cb7b-4f82-beb7-6f754a96f1dd",
+        "pod_identity_role_arn": null,
+        "priority_class": {
+          "name": "rescluster-k8s-prod-east1-preemptible-inference-low",
+          "preemption_policy": "Never",
+          "value": -1000
+        },
+        "queues": {
+          "cohort": "dedicated-pool-research",
+          "inference_cluster_queue": "skyserve-inference-borrowed",
+          "inference_gpu_quotas": [
+            {
+              "borrowing_limit": "64",
+              "flavor": "ml.p4d.24xlarge",
+              "nominal_quota": "0",
+              "resource_name": "nvidia.com/gpu"
+            },
+            {
+              "borrowing_limit": "264",
+              "flavor": "ml.p4de.24xlarge",
+              "nominal_quota": "0",
+              "resource_name": "nvidia.com/gpu"
+            }
+          ],
+          "inference_preemption": {
+            "borrow_within_cohort": "Never",
+            "reclaim_within_cohort": "Never",
+            "within_cluster_queue": "Never"
+          },
+          "research_cluster_queue": "hyperpod-ns-research-clusterqueue",
+          "research_gpu_quotas": [
+            {
+              "borrowing_limit": "0",
+              "flavor": "ml.p4d.24xlarge",
+              "nominal_quota": "64",
+              "resource_name": "nvidia.com/gpu"
+            },
+            {
+              "borrowing_limit": "0",
+              "flavor": "ml.p4de.24xlarge",
+              "nominal_quota": "264",
+              "resource_name": "nvidia.com/gpu"
+            }
+          ],
+          "research_namespace": "hyperpod-ns-research",
+          "research_preemption": {
+            "borrow_within_cohort": "LowerPriority",
+            "reclaim_within_cohort": "Any",
+            "within_cluster_queue": "LowerPriority"
+          }
+        },
+        "scheduler_name": "gpu-binpack-scheduler",
+        "service_account_name": "skypilot-pool-sa",
+        "workload_priority_class_name": "skyserve-inference-low"
+      },
+      {
+        "accelerators": {
+          "h200": {
+            "count": 1,
+            "flavors": [
+              "ml.p5e.48xlarge"
+            ],
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_values": [
+              "NVIDIA-H200"
+            ],
+            "resource_name": "nvidia.com/gpu"
+          }
+        },
+        "kubernetes_context": "phx_research_cluster_eks",
+        "local_queue_name": "default",
+        "namespace": "rescluster-k8s-prod-east1-preemptible-inference",
+        "physical_cluster_uid": "ba2dcdca-2a0d-447f-ad8a-31849a63c1d5",
+        "pod_identity_role_arn": null,
+        "priority_class": {
+          "name": "rescluster-k8s-prod-east1-preemptible-inference-low",
+          "preemption_policy": "Never",
+          "value": -1000
+        },
+        "queues": {
+          "cohort": "shared-pool",
+          "inference_cluster_queue": "skyserve-inference-borrowed",
+          "inference_gpu_quotas": [
+            {
+              "borrowing_limit": "512",
+              "flavor": "ml.p5e.48xlarge",
+              "nominal_quota": "0",
+              "resource_name": "nvidia.com/gpu"
+            }
+          ],
+          "inference_preemption": {
+            "borrow_within_cohort": "Never",
+            "reclaim_within_cohort": "Never",
+            "within_cluster_queue": "Never"
+          },
+          "research_cluster_queue": "hyperpod-ns-research-clusterqueue",
+          "research_gpu_quotas": [
+            {
+              "borrowing_limit": "512",
+              "flavor": "ml.p5e.48xlarge",
+              "nominal_quota": "512",
+              "resource_name": "nvidia.com/gpu"
+            }
+          ],
+          "research_namespace": "hyperpod-ns-research",
+          "research_preemption": {
+            "borrow_within_cohort": "LowerPriority",
+            "reclaim_within_cohort": "Any",
+            "within_cluster_queue": "LowerPriority"
+          }
+        },
+        "scheduler_name": "gpu-binpack-scheduler",
+        "service_account_name": "skypilot-pool-sa",
+        "workload_priority_class_name": "skyserve-inference-low"
+      }
+    ]
+  },
+  "provider_inventory": {
+    "contexts": [
+      {
+        "admission_policy": {
+          "binding_name": "kueue-queue-name-required.boltz.bio",
+          "name": "kueue-queue-name-required.boltz.bio",
+          "namespace_label_key": "boltz.bio/kueue-managed",
+          "namespace_label_value": "true"
+        },
+        "eks": {
+          "account_id": "421498156696",
+          "audit_role_arn": "arn:aws:iam::421498156696:role/skypilot-rf-b6ca6363ec70-audit",
+          "cluster_arn": "arn:aws:eks:us-east-1:421498156696:cluster/sagemaker-hyperpod-eks-cluster",
+          "cluster_name": "sagemaker-hyperpod-eks-cluster",
+          "region": "us-east-1"
+        },
+        "kubernetes_context": "prod_research_cluster_eks",
+        "kueue_controller": {
+          "config_map": "kueue-manager-config",
+          "deployment": "kueue-controller-manager",
+          "images": {
+            "manager": "463470961310.dkr.ecr.us-east-1.amazonaws.com/mirror-kueue:v0.18.0"
+          },
+          "namespace": "kueue-system",
+          "replicas": 1
+        },
+        "kueue_webhooks": {
+          "mutating": "kueue-mutating-webhook-configuration",
+          "validating": "kueue-validating-webhook-configuration"
+        },
+        "namespace_uid": "9e0fd87d-3d6f-4a32-8ec8-83472df0f34a",
+        "node_inventory": [
+          {
+            "capacity_per_node": 8,
+            "flavor": "ml.p4d.24xlarge",
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_value": "NVIDIA-A100-SXM4-40GB",
+            "resource_name": "nvidia.com/gpu",
+            "selector_label_key": "beta.kubernetes.io/instance-type",
+            "selector_label_value": "ml.p4d.24xlarge"
+          },
+          {
+            "capacity_per_node": 8,
+            "flavor": "ml.p4de.24xlarge",
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_value": "NVIDIA-A100-SXM4-80GB",
+            "resource_name": "nvidia.com/gpu",
+            "selector_label_key": "beta.kubernetes.io/instance-type",
+            "selector_label_value": "ml.p4de.24xlarge"
+          }
+        ],
+        "resource_flavors": [
+          {
+            "name": "ml.p4d.24xlarge",
+            "node_labels": {
+              "beta.kubernetes.io/instance-type": "ml.p4d.24xlarge",
+              "node.kubernetes.io/instance-type": "ml.p4d.24xlarge",
+              "sagemaker.amazonaws.com/compute-type": "hyperpod"
+            }
+          },
+          {
+            "name": "ml.p4de.24xlarge",
+            "node_labels": {
+              "beta.kubernetes.io/instance-type": "ml.p4de.24xlarge",
+              "sagemaker.amazonaws.com/compute-type": "hyperpod"
+            }
+          }
+        ],
+        "scheduler": {
+          "containers": {
+            "gpu-pod-mutator": "699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-gpu-binpack-scheduler@sha256:044d29f2c545b81fc3b27ce381c37eda64321bb44f97208dedf3dc1c11a96bfa",
+            "kube-scheduler": "699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-gpu-binpack-scheduler@sha256:044d29f2c545b81fc3b27ce381c37eda64321bb44f97208dedf3dc1c11a96bfa"
+          },
+          "deployment": "gpu-binpack-scheduler",
+          "namespace": "kube-system",
+          "replicas": 2
+        }
+      },
+      {
+        "admission_policy": {
+          "binding_name": "kueue-queue-name-required.boltz.bio",
+          "name": "kueue-queue-name-required.boltz.bio",
+          "namespace_label_key": "boltz.bio/kueue-managed",
+          "namespace_label_value": "true"
+        },
+        "eks": {
+          "account_id": "400920695547",
+          "audit_role_arn": "arn:aws:iam::400920695547:role/skypilot-rf-fe7c6c421c88-audit",
+          "cluster_arn": "arn:aws:eks:us-west-2:400920695547:cluster/sagemaker-hyperpod-eks-cluster-phx",
+          "cluster_name": "sagemaker-hyperpod-eks-cluster-phx",
+          "region": "us-west-2"
+        },
+        "kubernetes_context": "phx_research_cluster_eks",
+        "kueue_controller": {
+          "config_map": "kueue-manager-config",
+          "deployment": "kueue-controller-manager",
+          "images": {
+            "manager": "registry.k8s.io/kueue/kueue:v0.19.0"
+          },
+          "namespace": "kueue-system",
+          "replicas": 1
+        },
+        "kueue_webhooks": {
+          "mutating": "kueue-mutating-webhook-configuration",
+          "validating": "kueue-validating-webhook-configuration"
+        },
+        "namespace_uid": "f7eec6c5-6461-4d0c-83c5-85319854cf17",
+        "node_inventory": [
+          {
+            "capacity_per_node": 8,
+            "flavor": "ml.p5e.48xlarge",
+            "product_label_key": "nvidia.com/gpu.product",
+            "product_label_value": "NVIDIA-H200",
+            "resource_name": "nvidia.com/gpu",
+            "selector_label_key": "beta.kubernetes.io/instance-type",
+            "selector_label_value": "ml.p5e.48xlarge"
+          }
+        ],
+        "resource_flavors": [
+          {
+            "name": "ml.p5e.48xlarge",
+            "node_labels": {
+              "beta.kubernetes.io/instance-type": "ml.p5e.48xlarge",
+              "node.kubernetes.io/instance-type": "ml.p5e.48xlarge",
+              "sagemaker.amazonaws.com/compute-type": "hyperpod"
+            }
+          }
+        ],
+        "scheduler": {
+          "containers": {
+            "gpu-pod-mutator": "699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-gpu-binpack-scheduler@sha256:044d29f2c545b81fc3b27ce381c37eda64321bb44f97208dedf3dc1c11a96bfa",
+            "kube-scheduler": "699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-gpu-binpack-scheduler@sha256:044d29f2c545b81fc3b27ce381c37eda64321bb44f97208dedf3dc1c11a96bfa"
+          },
+          "deployment": "gpu-binpack-scheduler",
+          "namespace": "kube-system",
+          "replicas": 2
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boltz-skypilot-reserved-fill-reclaim-policy"
+version = "0.0.0"
+description = "Boltz deployment policy for SkyServe reserved-capacity reclaim"
+requires-python = ">=3.10"
+
+[project.entry-points."skypilot.reserved_fill_reclaim_policy"]
+boltz = "boltz_reserved_fill_reclaim_policy.policy:BoltzReservedFillReclaimPolicy"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+boltz_reserved_fill_reclaim_policy = ["fleet_bundle.json"]

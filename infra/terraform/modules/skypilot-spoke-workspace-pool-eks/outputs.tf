@@ -8,6 +8,20 @@ output "access_entry_id" {
   value       = aws_eks_access_entry.pool.id
 }
 
+output "reserved_fill_reclaim_audit_role_arn" {
+  description = "Exact spoke-account IAM role assumed for reserved-fill reclaim attestation, or null when disabled."
+  value       = try(aws_iam_role.reserved_fill_reclaim_audit[0].arn, null)
+}
+
+output "reserved_fill_reclaim_audit_caller_policy_statement" {
+  description = "Exact caller-side cross-account policy statement required for reclaim attestation, or null when disabled."
+  value = try({
+    Effect   = "Allow"
+    Action   = ["sts:AssumeRole", "sts:TagSession"]
+    Resource = aws_iam_role.reserved_fill_reclaim_audit[0].arn
+  }, null)
+}
+
 output "partition_service_accounts" {
   description = "Partition namespace to workload service-account name mapping."
   value = {
