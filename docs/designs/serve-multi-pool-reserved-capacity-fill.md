@@ -1,7 +1,7 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: implementation complete after the identity-free worker-partition
-correction; the final full test freeze and three consecutive adversarial
+Status: implementation and the exact automated freeze are complete after the
+identity-free worker-partition correction; three consecutive adversarial
 reviews are pending; not merged, deployed, or activated
 
 Last updated: 2026-08-13
@@ -1439,10 +1439,11 @@ before activation. If it does not, the new image may deploy but the gate stays
 
 None of the above is merged, deployed, or activated as of this update. The
 implementation and owner-death/request-liveness integration are complete in
-this worktree. Final serial PostgreSQL validation and three consecutive
-adversarial reviews remain before merge.
+this worktree. The final serial PostgreSQL validation passes on the exact code
+revision recorded below; three consecutive adversarial reviews remain before
+merge.
 
-### Runtime audit corrections implemented, awaiting final validation
+### Runtime audit corrections implemented and frozen for review
 
 The runtime audits found additional correctness and bounded-progress defects.
 The current worktree now:
@@ -1610,8 +1611,8 @@ either case.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
-| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; serial PostgreSQL validation and review pending. |
-| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; serial PostgreSQL validation and review pending. |
+| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze passes; review pending. |
+| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze passes; review pending. |
 | 2a | Full-fleet feature-image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
 | 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | Core interface/enforcement is implemented; no Boltz plugin/bundle exists, and current east/Phoenix evidence does not pass. |
 | 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; intentionally impossible in the generic feature build. |
@@ -1962,8 +1963,8 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
 - Historical pre-projection-v2 validation on 2026-08-12 passed its focused
   policy, Serve045, broker, non-PostgreSQL, format, mypy, pylint, dashboard, and
   Prettier checks. Those counts do not certify the current Serve046 worktree.
-- The final 2026-08-13 non-PostgreSQL matrix passed all 3,293 tests across the
-  50 documented files in 70.76 seconds after formatting. Its first run exposed
+- The final 2026-08-13 non-PostgreSQL matrix passed all 3,298 tests across the
+  50 documented files in 83 seconds after formatting. Its first run exposed
   and the implementation corrected one backend integration regression: the
   historical optional planner/DAG input must remain optional for a successful
   reserved-fill Kubernetes adoption while the post-materialization authority
@@ -1973,13 +1974,22 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   overload diagnostic present on `origin/improvements`; the repository mypy
   target reaches six unrelated baseline/environment diagnostics in unchanged
   files. No feature-owned typing diagnostic remains.
-- On the exact formatted behavior tree `a909cd4cc`, Terraform 1.15.8 validates
-  both changed spoke modules. The EKS module passes all 43 tests and the RBAC
-  module passes all 20 tests from their explicit `terraform-tests`
-  directories.
-- The final serial real-PostgreSQL matrix on the corrected identity-free
-  projection revision, and its exact commit, counts, and timing remain to be
-  recorded.
+- On the exact corrected behavior tree
+  `688521ffd6cce0838b55c98fbb1196584116fc70`, Terraform 1.15.8 validates both
+  changed spoke modules. The EKS module passes all 43 tests and the RBAC module
+  passes all 20 tests from their explicit `terraform-tests` directories.
+- The final serial real-PostgreSQL matrix passed all 618 tests across the 15
+  documented files with zero failures, errors, or skips. Repository-default
+  xdist was disabled; four ordered chunks each exited zero, with an aggregate
+  wall time of 1,252 seconds (20m52s) and aggregate JUnit test time of
+  1,221.896 seconds. The exact code revision was
+  `688521ffd6cce0838b55c98fbb1196584116fc70`; the four retained JUnit artifacts
+  are `/tmp/feature-pg-chunk1-688521ffd.R57qNi.xml` (206 tests),
+  `/tmp/feature-pg-chunk2-688521ffd.HiL1jE.xml` (211 tests),
+  `/tmp/feature-pg-chunk3-688521ffd.MoLBSj.xml` (80 tests), and
+  `/tmp/feature-pg-chunk4-688521ffd.Ax9kzJ.xml` (121 tests). Process audits
+  proved one pytest owner throughout each chunk and no PostgreSQL pytest
+  remained after the freeze.
 - No merge commit, deployment revision, activation result, live GPU fill, or
   BCL preemption result is claimed in this document yet.
 
@@ -2118,7 +2128,8 @@ legacy activation.
 
 ## Open gates
 
-- Complete the serial real-PostgreSQL suite and freeze the reviewed commit.
+- Freeze the reviewed documentation-only evidence commit over exact behavior
+  revision `688521ffd6cce0838b55c98fbb1196584116fc70`.
 - Complete and record three consecutive adversarial review passes.
 - Restack cleanup PR #1452 as the Serve047 successor over the frozen Serve046
   feature, including protocol-v1 projection-decoder removal and the enumerated
