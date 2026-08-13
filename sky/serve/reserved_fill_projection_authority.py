@@ -14,8 +14,8 @@ def projected_admission_for_candidate(
     accelerator: str,
     accelerator_count: int,
     expected_sha256: str | None = None,
-) -> tuple[dict[str, Any], reserved_fill_reclaim_attestation.
-           ReclaimProjectedAdmission]:
+) -> tuple[dict[str, Any],
+           reserved_fill_reclaim_attestation.ReclaimProjectedAdmission]:
     """Select one exact v2 candidate and derive its typed policy view."""
     validated = kubernetes_identity.validate_worker_placement_projections(
         worker_projections,
@@ -30,15 +30,12 @@ def projected_admission_for_candidate(
             kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
     if projection is None:
         raise ValueError('Reclaim has no exact protocol-v2 worker projection.')
-    projection_sha256 = kubernetes_identity.worker_projection_sha256(
-        projection)
-    if (expected_sha256 is not None and
-            projection_sha256 != expected_sha256):
+    projection_sha256 = kubernetes_identity.worker_projection_sha256(projection)
+    if (expected_sha256 is not None and projection_sha256 != expected_sha256):
         raise ValueError('Reclaim worker projection digest changed.')
     admission = (reserved_fill_reclaim_attestation.
                  projected_admission_from_worker_projection(
-                     projection,
-                     worker_projection_sha256=projection_sha256))
+                     projection, worker_projection_sha256=projection_sha256))
     return projection, admission
 
 
@@ -54,7 +51,8 @@ def projected_admissions_for_edge(
             type(accelerator_count) is not int or accelerator_count < 1):
         raise ValueError('Reclaim edge location and width must be exact.')
     folded_names = tuple(
-        sorted(name.casefold() for name in accelerator_names
+        sorted(name.casefold()
+               for name in accelerator_names
                if isinstance(name, str) and name))
     if (not folded_names or len(folded_names) != len(accelerator_names) or
             len(set(folded_names)) != len(folded_names)):

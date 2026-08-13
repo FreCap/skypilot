@@ -1021,8 +1021,7 @@ def test_same_allocation_drainer_is_debited_until_cleanup_proven() -> None:
             allocation.reclaim_policy_revision),
         reserved_fill_reclaim_provider_inventory_sha256=(
             allocation.reclaim_provider_inventory_sha256),
-        reserved_fill_worker_projection_sha256=(
-            _WORKER_PROJECTION_SHA256),
+        reserved_fill_worker_projection_sha256=(_WORKER_PROJECTION_SHA256),
         reserved_fill_pool_key=snapshot.pool_key,
         reserved_fill_service_generation=snapshot.service_generation,
         reserved_fill_physical_cluster_uid=snapshot.physical_cluster_uid,

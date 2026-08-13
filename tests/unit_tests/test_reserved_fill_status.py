@@ -121,9 +121,9 @@ def _replica(
             if reclaim_policy_revision is None else reclaim_policy_revision),
         reserved_fill_reclaim_provider_inventory_sha256=(
             allocation.reclaim_provider_inventory_sha256),
-        reserved_fill_worker_projection_sha256=(
-            _WORKER_PROJECTION_SHA256 if worker_projection_sha256 is None else
-            worker_projection_sha256),
+        reserved_fill_worker_projection_sha256=(_WORKER_PROJECTION_SHA256 if
+                                                worker_projection_sha256 is None
+                                                else worker_projection_sha256),
         reserved_fill_observation_generation=(snapshot.observation_generation),
         reserved_fill_observation_sequence=snapshot.observation_sequence,
         reserved_fill_intent_idempotency_key='intent-key',
@@ -151,9 +151,7 @@ def test_sequenced_status_joins_exact_durable_provenance_and_progress() -> None:
                  ready=True,
                  reclaim_policy_revision='tampered-reclaim-policy'),
         _replica(allocation, ready=True, service_version=2),
-        _replica(allocation,
-                 ready=True,
-                 worker_projection_sha256='f' * 64),
+        _replica(allocation, ready=True, worker_projection_sha256='f' * 64),
     ]
 
     with mock.patch.object(controller.serve_state,

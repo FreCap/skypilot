@@ -25,8 +25,8 @@ _END_TITLE = '-' * 20 + 'End:   {} ' + '-' * 20 + '\n'
 
 logger = sky_logging.init_logger(__name__)
 
-ProviderEffectGuardFactory = Callable[
-    [], contextlib.AbstractContextManager[None]]
+ProviderEffectGuardFactory = Callable[[],
+                                      contextlib.AbstractContextManager[None]]
 
 
 class ProvisionerError(RuntimeError):
@@ -91,7 +91,8 @@ class ProvisionConfig:
     # immediately around bounded provider mutations and release it before
     # passive capacity/readiness waits.
     provider_effect_guard_factory: ProviderEffectGuardFactory | None = (
-        dataclasses.field(default=None, kw_only=True, repr=False, compare=False))
+        dataclasses.field(default=None, kw_only=True, repr=False,
+                          compare=False))
 
     def get_redacted_config(self) -> dict[str, Any]:
         """Get the redacted config."""

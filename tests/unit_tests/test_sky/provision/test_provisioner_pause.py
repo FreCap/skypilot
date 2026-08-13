@@ -49,20 +49,19 @@ def patched_bulk_provision(monkeypatch):
 
 def _call_bulk_provision(
     tmp_path,
-    provider_effect_guard_factory: common.ProviderEffectGuardFactory | None =
-    None,
+    provider_effect_guard_factory: common.ProviderEffectGuardFactory |
+    None = None,
 ):
-    return provisioner.bulk_provision(cloud=clouds.Kubernetes(),
-                                      region=clouds.Region('us'),
-                                      zones=None,
-                                      cluster_name=resources_utils.ClusterName(
-                                          'c', 'c-on-cloud'),
-                                      num_nodes=1,
-                                      cluster_yaml='/fake/cluster.yaml',
-                                      prev_cluster_ever_up=False,
-                                      log_dir=str(tmp_path),
-                                      provider_effect_guard_factory=(
-                                          provider_effect_guard_factory))
+    return provisioner.bulk_provision(
+        cloud=clouds.Kubernetes(),
+        region=clouds.Region('us'),
+        zones=None,
+        cluster_name=resources_utils.ClusterName('c', 'c-on-cloud'),
+        num_nodes=1,
+        cluster_yaml='/fake/cluster.yaml',
+        prev_cluster_ever_up=False,
+        log_dir=str(tmp_path),
+        provider_effect_guard_factory=(provider_effect_guard_factory))
 
 
 def test_bulk_provision_does_not_teardown_on_pause(patched_bulk_provision,

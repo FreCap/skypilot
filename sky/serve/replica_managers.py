@@ -6527,8 +6527,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     reclaim_policy_revision=fill_reclaim_policy_revision,
                     reclaim_provider_inventory_sha256=(
                         fill_reclaim_provider_inventory_sha256),
-                    worker_projection_sha256=(
-                        fill_worker_projection_sha256)))
+                    worker_projection_sha256=(fill_worker_projection_sha256)))
         recovery_intent: (system_recovery_state.SystemRecoveryLaunchIntent |
                           None) = None
         recovery_launch_context: dict[str, Any] | None = None

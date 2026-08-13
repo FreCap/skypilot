@@ -380,8 +380,7 @@ class PoolFillSnapshot:
         if set(projection_digests) != set(identity.gpu_names):
             raise ValueError('Worker projection digests must exactly cover '
                              'the pool accelerators.')
-        object.__setattr__(self,
-                           'worker_projection_sha256_by_accelerator',
+        object.__setattr__(self, 'worker_projection_sha256_by_accelerator',
                            tuple(sorted(projection_digests.items())))
         _require_int(self.edge_cap, 'Pool edge cap')
         _require_int(self.broker_slot_width, 'Broker slot width', minimum=1)
@@ -498,8 +497,7 @@ class PoolFillSnapshot:
         else:
             raise ValueError('Exact-card feed must be a mapping when present.')
 
-        raw_projection_digests = data[
-            'worker_projection_sha256_by_accelerator']
+        raw_projection_digests = data['worker_projection_sha256_by_accelerator']
         if type(raw_projection_digests) is not dict:
             raise ValueError('Worker projection digests must be a mapping.')
 
@@ -952,8 +950,7 @@ class FillIntent:
         _require_int(self.pool_epoch, 'Pool epoch', minimum=1)
         physical_uid = _require_nonempty_string(self.physical_cluster_uid,
                                                 'Physical cluster UID')
-        _require_sha256(self.worker_projection_sha256,
-                        'Worker projection hash')
+        _require_sha256(self.worker_projection_sha256, 'Worker projection hash')
         _require_int(self.observation_generation,
                      'Observation generation',
                      minimum=1)
@@ -1446,9 +1443,8 @@ class ReservedFillPlanner:
                         pool_epoch=snapshot.grant_epoch,
                         physical_cluster_uid=snapshot.physical_cluster_uid,
                         worker_projection_sha256=dict(
-                            snapshot.
-                            worker_projection_sha256_by_accelerator)[
-                                selected_card],
+                            snapshot.worker_projection_sha256_by_accelerator)
+                        [selected_card],
                         observation_generation=snapshot.observation_generation,
                         observation_sequence=snapshot.observation_sequence,
                         ordinary_zero_cost_admission_sequence=(

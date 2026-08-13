@@ -234,9 +234,8 @@ def test_snapshot_rejects_mutable_nested_contracts() -> None:
             pool_key=pool_key,
             physical_cluster_uid='uid-east',
             service_generation=1,
-            worker_projection_sha256_by_accelerator=(
-                ('a100', _projection_sha256('a100')),
-            ),
+            worker_projection_sha256_by_accelerator=((
+                'a100', _projection_sha256('a100')),),
             edge_cap=1,
             free_slots=1,
             free_slots_by_accelerator=[('a100', 1)],  # type: ignore[arg-type]

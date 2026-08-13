@@ -71,9 +71,9 @@ def test_provision_config_retains_old_constructor_and_subclass_contract():
     parameters = list(
         inspect.signature(common.ProvisionConfig).parameters.values())
 
-    assert [parameter.name for parameter in parameters
-           ] == [*old_names, 'cluster_incarnation',
-                 'provider_effect_guard_factory']
+    assert [parameter.name for parameter in parameters] == [
+        *old_names, 'cluster_incarnation', 'provider_effect_guard_factory'
+    ]
     assert all(parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
                for parameter in parameters[:-2])
     assert all(parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -91,9 +91,9 @@ def test_provision_config_retains_old_constructor_and_subclass_contract():
     assert extension.required_extension == 'required'
     assert extension.cluster_incarnation is None
     assert extension.provider_effect_guard_factory is None
-    assert [field.name for field in dataclasses.fields(config)
-           ] == [*old_names, 'cluster_incarnation',
-                 'provider_effect_guard_factory']
+    assert [field.name for field in dataclasses.fields(config)] == [
+        *old_names, 'cluster_incarnation', 'provider_effect_guard_factory'
+    ]
 
 
 def test_provision_config_equality_repr_pickle_and_redaction_contract():
@@ -217,8 +217,8 @@ def test_bulk_provision_propagates_exact_optional_incarnation(
     bootstrap_config = calls[0][-1]
     assert calls[1][-1] is bootstrap_config
     assert bootstrap_config.cluster_incarnation is marker
-    assert (bootstrap_config.provider_effect_guard_factory is
-            provider_effect_guard)
+    assert (bootstrap_config.provider_effect_guard_factory
+            is provider_effect_guard)
 
 
 def test_builtin_bulk_identity_refreshes_with_module_reload():

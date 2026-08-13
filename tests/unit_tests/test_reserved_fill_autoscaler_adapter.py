@@ -87,8 +87,8 @@ def _snapshot(
         pool_key=pool_key,
         physical_cluster_uid=uid,
         service_generation=service_generation,
-        worker_projection_sha256_by_accelerator=(
-            (card.casefold(), _WORKER_PROJECTION_SHA256),),
+        worker_projection_sha256_by_accelerator=((card.casefold(),
+                                                  _WORKER_PROJECTION_SHA256),),
         edge_cap=free_slots,
         broker_slot_width=width,
         free_slots=free_slots,
