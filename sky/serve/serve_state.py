@@ -3136,10 +3136,9 @@ _SQLITE_MAX_BIND_PARAMS = 999
 _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE = 300
 _REPLICA_DELETE_CHUNK_SIZE = 500
 _REPLICA_STATE_VERSION = 1
-_LEGACY_REPLICA_ROW_COLUMNS = (
+_REPLICA_ROW_COLUMNS = (
     'service_name',
     'replica_id',
-    'replica_info',
     'replica_state_version',
     'status',
     'sky_down_status',
@@ -3566,17 +3565,13 @@ def _validate_replica_row_identity(
 def _replica_row_values(
         service_name: str, replica_id: int,
         replica_info: 'replica_managers.ReplicaInfo') -> dict[str, Any]:
-    """Build the legacy rollback blob and the authoritative query state."""
+    """Build the authoritative versioned JSON replica state."""
     _validate_replica_row_identity(replica_id, replica_info)
     replica_state = replica_info.to_storage_dict()
     sky_down_status = replica_info.status_property.sky_down_status
     values = {
         'service_name': service_name,
         'replica_id': replica_id,
-        # TODO(fcapponi): After 2026-07-20, delete the pickle column and this
-        # dual-write once production validation confirms every row has a
-        # supported replica_state_version and JSON/pickle parity.
-        'replica_info': pickle.dumps(replica_info),
         'replica_state_version': _REPLICA_STATE_VERSION,
         'status': replica_info.status.value,
         'sky_down_status':
@@ -3588,7 +3583,7 @@ def _replica_row_values(
         'paid_capacity_pool_key': replica_info.paid_capacity_pool_key,
         'replica_state': replica_state,
     }
-    assert tuple(values) == _LEGACY_REPLICA_ROW_COLUMNS
+    assert tuple(values) == _REPLICA_ROW_COLUMNS
     return values
 
 
@@ -3981,13 +3976,13 @@ def _upsert_replica_rows_in_session(
                 session, replica_infos))
         _apply_zero_cost_sequence_assignments(replica_infos,
                                               materializations=materializations)
-    chunk_size = (max(
-        1, _SQLITE_MAX_BIND_PARAMS // len(_LEGACY_REPLICA_ROW_COLUMNS)) if
-                  engine.dialect.name == db_utils.SQLAlchemyDialect.SQLITE.value
-                  else _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
+    chunk_size = (max(1, _SQLITE_MAX_BIND_PARAMS //
+                      len(_REPLICA_ROW_COLUMNS)) if engine.dialect.name
+                  == db_utils.SQLAlchemyDialect.SQLITE.value else
+                  _POSTGRESQL_REPLICA_UPSERT_CHUNK_SIZE)
     if expected_replica_exists:
         value_column_names = tuple(
-            column_name for column_name in _LEGACY_REPLICA_ROW_COLUMNS
+            column_name for column_name in _REPLICA_ROW_COLUMNS
             if column_name not in ('service_name', 'replica_id'))
         update_stmt = sqlalchemy.update(replicas_table).where(
             replicas_table.c.service_name == sqlalchemy.bindparam(
@@ -4034,7 +4029,20 @@ def _replica_from_state(
     if replica_state_version != _REPLICA_STATE_VERSION:
         raise RuntimeError('Unsupported replica state version: '
                            f'{replica_state_version!r}')
-    return replica_managers.ReplicaInfo.from_storage_dict(replica_state)
+    replica = replica_managers.ReplicaInfo.from_storage_dict(replica_state)
+    quarantine = replica.system_recovery_quarantine
+    if quarantine is not None:
+        # This operational warning belongs at the ordinary runtime row-read
+        # boundary. The pure decoder is also used by secret-safe maintenance
+        # operations, which must never emit persisted row identities.
+        logger.warning(
+            'Quarantined system recovery state for replica %s (%s); '
+            'the row remains off-route pending legacy cleanup.',
+            replica.replica_id, quarantine.reason.value)
+    if replica.status == ReplicaStatus.UNKNOWN:
+        logger.error('Decoded replica row projected UNKNOWN status; keeping '
+                     'it off-route pending state reconciliation.')
+    return replica
 
 
 def decode_replica_state_for_authority(
@@ -4192,13 +4200,9 @@ def _write_locked_replica_info_in_session(
         replica_info: 'replica_managers.ReplicaInfo') -> None:
     try:
         values = _replica_row_values(service_name, replica_id, replica_info)
-        pickled = pickle.loads(values['replica_info'])
     except (AttributeError, TypeError, ValueError) as error:
         raise ReplicaSystemRecoveryMutationRejected(
             'Replica recovery state could not be serialized.') from error
-    if pickled.to_storage_dict() != values['replica_state']:
-        raise ReplicaSystemRecoveryMutationRejected(
-            'Replica JSON/pickle recovery state diverged.')
     result = session.execute(
         sqlalchemy.update(replicas_table).where(
             replicas_table.c.service_name == service_name,
@@ -5229,7 +5233,6 @@ def adopt_paid_capacity_claims(
                     replicas_table.c.service_name == service_name,
                     replicas_table.c.replica_id == replica_id).values(
                         paid_capacity_pool_key=pool_key,
-                        replica_info=row_values['replica_info'],
                         replica_state=row_values['replica_state']))
             claim_insert = _upsert_insert_func(engine)(
                 paid_capacity_claims_table).values(service_name=service_name,

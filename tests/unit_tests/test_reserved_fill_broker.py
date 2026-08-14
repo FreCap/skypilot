@@ -2871,8 +2871,7 @@ class TestAtomicPersistFence:
         assert raw['created_at'] == 123.5
         assert raw['is_spot'] is True
         assert raw['replica_state'] == unchanged.to_storage_dict()
-        assert (pickle.loads(raw['replica_info']).to_storage_dict() ==
-                unchanged.to_storage_dict())
+        assert raw['replica_info'] is None
         stored = serve_state.get_replica_info_from_id('svc-a', 7)
         assert stored is not None
         assert stored.to_storage_dict() == unchanged.to_storage_dict()

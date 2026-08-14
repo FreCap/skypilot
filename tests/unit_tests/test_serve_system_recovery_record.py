@@ -89,7 +89,7 @@ def test_current_capable_record_round_trip_is_lossless() -> None:
     state = info.to_storage_dict()
     restored = replica_info.ReplicaInfo.from_storage_dict(state)
 
-    assert state['replica_info_version'] == 17
+    assert state['replica_info_version'] == 18
     assert restored.to_storage_dict() == state
     assert restored.system_recovery_launch_intent == _intent()
     assert restored.system_recovery_revision == 4
@@ -124,189 +124,35 @@ def test_v13_exact_additive_field_list_and_random_record_identity() -> None:
     assert first.replica_record_id != second.replica_record_id
 
 
-def test_v12_and_older_rows_default_to_ordinary() -> None:
+@pytest.mark.parametrize('version', [-1, 0, 12, 13, 15, 16, 19])
+def test_runtime_json_decoder_rejects_every_nontransitional_version(
+        version: int) -> None:
     state = _replica().to_storage_dict()
-    state['replica_id'] = 1
-    state['cluster_name'] = 'svc-1'
-    state['created_at'] = 123.5
-    state['replica_info_version'] = 12
-    untrusted_record_id = state['replica_record_id']
-    state['system_recovery_disposition'] = 'CAPABLE'
-    state['system_recovery_revision'] = 'untrusted-old-value'
+    state['replica_info_version'] = version
 
-    restored = replica_info.ReplicaInfo.from_storage_dict(state)
-    replay_state = copy.deepcopy(state)
-    replay_state['replica_record_id'] = str(uuid.uuid4())
-    replay = replica_info.ReplicaInfo.from_storage_dict(replay_state)
-
-    assert restored.system_recovery_disposition == (
-        recovery_state.SystemRecoveryDisposition.ORDINARY)
-    assert restored.system_recovery_revision == 0
-    assert restored.system_recovery is None
-    assert restored.system_recovery_quarantine is None
-    assert restored.replica_record_id == replay.replica_record_id
-    assert restored.replica_record_id != untrusted_record_id
-    assert (
-        restored.replica_record_id == '5b71cc7f-a36e-5c16-a0c7-de59389ead0e')
-    legacy_state = copy.deepcopy(state)
-    legacy_state['created_at'] = None
-    assert (replica_info.ReplicaInfo.from_storage_dict(legacy_state).
-            replica_record_id == '6f7d7c8f-8eac-5728-a487-b46516e74ba7')
-    rewritten = restored.to_storage_dict()
-    assert rewritten['replica_info_version'] == 17
-    assert rewritten['replica_record_id'] == restored.replica_record_id
+    with pytest.raises(ValueError, match='v17 collision records'):
+        replica_info.ReplicaInfo.from_storage_dict(state)
 
 
-def test_v12_pickle_and_json_derive_the_same_transition_identity() -> None:
-    source = _replica()
-    source.created_at = 123.5
-    json_state = source.to_storage_dict()
-    json_state['replica_info_version'] = 12
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        json_state.pop(field, None)
-    from_json = replica_info.ReplicaInfo.from_storage_dict(json_state)
-
-    pickle_state = copy.deepcopy(source.__dict__)
-    pickle_state['_version'] = 12
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        pickle_state.pop(field, None)
-    from_pickle = replica_info.ReplicaInfo.__new__(replica_info.ReplicaInfo)
-    from_pickle.__setstate__(pickle_state)
-
-    assert from_pickle.replica_record_id == from_json.replica_record_id
-    assert uuid.UUID(from_pickle.replica_record_id).version == 5
-    assert from_pickle.to_storage_dict()['replica_info_version'] == 17
-    assert (pickle.loads(pickle.dumps(from_pickle)).replica_record_id ==
-            from_json.replica_record_id)
-
-
-def test_all_fields_absent_v13_quarantines_json_pickle_and_memory() -> None:
-    source = _replica()
-    source.created_at = 123.5
-    missing = source.to_storage_dict()
-    missing['replica_info_version'] = 13
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        missing.pop(field)
-
-    from_json = replica_info.ReplicaInfo.from_storage_dict(missing)
-    pickle_state = copy.deepcopy(source.__dict__)
-    pickle_state['_version'] = 13
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        pickle_state.pop(field)
-    from_pickle = replica_info.ReplicaInfo.__new__(replica_info.ReplicaInfo)
-    from_pickle.__setstate__(pickle_state)
-
-    in_memory = _replica()
-    in_memory._version = 13  # pylint: disable=protected-access
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        delattr(in_memory, field)
-    serialized = in_memory.to_storage_dict()
-
-    expected = recovery_state.SystemRecoveryQuarantine(
-        recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE)
-    for restored in (from_json, from_pickle, in_memory):
-        assert restored.system_recovery_quarantine == expected
-        assert not restored.is_ready
-        assert set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).issubset(
-            restored.to_storage_dict())
-    for restored in (from_json, from_pickle):
-        assert restored.status == serve_state.ReplicaStatus.FAILED_CLEANUP
-    assert in_memory.status == serve_state.ReplicaStatus.NOT_READY
-    assert from_pickle.replica_record_id == from_json.replica_record_id
-    assert serialized['system_recovery_quarantine'] == expected.to_dict()
-
-    v12 = copy.deepcopy(missing)
-    v12['replica_info_version'] = 12
-    v12_restored = replica_info.ReplicaInfo.from_storage_dict(v12)
-    assert v12_restored.system_recovery_quarantine is None
-    assert v12_restored.system_recovery_disposition == (
-        recovery_state.SystemRecoveryDisposition.ORDINARY)
-    assert v12_restored.replica_record_id == from_json.replica_record_id
-
-
-def test_future_replica_info_versions_are_quarantined() -> None:
-    missing = _replica().to_storage_dict()
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        missing.pop(field)
-    future = copy.deepcopy(missing)
-    future['replica_info_version'] = 18
-    future_restored = replica_info.ReplicaInfo.from_storage_dict(future)
-    assert future_restored.system_recovery_quarantine == (
-        recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
-
-    future_complete = _replica().to_storage_dict()
-    future_complete['replica_info_version'] = 18
-    assert (
-        replica_info.ReplicaInfo.from_storage_dict(future_complete).
-        system_recovery_quarantine == recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
-
-    future_pickle = copy.deepcopy(vars(_replica()))
-    future_pickle['_version'] = 18
-    for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        future_pickle.pop(field)
-    future_pickle_restored = replica_info.ReplicaInfo.__new__(
-        replica_info.ReplicaInfo)
-    future_pickle_restored.__setstate__(future_pickle)
-    assert future_pickle_restored.system_recovery_quarantine == (
-        recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
-
-
-def test_partial_v13_is_reason_only_quarantine_and_does_not_abort_read(
-        caplog) -> None:
+def test_rejected_legacy_json_never_logs_payload(caplog) -> None:
     partial = _replica().to_storage_dict()
     partial['replica_info_version'] = 13
     partial.pop('service_job_id')
     partial['system_recovery_launch_intent'] = {'raw-secret': 'do-not-log'}
 
     with caplog.at_level(logging.WARNING):
-        restored = replica_info.ReplicaInfo.from_storage_dict(partial)
+        with pytest.raises(ValueError, match='v17 collision records'):
+            replica_info.ReplicaInfo.from_storage_dict(partial)
 
-    assert restored.system_recovery_quarantine == (
-        recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
-    assert not restored.is_ready
-    assert restored.status == serve_state.ReplicaStatus.FAILED_CLEANUP
-    assert 'PARTIAL_V13_BUNDLE' in caplog.text
     assert 'raw-secret' not in caplog.text
     assert 'do-not-log' not in caplog.text
 
-    # A quarantined record itself is a complete, reason-only v13 shape.
-    round_trip = replica_info.ReplicaInfo.from_storage_dict(
-        restored.to_storage_dict())
-    assert round_trip.system_recovery_quarantine == (
-        restored.system_recovery_quarantine)
 
-
-def test_partial_in_memory_v13_bundle_is_not_silently_demoted() -> None:
+def test_pre_v17_in_memory_record_is_not_writable() -> None:
     info = _replica()
     info._version = 13  # pylint: disable=protected-access
-    del info.service_job_id
-
-    state = info.to_storage_dict()
-
-    assert state['system_recovery_quarantine'] == {
-        'reason':
-            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE.value
-    }
-    assert not info.is_ready
-
-
-def test_v13_missing_only_record_id_is_partial_and_quarantined() -> None:
-    partial = _replica().to_storage_dict()
-    partial['replica_info_version'] = 13
-    partial.pop('replica_record_id')
-
-    restored = replica_info.ReplicaInfo.from_storage_dict(partial)
-
-    assert restored.system_recovery_quarantine == (
-        recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
-    assert str(uuid.UUID(
-        restored.replica_record_id)) == restored.replica_record_id
-    assert 'replica_record_id' in restored.to_storage_dict()
+    with pytest.raises(ValueError, match='v17 collision records'):
+        info.to_storage_dict()
 
 
 def test_malformed_and_inconsistent_complete_bundles_quarantine() -> None:
@@ -342,6 +188,66 @@ def test_malformed_and_inconsistent_complete_bundles_quarantine() -> None:
             recovery_state.RecoveryQuarantineReason.INCONSISTENT_V13_BUNDLE))
     assert (str(uuid.UUID(identity_restored.replica_record_id)) ==
             identity_restored.replica_record_id)
+
+
+@pytest.mark.parametrize('case', ['malformed', 'inconsistent'])
+def test_pure_decoder_never_logs_quarantined_row_identity_or_payload(
+        caplog, case: str) -> None:
+    sentinel_id = 987654321
+    sentinel_payload = 'pure-decoder-recovery-payload-sentinel'
+    state = _replica().to_storage_dict()
+    state['replica_id'] = sentinel_id
+    if case == 'malformed':
+        state['system_recovery_launch_intent'] = {
+            'raw-secret': sentinel_payload,
+        }
+    else:
+        state['system_recovery_disposition'] = 'CAPABLE'
+        state['launch_request_id'] = sentinel_payload
+
+    with caplog.at_level(logging.WARNING):
+        restored = replica_info.ReplicaInfo.from_storage_dict(state)
+
+    assert restored.system_recovery_quarantine is not None
+    assert str(sentinel_id) not in caplog.text
+    assert sentinel_payload not in caplog.text
+
+
+def test_runtime_row_decoder_owns_quarantine_warning(caplog) -> None:
+    sentinel_id = 987654321
+    sentinel_payload = 'runtime-recovery-payload-sentinel'
+    state = _replica().to_storage_dict()
+    state['replica_id'] = sentinel_id
+    state['system_recovery_disposition'] = 'CAPABLE'
+    state['launch_request_id'] = sentinel_payload
+
+    with caplog.at_level(logging.WARNING):
+        restored = serve_state.decode_replica_state_for_authority(1, state)
+
+    assert restored.system_recovery_quarantine is not None
+    assert f'replica {sentinel_id} (' in caplog.text
+    assert sentinel_payload not in caplog.text
+
+
+def test_runtime_row_decoder_logs_identifier_safe_unknown_status(
+        caplog) -> None:
+    sentinel_id = 987654321
+    sentinel_payload = 'runtime-unknown-status-payload-sentinel'
+    state = _replica().to_storage_dict()
+    state['replica_id'] = sentinel_id
+    state['cluster_name'] = sentinel_payload
+    status = state['status_property']
+    assert isinstance(status, dict)
+    status['sky_launch_status'] = common_utils.ProcessStatus.RUNNING.value
+    status['sky_down_status'] = common_utils.ProcessStatus.SUCCEEDED.value
+
+    with caplog.at_level(logging.ERROR):
+        restored = serve_state.decode_replica_state_for_authority(1, state)
+
+    assert restored.status is serve_state.ReplicaStatus.UNKNOWN
+    assert 'projected UNKNOWN status' in caplog.text
+    assert str(sentinel_id) not in caplog.text
+    assert sentinel_payload not in caplog.text
 
 
 def test_recovery_field_copy_preserves_latest_and_increments_exactly_once(

@@ -51,7 +51,22 @@ SYSTEM_RECOVERY_STORAGE_FIELDS = (
 # key, including a completely absent bundle, is quarantined.
 V13_ADDITIVE_STORAGE_FIELDS = ('replica_record_id',
                                *SYSTEM_RECOVERY_STORAGE_FIELDS)
-_REPLICA_INFO_VERSION = 17
+_REPLICA_INFO_VERSION = 18
+V17_COLLISION_OPTIONAL_STORAGE_FIELDS = (
+    'reserved_fill_allocation_generation',
+    'reserved_fill_allocation_input_sha256',
+    'reserved_fill_allocation_claim_generation',
+    'reserved_fill_reconciliation_gate_generation',
+    'reserved_fill_reclaim_fleet_bundle_sha256',
+    'reserved_fill_reclaim_policy_revision',
+    'reserved_fill_reclaim_provider_inventory_sha256',
+    'reserved_fill_worker_projection_sha256',
+    'reserved_fill_observation_generation',
+    'reserved_fill_observation_sequence',
+    'reserved_fill_intent_idempotency_key',
+    'zero_cost_admission_sequence',
+    'zero_cost_materialization_sequence',
+)
 _SHA256_PATTERN = re.compile(r'^[0-9a-f]{64}$')
 
 # A fixed namespace makes the v12 transition identity
@@ -457,7 +472,7 @@ _REPLICA_INFO_LEGACY_DEFAULTS = {
 
 
 def _materialize_legacy_replica_info_fields(replica: Any) -> None:
-    """Own additive ReplicaInfo fields after decoding a pre-v17 record."""
+    """Own additive ReplicaInfo fields after decoding a pre-v18 record."""
     replica_state = vars(replica)
     for field, default in _REPLICA_INFO_LEGACY_DEFAULTS.items():
         replica_state.setdefault(field, default)
@@ -478,29 +493,62 @@ def _require_replica_info_fields(replica: Any, *, owner: str) -> None:
     _require_status_property_fields(replica.status_property, owner=owner)
 
 
-def _require_current_storage_fields(state: dict[str, Any]) -> None:
-    """Reject a v17 JSON record with missing owned-interface fields."""
-    missing = [
-        field for field in _REPLICA_INFO_STORAGE_FIELDS if field not in state
-    ]
-    if missing:
-        raise ValueError('Current ReplicaInfo storage record is missing '
-                         f'required fields: {", ".join(missing)}')
+def _require_exact_storage_fields(
+    state: dict[str, Any], *, owner: str, optional: tuple[str,
+                                                          ...] = ()) -> None:
+    """Require one closed top-level and status-property storage shape."""
+    expected = set(_REPLICA_INFO_STORAGE_FIELDS)
+    observed = set(state)
+    missing = sorted(expected - observed - set(optional))
+    unexpected = sorted(observed - expected)
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f'missing fields: {", ".join(missing)}')
+        if unexpected:
+            details.append(f'unexpected fields: {", ".join(unexpected)}')
+        raise ValueError(f'{owner} has an invalid top-level shape ('
+                         f'{"; ".join(details)}).')
     status_state = state['status_property']
     if not isinstance(status_state, dict):
-        raise ValueError('Current ReplicaInfo status_property must be a dict.')
-    missing_status = [
-        field for field in _REPLICA_STATUS_PROPERTY_FIELDS
-        if field not in status_state
-    ]
-    if missing_status:
-        raise ValueError('Current ReplicaInfo storage record is missing '
-                         'required ReplicaStatusProperty fields: '
-                         f'{", ".join(missing_status)}')
+        raise ValueError(f'{owner} status_property must be a dict.')
+    expected_status = set(_REPLICA_STATUS_PROPERTY_FIELDS)
+    observed_status = set(status_state)
+    missing_status = sorted(expected_status - observed_status)
+    unexpected_status = sorted(observed_status - expected_status)
+    if missing_status or unexpected_status:
+        details = []
+        if missing_status:
+            details.append(f'missing fields: {", ".join(missing_status)}')
+        if unexpected_status:
+            details.append(f'unexpected fields: {", ".join(unexpected_status)}')
+        raise ValueError(f'{owner} has an invalid status_property shape ('
+                         f'{"; ".join(details)}).')
+
+
+def _require_current_storage_fields(state: dict[str, Any]) -> None:
+    """Reject anything except the exact v18 JSON record shape."""
+    _require_exact_storage_fields(state, owner='ReplicaInfo v18')
+
+
+def _require_v17_collision_storage_fields(state: dict[str, Any]) -> None:
+    """Accept only the observed v17 collision, never generic legacy JSON."""
+    attribution = set(V17_COLLISION_OPTIONAL_STORAGE_FIELDS)
+    present_attribution = attribution.intersection(state)
+    if present_attribution not in (set(), attribution):
+        missing = sorted(attribution - present_attribution)
+        raise ValueError('ReplicaInfo v17 collision has a partially missing '
+                         'attribution bundle: '
+                         f'{", ".join(missing)}')
+    _require_exact_storage_fields(
+        state,
+        owner='ReplicaInfo v17 collision',
+        optional=(V17_COLLISION_OPTIONAL_STORAGE_FIELDS
+                  if not present_attribution else ()))
 
 
 def _require_current_pickle_fields(state: dict[str, Any], version: int) -> None:
-    """Reject a v17+ pickle whose owned in-memory interface is partial."""
+    """Reject a v18+ pickle whose owned in-memory interface is partial."""
     missing = [
         field for field in _REPLICA_INFO_OWNED_FIELDS if field not in state
     ]
@@ -942,6 +990,10 @@ class ReplicaInfo:
     # reserved-fill debits.
     # Version 16 binds reserved-fill attribution to the reconciliation-gate
     # generation and immutable deployment reclaim-policy identity.
+    # Version 18 repairs the v17 record-label collision: some v17 writers
+    # omitted the 13 sequenced-attribution keys added during Serve046. A
+    # pre-finalization normalizer rewrites every retained row through this
+    # serializer, adding explicit nulls only where that attribution is absent.
     _VERSION = _REPLICA_INFO_VERSION
 
     def __init__(self,
@@ -1057,28 +1109,23 @@ class ReplicaInfo:
                 not isinstance(record_version, int)):
             raise AttributeError(
                 'ReplicaInfo is missing a valid record version.')
-        if record_version < self._VERSION:
-            _materialize_legacy_replica_info_fields(self)
-        else:
-            _require_replica_info_fields(self,
-                                         owner=f'ReplicaInfo v{record_version}')
+        if record_version not in (17, self._VERSION):
+            raise ValueError('Only ReplicaInfo v17 collision records and '
+                             f'v{self._VERSION} records are writable; got '
+                             f'v{record_version}.')
+        _require_replica_info_fields(self,
+                                     owner=f'ReplicaInfo v{record_version}')
 
-        # Pre-v13 pickles have no recovery fields and are ordinary by
-        # contract. Every v13 recovery bundle must be complete; a partial or
-        # completely absent bundle is quarantined. Current v17 objects were
-        # checked above and can never enter either path.
+        # The precursor writer accepts only a complete v17 collision object or
+        # an exact v18 object. Both versions own the complete recovery bundle.
         present_recovery_fields = {
             field for field in V13_ADDITIVE_STORAGE_FIELDS
             if field in vars(self)
         }
-        if record_version < 13:
-            _set_ordinary_system_recovery_defaults(self)
-            _set_transition_replica_record_id(self)
-        elif present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):
-            _quarantine_system_recovery(
-                self, system_recovery_state.RecoveryQuarantineReason.
-                PARTIAL_V13_BUNDLE)
-        if record_version < self._VERSION:
+        if present_recovery_fields != set(V13_ADDITIVE_STORAGE_FIELDS):
+            raise system_recovery_state.RecoveryStateError(
+                f'ReplicaInfo v{record_version} has a partial recovery bundle.')
+        if record_version == 17:
             self._version = self._VERSION
         _require_replica_info_fields(self,
                                      owner=f'ReplicaInfo v{self._version}')
@@ -1218,16 +1265,23 @@ class ReplicaInfo:
     @classmethod
     def from_storage_dict(cls, state: dict[str, Any]) -> 'ReplicaInfo':
         """Reconstruct a replica from the JSON storage contract."""
-        record_version = int(state['replica_info_version'])
+        if not isinstance(state, dict):
+            raise ValueError('ReplicaInfo storage record must be a dict.')
+        record_version = state.get('replica_info_version')
+        if type(record_version) is not int:
+            raise ValueError('ReplicaInfo storage version must be an integer.')
         if record_version == cls._VERSION:
             _require_current_storage_fields(state)
+        elif record_version == 17:
+            _require_v17_collision_storage_fields(state)
+        else:
+            raise ValueError('Only ReplicaInfo v17 collision records and '
+                             f'v{cls._VERSION} records are readable; got '
+                             f'{record_version!r}.')
         status_state = state['status_property']
 
         def _status_value(field: str) -> Any:
-            if record_version == cls._VERSION:
-                return status_state[field]
-            return status_state.get(
-                field, _REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS[field])
+            return status_state[field]
 
         def _process_status(
             value: common_utils.ProcessStatus | str | None,
@@ -1303,61 +1357,43 @@ class ReplicaInfo:
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
         replica.paid_capacity_pool_key = state.get('paid_capacity_pool_key')
-        recovery_keys = set(V13_ADDITIVE_STORAGE_FIELDS)
-        present_recovery_keys = recovery_keys.intersection(state)
-        if replica._version < 13:
-            _set_ordinary_system_recovery_defaults(replica)
-            # Old writers cannot choose or preserve the v13 fence. Ignore an
-            # untrusted additive key on an old-labelled row.
-            _set_transition_replica_record_id(replica)
-        elif replica._version > cls._VERSION:
+        _set_ordinary_system_recovery_defaults(replica)
+        try:
+            replica.replica_record_id = state['replica_record_id']
+            intent_state = state['system_recovery_launch_intent']
+            replica.system_recovery_launch_intent = (
+                system_recovery_state.SystemRecoveryLaunchIntent.from_dict(
+                    intent_state) if intent_state is not None else None)
+            replica.system_recovery_disposition = (
+                system_recovery_state.SystemRecoveryDisposition(
+                    state['system_recovery_disposition']))
+            replica.launch_request_id = state['launch_request_id']
+            replica.service_job_id = state['service_job_id']
+            replica.candidate_ready_observed_at = state[
+                'candidate_ready_observed_at']
+            replica.ordinary_release_not_before = state[
+                'ordinary_release_not_before']
+            replica.system_recovery_revision = state['system_recovery_revision']
+            nested_state = state['system_recovery']
+            replica.system_recovery = (
+                system_recovery_state.ReplicaSystemRecovery.from_dict(
+                    nested_state) if nested_state is not None else None)
+            quarantine_state = state['system_recovery_quarantine']
+            replica.system_recovery_quarantine = (
+                system_recovery_state.SystemRecoveryQuarantine.from_dict(
+                    quarantine_state) if quarantine_state is not None else None)
+        except (system_recovery_state.RecoveryStateError, TypeError,
+                ValueError):
             _quarantine_system_recovery(
                 replica, system_recovery_state.RecoveryQuarantineReason.
-                INCONSISTENT_V13_BUNDLE)
-        elif present_recovery_keys != recovery_keys:
-            _quarantine_system_recovery(
-                replica, system_recovery_state.RecoveryQuarantineReason.
-                PARTIAL_V13_BUNDLE)
+                MALFORMED_V13_BUNDLE)
         else:
-            _set_ordinary_system_recovery_defaults(replica)
             try:
-                replica.replica_record_id = state['replica_record_id']
-                intent_state = state['system_recovery_launch_intent']
-                replica.system_recovery_launch_intent = (
-                    system_recovery_state.SystemRecoveryLaunchIntent.from_dict(
-                        intent_state) if intent_state is not None else None)
-                replica.system_recovery_disposition = (
-                    system_recovery_state.SystemRecoveryDisposition(
-                        state['system_recovery_disposition']))
-                replica.launch_request_id = state['launch_request_id']
-                replica.service_job_id = state['service_job_id']
-                replica.candidate_ready_observed_at = state[
-                    'candidate_ready_observed_at']
-                replica.ordinary_release_not_before = state[
-                    'ordinary_release_not_before']
-                replica.system_recovery_revision = state[
-                    'system_recovery_revision']
-                nested_state = state['system_recovery']
-                replica.system_recovery = (
-                    system_recovery_state.ReplicaSystemRecovery.from_dict(
-                        nested_state) if nested_state is not None else None)
-                quarantine_state = state['system_recovery_quarantine']
-                replica.system_recovery_quarantine = (
-                    system_recovery_state.SystemRecoveryQuarantine.from_dict(
-                        quarantine_state)
-                    if quarantine_state is not None else None)
-            except (system_recovery_state.RecoveryStateError, TypeError,
-                    ValueError):
+                _validate_system_recovery_fields(replica)
+            except system_recovery_state.RecoveryStateError:
                 _quarantine_system_recovery(
                     replica, system_recovery_state.RecoveryQuarantineReason.
-                    MALFORMED_V13_BUNDLE)
-            else:
-                try:
-                    _validate_system_recovery_fields(replica)
-                except system_recovery_state.RecoveryStateError:
-                    _quarantine_system_recovery(
-                        replica, system_recovery_state.RecoveryQuarantineReason.
-                        INCONSISTENT_V13_BUNDLE)
+                    INCONSISTENT_V13_BUNDLE)
         drain_started_at = _status_value('drain_started_at')
         logical_retirement_committed = _status_value(
             'logical_retirement_committed')
@@ -1398,18 +1434,15 @@ class ReplicaInfo:
         )
         quarantine = replica.system_recovery_quarantine
         if quarantine is not None:
-            # Isolate only this row.  Never include its raw storage payload in
-            # the audit record or exception text.
+            # Isolate only this row. Logging is intentionally owned by the
+            # runtime storage boundary; this decoder is also used by secret-
+            # safe maintenance operations and must remain side-effect free.
             replica.status_property.service_ready_now = False
             replica.first_consecutive_failure_time = None
             if replica.status_property.sky_down_status is None:
                 replica.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SUCCEEDED)
                 replica.status_property.user_app_failed = True
-            logger.warning(
-                'Quarantined system recovery state for replica %s (%s); '
-                'the row remains off-route pending legacy cleanup.',
-                replica.replica_id, quarantine.reason.value)
         _require_replica_info_fields(
             replica, owner=f'decoded ReplicaInfo v{record_version}')
         _validate_reserved_fill_allocation_attribution(replica)
@@ -1543,9 +1576,6 @@ class ReplicaInfo:
             if self.status_property.first_ready_time is None:
                 return serve_state.ReplicaStatus.STARTING
             return serve_state.ReplicaStatus.NOT_READY
-        if replica_status == serve_state.ReplicaStatus.UNKNOWN:
-            logger.error('Detecting UNKNOWN replica status for '
-                         f'replica {self.replica_id}.')
         return replica_status
 
     def to_info_dict(

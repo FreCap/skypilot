@@ -1,13 +1,18 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: Serve046, its separately packaged Boltz reclaim policy, and the local
-Serve047 final-state cleanup restack are implemented after the identity-free
-worker-partition correction. Automated validation and three consecutive exact
-adversarial reviews are complete. Platform prerequisites remain; the feature
-is not deployed or activated, and the cleanup remains blocked on its documented
-live final-state gate
+Status: Serve046 merged in source PR #1451 and is present in the sealed live
+1.1.1276 release at source commit
+`8e16585659a9f4361f55052d88199a1c4615e27a`. Its independently releasable
+ReplicaInfo v18 precursor A is implemented locally but is not merged,
+published, or deployed. Publisher B and final Serve047 cleanup C are pending.
+The prior review record is historical.
+Precursor A requires independent security/contract review and CI before merge;
+three consecutive pragmatic adversarial rounds are required later against the
+frozen final A/B/C and platform heads before final deployment/completion.
+Platform PRs 14, 17, 18, and 19 remain unapplied, reserved-fill activation has
+not occurred, and cleanup remains blocked on the documented live receipt gates.
 
-Last updated: 2026-08-13
+Last updated: 2026-08-14 (precursor A sequencing correction)
 
 Canonical owner: this file
 
@@ -60,6 +65,47 @@ and do not retain a second operator-selectable happy path. A problem after
 activation is repaired by deploying a successor image and authorizing one new
 gate generation through the same command and transaction used for first
 activation. The prior generation then fails closed.
+
+The cross-repository rollout has one ordered fix-forward stack:
+
+1. Platform PR 14 migrates the sealed live 1.1.1276 release from the one-pod
+   `all` topology to an exact 2/2/2 `api`/`controller`/`executor` cohort and
+   physically deletes `all`. It never deploys precursor A.
+2. Precursor A introduces v18 and the one-shot receipt at Serve schema 046 and
+   is the final release produced by the old publisher. Platform PR 17 consumes
+   that exact A tuple, rolls the already-split cohort in place, proves all six
+   writers and no old writer, runs normalization, and archives the receipt.
+3. Only after that receipt, independently releasable publisher B establishes
+   the sole exact source image/chart publication contract and physically
+   deletes superseded moving-tag, overlay, and parallel chart publication
+   paths. Its first run must fail closed without publishing because the
+   canonical role does not exist yet. Platform PR 18 then adopts and hardens
+   the Rainier runtime and Como chart registries and publisher roles in
+   separate account applies/readbacks; it creates no Helm revision.
+4. Only after both PR 18 readbacks, final cleanup C drops the pickle column and
+   physically removes the temporary v17 runtime reader, normalizer, one-pod/
+   `all` source controls, and every other transition-only executable path. The
+   canonical roles publish C's immutable Serve047 image/chart tuple. Platform
+   PR 19 alone pins that tuple, upgrades the already-split release in place,
+   enables typed storage, and physically removes the remaining platform and
+   publisher transition paths.
+
+The exact operational split-old baseline is source/tag commit
+`8e16585659a9f4361f55052d88199a1c4615e27a`, Git tag `v1.1.1276`, API 77,
+runtime image
+`255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.1276@sha256:a832ad33d373a29f869528e5b54062cafc351320047360ee5a3147191b76f57c`,
+and chart version `1.1.1276` at
+`oci://699626303757.dkr.ecr.us-east-1.amazonaws.com/helm-charts/skypilot` with
+digest
+`sha256:0ae11215d6573334b49adfe83209c081c5a063559d69e0332d4a992894f9e8ad`.
+PR 14 must bind fresh live Helm values and an exact render to that tuple before
+it is applicable. Revision-389 release 1.1.1273 at source commit
+`c24ae4fe08a03101180c8401a34a1b241444116b` is historical audit evidence only,
+never an operational checkpoint, split target, intermediate apply, or fallback.
+
+Only frozen historical Alembic replay code remains after C; runtime code does
+not import it. There is no rollback branch, legacy publisher, topology
+re-creation, or second Helm/runtime happy path to preserve.
 
 Code rollout and gate activation are separate operations. The image may be
 rolled out while the gate remains `LEGACY_ACTIVE`. Activation is withheld if
@@ -491,7 +537,9 @@ before it can inspect the service and replica to learn whether the launch is
 zero-cost. Stale whole-row updates merge the immutable database-assigned event
 markers from the locked row, so a retry cannot erase or replace either one.
 
-Replica state version 17 persists the complete typed fill attribution:
+Replica state version 18 persists the complete typed fill attribution. The
+precursor's narrowly bounded v17 reader exists only to normalize the two exact
+observed v17 shapes described in the deployment gate below:
 
 - allocation generation, input hash, and claim generation;
 - observation generation and sequence;
@@ -1489,7 +1537,7 @@ under the same-session broker and fleet locks before atomically binding the
 complete evidence and writer receipt in the gate CAS. On first activation,
 every PENDING or PROVISIONING row is locked and decoded. Non-fill rows are
 ignored only after a current decode; every queued fill must be an exact current
-ReplicaInfo v17 record whose scalar columns agree, service version equals the
+ReplicaInfo v18 record whose scalar columns agree, service version equals the
 locked committed version, projection digest matches the locked claim
 admission, and policy tuple names the successor generation. Worktree-only v16,
 a stale version or digest, a partial policy tuple, or any decode/proof failure
@@ -1552,12 +1600,13 @@ before activation. If it does not, the new image may deploy but the gate stays
   exposed to the deployment policy. Protocol v1 remains only as the historical
   ordinary-launch decoder pending cleanup PR #1452.
 - API capability 77 advertises projection protocol v2; allocation-map schema 5
-  binds service version and the closed digest map; ReplicaInfo v17 persists the
-  selected scalar digest. Historical v15 records remain readable but cannot
-  pass a sequenced launch fence, and worktree-only v16 is not a durable format.
+  binds service version and the closed digest map; ReplicaInfo v18 persists the
+  selected scalar digest. The precursor reads only the two exact historical
+  v17 shapes long enough to produce the required normalization receipt;
+  historical v15 and worktree-only v16 are not live formats.
 - Concurrent provider-free pool observer and typed blackouts.
 - Committed-observation broker rounds and complete authenticated maps.
-- Ordinary zero-cost commit sequencing and complete v17 attribution.
+- Ordinary zero-cost commit sequencing and complete v18 attribution.
 - Lost-wakeup-free controller coordinator and optimistic actuation generation.
 - Pure planner, autoscaler adapter, manager sparse receipt, and receipt-driven
   rotation.
@@ -1569,16 +1618,19 @@ before activation. If it does not, the new image may deploy but the gate stays
   CAS.
 - Provider-free reconciliation diagnostics derived from current authenticated
   schema-5 allocation, its exact durable observations, and exact-version/
-  projection v17 replica rows.
-- An exact v17 queued-effect proof at first activation and per-mutation
+  projection v18 replica rows.
+- An exact v18 queued-effect proof at first activation and per-mutation
   Kubernetes guards with immediate create-response attestation, guard-free
   passive waits, and durable-owner cleanup after a terminal fence.
 
-None of the above is merged, deployed, or activated as of this update. The
-implementation and owner-death/request-liveness integration are complete in
-this worktree. The exact non-PostgreSQL and serial PostgreSQL validation passes
-and three consecutive adversarial reviews are recorded below. Remote CI on the
-published exact successor must pass before merge.
+The Serve046 base above merged in source PR #1451. Precursor A's v18 live
+contract and normalizer are implemented only in this local successor; A is not
+merged, published, or deployed, and reserved-fill is not activated. The
+validation and three-round review records below describe earlier exact
+Serve046 revisions and remain historical evidence only. They do not satisfy
+A's independent merge review or the three final reviews of the frozen
+integrated A/B/C/platform stack. Remote CI on each published exact successor
+must pass before merge.
 
 ### Runtime audit corrections implemented and frozen for review
 
@@ -1642,7 +1694,7 @@ The current worktree now:
     aggregate/per-card feed, and enforces the physical-or-logical
     `max_replicas` unit before advancing the admission sequence; and
 16. binds Serve046 service version and projection-v2 Kueue identity through
-    claims, schema-5 maps, v17 rows, activation, status, and terminal launch,
+    claims, schema-5 maps, v18 rows, activation, status, and terminal launch,
     while splitting built-in Kubernetes mutation guards from passive `-1`
     scheduling/readiness waits; and
 17. retains exact finite-request generation/token/worker/guardian-PID/process-
@@ -1779,12 +1831,13 @@ either case.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
-| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045 reclaim-policy identity | Implemented and behavior-frozen; exact automated freeze and three consecutive adversarial reviews pass. |
-| 1b | Worker projection protocol v2, Serve046 version/digest claim binding, allocation schema 5, replica state v17, exact projected Kueue rendering, and terminal revalidation | Implemented and behavior-frozen; exact automated freeze and three consecutive adversarial reviews pass. |
-| 2a | Full-fleet combined feature-and-policy image rollout while the gate remains `LEGACY_ACTIVE` | Not deployed. |
-| 2b | Deployment-owned Kueue bundle and unique entry-point policy, including ongoing future-claim and launch fences | The separately packaged plugin, strict bundle, Node cross-attestation, unique entry point, and reusable least-privilege spoke audit boundary are integrated into the one feature image and focused tests pass. They are not upstream-merged or deployed, and the exact IAM/RBAC/Kueue live gates above do not pass. |
-| 2c | Generation-fenced reconciliation authorization after exact fleet, schema, claim, and reclaim attestation | Not activated; the combined image cannot activate until the deployment policy and live attestation gates pass. |
-| 3 | Compatibility-path deletion in draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452), including forward-only Serve047 steady-state bootstrap | Reauthored and tested in the exact restack; it remains draft and merge-gated below. |
+| 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045/046 reclaim-policy identity | Merged in source PR #1451. Its prior freeze/reviews are historical evidence, not a pass for the current stack. |
+| 1b | Precursor A: replica state v18 plus its one-shot normalization receipt | Implemented locally; independent security/contract review and CI remain open before A merge. |
+| 2a | Platform PR 14: sealed live 1.1.1276 from one-pod `all` to exact split 2/2/2, with `all` deleted | Not applied; it contains no A code. |
+| 2b | Platform PR 17: roll the already-split fleet to the exact old-publisher A tuple and accept its normalization receipt | Blocked until A is merged, published, and the exact tuple is reviewed. |
+| 2c | Publisher B and platform PR 18: exact-only source publication, expected pre-adoption no-publish, then separate registry/role adoption and readbacks with no Helm revision | Not merged or applied. |
+| 2d | Deployment-owned Kueue bundle, unique entry-point policy, and generation-fenced authorization | Not activated; the live IAM/RBAC/Kueue attestation gates remain open. |
+| 3 | Source cleanup C and platform PR 19: publish/pin Serve047, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
 
 Durable acceptance hands rows to the existing asynchronous launch path, and
 status projects the same allocation/observation evidence used by
@@ -1796,56 +1849,57 @@ reconciliation; neither is a second source of launch authority.
 
 Before changing the gate:
 
-1. Run the complete required test suite and three passing adversarial reviews
-   against this exact file and code revision.
-2. Merge the feature only after its stacked cleanup PR has been authored and
-   linked as described below; the cleanup remains draft and merge-gated.
-3. Build and push one immutable image from the merged feature commit. The image
-   contains both the generic Serve implementation and the separately packaged,
-   unique Boltz policy plugin; there is no preparatory generic-only deployment
-   or second policy-image happy path.
-4. Record the live Helm release name, namespace, chart revision, complete
-   release values, rendered role topology, and immutable image identities for
-   diagnosis, but use fix forward rather than Helm rollback.
-5. Review one direct Helm upgrade that preserves the live release values and
-   changes only the full-fleet runtime image for this rollout. Do not change
-   the PostgreSQL target, credentials, persistent storage, role topology,
-   namespace, reserved-pool infrastructure, or Kueue policy in the same
-   upgrade.
-6. API-request schema 010 and the managed-job slot columns have not shipped.
-   Apply their additive migrations before target-image Pods become Ready. The
-   ordinary controller leader handoff is the only cutover: the old leader stops
-   claims and drains its request workers and controller processes before
-   releasing leadership; the new image advances the outer generation, recovers
-   nullable or prior-generation managed-job rows as stale ownership, then
-   transactionally starts its fixed slot supervisors. Verify that no old-image
-   controller lease or controller process remains before calling the
-   controller cohort converged. There is no shared PID-file migration, Recreate
-   flag, or alternate scheduler path to activate or later remove.
-7. After the current all-role Pod converges on the combined image, use the
-   separately reviewed Rainier migration stack to replace it with the full
-   split-role `api`, `controller`, and `executor` cohort on that same immutable
-   image and shared RWX state. Wait for every role to be Ready. This is a fleet
-   rollout, not a capacity canary. The gate remains `LEGACY_ACTIVE` throughout
-   both image and topology convergence.
-8. Verify public server API capability 77, API-request schema 010, Serve schema
-   046, worker placement projection protocol 2, allocation-map schema 5,
-   replica state 17, and reserved-fill protocol v2. Confirm every active
-   reserved-fill service version has exact protocol-v2 worker projections;
-   historical v1 projections cannot pass activation-ready claim checks.
-   Confirm every queued PENDING/PROVISIONING fill row is an exact current v17
-   record bound to the locked current service version, claim projection digest,
-   and successor policy tuple; drain any legacy, stale, or undecodable row.
+1. Precursor A must pass its independent security/contract review, CI, and
+   exact test suite before merge. After A/PR 17, B/PR 18, and C's publication
+   freeze every final source and platform head, run three consecutive pragmatic
+   adversarial rounds before PR 19's final deployment/completion. Any material
+   change resets that final sequence.
+2. Platform PR 14 must first apply the sealed live 1.1.1276 tuple to the migrated
+   RWX state while converting one-pod `all` to exact 2/2/2
+   `api`/`controller`/`executor` and deleting `all`. Capture the live Helm
+   revision, release values, render, Pods, and writer leases. PR 14 contains no
+   precursor code and never runs normalization.
+3. Merge and publish precursor A through the old publisher as that publisher's
+   final release. Amend platform PR 17 with one reviewed source, version,
+   runtime digest, chart digest, module pin, API version, and structural proof.
+   PR 17 rolls the existing 2/2/2 cohort in place; it must not create, replace,
+   or revive the `all` topology.
+4. During PR 17, apply API-request schema 010 and the managed-job slot columns
+   before A Pods become Ready. Let the ordinary controller leader handoff drain
+   old claims/processes, then prove exactly six Ready same-digest A writers and
+   no old writer. Verify API capability 77, API-request 010, Serve 046,
+   projection protocol 2, allocation schema 5, replica state 18, and
+   reserved-fill protocol v2. Run the normalization gate below and archive its
+   accepted exact receipt while authority remains `LEGACY_ACTIVE`.
+5. Only after that receipt, merge publisher B. Its first automatic run must
+   fail closed without publishing while the canonical role is absent. Platform
+   PR 18 then adopts and hardens the Rainier runtime and Como chart
+   registries/roles in separate account applies and readbacks. PR 18 creates no
+   Helm revision and does not deploy A or change topology.
+6. Only after both PR 18 account readbacks, merge cleanup C. C physically
+   removes the normalizer, v17 live decoder, pickle column, and source
+   topology/transition controls, while requiring B's superseded publisher paths
+   to remain absent. The canonical roles publish one immutable C image/chart
+   tuple and receipt.
+7. Amend platform PR 19 with that exact C tuple and publication receipt. PR 19
+   upgrades the already-split release in place, enables the typed worker-cache
+   contract, and physically removes platform publisher/storage/topology
+   transition paths. It must not create or replace the split topology.
+8. Prove every active reserved-fill service version has exact protocol-v2
+   worker projections and every queued PENDING/PROVISIONING fill row is exact
+   v18 bound to its locked service version, projection digest, and successor
+   policy tuple. Drain any stale or undecodable row; no legacy fallback is
+   permitted.
 9. Prove the deployment-owned Kueue LocalQueue, ClusterQueue namespace
    selection, shared preemption domain, workload priorities, strict SkyPilot
    configuration, RBAC, and fail-closed admission contract for every reserved
    inference context. Pod priority alone does not pass this gate. Launch no GPU
    or BCL verification workload for this rollout.
-10. Prove that every split-role Pod runs the one combined immutable image and
-    that the unique Boltz policy entry point resolves from its separately
-    packaged wheel. Re-run the exact fleet/schema/policy status proof before
-    activation. A fix-forward image is required only to correct a defect; it
-    replaces the complete fleet and does not create another supported path.
+10. Prove every split-role Pod runs the one immutable C image and the unique
+    Boltz policy entry point resolves from its separately packaged wheel before
+    first authorization. Later defects replace the complete fleet with a new
+    immutable tuple and use the same generation-fenced command; no rollback or
+    second policy/image path exists.
 
 The live Helm release is the deployment authority. A platform repository pin,
 Terraform/Terragrunt state, or open platform PR is neither a prerequisite nor
@@ -1866,6 +1920,105 @@ admission, and the code-owned policy plugin are implemented and reviewed. It
 is not smuggled into the runtime-image Helm upgrade and does not block
 deploying the combined image safely at `LEGACY_ACTIVE`; it does block
 activation.
+
+### ReplicaInfo v18 expand-and-normalize gate
+
+Production exposed a v17 label collision: retained rows were labelled current
+while some omitted the 13 sequenced-attribution keys introduced during the
+Serve046 development sequence. Generic legacy materialization would conceal
+that collision and could invent authority. The independently releasable
+precursor therefore moves the writer to v18. Runtime accepts exact v18, while
+the transitional v17 reader accepts exactly two closed v17 shapes: complete
+v17, or the one observed v17 collision shape with all 13 known collision
+fields absent. The collision shape becomes 13 explicit `null` values; a
+complete v17 value is preserved exactly. A
+partially missing attribution bundle, unknown field, a
+missing non-collision field, an incomplete status subdocument, and every other
+record version fail closed. The precursor also stops all live pickle
+dual-writes; the nullable column remains only until Serve047 drops it.
+
+Platform PR 14 must already have established this split topology on sealed live
+1.1.1276 and deleted `all`. Platform PR 17 changes only the existing cohort's
+immutable tuple. After exactly two `api`, two `controller`, and two `executor`
+Pods and their six Pod-bound writer leases are Ready on the same immutable A
+digest, with no old writer remaining, run the source-owned internal one-shot
+operation
+from that exact API Deployment (replace `<namespace>` and `<api-deployment>`
+with the reviewed live objects):
+
+```bash
+kubectl -n <namespace> exec deploy/<api-deployment> -c skypilot-api -- \
+  python -m sky.serve.replica_record_normalization --json
+```
+
+There is deliberately no public API, SDK, CLI, feature flag, or alternate
+normalization path. The operation proves the token-bound exact 2/2/2
+API/controller/executor writer rollout before and during the cutover, requires
+PostgreSQL at exact Serve schema revision 046, and takes the shared broker lock
+plus an `ACCESS EXCLUSIVE` replicas-table lock. It validates every retained row
+before the first update, including exact parity between JSON and every
+JSON-derived query scalar (`status`, `sky_down_status`, `version`,
+`cluster_name`, `created_at`, `is_spot`, and `paid_capacity_pool_key`). It does
+not repair denormalized scalar authority. It rewrites all rows atomically
+through the canonical serializer, preserves present
+attribution with exact JSON types and values, materializes only absent
+collision fields as null, and clears every legacy pickle. In the same atomic
+boundary it installs an enforced check requiring non-null outer version 1,
+non-null v18 JSON, and a null pickle column, so neither a v17 writer, a
+SQL-NULL outer version, nor stale pickle repopulation can return. Constraint
+validation is a separate, safely resumable transaction because replica updates
+can leave deferred foreign-key trigger events; the already-enforced check
+protects the gap. Failures identify only an opaque row ordinal and a controlled
+reason or exception class, suppress raw exception chaining, and never expose
+persisted identifiers, payloads, or credentials.
+`ReplicaInfo.from_storage_dict()` is a pure decoder with no logging side
+effects, and `ReplicaInfo.status` is the single pure status projection. The
+ordinary Serve row-read wrapper owns operational quarantine reporting and emits
+an identifier-free warning when that canonical projection is `UNKNOWN`; the
+normalizer calls the same pure decoder and projection directly. Quarantined
+recovery fields or an `UNKNOWN` stored status therefore cannot leak a persisted
+row identity while A validates retained state.
+
+The single stdout line is the durable deployment receipt. It contains counts
+and the immutable writer digest, never row payloads, credentials, or service
+names. Platform evidence must retain the exact JSON and require all of these
+invariants:
+
+```json
+{
+  "already_current_records": 0,
+  "constraint": "ck_replicas_replica_info_version_18",
+  "contract": "skyserve.replica-info-v18-normalization/v1",
+  "invalid_records": 0,
+  "remaining_legacy_pickle_records": 0,
+  "remaining_noncurrent_records": 0,
+  "rewritten_records": 1,
+  "scanned_records": 1,
+  "scanned_services": 1,
+  "schema_version": 18,
+  "serve_database_revision": "046",
+  "writer_deployment_roles": ["api", "controller", "executor"],
+  "writer_image_digest": "sha256:<exact-precursor-digest>",
+  "writer_pod_inventory_count": 6,
+  "writer_pod_inventory_sha256": "<exact-inventory-sha256>",
+  "writer_process_count": 6
+}
+```
+
+The counts are live values, not expected constants, but
+`scanned_records == rewritten_records + already_current_records`, both
+`remaining_*` fields and `invalid_records` are zero,
+`serve_database_revision` is `046`, the role list, Pod count, process count,
+and inventory hash prove the exact 2/2/2 cohort, and `writer_image_digest`
+equals the digest proven on every split writer role. A
+failed or absent receipt blocks Serve047. Rerunning after an interrupted
+validation is safe and produces an idempotent receipt. Serve047 then asserts
+the exact v18/key shape, drops the pickle column, and physically deletes the
+v17 runtime decoder and this normalization module; normalization is not a
+permanent happy path. Historical Alembic replay retains only the
+migration-owned, executable-global-allowlisted frozen pickle converter used by
+revisions 010 (maximum v7) and 026 (maximum v11). No runtime module imports it,
+and it cannot be called as a live compatibility path.
 
 ### Mechanical activation
 
@@ -2002,6 +2155,7 @@ uv run --no-sync pytest -q \
   tests/unit_tests/test_serve_replica_api.py \
   tests/unit_tests/test_serve_replica_managers.py \
   tests/unit_tests/test_serve_replica_record_contract.py \
+  tests/unit_tests/test_serve_state.py \
   tests/unit_tests/test_serve_utils.py \
   tests/unit_tests/test_interrupt_request_for_retry.py \
   tests/unit_tests/test_sky/server/requests/test_executor.py \
@@ -2035,6 +2189,7 @@ SKYPILOT_TEST_POSTGRES_URL=postgresql:///postgres \
   tests/unit_tests/test_reserved_fill_broker_pg.py \
   tests/unit_tests/test_reserved_fill_terminal_fence_pg.py \
   tests/unit_tests/test_reserved_fill_multi_pool_state.py \
+  tests/unit_tests/test_replica_record_normalization_pg.py \
   tests/unit_tests/test_serve_ordinary_launch_handoff_schema_041_pg.py \
   tests/unit_tests/test_serve_placement_normalization_schema_040_pg.py \
   tests/unit_tests/test_serve_resource_action_schema_033_pg.py \
@@ -2062,8 +2217,9 @@ Kubernetes tests cover fresh authorization for normal/AppArmor/409 create
 attempts and rejection cleanup, immediate create-response attestation,
 guard-free passive `provision_timeout: -1` waits, terminal cancellation, and
 durable-owner cleanup instead of opaque request teardown. PostgreSQL activation
-tests prove exact v17 queued authority and reject v16, stale service versions,
-and stale projection digests. Request tests cover exact outer-guardian
+tests prove exact v18 queued authority and reject pre-normalization v17/v16,
+stale service versions, and stale projection digests. Request tests cover exact
+outer-guardian
 receipts, pre-effect pidless claims, ambiguous RUNNING legacy claims, PID reuse
 and pidfd signalling, abrupt-boundary deferral, terminal result preservation,
 and the absence of any PID-death receipt shortcut. They cover ordinary and
@@ -2225,23 +2381,27 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
   product. The integrated policy/interface superset passes 132/132; Ruff and
   targeted mypy pass, pylint is 10.00/10, JSON parsing, compilation,
   formatting, and `git diff --check` pass.
-- The post-correction local Serve047 implementation restack at `1efa6b284`
-  passes 58/58
+- A historical post-correction local Serve047 implementation restack at
+  `1efa6b284` passed 58/58
   focused final-state, cleanup-presence, manager-receipt,
   reconciliation-transition, and status tests; the combined policy superset
   passes 134/134; and its required real-PostgreSQL Serve047 schema suite passes
   12/12 with zero skips against the isolated local PostgreSQL server.
-  These reruns supplement the complete cleanup freeze recorded below; the
-  final cleanup OID will change when it is rebased over review-record-only
-  feature commits, without changing its tested implementation tree.
-- No merge commit, deployment revision, activation result, live GPU fill, or
-  BCL preemption result is claimed in this document yet.
+  These results describe a superseded cleanup tree. They do not validate or
+  freeze current cleanup C, whose exact replacement revision and tests remain
+  open.
+- No A, B, or C merge/publication, platform PR 14/17/18/19 apply, activation
+  result, live GPU fill, or BCL preemption result is claimed in this document.
 
-### Adversarial review record
+### Historical adversarial review record
 
-The implementation is not merge-ready until three consecutive reviews pass
-against the exact current file and code. A finding that changes behavior must
-update this file before the next round.
+The final integrated A/B/C/platform stack has zero passing final review rounds.
+Three new consecutive pragmatic reviews run only after every final head is
+frozen and before final deployment/completion; any material change resets the
+sequence. A's earlier merge gate is the independent security/contract review
+and CI described above, not a separate three-round sequence. The table below is
+retained only as historical Serve046 evidence and no row counts toward the new
+sequence.
 
 One non-counting review attempt on feature `b93db03fb` and cleanup
 `1094b9ded` failed. It found that the deployment policy rejected valid
@@ -2271,28 +2431,25 @@ system.
 
 ## Transitional code and stacked removal path
 
-The feature PR is stacked with a cleanup PR before the feature is marked
-ready. The stack is:
+Source PR #1451 is the already-merged Serve046 base, not an open transition
+PR. The current source stack is:
 
-1. Feature PR [#1451](https://github.com/boltz-bio/skypilot/pull/1451),
-   `feat/serve-event-driven-reserved-fill`: additive observation ledger,
-   authenticated allocation, sequenced planner/receipt, activation and active
-   reauthorization, compatibility path, and transition tests.
-2. Draft cleanup PR [#1452](https://github.com/boltz-bio/skypilot/pull/1452),
-   `cleanup/serve-sequenced-reserved-fill`: final steady state with the
-   standalone protocol activation/demotion and legacy launch paths deleted.
-   It retains `reserved_fill_reconciliation_transition status/activate` as the
-   sole first-authorization and reauthorization surface and remains blocked
-   until the merge gate below is met.
+1. precursor A, targeting `improvements`: temporary v18 live reader/writer and
+   one-shot normalizer for platform PR 17;
+2. independently releasable publisher B: the exact-only publication contract
+   and physical deletion of superseded publisher paths, with no runtime or
+   schema behavior change; and
+3. final cleanup C: forward-only Serve047 plus physical deletion of every live
+   compatibility and transition path. C retains
+   `reserved_fill_reconciliation_transition status/activate` as the sole
+   first-authorization and reauthorization surface.
 
-Exact feature and cleanup commit IDs are recorded after the final review-record
-commit and final cleanup rebase. The local PR #1452 implementation has been
-restacked onto the frozen feature, reauthored for Serve046/projection v2 and
-the controller-runtime transition removals, and rerun against the integrated
-policy tree. The old remote cleanup tip remains stale and is not deployment or
-merge evidence. Any earlier remote cleanup tip is stale evidence after the
-final exact successor is published. Historical cleanup PR #1263 is not this correction's removal
-PR.
+Platform PR 14 precedes A's deployment; PR 17 deploys and normalizes A; PR 18
+follows B and creates no Helm revision; PR 19 alone pins and deploys C. The
+remote draft cleanup PR
+[#1452](https://github.com/boltz-bio/skypilot/pull/1452) is a stale predecessor,
+not current C or merge/deployment evidence. It must be replaced or updated to
+the exact reviewed C revision. Historical cleanup PR #1263 is unrelated.
 
 The cleanup uses a new forward-only Serve047 migration; it never edits or
 renumbers historical Serve044, Serve045, or Serve046. Serve047 preserves the
@@ -2319,6 +2476,16 @@ second bootstrap actuator.
 
 The cleanup change removes, rather than perpetuates:
 
+- the `replica_info` pickle column, live v17 reader, one-shot v18 normalizer,
+  its command/tests, and every transition-only receipt consumer after the exact
+  archived receipt passes; frozen revisions 010/026 migration replay is the
+  only historical pickle code retained;
+- the one-pod/all runtime role and corresponding Helm values, templates,
+  conditionals, tests, and operator knobs after the exact split-role receipt;
+- no superseded image/chart publisher workflow, overlay builder, moving tag,
+  or release fallback; B must physically delete those source paths before C is
+  eligible, C's final absence tests prevent their reintroduction, and PR 19
+  later deletes the retired external publisher identity;
 - the `LEGACY_ACTIVE` provider-query branch in protocol-v2 broker cycles;
 - legacy fill launch emission and emission-time feed/rotation spending from
   `_apply_reserved_capacity_fill_v2()`;
@@ -2349,9 +2516,23 @@ not transition-only code. Read-only historical row decoding may remain only
 where durable terminal data still requires it; the protocol-v1 ordinary worker
 projection decoder does not remain after its gate passes.
 
-The cleanup PR's exact merge gate is:
+Cleanup C's merge/publish gate and platform PR 19's later apply gate are
+distinct. Before evaluating the runtime gates below, the archived PR 17
+precursor A receipt must prove Serve revision 046, v18, zero
+pickle/noncurrent rows, exact 2/2/2 Pods and writer leases, and one immutable
+image digest. Publisher B must be merged, its expected pre-adoption run must
+have failed closed without publishing, and both platform PR 18 account applies
+and readbacks must have passed without creating a Helm revision. Missing
+evidence blocks C; it never permits a legacy path.
 
-1. the feature PR is merged and the full split-role fleet is running its image;
+After the runtime gates pass, C may merge and the canonical roles publish its
+immutable Serve047 image/chart tuple. PR 19 must not merge, plan, or apply until
+that exact publication receipt and all final platform absence gates pass. PR 19
+then pins C and upgrades the existing split topology in place; it does not
+create or replace that topology.
+
+1. source PR #1451 is merged, PR 14's split-old receipt is accepted, and PR 17
+   has the full split-role fleet running A with its normalization receipt;
 2. production reports `SEQUENCED_ACTIVE` and cannot demote;
 3. at least three consecutive observation periods complete without a stale
    writer overwriting a successor, a map-authentication failure caused by
@@ -2379,7 +2560,7 @@ The cleanup PR's exact merge gate is:
     require the stable Pod -> ReplicaSet -> Deployment owner chain. Tests also
     prove chart RBAC retains `get` on ReplicaSets, the protocol-v1 worker
     projection decoder is physically absent, and schema-5 allocations plus
-    v17 replica attribution still round-trip and fence correctly.
+    exact v18 replica attribution still round-trip and fence correctly.
 
 This gate is intentionally short and fix-forward compatible. It proves the
 old path is no longer needed without imposing a 24-hour soak or a GPU/BCL
@@ -2388,11 +2569,20 @@ legacy activation.
 
 ## Open gates
 
-- Merge the feature stack.
-- Build and deploy one immutable image to the complete split-role fleet with a
-  reviewed direct Helm upgrade using `--reuse-values`; verify the rendered
-  change and live rollout preserve all existing release values and persistent
-  resources.
+- Apply platform PR 14 to convert sealed live 1.1.1276 from one-pod `all` to
+  exact split 2/2/2 and delete `all`; archive its live Helm/render/lease proof.
+- Complete A's independent security/contract review, exact validation, and CI;
+  merge and publish A through the old publisher, then amend/apply PR 17 to roll
+  the already-split fleet in place and archive the normalization receipt.
+- Merge B only after that receipt. Prove B's expected no-publish run, then
+  apply and read back PR 18's separate canonical registry/role adoptions; PR 18
+  must create no Helm revision.
+- Complete C after the PR 18 readbacks, merge it, and archive its canonical
+  immutable image/chart publication receipt. Amend PR 19 with that exact tuple,
+  freeze every final A/B/C/platform head, then pass three consecutive pragmatic
+  adversarial rounds; any material change resets the sequence.
+- Pass every final absence gate, then apply PR 19 to upgrade the already-split
+  release in place and delete all remaining transition paths.
 - Record the pre-activation writer/image/schema proof.
 - Deploy and attest the separately owned Kueue inference queue/preemption
   contract for every reserved context; current east1 evidence does not pass.
@@ -2408,9 +2598,9 @@ legacy activation.
   Converge the full split-role fleet on that one digest and repeat the
   pre-activation proof; no generic assertion bypass or generic-only image path
   exists.
-- Perform initial activation and non-compute manual verification; later policy
-  or writer changes use the same command for one successor generation.
-- After the documented removal gate passes, merge the cleanup PR.
+- Perform initial activation and non-compute manual verification through the
+  one generation-fenced command; later fixes use the same surface.
 
-Until those gates are recorded, this document must not describe the correction
-as merged, deployed, activated, or proven by live capacity.
+Until those gates are recorded, this document must not describe A, B, C, or
+platform PR 14/17/18/19 as merged, published, deployed, activated, or proven by
+live capacity.
