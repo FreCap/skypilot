@@ -1,0 +1,17 @@
+apiService:
+  highAvailability:
+    enabled: true
+  replicas: 2
+  upgradeStrategy: RollingUpdate
+  dbConnectionSecretName: external-db
+requestStore:
+  backend: postgres
+  cutoverGatePath: /root/.sky/api-request-cutover.json
+  enforceBuiltinExecutionQuiescenceBackends: true
+storage:
+  enabled: true
+  accessMode: ReadWriteMany
+executorService:
+  replicas: 2
+controllerService:
+  replicas: 2

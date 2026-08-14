@@ -352,6 +352,38 @@ locals {
     local.extra_helm_top_level_keys,
     "requestStore",
   )
+  # A single migration revision may need to delete a requestStore map retained
+  # by Helm --reuse-values before Serve047 installs the canonical PostgreSQL-
+  # only shape.  Keep this escape hatch evidence-bound: the immutable capture
+  # must prove the live release is already on PostgreSQL, and the typed inputs
+  # must keep PostgreSQL plus the built-in execution-quiescence fence selected.
+  # Serve047 removes this null-tombstone allowance entirely.
+  prior_helm_release_values_decoded = try(
+    yamldecode(try(var.prior_helm_release_values.yaml, "")),
+    {},
+  )
+  prior_helm_request_store_backend = try(
+    local.prior_helm_release_values_decoded.requestStore.backend,
+    null,
+  )
+  prior_helm_request_store_enforces_quiescence = try(
+    local.prior_helm_release_values_decoded.requestStore.enforceBuiltinExecutionQuiescenceBackends == true,
+    false,
+  )
+  extra_helm_request_store_is_null_tombstone = try(
+    local.extra_helm_values_decoded.requestStore == null,
+    false,
+  )
+  extra_helm_request_store_override_allowed = (
+    !local.extra_helm_request_store_present || (
+      local.extra_helm_request_store_is_null_tombstone &&
+      var.prior_helm_release_values != null &&
+      local.prior_helm_request_store_backend == "postgres" &&
+      local.prior_helm_request_store_enforces_quiescence &&
+      var.request_store.backend == "postgres" &&
+      var.request_store.enforce_builtin_execution_quiescence_backends
+    )
+  )
   extra_helm_fullname_override_present = contains(
     local.extra_helm_top_level_keys,
     "fullnameOverride",
@@ -555,8 +587,8 @@ resource "helm_release" "skypilot" {
       error_message = "extra_helm_values.apiService must be a YAML map when present; null, scalar, and list values are not allowed."
     }
     precondition {
-      condition     = !local.extra_helm_request_store_present
-      error_message = "extra_helm_values must not redefine requestStore; use the typed request_store input so Terraform cannot silently override the selected persistence contract."
+      condition     = local.extra_helm_request_store_override_allowed
+      error_message = "extra_helm_values must not redefine requestStore. The one-revision transition before Serve047 permits exactly requestStore: null only when the immutable prior_helm_release_values capture and typed request_store both prove backend=postgres with built-in execution quiescence enforced."
     }
     precondition {
       condition     = !local.extra_helm_fullname_override_present

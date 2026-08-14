@@ -1,7 +1,8 @@
 {{- $databaseConfigured := or .Values.apiService.dbConnectionSecretName .Values.apiService.dbConnectionString -}}
 {{- if and $databaseConfigured .Values.databaseMigration.enabled }}
 {{- $haEnabled := .Values.apiService.highAvailability.enabled -}}
-{{- $guardedPostgresHook := and (eq .Values.requestStore.backend "postgres") (not (empty .Values.apiService.dbConnectionSecretName)) -}}
+{{- $requestStore := include "skypilot.effectiveRequestStore" . | fromJson -}}
+{{- $guardedPostgresHook := and (eq $requestStore.backend "postgres") (not (empty .Values.apiService.dbConnectionSecretName)) -}}
 {{- if and $haEnabled (not .Values.apiService.dbConnectionSecretName) -}}
 {{- fail "apiService.highAvailability.enabled=true requires a pre-existing apiService.dbConnectionSecretName for the blocking migration hook" -}}
 {{- end -}}
@@ -85,7 +86,7 @@ spec:
         - name: IS_SKYPILOT_SERVER
           value: "true"
         - name: SKYPILOT_API_REQUEST_BACKEND
-          value: {{ .Values.requestStore.backend | quote }}
+          value: {{ $requestStore.backend | quote }}
         - name: SKYPILOT_STATE_DB_MIGRATION_MODE
           value: {{ ternary "bootstrap" "upgrade" .Values.databaseMigration.bootstrapFreshSchema }}
         {{- if .Values.apiService.dbConnectionSecretName }}

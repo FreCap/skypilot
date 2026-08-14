@@ -1,0 +1,5 @@
+apiVersion: v2
+name: request-store-values-probe
+description: Test-only probe for Helm parent-null value deletion
+type: application
+version: 0.1.0
