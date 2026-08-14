@@ -6088,6 +6088,76 @@ def get_replica_infos(
     return [_replica_from_state(row[0], row[1]) for row in rows]
 
 
+def get_scale_planning_state_fingerprint(service_name: str,
+                                         require_version: bool = False
+                                        ) -> str | None:
+    """Return a compact mutation fingerprint for autoscaler planning state.
+
+    Shape-aware autoscalers may block while resolving legacy cluster handles.
+    The controller samples this fingerprint before reading its planning rows
+    and again after that blocking preload. Equality proves that the service's
+    runtime fields and every replica row stayed unchanged across the read and
+    preload window; a mismatch makes the tick retry from durable state.
+
+    PostgreSQL's per-row ``xmin`` is used as the mutation revision so a large
+    terminal history contributes only ``(replica_id, revision)`` rather than
+    transferring every JSON document again. SQLite remains a supported local
+    controller/test database, so its fallback hashes the complete JSON rows.
+    The central API-server path is PostgreSQL-only.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        runtime_query = sqlalchemy.select(
+            services_table.c.hash,
+            services_table.c.controller_pid,
+            services_table.c.controller_ip,
+            services_table.c.active_versions,
+        ).where(services_table.c.name == service_name)
+        if require_version:
+            runtime_query = runtime_query.where(sqlalchemy.exists().where(
+                version_specs_table.c.service_name == services_table.c.name))
+        runtime_row = session.execute(runtime_query).fetchone()
+        if runtime_row is None:
+            return None
+
+        if engine.dialect.name == db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            revision = sqlalchemy.literal_column('replicas.xmin::text').label(
+                '_row_revision')
+            replica_rows = session.execute(
+                sqlalchemy.select(replicas_table.c.replica_id, revision).where(
+                    replicas_table.c.service_name == service_name).order_by(
+                        replicas_table.c.replica_id)).fetchall()
+            replica_material: list[Any] = [
+                (int(row.replica_id), row._mapping['_row_revision'])  # pylint: disable=protected-access
+                for row in replica_rows
+            ]
+        else:
+            replica_rows = session.execute(
+                sqlalchemy.select(
+                    replicas_table.c.replica_id,
+                    replicas_table.c.replica_state_version,
+                    replicas_table.c.replica_state,
+                ).where(replicas_table.c.service_name == service_name).order_by(
+                    replicas_table.c.replica_id)).fetchall()
+            replica_material = [(int(row.replica_id), row.replica_state_version,
+                                 row.replica_state) for row in replica_rows]
+
+    runtime = runtime_row._mapping  # pylint: disable=protected-access
+    material = {
+        'runtime': {
+            'hash': runtime['hash'],
+            'controller_pid': runtime['controller_pid'],
+            'controller_ip': runtime['controller_ip'],
+            'active_versions': (json.loads(runtime['active_versions'])
+                                if runtime['active_versions'] else []),
+        },
+        'replicas': replica_material,
+    }
+    encoded = json.dumps(material, sort_keys=True,
+                         separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def get_replica_infos_grouped(
 ) -> dict[str, list['replica_managers.ReplicaInfo']]:
     """Gets every replica info grouped by its owning service in one query."""

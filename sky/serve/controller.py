@@ -1490,12 +1490,13 @@ class SkyServeController:
             effective_request_data.get('occupancy_sampled_urls', []),
             effective_request_data.get('unknown_in_flight_urls', []),
             force_all_live_unknown=(not drain_authoritative and not ha_enabled))
-        self._reconcile_generation += 1
-        reconcile_generation = self._reconcile_generation
         # Validate the reporter epoch and ingest its exact-card gauges under
-        # the same lock used to publish a new catalog/version. The report is
-        # therefore either wholly old-epoch or wholly new-epoch.
+        # the same lock used to publish a new catalog/version. Demand and its
+        # generation become visible in one atomic publication, so a planner
+        # can never observe a new generation paired with the previous gauges.
         with self._routing_state_lock:
+            self._reconcile_generation += 1
+            reconcile_generation = self._reconcile_generation
             compatibility_demand_complete = (
                 self._compatibility_demand_report_is_complete(request_data))
             self._autoscaler.collect_request_information({
@@ -1555,7 +1556,10 @@ class SkyServeController:
                     observed_slots_by_replica_id=observed_slots,
                     in_flight_by_replica_id=translated_in_flight,
                     unknown_replica_ids=unknown_replica_ids)
-        self._notify_scale_reconcile()
+            # Publish the wakeup generation in the same short critical section
+            # as its demand gauges. Reconciliation captures the same pair under
+            # this lock, so neither side can observe a half-published report.
+            self._notify_scale_reconcile()
         return True
 
     def _apply_load_balancer_drain_report(
@@ -5030,18 +5034,51 @@ class SkyServeController:
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
         actuation_generation: int,
+        notification_generation: int,
+        demand_generation: int,
         replica_infos: list[replica_managers.ReplicaInfo],
         active_versions: list[int],
+        planning_state_fingerprint: str | None,
         *,
         sequenced_reserved_fill: bool,
     ) -> tuple[list[autoscalers.AutoscalerDecision], int | None,
                autoscalers.UnrecoverableRolloutFailure | None, Any,
                bool] | None:
-        """Mutate one exact autoscaler while update/LB publication is fenced."""
+        """Mutate one exact autoscaler while update/LB publication is fenced.
+
+        Durable handle resolution can block on PostgreSQL connection setup.
+        Prepare it before taking the routing-epoch lock so controller health,
+        LB role heartbeats, and routing snapshots never wait behind provider
+        or database I/O. The prepared token is bound to this exact replica
+        snapshot and consumed under the existing update/demand fence. A
+        compact durable mutation fingerprint rejects replica/runtime changes
+        that do not publish an in-process notification.
+        """
+        if (not self._scale_actuation_is_current(
+                actuation_generation, decision_autoscaler, decision_version) or
+                self._scale_reconcile_coordinator.generation
+                != notification_generation or
+                self._reconcile_generation != demand_generation):
+            return None
+        decision_inputs = (
+            autoscalers.prepare_controller_scaling_decision_inputs(
+                decision_autoscaler, replica_infos))
+        if planning_state_fingerprint is not None:
+            current_fingerprint = (
+                serve_state.get_scale_planning_state_fingerprint(
+                    self._service_name, require_version=True))
+            if current_fingerprint != planning_state_fingerprint:
+                # Manager/provider threads may mutate replica rows without an
+                # in-process controller notification. Publish an explicit
+                # retry after observing that durable planning state changed.
+                self._notify_scale_reconcile()
+                return None
         with self._routing_state_lock:
-            if not self._scale_actuation_is_current(actuation_generation,
-                                                    decision_autoscaler,
-                                                    decision_version):
+            if (not self._scale_actuation_is_current(
+                    actuation_generation, decision_autoscaler, decision_version)
+                    or self._scale_reconcile_coordinator.generation
+                    != notification_generation or
+                    self._reconcile_generation != demand_generation):
                 return None
             decision_autoscaler.set_spot_placer(
                 self._replica_manager.spot_placer)
@@ -5055,8 +5092,9 @@ class SkyServeController:
                 if sequenced_reserved_fill else contextlib.nullcontext())
             with planning_context:
                 scaling_options = (
-                    decision_autoscaler.generate_scaling_decisions(
-                        replica_infos, active_versions))
+                    autoscalers.generate_controller_scaling_decisions(
+                        decision_autoscaler, replica_infos, active_versions,
+                        decision_inputs))
             target_num_replicas = None
             if decision_autoscaler.has_recomputed_with_fresh_data() is True:
                 demand_target = (
@@ -5214,6 +5252,19 @@ class SkyServeController:
                                                         decision_autoscaler,
                                                         decision_version):
                     return
+                with self._routing_state_lock:
+                    notification_generation = (
+                        self._scale_reconcile_coordinator.generation)
+                    demand_generation = self._reconcile_generation
+                planning_state_fingerprint = None
+                if (autoscalers.controller_prepares_scaling_decision_inputs(
+                        decision_autoscaler)):
+                    planning_state_fingerprint = (
+                        serve_state.get_scale_planning_state_fingerprint(
+                            self._service_name, require_version=True))
+                    assert planning_state_fingerprint is not None, (
+                        'No service record found for '
+                        f'{self._service_name}')
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
                 self._replica_counts_snapshot = self._get_replica_counts(
@@ -5236,8 +5287,11 @@ class SkyServeController:
                     decision_autoscaler,
                     decision_version,
                     actuation_generation,
+                    notification_generation,
+                    demand_generation,
                     replica_infos,
                     active_versions,
+                    planning_state_fingerprint,
                     sequenced_reserved_fill=(sequenced_reserved_fill))
                 if plan is None:
                     return
