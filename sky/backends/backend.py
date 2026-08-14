@@ -1,4 +1,5 @@
 """Sky backend interface."""
+import enum
 import typing
 from typing import Any, Generic, Optional
 
@@ -17,6 +18,21 @@ Path = str
 # pylint: disable=invalid-name
 _ResourceHandleType = typing.TypeVar('_ResourceHandleType',
                                      bound='ResourceHandle')
+
+
+class ServeReplicaJobStatusSource(enum.Enum):
+    """Authoritative steady-state liveness source for a Serve replica.
+
+    ``REMOTE_JOB`` requires querying the job table inside every replica.
+    ``PROVIDER_AND_ENDPOINT`` means the provider lifecycle plus SkyServe's
+    application endpoint probe own ordinary replica liveness, so a remote job
+    query would be duplicate evidence.  Callers must still request exact job
+    evidence for workflows whose contract explicitly requires it (for example
+    pools and system recovery).
+    """
+
+    REMOTE_JOB = 'remote_job'
+    PROVIDER_AND_ENDPOINT = 'provider_and_endpoint'
 
 
 # Backend-specific handle to the launched resources (e.g., a cluster).
@@ -177,6 +193,17 @@ class Backend(Generic[_ResourceHandleType]):
     def register_info(self, **kwargs) -> None:
         """Register backend-specific information."""
         pass
+
+    def serve_replica_job_status_source(
+            self, handle: _ResourceHandleType) -> ServeReplicaJobStatusSource:
+        """Return the backend's ordinary Serve replica liveness source.
+
+        Remote job status is the fail-closed default.  Backends may select a
+        provider-native lifecycle only when the ordinary SkyServe endpoint
+        probe and provider state together supersede per-replica job polling.
+        """
+        del handle
+        return ServeReplicaJobStatusSource.REMOTE_JOB
 
     # --- Implementations of the APIs ---
     def _provision(

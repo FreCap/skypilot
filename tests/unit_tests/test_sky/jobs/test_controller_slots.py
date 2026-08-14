@@ -15,6 +15,7 @@ from unittest import mock
 import pytest
 
 from sky.jobs import controller_slots
+from sky.jobs import managed_job_controller_runner
 from sky.server.requests import requests as api_requests
 from sky.server.requests import storage as request_storage
 from sky.utils import controller_capability
@@ -66,6 +67,44 @@ def _identity_exists(identity: tuple[int, int]) -> bool:
                 start_time_ticks)
     except (FileNotFoundError, ProcessLookupError, OSError, ValueError):
         return False
+
+
+def _direct_child_pids(pid: int) -> set[int]:
+    """Read one process's direct children across all of its threads."""
+    children: set[int] = set()
+    try:
+        task_names = os.listdir(f'/proc/{pid}/task')
+    except FileNotFoundError:
+        return children
+    for task_name in task_names:
+        if not task_name.isdigit():
+            continue
+        try:
+            raw = pathlib.Path(f'/proc/{pid}/task/{task_name}/children'
+                              ).read_text(encoding='utf-8').strip()
+        except FileNotFoundError:
+            continue
+        if raw:
+            children.update(int(value) for value in raw.split())
+    return children
+
+
+def test_live_adopted_reap_never_waits_on_manager_pid(monkeypatch):
+    """Popen remains the sole owner when its PID exits during a reap scan."""
+    command = mock.Mock(pid=101)
+    command.poll.return_value = None
+    monkeypatch.setattr(managed_job_controller_runner, '_direct_child_pids',
+                        lambda _pid: (101, 202, 303))
+    waitpid = mock.Mock(side_effect=lambda pid, _flags: (pid, 0))
+    monkeypatch.setattr(managed_job_controller_runner.os, 'waitpid', waitpid)
+
+    managed_job_controller_runner._reap_adopted_children(command)
+
+    command.poll.assert_called_once_with()
+    assert waitpid.call_args_list == [
+        mock.call(202, os.WNOHANG),
+        mock.call(303, os.WNOHANG),
+    ]
 
 
 def test_manager_child_environment_scrubs_all_capability_transport(monkeypatch):
@@ -632,7 +671,7 @@ def test_admission_send_failure_is_conservatively_effect_bearing(monkeypatch):
 @pytest.mark.skipif(not sys.platform.startswith('linux'),
                     reason='controller family proof requires Linux subreapers')
 def test_real_runner_drains_new_session_descendant_before_completion(tmp_path):
-    """The real two-owner runner proves detached descendants absent."""
+    """The live warden reaps orphans and later proves the family absent."""
     if os.uname().machine not in ('x86_64', 'aarch64'):
         pytest.skip('test requires the runner-supported pidfd architectures')
 
@@ -640,6 +679,8 @@ def test_real_runner_drains_new_session_descendant_before_completion(tmp_path):
     pids_path = tmp_path / 'controller_descendants'
     manager_proof_path = tmp_path / 'manager_capability_proof.json'
     callback_proof_path = tmp_path / 'callback_capability_proof.json'
+    orphans_done_path = tmp_path / 'manager_orphans_done'
+    manager_exit_path = tmp_path / 'manager_exit'
     helper_path.write_text('\n'.join([
         'import ctypes',
         'import json',
@@ -697,8 +738,22 @@ def test_real_runner_drains_new_session_descendant_before_completion(tmp_path):
         '    "SKYPILOT_SERVER_MANAGED_JOB_CONTROLLER_READY_FD"))',
         'os.write(ready_fd, b"1")',
         'os.close(ready_fd)',
-        'while True:',
-        '    time.sleep(1)',
+        '# Give the warden time to enter its normal live-manager loop, then',
+        '# repeatedly orphan short-lived grandchildren into the subreaper.',
+        'time.sleep(0.1)',
+        'for _ in range(128):',
+        '    intermediate = os.fork()',
+        '    if intermediate == 0:',
+        '        orphan = os.fork()',
+        '        if orphan == 0:',
+        '            os._exit(0)',
+        '        os._exit(0)',
+        '    os.waitpid(intermediate, 0)',
+        'pathlib.Path(sys.argv[4]).write_text("done", encoding="utf-8")',
+        'while not pathlib.Path(sys.argv[5]).exists():',
+        '    time.sleep(0.01)',
+        '# Exit concurrently with the warden\'s continuous adopted-child reap.',
+        'raise SystemExit(23)',
     ]),
                            encoding='utf-8')
     command = json.dumps([
@@ -708,6 +763,8 @@ def test_real_runner_drains_new_session_descendant_before_completion(tmp_path):
         str(pids_path),
         str(manager_proof_path),
         str(callback_proof_path),
+        str(orphans_done_path),
+        str(manager_exit_path),
     ],
                          separators=(',', ':'))
     runtime_control, runner_control = socket.socketpair()
@@ -776,6 +833,17 @@ def test_real_runner_drains_new_session_descendant_before_completion(tmp_path):
         assert capability not in callback_proof_path.read_text(encoding='utf-8')
         assert capability not in '\x00'.join(manager_proof['argv'])
         assert capability not in '\x00'.join(runner.args)
+        assert _wait_until(orphans_done_path.exists)
+        manager_pid = int(started['controller_pid'])
+        manager_identity = _process_identity(manager_pid)
+        assert _wait_until(lambda: len(_direct_child_pids(runner.pid)) == 1)
+        inner_pid = next(iter(_direct_child_pids(runner.pid)))
+        # The manager remains healthy and owns its long-lived child. Every
+        # completed double-fork descendant has been adopted and reaped by the
+        # inner warden instead of accumulating as a zombie until shutdown.
+        assert _wait_until(
+            lambda: _direct_child_pids(inner_pid) == {manager_pid})
+        assert _identity_exists(manager_identity)
         descendant_pids = [
             int(value)
             for value in pids_path.read_text(encoding='utf-8').split()
@@ -785,7 +853,7 @@ def test_real_runner_drains_new_session_descendant_before_completion(tmp_path):
             _process_identity(pid) for pid in set(descendant_pids)
         ]
 
-        controller_slots._write_message(runtime_control, {'type': 'terminate'})
+        manager_exit_path.write_text('exit', encoding='utf-8')
         completion = None
         while True:
             message = controller_slots._read_message(runtime_control)

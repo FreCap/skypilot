@@ -12477,13 +12477,17 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _fetch_job_status(self) -> None:
         """Fetch the service job status of all replicas.
 
-        This function will monitor the job status of all replicas
-        to make sure the service is running correctly. If any of the
-        replicas failed, it will terminate the replica.
+        This function monitors replicas whose backend or service contract
+        requires exact remote job evidence. If one of those jobs fails, it
+        terminates the replica.
 
-        It is still needed even if we already keep probing the replicas,
-        since the replica job might launch the API server in the background
-        (using &), and the readiness probe will not detect the worker failure.
+        Ordinary Kubernetes non-pool workers deliberately do not enter this
+        path. Their Pod lifecycle and application endpoint probe are the
+        canonical liveness owners; ``kubectl exec`` job-table polling would
+        duplicate those owners and create one child process per replica every
+        round. Pools, system-recovery rows, and non-Kubernetes backends retain
+        exact polling because their semantics require evidence the ordinary
+        endpoint/provider contract does not provide.
 
         NOTE: this does NOT hold ``self.lock`` across the per-replica
         ``get_job_status`` SSH walk. An unreachable (e.g. preempted spot)
@@ -12495,7 +12499,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         and user-code failure); those paths may still run a cloud status
         refresh or a log sync while holding it.
 
-        The SSH fetches run in a thread pool (like ``_probe_all_replicas``):
+        The remaining remote fetches run in a thread pool (like
+        ``_probe_all_replicas``):
         a serial walk lets one hung replica delay failure detection for every
         replica after it, scaling the round as O(N * per-replica SSH). The
         failure-handling branches still run serially, consuming results in
@@ -12569,20 +12574,29 @@ class SkyPilotReplicaManager(ReplicaManager):
                             provider_phase.ProviderPhaseMode.V2_FENCED)
                     invalid_recovery_ids[mode].append(info.replica_id)
                 continue
+            with_recovery = (
+                not self._is_pool and info.system_recovery_disposition
+                in (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
+                    system_recovery_state.SystemRecoveryDisposition.CAPABLE))
+            requires_exact_job_evidence = self._is_pool or with_recovery
+            if (not requires_exact_job_evidence and
+                    backend.serve_replica_job_status_source(handle) is
+                    backends.ServeReplicaJobStatusSource.PROVIDER_AND_ENDPOINT):
+                # The ordinary Kubernetes Serve contract has one happy path:
+                # provider lifecycle plus application readiness. Do not enter
+                # a provider phase, start a worker thread, or exec into the Pod
+                # merely to duplicate that evidence.
+                continue
             if cleanup_fence is not None:
-                # Register every valid-handle v2 row before validating its job
-                # association. Invalid recovery rows may still sync logs and
-                # schedule teardown, so their reduction needs the same batch
-                # physical owner as a normal status result.
+                # Register only rows that still require exact remote evidence.
+                # Invalid recovery rows may sync logs and schedule teardown,
+                # so their reduction needs the same batch physical owner as a
+                # normal status result.
                 key = (cleanup_fence.kubernetes_context,
                        cleanup_fence.physical_cluster_uid)
                 fence_representatives.setdefault(key, (info, handle))
                 fence_group_replica_ids.setdefault(key,
                                                    set()).add(info.replica_id)
-            with_recovery = (
-                not self._is_pool and info.system_recovery_disposition
-                in (system_recovery_state.SystemRecoveryDisposition.CANDIDATE,
-                    system_recovery_state.SystemRecoveryDisposition.CAPABLE))
             if with_recovery:
                 service_job_id = info.service_job_id
                 if (isinstance(service_job_id, bool) or

@@ -1665,6 +1665,201 @@ def test_v2_job_status_batch_reuses_one_physical_uid_proof():
     assert backend.get_job_status.call_count == 2
 
 
+def test_ordinary_kubernetes_fleet_skips_remote_job_status_at_840():
+    """Ordinary Kubernetes liveness must not scale remote execs with fleet."""
+    infos = []
+    records = {}
+    physical_pools = (('east', 'east-uid', 'A100-80GB'), ('phx', 'phx-uid',
+                                                          'H200'))
+    for replica_id in range(1, 841):
+        context, physical_uid, card = physical_pools[replica_id % 2]
+        info = replica_managers.ReplicaInfo(replica_id=replica_id,
+                                            cluster_name=f'svc-{replica_id}',
+                                            replica_port='8080',
+                                            is_spot=False,
+                                            location=None,
+                                            version=1,
+                                            resources_override=None)
+        info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        _stamp_protocol_v2_fill(info,
+                                context=context,
+                                physical_uid=physical_uid,
+                                card=card)
+        infos.append(info)
+        records[info.cluster_name] = {
+            'name': info.cluster_name,
+            'handle': _protocol_v2_handle(info, context=context),
+        }
+
+    mgr = _make_manager()
+    mgr._is_pool = False
+    mgr._handle_job_status_results = mock.Mock()
+    backend = replica_managers.backends.CloudVmRayBackend()
+    backend.get_job_status = mock.Mock(
+        side_effect=AssertionError('ordinary Kubernetes status used exec'))
+    backend.get_job_status_with_system_recovery = mock.Mock(
+        side_effect=AssertionError('ordinary row used recovery status'))
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=infos), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records) as get_clusters, \
+         mock.patch.object(replica_managers.backends,
+                           'CloudVmRayBackend',
+                           return_value=backend), \
+         mock.patch.object(
+             replica_managers.kubernetes_adaptor,
+             'physical_cluster_uid_fence') as physical_uid_fence, \
+         mock.patch.object(replica_managers.provider_phase,
+                           'provider_phase') as provider_phase:
+        mgr._fetch_job_status()
+
+    get_clusters.assert_called_once()
+    assert len(get_clusters.call_args.args[0]) == 840
+    backend.get_job_status.assert_not_called()
+    backend.get_job_status_with_system_recovery.assert_not_called()
+    physical_uid_fence.assert_not_called()
+    provider_phase.assert_not_called()
+    mgr._handle_job_status_results.assert_not_called()
+
+
+def test_kubernetes_system_recovery_retains_exact_remote_job_status():
+    """The ordinary Kubernetes capability cannot weaken recovery evidence."""
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    _stamp_protocol_v2_fill(info)
+    info.system_recovery_disposition = (
+        recovery_state.SystemRecoveryDisposition.CANDIDATE)
+    info.service_job_id = 17
+    handle = _protocol_v2_handle(info)
+    records = {info.cluster_name: {'name': info.cluster_name, 'handle': handle}}
+    mgr = _make_manager()
+    mgr._is_pool = False
+    backend = replica_managers.backends.CloudVmRayBackend()
+    backend.get_job_status = mock.Mock()
+    backend.get_job_status_with_system_recovery = mock.Mock(return_value=({
+        17: job_lib.JobStatus.RUNNING
+    }, {}, {
+        17: job_lib.JobSystemRecoveryDetailStatus.ABSENT
+    }))
+
+    def _consume(results):
+        for _, result in results:
+            result.get()
+
+    mgr._handle_job_status_results = mock.Mock(side_effect=_consume)
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records), \
+         mock.patch.object(replica_managers.backends,
+                           'CloudVmRayBackend',
+                           return_value=backend), \
+         mock.patch.object(replica_managers.kubernetes_adaptor,
+                           'physical_cluster_uid_fence',
+                           return_value=contextlib.nullcontext()):
+        mgr._fetch_job_status()
+
+    backend.get_job_status.assert_not_called()
+    backend.get_job_status_with_system_recovery.assert_called_once_with(
+        handle, [17], stream_logs=False)
+    mgr._handle_job_status_results.assert_called_once()
+
+
+@pytest.mark.parametrize(('endpoint_ready', 'expected_termination'),
+                         [(True, False), (False, True)])
+def test_ordinary_kubernetes_endpoint_owns_detached_job_liveness(
+        endpoint_ready, expected_termination):
+    """A detached ordinary job is governed only by its endpoint lifecycle."""
+    info = replica_managers.ReplicaInfo(replica_id=1,
+                                        cluster_name='svc-1',
+                                        replica_port='8080',
+                                        is_spot=False,
+                                        location=None,
+                                        version=1,
+                                        resources_override=None)
+    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    info.status_property.first_ready_time = 1.0
+    info.status_property.service_ready_now = True
+    info.first_consecutive_failure_time = 10.0
+    _stamp_protocol_v2_fill(info)
+    handle = _protocol_v2_handle(info)
+    records = {info.cluster_name: {'name': info.cluster_name, 'handle': handle}}
+    info.probe = mock.Mock(return_value=(info, endpoint_ready, 40.0))
+
+    mgr = _make_manager()
+    mgr._is_pool = False
+    mgr._uptime = 1.0
+    mgr._update_recovery_required = False
+    mgr._tick_version_spec_cache = {}
+    mgr._resolve_probe_urls = mock.Mock(
+        return_value={info.replica_id: 'http://10.0.0.1:8080'})
+    mgr._get_readiness_path = mock.Mock(return_value='/health')
+    mgr._get_post_data = mock.Mock(return_value=None)
+    mgr._get_readiness_timeout_seconds = mock.Mock(return_value=15)
+    mgr._get_readiness_headers = mock.Mock(return_value=None)
+    mgr._is_interruptible_replica = mock.Mock(return_value=False)
+    mgr._consecutive_failure_threshold_timeout = mock.Mock(return_value=30)
+    mgr._persist_replicas = mock.Mock()
+    mgr._terminate_replica = mock.Mock()
+    mgr._changed_only_readiness_persistence = False
+    mgr._handle_job_status_results = mock.Mock()
+
+    # Model an already-exited detached job. If exact status were consulted it
+    # would be terminal, but ordinary Kubernetes liveness must not consult it.
+    backend = replica_managers.backends.CloudVmRayBackend()
+    backend.get_job_status = mock.Mock(
+        return_value={1: job_lib.JobStatus.FAILED})
+    backend.get_job_status_with_system_recovery = mock.Mock(
+        side_effect=AssertionError('ordinary row used recovery status'))
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos',
+                           return_value=[info]), \
+         mock.patch.object(replica_managers.serve_state,
+                           'get_specs',
+                           return_value={1: mock.Mock()}), \
+         mock.patch.object(replica_managers.serve_state,
+                           'get_replica_infos_from_ids',
+                           return_value={1: info}), \
+         mock.patch.object(replica_managers.global_user_state,
+                           'get_clusters_from_names',
+                           return_value=records), \
+         mock.patch.object(replica_managers.backends,
+                           'CloudVmRayBackend',
+                           return_value=backend), \
+         mock.patch.object(replica_managers.provider_phase,
+                           'join_provider_phase',
+                           return_value=contextlib.nullcontext()):
+        mgr._fetch_job_status()
+        snapshot = mgr._probe_all_replicas_with_snapshot(
+            [info], phase_admission=mock.sentinel.phase_admission)
+
+    backend.get_job_status.assert_not_called()
+    backend.get_job_status_with_system_recovery.assert_not_called()
+    mgr._handle_job_status_results.assert_not_called()
+    assert info.status_property.service_ready_now is endpoint_ready
+    if expected_termination:
+        mgr._terminate_replica.assert_called_once_with(
+            info.replica_id, sync_down_logs=True, replica_drain_delay_seconds=0)
+        assert snapshot == [info]
+    else:
+        mgr._terminate_replica.assert_not_called()
+        assert info.first_consecutive_failure_time is None
+        assert snapshot == [info]
+
+
 def test_exact_non_kubernetes_job_status_does_not_hold_kubernetes_phase():
     info = replica_managers.ReplicaInfo(replica_id=1,
                                         cluster_name='svc-1',
