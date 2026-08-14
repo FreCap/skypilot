@@ -410,6 +410,29 @@ def test_normalizer_failure_never_exposes_retained_identifiers_or_payload(
     assert sentinel not in combined
 
 
+def test_normalizer_sanitizes_unexpected_database_failure(
+        normalization_engine, caplog, capsys) -> None:
+    sentinel = 'normalizer-database-failure-identifier-sentinel'
+    state = _v17_collision_state()
+    state['cluster_name'] = sentinel
+    _insert_state(normalization_engine, state)
+    with normalization_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.text(
+                'ALTER TABLE replicas ADD CONSTRAINT audit_v17_only '
+                "CHECK ((replica_state->>'replica_info_version')::int = 17)"))
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(normalization.ReplicaRecordNormalizationError,
+                           match='failed unexpectedly') as exc:
+            normalization.normalize_retained_replica_records()
+    captured = capsys.readouterr()
+    combined = str(exc.value) + caplog.text + captured.out + captured.err
+    assert sentinel not in combined
+    assert exc.value.__cause__ is None
+    assert exc.value.__suppress_context__ is True
+
+
 @pytest.mark.parametrize('case', ['malformed', 'inconsistent'])
 def test_normalizer_recovery_quarantine_never_logs_row_identity_or_payload(
         normalization_engine, caplog, capsys, case: str) -> None:

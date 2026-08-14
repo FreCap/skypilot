@@ -12,7 +12,7 @@ frozen final A/B/C and platform heads before final deployment/completion.
 Platform PRs 14, 17, 18, and 19 remain unapplied, reserved-fill activation has
 not occurred, and cleanup remains blocked on the documented live receipt gates.
 
-Last updated: 2026-08-14 (precursor A sequencing correction)
+Last updated: 2026-08-14 (precursor A secret-safe failure boundary)
 
 Canonical owner: this file
 
@@ -1968,9 +1968,12 @@ non-null v18 JSON, and a null pickle column, so neither a v17 writer, a
 SQL-NULL outer version, nor stale pickle repopulation can return. Constraint
 validation is a separate, safely resumable transaction because replica updates
 can leave deferred foreign-key trigger events; the already-enforced check
-protects the gap. Failures identify only an opaque row ordinal and a controlled
-reason or exception class, suppress raw exception chaining, and never expose
-persisted identifiers, payloads, or credentials.
+protects the gap. Controlled failures identify only an opaque row ordinal and a
+controlled reason or exception class. One outer public boundary lets the lock
+and transaction contexts finish cleanup, then converts every unexpected
+operation, database, or transaction exception to one generic error with raw
+exception chaining suppressed. No failure can therefore expose persisted
+identifiers, payloads, credentials, driver SQL, or bound parameters.
 `ReplicaInfo.from_storage_dict()` is a pure decoder with no logging side
 effects, and `ReplicaInfo.status` is the single pure status projection. The
 ordinary Serve row-read wrapper owns operational quarantine reporting and emits

@@ -200,7 +200,7 @@ def _remaining_pickle_records(session: orm.Session) -> int:
     return int(remaining.scalar_one())
 
 
-def normalize_retained_replica_records() -> dict[str, Any]:
+def _normalize_retained_replica_records() -> dict[str, Any]:
     """Rewrite every retained row once all writers run the v18 image."""
     lock = locks.get_lock(constants.RESERVED_FILL_BROKER_LOCK_ID)
     with lock.acquire(blocking=True):
@@ -352,6 +352,21 @@ def normalize_retained_replica_records() -> dict[str, Any]:
             'writer_pod_inventory_sha256': rollout.pod_inventory_sha256,
             'writer_process_count': len(rollout.writer_instances),
         }
+
+
+def normalize_retained_replica_records() -> dict[str, Any]:
+    """Run normalization without exposing unexpected operational failures."""
+    try:
+        return _normalize_retained_replica_records()
+    except ReplicaRecordNormalizationError:
+        raise
+    except Exception:  # pylint: disable=broad-except
+        # Keep this boundary outside the lock and both session contexts so they
+        # finish rollback/cleanup before an operational or database failure is
+        # reduced to the secret-safe public contract. In particular, raw
+        # SQLAlchemy exceptions can render bound replica identifiers or JSON.
+        raise ReplicaRecordNormalizationError(
+            'ReplicaInfo v18 normalization failed unexpectedly.') from None
 
 
 def main() -> None:
