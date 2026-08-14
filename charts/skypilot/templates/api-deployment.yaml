@@ -2,6 +2,7 @@
 {{- fail "resourceActions.authorityWorker has been removed; delete the stored resourceActions value before upgrading" -}}
 {{- end -}}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $requestStore := include "skypilot.effectiveRequestStore" . | fromJson -}}
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $haEnabled := get $haConfig "enabled" | default false -}}
@@ -148,7 +149,7 @@
 {{- if .Values.vastCredentials.enabled -}}
 {{- $apiReservedMountPaths = append $apiReservedMountPaths "/root/.config/vastai" -}}
 {{- end -}}
-{{- if eq .Values.requestStore.backend "postgres" -}}
+{{- if eq $requestStore.backend "postgres" -}}
 {{- if and (not .Values.apiService.dbConnectionSecretName) (not .Values.apiService.dbConnectionString) -}}
 {{- fail "requestStore.backend=postgres requires external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString" -}}
 {{- end -}}
@@ -222,7 +223,7 @@
 {{- else if $haEnabled -}}
 {{- fail "apiService.highAvailability.enabled=true requires requestStore.backend=postgres" -}}
 {{- end -}}
-{{- if and (default false .Values.requestStore.enforceBuiltinExecutionQuiescenceBackends) (ne .Values.requestStore.backend "postgres") -}}
+{{- if and (default false $requestStore.enforceBuiltinExecutionQuiescenceBackends) (ne $requestStore.backend "postgres") -}}
 {{- fail "requestStore.enforceBuiltinExecutionQuiescenceBackends=true requires requestStore.backend=postgres" -}}
 {{- end -}}
 {{ include "skypilot.validatePodExtras" (dict "envLists" (list .Values.global.extraEnvs .Values.databaseConnection.extraEnvs .Values.apiService.extraEnvs) "reservedEnvNames" $apiReservedEnvNames "volumeLists" (list .Values.databaseConnection.extraVolumes .Values.apiService.extraVolumes) "reservedVolumeNames" $apiReservedVolumeNames "mountLists" (list .Values.databaseConnection.extraVolumeMounts .Values.apiService.extraVolumeMounts) "reservedMountPaths" $apiReservedMountPaths) }}
@@ -354,9 +355,9 @@ spec:
         - name: SKYPILOT_RELEASE_NAME
           value: {{ $fullName | quote }}
         - name: SKYPILOT_API_REQUEST_BACKEND
-          value: {{ .Values.requestStore.backend | quote }}
+          value: {{ $requestStore.backend | quote }}
         - name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
-          value: {{ default false .Values.requestStore.enforceBuiltinExecutionQuiescenceBackends | quote }}
+          value: {{ default false $requestStore.enforceBuiltinExecutionQuiescenceBackends | quote }}
         - name: SKYPILOT_API_SERVER_ROLE
           value: {{ ternary "api" "all" $haEnabled | quote }}
         - name: SKYPILOT_API_SERVER_INSTANCE_ID
@@ -372,7 +373,7 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
-          value: {{ .Values.requestStore.cutoverGatePath | quote }}
+          value: {{ $requestStore.cutoverGatePath | quote }}
         {{- if .Values.ingress.enabled }}
         - name: SKYPILOT_INGRESS_HOST
           value: {{ .Values.ingress.host | quote }}

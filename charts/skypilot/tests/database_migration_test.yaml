@@ -3,6 +3,21 @@ suite: database_migration_test
 templates:
   - templates/database-migration-job.yaml
 tests:
+  - it: should keep the guarded postgres hook after the reused parent is tombstoned
+    values:
+      - fixtures/request-store-tombstone-prior.yaml
+      - fixtures/request-store-tombstone-generated.yaml
+      - fixtures/request-store-tombstone-final.yaml
+    asserts:
+      - equal:
+          path: metadata.annotations["helm.sh/hook"]
+          value: pre-install,pre-upgrade
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: postgres
+
   - it: should create one revision-scoped migration job for an external secret
     set:
       apiService.dbConnectionSecretName: external-db

@@ -3,6 +3,23 @@ suite: controller_deployment_test
 templates:
   - templates/controller-deployment.yaml
 tests:
+  - it: should keep postgres quiescence after the reused parent is tombstoned
+    values:
+      - fixtures/request-store-tombstone-prior.yaml
+      - fixtures/request-store-tombstone-generated.yaml
+      - fixtures/request-store-tombstone-final.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
+            value: /root/.sky/api-request-cutover.json
+
   - it: should mount a pre-existing state claim
     set:
       apiService.highAvailability.enabled: true

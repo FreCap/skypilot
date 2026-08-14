@@ -42,10 +42,31 @@ and verify its durable gate before changing this input. Set
 production control plane only when every execution path uses the built-in
 PostgreSQL storage and queue backends; the module rejects that guard with
 SQLite. `cutover_gate_path` defaults to the chart's durable gate location.
-`requestStore` is module-owned and cannot be redefined through
+`requestStore` is module-owned and cannot normally be redefined through
 `extra_helm_values`. Existing callers using that escape hatch must move the
 same effective values into `request_store` and remove the old block in one
 plan; this changes ownership without changing the rendered release contract.
+
+There is one intentionally narrow transition exception. For one Helm 3.19.1
+upgrade revision, `extra_helm_values` may contain the exact top-level tombstone
+`requestStore: null`. Helm applies this last while `reuse_values` is enabled,
+which removes the reused map instead of leaving legacy child keys in release
+values. The module accepts the tombstone only when the digest-checked
+`prior_helm_release_values` capture and the typed `request_store` both prove
+PostgreSQL with built-in execution quiescence enforced. Non-null maps, scalars,
+and lists remain rejected. Do not use this on a fresh install or retain it
+after the cleanup revision: the caller removes the tombstone on its next
+revision, and the
+[Serve047 cleanup](../../../../docs/designs/serve-multi-pool-reserved-capacity-fill.md#transitional-code-and-stacked-removal-path)
+physically deletes this allowance and the chart-side absent-parent bridge.
+After applying the one deletion revision, run:
+
+```bash
+helm get values <release> --namespace <namespace> -o yaml
+```
+
+The output must omit `requestStore`; do not advance to Serve047 if the parent
+remains present or null.
 
 For an in-place upgrade of an existing release, capture its exact user values
 with `helm get values <release> --namespace <namespace> -o yaml` and pass the

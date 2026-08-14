@@ -372,6 +372,9 @@ databaseConnection:
 # Persistence and delivery backend for API request envelopes. PostgreSQL is an
 # explicit compatibility milestone: it is production-safe for one all-role
 # pod, while role-split multi-replica mode is enabled by later milestones.
+# One transitional release also treats this entire parent being absent as
+# PostgreSQL with execution quiescence enforced. That narrow Helm 3.19.1 value-
+# deletion bridge is removed by Serve047; the ordinary default remains SQLite.
 requestStore:
   # @schema enum: [sqlite, postgres]; required: true
   backend: sqlite

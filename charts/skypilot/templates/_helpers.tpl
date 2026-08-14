@@ -170,6 +170,22 @@ Compute full release name with optional fullnameOverride.
 {{- end -}}
 
 {{/*
+Return the effective request-store contract. The absent-parent branch exists
+for exactly one Helm 3.19.1 --reuse-values cleanup revision: a final
+requestStore: null deletes the captured legacy map before Serve047 restores the
+canonical PostgreSQL-only map and removes this branch. Fail closed to
+PostgreSQL with execution quiescence enforced; never reinterpret absence as
+SQLite.
+*/}}
+{{- define "skypilot.effectiveRequestStore" -}}
+{{- if hasKey .Values "requestStore" -}}
+{{- toJson .Values.requestStore -}}
+{{- else -}}
+{{- toJson (dict "backend" "postgres" "enforceBuiltinExecutionQuiescenceBackends" true "cutoverGatePath" "/root/.sky/api-request-cutover.json") -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Return the state PVC selected by this release. An external claim is
 infrastructure-owned and must exist before any workload rollout begins.
 */}}

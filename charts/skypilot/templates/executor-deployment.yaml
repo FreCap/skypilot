@@ -1,5 +1,6 @@
 {{- if .Values.apiService.highAvailability.enabled }}
 {{- $fullName := include "skypilot.fullname" . -}}
+{{- $requestStore := include "skypilot.effectiveRequestStore" . | fromJson -}}
 {{- $stateClaimName := include "skypilot.storageClaimName" . -}}
 {{- $haConfig := .Values.apiService.highAvailability | default (dict) -}}
 {{- $readinessDrainSeconds := dig "readinessDrainSeconds" 20 $haConfig -}}
@@ -220,9 +221,9 @@ spec:
         - name: SKYPILOT_API_REQUEST_BACKEND
           value: postgres
         - name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
-          value: {{ default false .Values.requestStore.enforceBuiltinExecutionQuiescenceBackends | quote }}
+          value: {{ default false $requestStore.enforceBuiltinExecutionQuiescenceBackends | quote }}
         - name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
-          value: {{ .Values.requestStore.cutoverGatePath | quote }}
+          value: {{ $requestStore.cutoverGatePath | quote }}
         - name: SKYPILOT_API_SERVER_ENDPOINT
           value: {{ printf "http://%s-api-service.%s.svc" $fullName .Release.Namespace | quote }}
         - name: SKYPILOT_API_SERVER_ROLE

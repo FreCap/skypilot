@@ -219,6 +219,51 @@ run "existing_release_values_are_reused_in_helm_order" {
   }
 }
 
+run "postgres_request_store_null_tombstone_is_last" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+          enforceBuiltinExecutionQuiescenceBackends: true
+      EOT
+      sha256 = "4c1443efbd95d40dffe898049b8e0a89eaa1cf9f81ecf89e298aa1e892e3dc11"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      apiService:
+        replicas: 2
+      requestStore: null
+    EOT
+  }
+
+  assert {
+    condition     = helm_release.skypilot.reuse_values
+    error_message = "The requestStore tombstone must run only with Helm reuse_values enabled by the immutable capture."
+  }
+
+  assert {
+    condition = (
+      length(helm_release.skypilot.values) == 3 &&
+      yamldecode(helm_release.skypilot.values[0]).requestStore.backend == "postgres" &&
+      yamldecode(helm_release.skypilot.values[1]).requestStore == {
+        backend                                   = "postgres"
+        cutoverGatePath                           = "/root/.sky/api-request-cutover.json"
+        enforceBuiltinExecutionQuiescenceBackends = true
+      } &&
+      contains(keys(yamldecode(helm_release.skypilot.values[2])), "requestStore") &&
+      yamldecode(helm_release.skypilot.values[2]).requestStore == null &&
+      yamldecode(helm_release.skypilot.values[2]).apiService.replicas == 2
+    )
+    error_message = "The exact null tombstone must remain the last Helm values layer after the proven and typed PostgreSQL contracts."
+  }
+}
+
 run "rwx_authority_fence_is_typed_and_composed" {
   command = plan
 

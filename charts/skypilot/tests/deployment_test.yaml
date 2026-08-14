@@ -305,6 +305,35 @@ tests:
             name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
             value: "false"
 
+  - it: should render guarded postgres after the reused parent is tombstoned
+    values:
+      - fixtures/request-store-tombstone-prior.yaml
+      - fixtures/request-store-tombstone-generated.yaml
+      - fixtures/request-store-tombstone-final.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_BACKEND
+            value: postgres
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_REQUEST_CUTOVER_GATE_PATH
+            value: /root/.sky/api-request-cutover.json
+
+  - it: should never reinterpret a tombstoned parent as sqlite
+    values:
+      - fixtures/request-store-tombstone-final.yaml
+    asserts:
+      - failedTemplate:
+          errorMessage: "requestStore.backend=postgres requires external PostgreSQL via apiService.dbConnectionSecretName or apiService.dbConnectionString"
+
   - it: should enable the PostgreSQL request store for one compatibility pod
     set:
       requestStore.backend: postgres

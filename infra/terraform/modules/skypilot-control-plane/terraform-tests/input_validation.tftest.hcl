@@ -182,6 +182,208 @@ run "rejects_request_store_from_escape_hatch" {
   expect_failures = [helm_release.skypilot]
 }
 
+run "rejects_request_store_null_without_prior_capture" {
+  command = plan
+
+  variables {
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore: null
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_null_when_prior_capture_omits_backend" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        auth:
+          retainedOAuthSecret: live-oauth
+      EOT
+      sha256 = "d6bcbb03c60b0b4bf4f60c44f727ac20fbb69339b27d29ee36e3361e231cb4b6"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore: null
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_null_when_prior_backend_is_sqlite" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: sqlite
+      EOT
+      sha256 = "d8c91e4bc2983a864ccc5d4962004ecf8e7f0ec4fca761633d5d0f251e156647"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore: null
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_null_when_prior_quiescence_fence_is_absent" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+      EOT
+      sha256 = "376bb1eea709416d4e59ec9a776a1b54a09f34ba2cc947a2a7b2f70ff3c8f16b"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore: null
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_null_when_typed_backend_is_sqlite" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+          enforceBuiltinExecutionQuiescenceBackends: true
+      EOT
+      sha256 = "4c1443efbd95d40dffe898049b8e0a89eaa1cf9f81ecf89e298aa1e892e3dc11"
+    }
+    extra_helm_values = <<-EOT
+      requestStore: null
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_null_without_typed_quiescence_fence" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+          enforceBuiltinExecutionQuiescenceBackends: true
+      EOT
+      sha256 = "4c1443efbd95d40dffe898049b8e0a89eaa1cf9f81ecf89e298aa1e892e3dc11"
+    }
+    request_store = {
+      backend = "postgres"
+    }
+    extra_helm_values = <<-EOT
+      requestStore: null
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_map_even_with_transition_evidence" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+          enforceBuiltinExecutionQuiescenceBackends: true
+      EOT
+      sha256 = "4c1443efbd95d40dffe898049b8e0a89eaa1cf9f81ecf89e298aa1e892e3dc11"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore:
+        backend: postgres
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_scalar_even_with_transition_evidence" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+          enforceBuiltinExecutionQuiescenceBackends: true
+      EOT
+      sha256 = "4c1443efbd95d40dffe898049b8e0a89eaa1cf9f81ecf89e298aa1e892e3dc11"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore: postgres
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
+run "rejects_request_store_list_even_with_transition_evidence" {
+  command = plan
+
+  variables {
+    prior_helm_release_values = {
+      yaml   = <<-EOT
+        requestStore:
+          backend: postgres
+          enforceBuiltinExecutionQuiescenceBackends: true
+      EOT
+      sha256 = "4c1443efbd95d40dffe898049b8e0a89eaa1cf9f81ecf89e298aa1e892e3dc11"
+    }
+    request_store = {
+      backend                                       = "postgres"
+      enforce_builtin_execution_quiescence_backends = true
+    }
+    extra_helm_values = <<-EOT
+      requestStore:
+        - postgres
+    EOT
+  }
+
+  expect_failures = [helm_release.skypilot]
+}
+
 run "rejects_fullname_override_from_escape_hatch" {
   command = plan
 
