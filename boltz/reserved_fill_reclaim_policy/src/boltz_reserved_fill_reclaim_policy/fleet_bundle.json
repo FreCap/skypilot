@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "fleet": {
     "contexts": [
       {
@@ -40,18 +40,55 @@
         "queues": {
           "cohort": "dedicated-pool-research",
           "inference_cluster_queue": "skyserve-inference-borrowed",
-          "inference_gpu_quotas": [
+          "inference_resource_groups": [
             {
-              "borrowing_limit": "64",
-              "flavor": "ml.p4d.24xlarge",
-              "nominal_quota": "0",
-              "resource_name": "nvidia.com/gpu"
-            },
-            {
-              "borrowing_limit": "264",
-              "flavor": "ml.p4de.24xlarge",
-              "nominal_quota": "0",
-              "resource_name": "nvidia.com/gpu"
+              "covered_resources": [
+                "nvidia.com/gpu",
+                "cpu",
+                "memory"
+              ],
+              "flavors": [
+                {
+                  "name": "ml.p4de.24xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "264",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "1056",
+                      "nominal_quota": "0",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "4224Gi",
+                      "nominal_quota": "0",
+                      "resource_name": "memory"
+                    }
+                  ]
+                },
+                {
+                  "name": "ml.p4d.24xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "64",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "256",
+                      "nominal_quota": "0",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "1024Gi",
+                      "nominal_quota": "0",
+                      "resource_name": "memory"
+                    }
+                  ]
+                }
+              ]
             }
           ],
           "inference_preemption": {
@@ -60,18 +97,167 @@
             "within_cluster_queue": "Never"
           },
           "research_cluster_queue": "hyperpod-ns-research-clusterqueue",
-          "research_gpu_quotas": [
+          "research_resource_groups": [
             {
-              "borrowing_limit": "0",
-              "flavor": "ml.p4d.24xlarge",
-              "nominal_quota": "64",
-              "resource_name": "nvidia.com/gpu"
-            },
-            {
-              "borrowing_limit": "0",
-              "flavor": "ml.p4de.24xlarge",
-              "nominal_quota": "264",
-              "resource_name": "nvidia.com/gpu"
+              "covered_resources": [
+                "nvidia.com/gpu",
+                "aws.amazon.com/neurondevice",
+                "cpu",
+                "memory",
+                "vpc.amazonaws.com/efa"
+              ],
+              "flavors": [
+                {
+                  "name": "ml.p4de.24xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "264",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "3168",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "38016Gi",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "132",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                },
+                {
+                  "name": "ml.p4d.24xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "64",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "768",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "9Ti",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "32",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                },
+                {
+                  "name": "ml.m6i.4xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "128",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "512Gi",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "1G",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                },
+                {
+                  "name": "ml.c6i.16xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "64",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "128Gi",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "1G",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                },
+                {
+                  "name": "ml.c6i.8xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "256",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "512Gi",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "1G",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                }
+              ]
             }
           ],
           "research_namespace": "hyperpod-ns-research",
@@ -82,7 +268,7 @@
           }
         },
         "scheduler_name": "gpu-binpack-scheduler",
-        "service_account_name": "skypilot-pool-sa",
+        "service_account_name": "skypilot-inference-sa",
         "workload_priority_class_name": "skyserve-inference-low"
       },
       {
@@ -112,12 +298,35 @@
         "queues": {
           "cohort": "shared-pool",
           "inference_cluster_queue": "skyserve-inference-borrowed",
-          "inference_gpu_quotas": [
+          "inference_resource_groups": [
             {
-              "borrowing_limit": "512",
-              "flavor": "ml.p5e.48xlarge",
-              "nominal_quota": "0",
-              "resource_name": "nvidia.com/gpu"
+              "covered_resources": [
+                "nvidia.com/gpu",
+                "cpu",
+                "memory"
+              ],
+              "flavors": [
+                {
+                  "name": "ml.p5e.48xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "512",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "2048",
+                      "nominal_quota": "0",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "8192Gi",
+                      "nominal_quota": "0",
+                      "resource_name": "memory"
+                    }
+                  ]
+                }
+              ]
             }
           ],
           "inference_preemption": {
@@ -126,12 +335,77 @@
             "within_cluster_queue": "Never"
           },
           "research_cluster_queue": "hyperpod-ns-research-clusterqueue",
-          "research_gpu_quotas": [
+          "research_resource_groups": [
             {
-              "borrowing_limit": "512",
-              "flavor": "ml.p5e.48xlarge",
-              "nominal_quota": "512",
-              "resource_name": "nvidia.com/gpu"
+              "covered_resources": [
+                "nvidia.com/gpu",
+                "aws.amazon.com/neurondevice",
+                "cpu",
+                "memory",
+                "vpc.amazonaws.com/efa"
+              ],
+              "flavors": [
+                {
+                  "name": "ml.p5e.48xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "512",
+                      "nominal_quota": "512",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "12288",
+                      "nominal_quota": "12288",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "128Ti",
+                      "nominal_quota": "128Ti",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "2048",
+                      "nominal_quota": "2048",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                },
+                {
+                  "name": "ml.m6i.4xlarge",
+                  "resources": [
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "nvidia.com/gpu"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "0",
+                      "resource_name": "aws.amazon.com/neurondevice"
+                    },
+                    {
+                      "borrowing_limit": "32",
+                      "nominal_quota": "32",
+                      "resource_name": "cpu"
+                    },
+                    {
+                      "borrowing_limit": "128Gi",
+                      "nominal_quota": "128Gi",
+                      "resource_name": "memory"
+                    },
+                    {
+                      "borrowing_limit": "0",
+                      "nominal_quota": "1G",
+                      "resource_name": "vpc.amazonaws.com/efa"
+                    }
+                  ]
+                }
+              ]
             }
           ],
           "research_namespace": "hyperpod-ns-research",
@@ -142,7 +416,7 @@
           }
         },
         "scheduler_name": "gpu-binpack-scheduler",
-        "service_account_name": "skypilot-pool-sa",
+        "service_account_name": "skypilot-inference-sa",
         "workload_priority_class_name": "skyserve-inference-low"
       }
     ]

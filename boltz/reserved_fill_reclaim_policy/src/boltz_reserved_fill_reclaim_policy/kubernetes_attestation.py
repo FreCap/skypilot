@@ -120,43 +120,103 @@ def _preemption(spec: Mapping[str, Any]) -> dict[str, str]:
     return result  # type: ignore[return-value]
 
 
-def _gpu_quotas(spec: Mapping[str, Any]) -> list[dict[str, str]]:
-    result: list[dict[str, str]] = []
+def _resource_groups(spec: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Normalize the complete strict ClusterQueue resource topology."""
+    result: list[dict[str, Any]] = []
     groups = _list(spec.get('resourceGroups'), 'ClusterQueue resource groups')
+    covered_inventory: set[str] = set()
+    group_signatures: set[frozenset[str]] = set()
+    quota_atoms: set[tuple[str, str]] = set()
     for group in groups:
         group_mapping = _dict(group, 'ClusterQueue resource group')
-        for flavor in _list(group_mapping.get('flavors'),
-                            'ClusterQueue flavors'):
+        if set(group_mapping) != {'coveredResources', 'flavors'}:
+            raise KubernetesAttestationError(
+                'ClusterQueue resource group schema is not exact.')
+        covered_resources = _list(group_mapping.get('coveredResources'),
+                                  'ClusterQueue covered resources')
+        if (not covered_resources or any(not isinstance(item, str) or not item
+                                         for item in covered_resources) or
+                len(covered_resources) != len(set(covered_resources))):
+            raise KubernetesAttestationError(
+                'ClusterQueue covered resources are invalid.')
+        signature = frozenset(covered_resources)
+        if (signature in group_signatures or
+                covered_inventory.intersection(signature)):
+            raise KubernetesAttestationError(
+                'ClusterQueue has duplicate or overlapping resource groups.')
+        group_signatures.add(signature)
+        covered_inventory.update(signature)
+        normalized_flavors: list[dict[str, Any]] = []
+        flavors = _list(group_mapping.get('flavors'), 'ClusterQueue flavors')
+        if not flavors:
+            raise KubernetesAttestationError(
+                'ClusterQueue resource group has no flavors.')
+        flavor_names: set[str] = set()
+        for flavor in flavors:
             flavor_mapping = _dict(flavor, 'ClusterQueue flavor')
+            if set(flavor_mapping) != {'name', 'resources'}:
+                raise KubernetesAttestationError(
+                    'ClusterQueue flavor schema is not exact.')
             flavor_name = flavor_mapping.get('name')
             if not isinstance(flavor_name, str) or not flavor_name:
                 raise KubernetesAttestationError(
                     'ClusterQueue flavor name is invalid.')
+            if flavor_name in flavor_names:
+                raise KubernetesAttestationError(
+                    'ClusterQueue has duplicate flavors in one group.')
+            flavor_names.add(flavor_name)
+            normalized_resources: list[dict[str, str]] = []
+            resource_names: set[str] = set()
             for resource in _list(flavor_mapping.get('resources'),
                                   'ClusterQueue flavor resources'):
                 resource_mapping = _dict(resource,
                                          'ClusterQueue flavor resource')
-                if resource_mapping.get('name') != 'nvidia.com/gpu':
-                    continue
+                if set(resource_mapping) != {
+                        'name', 'nominalQuota', 'borrowingLimit'
+                }:
+                    raise KubernetesAttestationError(
+                        'ClusterQueue quota atom schema is not exact.')
+                resource_name = resource_mapping.get('name')
                 nominal = resource_mapping.get('nominalQuota')
                 borrowing = resource_mapping.get('borrowingLimit')
-                if nominal is None or borrowing is None:
+                if (not isinstance(resource_name, str) or not resource_name or
+                        not isinstance(nominal, str) or not nominal or
+                        not isinstance(borrowing, str) or not borrowing):
                     raise KubernetesAttestationError(
-                        'ClusterQueue GPU quota is incomplete.')
-                result.append({
-                    'flavor': flavor_name,
-                    'resource_name': 'nvidia.com/gpu',
-                    'nominal_quota': str(nominal),
-                    'borrowing_limit': str(borrowing),
+                        'ClusterQueue quota atom is incomplete.')
+                atom = (flavor_name, resource_name)
+                if resource_name in resource_names or atom in quota_atoms:
+                    raise KubernetesAttestationError(
+                        'ClusterQueue has duplicate quota atoms.')
+                resource_names.add(resource_name)
+                quota_atoms.add(atom)
+                normalized_resources.append({
+                    'resource_name': resource_name,
+                    'nominal_quota': nominal,
+                    'borrowing_limit': borrowing,
                 })
-    result.sort(key=lambda item: item['flavor'])
+            if resource_names != signature:
+                raise KubernetesAttestationError(
+                    'ClusterQueue flavor does not cover its exact resource '
+                    'group.')
+            normalized_resources.sort(key=lambda item: item['resource_name'])
+            normalized_flavors.append({
+                'name': flavor_name,
+                'resources': normalized_resources,
+            })
+        normalized_flavors.sort(key=lambda item: item['name'])
+        result.append({
+            'covered_resources': sorted(covered_resources),
+            'flavors': normalized_flavors,
+        })
+    result.sort(key=lambda item: tuple(item['covered_resources']))
     return result
 
 
 def _validate_cluster_queue(
         value: Mapping[str, Any], *, name: str, namespace: str, cohort: str,
         expected_preemption: Mapping[str, str],
-        expected_gpu_quotas: list[Mapping[str, str]]) -> None:
+        expected_resource_groups: list[Mapping[str, Any]]) -> None:
     _require_active(value, name=name)
     spec = _dict(value.get('spec'), f'{name} spec')
     expected_selector = {
@@ -168,7 +228,8 @@ def _validate_cluster_queue(
             spec.get('namespaceSelector') != expected_selector or
             spec.get('stopPolicy') not in (None, 'None') or
             _preemption(spec) != dict(expected_preemption) or
-            _gpu_quotas(spec) != [dict(item) for item in expected_gpu_quotas]):
+            _resource_groups(spec)
+            != [dict(item) for item in expected_resource_groups]):
         raise KubernetesAttestationError(
             f'ClusterQueue {name!r} does not match the reviewed reclaim '
             'contract.')
@@ -486,14 +547,14 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
         namespace=namespace_name,
         cohort=queue_contract['cohort'],
         expected_preemption=queue_contract['inference_preemption'],
-        expected_gpu_quotas=queue_contract['inference_gpu_quotas'])
+        expected_resource_groups=(queue_contract['inference_resource_groups']))
     _validate_cluster_queue(
         _dict(snapshot.get('research_cluster_queue'), 'research ClusterQueue'),
         name=queue_contract['research_cluster_queue'],
         namespace=queue_contract['research_namespace'],
         cohort=queue_contract['cohort'],
         expected_preemption=queue_contract['research_preemption'],
-        expected_gpu_quotas=queue_contract['research_gpu_quotas'])
+        expected_resource_groups=queue_contract['research_resource_groups'])
 
     observed_flavors = _dict(snapshot.get('resource_flavors'),
                              'ResourceFlavor inventory')
