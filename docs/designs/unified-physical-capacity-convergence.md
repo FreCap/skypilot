@@ -1389,8 +1389,10 @@ the convenience tag was `test-capacity-c2-73d80feb9`.
 
 The registry vulnerability report was attributed by image layer. Every
 reported high or critical finding mapped to an inherited base-image layer;
-none mapped to the new application overlay
-`sha256:9f8d6409fb7f2c3badab580b8858cb3928834f58ae01d97cb6278067723a2088`.
+none mapped to either new application-layer `rootfs.diff_ids` value: wheel
+copy `sha256:fecd35d37becf86a13127f7aed2d017e12c3c3fa62f6db5f52c5cd9b08c7950b`
+or wheel install
+`sha256:be39f8e77ffdccbd68c9c34f32810772ad213bafad678310d8e697d821453ffd`.
 This is causal attribution, not a waiver or remediation claim: inherited base
 image debt remains independently open.
 
