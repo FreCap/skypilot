@@ -149,6 +149,10 @@ def _replica_summary_query(
             services.c.name,
             services.c.hash,
             services.c.logical_replica_semantics,
+            services.c.status.label('service_status'),
+            services.c.uptime.label('service_uptime'),
+            services.c.policy.label('service_policy'),
+            services.c.requested_resources_str,
             replicas.c.status,
             sqlalchemy.func.count(  # pylint: disable=not-callable
                 replicas.c.replica_id).label('physical_count'),
@@ -167,6 +171,8 @@ def _replica_summary_query(
             query = query.where(services.c.name.in_(names))
     return query.group_by(services.c.name, services.c.hash,
                           services.c.logical_replica_semantics,
+                          services.c.status, services.c.uptime,
+                          services.c.policy, services.c.requested_resources_str,
                           replicas.c.status).order_by(services.c.name)
 
 
@@ -182,6 +188,18 @@ def _build_replica_summaries(rows: Collection[Any]) -> list[dict[str, Any]]:
             summary = {
                 'service_name': service_name,
                 'service_hash': mapping['hash'],
+                # Persisted lifecycle fields let the services list paint a
+                # useful identity snapshot from this direct PostgreSQL read.
+                # Live targets, request pressure, and endpoint discovery still
+                # arrive independently from the controller-backed summary.
+                'service_status':
+                    (mapping['service_status']
+                     if isinstance(mapping['service_status'], str) and
+                     mapping['service_status'] else ReplicaStatus.UNKNOWN.value
+                    ),
+                'service_uptime': mapping['service_uptime'],
+                'service_policy': mapping['service_policy'],
+                'requested_resources_str': mapping['requested_resources_str'],
                 'replica_unit':
                     ('logical_slot' if logical else 'physical_backend'),
                 'replica_status_counts': {},
@@ -215,6 +233,9 @@ def get_replica_summaries(
                 _replica_summary_query(service_names)).fetchall()
     return {
         'available': True,
+        # Explicit rollout capability: new dashboard assets may be served
+        # alongside an older API pod whose summaries are replica-only.
+        'service_metadata_included': True,
         'observed_at': observed_at,
         'summaries': _build_replica_summaries(rows),
     }
@@ -224,6 +245,7 @@ def unavailable_replica_summaries(reason: str) -> dict[str, Any]:
     return {
         'available': False,
         'reason': reason,
+        'service_metadata_included': False,
         'observed_at': None,
         'summaries': [],
     }

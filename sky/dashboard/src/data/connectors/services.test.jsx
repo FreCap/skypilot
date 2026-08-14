@@ -778,6 +778,10 @@ describe('direct replica projections', () => {
       normalizeServiceReplicaSummary({
         service_name: 'svc',
         service_hash: 'hash-a',
+        service_status: 'READY',
+        service_uptime: 1751600000,
+        service_policy: 'autoscaling(min=0,max=8)',
+        requested_resources_str: '1x[L4:4]',
         replica_unit: 'logical_slot',
         replica_status_counts: {
           READY: 1,
@@ -795,6 +799,11 @@ describe('direct replica projections', () => {
     ).toMatchObject({
       name: 'svc',
       serviceHash: 'hash-a',
+      persistedMetadataLoaded: true,
+      status: 'READY',
+      uptime: 1751600000,
+      policy: 'autoscaling(min=0,max=8)',
+      requestedResources: '1x[L4:4]',
       replicaUnit: 'logical',
       replicasReady: 8,
       replicasTotal: 12,
@@ -811,11 +820,16 @@ describe('direct replica projections', () => {
     apiClient.get.mockResolvedValue(
       directResponse({
         available: true,
+        service_metadata_included: true,
         observed_at: 123,
         summaries: [
           {
             service_name: 'svc-a',
             service_hash: 'hash-a',
+            service_status: 'READY',
+            service_uptime: 1751600000,
+            service_policy: 'autoscaling(min=0,max=1)',
+            requested_resources_str: '1x[L4:1]',
             replica_unit: 'physical',
             replica_status_counts: { READY: 1 },
             replica_capacity_counts: { READY: 1 },
@@ -836,9 +850,11 @@ describe('direct replica projections', () => {
     expect(result.summaries[0]).toMatchObject({
       name: 'svc-a',
       serviceHash: 'hash-a',
+      persistedMetadataLoaded: true,
       observedAt: 123,
       replicasReady: 1,
     });
+    expect(result.serviceMetadataIncluded).toBe(true);
   });
 
   it('capability-gates summary 404s and topology fallback', async () => {

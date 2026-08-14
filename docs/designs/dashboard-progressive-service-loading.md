@@ -2,12 +2,21 @@
 
 _Created: 2026-08-01_
 
-_Status: v0-v1c deployed; v1d locally verified and pending CI/merge_
-_Last updated: 2026-08-04_
+_Status: v0-v1d deployed; v1e implemented pending CI/merge/rollout_
+_Last updated: 2026-08-14_
 
 ## Problems
 
 Before v0, the services list blocked its first useful rows on one aggregate status request. The deployed v0 now renders metadata first, but it starts the summary only after metadata settles. Production verification measured 6.36 seconds for the sequential pair and 3.09 seconds when both requests started together.
+
+Production profiling on 2026-08-14 found a new first-paint floor: both the
+controller-backed metadata projection and controller-backed summary took
+6.18-6.55 seconds for six services, while the existing direct PostgreSQL
+replica-summary route returned in 0.13 seconds. The metadata payload was only
+15 KB, so the delay came from controller compatibility transport rather than
+database result size or browser rendering. The direct replica projection must
+therefore carry the persisted lifecycle fields needed to paint list rows; live
+controller fields remain progressive enrichment.
 
 The service detail still couples unrelated costs in one deferred full-status request: live autoscaler data, 24 hours of history, current replica detail, every retained attempt, endpoint resolution, and service YAML. For `boltz-l4-fleet`, the page transferred about 2.5 MB of 24-hour history even though its initial selection is one hour; the equivalent one-hour history was 113 KB. The direct PostgreSQL history query took 87 ms for one hour and 170 ms for 24 hours, while the scheduled status path retained a roughly 2.8-second controller-transport floor. The full fleet response also serialized hundreds of replica rows although the page displayed at most 50 historical attempts.
 
@@ -232,6 +241,18 @@ is not mislabeled as a catalog lookup.
 Replica cursors are opaque, versioned keyset cursors over descending `replica_id`. They carry the service hash, scope, first-page maximum replica ID, and last replica ID. Each request supplies the expected service hash, so recreating a same-name service invalidates the cursor with `409`; the first-page maximum keeps later pages stable when newer attempts arrive. Each page filters before decoding legacy JSON/pickle replica state and reads at most `limit + 1` rows. Rows that transition between current and past across refreshes are deduplicated by replica ID, and a manual or visibility refresh replaces the current page and exact totals rather than adding counts from different snapshots.
 
 The dashboard starts the list metadata and summary requests together and renders either phase as it arrives. On a cold consolidated detail route, the cheap existing metadata projection is the required identity anchor because it supplies the current service hash. As soon as that hash lands, the dashboard fans out one hour of direct history, the batched replica summary, the dedicated no-ID pricing aggregate, and the first current-replica page concurrently while the controller-backed live summary proceeds independently. After a current page lands, separate ID-mode pricing requests select only rows that do not already have a result, in chunks no larger than 100. Row responses never update aggregate state, preventing chunk order from replacing a newer aggregate. Direct responses are merged only when they match the anchored visible service incarnation. A refresh may reuse the visible hash to start those reads immediately, but a `409` invalidates that anchor and restarts from metadata. Each section has its own loading and unavailable state, and stale-response fencing checks both the route generation and service hash. Selecting 12 or 24 hours requests only that range; choosing a smaller range reuses already loaded data. A 404 from an older server or `available: false` from a non-consolidated server uses the existing v0 full-status path.
+
+For the services list in v1e, the batched replica-summary route also returns
+the compact persisted service status, uptime, policy, and requested-resource
+string from the same repeatable-read query. That projection is the canonical
+first paint in consolidated mode and may create rows before controller
+metadata arrives. The controller summary remains authoritative for endpoints,
+autoscaler targets, request pressure, and other live fields and merges later.
+Older/non-consolidated servers keep the v0 metadata-first fallback. A direct
+first paint ends the page-level loading state while deferred cells retain their
+own loading indicators. A top-level `service_metadata_included: true`
+capability marker prevents a new dashboard bundle from treating a replica-only
+response from an older API pod as first-paint metadata during a rolling update.
 
 Pricing has its own loading, unavailable, and last-good state. A failure never
 blanks replica counts, endpoints, history, or prior prices. Newly loaded current

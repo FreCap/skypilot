@@ -165,6 +165,8 @@ def test_summary_query_is_one_compact_grouped_scan():
     assert 'LEFT OUTER JOIN replicas' in sql
     assert 'GROUP BY services.name' in sql
     assert "services.name IN ('svc-a', 'svc-b')" in sql
+    assert 'services.status AS service_status' in sql
+    assert 'services.requested_resources_str' in sql
     assert 'replicas.replica_state' in sql
     assert 'replicas.replica_info' not in sql
 
@@ -174,6 +176,10 @@ def test_summary_counts_physical_attempts_separately_from_capacity():
         'name': 'svc',
         'hash': 'hash-a',
         'logical_replica_semantics': 1,
+        'service_status': 'READY',
+        'service_uptime': 100,
+        'service_policy': 'autoscaling(min=0,max=8)',
+        'requested_resources_str': '1x[L4:4]',
         'status': 'READY',
         'physical_count': 2,
         'capacity_count': 8,
@@ -181,6 +187,10 @@ def test_summary_counts_physical_attempts_separately_from_capacity():
         'name': 'svc',
         'hash': 'hash-a',
         'logical_replica_semantics': 1,
+        'service_status': 'READY',
+        'service_uptime': 100,
+        'service_policy': 'autoscaling(min=0,max=8)',
+        'requested_resources_str': '1x[L4:4]',
         'status': 'FAILED_PROVISION',
         'physical_count': 3,
         'capacity_count': 12,
@@ -188,6 +198,10 @@ def test_summary_counts_physical_attempts_separately_from_capacity():
         'name': 'svc',
         'hash': 'hash-a',
         'logical_replica_semantics': 1,
+        'service_status': 'READY',
+        'service_uptime': 100,
+        'service_policy': 'autoscaling(min=0,max=8)',
+        'requested_resources_str': '1x[L4:4]',
         'status': None,
         'physical_count': 1,
         'capacity_count': 4,
@@ -196,6 +210,10 @@ def test_summary_counts_physical_attempts_separately_from_capacity():
     assert serve_dashboard._build_replica_summaries(rows) == [{
         'service_name': 'svc',
         'service_hash': 'hash-a',
+        'service_status': 'READY',
+        'service_uptime': 100,
+        'service_policy': 'autoscaling(min=0,max=8)',
+        'requested_resources_str': '1x[L4:4]',
         'replica_unit': 'logical_slot',
         'replica_status_counts': {
             'READY': 2,
@@ -218,6 +236,10 @@ def test_replica_summaries_execute_one_batched_query(monkeypatch):
             'name': 'svc',
             'hash': 'hash-a',
             'logical_replica_semantics': 0,
+            'service_status': 'READY',
+            'service_uptime': 100,
+            'service_policy': 'autoscaling(min=0,max=1)',
+            'requested_resources_str': '1x[L4:1]',
             'status': 'READY',
             'physical_count': 1,
             'capacity_count': 1,
@@ -233,6 +255,7 @@ def test_replica_summaries_execute_one_batched_query(monkeypatch):
 
     assert len(connection.statements) == 1
     assert result['observed_at'] == 42.0
+    assert result['service_metadata_included'] is True
     assert result['summaries'][0]['service_name'] == 'svc'
 
 
