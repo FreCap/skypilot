@@ -70,6 +70,7 @@ jest.mock('@/data/connectors/infra', () => ({
   getContextGPUData: jest.fn(),
   getCloudInfrastructure: jest.fn(),
   getEnabledCloudsList: jest.fn(),
+  getInfraSummary: jest.fn(),
   getContextJobs: jest.fn(async () => ({})),
   getContextClusters: jest.fn(async () => ({})),
   getSlurmInfrastructure: jest.fn(),
@@ -240,6 +241,9 @@ describe('Infra page refresh lifecycle', () => {
 
     const { unmount } = render(<GPUs />);
     await screen.findByText('initial-context');
+    expect(cachePreloader.preloadForPage).toHaveBeenCalledWith('infra', {
+      backgroundPreload: false,
+    });
     await act(async () => {
       await Promise.resolve();
     });

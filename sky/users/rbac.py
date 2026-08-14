@@ -256,6 +256,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
     },
     # --- Infra info (read-only catalog/state) ---
     {
+        'path': '/infra_summary',
+        'method': 'GET'
+    },
+    {
         'path': '/enabled_clouds',
         'method': 'GET'
     },

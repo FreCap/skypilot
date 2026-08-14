@@ -65,6 +65,7 @@ from sky.server import core_middleware
 from sky.server import csp_utils
 from sky.server import dashboard as dashboard_app
 from sky.server import file_mount_uploads
+from sky.server import infra_dashboard
 from sky.server import metrics
 from sky.server import plugins
 from sky.server import public_capacity as public_capacity_api
@@ -490,6 +491,7 @@ app.include_router(ssh_node_pools_rest.router,
                    tags=['ssh_node_pools'])
 app.include_router(recipes_rest.router, prefix='/recipes', tags=['recipes'])
 app.include_router(events_rest.router, prefix='/events', tags=['events'])
+app.include_router(infra_dashboard.router, tags=['dashboard'])
 app.include_router(public_capacity_api.router, tags=['public'])
 app.include_router(file_mount_uploads.router)
 app.include_router(launch_identity.router)

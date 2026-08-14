@@ -24,6 +24,7 @@ import { canonicalizeGpuName, summarizeGpusByType } from '@/utils/gpuUtils';
 import {
   getWorkspaceInfrastructure,
   getWorkspaceContexts,
+  getInfraSummary,
   getContextGPUData,
   getCloudInfrastructure,
   getEnabledCloudsList,
@@ -737,8 +738,10 @@ export function GPUs() {
     // This calls the fetchData version defined when isInitialLoad is true.
     // That fetchData will then set isInitialLoad to false within its finally block.
     const initializeData = async () => {
-      // Trigger cache preloading for infra page and background preload other pages
-      await cachePreloader.preloadForPage('infra');
+      // Keep unrelated page preloads out of the critical first-paint window.
+      await cachePreloader.preloadForPage('infra', {
+        backgroundPreload: false,
+      });
 
       await startRefresh({ showLoadingIndicators: true });
     };
@@ -792,6 +795,7 @@ export function GPUs() {
       { allUsers: true, skipFinished: true },
     ]);
     dashboardCache.invalidate(getWorkspaceContexts);
+    dashboardCache.invalidate(getInfraSummary);
     dashboardCache.invalidate(getWorkspaceInfrastructure); // Keep for backwards compatibility
     dashboardCache.invalidate(getEnabledCloudsList);
     // `getWorkspaceContexts` reads `getEnabledCloudsBatch` internally

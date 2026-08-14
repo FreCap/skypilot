@@ -10,6 +10,125 @@ import { buildContextStatsKeyFromCloud } from '@/utils/infraUtils';
 export { getSlurmInfrastructure } from '@/data/connectors/infra-slurm';
 export { getContextGPUData } from '@/data/connectors/infra-kubernetes';
 
+const INFRA_SUMMARY_VERSION = 1;
+
+/**
+ * Fetch the workspace/infra identity needed for first paint directly from the
+ * API process. Older servers return 404 and keep using the scheduled reads.
+ */
+export async function getInfraSummary() {
+  try {
+    const response = await apiClient.get('/infra_summary');
+    if (response.status === 404) {
+      return { available: false, reason: 'unsupported' };
+    }
+    if (!response.ok) {
+      throw new Error(`Infra summary request failed with ${response.status}`);
+    }
+
+    const payload = await response.json();
+    if (
+      payload?.version !== INFRA_SUMMARY_VERSION ||
+      !Array.isArray(payload.workspaces)
+    ) {
+      throw new Error('Infra summary response was malformed');
+    }
+
+    const workspaces = {};
+    for (const workspace of payload.workspaces) {
+      if (
+        !workspace ||
+        typeof workspace.name !== 'string' ||
+        !Array.isArray(workspace.infrastructure)
+      ) {
+        throw new Error('Infra summary workspace was malformed');
+      }
+      workspaces[workspace.name] = workspace.infrastructure.filter(
+        (item) => typeof item === 'string' && item.length > 0
+      );
+    }
+    return { available: true, workspaces };
+  } catch (error) {
+    console.warn(
+      'Direct infra summary unavailable; using legacy reads:',
+      error
+    );
+    return {
+      available: false,
+      reason: 'unavailable',
+      // A transient direct-read failure should be retried on the next refresh.
+      __skipCache: true,
+    };
+  }
+}
+
+function enabledCloudRows(workspaceInfrastructure) {
+  const enabledCloudsSet = new Set();
+  Object.values(workspaceInfrastructure || {}).forEach((infrastructure) => {
+    (infrastructure || []).forEach((item) => {
+      enabledCloudsSet.add(item.toLowerCase().split('/')[0]);
+    });
+  });
+
+  const clouds = CLOUDS_LIST.filter((cloud) =>
+    enabledCloudsSet.has(cloud.toLowerCase())
+  )
+    .map((name) => ({ name, enabled: true }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return {
+    clouds,
+    totalClouds: CLOUDS_LIST.length,
+    enabledClouds: clouds.length,
+  };
+}
+
+export function buildWorkspaceContexts(
+  workspaceInfrastructure,
+  workspaceConfigs = {}
+) {
+  const workspaces = {};
+  const allContextNames = new Set();
+  const contextWorkspaceMap = {};
+
+  Object.entries(workspaceInfrastructure || {}).forEach(
+    ([workspaceName, infrastructure]) => {
+      workspaces[workspaceName] = {
+        config: workspaceConfigs[workspaceName] || {},
+        clouds: infrastructure,
+        contexts: [],
+      };
+
+      (infrastructure || []).forEach((infraItem) => {
+        const normalized = infraItem.toLowerCase();
+        let context = null;
+        if (normalized.startsWith('kubernetes/')) {
+          context = infraItem.replace(/^kubernetes\//i, '');
+        } else if (normalized.startsWith('ssh/')) {
+          context = `ssh-${infraItem.replace(/^ssh\//i, '')}`;
+        }
+        if (!context) return;
+
+        allContextNames.add(context);
+        if (!workspaces[workspaceName].contexts.includes(context)) {
+          workspaces[workspaceName].contexts.push(context);
+        }
+        if (!contextWorkspaceMap[context]) {
+          contextWorkspaceMap[context] = [];
+        }
+        if (!contextWorkspaceMap[context].includes(workspaceName)) {
+          contextWorkspaceMap[context].push(workspaceName);
+        }
+      });
+    }
+  );
+
+  return {
+    workspaces,
+    allContextNames: [...allContextNames].sort(),
+    contextWorkspaceMap,
+  };
+}
+
 /**
  * Fast function to get just the list of enabled clouds (without counts).
  * Used for progressive loading - display cloud rows immediately, then overlay counts.
@@ -20,6 +139,11 @@ export async function getEnabledCloudsList() {
   );
 
   try {
+    const summary = await dashboardCache.get(getInfraSummary);
+    if (summary.available) {
+      return enabledCloudRows(summary.workspaces);
+    }
+
     // Get workspaces (fast - cached)
     const workspacesData = await dashboardCache
       .get(getWorkspaces)
@@ -342,6 +466,11 @@ export async function getWorkspaceInfrastructure() {
 // This allows the UI to show contexts immediately while GPU data loads progressively
 export async function getWorkspaceContexts() {
   try {
+    const summary = await dashboardCache.get(getInfraSummary);
+    if (summary.available) {
+      return buildWorkspaceContexts(summary.workspaces);
+    }
+
     // Step 1: Get all accessible workspaces for the user (use cache for performance)
     const { getWorkspaces } = await import('@/data/connectors/workspaces');
     const workspacesData = await dashboardCache.get(getWorkspaces);
@@ -363,51 +492,13 @@ export async function getWorkspaceContexts() {
       .get(getEnabledCloudsBatch, [workspaceNames, true])
       .catch(() => ({}));
 
-    const workspaceInfraData = {};
-    const allContextsAcrossWorkspaces = [];
-    const contextWorkspaceMap = {};
-
-    Object.entries(workspacesData).forEach(
-      ([workspaceName, workspaceConfig]) => {
-        const expandedClouds = batchResult[workspaceName] || [];
-        workspaceInfraData[workspaceName] = {
-          config: workspaceConfig,
-          clouds: expandedClouds,
-          contexts: [],
-        };
-
-        expandedClouds.forEach((infraItem) => {
-          if (infraItem.toLowerCase().startsWith('kubernetes/')) {
-            const context = infraItem.replace(/^kubernetes\//i, '');
-            allContextsAcrossWorkspaces.push(context);
-            if (!contextWorkspaceMap[context]) {
-              contextWorkspaceMap[context] = [];
-            }
-            if (!contextWorkspaceMap[context].includes(workspaceName)) {
-              contextWorkspaceMap[context].push(workspaceName);
-            }
-            workspaceInfraData[workspaceName].contexts.push(context);
-          } else if (infraItem.toLowerCase().startsWith('ssh/')) {
-            const poolName = infraItem.replace(/^ssh\//i, '');
-            const sshContextName = `ssh-${poolName}`;
-            allContextsAcrossWorkspaces.push(sshContextName);
-            if (!contextWorkspaceMap[sshContextName]) {
-              contextWorkspaceMap[sshContextName] = [];
-            }
-            if (!contextWorkspaceMap[sshContextName].includes(workspaceName)) {
-              contextWorkspaceMap[sshContextName].push(workspaceName);
-            }
-            workspaceInfraData[workspaceName].contexts.push(sshContextName);
-          }
-        });
-      }
+    const workspaceInfrastructure = Object.fromEntries(
+      Object.keys(workspacesData).map((workspaceName) => [
+        workspaceName,
+        batchResult[workspaceName] || [],
+      ])
     );
-
-    return {
-      workspaces: workspaceInfraData,
-      allContextNames: [...new Set(allContextsAcrossWorkspaces)].sort(),
-      contextWorkspaceMap: contextWorkspaceMap,
-    };
+    return buildWorkspaceContexts(workspaceInfrastructure, workspacesData);
   } catch (error) {
     console.error('Failed to fetch workspace contexts:', error);
     throw error;
