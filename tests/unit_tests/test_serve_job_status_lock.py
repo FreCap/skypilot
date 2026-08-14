@@ -19,6 +19,8 @@ import threading
 
 import pytest
 
+from sky import backends
+from sky import clouds
 from sky import exceptions
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -58,6 +60,40 @@ def _build_manager():
     mgr._is_pool = False
     mgr.latest_version = 1
     return mgr
+
+
+@pytest.mark.parametrize(
+    ('cloud', 'expected'),
+    [(clouds.Kubernetes(),
+      backends.ServeReplicaJobStatusSource.PROVIDER_AND_ENDPOINT),
+     (clouds.GCP(), backends.ServeReplicaJobStatusSource.REMOTE_JOB)],
+)
+def test_backend_selects_one_ordinary_serve_liveness_source(cloud, expected):
+    handle = backends.CloudVmRayResourceHandle.__new__(
+        backends.CloudVmRayResourceHandle)
+    handle.launched_resources = type('LaunchedResources', (),
+                                     {'cloud': cloud})()
+
+    assert (backends.CloudVmRayBackend().serve_replica_job_status_source(handle)
+            is expected)
+
+
+def test_backend_liveness_source_fails_closed_for_malformed_handle():
+    backend = backends.CloudVmRayBackend()
+    handle = backends.CloudVmRayResourceHandle.__new__(
+        backends.CloudVmRayResourceHandle)
+
+    # Missing launched_resources, a malformed resource object, and a missing
+    # cloud must all preserve exact remote status polling instead of raising or
+    # silently selecting the endpoint-only path.
+    assert (backend.serve_replica_job_status_source(handle)
+            is backends.ServeReplicaJobStatusSource.REMOTE_JOB)
+    handle.launched_resources = object()
+    assert (backend.serve_replica_job_status_source(handle)
+            is backends.ServeReplicaJobStatusSource.REMOTE_JOB)
+    handle.launched_resources = type('LaunchedResources', (), {'cloud': None})()
+    assert (backend.serve_replica_job_status_source(handle)
+            is backends.ServeReplicaJobStatusSource.REMOTE_JOB)
 
 
 def test_fetch_job_status_samples_latest_version_first(monkeypatch):

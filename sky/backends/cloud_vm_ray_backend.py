@@ -3811,6 +3811,29 @@ class CloudVmRayBackend(backends.Backend['CloudVmRayResourceHandle']):
         # a job (detach_setup, default).
         self._setup_cmd = None
 
+    def serve_replica_job_status_source(
+        self, handle: CloudVmRayResourceHandle
+    ) -> backends.ServeReplicaJobStatusSource:
+        """Return the canonical ordinary SkyServe liveness source.
+
+        A Kubernetes Serve worker's Pod lifecycle is provider-owned and its
+        application liveness is already sampled by the readiness probe.  A
+        second ``kubectl exec`` into every Pod to read SkyPilot's remote job
+        table duplicates those owners and makes each status round O(replicas)
+        in processes, threads, and file descriptors.  VM-like providers do
+        not expose the same Pod lifecycle contract and retain exact remote job
+        polling.
+
+        Pool and system-recovery semantics are intentionally not encoded in
+        this provider capability; their callers require exact job evidence and
+        override this ordinary steady-state source.
+        """
+        launched_resources = getattr(handle, 'launched_resources', None)
+        cloud = getattr(launched_resources, 'cloud', None)
+        if isinstance(cloud, clouds.Kubernetes):
+            return (backends.ServeReplicaJobStatusSource.PROVIDER_AND_ENDPOINT)
+        return backends.ServeReplicaJobStatusSource.REMOTE_JOB
+
     # --- Implementation of Backend APIs ---
 
     def register_info(self, **kwargs) -> None:

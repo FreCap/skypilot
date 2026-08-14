@@ -282,19 +282,32 @@ def _descendants() -> dict[int, ProcessIdentity]:
 
 
 def _reap_adopted_children(command: subprocess.Popen[bytes] | None) -> None:
-    if command is not None:
-        command.poll()
-    while True:
+    """Reap direct adopted descendants without stealing the manager wait.
+
+    ``Popen.poll()`` is the sole owner of the manager PID.  A generic
+    ``waitpid(-1)`` can race a manager exit after ``poll()`` reports it alive,
+    reap that PID itself, and make ``Popen`` lose the real exit status.  Enumerate
+    the subreaper's direct children instead and exclude the still-live manager;
+    every orphan adopted by this process becomes a direct child.
+    """
+    command_pid: int | None = None
+    if command is not None and command.poll() is None:
+        command_pid = command.pid
+    for child_pid in _direct_child_pids(os.getpid()):
+        if child_pid == command_pid:
+            continue
         try:
-            waited_pid, _ = os.waitpid(-1, os.WNOHANG)
+            os.waitpid(child_pid, os.WNOHANG)
         except ChildProcessError:
-            return
+            # The child exited and another owner already reaped it, or procfs
+            # changed between enumeration and waitpid().
+            continue
         except OSError as e:
+            if e.errno in (errno.ECHILD, errno.ESRCH):
+                continue
             raise FamilyEnumerationError(
                 f'could not reap managed-job controller descendants: {e}'
             ) from e
-        if waited_pid == 0:
-            return
 
 
 def _kill_exact_process(process: ProcessIdentity) -> None:
@@ -371,7 +384,8 @@ def _wait_for_manager_ready(command: subprocess.Popen[bytes], ready_fd: int,
         if termination_requested.is_set():
             raise RuntimeError(
                 'managed-job controller was terminated before readiness')
-        if command.poll() is not None:
+        _reap_adopted_children(command)
+        if command.returncode is not None:
             raise RuntimeError('managed-job controller exited before readiness')
         if not _process_identity_matches(guardian_pid,
                                          guardian_start_time_ticks):
@@ -485,7 +499,22 @@ def _run_inner_warden(control: socket.socket, runtime_control: socket.socket,
         if manager_ready_write_fd is not None:
             os.close(manager_ready_write_fd)
     if command is not None:
-        while command.poll() is None and not termination_requested.is_set():
+        while not termination_requested.is_set():
+            try:
+                # This warden remains a subreaper for the manager's full
+                # lifetime. Reap short-lived adopted descendants every
+                # monitoring tick instead of retaining them as zombies until
+                # the manager stops and the terminal family drain begins.
+                _reap_adopted_children(command)
+            except FamilyEnumerationError as e:
+                # Procfs uncertainty is not a reason to kill a healthy
+                # controller. Retry on the next bounded monitoring tick; the
+                # terminal drain still requires stable proven absence.
+                print(f'Managed-job controller live reap retry: {e}',
+                      file=sys.stderr,
+                      flush=True)
+            if command.returncode is not None:
+                break
             try:
                 readable, _, _ = select.select([control], [], [], _POLL_SECONDS)
             except (OSError, ValueError):

@@ -3270,6 +3270,59 @@ class TestGetLbReplicaInfo:
         assert fence_entries == 1
         assert active_fence_depth == 0
 
+    def test_840_replica_sync_provider_work_is_bounded_by_physical_pools(self):
+        """LB heartbeats do no per-replica provider I/O at fleet scale."""
+        ctrl = _make_controller()
+        infos = [
+            _FakeReplicaInfo(replica_id,
+                             serve_state.ReplicaStatus.READY,
+                             url=f'http://10.0.{replica_id // 256}.'
+                             f'{replica_id % 256}:8080',
+                             accelerators={'H200': 8})
+            for replica_id in range(1, 841)
+        ]
+        fences = {
+            id(info): controller.reserved_capacity.ProtocolV2CleanupFence(
+                kubernetes_context=('east'
+                                    if info.replica_id <= 420 else 'phx'),
+                physical_cluster_uid=('east-uid' if info.replica_id <= 420 else
+                                      'phx-uid')) for info in infos
+        }
+        physical_provider_entries = []
+
+        @contextlib.contextmanager
+        def _physical_fence(info):
+            cleanup_fence = fences[id(info)]
+            physical_provider_entries.append(
+                (cleanup_fence.kubernetes_context,
+                 cleanup_fence.physical_cluster_uid))
+            yield
+
+        def _provider_fence(info, *, handle=None):
+            assert handle is not None
+            return _physical_fence(info)
+
+        with mock.patch.object(
+                controller.reserved_capacity,
+                'parse_protocol_v2_cleanup_fence',
+                side_effect=lambda info: fences[id(info)]), \
+             mock.patch.object(controller.reserved_capacity,
+                               'protocol_v2_provider_fence',
+                               side_effect=_provider_fence):
+            cold_routes, cold_ready = _sync_full(ctrl, infos)
+            warm_routes, warm_ready = _sync_full(ctrl, infos)
+
+        assert cold_ready == warm_ready == 840
+        assert len(cold_routes) == len(warm_routes) == 840
+        # One live UID proof per physical pool per heartbeat, independent of
+        # the 840 logical backends. Endpoint resolution is incremental: only
+        # the cold pass resolves each URL.
+        assert physical_provider_entries == [('east', 'east-uid'),
+                                             ('phx', 'phx-uid'),
+                                             ('east', 'east-uid'),
+                                             ('phx', 'phx-uid')]
+        assert all(info.url_resolutions == 1 for info in infos)
+
     def test_mixed_sync_completes_v2_phase_before_ambient(self):
         ctrl = _make_controller()
         ordinary = _FakeReplicaInfo(1,
