@@ -113,6 +113,8 @@ would add a false concept.
   including duplicates and case variants.
 - Preserve the historical `SkyServeLoadBalancer` descriptors, signatures,
   function module/qualified names, and both import orders.
+- Exercise both import orders in fresh Python processes so module caching cannot
+  hide a circular import or a stale facade-to-implementation binding.
 - Do not change request bodies, queue state, scheduling order, proxy retries,
   network call count, controller synchronization, or public imports.
 
@@ -151,7 +153,7 @@ would add a false concept.
 | request-metadata implementation and facade descriptors | new characterization contract plus existing request-queue header tests |
 | queue-admission callers | `tests/unit_tests/test_serve_request_queue.py` |
 | proxy transport and retry callers | `tests/unit_tests/test_lb_retry_routing.py`, `tests/unit_tests/test_serve_load_balancer_eviction.py`, and focused LB auth tests |
-| import and compatibility boundary | both import orders, `compileall`, import-linter, mypy, Pylint, Ruff, and BasedPyright |
+| import and compatibility boundary | fresh-process metadata-first and facade-first identity/pickle checks, `compileall`, import-linter, mypy, Pylint, Ruff, and BasedPyright |
 | design and changed Python files | `bash format.sh --files ...` and `git diff --check` |
 
 The pull-request workflows for `improvements` must be inspected before
@@ -169,7 +171,9 @@ characterization commit preceded the production move.
 
 - The five normalized function AST fingerprints are unchanged.  The facade
   descriptors, signatures, historical module/qualified names, implementation
-  identities, prior pickling behavior, and both import orders are pinned.
+  identities, and prior pickling behavior are pinned.  A post-merge audit found
+  that the original in-process contract exercised only facade-first import;
+  fresh-process coverage now pins both facade-first and metadata-first import.
 - The complete 16-file load-balancer matrix collected 447 tests and exited
   successfully in both parallel and serial runs.  It covers request metadata,
   queue admission, capacity/demand/occupancy, proxy retry and eviction, auth,
