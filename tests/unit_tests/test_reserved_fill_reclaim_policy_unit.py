@@ -178,8 +178,8 @@ def _durable_replica(context: dict[str, object]):
     if fence is None:
         return types.SimpleNamespace(reserved_fill=True)
     return types.SimpleNamespace(
-        _version=17,
-        _VERSION=17,
+        _version=18,
+        _VERSION=18,
         reserved_fill=True,
         version=fence.service_version,
         reserved_fill_pool_key=fence.pool_key,

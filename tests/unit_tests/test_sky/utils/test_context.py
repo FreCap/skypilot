@@ -12,6 +12,15 @@ import pytest
 from sky.utils import context
 
 
+@pytest.fixture(autouse=True)
+def _isolate_context():
+    token = context._CONTEXT.set(None)
+    try:
+        yield
+    finally:
+        context._CONTEXT.reset(token)
+
+
 @pytest.fixture
 def ctx():
     """Fixture to provide a fresh context for each test."""

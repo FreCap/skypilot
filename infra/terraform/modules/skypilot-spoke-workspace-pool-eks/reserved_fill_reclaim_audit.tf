@@ -36,8 +36,19 @@ resource "aws_iam_role" "reserved_fill_reclaim_audit" {
     }
 
     precondition {
-      condition     = try(local.reclaim_audit_partition != null && local.reclaim_audit_partition.priority_class != null && local.reclaim_audit_partition.kueue != null, false)
-      error_message = "reserved_fill_reclaim_audit.partition_namespace must select one configured partition with priority and Kueue contracts."
+      condition     = try(local.reclaim_audit_partition != null && local.reclaim_audit_partition.priority_class != null, false)
+      error_message = "reserved_fill_reclaim_audit.partition_namespace must select one configured partition with a priority contract."
+    }
+
+    precondition {
+      condition = local.reclaim_audit_partition == null ? true : try(
+        local.reclaim_audit_partition.kueue == null || (
+          local.reclaim_audit_partition.kueue.local_queue_name == var.reserved_fill_reclaim_audit.local_queue_name &&
+          local.reclaim_audit_partition.kueue.cluster_queue_name == var.reserved_fill_reclaim_audit.inference_cluster_queue_name
+        ),
+        false,
+      )
+      error_message = "When partition.kueue is enabled, its local_queue_name and cluster_queue_name must exactly match the reserved_fill_reclaim_audit targets."
     }
   }
 }

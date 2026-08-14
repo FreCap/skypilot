@@ -48,18 +48,24 @@ variable "reserved_fill_reclaim_audit" {
     access entry, and binds it to read-only Kubernetes rules for the reviewed
     partition, Kueue topology, scheduler, provider-owned flavors, and Nodes.
 
-    partition_namespace must name one configured partition with both priority
-    and Kueue contracts. The module derives its Namespace, ServiceAccount,
-    LocalQueue, inference ClusterQueue, and Pod PriorityClass rather than
-    accepting duplicate values. External operator-owned ClusterQueues and
-    other objects are listed explicitly and remain exact-name reads. The IAM
+    partition_namespace must name one configured partition with a priority
+    contract. local_queue_name and inference_cluster_queue_name are the
+    explicit read-only audit targets, so this identity can be staged before
+    that partition enables Kueue. Once partition.kueue is configured, its two
+    queue names must exactly equal these audit targets. There is no derived or
+    compatibility fallback between the contracts. The module still derives
+    the Namespace, ServiceAccount, and Pod PriorityClass from the partition.
+    External operator-owned ClusterQueues and other objects are listed
+    explicitly and remain exact-name reads. The IAM
     role and Kubernetes group are deterministically unique to the target
     cluster and partition. The caller must separately grant AssumeRole and
     TagSession on the returned role ARN. Node inventory is necessarily a
     cluster-wide list because Kubernetes RBAC cannot restrict list by labels.
   EOT
   type = object({
-    partition_namespace = string
+    partition_namespace          = string
+    local_queue_name             = string
+    inference_cluster_queue_name = string
 
     source_identity = object({
       eks_cluster_arn = string
@@ -81,6 +87,22 @@ variable "reserved_fill_reclaim_audit" {
     mutating_webhook_names         = set(string)
   })
   default = null
+
+  validation {
+    condition = var.reserved_fill_reclaim_audit == null ? true : (
+      length(var.reserved_fill_reclaim_audit.local_queue_name) >= 1 &&
+      length(var.reserved_fill_reclaim_audit.local_queue_name) <= 253 &&
+      alltrue([
+        for label in split(".", var.reserved_fill_reclaim_audit.local_queue_name) :
+        length(label) >= 1 && length(label) <= 63 &&
+        can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", label))
+      ]) &&
+      length(var.reserved_fill_reclaim_audit.inference_cluster_queue_name) >= 1 &&
+      length(var.reserved_fill_reclaim_audit.inference_cluster_queue_name) <= 63 &&
+      can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", var.reserved_fill_reclaim_audit.inference_cluster_queue_name))
+    )
+    error_message = "reserved_fill_reclaim_audit.local_queue_name must be a Kubernetes DNS-1123 subdomain and inference_cluster_queue_name must be a DNS-1123 label of at most 63 characters."
+  }
 
   validation {
     condition = var.reserved_fill_reclaim_audit == null ? true : (

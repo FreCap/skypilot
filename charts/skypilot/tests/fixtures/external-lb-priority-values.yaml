@@ -2,6 +2,9 @@ serve:
   externalLoadBalancer:
     enabled: true
     priorityClassName: skypilot-serve-lb
+    serviceAnnotations:
+      example.com/a-listener: enabled
+      example.com/z-listener: "4000"
     auth:
       lbSync:
         existingSecret: serve-lb-sync

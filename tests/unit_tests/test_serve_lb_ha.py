@@ -546,7 +546,10 @@ def test_demand_snapshot_preserves_real_load_balancer_timestamps():
     assert snapshot.timestamps == (10.25, 20.75)
 
 
-def test_ha_kubernetes_contract_has_single_slot_selector_and_disruption_guard():
+def test_ha_kubernetes_contract_has_single_slot_selector_and_disruption_guard(
+        monkeypatch):
+    monkeypatch.setenv(serve_constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR,
+                       '{}')
     service = lb_k8s._build_service_dict('service',
                                          'service-lb',
                                          'service-lb-a',

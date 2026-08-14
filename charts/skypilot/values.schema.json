@@ -1461,6 +1461,12 @@
                                     }
                                 }
                             }
+                        },
+                        "serviceAnnotations": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }

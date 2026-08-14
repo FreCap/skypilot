@@ -110,7 +110,9 @@ variables {
     port                   = 8000
   }
   reserved_fill_reclaim_audit = {
-    partition_namespace = "inference"
+    partition_namespace          = "inference"
+    local_queue_name             = "default"
+    inference_cluster_queue_name = "inference-borrower"
     source_identity = {
       eks_cluster_arn = "arn:aws:eks:us-east-1:123456789012:cluster/control-plane"
       namespace       = "skypilot"
@@ -337,7 +339,7 @@ run "reserved_fill_audit_is_exact_read_only_and_separate" {
         if toset(rule.resources) == toset(["localqueues"]) && toset(rule.resource_names) == toset(["default"]) && toset(rule.verbs) == toset(["get"])
       ]) == 1
     )
-    error_message = "Partition audit reads must derive the exact ServiceAccount and LocalQueue from the canonical partition."
+    error_message = "Partition audit reads must use the explicit audit LocalQueue and the partition-derived ServiceAccount."
   }
 
   assert {
@@ -375,7 +377,7 @@ run "reserved_fill_audit_rejects_a_partition_without_priority" {
   expect_failures = [aws_iam_role.reserved_fill_reclaim_audit[0]]
 }
 
-run "reserved_fill_audit_rejects_a_partition_without_kueue" {
+run "reserved_fill_audit_stages_before_partition_kueue_ownership" {
   command = plan
 
   variables {
@@ -387,7 +389,101 @@ run "reserved_fill_audit_rejects_a_partition_without_kueue" {
     }]
   }
 
+  assert {
+    condition = (
+      length(kubernetes_manifest.partition_local_queue) == 0 &&
+      length([
+        for rule in kubernetes_cluster_role_v1.reserved_fill_reclaim_audit[0].rule : rule
+        if toset(rule.resources) == toset(["clusterqueues"]) && toset(rule.resource_names) == toset(["inference-borrower", "research"])
+      ]) == 1 &&
+      length([
+        for rule in kubernetes_role_v1.reserved_fill_reclaim_partition_audit[0].rule : rule
+        if toset(rule.resources) == toset(["localqueues"]) && toset(rule.resource_names) == toset(["default"])
+      ]) == 1
+    )
+    error_message = "The read-only audit identity must retain its explicit queue targets before partition Kueue ownership is enabled."
+  }
+}
+
+run "reserved_fill_audit_rejects_later_partition_queue_mismatch" {
+  command = plan
+
+  variables {
+    partitions = [{
+      namespace = "inference"
+      priority_class = {
+        value = -1000
+      }
+      kueue = {
+        local_queue_name   = "different"
+        cluster_queue_name = "inference-borrower"
+      }
+    }]
+  }
+
   expect_failures = [aws_iam_role.reserved_fill_reclaim_audit[0]]
+}
+
+run "reserved_fill_audit_rejects_noncanonical_local_queue_target" {
+  command = plan
+
+  variables {
+    reserved_fill_reclaim_audit = {
+      partition_namespace          = "inference"
+      local_queue_name             = "Default"
+      inference_cluster_queue_name = "inference-borrower"
+      source_identity = {
+        eks_cluster_arn = "arn:aws:eks:us-east-1:123456789012:cluster/control-plane"
+        namespace       = "skypilot"
+        service_account = "skypilot-api-sa"
+      }
+      external_cluster_queue_names   = ["research"]
+      workload_priority_class_names  = ["skyserve-inference-low"]
+      resource_flavor_names          = ["ml.p4d.24xlarge"]
+      scheduler_namespace            = "kube-system"
+      scheduler_deployment_name      = "gpu-binpack-scheduler"
+      kueue_namespace                = "kueue-system"
+      kueue_deployment_name          = "kueue-controller-manager"
+      kueue_config_map_name          = "kueue-manager-config"
+      admission_policy_names         = ["kueue-queue-name-required.boltz.bio"]
+      admission_policy_binding_names = ["kueue-queue-name-required.boltz.bio"]
+      validating_webhook_names       = ["kueue-validating-webhook-configuration"]
+      mutating_webhook_names         = ["kueue-mutating-webhook-configuration"]
+    }
+  }
+
+  expect_failures = [var.reserved_fill_reclaim_audit]
+}
+
+run "reserved_fill_audit_rejects_noncanonical_inference_cluster_queue_target" {
+  command = plan
+
+  variables {
+    reserved_fill_reclaim_audit = {
+      partition_namespace          = "inference"
+      local_queue_name             = "default"
+      inference_cluster_queue_name = "inference.borrower"
+      source_identity = {
+        eks_cluster_arn = "arn:aws:eks:us-east-1:123456789012:cluster/control-plane"
+        namespace       = "skypilot"
+        service_account = "skypilot-api-sa"
+      }
+      external_cluster_queue_names   = ["research"]
+      workload_priority_class_names  = ["skyserve-inference-low"]
+      resource_flavor_names          = ["ml.p4d.24xlarge"]
+      scheduler_namespace            = "kube-system"
+      scheduler_deployment_name      = "gpu-binpack-scheduler"
+      kueue_namespace                = "kueue-system"
+      kueue_deployment_name          = "kueue-controller-manager"
+      kueue_config_map_name          = "kueue-manager-config"
+      admission_policy_names         = ["kueue-queue-name-required.boltz.bio"]
+      admission_policy_binding_names = ["kueue-queue-name-required.boltz.bio"]
+      validating_webhook_names       = ["kueue-validating-webhook-configuration"]
+      mutating_webhook_names         = ["kueue-mutating-webhook-configuration"]
+    }
+  }
+
+  expect_failures = [var.reserved_fill_reclaim_audit]
 }
 
 run "reserved_fill_audit_rejects_noncanonical_external_names" {
@@ -395,7 +491,9 @@ run "reserved_fill_audit_rejects_noncanonical_external_names" {
 
   variables {
     reserved_fill_reclaim_audit = {
-      partition_namespace = "inference"
+      partition_namespace          = "inference"
+      local_queue_name             = "default"
+      inference_cluster_queue_name = "inference-borrower"
       source_identity = {
         eks_cluster_arn = "arn:aws:eks:us-east-1:123456789012:cluster/control-plane"
         namespace       = "skypilot"

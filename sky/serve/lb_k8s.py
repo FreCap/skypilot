@@ -67,6 +67,8 @@ ACTIVE_SLOT_ANNOTATION_KEY = 'skypilot.co/serve-lb-active-slot'
 CUTOVER_GENERATION_ANNOTATION_KEY = ('skypilot.co/serve-lb-cutover-generation')
 DESIRED_RUNTIME_REVISION_ANNOTATION_KEY = (
     'skypilot.co/serve-lb-desired-runtime-revision')
+OPERATOR_ANNOTATION_KEYS_MARKER = (
+    'skypilot.co/serve-lb-operator-annotation-keys')
 # Pod selector label: app=<lb_deployment_name>.
 APP_LABEL_KEY = 'app'
 # Label-key selector used by reconcile to list all LB Deployments.
@@ -87,6 +89,18 @@ _AWS_LB_SSL_POLICY_ANNOTATION = ('service.beta.kubernetes.io/'
                                  'aws-load-balancer-ssl-negotiation-policy')
 _EXTERNAL_DNS_HOSTNAME_ANNOTATION = ('external-dns.alpha.kubernetes.io/'
                                      'hostname')
+
+_SKYPILOT_ANNOTATION_PREFIX = 'skypilot.co/'
+_RESERVED_EXTERNAL_SERVICE_ANNOTATION_KEYS = frozenset({
+    _AWS_LB_SSL_CERT_ANNOTATION,
+    _AWS_LB_SSL_PORTS_ANNOTATION,
+    _AWS_LB_SSL_POLICY_ANNOTATION,
+    _EXTERNAL_DNS_HOSTNAME_ANNOTATION,
+    constants.AWS_LB_BACKEND_PROTOCOL_ANNOTATION,
+})
+_ANNOTATION_NAME_RE = re.compile(
+    r'^[A-Za-z0-9](?:[-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$')
+_DNS_LABEL_RE = re.compile(r'^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$')
 
 # RFC1123 name constraints for k8s object names.
 _MAX_NAME_LEN = 63
@@ -429,6 +443,7 @@ def require_external_lb_runtime() -> None:
             'chart with serve.externalLoadBalancer.enabled=true.')
     _api_deployment_name()
     get_lb_namespace()
+    _operator_service_annotations()
     # File contents are read afresh on every request; this boot-time check only
     # prevents publishing a service that cannot authenticate its first sync or
     # (when enabled) inference request.
@@ -1054,6 +1069,170 @@ def _lb_priority_class_name() -> str | None:
     return priority_class_name or None
 
 
+def _validate_service_annotation_key(key: str) -> None:
+    """Validate one Kubernetes annotation key without provider assumptions."""
+    if not isinstance(key, str):
+        raise RuntimeError('External LB Service annotation keys must be '
+                           f'strings; got {key!r}.')
+    parts = key.split('/')
+    if len(parts) > 2:
+        raise RuntimeError(
+            f'External LB Service annotation key {key!r} is malformed.')
+    if len(parts) == 2:
+        prefix, name = parts
+        if (not prefix or len(prefix) > 253 or
+                any(not _DNS_LABEL_RE.fullmatch(label)
+                    for label in prefix.split('.'))):
+            raise RuntimeError(
+                f'External LB Service annotation key {key!r} has an invalid '
+                'DNS prefix.')
+    else:
+        name = parts[0]
+    if not _ANNOTATION_NAME_RE.fullmatch(name):
+        raise RuntimeError(
+            f'External LB Service annotation key {key!r} has an invalid '
+            'name segment.')
+
+
+def _service_annotation_key_is_reserved(key: str) -> bool:
+    """Whether SkyPilot owns this Service annotation namespace or exact key."""
+    return (key.startswith(_SKYPILOT_ANNOTATION_PREFIX) or
+            key in _RESERVED_EXTERNAL_SERVICE_ANNOTATION_KEYS)
+
+
+def _operator_service_annotations() -> dict[str, str]:
+    """Return the exact Helm-owned annotation map, failing closed on drift."""
+    env_name = constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR
+    raw = os.environ.get(env_name)
+    if raw is None:
+        raise RuntimeError(
+            f'External load balancer mode requires {env_name}. Upgrade the '
+            'SkyPilot Helm chart before starting or reconciling a service.')
+
+    def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f'duplicate key {key!r}')
+            result[key] = value
+        return result
+
+    try:
+        parsed = json.loads(raw, object_pairs_hook=_unique_object)
+    except (json.JSONDecodeError, ValueError) as e:
+        raise RuntimeError(f'{env_name} must contain exact JSON: {e}') from e
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f'{env_name} must contain a JSON object.')
+    result: dict[str, str] = {}
+    for key, value in parsed.items():
+        _validate_service_annotation_key(key)
+        if not isinstance(value, str):
+            raise RuntimeError(f'{env_name}[{key!r}] must be a string; got '
+                               f'{type(value).__name__}.')
+        if _service_annotation_key_is_reserved(key):
+            raise RuntimeError(
+                f'{env_name}[{key!r}] conflicts with a SkyPilot-managed '
+                'external LB annotation.')
+        result[key] = value
+    return dict(sorted(result.items()))
+
+
+def _operator_annotation_keys_marker(annotations: Mapping[str, str]) -> str:
+    return json.dumps(sorted(annotations), separators=(',', ':'))
+
+
+def _parse_operator_annotation_keys(annotations: Mapping[str, Any], *,
+                                    require_marker: bool) -> tuple[str, ...]:
+    """Parse the narrow annotation-ownership marker in canonical form."""
+    raw = annotations.get(OPERATOR_ANNOTATION_KEYS_MARKER)
+    if raw is None:
+        if require_marker:
+            raise RuntimeError(
+                'Desired external LB Service annotations are missing the '
+                'SkyPilot ownership marker.')
+        # Transition-only bootstrap for Services created before the ownership
+        # ledger existed.  The Serve047 cleanup gate in the canonical reserved-
+        # fill design removes this acceptance after PR 14 proves every live
+        # generated Service carries a canonical marker.  Until then, the only
+        # safe inference is that SkyPilot owns no unmarked annotation key.
+        return ()
+    if not isinstance(raw, str):
+        raise RuntimeError('External LB Service annotation ownership marker '
+                           'must be a string.')
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            'External LB Service annotation ownership marker is malformed: '
+            f'{e}') from e
+    if not isinstance(parsed, list) or any(
+            not isinstance(key, str) for key in parsed):
+        raise RuntimeError('External LB Service annotation ownership marker '
+                           'must be a JSON string array.')
+    if parsed != sorted(set(parsed)):
+        raise RuntimeError('External LB Service annotation ownership marker '
+                           'must contain sorted unique keys.')
+    canonical = json.dumps(parsed, separators=(',', ':'))
+    if raw != canonical:
+        raise RuntimeError('External LB Service annotation ownership marker '
+                           'is not canonical JSON.')
+    for key in parsed:
+        _validate_service_annotation_key(key)
+        if _service_annotation_key_is_reserved(key):
+            raise RuntimeError('External LB Service annotation ownership '
+                               f'marker claims reserved key {key!r}.')
+    return tuple(parsed)
+
+
+def _object_annotations(obj: Any) -> dict[str, Any]:
+    if isinstance(obj, dict):
+        metadata = obj.get('metadata', {}) or {}
+        annotations = metadata.get('annotations', {}) or {}
+    else:
+        annotations = getattr(getattr(obj, 'metadata', None), 'annotations',
+                              {}) or {}
+    if not isinstance(annotations, Mapping):
+        raise RuntimeError('External LB Service metadata.annotations must be '
+                           'an object.')
+    return dict(annotations)
+
+
+def _operator_service_annotations_patch(
+        existing_annotations: Mapping[str, Any],
+        desired_annotations: Mapping[str, Any]) -> dict[str, Any]:
+    """Patch only operator-owned keys and delete only their retired subset."""
+    existing_keys = set(
+        _parse_operator_annotation_keys(existing_annotations,
+                                        require_marker=False))
+    desired_keys = set(
+        _parse_operator_annotation_keys(desired_annotations,
+                                        require_marker=True))
+    patch: dict[str, Any] = {
+        OPERATOR_ANNOTATION_KEYS_MARKER:
+            desired_annotations[OPERATOR_ANNOTATION_KEYS_MARKER],
+    }
+    for key in sorted(desired_keys):
+        value = desired_annotations.get(key)
+        if not isinstance(value, str):
+            raise RuntimeError(
+                f'Desired operator-owned Service annotation {key!r} must '
+                'have a string value.')
+        patch[key] = value
+    for key in sorted(existing_keys - desired_keys):
+        # A metadata.annotations strategic merge treats JSON null as deletion.
+        # Never replace the whole map: provider/controller annotations remain.
+        patch[key] = None
+    return patch
+
+
+def _service_annotations_patch(existing: Any,
+                               desired_annotations: Mapping[str, Any]) -> dict:
+    return {
+        **desired_annotations,
+        **_operator_service_annotations_patch(_object_annotations(existing), desired_annotations),
+    }
+
+
 def _lb_pod_runtime_fields(pod_runtime_fields: dict, service_name: str,
                            service_hash: str | None,
                            slot: lb_ha.LbSlot | None) -> dict:
@@ -1401,17 +1580,22 @@ def _build_service_dict(service_name: str,
             SERVICE_HASH_LABEL_KEY: service_hash
         } if service_hash else {}),
     })
-    annotations = {}
+    operator_annotations = _operator_service_annotations()
+    annotations = {
+        **operator_annotations,
+        OPERATOR_ANNOTATION_KEYS_MARKER:
+            _operator_annotation_keys_marker(operator_annotations),
+    }
     if active_slot is not None:
         if cutover_generation is None:
             raise ValueError('HA LB Service requires a cutover generation.')
-        annotations = {
+        annotations.update({
             ACTIVE_SLOT_ANNOTATION_KEY: active_slot.value,
             CUTOVER_GENERATION_ANNOTATION_KEY: str(cutover_generation),
             **({
                 DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_runtime_revision,
             } if desired_runtime_revision is not None else {}),
-        }
+        })
     https_config = external_https_config()
     ports: list[dict[str, Any]] = [{
         'port': constants.LOAD_BALANCER_PORT_START,
@@ -1437,14 +1621,13 @@ def _build_service_dict(service_name: str,
         else:
             ports[0]['name'] = constants.EXTERNAL_LB_HTTP_PORT_NAME
             ports.append(https_port)
-        annotations = {
-            **annotations,
+        annotations.update({
             _AWS_LB_SSL_CERT_ANNOTATION: https_config.certificate_arn,
             _AWS_LB_SSL_PORTS_ANNOTATION: constants.EXTERNAL_LB_HTTPS_PORT_NAME,
             _AWS_LB_SSL_POLICY_ANNOTATION: https_config.ssl_policy,
             _EXTERNAL_DNS_HOSTNAME_ANNOTATION: external_https_hostname(
                 https_config, service_name),
-        }
+        })
         if https_config.https_only:
             # Only once the plaintext listener is gone: the annotation applies
             # to every target group on the Service, so it cannot coexist with
@@ -1457,9 +1640,7 @@ def _build_service_dict(service_name: str,
         'metadata': {
             'name': service_name_k8s,
             'labels': _object_labels(service_name, service_hash),
-            **({
-                'annotations': annotations
-            } if annotations else {}),
+            'annotations': annotations,
             **({
                 'ownerReferences': [owner_reference]
             } if owner_reference else {}),
@@ -1554,6 +1735,10 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
                                            None) or 'Cluster')
         annotations = getattr(metadata, 'annotations', {}) or {}
 
+    if not isinstance(annotations, Mapping):
+        raise RuntimeError('External LB Service metadata.annotations must be '
+                           'an object.')
+
     def _port_tuple(port) -> tuple[Any, Any, Any, Any]:
         # ``name`` participates so that adding the TLS listener also reconciles
         # the rename of the pre-existing unnamed plaintext port; Kubernetes
@@ -1567,11 +1752,16 @@ def _service_has_desired_routing(service, desired: dict) -> bool:
 
     desired_spec = desired['spec']
     desired_annotations = desired.get('metadata', {}).get('annotations', {})
+    existing_operator_keys = _parse_operator_annotation_keys(
+        annotations, require_marker=False)
+    desired_operator_keys = _parse_operator_annotation_keys(desired_annotations,
+                                                            require_marker=True)
     return (service_type == desired_spec['type'] and external_traffic_policy
             == desired_spec.get('externalTrafficPolicy', 'Cluster') and
             selector == desired_spec['selector'] and all(
                 annotations.get(key) == value
                 for key, value in desired_annotations.items()) and
+            existing_operator_keys == desired_operator_keys and
             [_port_tuple(port) for port in ports
             ] == [_port_tuple(port) for port in desired_spec['ports']])
 
@@ -1827,29 +2017,32 @@ def _reconcile_ha_service(
             resource_version = _require_existing_lb_object_ownership(
                 context, namespace, name, existing, owner_reference,
                 service_hash)
+            desired_annotations = service_dict['metadata'].get(
+                'annotations', {})
             if preserve_existing_selector:
-                desired_revision = service_dict['metadata'].get(
-                    'annotations',
-                    {}).get(DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
+                annotations_patch = _operator_service_annotations_patch(
+                    _object_annotations(existing), desired_annotations)
+                desired_revision = desired_annotations.get(
+                    DESIRED_RUNTIME_REVISION_ANNOTATION_KEY)
                 if desired_revision is not None:
-                    body: dict[str, Any] = {
-                        'metadata': {
-                            'resourceVersion': resource_version,
-                            'annotations': {
-                                DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
-                            },
-                        },
-                    }
-                    _strategic_merge_patch(
-                        context,
-                        '/api/v1/namespaces/{namespace}/services/{name}',
-                        'V1Service', name, namespace, body)
+                    annotations_patch[
+                        DESIRED_RUNTIME_REVISION_ANNOTATION_KEY] = (
+                            desired_revision)
+                body: dict[str, Any] = {
+                    'metadata': {
+                        'resourceVersion': resource_version,
+                        'annotations': annotations_patch,
+                    },
+                }
+                _strategic_merge_patch(
+                    context, '/api/v1/namespaces/{namespace}/services/{name}',
+                    'V1Service', name, namespace, body)
                 return True
             body = {
                 'metadata': {
                     'labels': service_dict['metadata']['labels'],
-                    'annotations': service_dict['metadata'].get(
-                        'annotations', {}),
+                    'annotations': _service_annotations_patch(
+                        existing, desired_annotations),
                     'resourceVersion': resource_version,
                 },
                 'spec': {
@@ -2272,12 +2465,6 @@ def create_lb_deployment_and_service(
                                   deployment_name,
                                   continue_guard=continue_guard)
     if service_existed:
-        if preserve_existing_service_selector:
-            _wait_for_lb_service_endpoint(core_api,
-                                          namespace,
-                                          service_name_k8s,
-                                          continue_guard=continue_guard)
-            return
         logger.debug(f'LB Service {service_name_k8s} already exists; '
                      f'reconciling it after the desired rollout is ready '
                      f'(fenced={service_was_fenced}).')
@@ -2303,11 +2490,24 @@ def create_lb_deployment_and_service(
                 resource_version = _require_existing_lb_object_ownership(
                     context, namespace, service_name_k8s, existing_service,
                     owner_reference, service_hash)
-                _strategic_merge_patch(
-                    context, '/api/v1/namespaces/{namespace}/services/{name}',
-                    'V1Service', service_name_k8s, namespace, {
+                desired_annotations = service_dict['metadata'].get(
+                    'annotations', {})
+                service_patch: dict[str, Any]
+                if preserve_existing_service_selector:
+                    service_patch = {
+                        'metadata': {
+                            'resourceVersion': resource_version,
+                            'annotations': _operator_service_annotations_patch(
+                                _object_annotations(existing_service),
+                                desired_annotations),
+                        },
+                    }
+                else:
+                    service_patch = {
                         'metadata': {
                             'labels': service_dict['metadata']['labels'],
+                            'annotations': _service_annotations_patch(
+                                existing_service, desired_annotations),
                             'resourceVersion': resource_version,
                         },
                         'spec': {
@@ -2321,7 +2521,10 @@ def create_lb_deployment_and_service(
                             'ports': _service_ports_patch(
                                 service_dict['spec']['ports']),
                         },
-                    })
+                    }
+                _strategic_merge_patch(
+                    context, '/api/v1/namespaces/{namespace}/services/{name}',
+                    'V1Service', service_name_k8s, namespace, service_patch)
                 break
             except kubernetes.api_exception() as e:
                 reconciliation_error = e

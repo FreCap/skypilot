@@ -19,6 +19,10 @@ tests:
           content:
             name: SKYPILOT_API_DEPLOYMENT_NAME
       - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+      - notContains:
           path: spec.template.spec.volumes
           content:
             name: skypilot-serve-lb-sync-auth
@@ -181,6 +185,9 @@ tests:
       serve.externalLoadBalancer.auth.controllerAdmin.key: admin-tokens
       serve.externalLoadBalancer.auth.lbDataPlane.existingSecret: serve-lb-data-plane
       serve.externalLoadBalancer.auth.lbDataPlane.key: data-tokens
+      serve.externalLoadBalancer.serviceAnnotations:
+        example.com/z-listener: "4000"
+        example.com/a-listener: enabled
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -197,6 +204,11 @@ tests:
           content:
             name: SKYPILOT_SERVE_LB_RESOURCES_JSON
             value: '{"limits":{"memory":"512Mi"},"requests":{"cpu":"100m","memory":"128Mi"}}'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+            value: '{"example.com/a-listener":"enabled","example.com/z-listener":"4000"}'
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -288,3 +300,23 @@ tests:
           content:
             name: SKYPILOT_SERVE_LB_RESOURCES_JSON
             value: '{}'
+
+  - it: should reject a non-object generated-Service annotation contract
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      serve.externalLoadBalancer.serviceAnnotations: null
+    asserts:
+      - failedTemplate:
+          errorMessage: serve.externalLoadBalancer.serviceAnnotations must be an object whose keys and values are strings
+
+  - it: should reserve the annotation projection environment variable
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      apiService.extraEnvs:
+        - name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+          value: attacker-controlled
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" is duplicated or reserved by the chart

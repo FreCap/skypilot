@@ -46,10 +46,10 @@ The chart delta is:
 
 | File | Change | Why |
 | --- | --- | --- |
-| `charts/skypilot/templates/api-deployment.yaml` | **Modified.** When enabled, injects pod identity, the stable API-Service URL, three mandatory token-ring file paths, and an explicit data-plane-auth capability signal. | `lb_k8s.py` mirrors the running API image plus the LB-sync and data-plane projections into each LB. The controller-admin projection remains API/controller-only. Projected files make overlap-token rotation live without a pod restart. |
+| `charts/skypilot/templates/api-deployment.yaml`, `controller-deployment.yaml`, `executor-deployment.yaml` | **Modified.** When enabled, inject pod identity, the stable API-Service URL, three mandatory token-ring file paths, an explicit data-plane-auth capability signal, and the same reserved generated-Service annotation JSON into every server role. | Any role that owns or recovers a Serve controller receives the identical typed contract. `lb_k8s.py` mirrors the running image plus the LB-sync and data-plane projections into each LB. The controller-admin projection remains API/controller-only. |
 | `charts/skypilot/templates/rbac.yaml` | **Modified.** When the workload namespace differs from the Helm release namespace, adds a least-privilege external-LB Role/Binding beside the API pod and retains it while the feature is disabled. | LB Deployments, Services, projected auth Secrets, and controller image identity all live in the release namespace; workload-namespace RBAC alone is insufficient, and disabling the feature must not remove permission before old objects are reaped. |
-| `charts/skypilot/values.yaml` | **Modified.** Adds `serve.externalLoadBalancer.enabled`, per-LB resources, and mandatory `lbSync`/`controllerAdmin`/`lbDataPlane` references. | This is the platform-facing values contract. There is no controller port-range configuration. |
-| `charts/skypilot/values.schema.json` | **Generated.** Describes the external-LB flag and three auth objects. | Kept in sync with `values.yaml` by the `helm-values-schema-json` plugin; `.github/workflows/helm-values-schema.yaml` gates drift. |
+| `charts/skypilot/values.yaml` | **Modified.** Adds `serve.externalLoadBalancer.enabled`, `serviceAnnotations`, per-LB resources, and mandatory `lbSync`/`controllerAdmin`/`lbDataPlane` references. | This is the platform-facing values contract. There is no controller port-range configuration. |
+| `charts/skypilot/values.schema.json` | **Generated.** Describes the external-LB flag, exact string annotation map, and three auth objects. | Kept in sync with `values.yaml` by the `helm-values-schema-json` plugin; `.github/workflows/helm-values-schema.yaml` gates drift. |
 | `charts/skypilot/tests/external_lb_test.yaml` | **New.** Covers disabled-mode inertness, mandatory-ring failures, null-safe values, projections, and injected environment variables. | Prevents the chart from silently rendering an incomplete external-LB deployment. |
 | `charts/skypilot/tests/external_lb_rbac_test.yaml` | **New.** Covers the split workload/release namespace Role and the same-namespace no-duplicate case. | Prevents valid `kubernetesCredentials.inclusterNamespace` configurations from passing Helm render but failing every LB create. |
 | `charts/skypilot/templates/serve-controller-service.yaml` | **Deleted.** | A Service selecting all API pods is not a valid route to a child controller owned by exactly one pod. Do not restore it during an upstream sync. |
@@ -64,6 +64,8 @@ provider-default Kubernetes `LoadBalancer` Service.
 serve:
   externalLoadBalancer:
     enabled: true
+    serviceAnnotations:
+      service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-30001: tcp.idle_timeout.seconds=4000
     auth:
       lbSync:
         existingSecret: skypilot-serve-lb-sync
@@ -76,9 +78,18 @@ serve:
         key: tokens
 ```
 
-The generated Service is always `type: LoadBalancer`; SkyPilot does not configure
-an internal scheme, provider annotations, or source ranges. SkyServe waits for
-the provider-published hostname or IP before registration and returns
+The generated Service is always `type: LoadBalancer`. SkyPilot does not choose
+an internal scheme or source ranges, but it merges the exact
+`serviceAnnotations` string map into every generated inference Service. The
+source interface is provider-neutral; the listener annotation above is a
+platform-owned example. Runtime validation rejects malformed keys, the whole
+SkyPilot-owned `skypilot.co/` domain, and conflicts with exact third-party-
+domain TLS/DNS/backend-protocol annotations managed by SkyPilot. A narrow
+durable annotation records only the configured keys, so removing one emits a
+strategic-merge `null` for
+that formerly owned key while provider/controller annotations remain untouched.
+SkyServe waits for the provider-published hostname or IP before registration
+and returns
 `http://<load-balancer-address>:30001` from `sky serve status --endpoint`.
 Clients send `X-SkyPilot-Serve-Authorization: Bearer <token>`. The endpoint stays
 HTTP-only; terminate TLS separately if required.
@@ -167,17 +178,19 @@ re-pull them periodically and re-apply the boltz delta on top.
    ```
 
 3. **Re-apply the boltz delta** — restore/replay exactly the files listed above:
-   - `templates/api-deployment.yaml` — re-insert the
+   - `templates/api-deployment.yaml`, `templates/controller-deployment.yaml`,
+     and `templates/executor-deployment.yaml` — re-insert the
      `{{- if .Values.serve.externalLoadBalancer.enabled }}` identity/env, volume
      mount, and projected-volume blocks, including the explicit data-plane-auth
-     capability and mandatory data-plane projection. Upstream may have
+     capability, mandatory data-plane projection, and the reserved generated-
+     Service annotation JSON. Upstream may have
      restructured this file, so reconcile by hand rather than blindly reverting.
    - `templates/rbac.yaml` — restore the conditional least-privilege LB
      Role/Binding in the Helm release namespace when the workload namespace is
      different.
-   - `values.yaml` — re-add the complete `serve.externalLoadBalancer` flag and
-     the three mandatory auth rings. Do not reintroduce controller port-range
-     values.
+   - `values.yaml` — re-add the complete `serve.externalLoadBalancer` flag,
+     `serviceAnnotations`, and the three mandatory auth rings. Do not
+     reintroduce controller port-range values.
    - `values.schema.json` — regenerate, do NOT hand-edit (see step 4).
    - `tests/external_lb_test.yaml` — restore the fail-closed contract tests.
    - `tests/external_lb_rbac_test.yaml` — restore split-namespace RBAC tests.

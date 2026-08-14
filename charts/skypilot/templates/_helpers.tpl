@@ -104,6 +104,28 @@ inputs collide with each other or with chart-owned fields.
 {{- end -}}
 
 {{/*
+Type-check and serialize the operator-owned annotations that SkyPilot merges
+into each controller-generated inference Service. Kubernetes key syntax and
+SkyPilot ownership conflicts have one semantic validator in sky/serve/lb_k8s.py.
+*/}}
+{{- define "skypilot.externalLBServiceAnnotationsJson" -}}
+{{- $externalLB := .Values.serve.externalLoadBalancer -}}
+{{- $annotations := get $externalLB "serviceAnnotations" -}}
+{{- if not (kindIs "map" $annotations) -}}
+{{- fail "serve.externalLoadBalancer.serviceAnnotations must be an object whose keys and values are strings" -}}
+{{- end -}}
+{{- range $key, $value := $annotations -}}
+{{- if not (kindIs "string" $key) -}}
+{{- fail "serve.externalLoadBalancer.serviceAnnotations keys must be strings" -}}
+{{- end -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "serve.externalLoadBalancer.serviceAnnotations[%q] must be a string" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $annotations -}}
+{{- end -}}
+
+{{/*
 Resolve the image name, overriding the registry when global.imageRegistry is set.
 Usage: {{ include "common.image" (dict "root" . "image" "repo/name:tag") }}
 */}}
