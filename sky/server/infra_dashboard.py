@@ -30,8 +30,7 @@ def get_infra_summary(request: fastapi.Request) -> dict[str, Any]:
 
     common_utils.set_current_user(auth_user)
     server_common.refresh_workspace_state_for_sync_handler()
-    workspace_names = sorted(
-        workspaces_core.get_accessible_workspace_names())
+    workspace_names = sorted(workspaces_core.get_accessible_workspace_names())
     enabled_infrastructure = core.enabled_clouds_batch(workspace_names,
                                                        expand=True)
     return {

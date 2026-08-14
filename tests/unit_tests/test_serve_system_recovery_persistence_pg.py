@@ -155,11 +155,11 @@ def _raw_replica_row(engine, replica_id: int) -> dict[str, Any]:
     return dict(row)
 
 
-def _assert_json_pickle_parity(engine, replica_id: int) -> None:
+def _assert_json_only_replica_state(engine, replica_id: int) -> None:
     row = _raw_replica_row(engine, replica_id)
     json_info = replica_info.ReplicaInfo.from_storage_dict(row['replica_state'])
-    pickle_info = pickle.loads(row['replica_info'])
-    assert pickle_info.to_storage_dict() == json_info.to_storage_dict()
+    assert row['replica_info'] is None
+    assert json_info.to_storage_dict() == row['replica_state']
 
 
 def test_authorization_snapshot_pairs_quarantine_aware_version_and_incarnation(
@@ -370,7 +370,7 @@ def test_nonce_bind_is_locked_update_only_and_one_shot(
             expected_launch_request_id='request-1',
             expected_revision=3,
             **_fence())
-    _assert_json_pickle_parity(engine, 7)
+    _assert_json_only_replica_state(engine, 7)
 
     missing_context = _unbound_context(_intent(99))
     with pytest.raises(serve_state.ReplicaSystemRecoveryMutationRejected,
@@ -450,18 +450,8 @@ def test_revision_terminal_quarantine_and_demotion_are_absorbing(
                 serve_state.replicas_table.c.service_name == _SERVICE_NAME,
                 serve_state.replicas_table.c.replica_id == 9).values(
                     replica_state=partial))
-    quarantined = serve_state.get_replica_info_from_id(_SERVICE_NAME, 9)
-    assert quarantined is not None
-    assert quarantined.system_recovery_quarantine is not None
-    clear_quarantine = copy.deepcopy(quarantined)
-    clear_quarantine.system_recovery_quarantine = None
-    with pytest.raises(serve_state.ReplicaSystemRecoveryMutationRejected,
-                       match='absorbing'):
-        serve_state.patch_replica_system_recovery(_SERVICE_NAME,
-                                                  9,
-                                                  clear_quarantine,
-                                                  expected_revision=0,
-                                                  **_fence())
+    with pytest.raises(ValueError, match='v17 collision records'):
+        serve_state.get_replica_info_from_id(_SERVICE_NAME, 9)
 
 
 def test_stale_generic_whole_row_preserves_locked_recovery_bundle(
@@ -488,7 +478,7 @@ def test_stale_generic_whole_row_preserves_locked_recovery_bundle(
     assert persisted.first_not_ready_time == 42.0
     assert persisted.launch_request_id == 'request-1'
     assert persisted.system_recovery_revision == 2
-    _assert_json_pickle_parity(engine, 7)
+    _assert_json_only_replica_state(engine, 7)
 
 
 def test_delete_first_rejects_stale_single_batch_and_paid_completion(
@@ -668,7 +658,7 @@ def test_recreated_numeric_id_rejects_stale_single_batch_and_paid_completion(
                 sqlalchemy.select(
                     serve_state.paid_capacity_claims_table)).mappings().one())
     assert claim_after == claim_before
-    _assert_json_pickle_parity(engine, 7)
+    _assert_json_only_replica_state(engine, 7)
 
 
 def test_initial_replica_paths_are_insert_only_on_key_conflict(
@@ -743,7 +733,7 @@ def test_initial_replica_paths_are_insert_only_on_key_conflict(
     assert paid_claim is None
 
 
-def test_all_fields_absent_v13_is_quarantined_without_compatibility_rewrite(
+def test_all_fields_absent_v13_is_not_a_runtime_read_path(
         recovery_database) -> None:
     engine = recovery_database
     row = _raw_replica_row(engine, 7)
@@ -758,42 +748,8 @@ def test_all_fields_absent_v13_is_quarantined_without_compatibility_rewrite(
                 serve_state.replicas_table.c.replica_id == 7).values(
                     replica_state=rollback))
 
-    transitioned = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
-    assert transitioned is not None
-    assert transitioned.system_recovery_quarantine == (
-        recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
-    assert not transitioned.is_ready
+    with pytest.raises(ValueError, match='v17 collision records'):
+        serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
     persisted = _raw_replica_row(engine, 7)
     assert not set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).intersection(
         persisted['replica_state'])
-
-
-def test_all_fields_absent_v13_quarantine_identity_can_fence_delete(
-        recovery_database) -> None:
-    engine = recovery_database
-    row = _raw_replica_row(engine, 7)
-    rollback = row['replica_state']
-    rollback['replica_info_version'] = 13
-    for field_name in replica_info.V13_ADDITIVE_STORAGE_FIELDS:
-        rollback.pop(field_name)
-    with engine.begin() as connection:
-        connection.execute(
-            sqlalchemy.update(serve_state.replicas_table).where(
-                serve_state.replicas_table.c.service_name == _SERVICE_NAME,
-                serve_state.replicas_table.c.replica_id == 7).values(
-                    replica_state=rollback))
-
-    transitioned = serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
-    assert transitioned is not None
-    assert transitioned.system_recovery_quarantine == (
-        recovery_state.SystemRecoveryQuarantine(
-            recovery_state.RecoveryQuarantineReason.PARTIAL_V13_BUNDLE))
-    with _capture_sql(engine) as statements:
-        assert serve_state.remove_replica(
-            _SERVICE_NAME,
-            7,
-            **_fence(),
-            expected_replica_record_id=transitioned.replica_record_id)
-    _assert_lifecycle_service_replica_lock_order(statements)
-    assert serve_state.get_replica_info_from_id(_SERVICE_NAME, 7) is None

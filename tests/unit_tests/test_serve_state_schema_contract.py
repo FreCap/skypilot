@@ -260,9 +260,10 @@ def test_resource_action_existing_table_columns_are_dialect_portable():
         'desired_generation',
         'resource_action_spec_identity_sha256',
     }
-    assert set(serve_state._LEGACY_REPLICA_ROW_COLUMNS).isdisjoint(
+    assert set(serve_state._REPLICA_ROW_COLUMNS).isdisjoint(
         serve_state._ACTION_OWNED_REPLICA_COLUMNS)
-    assert set(serve_state._LEGACY_REPLICA_ROW_COLUMNS) <= set(
+    assert 'replica_info' not in serve_state._REPLICA_ROW_COLUMNS
+    assert set(serve_state._REPLICA_ROW_COLUMNS) <= set(
         serve_state.replicas_table.c.keys())
     for name in uuid_columns:
         column_type = serve_state.replicas_table.c[name].type

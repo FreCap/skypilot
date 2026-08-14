@@ -9,6 +9,7 @@ leader-aware routing.
 # pylint: disable=invalid-name,protected-access
 import contextlib
 import copy
+import enum
 import hashlib
 import json
 import pickle
@@ -23,6 +24,7 @@ from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
 
 from sky import clouds
+from sky.schemas.db import legacy_replica_pickle
 from sky.serve import constants as serve_constants
 from sky.serve import ephemeral_storage_contract
 from sky.serve import paid_capacity
@@ -950,27 +952,12 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert restored.logical_bridge_capacity_verified is True
     assert restored.status == info.status
 
-    legacy_state = info.to_storage_dict()
-    legacy_state['replica_info_version'] = 13
-    legacy_state['status_property'].pop('logical_retirement_bounded_deadline')
-    legacy_restored = replica_managers.ReplicaInfo.from_storage_dict(
-        legacy_state)
-    assert not legacy_restored.status_property.logical_retirement_bounded_deadline
-
     malformed_state = info.to_storage_dict()
     malformed_state['status_property'][
         'logical_retirement_bounded_deadline'] = 'true'
     malformed_restored = replica_managers.ReplicaInfo.from_storage_dict(
         malformed_state)
     assert not malformed_restored.status_property.logical_retirement_bounded_deadline
-
-    legacy_commit_state = info.to_storage_dict()
-    legacy_commit_state['replica_info_version'] = 13
-    legacy_commit_state['status_property'].pop('logical_retirement_committed')
-    legacy_commit_restored = replica_managers.ReplicaInfo.from_storage_dict(
-        legacy_commit_state)
-    assert (legacy_commit_restored.status_property.logical_retirement_committed
-            is None)
 
     malformed_commit_state = info.to_storage_dict()
     malformed_commit_state['status_property'][
@@ -980,13 +967,6 @@ def test_replica_json_storage_round_trip_preserves_lifecycle_state():
     assert (
         malformed_commit_restored.status_property.logical_retirement_committed
         is None)
-
-    legacy_drain_state = info.to_storage_dict()
-    legacy_drain_state['replica_info_version'] = 13
-    legacy_drain_state['status_property'].pop('drain_started_at')
-    legacy_drain_restored = replica_managers.ReplicaInfo.from_storage_dict(
-        legacy_drain_state)
-    assert legacy_drain_restored.status_property.drain_started_at is None
 
     for malformed_started_at in (True, 0, -1, float('inf'), '1234.5'):
         malformed_drain_state = info.to_storage_dict()
@@ -1357,11 +1337,7 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
                           sqlalchemy.String(32),
                           primary_key=True))
     legacy_metadata.create_all(engine)
-    info = _replica(3, cluster_name='legacy-cluster', version=2)
-    info._version = 6
-    del info.first_consecutive_failure_time
-    info.consecutive_failure_times = [42.0, 43.0]
-    info.location = {
+    historical_location = {
         'cloud': 'Kubernetes',
         'region': 'prod_research_cluster_eks',
         'zone': None,
@@ -1375,45 +1351,15 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
         'disk_tier': None,
         'ephemeral_storage': 20,
     }
-    info.resources_override = dict(info.location)
-    info.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
-    info.status_property.service_ready_now = True
-    legacy_blob = pickle.dumps(info)
-    expected_state = pickle.loads(legacy_blob).to_storage_dict()
-    uncertain = _replica(4, cluster_name='legacy-uncertain-cluster', version=1)
-    uncertain.status_property.sky_launch_status = (
-        common_utils.ProcessStatus.SUCCEEDED)
-    uncertain.status_property.service_ready_now = True
-    uncertain_status = uncertain.status_property
-    uncertain_status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
-    uncertain_status.is_scale_down = True
-    uncertain_status.wait_for_idle_before_termination = False
-    uncertain_status.logical_retirement_version = 2
-    uncertain_status.logical_retirement_controller_epoch = 'legacy-epoch'
-    uncertain_status.logical_retirement_generation = 3
-    uncertain_status.logical_retirement_target_capacity = 1
-    uncertain_status.logical_retirement_confirmed_generation = 4
-    # Model a real pre-field v13 pickle. The decode boundary must materialize
-    # the missing-vs-uncommitted distinction explicitly.
-    uncertain._version = 13
-    vars(uncertain_status).pop('logical_retirement_committed')
-    uncertain_blob = pickle.dumps(uncertain)
-    loaded_uncertain = pickle.loads(uncertain_blob)
-    assert ('logical_retirement_committed'
-            in vars(loaded_uncertain.status_property))
-    assert loaded_uncertain.status_property.logical_retirement_committed is None
-    assert (loaded_uncertain.to_storage_dict()['status_property']
-            ['logical_retirement_committed'] is None)
+    legacy_blob = _genuine_pre_json_replica_pickle(
+        replica_id=3,
+        cluster_name='legacy-cluster',
+        version=2,
+        ready=True,
+        location=historical_location)
     with engine.begin() as connection:
-        connection.execute(legacy_replicas.insert(), [{
-            'service_name': 'svc',
-            'replica_id': 3,
-            'replica_info': legacy_blob,
-        }, {
-            'service_name': 'svc',
-            'replica_id': 4,
-            'replica_info': uncertain_blob,
-        }])
+        connection.execute(legacy_replicas.insert().values(
+            service_name='svc', replica_id=3, replica_info=legacy_blob))
         connection.execute(version_table.insert().values(version_num='009'))
 
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
@@ -1422,18 +1368,204 @@ def test_replica_json_migration_backfills_legacy_pickle(tmp_path, monkeypatch):
 
     restored = serve_state.get_replica_info_from_id('svc', 3)
     assert restored is not None
-    assert restored.to_storage_dict() == expected_state
+    assert restored.to_storage_dict()['replica_info_version'] == 18
+    assert restored.cluster_name == 'legacy-cluster'
+    assert restored.location == historical_location
+    assert restored.resources_override == historical_location
     assert restored.first_consecutive_failure_time == 42.0
-    restored_uncertain = serve_state.get_replica_info_from_id('svc', 4)
-    assert restored_uncertain is not None
-    assert (restored_uncertain.status_property.logical_retirement_committed
-            is None)
-    assert (replica_managers.SkyPilotReplicaManager.
-            _is_legacy_uncertain_logical_retirement(restored_uncertain))
-    assert serve_state.get_replica_status_counts('svc') == {
-        'READY': 1,
-        'SHUTTING_DOWN': 1,
+    assert serve_state.get_replica_status_counts('svc') == {'READY': 1}
+
+
+def _genuine_pre_json_replica_pickle(
+        *,
+        replica_id: int,
+        cluster_name: str,
+        version: int,
+        record_version: int = 6,
+        ready: bool = False,
+        location: dict | None = None,
+        legacy_process_status_identity: bool = False) -> bytes:
+    """Build an exact historical state shape from before JSON authority."""
+    source = _replica(3, cluster_name='legacy-cluster', version=2)
+    source.replica_id = replica_id
+    source.cluster_name = cluster_name
+    source.version = version
+    source._version = record_version
+    if ready:
+        source.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.SUCCEEDED)
+        source.status_property.service_ready_now = True
+    if location is not None:
+        source.location = copy.deepcopy(location)
+        source.resources_override = copy.deepcopy(location)
+    historical_replica_fields = {
+        '_version',
+        'replica_id',
+        'cluster_name',
+        'version',
+        'replica_port',
+        'created_at',
+        'first_not_ready_time',
+        'status_property',
+        'is_spot',
+        'location',
+        'resources_override',
+        'reserved_fill',
+        'cost_rebalance_for_replica_id',
     }
+    if record_version < 7:
+        source.consecutive_failure_times = [42.0, 43.0]
+        historical_replica_fields.add('consecutive_failure_times')
+    else:
+        source.first_consecutive_failure_time = 42.0
+        historical_replica_fields.add('first_consecutive_failure_time')
+    if record_version >= 8:
+        source.planned_capacity = 4
+        historical_replica_fields.add('planned_capacity')
+    if record_version >= 9:
+        source.unknown_capacity_replacement = True
+        historical_replica_fields.add('unknown_capacity_replacement')
+    if record_version >= 10:
+        source.logical_bridge_capacity_verified = True
+        historical_replica_fields.add('logical_bridge_capacity_verified')
+    if record_version >= 11:
+        source.is_zero_cost = True
+        source.cost_rebalance_for_replica_id = 9
+        source.resources_override = {
+            'cloud': clouds.AWS(),
+            'image_id': {
+                None: 'ami-historical',
+            },
+        }
+        historical_replica_fields.add('is_zero_cost')
+    for field in set(vars(source)) - historical_replica_fields:
+        delattr(source, field)
+    historical_status_fields = {
+        'sky_launch_status',
+        'user_app_failed',
+        'service_ready_now',
+        'first_ready_time',
+        'sky_down_status',
+        'is_scale_down',
+        'preempted',
+        'purged',
+        'failed_spot_availability',
+        'drain_cap_seconds',
+        'wait_for_idle_before_termination',
+    }
+    if record_version >= 11:
+        source.status_property.drain_started_at = 100.0
+        source.status_property.wait_for_idle_before_termination = True
+        source.status_property.logical_retirement_version = 3
+        source.status_property.logical_retirement_controller_epoch = 'epoch'
+        source.status_property.logical_retirement_generation = 4
+        source.status_property.logical_retirement_target_capacity = 5
+        source.status_property.logical_retirement_confirmed_generation = 6
+        source.status_property.logical_retirement_bounded_deadline = True
+        source.status_property.logical_retirement_committed = True
+        historical_status_fields.update({
+            'drain_started_at',
+            'logical_retirement_version',
+            'logical_retirement_controller_epoch',
+            'logical_retirement_generation',
+            'logical_retirement_target_capacity',
+            'logical_retirement_confirmed_generation',
+            'logical_retirement_bounded_deadline',
+            'logical_retirement_committed',
+        })
+    for field in set(vars(source.status_property)) - historical_status_fields:
+        delattr(source.status_property, field)
+    original_process_status = replica_managers.ProcessStatus
+    if legacy_process_status_identity:
+        historical_process_status = enum.Enum(
+            'ProcessStatus', {
+                status.value: status.value
+                for status in common_utils.ProcessStatus
+            },
+            module='sky.serve.replica_managers')
+        replica_managers.ProcessStatus = historical_process_status
+        launch_status = source.status_property.sky_launch_status
+        down_status = source.status_property.sky_down_status
+        source.status_property.sky_launch_status = historical_process_status(
+            launch_status.value)
+        source.status_property.sky_down_status = (historical_process_status(
+            down_status.value) if down_status is not None else None)
+    try:
+        payload = pickle.dumps(source)
+    finally:
+        replica_managers.ProcessStatus = original_process_status
+    assert b'sky.serve.replica_managers' in payload
+    assert b'ReplicaInfo' in payload
+    assert b'ReplicaStatusProperty' in payload
+    if legacy_process_status_identity:
+        assert b'ProcessStatus' in payload
+        assert b'sky.utils.common_utils' not in payload
+    return payload
+
+
+_FORBIDDEN_PICKLE_CALLS: list[bool] = []
+
+
+def _mark_forbidden_pickle_call() -> None:
+    _FORBIDDEN_PICKLE_CALLS.append(True)
+
+
+class _ForbiddenReduce:
+
+    def __reduce__(self):
+        return _mark_forbidden_pickle_call, ()
+
+
+def test_replica_json_migration_owns_pre_v17_projection(monkeypatch):
+    payload = _genuine_pre_json_replica_pickle(
+        replica_id=3,
+        cluster_name='legacy-cluster',
+        version=2,
+        legacy_process_status_identity=True)
+
+    def _fail_live_decoder(*_args, **_kwargs):
+        raise AssertionError('live ReplicaInfo decoder was called')
+
+    def _fail_live_serializer(*_args, **_kwargs):
+        raise AssertionError('live ReplicaInfo serializer was called')
+
+    monkeypatch.setattr(replica_managers.ReplicaInfo, '__setstate__',
+                        _fail_live_decoder)
+    monkeypatch.setattr(replica_managers.ReplicaInfo, 'to_storage_dict',
+                        _fail_live_serializer)
+
+    legacy = legacy_replica_pickle.load_pre_json_replica(payload)
+    values = legacy_replica_pickle.frozen_replica_row_values(legacy,
+                                                             maximum_version=7)
+
+    state = values['replica_state']
+    assert vars(legacy)['_version'] == 6
+    assert state['replica_info_version'] == 18
+    assert set(state) == set(replica_info_lib._REPLICA_INFO_STORAGE_FIELDS)
+    assert set(state['status_property']) == set(
+        replica_info_lib._REPLICA_STATUS_PROPERTY_FIELDS)
+    assert state['first_consecutive_failure_time'] == 42.0
+    assert state['system_recovery_disposition'] == 'ORDINARY'
+    assert state['logical_bridge_capacity_verified'] is False
+    assert values['status'] == serve_state.ReplicaStatus.PENDING.value
+
+
+def test_replica_json_migration_rejects_newer_and_executable_pickles():
+    v11_payload = _genuine_pre_json_replica_pickle(replica_id=3,
+                                                   cluster_name='preview',
+                                                   version=2,
+                                                   record_version=11)
+    v11 = legacy_replica_pickle.load_pre_json_replica(v11_payload)
+    with pytest.raises(legacy_replica_pickle.LegacyReplicaPickleError,
+                       match='exceeds this migration boundary'):
+        legacy_replica_pickle.frozen_replica_row_values(v11, maximum_version=7)
+
+    _FORBIDDEN_PICKLE_CALLS.clear()
+    payload = pickle.dumps(_ForbiddenReduce())
+    with pytest.raises(legacy_replica_pickle.LegacyReplicaPickleError,
+                       match='forbidden global'):
+        legacy_replica_pickle.load_pre_json_replica(payload)
+    assert not _FORBIDDEN_PICKLE_CALLS
 
 
 def test_replica_json_migration_handles_fresh_database(tmp_path):
@@ -1458,6 +1590,45 @@ def test_replica_json_migration_handles_fresh_database(tmp_path):
     ]
 
 
+def test_replica_json_migration_owns_retired_pickle_column_on_fresh_replay(
+        tmp_path):
+    engine = create_engine(f'sqlite:///{tmp_path / "future-fresh.db"}')
+    metadata = sqlalchemy.MetaData()
+    sqlalchemy.Table(
+        'replicas',
+        metadata,
+        sqlalchemy.Column('service_name', sqlalchemy.Text, primary_key=True),
+        sqlalchemy.Column('replica_id', sqlalchemy.Integer, primary_key=True),
+    )
+    version_table = sqlalchemy.Table(
+        'alembic_version_serve_state_db',
+        metadata,
+        sqlalchemy.Column('version_num',
+                          sqlalchemy.String(32),
+                          primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(version_table.insert().values(version_num='009'))
+
+    migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
+                                         '010')
+
+    columns = {
+        column['name']
+        for column in sqlalchemy.inspect(engine).get_columns('replicas')
+    }
+    assert {
+        'replica_info',
+        'replica_state_version',
+        'status',
+        'replica_state',
+    } <= columns
+    with engine.connect() as connection:
+        assert connection.execute(sqlalchemy.select(
+            version_table.c.version_num)).scalar_one() == '010'
+
+
 def test_replica_index_migration_converges_predecessor_stamped_legacy_state(
         tmp_path):
     """Revision 026 repairs previews stamped past replica JSON revision 010."""
@@ -1478,12 +1649,14 @@ def test_replica_index_migration_converges_predecessor_stamped_legacy_state(
                           primary_key=True),
     )
     metadata.create_all(engine)
-    legacy = _replica(1, cluster_name='svc-1', version=3)
+    legacy = _genuine_pre_json_replica_pickle(replica_id=1,
+                                              cluster_name='svc-1',
+                                              version=3,
+                                              record_version=11)
     with engine.begin() as connection:
-        connection.execute(
-            legacy_replicas.insert().values(service_name='svc',
-                                            replica_id=1,
-                                            replica_info=pickle.dumps(legacy)))
+        connection.execute(legacy_replicas.insert().values(service_name='svc',
+                                                           replica_id=1,
+                                                           replica_info=legacy))
         connection.execute(version_table.insert().values(version_num='025'))
 
     migration_utils.safe_alembic_upgrade(engine, migration_utils.SERVE_DB_NAME,
@@ -1521,6 +1694,38 @@ def test_replica_index_migration_converges_predecessor_stamped_legacy_state(
     assert row['status'] == serve_state.ReplicaStatus.PENDING.value
     assert row['replica_state_version'] == 1
     assert row['replica_state'] is not None
+    state = row['replica_state']
+    assert state['replica_info_version'] == 18
+    assert state['planned_capacity'] == 4
+    assert state['unknown_capacity_replacement'] is True
+    assert state['logical_bridge_capacity_verified'] is True
+    assert state['is_zero_cost'] is True
+    assert state['cost_rebalance_for_replica_id'] == 9
+    assert state['resources_override'] == {
+        'cloud': 'AWS',
+        'image_id': [[None, 'ami-historical']],
+    }
+    assert state['status_property'] == {
+        'sky_launch_status': 'SCHEDULED',
+        'user_app_failed': False,
+        'service_ready_now': False,
+        'first_ready_time': None,
+        'sky_down_status': None,
+        'is_scale_down': False,
+        'preempted': False,
+        'purged': False,
+        'failed_spot_availability': False,
+        'drain_cap_seconds': None,
+        'drain_started_at': 100.0,
+        'wait_for_idle_before_termination': True,
+        'logical_retirement_version': 3,
+        'logical_retirement_controller_epoch': 'epoch',
+        'logical_retirement_generation': 4,
+        'logical_retirement_target_capacity': 5,
+        'logical_retirement_confirmed_generation': 6,
+        'logical_retirement_bounded_deadline': True,
+        'logical_retirement_committed': True,
+    }
     assert revision == '026'
 
 
@@ -6558,7 +6763,7 @@ class TestExpectedExistingReplicaPersistence:
                     serve_state.paid_capacity_claims_table)).first()
         assert claim is not None
 
-    def test_v12_transition_identity_can_fence_terminal_delete(
+    def test_pre_v17_json_cannot_enter_terminal_delete_path(
             self, _mock_serve_db):
         info = _replica(1)
         info.created_at = 123.5
@@ -6580,13 +6785,8 @@ class TestExpectedExistingReplicaPersistence:
                         replica_state=row))
             session.commit()
 
-        transitioned = serve_state.get_replica_info_from_id('svc', 1)
-        assert transitioned is not None
-        assert transitioned.replica_record_id == (
-            '5b71cc7f-a36e-5c16-a0c7-de59389ead0e')
-        assert serve_state.remove_replica(
-            'svc', 1, expected_replica_record_id=transitioned.replica_record_id)
-        assert serve_state.get_replica_info_from_id('svc', 1) is None
+        with pytest.raises(ValueError, match='v17 collision records'):
+            serve_state.get_replica_info_from_id('svc', 1)
 
     def test_recreated_numeric_id_rejects_stale_updates_and_deletes(
             self, _mock_serve_db):
@@ -6664,10 +6864,8 @@ class TestExpectedExistingReplicaPersistence:
                     1)).mappings().one()
         from_json = replica_managers.ReplicaInfo.from_storage_dict(
             row['replica_state'])
-        from_pickle = pickle.loads(row['replica_info'])
         assert from_json.replica_record_id == replacement.replica_record_id
-        assert from_pickle.replica_record_id == replacement.replica_record_id
-        assert from_pickle.to_storage_dict() == from_json.to_storage_dict()
+        assert row['replica_info'] is None
 
     def test_initial_single_and_batch_insert_conflicts_are_atomic(
             self, _mock_serve_db):

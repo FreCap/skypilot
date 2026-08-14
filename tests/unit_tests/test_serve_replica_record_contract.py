@@ -2,6 +2,7 @@
 # pylint: disable=protected-access
 import copy
 import dataclasses
+import logging
 import pickle
 from unittest import mock
 
@@ -190,6 +191,25 @@ def test_status_projection_contract(updates, expected):
     assert status.to_replica_status() is expected
 
 
+def test_replica_status_projection_is_side_effect_free(caplog):
+    sentinel_id = 987654321
+    sentinel_payload = 'status-projection-payload-sentinel'
+    replica = _replica()
+    replica.replica_id = sentinel_id
+    replica.cluster_name = sentinel_payload
+    replica.status_property.sky_launch_status = (
+        common_utils.ProcessStatus.RUNNING)
+    replica.status_property.sky_down_status = (
+        common_utils.ProcessStatus.SUCCEEDED)
+
+    with caplog.at_level(logging.ERROR):
+        assert replica.status is serve_state.ReplicaStatus.UNKNOWN
+
+    assert str(sentinel_id) not in caplog.text
+    assert sentinel_payload not in caplog.text
+    assert not caplog.records
+
+
 def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     replica = _replica()
     assert replica.resources_override is not None
@@ -199,7 +219,7 @@ def test_storage_round_trip_is_lossless_and_does_not_mutate_source():
     state = replica.to_storage_dict()
     restored = replica_managers.ReplicaInfo.from_storage_dict(state)
 
-    assert state['replica_info_version'] == 17
+    assert state['replica_info_version'] == 18
     assert set(state) == set(replica_info._REPLICA_INFO_STORAGE_FIELDS)
     assert replica.resources_override['cloud'] is cloud_before
     assert replica.resources_override['image_id'] == image_id_before
@@ -352,25 +372,23 @@ def test_first_typed_fill_round_trips_zero_observation_sequence():
     assert from_pickle.reserved_fill_observation_sequence == 0
 
 
-def test_v15_fill_record_materializes_absent_allocation_attribution():
+def test_v17_collision_materializes_absent_allocation_attribution():
     state = _protocol_v2_replica().to_storage_dict()
-    state['replica_info_version'] = 15
-    for field in replica_info._RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS:
+    state['replica_info_version'] = 17
+    for field in replica_info.V17_COLLISION_OPTIONAL_STORAGE_FIELDS:
         state.pop(field)
 
     restored = replica_managers.ReplicaInfo.from_storage_dict(state)
 
     assert all(
         getattr(restored, field) is None
-        for field in replica_info._RESERVED_FILL_ALLOCATION_ATTRIBUTION_FIELDS)
-    assert restored.to_storage_dict()['replica_info_version'] == 17
+        for field in replica_info.V17_COLLISION_OPTIONAL_STORAGE_FIELDS)
+    assert restored.to_storage_dict()['replica_info_version'] == 18
 
 
-def test_v15_typed_fill_without_reclaim_identity_remains_readable_legacy():
+def test_complete_v17_shape_preserves_all_attribution():
     state = _attributed_protocol_v2_replica().to_storage_dict()
-    state['replica_info_version'] = 15
-    for field in _RECLAIM_ATTRIBUTION_FIELDS:
-        state.pop(field)
+    state['replica_info_version'] = 17
 
     restored = replica_managers.ReplicaInfo.from_storage_dict(state)
 
@@ -380,19 +398,25 @@ def test_v15_typed_fill_without_reclaim_identity_remains_readable_legacy():
     assert restored.reserved_fill_observation_generation == 13
     assert restored.reserved_fill_observation_sequence == 17
     assert restored.reserved_fill_intent_idempotency_key == 'b' * 64
-    assert all(
-        getattr(restored, field) is None
-        for field in _RECLAIM_ATTRIBUTION_FIELDS)
+    assert restored.reserved_fill_reconciliation_gate_generation == 29
+    assert (restored.reserved_fill_reclaim_fleet_bundle_sha256 ==
+            _RECLAIM_FLEET_BUNDLE_SHA256)
 
     rewritten = restored.to_storage_dict()
-    assert rewritten['replica_info_version'] == 17
-    assert all(
-        rewritten[field] is None for field in _RECLAIM_ATTRIBUTION_FIELDS)
+    assert rewritten['replica_info_version'] == 18
     decoded_again = replica_managers.ReplicaInfo.from_storage_dict(rewritten)
     assert decoded_again.reserved_fill_allocation_generation == 5
-    assert all(
-        getattr(decoded_again, field) is None
-        for field in _RECLAIM_ATTRIBUTION_FIELDS)
+    assert (decoded_again.reserved_fill_reclaim_policy_revision ==
+            _RECLAIM_POLICY_REVISION)
+
+
+def test_v17_collision_rejects_partially_missing_attribution():
+    state = _attributed_protocol_v2_replica().to_storage_dict()
+    state['replica_info_version'] = 17
+    state.pop('reserved_fill_reclaim_policy_revision')
+
+    with pytest.raises(ValueError, match='partially missing attribution'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
 
 
 @pytest.mark.parametrize(
@@ -595,39 +619,19 @@ def test_pool_probe_propagates_explicit_provider_phase_admission():
     ]
 
 
-def test_legacy_null_image_key_and_missing_fields_remain_compatible():
+def test_pre_v17_json_is_not_a_runtime_read_path():
     state = _replica().to_storage_dict()
     state['replica_info_version'] = 13
-    state['resources_override']['image_id'] = {
-        'null': 'global-image',
-        'us-east-1': 'regional-image',
-    }
-    state.pop('planned_capacity')
-    state.pop('unknown_capacity_replacement')
-    state.pop('logical_bridge_capacity_verified')
+    with pytest.raises(ValueError, match='v17 collision records'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+def test_v17_collision_requires_exact_status_shape():
+    state = _replica().to_storage_dict()
+    state['replica_info_version'] = 17
     state['status_property'].pop('logical_retirement_committed')
-
-    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
-
-    assert restored.resources_override['image_id'] == {
-        None: 'global-image',
-        'us-east-1': 'regional-image',
-    }
-    assert restored.planned_capacity == 1
-    assert restored.unknown_capacity_replacement is False
-    assert restored.logical_bridge_capacity_verified is False
-    assert restored.status_property.logical_retirement_committed is None
-
-
-def test_legacy_json_materializes_every_status_field():
-    state = _replica().to_storage_dict()
-    state['replica_info_version'] = 13
-    state['status_property'] = {}
-
-    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
-
-    assert set(vars(restored.status_property)) == set(_status_field_names())
-    _assert_materialized_legacy_status_defaults(restored.status_property)
+    with pytest.raises(ValueError, match='logical_retirement_committed'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
 
 
 @pytest.mark.parametrize('field', replica_info._REPLICA_INFO_OWNED_FIELDS)
@@ -645,6 +649,25 @@ def test_current_json_requires_every_status_field(field):
     state['status_property'].pop(field)
 
     with pytest.raises(ValueError, match=field):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_current_json_rejects_unknown_fields(nested):
+    state = _replica().to_storage_dict()
+    target = state['status_property'] if nested else state
+    target['unknown_legacy_field'] = 'not-owned'
+
+    with pytest.raises(ValueError, match='unexpected fields'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+def test_v17_collision_rejects_missing_noncollision_field():
+    state = _replica().to_storage_dict()
+    state['replica_info_version'] = 17
+    state.pop('planned_capacity')
+
+    with pytest.raises(ValueError, match='planned_capacity'):
         replica_managers.ReplicaInfo.from_storage_dict(state)
 
 

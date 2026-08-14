@@ -36,8 +36,8 @@ def test_infra_summary_is_direct_scoped_and_deterministic():
         response = infra_dashboard.get_infra_summary(_request(user))
 
     refresh.assert_called_once_with()
-    enabled_clouds_batch.assert_called_once_with(
-        ['workspace-a', 'workspace-b'], expand=True)
+    enabled_clouds_batch.assert_called_once_with(['workspace-a', 'workspace-b'],
+                                                 expand=True)
     assert response == {
         'version': 1,
         'workspaces': [{

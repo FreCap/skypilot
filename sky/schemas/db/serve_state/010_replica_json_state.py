@@ -10,13 +10,12 @@ could make the migrated JSON state stale after this backfill.
 """
 # pylint: disable=invalid-name
 from collections.abc import Sequence
-import pickle
-from typing import Any
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
+from sky.schemas.db import legacy_replica_pickle
 from sky.utils.db import db_utils
 
 # revision identifiers, used by Alembic.
@@ -36,23 +35,6 @@ _JSON_ROW_KEYS = (
     'is_spot',
     'replica_state',
 )
-
-
-def _legacy_replica_row_values(replica_info: Any) -> dict[str, Any]:
-    """Convert one legacy pickle using this migration's frozen projection."""
-    replica_state = replica_info.to_storage_dict()
-    sky_down_status = replica_info.status_property.sky_down_status
-    return {
-        'replica_state_version': 1,
-        'status': replica_info.status.value,
-        'sky_down_status':
-            (sky_down_status.value if sky_down_status is not None else None),
-        'version': replica_info.version,
-        'cluster_name': replica_info.cluster_name,
-        'created_at': getattr(replica_info, 'created_at', None),
-        'is_spot': replica_info.is_spot,
-        'replica_state': replica_state,
-    }
 
 
 def _replicas_table() -> sa.Table:
@@ -78,6 +60,11 @@ def _replicas_table() -> sa.Table:
 def _add_columns() -> None:
     json_type = sa.JSON().with_variant(postgresql.JSONB(), 'postgresql')
     columns = (
+        # Revision 001 historically created this column through the live
+        # Serve declarative model. Keep the migration boundary self-contained
+        # so a future model without the retired column can still replay 000 to
+        # head on an empty database.
+        ('replica_info', sa.LargeBinary()),
         ('replica_state_version', sa.Integer()),
         ('status', sa.Text()),
         ('sky_down_status', sa.Text()),
@@ -115,8 +102,13 @@ def _backfill_and_verify() -> None:
             break
         values = []
         for service_name, replica_id, replica_info_bytes in batch:
-            replica_info = pickle.loads(replica_info_bytes)
-            row_values = _legacy_replica_row_values(replica_info)
+            if replica_info_bytes is None:
+                raise RuntimeError(
+                    'Replica JSON migration found a row without legacy '
+                    'replica_info state.')
+            row_values = (
+                legacy_replica_pickle.frozen_replica_row_values_from_pickle(
+                    replica_info_bytes, maximum_version=7))
             values.append({
                 '_service_name': service_name,
                 '_replica_id': replica_id,
@@ -152,8 +144,13 @@ def _backfill_and_verify() -> None:
         if not batch:
             break
         for row in batch:
-            legacy = pickle.loads(row.replica_info)
-            expected = _legacy_replica_row_values(legacy)
+            if row.replica_info is None:
+                raise RuntimeError(
+                    'Replica JSON migration parity check found a row without '
+                    'legacy replica_info state.')
+            expected = (
+                legacy_replica_pickle.frozen_replica_row_values_from_pickle(
+                    row.replica_info, maximum_version=7))
             actual = {
                 'replica_state_version': row.replica_state_version,
                 'status': row.status,

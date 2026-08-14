@@ -12228,8 +12228,7 @@ class TestFailedCleanupReconciliation:
                                           purge=False,
                                           in_flight_drain_cap_seconds=0)
 
-    def test_legacy_failed_row_gets_one_conservative_bounded_drain(self):
-        manager = _make_manager()
+    def test_legacy_failed_row_is_rejected_before_cleanup(self):
         info = self._info()
         info.status_property.is_scale_down = True
         info.status_property.drain_cap_seconds = 600
@@ -12237,21 +12236,9 @@ class TestFailedCleanupReconciliation:
         legacy_state = info.to_storage_dict()
         legacy_state['replica_info_version'] = 13
         legacy_state['status_property'].pop('drain_started_at')
-        legacy_info = replica_managers.ReplicaInfo.from_storage_dict(
-            legacy_state)
-        assert legacy_info.status_property.drain_started_at is None
 
-        with mock.patch.object(manager, '_terminate_replica') as terminate, \
-             mock.patch('sky.serve.replica_managers.time.monotonic',
-                        return_value=100):
-            manager._reconcile_failed_cleanup([legacy_info])
-
-        terminate.assert_called_once_with(1,
-                                          sync_down_logs=False,
-                                          replica_drain_delay_seconds=0,
-                                          is_scale_down=True,
-                                          purge=False,
-                                          in_flight_drain_cap_seconds=600)
+        with pytest.raises(ValueError, match='v17 collision records'):
+            replica_managers.ReplicaInfo.from_storage_dict(legacy_state)
 
     def test_cleanup_retry_respects_capped_backoff_deadline(self):
         manager = _make_manager()
