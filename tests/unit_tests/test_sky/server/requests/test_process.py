@@ -6,6 +6,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import threading
 import time
 import unittest.mock
@@ -76,6 +77,42 @@ def hanging_inner_warden(*_args):
 
 def guardian_identity_task():
     return os.getpid(), os.getppid()
+
+
+class _DeferredFdAliasProbe:
+    """Open raw FDs only when this argument is deserialized."""
+
+    def __init__(self, path, count=8):
+        self.path = path
+        self.count = count
+
+    def __reduce__(self):
+        return _open_fd_alias_probe, (self.path, self.count)
+
+
+class _OpenFdAliasProbe:
+    """Raw descriptors whose owner deliberately outlives a fork boundary."""
+
+    def __init__(self, path, count):
+        self.created_in_pid = os.getpid()
+        self.fds = tuple(os.open(path, os.O_RDONLY) for _ in range(count))
+
+    def close(self):
+        for fd in self.fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _open_fd_alias_probe(path, count):
+    return _OpenFdAliasProbe(path, count)
+
+
+def close_fd_alias_probe(probe):
+    created_in_pid = probe.created_in_pid
+    probe.close()
+    return created_in_pid, os.getpid()
 
 
 def capability_owner_proof(expected_capability):
@@ -190,6 +227,89 @@ def test_guardian_identity_is_published_before_explicit_admission(tmp_path):
         executor.shutdown()
 
 
+def test_invocation_deserializes_after_protocol_fd_isolation(tmp_path):
+    """Stale objects cannot close FDs reused by the handler protocol."""
+    source = tmp_path / 'fd-source'
+    source.write_text('probe', encoding='utf-8')
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        future = executor.submit(close_fd_alias_probe,
+                                 _DeferredFdAliasProbe(str(source)))
+        created_in_pid, handler_pid = future.result(timeout=20)
+        assert created_in_pid == handler_pid
+    finally:
+        executor.shutdown()
+
+
+def test_fd_quarantine_prevents_stale_slot_reuse(tmp_path):
+    """A later protocol pipe cannot alias an inherited object's raw FD."""
+    source = tmp_path / 'quarantine-source'
+    source.write_text('probe', encoding='utf-8')
+    stale_fds = tuple(os.open(source, os.O_RDONLY) for _ in range(8))
+    reader = writer = None
+    try:
+        process._quarantine_fd_slots(stale_fds, frozenset())
+        reader, writer = os.pipe()
+        assert {reader, writer}.isdisjoint(stale_fds)
+
+        # Simulate the inherited Python owners discovering a PID change and
+        # closing the numeric descriptors they still remember.
+        for fd in stale_fds:
+            os.close(fd)
+        os.write(writer, b'x')
+        assert os.read(reader, 1) == b'x'
+    finally:
+        for fd in (*stale_fds, reader, writer):
+            if fd is None:
+                continue
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def test_prometheus_multiprocess_fds_do_not_alias_boundary_protocol(tmp_path):
+    """Exercise the production metric FD lifecycle in a clean interpreter."""
+    metrics_dir = tmp_path / 'prometheus'
+    metrics_dir.mkdir()
+    env = os.environ.copy()
+    env['PROMETHEUS_MULTIPROC_DIR'] = str(metrics_dir)
+    env['SKY_API_SERVER_METRICS_ENABLED'] = 'true'
+    script = """
+from prometheus_client import values
+from sky.metrics import utils
+from sky.server.requests.process import DisposableExecutor
+
+assert utils.METRICS_ENABLED
+assert values.ValueClass.__name__ == 'MmapedValue'
+executor = DisposableExecutor(max_workers=1)
+try:
+    future = executor.submit(utils.record_persistence_operation,
+                             'kv_cache', 'get', 'read', 'postgresql')
+    assert future.result(timeout=30) is None
+finally:
+    executor.shutdown()
+"""
+    result = subprocess.run([sys.executable, '-c', script],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            env=env,
+                            timeout=40)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_invocation_serialization_failure_releases_capacity():
+    executor = DisposableExecutor(max_workers=1)
+    try:
+        with pytest.raises(TypeError, match='pickle'):
+            executor.submit(dummy_task, threading.Lock())
+        assert executor.available_slots() == 1
+        assert executor.submit(dummy_task).result(timeout=20)
+    finally:
+        executor.shutdown()
+
+
 def test_cancel_before_admission_is_typed_pre_effect(tmp_path):
     executor = DisposableExecutor(max_workers=1)
     touched = tmp_path / 'not-run'
@@ -271,7 +391,7 @@ def test_capability_skips_setproctitle_until_exact_handler_install(monkeypatch):
         executor.shutdown()
     # Forked child writes to ``calls`` are copy-on-write, so the parent sees no
     # hook. The callable independently proves only the exact handler is bound.
-    assert calls == []
+    assert not calls
     assert proof['authorized'] is True
     assert proof['pid'] != future.guardian_identity.pid
 
