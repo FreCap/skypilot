@@ -1031,6 +1031,54 @@ def test_update_cluster_status_cancellation_stops_before_next_ray_probe():
     sleep.assert_called_once_with(1)
 
 
+def test_update_cluster_status_cancellation_stops_transport_retry():
+    handle = _make_handle()
+    handle.launched_nodes = 1
+    handle.provision_runtime_metadata.has_ray = True
+    handle.launched_resources.cloud = clouds.Kubernetes()
+    runner = mock.Mock()
+    runner.run.side_effect = [
+        (1, '', 'transient transport failure'),
+        AssertionError('retried ray status after cancellation'),
+    ]
+    handle.get_command_runners.return_value = [runner]
+    record = _make_record(handle)
+    node_statuses = {'pod-0': (status_lib.ClusterStatus.UP, None)}
+    external_failure = mock.Mock()
+    external_failure.get.return_value = []
+
+    with mock.patch.object(backend_utils,
+                           '_query_cluster_status_via_cloud_api',
+                           return_value=node_statuses) as query_status, \
+         mock.patch.object(backend_utils, 'ExternalFailureSource',
+                           external_failure), \
+         mock.patch.object(backend_utils,
+                           '_ray_status_via_skylet_grpc',
+                           return_value=None), \
+         mock.patch.object(backend_utils.context_utils,
+                           'sleep_with_cancellation',
+                           side_effect=asyncio.CancelledError()) as sleep, \
+         mock.patch.object(
+             backend_utils.time,
+             'sleep',
+             side_effect=AssertionError(
+                 'used raw sleep instead of cancelable wait')):
+        with pytest.raises(asyncio.CancelledError):
+            backend_utils._update_cluster_status('test-cluster',
+                                                 record,
+                                                 retry_if_missing=False)
+
+    query_status.assert_called_once_with(handle,
+                                         retry_if_missing=False,
+                                         get_ray_config=mock.ANY)
+    runner.run.assert_called_once_with(
+        backend_utils.instance_setup.RAY_STATUS_WITH_SKY_RAY_PORT_COMMAND,
+        stream_logs=False,
+        require_outputs=True,
+        separate_stderr=True)
+    sleep.assert_called_once_with(1)
+
+
 def test_update_cluster_status_cancellation_stops_before_launch_double_check_reread(
 ):
     handle = _make_handle()
