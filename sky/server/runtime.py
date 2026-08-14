@@ -789,8 +789,20 @@ def _start_metrics_background_loop(role: str, host: str,
     return background
 
 
-def _start_background_loop(role: str) -> _BackgroundLoop:
+def _start_background_loop(
+    role: str,
+    *,
+    compatibility_controller_lease: request_postgres.ControllerLeaderLease |
+    None = None,
+) -> _BackgroundLoop:
     background = _BackgroundLoop()
+    if compatibility_controller_lease is not None:
+        if role != 'all':
+            raise ValueError('Only compatibility all-mode can register its '
+                             'controller leadership monitor.')
+        background.create_task(
+            _monitor_compat_controller_leadership(
+                background, compatibility_controller_lease))
     if role in ('all', 'controller'):
         background.create_task(
             _singleton_task('requests-gc', requests_lib.requests_gc_daemon))
@@ -1379,7 +1391,13 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     _start_surface_interrupted_cluster_launches()
             if state.role in ('all', 'executor'):
                 clean_env_module.capture_clean_server_env()
-            background = _start_background_loop(state.role)
+            if compatibility_controller_lease is None:
+                background = _start_background_loop(state.role)
+            else:
+                background = _start_background_loop(
+                    state.role,
+                    compatibility_controller_lease=(
+                        compatibility_controller_lease))
             if state.role in ('all', 'executor'):
                 if state.role == 'all':
                     # Compatibility all-mode can claim controller-class
@@ -1431,10 +1449,6 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
                             background,
                             state.config.num_db_connections_per_worker,
                             compatibility_controller_owner))
-                    if compatibility_controller_lease is not None:
-                        background.run(
-                            _monitor_compat_controller_leadership(
-                                background, compatibility_controller_lease))
                 background.run(_initialize_normal_executor_requests())
 
             if state.role == 'executor':

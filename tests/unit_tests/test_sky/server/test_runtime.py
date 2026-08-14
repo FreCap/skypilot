@@ -30,11 +30,14 @@ observability.record(
 
 
 class _BackgroundLoop:
+    """Minimal owned-loop fake for role-wiring tests."""
 
     def __init__(self) -> None:
         self.stopped = False
+        self.run_coroutines = []
 
     def run(self, coroutine) -> None:
+        self.run_coroutines.append(coroutine.cr_code.co_name)
         coroutine.close()
 
     def stop(self) -> None:
@@ -408,9 +411,9 @@ def test_postgres_all_mode_fences_and_recovers_before_admission(
         'refresh-cutover')
     supervisor.start.side_effect = lambda: events.append('slots-start')
 
-    monkeypatch.setattr(
-        runtime, '_start_background_loop', lambda *args:
-        (events.append('background-start') or background))
+    start_background = mock.Mock(side_effect=lambda *args, **kwargs: (
+        events.append('background-start') or background))
+    monkeypatch.setattr(runtime, '_start_background_loop', start_background)
     monkeypatch.setattr(runtime.managed_job_utils, 'is_consolidation_mode',
                         lambda: True)
     monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
@@ -473,7 +476,38 @@ def test_postgres_all_mode_fences_and_recovers_before_admission(
     assert events.index('reenqueue') > next(
         index for index, event in enumerate(events)
         if isinstance(event, tuple) and event[0] == 'workers')
+    assert '_monitor_compat_controller_leadership' not in (
+        background.run_coroutines)
+    start_background.assert_called_once_with(
+        'all', compatibility_controller_lease=leader)
     leader.release.assert_called_once_with()
+
+
+def test_compat_leadership_monitor_is_owned_before_background_start(
+        monkeypatch):
+    events = []
+
+    class RecordingBackgroundLoop:
+
+        def create_task(self, coroutine):
+            events.append(('create', coroutine.cr_code.co_name))
+            coroutine.close()
+
+        def start(self):
+            events.append(('start', None))
+
+    leader = mock.Mock()
+    monkeypatch.setattr(runtime, '_BackgroundLoop', RecordingBackgroundLoop)
+    monkeypatch.setattr(runtime, '_uses_postgres_requests', lambda: False)
+
+    result = runtime._start_background_loop(  # pylint: disable=protected-access
+        'all',
+        compatibility_controller_lease=leader)
+
+    assert isinstance(result, RecordingBackgroundLoop)
+    monitor_event = ('create', '_monitor_compat_controller_leadership')
+    assert monitor_event in events
+    assert events.index(monitor_event) < events.index(('start', None))
 
 
 def test_postgres_all_mode_without_consolidation_still_owns_mixed_queue(
@@ -506,7 +540,7 @@ def test_postgres_all_mode_without_consolidation_still_owns_mixed_queue(
     monkeypatch.setattr(runtime, '_start_metrics_background_loop',
                         lambda *args: None)
     monkeypatch.setattr(runtime, '_start_background_loop',
-                        lambda *args: background)
+                        lambda *args, **kwargs: background)
     monkeypatch.setattr(runtime.managed_job_utils, 'is_consolidation_mode',
                         lambda: False)
     monkeypatch.setattr(runtime.request_postgres, 'ControllerLeaderLease',
