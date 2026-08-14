@@ -226,7 +226,7 @@ describe('Services fetch wiring', () => {
     expect(screen.queryByText('Loading...')).not.toBeInTheDocument();
   });
 
-  it('buffers a direct-first replica summary until lifecycle identity lands', async () => {
+  it('paints direct persisted metadata before controller transport lands', async () => {
     const metadata = deferred();
     const liveSummary = deferred();
     const replicaSummary = deferred();
@@ -239,10 +239,16 @@ describe('Services fetch wiring', () => {
     await act(async () => {
       replicaSummary.resolve({
         available: true,
+        serviceMetadataIncluded: true,
         summaries: [
           {
             name: 'boltz-l4-fleet',
-            serviceHash: 'old-hash',
+            serviceHash: 'hash-a',
+            persistedMetadataLoaded: true,
+            status: 'READY',
+            uptime: 1751600000,
+            policy: 'autoscaling(min=1,max=4)',
+            requestedResources: '1x[L4:1]',
             replicasReady: 9,
             replicasTotal: 9,
             pastAttemptCount: 99,
@@ -252,15 +258,18 @@ describe('Services fetch wiring', () => {
       await replicaSummary.promise;
     });
 
-    expect(screen.queryByText('boltz-l4-fleet')).not.toBeInTheDocument();
-    expect(screen.queryByText('UNKNOWN')).not.toBeInTheDocument();
+    expect(screen.getByText('boltz-l4-fleet')).toBeInTheDocument();
+    expect(screen.getByText('Serving')).toBeInTheDocument();
+    expect(screen.getByText('9/9')).toBeInTheDocument();
+    expect(screen.getByText('99 past attempts')).toBeInTheDocument();
+    expect(screen.getAllByText('Loading...')).toHaveLength(1);
 
     await act(async () => {
       metadata.resolve({
         services: [
           {
             ...SERVICES_RESPONSE.services[0],
-            serviceHash: 'new-hash',
+            serviceHash: 'hash-a',
             metadataOnly: true,
             replicasReady: null,
             replicasTotal: null,
@@ -271,15 +280,15 @@ describe('Services fetch wiring', () => {
     });
 
     expect(screen.getByText('boltz-l4-fleet')).toBeInTheDocument();
-    expect(screen.queryByText('9/9')).not.toBeInTheDocument();
-    expect(screen.queryByText('99 past attempts')).not.toBeInTheDocument();
+    expect(screen.getByText('9/9')).toBeInTheDocument();
+    expect(screen.getByText('99 past attempts')).toBeInTheDocument();
 
     await act(async () => {
       liveSummary.resolve({
         services: [
           {
             ...SERVICES_RESPONSE.services[0],
-            serviceHash: 'new-hash',
+            serviceHash: 'hash-a',
             summaryOnly: true,
           },
         ],

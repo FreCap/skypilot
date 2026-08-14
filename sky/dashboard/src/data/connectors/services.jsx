@@ -870,9 +870,23 @@ export function normalizeServiceReplicaSummary(summary) {
     totalReplicaCounts(replicaCapacityCounts) - logicalReplicasFailed;
   const currentOrUncertainCount = Number(summary.current_or_uncertain_count);
   const pastAttemptCount = Number(summary.past_attempt_count);
+  const persistedMetadataLoaded =
+    typeof summary.service_status === 'string' &&
+    summary.service_status.length > 0;
   return {
     name,
     serviceHash,
+    persistedMetadataLoaded,
+    status: persistedMetadataLoaded ? summary.service_status : undefined,
+    uptime: persistedMetadataLoaded
+      ? finiteOrNull(summary.service_uptime)
+      : undefined,
+    policy: persistedMetadataLoaded
+      ? summary.service_policy || null
+      : undefined,
+    requestedResources: persistedMetadataLoaded
+      ? summary.requested_resources_str || null
+      : undefined,
     replicaUnit: usesLogicalReplicas ? 'logical' : 'physical',
     replicaStatusCounts: { ...replicaStatusCounts },
     replicaCapacityCounts: { ...replicaCapacityCounts },
@@ -944,6 +958,7 @@ export async function getServiceReplicaSummaries({ serviceNames = null } = {}) {
     throw new Error('Service replica summary response was malformed');
   }
   const available = payload.available !== false;
+  const serviceMetadataIncluded = payload.service_metadata_included === true;
   const observedAt = finiteOrNull(payload.observed_at);
   const summaries = (
     Array.isArray(payload.summaries)
@@ -959,6 +974,7 @@ export async function getServiceReplicaSummaries({ serviceNames = null } = {}) {
     available,
     reason: payload.reason || null,
     legacyFallback: !available && payload.reason === 'non_consolidated',
+    serviceMetadataIncluded,
     observedAt,
     summaries,
   };

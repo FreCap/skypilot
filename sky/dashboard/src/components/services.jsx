@@ -259,10 +259,11 @@ function mergeReplicaSummaryRows(baseRows, summaries) {
   const merged = new Map((baseRows || []).map((row) => [row.name, row]));
   (summaries || []).forEach((summary) => {
     const previous = merged.get(summary.name);
-    // A replica-only projection has no lifecycle status. Buffer it until an
-    // identity-bearing metadata/controller row exists so the UI never invents
-    // an UNKNOWN service state during an arrival-order race.
-    if (!previous) return;
+    // New servers attach persisted lifecycle metadata to this direct
+    // PostgreSQL projection, so it can own first paint without waiting for
+    // controller transport. Older servers remain replica-only and are still
+    // buffered until an identity-bearing controller row exists.
+    if (!previous && !summary.persistedMetadataLoaded) return;
     if (
       previous?.serviceHash &&
       summary.serviceHash &&
@@ -536,6 +537,16 @@ export function ServicesTable({
           setData((previous) =>
             mergeReplicaSummaryRows(previous, response.summaries || [])
           );
+          if (response.available && response.serviceMetadataIncluded) {
+            // The direct snapshot is the first useful paint. Controller-backed
+            // endpoints and live autoscaler fields continue loading behind
+            // their per-cell placeholders.
+            setLoading(false);
+            setIsInitialLoad(false);
+            if (onFetched) {
+              onFetched(new Date());
+            }
+          }
         });
 
       const [metadataResult, summaryResult, replicaSummaryResult] =
