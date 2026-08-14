@@ -4067,8 +4067,10 @@ for _image_command in (
         image_profile_qualify,
         image_profile_canary,
 ):
-    if _image_command.callback is not None:
-        _image_command.callback.__module__ = __name__
+    _image_callback = _image_command.callback
+    while _image_callback is not None:
+        _image_callback.__module__ = __name__
+        _image_callback = getattr(_image_callback, '__wrapped__', None)
 cli.add_command(image)
 
 
