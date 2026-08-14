@@ -183,8 +183,13 @@ those operator-owned keys in the canonical durable annotation
 keys and emits strategic-merge `null` only for retired keys in that ledger;
 unrelated annotations injected by AWS Load Balancer Controller, ExternalDNS,
 or another provider/controller remain untouched. A malformed ledger fails
-closed. A missing ledger is accepted only as a transition bootstrap for a
-Service created before A and is interpreted as owning zero existing keys.
+closed. During A's bounded PR 14-to-C transition, a missing ledger is accepted
+as a bootstrap and is interpreted as owning zero existing keys. A cannot prove
+from a markerless Kubernetes object whether it predates A or lost its ledger
+after A, so it deliberately preserves every unmarked key in either case. A
+post-A missing ledger is therefore observable drift that fails the PR 14/C
+receipt gates even though A can still repair the marker without deleting an
+unknown provider-owned key.
 
 PR 14 must reconcile and read back every live generated inference Service with
 a canonical ledger. That receipt is cleanup C's exact removal gate: Serve047
@@ -1753,7 +1758,8 @@ published, or deployed, and reserved fill is not activated. The validation and
 three-round review records below describe earlier exact Serve046 revisions and
 remain historical evidence only. They do not satisfy A's independent merge
 review or the three final reviews of the frozen integrated A/B/C/platform
-stack. Remote CI on each published exact successor must pass before merge.
+stack. Remote CI on each exact successor must pass before that successor
+merges; its immutable publication receipt is captured only after merge.
 
 ### Runtime audit corrections implemented and frozen for review
 
@@ -2003,29 +2009,39 @@ Before changing the gate:
    PR 18 then adopts and hardens the Rainier runtime and Como chart
    registries/roles in separate account applies and readbacks. PR 18 creates no
    Helm revision and does not deploy A or change topology.
-7. Only after both PR 18 account readbacks, merge cleanup C. C physically
-   removes the normalizer, v17 live decoder, pickle column, and source
-   topology/transition controls, while requiring B's superseded publisher paths
-   to remain absent. The canonical roles publish one immutable C image/chart
-   tuple and receipt.
-8. Amend platform PR 19 with that exact C tuple and publication receipt. PR 19
-   upgrades the already-split release in place, enables the typed worker-cache
-   contract, and physically removes platform publisher/storage/topology
-   transition paths. It must not create or replace the split topology.
-9. Prove every active reserved-fill service version has exact protocol-v2
+7. Deploy and attest the separately owned Kueue inference contract and the
+   unique policy-bearing A image, converge the full split-role fleet on that
+   image, and repeat the pre-activation proof. The generic A image cannot
+   authorize activation.
+8. Perform A's initial generation-fenced activation and non-compute manual
+   verification. Keep A deployed until every cleanup-C runtime/removal horizon
+   below passes, including `SEQUENCED_ACTIVE`, one controller restart, and one
+   ordinary service update on the sequenced path.
+9. Only after both PR 18 account readbacks and all cleanup-C runtime gates pass,
+   merge cleanup C. C physically removes the normalizer, v17 live decoder,
+   pickle column, and source topology/transition controls, while requiring B's
+   superseded publisher paths to remain absent. The canonical roles publish one
+   immutable C image/chart tuple and receipt.
+10. Amend platform PR 19 with that exact C tuple and publication receipt. PR 19
+    upgrades the already-split release in place, enables the typed worker-cache
+    contract, and physically removes platform publisher/storage/topology
+    transition paths. It must not create or replace the split topology. Invoke
+    the same generation-fenced command to reauthorize the C fleet; no rollback
+    or second activation path exists.
+11. Prove every active reserved-fill service version has exact protocol-v2
    worker projections and every queued PENDING/PROVISIONING fill row is exact
    v18 bound to its locked service version, projection digest, and successor
    policy tuple. Drain any stale or undecodable row; no legacy fallback is
    permitted.
-10. Prove the deployment-owned Kueue LocalQueue, ClusterQueue namespace
+12. Prove the deployment-owned Kueue LocalQueue, ClusterQueue namespace
    selection, shared preemption domain, workload priorities, strict SkyPilot
    configuration, RBAC, and fail-closed admission contract for every reserved
    inference context. Pod priority alone does not pass this gate. Launch no GPU
    or BCL verification workload for this rollout.
-11. Prove every split-role Pod runs the one immutable C image and the unique
+13. Prove every split-role Pod runs the one immutable C image and the unique
     Boltz policy entry point resolves from its separately packaged wheel before
-    first authorization. Later defects replace the complete fleet with a new
-    immutable tuple and use the same generation-fenced command; no rollback or
+    C reauthorization. Later defects replace the complete fleet with a new
+    immutable tuple and use that same generation-fenced command; no rollback or
     second policy/image path exists.
 
 The live Helm release is the deployment authority. A platform repository pin,
@@ -2760,12 +2776,6 @@ legacy activation.
 - Merge B only after that receipt. Prove B's expected no-publish run, then
   apply and read back PR 18's separate canonical registry/role adoptions; PR 18
   must create no Helm revision.
-- Complete C after the PR 18 readbacks, merge it, and archive its canonical
-  immutable image/chart publication receipt. Amend PR 19 with that exact tuple,
-  freeze every final A/B/C/platform head, then pass three consecutive pragmatic
-  adversarial rounds; any material change resets the sequence.
-- Pass every final absence gate, then apply PR 19 to upgrade the already-split
-  release in place and delete all remaining transition paths.
 - Record the pre-activation writer/image/schema proof.
 - Deploy and attest the separately owned Kueue inference queue/preemption
   contract for every reserved context; current east1 evidence does not pass.
@@ -2781,8 +2791,16 @@ legacy activation.
   Converge the full split-role fleet on that one digest and repeat the
   pre-activation proof; no generic assertion bypass or generic-only image path
   exists.
-- Perform initial activation and non-compute manual verification through the
-  one generation-fenced command; later fixes use the same surface.
+- Perform initial activation of A and non-compute manual verification through
+  the one generation-fenced command. Keep A live until every cleanup-C runtime
+  gate and removal horizon passes; later fixes use the same command.
+- Only then complete C, merge it, and archive its canonical immutable
+  image/chart publication receipt. Amend PR 19 with that exact tuple, freeze
+  every final A/B/C/platform head, then pass three consecutive pragmatic
+  adversarial rounds; any material change resets the sequence.
+- Pass every final absence gate, then apply PR 19 to upgrade the already-split
+  release in place, delete all remaining transition paths, and reauthorize C
+  through the same generation-fenced command.
 
 Until those gates are recorded, this document must not describe A, B, C, or
 platform PR 14/17/18/19 as merged, published, deployed, activated, or proven by

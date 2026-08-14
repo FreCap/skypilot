@@ -2856,6 +2856,26 @@ def test_operator_annotation_patch_bootstraps_markerless_service_safely():
     }
 
 
+def test_operator_annotation_patch_marker_loss_preserves_unknown_keys():
+    """A's bounded bootstrap never guesses ownership after marker loss."""
+    marker = lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER
+    retired_or_provider_key = 'example.com/retired-or-provider-owned'
+    existing = {retired_or_provider_key: 'must-not-guess'}
+    desired = {
+        marker: '["example.com/current"]',
+        'example.com/current': 'configured',
+    }
+
+    patch = lb_k8s._operator_service_annotations_patch(existing, desired)
+
+    assert patch == {
+        marker: '["example.com/current"]',
+        'example.com/current': 'configured',
+    }
+    assert retired_or_provider_key not in patch
+    assert {**existing, **patch}[retired_or_provider_key] == 'must-not-guess'
+
+
 @pytest.mark.parametrize('raw,match', [
     ('not-json', 'malformed'),
     ('{}', 'JSON string array'),
