@@ -1132,6 +1132,19 @@ class SkyServeLoadBalancer:
                          queue_capacity_units * config['size_per_replica'])
         return dispatch_limit, min(config['max_size'], queue_size)
 
+    def _request_queue_submission_limit(self) -> int:
+        """Return the capacity-insensitive controller HTTP concurrency.
+
+        Backend dispatch remains limited by currently usable capacity.  Queue
+        submission cannot be: a cold scale-to-zero service needs to accept its
+        configured backlog before the first backend exists.  Active requests
+        are outside the waiting-depth count, so the useful upper bound includes
+        both the maximum waiting backlog and maximum active dispatches.
+        """
+        config = self._request_queue_config
+        assert config is not None
+        return config['max_size'] + config['max_concurrency']
+
     @staticmethod
     def _request_queue_timeout(config: dict[str, Any], priority: int) -> float:
         timeout = float(config['timeout_seconds'])
@@ -2820,10 +2833,29 @@ class SkyServeLoadBalancer:
                     self._occupancy_unassigned_reservations)
         request_queue_capacity: int | None = None
         request_queue_dispatch_limit: int | None = None
+        request_queue_submission_limit: int | None = None
+        request_queue_min_size: int | None = None
+        request_queue_size_per_replica: int | None = None
+        request_queue_max_size: int | None = None
+        request_queue_max_concurrency: int | None = None
+        request_queue_max_request_body_bytes: int | None = None
+        request_queue_timeout_seconds: float | None = None
         request_queue_uses_async_occupancy: bool | None = None
         if self._request_queue_config is not None:
             (request_queue_dispatch_limit,
              request_queue_capacity) = self._request_queue_limits()
+            request_queue_submission_limit = (
+                self._request_queue_submission_limit())
+            request_queue_min_size = self._request_queue_config['min_size']
+            request_queue_size_per_replica = self._request_queue_config[
+                'size_per_replica']
+            request_queue_max_size = self._request_queue_config['max_size']
+            request_queue_max_concurrency = self._request_queue_config[
+                'max_concurrency']
+            request_queue_max_request_body_bytes = self._request_queue_config[
+                'max_request_body_bytes']
+            request_queue_timeout_seconds = self._request_queue_config[
+                'timeout_seconds']
             request_queue_uses_async_occupancy = self._request_queue_config.get(
                 'use_async_occupancy', False)
         # Envelope in-flight plus occupancy per url and including
@@ -2901,6 +2933,7 @@ class SkyServeLoadBalancer:
             max_replicas = 0
             request_queue_capacity = 0
             request_queue_dispatch_limit = 0
+            request_queue_submission_limit = 0
         slot = self._lb_slot
         return fastapi.responses.JSONResponse({
             'lb_role': role.value,
@@ -2945,6 +2978,13 @@ class SkyServeLoadBalancer:
             'waiting_request_body_bytes': self._waiting_request_body_bytes,
             'request_queue_capacity': request_queue_capacity,
             'request_queue_dispatch_limit': request_queue_dispatch_limit,
+            'request_queue_submission_limit': request_queue_submission_limit,
+            'request_queue_min_size': request_queue_min_size,
+            'request_queue_size_per_replica': request_queue_size_per_replica,
+            'request_queue_max_size': request_queue_max_size,
+            'request_queue_max_concurrency': request_queue_max_concurrency,
+            'request_queue_max_request_body_bytes': request_queue_max_request_body_bytes,
+            'request_queue_timeout_seconds': request_queue_timeout_seconds,
             'request_queue_uses_async_occupancy': request_queue_uses_async_occupancy,
             'rejected_in_window': self._rejected_in_window(),
             'rejected_in_recent_window': self._rejected_in_recent_window(),

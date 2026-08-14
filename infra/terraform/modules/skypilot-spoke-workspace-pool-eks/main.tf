@@ -39,8 +39,8 @@ locals {
   reclaim_audit_identity                = local.reclaim_audit_enabled ? "skypilot-rf-${substr(sha256("${var.eks_cluster_name}:${var.reserved_fill_reclaim_audit.partition_namespace}"), 0, 12)}-audit" : null
   reclaim_audit_partition_namespace     = try(local.reclaim_audit_partition.namespace, "invalid")
   reclaim_audit_service_account         = try(local.reclaim_audit_partition.pod_identity_service_account, "invalid")
-  reclaim_audit_local_queue             = try(local.reclaim_audit_partition.kueue.local_queue_name, "invalid")
-  reclaim_audit_inference_cluster_queue = try(local.reclaim_audit_partition.kueue.cluster_queue_name, "invalid")
+  reclaim_audit_local_queue             = local.reclaim_audit_enabled ? var.reserved_fill_reclaim_audit.local_queue_name : "invalid"
+  reclaim_audit_inference_cluster_queue = local.reclaim_audit_enabled ? var.reserved_fill_reclaim_audit.inference_cluster_queue_name : "invalid"
   reclaim_audit_cluster_queues = local.reclaim_audit_enabled ? setunion(
     var.reserved_fill_reclaim_audit.external_cluster_queue_names,
     toset([local.reclaim_audit_inference_cluster_queue]),

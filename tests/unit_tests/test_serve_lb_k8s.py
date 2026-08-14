@@ -21,6 +21,12 @@ _DEPLOYMENT_PATCH_PATH = (
 _SERVICE_PATCH_PATH = '/api/v1/namespaces/{namespace}/services/{name}'
 
 
+@pytest.fixture(autouse=True)
+def _external_lb_service_annotations_contract(monkeypatch):
+    """Model the chart's required projection for every external-LB test."""
+    monkeypatch.setenv(constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR, '{}')
+
+
 class _ApiException(Exception):
 
     def __init__(self, status):
@@ -194,7 +200,9 @@ def _install(monkeypatch,
         read_service.return_value = SimpleNamespace(
             metadata=SimpleNamespace(
                 resource_version='lb-service-rv',
-                annotations={},
+                annotations={
+                    lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '[]',
+                },
                 labels={
                     lb_k8s.SERVE_LB_LABEL_KEY: 'svc',
                     lb_k8s.SERVICE_HASH_LABEL_KEY: 'incarnation',
@@ -419,6 +427,14 @@ def test_external_runtime_requires_projected_files(monkeypatch):
     _install(monkeypatch)
     monkeypatch.delenv(constants.LB_SYNC_AUTH_TOKENS_FILE_ENV_VAR)
     with pytest.raises(RuntimeError, match='projected Secret'):
+        lb_k8s.require_external_lb_runtime()
+
+
+def test_external_runtime_requires_service_annotation_projection(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.delenv(constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR)
+    with pytest.raises(RuntimeError,
+                       match=constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR):
         lb_k8s.require_external_lb_runtime()
 
 
@@ -661,12 +677,19 @@ def test_supervision_service_reconcile_rejects_stale_cutover_snapshot():
     reconcile.assert_not_called()
 
 
-def test_transition_reconcile_patches_only_desired_revision(monkeypatch):
+def test_transition_reconcile_bootstraps_marker_without_provider_deletion(
+        monkeypatch):
+    monkeypatch.setenv(constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR,
+                       '{"example.com/listener":"4000"}')
     core = mock.MagicMock()
     patch_api = mock.MagicMock()
     core.create_namespaced_service.side_effect = _ApiException(409)
-    core.read_namespaced_service.return_value = _owned_object(
-        'incarnation', rv='11', object_name=lb_k8s.lb_service_name('svc'))
+    existing = _owned_object('incarnation',
+                             rv='11',
+                             object_name=lb_k8s.lb_service_name('svc'))
+    provider_key = 'provider.example.com/controller-state'
+    existing.metadata.annotations = {provider_key: 'provider-owned'}
+    core.read_namespaced_service.return_value = existing
     _install(monkeypatch, core_api=core, patch_api=patch_api)
     owner = {
         'apiVersion': 'apps/v1',
@@ -696,10 +719,18 @@ def test_transition_reconcile_patches_only_desired_revision(monkeypatch):
         'metadata': {
             'resourceVersion': '11',
             'annotations': {
+                lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '["example.com/listener"]',
+                'example.com/listener': '4000',
                 lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY: desired_revision,
             },
         },
     }
+    assert provider_key not in body['metadata']['annotations']
+    assert None not in body['metadata']['annotations'].values()
+    assert {
+        **existing.metadata.annotations,
+        **body['metadata']['annotations'],
+    }[provider_key] == 'provider-owned'
 
 
 def test_owned_pdb_spec_drift_fails_closed_without_patch(monkeypatch):
@@ -780,7 +811,9 @@ def test_create_builds_provider_default_load_balancer_and_waits(monkeypatch):
     lb_k8s.create_lb_deployment_and_service('svc', 225, 'incarnation')
 
     _, service = core.create_namespaced_service.call_args.args
-    assert 'annotations' not in service['metadata']
+    assert service['metadata']['annotations'] == {
+        lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '[]',
+    }
     assert service['spec']['type'] == 'LoadBalancer'
     assert 'loadBalancerSourceRanges' not in service['spec']
     core.read_namespaced_service.assert_called_once_with(
@@ -1495,6 +1528,9 @@ def test_ensure_reports_existing_crashloop_as_unhealthy(monkeypatch):
                                unavailable_replicas=1))
     _, core = _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
     core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(annotations={
+            lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '[]',
+        }),
         spec=SimpleNamespace(
             type='LoadBalancer',
             selector={
@@ -1530,6 +1566,9 @@ def test_ensure_requires_published_provider_endpoint(monkeypatch, ingress,
                                unavailable_replicas=0))
     _, core = _install(monkeypatch, apps_api=apps, db_service_names=('svc',))
     core.read_namespaced_service.return_value = SimpleNamespace(
+        metadata=SimpleNamespace(annotations={
+            lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '[]',
+        }),
         spec=SimpleNamespace(
             type='LoadBalancer',
             selector={
@@ -2707,12 +2746,153 @@ def test_service_dict_unchanged_without_https_config(monkeypatch):
     _https_env(monkeypatch, cert=None, suffix=None)
     service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
                                          'deploy')
-    assert 'annotations' not in service['metadata']
+    assert service['metadata']['annotations'] == {
+        lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '[]',
+    }
     assert service['spec']['ports'] == [{
         'port': constants.LOAD_BALANCER_PORT_START,
         'targetPort': constants.LOAD_BALANCER_PORT_START,
         'protocol': 'TCP',
     }]
+
+
+def test_service_dict_merges_exact_operator_annotations(monkeypatch):
+    annotation_env = constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR
+    monkeypatch.setenv(
+        annotation_env,
+        '{"example.com/z-listener":"4000","example.com/a-listener":"on"}')
+    _https_env(monkeypatch, cert=None, suffix=None)
+
+    service = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+
+    assert service['metadata']['annotations'] == {
+        'example.com/a-listener': 'on',
+        'example.com/z-listener': '4000',
+        lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: '["example.com/a-listener","example.com/z-listener"]',
+    }
+
+
+@pytest.mark.parametrize('raw,match', [
+    ('[]', 'JSON object'),
+    ('{"example.com/key":1}', 'must be a string'),
+    ('{"example.com/key":"a","example.com/key":"b"}', 'duplicate key'),
+    ('{"UPPER.example.com/key":"value"}', 'invalid DNS prefix'),
+    ('{"example.com/-key":"value"}', 'invalid name segment'),
+])
+def test_operator_service_annotations_reject_malformed_input(
+        monkeypatch, raw, match):
+    monkeypatch.setenv(constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR, raw)
+    with pytest.raises(RuntimeError, match=match):
+        lb_k8s._operator_service_annotations()
+
+
+@pytest.mark.parametrize('key', [
+    lb_k8s.ACTIVE_SLOT_ANNOTATION_KEY,
+    lb_k8s.CUTOVER_GENERATION_ANNOTATION_KEY,
+    lb_k8s.DESIRED_RUNTIME_REVISION_ANNOTATION_KEY,
+    lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER,
+    lb_k8s._AWS_LB_SSL_CERT_ANNOTATION,
+    lb_k8s._AWS_LB_SSL_PORTS_ANNOTATION,
+    lb_k8s._AWS_LB_SSL_POLICY_ANNOTATION,
+    lb_k8s._EXTERNAL_DNS_HOSTNAME_ANNOTATION,
+    constants.AWS_LB_BACKEND_PROTOCOL_ANNOTATION,
+    'skypilot.co/future-source-owned-key',
+])
+def test_operator_service_annotations_reject_skypilot_owned_key(
+        monkeypatch, key):
+    monkeypatch.setenv(constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR,
+                       f'{{"{key}":"operator-value"}}')
+    with pytest.raises(RuntimeError, match='SkyPilot-managed'):
+        lb_k8s._operator_service_annotations()
+
+
+def test_operator_annotation_patch_deletes_only_retired_owned_keys():
+    marker = lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER
+    existing = {
+        marker: '["example.com/keep","example.com/retire"]',
+        'example.com/keep': 'old',
+        'example.com/retire': 'old',
+        'provider.example.com/controller-state': 'untouched',
+    }
+    desired = {
+        marker: '["example.com/add","example.com/keep"]',
+        'example.com/add': 'new',
+        'example.com/keep': 'updated',
+    }
+
+    assert lb_k8s._operator_service_annotations_patch(existing, desired) == {
+        marker: '["example.com/add","example.com/keep"]',
+        'example.com/add': 'new',
+        'example.com/keep': 'updated',
+        'example.com/retire': None,
+    }
+
+
+def test_operator_annotation_patch_bootstraps_markerless_service_safely():
+    marker = lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER
+    provider_key = 'provider.example.com/controller-state'
+    existing = {provider_key: 'provider-owned'}
+    desired = {
+        marker: '["example.com/listener"]',
+        'example.com/listener': 'configured',
+    }
+
+    patch = lb_k8s._operator_service_annotations_patch(existing, desired)
+
+    assert patch == {
+        marker: '["example.com/listener"]',
+        'example.com/listener': 'configured',
+    }
+    assert provider_key not in patch
+    assert None not in patch.values()
+    # A strategic metadata.annotations merge preserves keys absent from the
+    # patch; model that exact PR 14 bootstrap readback explicitly.
+    merged = {**existing, **patch}
+    assert merged == {
+        provider_key: 'provider-owned',
+        marker: '["example.com/listener"]',
+        'example.com/listener': 'configured',
+    }
+
+
+@pytest.mark.parametrize('raw,match', [
+    ('not-json', 'malformed'),
+    ('{}', 'JSON string array'),
+    ('["example.com/key",1]', 'JSON string array'),
+    ('["example.com/key","example.com/key"]', 'sorted unique'),
+    ('["example.com/z","example.com/a"]', 'sorted unique'),
+    ('[ "example.com/key" ]', 'canonical JSON'),
+    ('["skypilot.co/serve-lb-active-slot"]', 'reserved key'),
+    ('["skypilot.co/future-source-owned-key"]', 'reserved key'),
+])
+def test_operator_annotation_marker_fails_closed(raw, match):
+    with pytest.raises(RuntimeError, match=match):
+        lb_k8s._parse_operator_annotation_keys(
+            {lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER: raw}, require_marker=False)
+
+
+def test_routing_checks_operator_ownership_but_tolerates_provider_annotations(
+        monkeypatch):
+    monkeypatch.setenv(constants.EXTERNAL_LB_SERVICE_ANNOTATIONS_ENV_VAR,
+                       '{"example.com/operator":"configured"}')
+    _https_env(monkeypatch, cert=None, suffix=None)
+    desired = lb_k8s._build_service_dict('svc', lb_k8s.lb_service_name('svc'),
+                                         'deploy')
+    live = {
+        'metadata': {
+            'annotations': {
+                **desired['metadata']['annotations'],
+                'provider.example.com/controller-state': 'preserved',
+            },
+        },
+        'spec': desired['spec'],
+    }
+    assert lb_k8s._service_has_desired_routing(live, desired)
+
+    live['metadata']['annotations'][
+        lb_k8s.OPERATOR_ANNOTATION_KEYS_MARKER] = '[]'
+    assert not lb_k8s._service_has_desired_routing(live, desired)
 
 
 def test_service_dict_adds_tls_listener_and_hostname(monkeypatch):

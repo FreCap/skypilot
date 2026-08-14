@@ -180,6 +180,38 @@ ResourceFlavor, preemption, or topology policy and has no TAS-specific branch.
 Omitting `kueue` performs no Kueue API read and creates no queue, admission rule,
 or additional RBAC.
 
+The optional `reserved_fill_reclaim_audit` identity is a separate read-only
+attestation boundary. Its required `local_queue_name` and
+`inference_cluster_queue_name` fields are the canonical audit targets; the
+module never derives them from `partition.kueue`. This allows IAM, EKS access,
+and exact-name RBAC to be staged while the selected partition still has
+`kueue = null`:
+
+```hcl
+reserved_fill_reclaim_audit = {
+  partition_namespace          = "skypilot-inference"
+  local_queue_name             = "default"
+  inference_cluster_queue_name = "inference-borrower"
+
+  # The remaining source identity and exact object inventories are required;
+  # see the generated input reference below for their complete shape.
+  source_identity = {
+    eks_cluster_arn = "arn:aws:eks:us-east-1:123456789012:cluster/control-plane"
+    namespace       = "skypilot"
+    service_account = "skypilot-api-sa"
+  }
+  # ...exact external ClusterQueue, priority, flavor, controller, admission,
+  # and webhook names...
+}
+```
+
+When `partition.kueue` is later enabled, plan fails unless its
+`local_queue_name` equals the audit `local_queue_name` and its
+`cluster_queue_name` equals `inference_cluster_queue_name`. There is no legacy
+alias, derived default, or precedence rule between these two ownership
+contracts. Update an audit target only as an explicit attestation migration;
+do not use it to mask partition drift.
+
 The server-owned SkyPilot workspace must separately use the same
 `local_queue_name`; this module cannot safely wire a control-plane stack back to
 its spoke output without creating a dependency cycle. Use a SkyPilot release
@@ -230,10 +262,10 @@ unchanged.
 
 ## State and upgrades
 
-Namespace, group, priority-class name, LocalQueue and ClusterQueue names, claim
-name, role ARN, and the derived RBAC names are durable identity inputs. Changing
-one can replace or orphan infrastructure and should be handled as an explicit
-state and workload migration.
+Namespace, group, priority-class name, partition and audit LocalQueue and
+ClusterQueue names, claim name, role ARN, and the derived RBAC names are durable
+identity inputs. Changing one can replace or orphan infrastructure and should
+be handled as an explicit state and workload migration.
 
 The module preserves the resource labels, `module.rbac` label, `count` and
 `for_each` shapes, and namespace/claim identity keys from the original
@@ -248,7 +280,7 @@ replacement, deletion, namespace recreation, or PV recreation.
 ## Requirements
 
 | Name | Version |
-| ---- | ------- |
+|------|---------|
 | <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.5.0 |
 | <a name="requirement_aws"></a> [aws](#requirement\_aws) | >= 6.24.0 |
 | <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | >= 2.20 |
@@ -256,25 +288,30 @@ replacement, deletion, namespace recreation, or PV recreation.
 ## Providers
 
 | Name | Version |
-| ---- | ------- |
-| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.58.0 |
+|------|---------|
+| <a name="provider_aws"></a> [aws](#provider\_aws) | 6.60.0 |
 | <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | 3.2.1 |
 
 ## Modules
 
 | Name | Source | Version |
-| ---- | ------ | ------- |
+|------|--------|---------|
 | <a name="module_rbac"></a> [rbac](#module\_rbac) | ../skypilot-spoke-workspace-pool-rbac | n/a |
 
 ## Resources
 
 | Name | Type |
-| ---- | ---- |
+|------|------|
 | [aws_eks_access_entry.pool](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_access_entry) | resource |
+| [aws_eks_access_entry.reserved_fill_reclaim_audit](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_access_entry) | resource |
 | [aws_eks_pod_identity_association.pool_sa](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/eks_pod_identity_association) | resource |
+| [aws_iam_role.reserved_fill_reclaim_audit](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
+| [aws_iam_role_policy.reserved_fill_reclaim_audit](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
 | [aws_security_group_rule.cluster_api_from_control_plane](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group_rule) | resource |
 | [aws_security_group_rule.serve_control_plane_additional](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group_rule) | resource |
 | [aws_security_group_rule.serve_probe_from_control_plane](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/security_group_rule) | resource |
+| [kubernetes_cluster_role_binding_v1.reserved_fill_reclaim_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_binding_v1) | resource |
+| [kubernetes_cluster_role_v1.reserved_fill_reclaim_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_v1) | resource |
 | [kubernetes_manifest.partition_kueue_binding](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest) | resource |
 | [kubernetes_manifest.partition_kueue_policy](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest) | resource |
 | [kubernetes_manifest.partition_local_queue](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/manifest) | resource |
@@ -283,6 +320,13 @@ replacement, deletion, namespace recreation, or PV recreation.
 | [kubernetes_persistent_volume_claim_v1.fsx](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/persistent_volume_claim_v1) | resource |
 | [kubernetes_persistent_volume_v1.fsx](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/persistent_volume_v1) | resource |
 | [kubernetes_priority_class_v1.partition](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/priority_class_v1) | resource |
+| [kubernetes_role_binding_v1.reserved_fill_reclaim_kueue_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1) | resource |
+| [kubernetes_role_binding_v1.reserved_fill_reclaim_partition_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1) | resource |
+| [kubernetes_role_binding_v1.reserved_fill_reclaim_scheduler_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_binding_v1) | resource |
+| [kubernetes_role_v1.reserved_fill_reclaim_kueue_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1) | resource |
+| [kubernetes_role_v1.reserved_fill_reclaim_partition_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1) | resource |
+| [kubernetes_role_v1.reserved_fill_reclaim_scheduler_audit](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/role_v1) | resource |
+| [aws_caller_identity.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/caller_identity) | data source |
 | [aws_eks_cluster.target](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/eks_cluster) | data source |
 | [aws_partition.current](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/partition) | data source |
 | [kubernetes_resource.partition_cluster_queue](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/data-sources/resource) | data source |
@@ -290,24 +334,27 @@ replacement, deletion, namespace recreation, or PV recreation.
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-| ---- | ----------- | ---- | ------- | :------: |
+|------|-------------|------|---------|:--------:|
 | <a name="input_aws_profile"></a> [aws\_profile](#input\_aws\_profile) | Optional AWS CLI profile exposed through local.exec\_env for Terragrunt<br/>callers that generate an aws eks get-token Kubernetes provider in the<br/>downloaded module directory. Ordinary Terraform callers may leave this<br/>null and pass their own configured providers. | `string` | `null` | no |
 | <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | Region of the existing EKS cluster. | `string` | n/a | yes |
 | <a name="input_cluster_api_ingress_cidrs"></a> [cluster\_api\_ingress\_cidrs](#input\_cluster\_api\_ingress\_cidrs) | IPv4 CIDRs from which the SkyPilot control plane may reach the existing<br/>EKS cluster's private API endpoint. The module adds one TCP/443 rule to the<br/>EKS-managed cluster security group. The default creates no rule, and public<br/>/0 sources are rejected. | `list(string)` | `[]` | no |
 | <a name="input_controller_role_arn"></a> [controller\_role\_arn](#input\_controller\_role\_arn) | IAM role ARN used by the SkyPilot control plane. The module maps this<br/>principal to every partition's RBAC group through one EKS access entry.<br/>Cross-account roles are supported within the active AWS partition. | `string` | n/a | yes |
 | <a name="input_eks_cluster_name"></a> [eks\_cluster\_name](#input\_eks\_cluster\_name) | Name of the existing EKS cluster to register as a SkyPilot pool. | `string` | n/a | yes |
 | <a name="input_partitions"></a> [partitions](#input\_partitions) | Workload partitions to register. Each item creates namespaced RBAC and can<br/>optionally create a Pod Identity association, an exact-priority admission<br/>policy, a Kueue LocalQueue, and static FSx PV/PVC pairs.<br/><br/>A partition is a workload credential and storage partition, not an<br/>independent tenant boundary. The same controller principal receives every<br/>configured group. Pin each SkyPilot workspace to its intended namespace and<br/>audit pre-existing service-account associations and namespaced resources.<br/><br/>Durable identity keys are namespace, group, priority-class name, Kueue<br/>LocalQueue and ClusterQueue names, FSx claim name, and the derived RBAC<br/>resource names. Change them only with a reviewed Terraform state and<br/>workload migration.<br/><br/>Each Kueue ClusterQueue name must be one DNS-1123 label of at most 63<br/>characters. Strict SkyPilot admission requires Kueue's<br/>AssignQueueLabelsForPods feature to publish that name on admitted Pods;<br/>dotted DNS subdomains and other non-label names cannot be published. | <pre>list(object({<br/>    namespace                    = string<br/>    group                        = optional(string)<br/>    manage_namespace             = optional(bool, true)<br/>    pod_identity_role_arn        = optional(string, "")<br/>    pod_identity_service_account = optional(string, "skypilot-pool-sa")<br/><br/>    priority_class = optional(object({<br/>      value = number<br/>      name  = optional(string)<br/>    }))<br/><br/>    kueue = optional(object({<br/>      local_queue_name   = optional(string, "default")<br/>      cluster_queue_name = string<br/>    }))<br/><br/>    fsx_volumes = optional(list(object({<br/>      claim_name    = string<br/>      volume_handle = string<br/>      storage_class = string<br/>      capacity      = string<br/>      driver        = optional(string, "fsx.csi.aws.com")<br/>      mountname     = optional(string)<br/>    })), [])<br/>  }))</pre> | n/a | yes |
+| <a name="input_reserved_fill_reclaim_audit"></a> [reserved\_fill\_reclaim\_audit](#input\_reserved\_fill\_reclaim\_audit) | Optional least-privilege attestation boundary for a deployment-owned<br/>reserved-fill reclaim policy. When configured, the module creates one<br/>spoke-account IAM role trusted only by the control-plane role carrying the<br/>exact EKS Pod Identity source tags, maps that role through a separate EKS<br/>access entry, and binds it to read-only Kubernetes rules for the reviewed<br/>partition, Kueue topology, scheduler, provider-owned flavors, and Nodes.<br/><br/>partition\_namespace must name one configured partition with a priority<br/>contract. local\_queue\_name and inference\_cluster\_queue\_name are the<br/>explicit read-only audit targets, so this identity can be staged before<br/>that partition enables Kueue. Once partition.kueue is configured, its two<br/>queue names must exactly equal these audit targets. There is no derived or<br/>compatibility fallback between the contracts. The module still derives<br/>the Namespace, ServiceAccount, and Pod PriorityClass from the partition.<br/>External operator-owned ClusterQueues and other objects are listed<br/>explicitly and remain exact-name reads. The IAM<br/>role and Kubernetes group are deterministically unique to the target<br/>cluster and partition. The caller must separately grant AssumeRole and<br/>TagSession on the returned role ARN. Node inventory is necessarily a<br/>cluster-wide list because Kubernetes RBAC cannot restrict list by labels. | <pre>object({<br/>    partition_namespace          = string<br/>    local_queue_name             = string<br/>    inference_cluster_queue_name = string<br/><br/>    source_identity = object({<br/>      eks_cluster_arn = string<br/>      namespace       = string<br/>      service_account = string<br/>    })<br/><br/>    external_cluster_queue_names   = set(string)<br/>    workload_priority_class_names  = set(string)<br/>    resource_flavor_names          = set(string)<br/>    scheduler_namespace            = string<br/>    scheduler_deployment_name      = string<br/>    kueue_namespace                = string<br/>    kueue_deployment_name          = string<br/>    kueue_config_map_name          = string<br/>    admission_policy_names         = set(string)<br/>    admission_policy_binding_names = set(string)<br/>    validating_webhook_names       = set(string)<br/>    mutating_webhook_names         = set(string)<br/>  })</pre> | `null` | no |
 | <a name="input_serve_probe_ingress"></a> [serve\_probe\_ingress](#input\_serve\_probe\_ingress) | Optional ingress rules on a caller-owned node security group for the<br/>SkyServe control plane. The default creates no rule. The source CIDR<br/>cannot be 0.0.0.0/0 unless allow\_public\_cidr is explicitly true.<br/><br/>`port` is the replica serving port the prober and load balancer reach.<br/><br/>`additional_ports` covers the rest of the control plane's Pod-IP traffic.<br/>Provisioning a Kubernetes replica SSHes to its Pod IP, so a spoke whose<br/>security group grants only the serving port accepts the probe but can<br/>never finish a launch: the Pod runs, the container reports ready, and the<br/>replica stays PROVISIONING until it is culled. Measured on a spoke built<br/>from this module alone -- TCP/8080 answered while TCP/22 was dropped, and<br/>every replica stalled. The sibling spoke worked only because an unrelated<br/>legacy rule ("SSH access from admin subnets") happened to cover the same<br/>control-plane CIDR, so the dependency was never represented here.<br/><br/>`additional_port_descriptions` pins the AWS description of one additional<br/>port, keyed by port number as a string. Its only purpose is adopting a<br/>pre-existing rule: AWS treats (protocol, ports, CIDR) as the rule identity<br/>and rejects a duplicate, so a spoke that already carries the grant must<br/>import it rather than create it, and the import only plans clean if the<br/>description matches byte for byte. Leave it unset for new rules. | <pre>object({<br/>    node_security_group_id       = string<br/>    control_plane_cidr           = string<br/>    port                         = number<br/>    additional_ports             = optional(set(number), [])<br/>    additional_port_descriptions = optional(map(string), {})<br/>    description                  = optional(string, "SkyServe probe traffic from the control plane")<br/>    allow_public_cidr            = optional(bool, false)<br/>  })</pre> | `null` | no |
 | <a name="input_tags"></a> [tags](#input\_tags) | Tags to merge onto AWS resources. | `map(string)` | `{}` | no |
 
 ## Outputs
 
 | Name | Description |
-| ---- | ----------- |
+|------|-------------|
 | <a name="output_access_entry_id"></a> [access\_entry\_id](#output\_access\_entry\_id) | ID of the EKS access entry that maps the controller principal. |
 | <a name="output_fsx_claims"></a> [fsx\_claims](#output\_fsx\_claims) | Static FSx volume identity keys to namespaced PVC names. |
 | <a name="output_kueue_local_queues"></a> [kueue\_local\_queues](#output\_kueue\_local\_queues) | Active Kueue LocalQueues created for configured partitions. |
 | <a name="output_partition_service_accounts"></a> [partition\_service\_accounts](#output\_partition\_service\_accounts) | Partition namespace to workload service-account name mapping. |
 | <a name="output_partitions"></a> [partitions](#output\_partitions) | Partition namespace to RBAC group mapping. |
 | <a name="output_priority_classes"></a> [priority\_classes](#output\_priority\_classes) | Partition namespace to enforced PriorityClass name mapping. |
+| <a name="output_reserved_fill_reclaim_audit_caller_policy_statement"></a> [reserved\_fill\_reclaim\_audit\_caller\_policy\_statement](#output\_reserved\_fill\_reclaim\_audit\_caller\_policy\_statement) | Exact caller-side cross-account policy statement required for reclaim attestation, or null when disabled. |
+| <a name="output_reserved_fill_reclaim_audit_role_arn"></a> [reserved\_fill\_reclaim\_audit\_role\_arn](#output\_reserved\_fill\_reclaim\_audit\_role\_arn) | Exact spoke-account IAM role assumed for reserved-fill reclaim attestation, or null when disabled. |
 <!-- END_TF_DOCS -->

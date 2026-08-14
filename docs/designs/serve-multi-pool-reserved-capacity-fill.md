@@ -1,18 +1,23 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: Serve046 merged in source PR #1451 and is present in the sealed live
-1.1.1276 release at source commit
-`8e16585659a9f4361f55052d88199a1c4615e27a`. Its independently releasable
-ReplicaInfo v18 precursor A is implemented locally but is not merged,
-published, or deployed. Publisher B and final Serve047 cleanup C are pending.
-The prior review record is historical.
-Precursor A requires independent security/contract review and CI before merge;
-three consecutive pragmatic adversarial rounds are required later against the
-frozen final A/B/C and platform heads before final deployment/completion.
-Platform PRs 14, 17, 18, and 19 remain unapplied, reserved-fill activation has
-not occurred, and cleanup remains blocked on the documented live receipt gates.
+Status: Serve046 merged in source PR #1451. ReplicaInfo v18 and its one-shot
+normalizer then merged in PR #1483 at
+`df71f6cff011a74ddce2c23245629a6b83d306cf` (tree
+`e47880cf96d1df0611b8ae03be8148b8ed9f8e67`) and were published successfully
+as `v1.1.1277`. That published precursor is historical evidence only and is
+activation-ineligible: it predates the capacity, generated-Service annotation,
+and audit-target contracts in this design and the corresponding CI-isolation
+fix. Activation successor A is the single current source successor. It
+subsumes that v18-only precursor and adds all three pre-activation contracts;
+it is not yet merged, published, or deployed. Exact-only publisher B and final
+Serve047 cleanup C are pending. The prior review record is historical. A
+requires independent security/contract review and CI before merge; three
+consecutive pragmatic adversarial rounds are required later against the frozen
+final A/B/C and platform heads before final deployment/completion. Platform PRs
+14, 17, 18, and 19 remain unapplied, reserved-fill activation has not occurred,
+and cleanup remains blocked on the documented live receipt gates.
 
-Last updated: 2026-08-14 (precursor A secret-safe failure boundary)
+Last updated: 2026-08-14 (activation-successor pre-activation contracts)
 
 Canonical owner: this file
 
@@ -68,13 +73,16 @@ activation. The prior generation then fails closed.
 
 The cross-repository rollout has one ordered fix-forward stack:
 
-1. Platform PR 14 migrates the sealed live 1.1.1276 release from the one-pod
-   `all` topology to an exact 2/2/2 `api`/`controller`/`executor` cohort and
-   physically deletes `all`. It never deploys precursor A.
-2. Precursor A introduces v18 and the one-shot receipt at Serve schema 046 and
-   is the final release produced by the old publisher. Platform PR 17 consumes
-   that exact A tuple, rolls the already-split cohort in place, proves all six
-   writers and no old writer, runs normalization, and archives the receipt.
+1. Activation successor A is the final release produced by the old publisher.
+   It carries ReplicaInfo v18 and its one-shot normalizer together with the
+   authenticated queue-capacity, generic generated-Service annotation, and
+   audit-target contracts below. Platform PR 14 pins A's one immutable source,
+   image, chart, and module tuple, migrates the live one-pod `all` topology to
+   an exact 2/2/2 `api`/`controller`/`executor` cohort, physically deletes
+   `all`, and proves all six Ready writers run that tuple.
+2. Platform PR 17 invokes A's one-shot normalization against the unchanged PR
+   14 tuple and archives its receipt. It performs no image, chart, module,
+   values, topology, Pod, or Helm-revision change.
 3. Only after that receipt, independently releasable publisher B establishes
    the sole exact source image/chart publication contract and physically
    deletes superseded moving-tag, overlay, and parallel chart publication
@@ -90,18 +98,131 @@ The cross-repository rollout has one ordered fix-forward stack:
    enables typed storage, and physically removes the remaining platform and
    publisher transition paths.
 
-The exact operational split-old baseline is source/tag commit
-`8e16585659a9f4361f55052d88199a1c4615e27a`, Git tag `v1.1.1276`, API 77,
-runtime image
-`255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.1276@sha256:a832ad33d373a29f869528e5b54062cafc351320047360ee5a3147191b76f57c`,
-and chart version `1.1.1276` at
-`oci://699626303757.dkr.ecr.us-east-1.amazonaws.com/helm-charts/skypilot` with
-digest
-`sha256:0ae11215d6573334b49adfe83209c081c5a063559d69e0332d4a992894f9e8ad`.
-PR 14 must bind fresh live Helm values and an exact render to that tuple before
-it is applicable. Revision-389 release 1.1.1273 at source commit
+The last successfully published precursor is source/tag commit
+`df71f6cff011a74ddce2c23245629a6b83d306cf`, Git tag `v1.1.1277`, source tree
+`e47880cf96d1df0611b8ae03be8148b8ed9f8e67`, runtime image
+`255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.1277@sha256:a84ec11d8838b5367c4669bd5c4792ef96b735a8503ba2f2de6bf054459e3470`,
+and chart
+`oci://699626303757.dkr.ecr.us-east-1.amazonaws.com/helm-charts/skypilot:1.1.1277@sha256:4efdeb85a46dbcfcea1269d9a75f15891a83161741381e12fcb8b70a74329561`.
+Its chart tree is `e8828c247` and module tree is `39e3108c65`. Publication
+succeeded, but this tuple is not a PR 14 candidate and must not be activated:
+it lacks A's three pre-activation contracts and did not include the CI-isolation
+fix. PR 14 must bind fresh live Helm values and an exact render to A's later
+immutable publication receipt. Revision-389 release 1.1.1273 at source commit
 `c24ae4fe08a03101180c8401a34a1b241444116b` is historical audit evidence only,
 never an operational checkpoint, split target, intermediate apply, or fallback.
+
+## Activation successor A pre-activation contracts
+
+A is one artifact, not a second v18 precursor. It inherits the already-merged
+v18 writer and normalizer and adds the contracts that PR 14 needs before it can
+both split and roll the fleet. These contracts are deliberately independent of
+reserved-fill activation: they can be rendered, started, and read back while
+the generation gate remains closed.
+
+### Authenticated request-queue capacity
+
+The authenticated `/_lb/capacity` response is the canonical admission contract
+for the platform client. When `load_balancer.request_queue` is configured it
+always includes:
+
+| Field | Contract |
+|---|---|
+| `request_queue_capacity` | Dynamic waiting capacity derived from the current ready/logical fleet, bounded by configured minimum and maximum. |
+| `request_queue_dispatch_limit` | Dynamic backend dispatch concurrency; zero while no usable backend capacity exists. |
+| `request_queue_submission_limit` | Capacity-insensitive controller HTTP concurrency, exactly `max_size + max_concurrency`. This lets a cold service accept its configured backlog before its first worker is Ready. |
+| `request_queue_min_size` | Immutable configured minimum waiting capacity. |
+| `request_queue_size_per_replica` | Immutable configured waiting capacity per ready/logical replica unit. |
+| `request_queue_max_size` | Immutable configured waiting-capacity ceiling. |
+| `request_queue_max_concurrency` | Immutable configured active-dispatch ceiling. |
+| `request_queue_max_request_body_bytes` | Immutable configured per-request body ceiling. |
+| `request_queue_timeout_seconds` | Immutable configured queue-wait timeout. |
+| `request_queue_uses_async_occupancy` | Immutable configured occupancy mode. |
+
+The three admission fields are zero on a non-armed/non-active LB slot; the
+immutable echoes remain present so a reader can diagnose role mismatch without
+mistaking it for a different service contract. All queue fields are `null` only
+when the queue is disabled. Presence and exact JSON types form the compatibility
+boundary; this localized response extension does not add another schema/version
+switch or alternate endpoint.
+
+The PR 14 cold-start contract is exactly `min_size: 200`,
+`size_per_replica: 10`, `max_size: 2000`, `max_concurrency: 128`,
+`max_request_body_bytes: 1048576`, `timeout_seconds: 3600`, and
+`use_async_occupancy: true`. Before any worker is Ready, the response therefore
+reports queue capacity `200`, dispatch limit `0`, and submission limit `2128`.
+
+Timeout ownership is intentionally layered rather than duplicated:
+
+| Owner | Setting | Seconds | Invariant |
+|---|---|---:|---|
+| Platform node-local model/router render | `--request-timeout-seconds` | 315 | Returns before SkyServe's upstream stream deadline. |
+| SkyPilot source/service spec | SkyServe LB `stream_timeout_seconds` | 330 | Covers the 315-second model/router request with margin. |
+| Platform outbound SkyServe client config | request timeout | 3960 | Covers the 3600-second queue wait plus 330-second stream window and margin. |
+| Platform generated-Service annotation | NLB TCP listener idle timeout | 4000 | Strictly exceeds the 3960-second client deadline. |
+
+Source owns and supports the 330-second LB setting and the queue contract.
+Platform owns the 315-, 3960-, and 4000-second rendered values. Neither side
+silently derives or rewrites the other's values.
+
+### Generic generated-Service annotations
+
+The only operator input is the exact string map
+`serve.externalLoadBalancer.serviceAnnotations`. Helm validates only that the
+value is an object with string keys and values, serializes it deterministically
+as JSON, and projects the same reserved environment variable into every
+`api`, `controller`, and `executor` Pod. Python is the sole semantic authority:
+startup and every reconciliation reject malformed Kubernetes annotation keys,
+duplicate JSON keys, non-string values, and conflicts with SkyPilot-owned
+`skypilot.co/` keys or the exact third-party-domain TLS, DNS, and backend-
+protocol keys managed by SkyPilot.
+
+Every generated inference `Service` receives the map. SkyPilot records only
+those operator-owned keys in the canonical durable annotation
+`skypilot.co/serve-lb-operator-annotation-keys`. On update it sets current owned
+keys and emits strategic-merge `null` only for retired keys in that ledger;
+unrelated annotations injected by AWS Load Balancer Controller, ExternalDNS,
+or another provider/controller remain untouched. A malformed ledger fails
+closed. A missing ledger is accepted only as a transition bootstrap for a
+Service created before A and is interpreted as owning zero existing keys.
+
+PR 14 must reconcile and read back every live generated inference Service with
+a canonical ledger. That receipt is cleanup C's exact removal gate: Serve047
+must physically remove markerless acceptance and reject a missing ledger while
+retaining the ledger and narrow merge behavior as the permanent single path.
+The cleanup absence tests must prove no `require_marker=False` call or
+missing-marker bootstrap remains and that a missing live ledger fails closed;
+this is not a TODO or optional soak gate.
+
+The interface is provider-neutral. The platform's current AWS contract uses:
+
+```yaml
+serve:
+  externalLoadBalancer:
+    serviceAnnotations:
+      service.beta.kubernetes.io/aws-load-balancer-listener-attributes.TCP-30001: tcp.idle_timeout.seconds=4000
+```
+
+The key shape and TCP idle-timeout range follow the official
+[AWS Load Balancer Controller Service annotation contract](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/guide/service/annotations/)
+and [AWS Network Load Balancer listener behavior](https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-listeners.html).
+
+### Audit targets independent of Kueue object creation
+
+`reserved_fill_reclaim_audit` is an audit identity and exact read target, not
+the owner of partition Kueue objects. Its required
+`local_queue_name` and `inference_cluster_queue_name` fields are therefore
+available even when the selected `partition.kueue` is `null`. Terraform can
+stage the audit role, EKS access entry, and exact Kubernetes RBAC before a
+separately owned Kueue rollout. Once that partition enables Kueue, a lifecycle
+precondition requires exact equality with its `local_queue_name` and
+`cluster_queue_name`; there is no alias, fallback, inferred default, or second
+source of queue identity.
+
+This decoupling changes neither ordinary workspace placement nor its
+credentials. The existing ordinary `wa` and `skypilot-wa` paths remain
+unchanged. A's module tests must prove both the Kueue-null staging state and the
+later exact-match rejection boundary.
 
 Only frozen historical Alembic replay code remains after C; runtime code does
 not import it. There is no rollback branch, legacy publisher, topology
@@ -1601,7 +1722,8 @@ before activation. If it does not, the new image may deploy but the gate stays
   ordinary-launch decoder pending cleanup PR #1452.
 - API capability 77 advertises projection protocol v2; allocation-map schema 5
   binds service version and the closed digest map; ReplicaInfo v18 persists the
-  selected scalar digest. The precursor reads only the two exact historical
+  selected scalar digest. Activation successor A reads only the two exact
+  historical
   v17 shapes long enough to produce the required normalization receipt;
   historical v15 and worktree-only v16 are not live formats.
 - Concurrent provider-free pool observer and typed blackouts.
@@ -1623,14 +1745,15 @@ before activation. If it does not, the new image may deploy but the gate stays
   Kubernetes guards with immediate create-response attestation, guard-free
   passive waits, and durable-owner cleanup after a terminal fence.
 
-The Serve046 base above merged in source PR #1451. Precursor A's v18 live
-contract and normalizer are implemented only in this local successor; A is not
-merged, published, or deployed, and reserved-fill is not activated. The
-validation and three-round review records below describe earlier exact
-Serve046 revisions and remain historical evidence only. They do not satisfy
-A's independent merge review or the three final reviews of the frozen
-integrated A/B/C/platform stack. Remote CI on each published exact successor
-must pass before merge.
+The Serve046 base above merged in source PR #1451, and the v18 live contract
+plus normalizer merged in PR #1483. Activation successor A is this local
+successor: it retains that v18 code and adds the queue-capacity,
+generated-Service annotation, and audit-target prerequisites. A is not merged,
+published, or deployed, and reserved fill is not activated. The validation and
+three-round review records below describe earlier exact Serve046 revisions and
+remain historical evidence only. They do not satisfy A's independent merge
+review or the three final reviews of the frozen integrated A/B/C/platform
+stack. Remote CI on each published exact successor must pass before merge.
 
 ### Runtime audit corrections implemented and frozen for review
 
@@ -1832,9 +1955,9 @@ either case.
 |---|---|---|
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
 | 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045/046 reclaim-policy identity | Merged in source PR #1451. Its prior freeze/reviews are historical evidence, not a pass for the current stack. |
-| 1b | Precursor A: replica state v18 plus its one-shot normalization receipt | Implemented locally; independent security/contract review and CI remain open before A merge. |
-| 2a | Platform PR 14: sealed live 1.1.1276 from one-pod `all` to exact split 2/2/2, with `all` deleted | Not applied; it contains no A code. |
-| 2b | Platform PR 17: roll the already-split fleet to the exact old-publisher A tuple and accept its normalization receipt | Blocked until A is merged, published, and the exact tuple is reviewed. |
+| 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
+| 2a | Activation successor A and platform PR 14: publish/pin A, migrate one-pod `all` directly to exact split 2/2/2 on A, and delete `all` | A is local and PR 14 is not applied; both are blocked on A review, CI, publication, and exact tuple binding. |
+| 2b | Platform PR 17: invoke normalization and accept its receipt on the unchanged PR 14 A tuple | Blocked until PR 14's exact split-A rollout/readback passes; PR 17 creates no rollout or Helm revision. |
 | 2c | Publisher B and platform PR 18: exact-only source publication, expected pre-adoption no-publish, then separate registry/role adoption and readbacks with no Helm revision | Not merged or applied. |
 | 2d | Deployment-owned Kueue bundle, unique entry-point policy, and generation-fenced authorization | Not activated; the live IAM/RBAC/Kueue attestation gates remain open. |
 | 3 | Source cleanup C and platform PR 19: publish/pin Serve047, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
@@ -1849,53 +1972,57 @@ reconciliation; neither is a second source of launch authority.
 
 Before changing the gate:
 
-1. Precursor A must pass its independent security/contract review, CI, and
-   exact test suite before merge. After A/PR 17, B/PR 18, and C's publication
-   freeze every final source and platform head, run three consecutive pragmatic
-   adversarial rounds before PR 19's final deployment/completion. Any material
-   change resets that final sequence.
-2. Platform PR 14 must first apply the sealed live 1.1.1276 tuple to the migrated
-   RWX state while converting one-pod `all` to exact 2/2/2
-   `api`/`controller`/`executor` and deleting `all`. Capture the live Helm
-   revision, release values, render, Pods, and writer leases. PR 14 contains no
-   precursor code and never runs normalization.
-3. Merge and publish precursor A through the old publisher as that publisher's
-   final release. Amend platform PR 17 with one reviewed source, version,
-   runtime digest, chart digest, module pin, API version, and structural proof.
-   PR 17 rolls the existing 2/2/2 cohort in place; it must not create, replace,
-   or revive the `all` topology.
-4. During PR 17, apply API-request schema 010 and the managed-job slot columns
-   before A Pods become Ready. Let the ordinary controller leader handoff drain
-   old claims/processes, then prove exactly six Ready same-digest A writers and
-   no old writer. Verify API capability 77, API-request 010, Serve 046,
-   projection protocol 2, allocation schema 5, replica state 18, and
-   reserved-fill protocol v2. Run the normalization gate below and archive its
-   accepted exact receipt while authority remains `LEGACY_ACTIVE`.
-5. Only after that receipt, merge publisher B. Its first automatic run must
+1. Activation successor A must pass its independent security/contract review,
+   CI, exact Python/Helm/Terraform suites, and deterministic generated-file
+   checks before merge. After PR 17's unchanged-A normalization receipt, B/PR
+   18, and C's publication, freeze every final source and platform head and run
+   three consecutive pragmatic adversarial rounds before PR 19's final
+   deployment/completion. Any material change resets that final sequence.
+2. Merge and publish A through the old publisher as that publisher's final
+   release. Amend platform PR 14 with one reviewed source, version, runtime
+   digest, chart digest, module pin, API version, and structural proof. The
+   historical 1.1.1277 tuple is forbidden here.
+3. During PR 14, apply API-request schema 010 and the managed-job slot columns
+   before A Pods become Ready. In the same Helm revision, convert one-pod `all`
+   directly to exact 2/2/2 `api`/`controller`/`executor` on A and physically
+   delete `all`. Let ordinary controller leader handoff drain old
+   claims/processes; capture live values, render, Pods, and writer leases.
+4. PR 14 must prove exactly six Ready same-digest A writers and no old writer;
+   API capability 77, API-request 010, Serve 046, projection protocol 2,
+   allocation schema 5, replica state 18, and reserved-fill protocol v2; the
+   exact authenticated cold queue-capacity response; the identical annotation
+   projection on all three roles; canonical ownership ledgers on every live
+   generated inference Service; and the audit module's explicit queue targets.
+   Authority remains `LEGACY_ACTIVE` and PR 14 does not run normalization.
+5. Platform PR 17 runs A's normalization command and archives its accepted
+   exact receipt while the PR 14 source, image, chart, module, values, Pods,
+   topology, and Helm revision remain unchanged. It is an operation against A,
+   not an A deployment or a second release.
+6. Only after that receipt, merge publisher B. Its first automatic run must
    fail closed without publishing while the canonical role is absent. Platform
    PR 18 then adopts and hardens the Rainier runtime and Como chart
    registries/roles in separate account applies and readbacks. PR 18 creates no
    Helm revision and does not deploy A or change topology.
-6. Only after both PR 18 account readbacks, merge cleanup C. C physically
+7. Only after both PR 18 account readbacks, merge cleanup C. C physically
    removes the normalizer, v17 live decoder, pickle column, and source
    topology/transition controls, while requiring B's superseded publisher paths
    to remain absent. The canonical roles publish one immutable C image/chart
    tuple and receipt.
-7. Amend platform PR 19 with that exact C tuple and publication receipt. PR 19
+8. Amend platform PR 19 with that exact C tuple and publication receipt. PR 19
    upgrades the already-split release in place, enables the typed worker-cache
    contract, and physically removes platform publisher/storage/topology
    transition paths. It must not create or replace the split topology.
-8. Prove every active reserved-fill service version has exact protocol-v2
+9. Prove every active reserved-fill service version has exact protocol-v2
    worker projections and every queued PENDING/PROVISIONING fill row is exact
    v18 bound to its locked service version, projection digest, and successor
    policy tuple. Drain any stale or undecodable row; no legacy fallback is
    permitted.
-9. Prove the deployment-owned Kueue LocalQueue, ClusterQueue namespace
+10. Prove the deployment-owned Kueue LocalQueue, ClusterQueue namespace
    selection, shared preemption domain, workload priorities, strict SkyPilot
    configuration, RBAC, and fail-closed admission contract for every reserved
    inference context. Pod priority alone does not pass this gate. Launch no GPU
    or BCL verification workload for this rollout.
-10. Prove every split-role Pod runs the one immutable C image and the unique
+11. Prove every split-role Pod runs the one immutable C image and the unique
     Boltz policy entry point resolves from its separately packaged wheel before
     first authorization. Later defects replace the complete fleet with a new
     immutable tuple and use the same generation-fenced command; no rollback or
@@ -1926,25 +2053,24 @@ activation.
 Production exposed a v17 label collision: retained rows were labelled current
 while some omitted the 13 sequenced-attribution keys introduced during the
 Serve046 development sequence. Generic legacy materialization would conceal
-that collision and could invent authority. The independently releasable
-precursor therefore moves the writer to v18. Runtime accepts exact v18, while
+that collision and could invent authority. PR #1483 therefore moved the writer
+to v18, and activation successor A carries that writer and normalizer together
+with its other pre-activation contracts. Runtime accepts exact v18, while
 the transitional v17 reader accepts exactly two closed v17 shapes: complete
 v17, or the one observed v17 collision shape with all 13 known collision
 fields absent. The collision shape becomes 13 explicit `null` values; a
-complete v17 value is preserved exactly. A
-partially missing attribution bundle, unknown field, a
+complete v17 value is preserved exactly. A partially missing attribution
+bundle, unknown field, a
 missing non-collision field, an incomplete status subdocument, and every other
-record version fail closed. The precursor also stops all live pickle
+record version fail closed. A also stops all live pickle
 dual-writes; the nullable column remains only until Serve047 drops it.
 
-Platform PR 14 must already have established this split topology on sealed live
-1.1.1276 and deleted `all`. Platform PR 17 changes only the existing cohort's
-immutable tuple. After exactly two `api`, two `controller`, and two `executor`
-Pods and their six Pod-bound writer leases are Ready on the same immutable A
-digest, with no old writer remaining, run the source-owned internal one-shot
-operation
-from that exact API Deployment (replace `<namespace>` and `<api-deployment>`
-with the reviewed live objects):
+Platform PR 14 establishes the split topology directly on A and deletes `all`.
+Only after exactly two `api`, two `controller`, and two `executor` Pods and
+their six Pod-bound writer leases are Ready on the same immutable A digest,
+with no old writer remaining, PR 17 runs the source-owned internal one-shot
+operation from that exact unchanged API Deployment (replace `<namespace>` and
+`<api-deployment>` with the reviewed live objects):
 
 ```bash
 kubectl -n <namespace> exec deploy/<api-deployment> -c skypilot-api -- \
@@ -2001,7 +2127,7 @@ invariants:
   "schema_version": 18,
   "serve_database_revision": "046",
   "writer_deployment_roles": ["api", "controller", "executor"],
-  "writer_image_digest": "sha256:<exact-precursor-digest>",
+  "writer_image_digest": "sha256:<exact-A-digest>",
   "writer_pod_inventory_count": 6,
   "writer_pod_inventory_sha256": "<exact-inventory-sha256>",
   "writer_process_count": 6
@@ -2130,6 +2256,27 @@ No step below creates compute.
 ### Required automated commands
 
 ```bash
+# Activation successor A pre-activation contracts.
+uv run --no-sync pytest -q -n 0 \
+  tests/unit_tests/test_serve_lb_k8s.py \
+  tests/unit_tests/test_serve_request_queue.py \
+  tests/unit_tests/test_reserved_fill_reclaim_policy_unit.py \
+  tests/unit_tests/test_sky/utils/test_context.py
+
+helm lint charts/skypilot
+helm unittest charts/skypilot
+helm schema -f charts/skypilot/values.yaml \
+  -o /tmp/skypilot-values.schema.json
+cmp /tmp/skypilot-values.schema.json charts/skypilot/values.schema.json
+
+terraform -chdir=infra/terraform/modules/skypilot-spoke-workspace-pool-eks \
+  fmt -check -recursive
+terraform -chdir=infra/terraform/modules/skypilot-spoke-workspace-pool-eks \
+  validate
+terraform -chdir=infra/terraform/modules/skypilot-spoke-workspace-pool-eks \
+  test -test-directory=terraform-tests
+
+# Existing reserved-fill protocol regression set.
 uv run --no-sync pytest -q \
   tests/unit_tests/test_pool_capacity_observation.py \
   tests/unit_tests/test_pool_capacity_observer.py \
@@ -2209,6 +2356,16 @@ exhaust a small server's shared lock table without exercising feature
 correctness. Formatting, typing, lint, and diff integrity must also pass for
 every changed file.
 
+The generated values schema is a required enforcement layer, not decorative
+documentation: `serviceAnnotations.additionalProperties` must remain
+`type: string`. The Helm helper independently rejects a non-map or non-string
+entry before serializing deterministic JSON, and Python tests feed raw JSON
+directly to the semantic boundary to reject numeric values, duplicate keys,
+malformed keys, reserved-key conflicts, and malformed ownership ledgers. This
+combination is the numeric-value evidence; a `helm-unittest --set` fixture is
+not authoritative because that harness may coerce scalar input before the
+template observes its original YAML type.
+
 The automated policy tests cover zero and multiple entry points, malformed or
 stale typed evidence, identity mismatch, a claim change between external proof
 and locked persistence, an activation change between attestation and CAS,
@@ -2266,6 +2423,15 @@ PID-file, request-triggered controller spawn, or shared-PID decoder.
 
 ### Evidence recorded so far
 
+- Activation successor A's pre-activation contract suite passes locally on the
+  exact current worktree: 350/350 Python tests across external-LB Kubernetes
+  lifecycle, request queue, reclaim-policy, and request-context isolation;
+  Helm lint plus 21/21 suites and 305/305 tests; byte-identical regenerated
+  values schema; an expected-negative schema lint rejecting an integer Service
+  annotation; Terraform 1.14.8 init/validate/fmt plus 51/51 module tests; and
+  `format.sh` mypy/pylint/dashboard checks. These are source/render tests, not
+  PR 14 deployment, generated-Service readback, route materialization, live
+  capacity, or BCL-preemption evidence.
 - Historical live diagnosis: repeated UID-fenced 34-slot A100 publications,
   with 181--250-second age at autoscaler consumption.
 - Implementation tests exist for concurrent observation, pool-local blackout,
@@ -2437,8 +2603,10 @@ system.
 Source PR #1451 is the already-merged Serve046 base, not an open transition
 PR. The current source stack is:
 
-1. precursor A, targeting `improvements`: temporary v18 live reader/writer and
-   one-shot normalizer for platform PR 17;
+1. activation successor A, targeting `improvements`: the already-merged v18
+   live reader/writer and one-shot normalizer plus the queue-capacity,
+   generated-Service annotation, and audit-target contracts required for
+   platform PR 14's direct split-and-roll;
 2. independently releasable publisher B: the exact-only publication contract
    and physical deletion of superseded publisher paths, with no runtime or
    schema behavior change; and
@@ -2447,9 +2615,10 @@ PR. The current source stack is:
    `reserved_fill_reconciliation_transition status/activate` as the sole
    first-authorization and reauthorization surface.
 
-Platform PR 14 precedes A's deployment; PR 17 deploys and normalizes A; PR 18
-follows B and creates no Helm revision; PR 19 alone pins and deploys C. The
-remote draft cleanup PR
+Platform PR 14 alone pins and deploys A while creating the split topology; PR
+17 normalizes retained rows on that unchanged tuple and creates no Helm
+revision; PR 18 follows B and also creates no Helm revision; PR 19 alone pins
+and deploys C. The remote draft cleanup PR
 [#1452](https://github.com/boltz-bio/skypilot/pull/1452) is a stale predecessor,
 not current C or merge/deployment evidence. It must be replaced or updated to
 the exact reviewed C revision. Historical cleanup PR #1263 is unrelated.
@@ -2485,6 +2654,10 @@ The cleanup change removes, rather than perpetuates:
   only historical pickle code retained;
 - the one-pod/all runtime role and corresponding Helm values, templates,
   conditionals, tests, and operator knobs after the exact split-role receipt;
+- transition-only acceptance of a generated inference Service without
+  `skypilot.co/serve-lb-operator-annotation-keys`, after PR 14 proves every
+  live Service has been reconciled to a canonical ledger; the permanent narrow
+  ownership ledger and strategic-merge behavior remain;
 - no superseded image/chart publisher workflow, overlay builder, moving tag,
   or release fallback; B must physically delete those source paths before C is
   eligible, C's final absence tests prevent their reintroduction, and PR 19
@@ -2521,7 +2694,8 @@ projection decoder does not remain after its gate passes.
 
 Cleanup C's merge/publish gate and platform PR 19's later apply gate are
 distinct. Before evaluating the runtime gates below, the archived PR 17
-precursor A receipt must prove Serve revision 046, v18, zero
+normalization receipt for the unchanged A tuple must prove Serve revision 046,
+v18, zero
 pickle/noncurrent rows, exact 2/2/2 Pods and writer leases, and one immutable
 image digest. Publisher B must be merged, its expected pre-adoption run must
 have failed closed without publishing, and both platform PR 18 account applies
@@ -2534,8 +2708,9 @@ that exact publication receipt and all final platform absence gates pass. PR 19
 then pins C and upgrades the existing split topology in place; it does not
 create or replace that topology.
 
-1. source PR #1451 is merged, PR 14's split-old receipt is accepted, and PR 17
-   has the full split-role fleet running A with its normalization receipt;
+1. source PR #1451 and the v18 precursor PR #1483 are merged, PR 14's exact
+   split-A receipt is accepted, and PR 17's normalization receipt names the
+   unchanged full split-role A fleet;
 2. production reports `SEQUENCED_ACTIVE` and cannot demote;
 3. at least three consecutive observation periods complete without a stale
    writer overwriting a successor, a map-authentication failure caused by
@@ -2572,11 +2747,16 @@ legacy activation.
 
 ## Open gates
 
-- Apply platform PR 14 to convert sealed live 1.1.1276 from one-pod `all` to
-  exact split 2/2/2 and delete `all`; archive its live Helm/render/lease proof.
 - Complete A's independent security/contract review, exact validation, and CI;
-  merge and publish A through the old publisher, then amend/apply PR 17 to roll
-  the already-split fleet in place and archive the normalization receipt.
+  merge and publish A through the old publisher, then bind that exact tuple to
+  platform PR 14. The published 1.1.1277 precursor is not eligible.
+- Apply platform PR 14 once to convert one-pod `all` directly to exact split
+  2/2/2 on A and delete `all`; archive its live Helm/render/lease proof, exact
+  cold queue-capacity response, all-role annotation projection, canonical
+  generated-Service ownership ledgers, and exact audit-target proof.
+- Apply PR 17 only as the one-shot normalization operation on PR 14's unchanged
+  A tuple; archive the normalization receipt and prove no Helm revision, Pod
+  rollout, values change, or second release occurred.
 - Merge B only after that receipt. Prove B's expected no-publish run, then
   apply and read back PR 18's separate canonical registry/role adoptions; PR 18
   must create no Helm revision.

@@ -3,6 +3,30 @@ suite: executor_deployment_test
 templates:
   - templates/executor-deployment.yaml
 tests:
+  - it: should project the generated-Service annotations to the executor role
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      apiService.highAvailability.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+            value: '{"example.com/a-listener":"enabled","example.com/z-listener":"4000"}'
+
+  - it: should reserve the annotation projection in the executor role
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      apiService.highAvailability.enabled: true
+      executorService.extraEnvs:
+        - name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+          value: attacker-controlled
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" is duplicated or reserved by the chart
+
   - it: should keep postgres quiescence after the reused parent is tombstoned
     values:
       - fixtures/request-store-tombstone-prior.yaml

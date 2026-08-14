@@ -14,6 +14,11 @@ tests:
           content:
             name: SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME
             value: skypilot-serve-lb
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+            value: '{"example.com/a-listener":"enabled","example.com/z-listener":"4000"}'
 
   - it: should reserve the class across controller-specific extra environments
     values:
@@ -26,3 +31,15 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: environment variable "SKYPILOT_SERVE_LB_PRIORITY_CLASS_NAME" is duplicated or reserved by the chart
+
+  - it: should reserve the annotation projection in the split controller path
+    values:
+      - fixtures/external-lb-priority-values.yaml
+    set:
+      apiService.highAvailability.enabled: true
+      controllerService.extraEnvs:
+        - name: SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON
+          value: attacker-controlled
+    asserts:
+      - failedTemplate:
+          errorMessage: environment variable "SKYPILOT_SERVE_EXTERNAL_LB_SERVICE_ANNOTATIONS_JSON" is duplicated or reserved by the chart

@@ -13,6 +13,7 @@ import pytest
 from starlette import datastructures
 
 from sky.serve import constants
+from sky.serve import lb_ha
 from sky.serve import load_balancer
 from sky.serve import load_balancing_policies
 from sky.serve import service_spec as service_spec_lib
@@ -2127,11 +2128,96 @@ def test_capacity_reports_request_queue_state():
         assert payload['request_queue_depth'] == 2
         assert payload['request_queue_capacity'] == 3
         assert payload['request_queue_dispatch_limit'] == 1
+        assert payload['request_queue_submission_limit'] == 3032
+        assert payload['request_queue_min_size'] == 0
+        assert payload['request_queue_size_per_replica'] == 3
+        assert payload['request_queue_max_size'] == 3000
+        assert payload['request_queue_max_concurrency'] == 32
+        assert payload['request_queue_max_request_body_bytes'] == 16
+        assert payload['request_queue_timeout_seconds'] == 1
         assert payload['request_queue_uses_async_occupancy'] is True
         assert payload['queue_depth'] == 3
         assert payload['queue_depth_by_priority'] == {'0': 2, '50': 1}
         assert payload['unique_job_arrivals_60s'] == 0
         assert payload['unique_job_arrivals_300s'] == 0
+
+    asyncio.run(_run())
+
+
+def test_capacity_reports_positive_submission_limit_while_cold():
+
+    async def _run():
+        lb = _make_lb(min_size=200,
+                      size_per_replica=10,
+                      max_size=2000,
+                      max_concurrency=128,
+                      max_request_body_bytes=1048576,
+                      timeout_seconds=3600,
+                      use_async_occupancy=True)
+        response = await lb._capacity(mock.MagicMock())
+        payload = json.loads(response.body)
+
+        assert payload['request_queue_capacity'] == 200
+        assert payload['request_queue_depth'] == 0
+        assert payload['request_queue_dispatch_limit'] == 0
+        assert payload['request_queue_submission_limit'] == 2128
+        assert payload['request_queue_min_size'] == 200
+        assert payload['request_queue_size_per_replica'] == 10
+        assert payload['request_queue_max_size'] == 2000
+        assert payload['request_queue_max_concurrency'] == 128
+        assert payload['request_queue_max_request_body_bytes'] == 1048576
+        assert payload['request_queue_timeout_seconds'] == 3600
+        assert payload['current_capacity'] == 0
+        assert payload['free_slots'] == 0
+
+    asyncio.run(_run())
+
+
+def test_capacity_withholds_submission_limit_from_standby():
+
+    async def _run():
+        lb = _make_lb(min_size=200,
+                      size_per_replica=10,
+                      max_size=2000,
+                      max_concurrency=128,
+                      max_request_body_bytes=1048576,
+                      timeout_seconds=3600,
+                      use_async_occupancy=True)
+        lb._lb_role = lb_ha.LbRole.STANDBY
+        response = await lb._capacity(mock.MagicMock())
+        payload = json.loads(response.body)
+
+        assert payload['request_queue_capacity'] == 0
+        assert payload['request_queue_dispatch_limit'] == 0
+        assert payload['request_queue_submission_limit'] == 0
+        # The inactive slot still reports the configured contract so clients
+        # can diagnose a role mismatch without treating it as admission.
+        assert payload['request_queue_min_size'] == 200
+        assert payload['request_queue_size_per_replica'] == 10
+        assert payload['request_queue_max_size'] == 2000
+        assert payload['request_queue_max_concurrency'] == 128
+        assert payload['request_queue_max_request_body_bytes'] == 1048576
+        assert payload['request_queue_timeout_seconds'] == 3600
+
+    asyncio.run(_run())
+
+
+def test_capacity_reports_null_queue_contract_only_when_disabled():
+
+    async def _run():
+        lb = load_balancer.SkyServeLoadBalancer('http://controller:8001', 8890)
+        response = await lb._capacity(mock.MagicMock())
+        payload = json.loads(response.body)
+
+        for field in ('request_queue_capacity', 'request_queue_dispatch_limit',
+                      'request_queue_submission_limit',
+                      'request_queue_min_size',
+                      'request_queue_size_per_replica',
+                      'request_queue_max_size', 'request_queue_max_concurrency',
+                      'request_queue_max_request_body_bytes',
+                      'request_queue_timeout_seconds',
+                      'request_queue_uses_async_occupancy'):
+            assert payload[field] is None
 
     asyncio.run(_run())
 
