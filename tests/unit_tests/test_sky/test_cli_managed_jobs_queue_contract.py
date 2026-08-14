@@ -109,6 +109,31 @@ def test_jobs_queue_symbols_are_direct_facade_aliases() -> None:
     assert command.env_options is managed_jobs_queue.env_options
 
 
+@pytest.mark.parametrize('import_order', ('command-first', 'queue-first'))
+def test_jobs_queue_facade_survives_both_import_orders(
+        import_order: str) -> None:
+    script = '''
+import pickle
+import sys
+
+if sys.argv[1] == 'command-first':
+    from sky.client.cli import command
+    from sky.client.cli import managed_jobs_queue
+else:
+    from sky.client.cli import managed_jobs_queue
+    from sky.client.cli import command
+
+assert command.jobs_queue is managed_jobs_queue.jobs_queue
+for name in ('_handle_jobs_queue_request', 'StatusList',
+             '_parse_datetime_to_epoch'):
+    value = getattr(command, name)
+    assert value is getattr(managed_jobs_queue, name)
+    assert value.__module__ == command.__name__
+    assert pickle.loads(pickle.dumps(value)) is value
+'''
+    subprocess.run([sys.executable, '-c', script, import_order], check=True)
+
+
 @pytest.mark.parametrize(
     'name,value',
     [
