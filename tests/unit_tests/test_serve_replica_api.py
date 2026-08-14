@@ -116,6 +116,7 @@ def test_replica_summaries_report_non_consolidated_capability():
     assert response.json() == {
         'available': False,
         'reason': 'non_consolidated',
+        'service_metadata_included': False,
         'observed_at': None,
         'summaries': [],
     }
