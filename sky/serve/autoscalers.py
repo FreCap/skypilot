@@ -89,6 +89,28 @@ _RESERVED_CAPACITY_MAX_FUTURE_SKEW_SECONDS = (
     constants.RESERVED_CAPACITY_STALE_AFTER_INTERVALS)
 
 
+def _validate_reserved_fill_pool_topology(
+    edges: Iterable[tuple[str, str, Iterable[str]]],) -> None:
+    """Validate one complete v2 map using physical UID/card identity."""
+    physical_uid_by_context: dict[str, str] = {}
+    cards_by_physical_uid: dict[str, set[str]] = {}
+    for context, physical_uid, gpu_names in edges:
+        context_physical_uid = physical_uid_by_context.setdefault(
+            context, physical_uid)
+        if context_physical_uid != physical_uid:
+            raise ValueError('One protocol-v2 Kubernetes context cannot '
+                             'identify multiple physical clusters: '
+                             f'{context!r}.')
+        physical_cards = cards_by_physical_uid.setdefault(physical_uid, set())
+        cards = set(gpu_names)
+        overlap = physical_cards.intersection(cards)
+        if overlap:
+            raise ValueError('Protocol-v2 pool snapshots overlap on one '
+                             'physical cluster for cards '
+                             f'{sorted(overlap)}.')
+        physical_cards.update(cards)
+
+
 @dataclasses.dataclass
 class _PoolFillState:
     """One protocol-v2 reserved-fill pool's independently mutable gauges."""
@@ -1148,8 +1170,7 @@ class Autoscaler:
         """
         parsed: dict[str, _PoolFillState] = {}
         generations: set[int] = set()
-        seen_contexts: set[str] = set()
-        cards_by_physical_uid: dict[str, set[str]] = {}
+        topology_edges: list[tuple[str, str, Iterable[str]]] = []
         for map_key, snapshot in pool_snapshots.items():
             pool_key = str(snapshot.get('pool_key', map_key))
             if pool_key != map_key:
@@ -1248,18 +1269,7 @@ class Autoscaler:
                                  'physical Kubernetes cluster UID matching '
                                  'its composite pool key.')
             context = locations[0].region
-            if context in seen_contexts:
-                raise ValueError('Protocol-v2 pool snapshots may use each '
-                                 'Kubernetes context in only one edge.')
-            seen_contexts.add(context)
-            physical_cards = cards_by_physical_uid.setdefault(
-                physical_uid, set())
-            overlap = physical_cards.intersection(identity.gpu_names)
-            if overlap:
-                raise ValueError('Protocol-v2 pool snapshots overlap on one '
-                                 'physical cluster for cards '
-                                 f'{sorted(overlap)}.')
-            physical_cards.update(identity.gpu_names)
+            topology_edges.append((context, physical_uid, identity.gpu_names))
             raw_timestamp = snapshot['timestamp']
             if (isinstance(raw_timestamp, bool) or
                     not isinstance(raw_timestamp, (int, float)) or
@@ -1287,6 +1297,7 @@ class Autoscaler:
             # state; raw_free remains local so no half-updated map is visible.
             parsed[pool_key].last_raw_free_slots = raw_free
 
+        _validate_reserved_fill_pool_topology(topology_edges)
         if len(generations) > 1:
             raise ValueError('A complete reserved-fill pool map must carry '
                              f'one service generation, got {generations}.')
@@ -3442,8 +3453,7 @@ class Autoscaler:
             self._fill_snapshot_time = fill_state.get('fill_snapshot_time')
             if fill_state.get('version') == 2:
                 restored: dict[str, _PoolFillState] = {}
-                restored_contexts: set[str] = set()
-                restored_cards_by_uid: dict[str, set[str]] = {}
+                restored_topology: list[tuple[str, str, Iterable[str]]] = []
                 restored_generations: set[int] = set()
                 for pool_key, raw_pool in fill_state.get('pools', {}).items():
                     try:
@@ -3504,20 +3514,9 @@ class Autoscaler:
                         else:
                             restored_shelter_grant = min(
                                 restored_edge_cap, raw_shelter_grant)
-                        context = locations[0].region
-                        physical_cards = restored_cards_by_uid.setdefault(
-                            raw_physical_uid, set())
-                        if (context in restored_contexts or
-                                physical_cards.intersection(
-                                    identity.gpu_names)):
-                            # A restored complete-map conflict has no
-                            # deterministic authoritative subset. Drop the
-                            # whole map rather than making shelter depend on
-                            # serialized edge order.
-                            restored = {}
-                            break
-                        restored_contexts.add(context)
-                        physical_cards.update(identity.gpu_names)
+                        restored_topology.append(
+                            (locations[0].region, raw_physical_uid,
+                             identity.gpu_names))
                         restored_generations.add(raw_generation)
                         restored[str(pool_key)] = _PoolFillState(
                             protocol_version=raw_protocol_version,
@@ -3537,6 +3536,13 @@ class Autoscaler:
                             grant_epoch=None)
                     except (KeyError, TypeError, ValueError):
                         continue
+                try:
+                    _validate_reserved_fill_pool_topology(restored_topology)
+                except ValueError:
+                    # A restored complete-map conflict has no deterministic
+                    # authoritative subset. Drop the whole map rather than
+                    # making shelter depend on serialized edge order.
+                    restored = {}
                 if len(restored_generations) > 1:
                     restored = {}
                 raw_last_started_key = fill_state.get(

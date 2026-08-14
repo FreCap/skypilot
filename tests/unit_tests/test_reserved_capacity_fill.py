@@ -1419,6 +1419,68 @@ class TestPollerClaimLifecycle(unittest.TestCase):
 class TestMultiPoolBrokerCycle(unittest.TestCase):
     """One v2 poll publishes a complete service generation."""
 
+    def test_cycle_accepts_same_context_exact_card_edges(self):
+        context = 'research-context'
+        locations = [
+            make_location(context,
+                          accelerators={card: 1},
+                          cloud_name='Kubernetes',
+                          use_spot=False) for card in ('A100', 'A100-80GB')
+        ]
+        placer = mock.Mock()
+        placer.active_locations.return_value = locations
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=2)
+        timestamp = time.time()
+        allocations = iter([
+            reserved_capacity_broker.Allocation(
+                grant=1,
+                feed=1,
+                round_id=index,
+                epoch=index,
+                snapshot_time=timestamp,
+                protocol_version=2,
+                service_generation=1,
+                observed_free_slots=1,
+                observed_free_slots_by_accelerator={card.casefold(): 1},
+                observed_at=timestamp)
+            for index, card in enumerate(('A100', 'A100-80GB'), start=1)
+        ])
+
+        with mock.patch.object(
+                reserved_capacity,
+                'get_kubernetes_physical_cluster_uid',
+                return_value='research-uid') as resolve_uid, \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_replica_infos', return_value=[]), \
+             mock.patch.object(
+                 reserved_capacity.serve_state,
+                 'get_reserved_fill_service_claim_set', return_value=None), \
+             mock.patch.object(reserved_capacity.serve_state,
+                               'get_reserved_fill_round', return_value=None), \
+             mock.patch.object(reserved_capacity_broker,
+                               'replace_claim_set', return_value=1) as replace, \
+             mock.patch.object(reserved_capacity_broker,
+                               'run_round_if_stale',
+                               side_effect=lambda *_args, **_kwargs: next(
+                                   allocations)), \
+             mock.patch.object(
+                 reserved_capacity.provider_phase,
+                 'provider_phase',
+                 side_effect=lambda _mode: contextlib.nullcontext()), \
+             mock.patch.object(reserved_capacity,
+                               '_record_allocation_observation'):
+            reserved_capacity._broker_cycle_v2(autoscaler, placer, 'svc',
+                                               locations, 'service-hash',
+                                               (123, 'controller-ip'))
+
+        resolve_uid.assert_called_once_with(context)
+        edges = replace.call_args.kwargs['edges']
+        self.assertEqual([edge['access_context'] for edge in edges],
+                         [context, context])
+        self.assertEqual(len({edge['pool_key'] for edge in edges}), 2)
+        self.assertEqual(set(autoscaler.info()['fill_by_pool']),
+                         {edge['pool_key'] for edge in edges})
+
     def test_cycle_reads_replicas_and_utilization_once_and_partitions_budget(
             self):
         east = spot_placer.Location.from_pickleable(
@@ -1786,6 +1848,102 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
                 'timestamp': timestamp,
             },
         }
+
+    def _heterogeneous_context_snapshots(self):
+        context = 'research-context'
+        physical_uid = 'research-uid'
+        locations = {
+            card: make_location(context,
+                                accelerators={display_name: 1},
+                                cloud_name='Kubernetes',
+                                use_spot=False)
+            for card, display_name in (('a100', 'A100'), ('a100-80gb',
+                                                          'A100-80GB'))
+        }
+        timestamp = time.time()
+        snapshots = {}
+        for epoch, (card, location) in enumerate(locations.items(), start=1):
+            pool_key = reserved_capacity_broker.make_pool_key(
+                context,
+                card,
+                protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+                physical_cluster_uid=physical_uid)
+            snapshots[pool_key] = {
+                'protocol_version': 2,
+                'pool_key': pool_key,
+                'physical_cluster_uid': physical_uid,
+                'service_generation': 1,
+                'edge_cap': 1,
+                'zero_cost_location_keys': [location.to_pickleable()],
+                'free_slots': 1,
+                'free_slots_by_accelerator': {
+                    card: 1
+                },
+                'grant': 1,
+                'grant_epoch': epoch,
+                'timestamp': timestamp,
+            }
+        snapshots[self.phx_pool] = {
+            'protocol_version': 2,
+            'pool_key': self.phx_pool,
+            'physical_cluster_uid': 'phx-uid',
+            'service_generation': 1,
+            'edge_cap': 1,
+            'zero_cost_location_keys': [self.phx.to_pickleable()],
+            'free_slots': 1,
+            'free_slots_by_accelerator': {
+                'h200': 1
+            },
+            'grant': 1,
+            'grant_epoch': 3,
+            'timestamp': timestamp,
+        }
+        return snapshots
+
+    def test_same_context_disjoint_cards_share_one_physical_cluster(self):
+        snapshots = self._heterogeneous_context_snapshots()
+        expected_accelerators = {
+            pool_key: snapshot['zero_cost_location_keys'][0]['accelerators']
+            for pool_key, snapshot in snapshots.items()
+        }
+
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=3)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+        autoscaler.collect_reserved_capacity_pools(snapshots)
+
+        decisions = _ups(_decisions(autoscaler, []))
+        self.assertEqual({decision.target[_POOL_KEY] for decision in decisions},
+                         set(snapshots))
+        for decision in decisions:
+            pool_key = decision.target[_POOL_KEY]
+            self.assertEqual(decision.target['accelerators'],
+                             expected_accelerators[pool_key])
+            self.assertEqual(
+                decision.target[
+                    constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY],
+                snapshots[pool_key]['zero_cost_location_keys'])
+
+    def test_same_context_cannot_identify_different_physical_clusters(self):
+        autoscaler = _make_autoscaler(min_replicas=0, max_replicas=2)
+        autoscaler.collect_reserved_capacity_pools(self._snapshots())
+        installed_states = autoscaler._fill_pool_states
+
+        snapshots = self._snapshots(east_feed=1, phx_feed=1)
+        phx_snapshot = snapshots.pop(self.phx_pool)
+        phx_snapshot['zero_cost_location_keys'] = [
+            make_location('east-context',
+                          accelerators={
+                              'H200': 1
+                          },
+                          cloud_name='Kubernetes',
+                          use_spot=False).to_pickleable()
+        ]
+        snapshots[self.phx_pool] = phx_snapshot
+
+        with self.assertRaisesRegex(ValueError,
+                                    'cannot identify multiple physical'):
+            autoscaler.collect_reserved_capacity_pools(snapshots)
+        self.assertIs(autoscaler._fill_pool_states, installed_states)
 
     def test_launches_carry_exact_pool_generation_uid_and_locations(self):
         autoscaler = _make_autoscaler(min_replicas=1, max_replicas=5)
@@ -2903,6 +3061,25 @@ class TestMultiPoolAutoscaler(unittest.TestCase):
         self.assertEqual(_ups(decisions), [])
         self.assertEqual(_downs(decisions), [])
         self.assertEqual(restored.info()['fill_free_slots'], 0)
+
+    def test_same_context_disjoint_cards_survive_dynamic_restore(self):
+        snapshots = self._heterogeneous_context_snapshots()
+        old = _make_autoscaler(min_replicas=0, max_replicas=3)
+        old.collect_reserved_capacity_pools(snapshots)
+        old.collect_reserved_capacity_pools(snapshots)
+
+        restored = _make_autoscaler(min_replicas=0, max_replicas=3)
+        restored.load_dynamic_states(old.dump_dynamic_states())
+
+        self.assertEqual(set(restored._fill_pool_states), set(snapshots))
+        for pool_key, state in restored._fill_pool_states.items():
+            self.assertEqual(
+                state.zero_cost_locations[0].region,
+                snapshots[pool_key]['zero_cost_location_keys'][0]['region'])
+            self.assertEqual(state.shelter_grant, 1)
+            self.assertEqual(state.grant, 0)
+            self.assertEqual(state.free_slots, 0)
+            self.assertIsNone(state.grant_epoch)
 
     def test_update_preserves_only_the_last_real_grant_for_shelter(self):
         autoscaler = _make_autoscaler(min_replicas=0, max_replicas=5)
