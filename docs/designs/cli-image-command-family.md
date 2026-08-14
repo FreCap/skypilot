@@ -28,6 +28,7 @@ keeping `sky.client.cli.command` as the stable public facade. Preserve:
 
 - root and nested Click command order, names, options, help, and callbacks;
 - historical command object aliases and callback module and qualified names;
+- historical usage-telemetry entrypoint names derived from wrapped callbacks;
 - image selector validation and error messages;
 - SDK methods, arguments, call counts, and wait behavior;
 - workspace callbacks, confirmation behavior, and table output;
@@ -105,9 +106,10 @@ Reverting the extraction restores the prior layout.
 ## Test plan
 
 Characterization covers the root and nested command hierarchy, exact help
-snapshots, historical callback metadata, version-stable AST body hashes, and
-representative SDK projections for every command path, including both retry
-branches. Final validation runs the focused image CLI tests, root CLI tests,
-container-image client and model tests, formatter and static analysis, root and
-subcommand help snapshots, import and identity probes, an alternating cold
-import comparison, `git diff --check`, and the CI workflow path-to-test mapping.
+snapshots, historical callback and wrapped-callback metadata, usage-telemetry
+entrypoint names, version-stable AST body hashes, and representative SDK
+projections for every command path, including both retry branches. Final
+validation runs the focused image CLI tests, root CLI tests, container-image
+client and model tests, formatter and static analysis, root and subcommand help
+snapshots, import and identity probes, an alternating cold import comparison,
+`git diff --check`, and the CI workflow path-to-test mapping.

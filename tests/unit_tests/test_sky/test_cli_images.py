@@ -1,6 +1,7 @@
 """Characterization tests for the ``sky image`` command family."""
 
 import ast
+import contextvars
 import hashlib
 import inspect
 import json
@@ -14,6 +15,7 @@ import pytest
 
 from sky.client.cli import command
 from sky.client.cli import images
+from sky.usage import usage_lib
 
 _COMMAND_NAMES = (
     'image',
@@ -99,6 +101,25 @@ def test_image_command_hierarchy_and_facade_metadata() -> None:
         assert callback is not None
         assert callback.__module__ == command.__name__
         assert callback.__qualname__ == name
+        assert inspect.unwrap(callback).__module__ == command.__name__
+
+
+def test_image_usage_entrypoint_preserves_facade_identity(monkeypatch) -> None:
+    monkeypatch.setenv('SKYPILOT_DISABLE_USAGE_COLLECTION', '1')
+    monkeypatch.setattr(command.container_images_sdk, 'status',
+                        mock.Mock(return_value=[]))
+    monkeypatch.setattr(command.table_utils, 'format_container_image_table',
+                        mock.Mock(return_value=''))
+
+    def _invoke() -> str | None:
+        usage_lib.install_fresh_messages_for_current_context()
+        callback = command.image_status.callback
+        assert callback is not None
+        callback(None, None)
+        return usage_lib.messages.usage.entrypoint
+
+    assert contextvars.Context().run(
+        _invoke) == 'sky.client.cli.command.image_status'
 
 
 def test_image_commands_are_direct_facade_aliases() -> None:
