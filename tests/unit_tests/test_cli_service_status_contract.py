@@ -4,6 +4,9 @@
 
 import inspect
 import pickle
+import subprocess
+import sys
+import textwrap
 import typing
 from unittest import mock
 
@@ -24,7 +27,7 @@ def _call_handler(*,
                   show_endpoint=False,
                   pool=False,
                   is_called_by_user=True):
-    with mock.patch.object(command.sdk, 'get', return_value=records), \
+    with mock.patch.object(command.sdk, 'get', return_value=records) as get, \
          mock.patch.object(command.serve_lib,
                            'format_service_table',
                            return_value='TABLE') as format_table, \
@@ -37,6 +40,7 @@ def _call_handler(*,
             show_endpoint=show_endpoint,
             pool=pool,
             is_called_by_user=is_called_by_user)
+        get.assert_called_once_with('request-id')
     return result, format_table, set_internal
 
 
@@ -58,6 +62,30 @@ def test_historical_function_contract_and_pickle_identity():
     assert signature.parameters['is_called_by_user'].default is False
     assert signature.return_annotation == tuple[int | None, str]
     assert pickle.loads(pickle.dumps(handler)) is handler
+
+
+@pytest.mark.parametrize('module_order', [
+    ('sky.client.cli.command', 'sky.client.cli.service_status'),
+    ('sky.client.cli.service_status', 'sky.client.cli.command'),
+])
+def test_historical_function_contract_in_fresh_process(module_order):
+    program = textwrap.dedent(f'''\
+        import importlib
+        import pickle
+
+        for module_name in {module_order!r}:
+            importlib.import_module(module_name)
+
+        from sky.client.cli import command
+        from sky.client.cli import service_status
+
+        handler = command._handle_services_request
+        assert handler is service_status._handle_services_request
+        assert handler.__module__ == 'sky.client.cli.command'
+        assert handler.__qualname__ == '_handle_services_request'
+        assert pickle.loads(pickle.dumps(handler)) is handler
+    ''')
+    subprocess.run([sys.executable, '-c', program], check=True)
 
 
 def test_table_projection_preserves_counts_arguments_and_missing_names():
