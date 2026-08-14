@@ -7,6 +7,8 @@ import ast
 import hashlib
 import inspect
 import pickle
+import subprocess
+import sys
 import textwrap
 from types import SimpleNamespace
 
@@ -95,6 +97,51 @@ def test_request_metadata_callable_contract(name: str) -> None:
     else:
         assert pickle.loads(pickle.dumps(function)) is function
     assert _normalized_ast_sha256(function) == expected_fingerprint
+
+
+@pytest.mark.parametrize('metadata_first', [False, True],
+                         ids=['facade-first', 'metadata-first'])
+def test_request_metadata_fresh_import_orders(metadata_first: bool) -> None:
+    if metadata_first:
+        imports = '''
+            import sys
+            from sky.serve import load_balancer_request_metadata
+            assert 'sky.serve.load_balancer' not in sys.modules
+            from sky.serve import load_balancer
+        '''
+    else:
+        imports = '''
+            import sys
+            from sky.serve import load_balancer
+            assert 'sky.serve.load_balancer_request_metadata' in sys.modules
+            from sky.serve import load_balancer_request_metadata
+        '''
+    script = textwrap.dedent(imports) + textwrap.dedent('''
+        import pickle
+
+        names = (
+            '_priority_header_error',
+            '_parse_request_priority',
+            '_accelerator_header_error',
+            '_parse_request_accelerators',
+            '_headers_without_request_priority',
+        )
+        for name in names:
+            descriptor = load_balancer.SkyServeLoadBalancer.__dict__[name]
+            function = (descriptor.__func__ if isinstance(
+                descriptor, (staticmethod, classmethod)) else descriptor)
+            assert function is getattr(load_balancer_request_metadata, name)
+            if name == '_parse_request_priority':
+                try:
+                    pickle.dumps(function)
+                except pickle.PicklingError:
+                    pass
+                else:
+                    raise AssertionError('classmethod function became picklable')
+            else:
+                assert pickle.loads(pickle.dumps(function)) is function
+    ''')
+    subprocess.run([sys.executable, '-c', script], check=True)
 
 
 def test_request_metadata_error_and_translation_contract() -> None:
