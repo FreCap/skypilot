@@ -1,5 +1,4 @@
 """SDK functions for cluster/job management."""
-import concurrent.futures
 import shlex
 import typing
 from typing import Any, Literal
@@ -1787,7 +1786,10 @@ def enabled_clouds_batch(workspaces: list[str],
             common_utils.get_current_user().id).keys())
     allowed = [ws for ws in workspaces if ws in accessible]
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
+    # The current user lives in a ContextVar. Keep it attached to each
+    # workspace expansion when this function is called by a synchronous API
+    # handler instead of an executor process.
+    with subprocess_utils.ContextThreadPoolExecutor() as executor:
         futures = {
             ws: executor.submit(enabled_clouds, workspace=ws, expand=expand)
             for ws in allowed

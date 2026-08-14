@@ -51,6 +51,7 @@ jest.mock('@/data/connectors/infra', () => ({
   getWorkspaceInfrastructure: jest.fn().mockResolvedValue({}),
   getWorkspaceContexts: jest.fn(),
   getContextGPUData: jest.fn(),
+  getInfraSummary: jest.fn(),
   getCloudInfrastructure: jest.fn().mockResolvedValue({}),
   getEnabledCloudsList: jest.fn().mockResolvedValue({
     clouds: [],
