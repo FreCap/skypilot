@@ -28,9 +28,11 @@ context callback to `threading.Event.wait()`.
 Add `context_utils.sleep_with_cancellation(seconds)`. Without a request
 context it delegates directly to `time.sleep(seconds)`. With a context it
 registers a callback that sets a local `threading.Event`, waits for the same
-duration, raises `asyncio.CancelledError` when cancellation wins, and always
-unregisters the callback. The register API closes cancel-before-register;
-an `is_canceled()` check after a timeout closes the timeout/unregister edge.
+duration, and always unregisters the callback. It then raises
+`asyncio.CancelledError` when either the event or context records cancellation.
+The register API closes cancel-before-register; checking `is_canceled()` only
+after unregistering closes cancellation between the timeout and callback
+cleanup.
 
 Use this primitive for the Ray-up retry backoff and the multi-node readiness
 poll interval only. Do not alter subprocess execution, readiness parsing,

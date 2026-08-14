@@ -112,6 +112,22 @@ def test_sleep_with_cancellation_cancellation_at_timeout_raises(monkeypatch):
     assert not ctx._cancel_callbacks
 
 
+def test_sleep_with_cancellation_cancellation_during_unregister_raises(
+        monkeypatch):
+
+    class _CancelDuringUnregisterContext(context.SkyPilotContext):
+
+        def unregister_cancel_callback(self, callback):
+            self.cancel()
+            super().unregister_cancel_callback(callback)
+
+    ctx = _CancelDuringUnregisterContext()
+    monkeypatch.setattr(context_utils.context, 'get', lambda: ctx)
+
+    with pytest.raises(asyncio.CancelledError):
+        context_utils.sleep_with_cancellation(0)
+
+
 def test_sleep_with_cancellation_rejects_pre_cancelled_context(monkeypatch):
     ctx = context.SkyPilotContext()
     ctx.cancel()
