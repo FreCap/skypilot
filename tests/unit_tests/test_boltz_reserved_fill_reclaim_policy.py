@@ -38,6 +38,19 @@ def _encoded_bundle(document: dict) -> bytes:
                       separators=(',', ':')).encode('utf-8')
 
 
+def _quota(context: dict, prefix: str, flavor_name: str,
+           resource_name: str) -> dict:
+    for group in context['queues'][f'{prefix}_resource_groups']:
+        for flavor in group['flavors']:
+            if flavor['name'] != flavor_name:
+                continue
+            for resource in flavor['resources']:
+                if resource['resource_name'] == resource_name:
+                    return resource
+    raise AssertionError(
+        f'No {prefix} quota for {flavor_name}/{resource_name}.')
+
+
 def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     bundle = bundle_lib.load_embedded_bundle()
     east = bundle.fleet_context('prod_research_cluster_eks')
@@ -49,6 +62,8 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert east['workload_priority_class_name'] == 'skyserve-inference-low'
     assert east['priority_class'][
         'name'] == 'rescluster-k8s-prod-east1-preemptible-inference-low'
+    assert east['service_account_name'] == 'skypilot-inference-sa'
+    assert phx['service_account_name'] == 'skypilot-inference-sa'
     assert east['accelerators']['a100-80gb'] == {
         'count': 1,
         'flavors': ['ml.p4de.24xlarge'],
@@ -62,13 +77,16 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['accelerators']['h200']['product_label_values'] == [
         'NVIDIA-H200'
     ]
-    assert [
-        quota['borrowing_limit']
-        for quota in east['queues']['research_gpu_quotas']
-    ] == ['0', '0']
-    assert all(quota['resource_name'] == 'nvidia.com/gpu'
-               for context in (east, phx)
-               for quota in context['queues']['inference_gpu_quotas'])
+    assert _quota(east, 'inference', 'ml.p4d.24xlarge',
+                  'cpu')['borrowing_limit'] == '256'
+    assert _quota(east, 'inference', 'ml.p4de.24xlarge',
+                  'memory')['borrowing_limit'] == '4224Gi'
+    assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
+                  'cpu')['borrowing_limit'] == '2048'
+    assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
+                  'memory')['borrowing_limit'] == '8192Gi'
+    assert _quota(east, 'research', 'ml.p4d.24xlarge',
+                  'nvidia.com/gpu')['borrowing_limit'] == '0'
 
 
 def test_bundle_hashes_are_domain_separated_and_order_independent():
@@ -78,8 +96,14 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
     reordered['fleet']['contexts'].reverse()
     reordered['provider_inventory']['contexts'].reverse()
     for context in reordered['fleet']['contexts']:
-        context['queues']['inference_gpu_quotas'].reverse()
-        context['queues']['research_gpu_quotas'].reverse()
+        for prefix in ('inference', 'research'):
+            groups = context['queues'][f'{prefix}_resource_groups']
+            groups.reverse()
+            for group in groups:
+                group['covered_resources'].reverse()
+                group['flavors'].reverse()
+                for flavor in group['flavors']:
+                    flavor['resources'].reverse()
         for accelerator in context['accelerators'].values():
             accelerator['flavors'].reverse()
             accelerator['product_label_values'].reverse()
@@ -96,7 +120,7 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
 def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
     with pytest.raises(bundle_lib.BundleValidationError, match='Duplicate'):
         bundle_lib.parse_bundle_bytes(
-            b'{"schema_version":1,"schema_version":1}')
+            b'{"schema_version":2,"schema_version":2}')
 
     document = _bundle_document()
     document['unknown'] = True
@@ -105,8 +129,9 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    document['fleet']['contexts'][0]['queues']['inference_gpu_quotas'][0][
-        'nominal_quota'] = '1'
+    context = document['fleet']['contexts'][0]
+    _quota(context, 'inference', 'ml.p4de.24xlarge',
+           'nvidia.com/gpu')['nominal_quota'] = '1'
     with pytest.raises(bundle_lib.BundleValidationError, match='zero-nominal'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
@@ -115,6 +140,121 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
         'product_label_value'] = 'NVIDIA-H200'
     with pytest.raises(bundle_lib.BundleValidationError,
                        match='reviewed flavor, Node selector, and product'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
+    document = _bundle_document()
+    context = document['fleet']['contexts'][0]
+    group = context['queues']['inference_resource_groups'][0]
+    group['covered_resources'].remove('cpu')
+    for flavor in group['flavors']:
+        flavor['resources'] = [
+            resource for resource in flavor['resources']
+            if resource['resource_name'] != 'cpu'
+        ]
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exactly one inference resource group'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    context = document['fleet']['contexts'][0]
+    _quota(context, 'inference', 'ml.p4de.24xlarge',
+           'cpu')['borrowing_limit'] = '1055'
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exact reviewed worker-fit'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    context = document['fleet']['contexts'][0]
+    group = context['queues']['inference_resource_groups'][0]
+    memory_flavors = []
+    for flavor in group['flavors']:
+        memory = next(resource for resource in flavor['resources']
+                      if resource['resource_name'] == 'memory')
+        flavor['resources'].remove(memory)
+        memory_flavors.append({
+            'name': flavor['name'],
+            'resources': [memory],
+        })
+    group['covered_resources'].remove('memory')
+    context['queues']['inference_resource_groups'].append({
+        'covered_resources': ['memory'],
+        'flavors': memory_flavors,
+    })
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exactly one inference resource group'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+def test_bundle_bounds_each_inference_resource_by_research_nominal():
+    document = _bundle_document()
+    context = document['fleet']['contexts'][0]
+    _quota(context, 'research', 'ml.p4de.24xlarge',
+           'memory')['nominal_quota'] = '4000Gi'
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='bounded by matching research nominal'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+def test_bundle_rejects_extra_inference_group_and_quota_atom():
+    document = _bundle_document()
+    queues = document['fleet']['contexts'][0]['queues']
+    queues['inference_resource_groups'].append({
+        'covered_resources': ['example.com/unreviewed'],
+        'flavors': [{
+            'name': 'unreviewed',
+            'resources': [{
+                'resource_name': 'example.com/unreviewed',
+                'nominal_quota': '0',
+                'borrowing_limit': '1',
+            }],
+        }],
+    })
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exactly one inference resource group'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    group = document['fleet']['contexts'][0]['queues'][
+        'inference_resource_groups'][0]
+    group['covered_resources'].append('example.com/unreviewed')
+    for flavor in group['flavors']:
+        flavor['resources'].append({
+            'resource_name': 'example.com/unreviewed',
+            'nominal_quota': '0',
+            'borrowing_limit': '1',
+        })
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='covering only GPU, CPU, and memory'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+@pytest.mark.parametrize(('resource_name', 'borrowing_limit'), [
+    ('cpu', '1057'),
+    ('memory', '4225Gi'),
+])
+def test_bundle_rejects_oversized_worker_fit_quota(resource_name,
+                                                   borrowing_limit):
+    document = _bundle_document()
+    context = document['fleet']['contexts'][0]
+    _quota(context, 'inference', 'ml.p4de.24xlarge',
+           resource_name)['borrowing_limit'] = borrowing_limit
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exact reviewed worker-fit'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+def test_bundle_rejects_fractional_gpu_borrowing():
+    document = _bundle_document()
+    context = document['fleet']['contexts'][0]
+    _quota(context, 'inference', 'ml.p4de.24xlarge',
+           'nvidia.com/gpu')['borrowing_limit'] = '263.5'
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='positive integral borrowed GPU'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
@@ -639,7 +779,7 @@ def _active_object(name: str, spec: dict, namespace: str | None = None) -> dict:
 def _queue_object(context: dict, *, inference: bool) -> dict:
     queues = context['queues']
     prefix = 'inference' if inference else 'research'
-    quotas = queues[f'{prefix}_gpu_quotas']
+    resource_groups = queues[f'{prefix}_resource_groups']
     spec = {
         'cohortName': queues['cohort'],
         'namespaceSelector': {
@@ -660,16 +800,16 @@ def _queue_object(context: dict, *, inference: bool) -> dict:
         },
         'stopPolicy': 'None',
         'resourceGroups': [{
-            'coveredResources': ['nvidia.com/gpu'],
+            'coveredResources': copy.deepcopy(group['covered_resources']),
             'flavors': [{
-                'name': quota['flavor'],
+                'name': flavor['name'],
                 'resources': [{
-                    'name': 'nvidia.com/gpu',
-                    'nominalQuota': quota['nominal_quota'],
-                    'borrowingLimit': quota['borrowing_limit'],
-                }],
-            } for quota in quotas],
-        }],
+                    'name': resource['resource_name'],
+                    'nominalQuota': resource['nominal_quota'],
+                    'borrowingLimit': resource['borrowing_limit'],
+                } for resource in flavor['resources']],
+            } for flavor in group['flavors']],
+        } for group in resource_groups],
     }
     name = queues[f'{prefix}_cluster_queue']
     return _active_object(name, spec)
@@ -934,6 +1074,76 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
         capacity_per_node=8),)
 
 
+def _remove_inference_quota_atom(snapshot: dict, resource_name: str) -> None:
+    group = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0]
+    flavor = group['flavors'][0]
+    flavor['resources'] = [
+        resource for resource in flavor['resources']
+        if resource['name'] != resource_name
+    ]
+
+
+def _set_inference_borrowing(snapshot: dict, resource_name: str,
+                             quantity: str) -> None:
+    group = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0]
+    resource = next(resource for resource in group['flavors'][0]['resources']
+                    if resource['name'] == resource_name)
+    resource['borrowingLimit'] = quantity
+
+
+def _move_inference_memory_to_another_group(snapshot: dict) -> None:
+    groups = snapshot['inference_cluster_queue']['spec']['resourceGroups']
+    group = groups[0]
+    flavor = group['flavors'][0]
+    memory = next(resource for resource in flavor['resources']
+                  if resource['name'] == 'memory')
+    flavor['resources'].remove(memory)
+    group['coveredResources'].remove('memory')
+    groups.append({
+        'coveredResources': ['memory'],
+        'flavors': [{
+            'name': flavor['name'],
+            'resources': [memory],
+        }],
+    })
+
+
+def _add_inference_quota_atom(snapshot: dict) -> None:
+    group = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0]
+    group['coveredResources'].append('example.com/unreviewed')
+    group['flavors'][0]['resources'].append({
+        'name': 'example.com/unreviewed',
+        'nominalQuota': '0',
+        'borrowingLimit': '1',
+    })
+
+
+def _add_inference_resource_group(snapshot: dict) -> None:
+    groups = snapshot['inference_cluster_queue']['spec']['resourceGroups']
+    groups.append({
+        'coveredResources': ['example.com/unreviewed'],
+        'flavors': [{
+            'name': 'unreviewed',
+            'resources': [{
+                'name': 'example.com/unreviewed',
+                'nominalQuota': '0',
+                'borrowingLimit': '1',
+            }],
+        }],
+    })
+
+
+def _duplicate_inference_resource_group(snapshot: dict) -> None:
+    groups = snapshot['inference_cluster_queue']['spec']['resourceGroups']
+    groups.append(copy.deepcopy(groups[0]))
+
+
+def _duplicate_inference_quota_atom(snapshot: dict) -> None:
+    flavor = snapshot['inference_cluster_queue']['spec']['resourceGroups'][0][
+        'flavors'][0]
+    flavor['resources'].append(copy.deepcopy(flavor['resources'][0]))
+
+
 @pytest.mark.parametrize('mutation,match', [
     (lambda snapshot: snapshot['service_account']['metadata']['annotations'].
      update({'eks.amazonaws.com/role-arn': 'arn:unreviewed'}), 'IRSA'),
@@ -961,6 +1171,21 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
         'resourceRules'][0].__setitem__('operations', None), 'invalid'),
     (lambda snapshot: snapshot['research_cluster_queue']['spec']['preemption'].
      __setitem__('reclaimWithinCohort', 'Never'), 'reclaim contract'),
+    (lambda snapshot: _remove_inference_quota_atom(snapshot, 'cpu'),
+     'exact resource group'),
+    (lambda snapshot: _remove_inference_quota_atom(snapshot, 'memory'),
+     'exact resource group'),
+    (lambda snapshot: _set_inference_borrowing(snapshot, 'cpu', '2047'),
+     'reclaim contract'),
+    (lambda snapshot: _set_inference_borrowing(snapshot, 'memory', '8191Gi'),
+     'reclaim contract'),
+    (_move_inference_memory_to_another_group, 'reclaim contract'),
+    (_add_inference_quota_atom, 'reclaim contract'),
+    (_add_inference_resource_group, 'reclaim contract'),
+    (_duplicate_inference_resource_group, 'overlapping resource groups'),
+    (_duplicate_inference_quota_atom, 'duplicate quota atoms'),
+    (lambda snapshot: snapshot['inference_cluster_queue']['spec'].__setitem__(
+        'resourceGroups', []), 'reclaim contract'),
     (lambda snapshot: snapshot['validating_webhook']['webhooks'][0].__setitem__(
         'rules', []), 'Pod admission contract'),
     (lambda snapshot: snapshot['validating_webhook']['webhooks'][0]['rules'][0].

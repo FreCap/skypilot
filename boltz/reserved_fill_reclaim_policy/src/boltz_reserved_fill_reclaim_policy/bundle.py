@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 import dataclasses
+import decimal
 from importlib import resources
 import hashlib
 import json
@@ -18,8 +19,41 @@ _ROLE_ARN_RE: Final = re.compile(
     r'role/[A-Za-z0-9+=,.@_/-]+$')
 _UUID_RE: Final = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
                              r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v1\x00'
+_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v2\x00'
 _PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v1\x00'
+_REQUIRED_QUEUE_RESOURCES: Final = frozenset(
+    {'cpu', 'memory', 'nvidia.com/gpu'})
+_RESOURCE_GROUP_KEYS: Final = frozenset({'covered_resources', 'flavors'})
+_RESOURCE_FLAVOR_KEYS: Final = frozenset({'name', 'resources'})
+_RESOURCE_QUOTA_KEYS: Final = frozenset(
+    {'resource_name', 'nominal_quota', 'borrowing_limit'})
+_QUANTITY_RE: Final = re.compile(
+    r'^(?P<number>[0-9]+(?:\.[0-9]+)?)'
+    r'(?P<suffix>n|u|m|k|K|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$')
+_DECIMAL_QUANTITY_SCALE: Final = {
+    '': decimal.Decimal(1),
+    'n': decimal.Decimal('1e-9'),
+    'u': decimal.Decimal('1e-6'),
+    'm': decimal.Decimal('1e-3'),
+    'k': decimal.Decimal('1e3'),
+    'K': decimal.Decimal('1e3'),
+    'M': decimal.Decimal('1e6'),
+    'G': decimal.Decimal('1e9'),
+    'T': decimal.Decimal('1e12'),
+    'P': decimal.Decimal('1e15'),
+    'E': decimal.Decimal('1e18'),
+    'Ki': decimal.Decimal(2)**10,
+    'Mi': decimal.Decimal(2)**20,
+    'Gi': decimal.Decimal(2)**30,
+    'Ti': decimal.Decimal(2)**40,
+    'Pi': decimal.Decimal(2)**50,
+    'Ei': decimal.Decimal(2)**60,
+}
+_WORKER_RESOURCE_PER_GPU: Final = {
+    'cpu': decimal.Decimal(4),
+    'memory': decimal.Decimal(16) * (decimal.Decimal(2)**30),
+    'nvidia.com/gpu': decimal.Decimal(1),
+}
 
 
 class BundleValidationError(ValueError):
@@ -77,28 +111,89 @@ def _optional_role(value: object, path: str) -> str | None:
     return role
 
 
-def _validate_quota_list(value: object, path: str) -> None:
-    quotas = _list(value, path)
-    if not quotas:
+def _quantity(value: object, path: str) -> decimal.Decimal:
+    quantity = _text(value, path)
+    match = _QUANTITY_RE.fullmatch(quantity)
+    if match is None:
+        raise BundleValidationError(
+            f'{path} must be a nonnegative Kubernetes quantity.')
+    return (decimal.Decimal(match.group('number')) *
+            _DECIMAL_QUANTITY_SCALE[match.group('suffix') or ''])
+
+
+def _validate_resource_groups(
+    value: object, path: str
+) -> dict[tuple[str, str], tuple[decimal.Decimal, decimal.Decimal]]:
+    """Validate the complete Kueue quota topology and index its atoms."""
+    groups = _list(value, path)
+    if not groups:
         raise BundleValidationError(f'{path} must not be empty.')
-    flavors: list[str] = []
-    for index, item in enumerate(quotas):
-        quota = _mapping(item, f'{path}[{index}]')
-        _exact_keys(
-            quota,
-            {'flavor', 'nominal_quota', 'borrowing_limit', 'resource_name'},
-            f'{path}[{index}]')
-        flavors.append(_text(quota['flavor'], f'{path}[{index}].flavor'))
-        if quota['resource_name'] != 'nvidia.com/gpu':
+    covered_inventory: set[str] = set()
+    group_signatures: set[frozenset[str]] = set()
+    quota_inventory: dict[tuple[str, str], tuple[decimal.Decimal,
+                                                 decimal.Decimal]] = {}
+    for group_index, raw_group in enumerate(groups):
+        group_path = f'{path}[{group_index}]'
+        group = _mapping(raw_group, group_path)
+        _exact_keys(group, set(_RESOURCE_GROUP_KEYS), group_path)
+        covered_resources = [
+            _text(item, f'{group_path}.covered_resources') for item in _list(
+                group['covered_resources'], f'{group_path}.covered_resources')
+        ]
+        if (not covered_resources or
+                len(covered_resources) != len(set(covered_resources))):
             raise BundleValidationError(
-                f'{path}[{index}].resource_name must be nvidia.com/gpu.')
-        for key in ('nominal_quota', 'borrowing_limit'):
-            quantity = _text(quota[key], f'{path}[{index}].{key}')
-            if not quantity.isdecimal():
+                f'{group_path}.covered_resources must be nonempty and '
+                'unique.')
+        signature = frozenset(covered_resources)
+        if (signature in group_signatures or
+                covered_inventory.intersection(signature)):
+            raise BundleValidationError(
+                f'{path} has duplicate or overlapping resource groups.')
+        group_signatures.add(signature)
+        covered_inventory.update(signature)
+        if ('nvidia.com/gpu' in signature and
+                not _REQUIRED_QUEUE_RESOURCES.issubset(signature)):
+            raise BundleValidationError(
+                f'{group_path} must co-locate GPU, CPU, and memory quotas.')
+
+        flavors = _list(group['flavors'], f'{group_path}.flavors')
+        if not flavors:
+            raise BundleValidationError(
+                f'{group_path}.flavors must not be empty.')
+        flavor_names: set[str] = set()
+        for flavor_index, raw_flavor in enumerate(flavors):
+            flavor_path = f'{group_path}.flavors[{flavor_index}]'
+            flavor = _mapping(raw_flavor, flavor_path)
+            _exact_keys(flavor, set(_RESOURCE_FLAVOR_KEYS), flavor_path)
+            flavor_name = _text(flavor['name'], f'{flavor_path}.name')
+            if flavor_name in flavor_names:
                 raise BundleValidationError(
-                    f'{path}[{index}].{key} must be an integer quantity.')
-    if len(flavors) != len(set(flavors)):
-        raise BundleValidationError(f'{path} has duplicate flavors.')
+                    f'{group_path} has duplicate flavors.')
+            flavor_names.add(flavor_name)
+            quota_rows = _list(flavor['resources'], f'{flavor_path}.resources')
+            resource_names: set[str] = set()
+            for resource_index, raw_resource in enumerate(quota_rows):
+                resource_path = (f'{flavor_path}.resources[{resource_index}]')
+                resource = _mapping(raw_resource, resource_path)
+                _exact_keys(resource, set(_RESOURCE_QUOTA_KEYS), resource_path)
+                resource_name = _text(resource['resource_name'],
+                                      f'{resource_path}.resource_name')
+                atom = (flavor_name, resource_name)
+                if (resource_name in resource_names or atom in quota_inventory):
+                    raise BundleValidationError(
+                        f'{path} has duplicate quota atoms.')
+                resource_names.add(resource_name)
+                quota_inventory[atom] = (
+                    _quantity(resource['nominal_quota'],
+                              f'{resource_path}.nominal_quota'),
+                    _quantity(resource['borrowing_limit'],
+                              f'{resource_path}.borrowing_limit'))
+            if resource_names != signature:
+                raise BundleValidationError(
+                    f'{flavor_path} must have exactly one quota atom for '
+                    'every covered resource.')
+    return quota_inventory
 
 
 def _validate_preemption(value: object, path: str) -> None:
@@ -211,38 +306,73 @@ def _validate_fleet_context(value: object, path: str) -> None:
     queues = _mapping(context['queues'], f'{path}.queues')
     _exact_keys(
         queues, {
-            'cohort', 'inference_cluster_queue', 'inference_gpu_quotas',
+            'cohort', 'inference_cluster_queue', 'inference_resource_groups',
             'inference_preemption', 'research_cluster_queue',
-            'research_gpu_quotas', 'research_namespace', 'research_preemption'
+            'research_resource_groups', 'research_namespace',
+            'research_preemption'
         }, f'{path}.queues')
     for key in ('cohort', 'inference_cluster_queue', 'research_cluster_queue',
                 'research_namespace'):
         _text(queues[key], f'{path}.queues.{key}')
-    _validate_quota_list(queues['inference_gpu_quotas'],
-                         f'{path}.queues.inference_gpu_quotas')
-    _validate_quota_list(queues['research_gpu_quotas'],
-                         f'{path}.queues.research_gpu_quotas')
+    inference_groups = _list(queues['inference_resource_groups'],
+                             f'{path}.queues.inference_resource_groups')
+    if (len(inference_groups) != 1 or
+            not isinstance(inference_groups[0], dict) or
+            set(inference_groups[0].get('covered_resources',
+                                        ())) != _REQUIRED_QUEUE_RESOURCES):
+        raise BundleValidationError(
+            f'{path}.queues must have exactly one inference resource group '
+            'covering only GPU, CPU, and memory.')
+    inference_quotas = _validate_resource_groups(
+        inference_groups, f'{path}.queues.inference_resource_groups')
+    research_quotas = _validate_resource_groups(
+        queues['research_resource_groups'],
+        f'{path}.queues.research_resource_groups')
     _validate_preemption(queues['inference_preemption'],
                          f'{path}.queues.inference_preemption')
     _validate_preemption(queues['research_preemption'],
                          f'{path}.queues.research_preemption')
-    inference_quotas = {
-        item['flavor']: item for item in queues['inference_gpu_quotas']
+    inference_gpu_flavors = {
+        flavor for flavor, resource_name in inference_quotas
+        if resource_name == 'nvidia.com/gpu'
     }
-    research_quotas = {
-        item['flavor']: item for item in queues['research_gpu_quotas']
+    positive_research_gpu_flavors = {
+        flavor for (flavor, resource_name), (nominal,
+                                             _) in research_quotas.items()
+        if resource_name == 'nvidia.com/gpu' and nominal > 0
     }
-    if set(inference_quotas) != set(research_quotas):
+    if (not inference_gpu_flavors or
+            inference_gpu_flavors != positive_research_gpu_flavors):
         raise BundleValidationError(
-            f'{path}.queues GPU flavor sets must agree.')
-    for flavor, inference_quota in inference_quotas.items():
-        research_quota = research_quotas[flavor]
-        if (inference_quota['nominal_quota'] != '0' or
-                int(inference_quota['borrowing_limit']) > int(
-                    research_quota['nominal_quota'])):
+            f'{path}.queues GPU flavor inventories must agree exactly.')
+    for flavor in inference_gpu_flavors:
+        gpu_borrowing = inference_quotas[(flavor, 'nvidia.com/gpu')][1]
+        if (gpu_borrowing <= 0 or
+                gpu_borrowing != gpu_borrowing.to_integral_value()):
             raise BundleValidationError(
-                f'{path}.queues inference quota must be zero-nominal and '
-                'bounded by research nominal quota.')
+                f'{path}.queues must expose positive integral borrowed GPU '
+                'capacity.')
+        for resource_name in _REQUIRED_QUEUE_RESOURCES:
+            atom = (flavor, resource_name)
+            inference_quota = inference_quotas.get(atom)
+            research_quota = research_quotas.get(atom)
+            if inference_quota is None or research_quota is None:
+                raise BundleValidationError(
+                    f'{path}.queues must co-locate GPU, CPU, and memory '
+                    'quota atoms for every inference flavor.')
+            inference_nominal, inference_borrowing = inference_quota
+            research_nominal, _ = research_quota
+            if (inference_nominal != 0 or
+                    inference_borrowing > research_nominal):
+                raise BundleValidationError(
+                    f'{path}.queues inference quotas must be zero-nominal '
+                    'and bounded by matching research nominal quotas.')
+            minimum_borrowing = (gpu_borrowing *
+                                 _WORKER_RESOURCE_PER_GPU[resource_name])
+            if inference_borrowing != minimum_borrowing:
+                raise BundleValidationError(
+                    f'{path}.queues {resource_name} borrowing quota is '
+                    'not the exact reviewed worker-fit quantity.')
     if (queues['inference_preemption'] != {
             'borrow_within_cohort': 'Never',
             'reclaim_within_cohort': 'Never',
@@ -439,8 +569,18 @@ def _normalized_section(section: dict[str, Any]) -> dict[str, Any]:
     for context in normalized['contexts']:
         queues = context.get('queues')
         if isinstance(queues, dict):
-            queues['inference_gpu_quotas'].sort(key=lambda item: item['flavor'])
-            queues['research_gpu_quotas'].sort(key=lambda item: item['flavor'])
+            for key in ('inference_resource_groups',
+                        'research_resource_groups'):
+                groups = queues.get(key)
+                if not isinstance(groups, list):
+                    continue
+                for group in groups:
+                    group['covered_resources'].sort()
+                    group['flavors'].sort(key=lambda item: item['name'])
+                    for flavor in group['flavors']:
+                        flavor['resources'].sort(
+                            key=lambda item: item['resource_name'])
+                groups.sort(key=lambda item: tuple(item['covered_resources']))
         accelerators = context.get('accelerators')
         if isinstance(accelerators, dict):
             for contract in accelerators.values():
@@ -508,7 +648,7 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     root = _mapping(document, 'bundle')
     _exact_keys(root, {'schema_version', 'fleet', 'provider_inventory'},
                 'bundle')
-    if root['schema_version'] != 1:
+    if root['schema_version'] != 2:
         raise BundleValidationError(
             'Fleet bundle schema version is unsupported.')
     fleet = _mapping(root['fleet'], 'bundle.fleet')
@@ -551,8 +691,10 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
             item['flavor']: item for item in provider_context['node_inventory']
         }
         queue_flavors = {
-            item['flavor']
-            for item in fleet_context['queues']['inference_gpu_quotas']
+            flavor['name']
+            for group in fleet_context['queues']['inference_resource_groups']
+            if 'nvidia.com/gpu' in group['covered_resources']
+            for flavor in group['flavors']
         }
         if (queue_flavors != set(flavor_labels) or
                 queue_flavors != set(node_inventory)):
