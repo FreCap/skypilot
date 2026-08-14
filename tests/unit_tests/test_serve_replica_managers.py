@@ -744,6 +744,59 @@ class TestBackgroundDutyOwnershipLifecycle:
                       target_num_replicas=1),
         ]
 
+    def test_status_write_converges_after_repeated_target_changes(self):
+        mgr = replica_managers.SkyPilotReplicaManager.__new__(
+            replica_managers.SkyPilotReplicaManager)
+        mgr.latest_version = 1
+        mgr._service_name = 'svc'
+        mgr._target_num_replicas = 0
+        mgr._update_mode = serve_utils.UpdateMode.ROLLING
+        mgr._db_fence_kwargs = mock.Mock(return_value={})
+        fallback_publisher_started = threading.Event()
+        fallback_publisher_done = threading.Event()
+        fallback_publishers = []
+
+        def _write_status(*args, **kwargs):
+            del args, kwargs
+            if set_st.call_count == 1:
+                assert mgr.publish_target_num_replicas(1, expected_version=1)
+            elif set_st.call_count == 2:
+                assert mgr.publish_target_num_replicas(0, expected_version=1)
+            else:
+
+                def _publish_after_fallback():
+                    fallback_publisher_started.set()
+                    assert mgr.publish_target_num_replicas(1,
+                                                           expected_version=1)
+                    fallback_publisher_done.set()
+
+                publisher = threading.Thread(target=_publish_after_fallback)
+                fallback_publishers.append(publisher)
+                publisher.start()
+                assert fallback_publisher_started.wait(timeout=5)
+                assert not fallback_publisher_done.wait(timeout=0.1)
+
+        with mock.patch.object(
+                replica_managers.serve_utils,
+                'set_service_status_and_active_versions_from_replica',
+                side_effect=_write_status) as set_st:
+            mgr._set_service_status_from_replica_infos([])
+
+        assert set_st.call_args_list == [
+            mock.call('svc', [],
+                      serve_utils.UpdateMode.ROLLING,
+                      target_num_replicas=0),
+            mock.call('svc', [],
+                      serve_utils.UpdateMode.ROLLING,
+                      target_num_replicas=1),
+            mock.call('svc', [],
+                      serve_utils.UpdateMode.ROLLING,
+                      target_num_replicas=0),
+        ]
+        fallback_publishers[0].join(timeout=5)
+        assert not fallback_publishers[0].is_alive()
+        assert fallback_publisher_done.is_set()
+
     def test_ownership_loss_interrupts_interval_before_next_round(self):
         mgr = self._stopped_manager()
         mgr._ownership_lost = threading.Event()

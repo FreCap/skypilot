@@ -14331,6 +14331,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 ownership_lost = self._ownership_lost
                 if ownership_lost is not None and ownership_lost.is_set():
                     return
+            # Repeated target churn outpaced both optimistic writes. Serialize
+            # one final write with publication so the last persisted status
+            # cannot already be stale when this probe round returns. This
+            # blocking fallback is restricted to the contended path; the
+            # common stable-target path above never holds this lock over I/O.
+            with self._get_target_num_replicas_lock():
+                if self._update_recovery_required:
+                    return
+                ownership_lost = self._ownership_lost
+                if ownership_lost is not None and ownership_lost.is_set():
+                    return
+                serve_utils.set_service_status_and_active_versions_from_replica(
+                    self._service_name,
+                    replica_infos,
+                    self._update_mode,
+                    target_num_replicas=self._target_num_replicas,
+                    **self._db_fence_kwargs())
 
     async def _probe_system_recovery_route_target(
             self, session: aiohttp.ClientSession,
