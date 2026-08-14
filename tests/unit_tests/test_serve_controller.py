@@ -4021,6 +4021,295 @@ class TestAutoscalerRuntimeSnapshot:
         assert not update.is_alive()
         ctrl._finish_actuation_transition(1)  # pylint: disable=protected-access
 
+    def test_blocking_decision_preload_does_not_hold_routing_epoch_lock(self):
+        """PostgreSQL/provider input reads cannot freeze controller HTTP."""
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 2
+        decision_autoscaler.reserved_capacity_fill = False
+        decision_autoscaler.has_recomputed_with_fresh_data.return_value = False
+        decision_autoscaler.generate_scaling_decisions.return_value = []
+        preload_started = threading.Event()
+        release_preload = threading.Event()
+        decision_inputs = object()
+
+        def _blocking_preload(_autoscaler, _replicas):
+            preload_started.set()
+            assert release_preload.wait(timeout=5)
+            return decision_inputs
+
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_scale_planning_state_fingerprint',
+                 return_value='stable'), \
+             mock.patch.object(
+                 autoscalers,
+                 'controller_prepares_scaling_decision_inputs',
+                 return_value=True), \
+             mock.patch.object(
+                 autoscalers,
+                 'prepare_controller_scaling_decision_inputs',
+                 side_effect=_blocking_preload) as prepare_inputs, \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions',
+                 return_value=[]) as generate_decisions, \
+             mock.patch.object(
+                 ctrl, '_persist_cost_rebalance_state', return_value=True):
+            reconcile = threading.Thread(
+                target=ctrl._reconcile_scale_once,  # pylint: disable=protected-access
+                args=(0,))
+            reconcile.start()
+            assert preload_started.wait(timeout=5)
+            acquired = ctrl._routing_state_lock.acquire(timeout=1)  # pylint: disable=protected-access
+            assert acquired
+            if acquired:
+                ctrl._routing_state_lock.release()  # pylint: disable=protected-access
+            release_preload.set()
+            reconcile.join(timeout=5)
+
+        assert not reconcile.is_alive()
+        prepare_inputs.assert_called_once_with(decision_autoscaler, [])
+        generate_decisions.assert_called_once_with(decision_autoscaler, [], [2],
+                                                   decision_inputs)
+
+    def test_built_in_historical_spec_read_precedes_routing_epoch_lock(self):
+        """The real built-in preload cannot move its spec read under lock."""
+        ctrl = _make_controller()
+        spec = _make_autoscaler_spec(target_qps_per_replica={'A100': 10.0})
+        decision_autoscaler = autoscalers.InstanceAwareRequestRateAutoscaler(
+            'svc', spec, version=2)
+        old_spec = _make_autoscaler_spec(target_qps_per_replica={'L4': 0.1})
+        old = mock.Mock()
+        old.replica_id = 1
+        old.version = 1
+        old.is_terminal = False
+        decision_autoscaler._gpu_shape_cache[1] = ('L4', 1)  # pylint: disable=protected-access
+        decision_autoscaler._replica_cost_cache[1] = 0.0  # pylint: disable=protected-access
+        preload_started = threading.Event()
+        release_preload = threading.Event()
+
+        def _blocking_get_specs(service_name, versions):
+            assert service_name == 'svc'
+            assert versions == [1]
+            preload_started.set()
+            assert release_preload.wait(timeout=5)
+            return {1: old_spec}
+
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[old]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1, 2]}), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_scale_planning_state_fingerprint',
+                 return_value='stable'), \
+             mock.patch.object(controller.serve_state,
+                               'get_specs',
+                               side_effect=_blocking_get_specs) as get_specs, \
+             mock.patch.object(controller.serve_state,
+                               'get_spec',
+                               side_effect=AssertionError) as get_spec, \
+             mock.patch.object(ctrl, '_get_replica_counts', return_value={}), \
+             mock.patch.object(
+                 ctrl,
+                 '_get_free_reserved_slots_by_accelerator',
+                 return_value={}), \
+             mock.patch.object(decision_autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               return_value=[]), \
+             mock.patch.object(
+                 ctrl, '_persist_cost_rebalance_state', return_value=True):
+            reconcile = threading.Thread(
+                target=ctrl._reconcile_scale_once,  # pylint: disable=protected-access
+                args=(0,))
+            reconcile.start()
+            assert preload_started.wait(timeout=5)
+            acquired = ctrl._routing_state_lock.acquire(timeout=1)  # pylint: disable=protected-access
+            assert acquired
+            if acquired:
+                ctrl._routing_state_lock.release()  # pylint: disable=protected-access
+            release_preload.set()
+            reconcile.join(timeout=5)
+
+        assert not reconcile.is_alive()
+        get_specs.assert_called_once_with('svc', [1])
+        get_spec.assert_not_called()
+
+    def test_demand_and_generation_publish_atomically(self):
+        """A planner cannot observe the new generation before its gauges."""
+
+        class _TrackingRLock:
+
+            def __init__(self):
+                self._lock = threading.RLock()
+                self.acquire_attempted = threading.Event()
+
+            def __enter__(self):
+                self.acquire_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+                self._lock.release()
+
+        ctrl = _make_controller()
+        lock = _TrackingRLock()
+        ctrl._routing_state_lock = lock  # pylint: disable=protected-access
+        ctrl._autoscaler = mock.Mock()  # pylint: disable=protected-access
+        ctrl._autoscaler.replica_unit = 'physical_backend'  # pylint: disable=protected-access
+        request_data = {'request_aggregator': {'timestamps': []}}
+        result = []
+
+        def _publish():
+            result.append(
+                ctrl._apply_prepared_load_balancer_report(  # pylint: disable=protected-access
+                    request_data, request_data, [], {}, (True, True, True), {},
+                    False))
+
+        with lock:
+            lock.acquire_attempted.clear()
+            publisher = threading.Thread(target=_publish)
+            publisher.start()
+            assert lock.acquire_attempted.wait(timeout=5)
+            assert ctrl._reconcile_generation == 0  # pylint: disable=protected-access
+            ctrl._autoscaler.collect_request_information.assert_not_called()  # pylint: disable=line-too-long,protected-access
+            assert ctrl._scale_reconcile_coordinator.generation == 0  # pylint: disable=protected-access
+
+        publisher.join(timeout=5)
+        assert not publisher.is_alive()
+        assert result == [True]
+        assert ctrl._reconcile_generation == 1  # pylint: disable=protected-access
+        report = ctrl._autoscaler.collect_request_information.call_args.args[0]  # pylint: disable=line-too-long,protected-access
+        assert report['reconcile_generation'] == 1
+        assert ctrl._scale_reconcile_coordinator.generation == 1  # pylint: disable=protected-access
+
+    def test_changed_durable_snapshot_discards_blocked_preload(self):
+        """A manager mutation cannot be planned from pre-mutation rows."""
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 2
+        decision_autoscaler.reserved_capacity_fill = False
+        preload_started = threading.Event()
+        release_preload = threading.Event()
+
+        def _blocking_preload(_autoscaler, _replicas):
+            preload_started.set()
+            assert release_preload.wait(timeout=5)
+            return object()
+
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_scale_planning_state_fingerprint',
+                 side_effect=['before-mutation', 'after-mutation']), \
+             mock.patch.object(
+                 autoscalers,
+                 'controller_prepares_scaling_decision_inputs',
+                 return_value=True), \
+             mock.patch.object(
+                 autoscalers,
+                 'prepare_controller_scaling_decision_inputs',
+                 side_effect=_blocking_preload), \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions') as generate:
+            reconcile = threading.Thread(
+                target=ctrl._reconcile_scale_once,  # pylint: disable=protected-access
+                args=(0,))
+            reconcile.start()
+            assert preload_started.wait(timeout=5)
+            release_preload.set()
+            reconcile.join(timeout=5)
+
+        assert not reconcile.is_alive()
+        generate.assert_not_called()
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
+        assert ctrl._scale_reconcile_coordinator.generation == 1  # pylint: disable=protected-access
+
+    def test_new_demand_generation_discards_blocked_preload(self):
+        """A newer LB report cannot be combined with an older fleet read."""
+        ctrl = _make_controller()
+        decision_autoscaler = mock.Mock()
+        decision_autoscaler.latest_version = 2
+        decision_autoscaler.reserved_capacity_fill = False
+        preload_started = threading.Event()
+        release_preload = threading.Event()
+
+        def _blocking_preload(_autoscaler, _replicas):
+            preload_started.set()
+            assert release_preload.wait(timeout=5)
+            return object()
+
+        ctrl._autoscaler = decision_autoscaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [2]}), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_scale_planning_state_fingerprint',
+                 return_value='stable'), \
+             mock.patch.object(
+                 autoscalers,
+                 'controller_prepares_scaling_decision_inputs',
+                 return_value=True), \
+             mock.patch.object(
+                 autoscalers,
+                 'prepare_controller_scaling_decision_inputs',
+                 side_effect=_blocking_preload), \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions') as generate:
+            reconcile = threading.Thread(
+                target=ctrl._reconcile_scale_once,  # pylint: disable=protected-access
+                args=(0,))
+            reconcile.start()
+            assert preload_started.wait(timeout=5)
+            assert ctrl._apply_prepared_load_balancer_report(  # pylint: disable=protected-access
+                {'request_aggregator': {
+                    'timestamps': []
+                }}, {'request_aggregator': {
+                    'timestamps': []
+                }}, [], {}, (True, True, True), {}, False)
+            release_preload.set()
+            reconcile.join(timeout=5)
+
+        assert not reconcile.is_alive()
+        generate.assert_not_called()
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
+
     def test_incomplete_exact_logical_tick_revokes_prior_target(self):
         ctrl = _make_controller()
         decision_autoscaler = mock.Mock(spec=autoscalers.ConcurrencyAutoscaler)

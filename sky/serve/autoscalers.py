@@ -40,6 +40,23 @@ UnrecoverableRolloutFailure = (autoscaler_decisions.UnrecoverableRolloutFailure)
 FillDemandSample = autoscaler_decisions.FillDemandSample
 AutoscalerDecision = autoscaler_decisions.AutoscalerDecision
 
+
+@dataclasses.dataclass(frozen=True)
+class ScalingDecisionInputs:
+    """Blocking inputs prepared for one exact autoscaler replica snapshot.
+
+    Controller routing publication must never wait on provider or database
+    I/O. Shape-aware autoscalers therefore resolve durable cluster handles and
+    historical capacity metadata before the controller enters its
+    routing-epoch lock, then consume this token without another state-store
+    read inside that lock.
+    """
+
+    replica_ids: tuple[int, ...]
+    gpu_shape_handles: dict[int, Any] | None = None
+    historical_scaling_values: dict[int, Any] | None = None
+
+
 # Preserve historical private import and pickle identities while the pure
 # compatibility policy lives behind this module's facade. Internal call sites
 # intentionally continue resolving these globals so facade monkeypatches keep
@@ -3815,12 +3832,74 @@ class _GpuShapeResolverMixin:
     # shape-aware autoscalers.
     _replica_cost_cache: dict[int, float]
     configured_accelerator_shapes: dict[str, int]
+    latest_version: int
+    _service_name: str
     # Immutable per-decision legacy handle snapshot, populated before the
     # autoscaler state lock is acquired.
     _gpu_shape_handles_for_tick: dict[int, Any] | None
 
     def _supports_exact_fill_shape_resolution(self) -> bool:
         return True
+
+    def _prepare_scaling_decision_inputs(
+        self, replica_infos: list['replica_managers.ReplicaInfo']
+    ) -> ScalingDecisionInputs:
+        """Resolve every durable input before routing serialization."""
+        historical_versions = {
+            info.version
+            for info in replica_infos
+            if not info.is_terminal and info.version != self.latest_version
+        }
+        if historical_versions:
+            historical_versions.difference_update(
+                self._cached_historical_scaling_versions())
+        sorted_historical_versions = sorted(historical_versions)
+        historical_values: dict[int, Any] = {}
+        if sorted_historical_versions:
+            load_failed = False
+            try:
+                historical_specs = serve_state.get_specs(
+                    self._service_name, sorted_historical_versions)
+            except Exception as e:  # pylint: disable=broad-except
+                load_failed = True
+                logger.warning(
+                    'Failed to batch-load historical service specs for '
+                    f'versions {sorted_historical_versions}: '
+                    f'{common_utils.format_exception(e)}')
+                historical_specs = {}
+            for version in sorted_historical_versions:
+                value = self._normalize_historical_scaling_spec(
+                    historical_specs.get(version))
+                if value is None and not load_failed:
+                    logger.warning(
+                        'No usable scaling capacity metadata for historical '
+                        'version %s; using the latest-version fallback for '
+                        'this decision tick.', version)
+                historical_values[version] = value
+        return ScalingDecisionInputs(
+            tuple(info.replica_id for info in replica_infos),
+            gpu_shape_handles=self._resolve_gpu_shape_handles(replica_infos),
+            historical_scaling_values=historical_values)
+
+    def _cached_historical_scaling_versions(self) -> set[int]:
+        """Return versions whose capacity metadata needs no durable read."""
+        raise NotImplementedError
+
+    def _normalize_historical_scaling_spec(self, spec: Any) -> Any:
+        """Extract immutable capacity metadata from one historical spec."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _validate_scaling_decision_inputs(
+        decision_inputs: ScalingDecisionInputs,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+    ) -> None:
+        if not isinstance(decision_inputs, ScalingDecisionInputs):
+            raise TypeError('Invalid scaling decision input token.')
+        replica_ids = tuple(info.replica_id for info in replica_infos)
+        if decision_inputs.replica_ids != replica_ids:
+            raise ValueError('Scaling decision inputs do not match the exact '
+                             'replica snapshot.')
 
     def _resolve_fill_gpu_shape(
             self, info: 'replica_managers.ReplicaInfo') -> tuple[str, int]:
@@ -3906,10 +3985,10 @@ class _GpuShapeResolverMixin:
         batch instead of falling back to per-replica reads under the lock.
         """
         unresolved = [
-            info for info in replica_infos
-            if ((info.replica_id not in self._gpu_shape_cache and
+            info for info in replica_infos if (not info.is_terminal and (
+                (info.replica_id not in self._gpu_shape_cache and
                  self._gpu_shape_from_resources_override(info) is None) or
-                info.replica_id not in self._replica_cost_cache)
+                info.replica_id not in self._replica_cost_cache))
         ]
         if not unresolved:
             return {}
@@ -4345,10 +4424,50 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
         replica_infos: list['replica_managers.ReplicaInfo'],
         active_versions: list[int],
     ) -> list[AutoscalerDecision]:
-        shape_handles = self._resolve_gpu_shape_handles(replica_infos)
+        decision_inputs = self._prepare_scaling_decision_inputs(replica_infos)
+        return self._generate_scaling_decisions_with_inputs(
+            replica_infos, active_versions, decision_inputs)
+
+    def _cached_historical_scaling_versions(self) -> set[int]:
+        with self._instance_state_lock:
+            return set(self._qps_dict_by_version)
+
+    def _normalize_historical_scaling_spec(
+            self, spec: Any) -> dict[str, float] | None:
+        if spec is None or not isinstance(spec.target_qps_per_replica, dict):
+            return None
+        return dict(spec.target_qps_per_replica)
+
+    def _generate_scaling_decisions_with_inputs(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+        decision_inputs: ScalingDecisionInputs,
+    ) -> list[AutoscalerDecision]:
+        """Consume controller-prepared handles without public API changes."""
+        self._validate_scaling_decision_inputs(decision_inputs, replica_infos)
+        shape_handles = decision_inputs.gpu_shape_handles
+        if shape_handles is None:
+            raise ValueError('Shape-aware scaling inputs have no handle '
+                             'snapshot.')
+        historical_values = decision_inputs.historical_scaling_values
+        if historical_values is None:
+            raise ValueError('Shape-aware scaling inputs have no historical '
+                             'capacity snapshot.')
+        for version, value in historical_values.items():
+            if value is not None and not isinstance(value, dict):
+                raise TypeError('Invalid prepared historical QPS '
+                                f'value for version {version}.')
         with self._instance_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
-            self._qps_dict_unavailable_versions_for_tick = set()
+            self._qps_dict_unavailable_versions_for_tick = {
+                version for version, value in historical_values.items()
+                if value is None
+            }
+            for version, value in historical_values.items():
+                if value is not None:
+                    assert isinstance(value, dict)
+                    self._qps_dict_by_version[version] = value
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
@@ -4949,28 +5068,18 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
             assert isinstance(self.target_qps_per_replica, dict), \
                 'Expected dict for instance-aware logic'
             return self.target_qps_per_replica
-        qps_dict = None
-        load_failed = False
-        try:
-            spec = serve_state.get_spec(self._service_name, version)
-            if spec is not None:
-                qps_dict = spec.target_qps_per_replica
-        except Exception as e:  # pylint: disable=broad-except
-            load_failed = True
-            logger.warning('Failed to load spec for version '
-                           f'{version}: {common_utils.format_exception(e)}')
-        if not isinstance(qps_dict, dict):
-            if not load_failed:
-                logger.warning(
-                    'No usable target QPS spec for historical version %s; '
-                    'using the latest-version fallback.', version)
-            if unavailable_versions is not None:
-                unavailable_versions.add(version)
-            assert isinstance(self.target_qps_per_replica, dict), \
-                'Expected dict for instance-aware logic'
-            return self.target_qps_per_replica
-        self._qps_dict_by_version[version] = qps_dict
-        return qps_dict
+        # Historical metadata has one canonical I/O path: the prepared token.
+        # An unexpected miss must fail closed rather than re-enter PostgreSQL
+        # from decision generation under the controller routing lock.
+        if unavailable_versions is not None:
+            unavailable_versions.add(version)
+        else:
+            logger.warning(
+                'Historical QPS version %s was used outside a prepared '
+                'decision; using the latest-version fallback.', version)
+        assert isinstance(self.target_qps_per_replica, dict), \
+            'Expected dict for instance-aware logic'
+        return self.target_qps_per_replica
 
     def _get_target_qps_for_gpu_shape(self,
                                       gpu_type: str,
@@ -5999,20 +6108,17 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if (unavailable_versions is not None and
                 version in unavailable_versions):
             return self.target_concurrency_per_replica
-        knob = None
-        try:
-            spec = serve_state.get_spec(self._service_name, version)
-            if spec is not None:
-                knob = spec.target_concurrency_per_replica
-        except Exception as e:  # pylint: disable=broad-except
-            logger.warning('Failed to load spec for version '
-                           f'{version}: {common_utils.format_exception(e)}')
-        if knob is None:
-            if unavailable_versions is not None:
-                unavailable_versions.add(version)
-            return self.target_concurrency_per_replica
-        self._knob_by_version[version] = float(knob)
-        return float(knob)
+        # Historical metadata has one canonical I/O path: the prepared token.
+        # An unexpected miss must fail closed rather than re-enter PostgreSQL
+        # from decision generation under the controller routing lock.
+        if unavailable_versions is not None:
+            unavailable_versions.add(version)
+        else:
+            logger.warning(
+                'Historical concurrency version %s was used outside a '
+                'prepared decision; using the latest-version fallback.',
+                version)
+        return self.target_concurrency_per_replica
 
     def _replica_capacity(self, info: 'replica_managers.ReplicaInfo') -> float:
         """A replica's capacity in the autoscaler's target units.
@@ -7877,10 +7983,54 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         replica_infos: list['replica_managers.ReplicaInfo'],
         active_versions: list[int],
     ) -> list[AutoscalerDecision]:
-        shape_handles = self._resolve_gpu_shape_handles(replica_infos)
+        decision_inputs = self._prepare_scaling_decision_inputs(replica_infos)
+        return self._generate_scaling_decisions_with_inputs(
+            replica_infos, active_versions, decision_inputs)
+
+    def _cached_historical_scaling_versions(self) -> set[int]:
+        with self._logical_state_lock:
+            return set(self._knob_by_version)
+
+    def _normalize_historical_scaling_spec(self, spec: Any) -> float | None:
+        if spec is None or spec.target_concurrency_per_replica is None:
+            return None
+        try:
+            return float(spec.target_concurrency_per_replica)
+        except (TypeError, ValueError):
+            return None
+
+    def _generate_scaling_decisions_with_inputs(
+        self,
+        replica_infos: list['replica_managers.ReplicaInfo'],
+        active_versions: list[int],
+        decision_inputs: ScalingDecisionInputs,
+    ) -> list[AutoscalerDecision]:
+        """Consume controller-prepared handles without public API changes."""
+        self._validate_scaling_decision_inputs(decision_inputs, replica_infos)
+        shape_handles = decision_inputs.gpu_shape_handles
+        if shape_handles is None:
+            raise ValueError('Shape-aware scaling inputs have no handle '
+                             'snapshot.')
+        historical_values = decision_inputs.historical_scaling_values
+        if historical_values is None:
+            raise ValueError('Shape-aware scaling inputs have no historical '
+                             'capacity snapshot.')
+        for version, value in historical_values.items():
+            if (value is not None and
+                (not isinstance(value,
+                                (int, float)) or isinstance(value, bool))):
+                raise TypeError('Invalid prepared historical concurrency '
+                                f'value for version {version}.')
         with self._logical_state_lock:
             self._gpu_shape_handles_for_tick = shape_handles
-            self._knob_unavailable_versions_for_tick = set()
+            self._knob_unavailable_versions_for_tick = {
+                version for version, value in historical_values.items()
+                if value is None
+            }
+            for version, value in historical_values.items():
+                if value is not None:
+                    assert isinstance(value, (int, float))
+                    self._knob_by_version[version] = float(value)
             try:
                 return self._generate_scaling_decisions_locked(
                     replica_infos, active_versions)
@@ -9403,3 +9553,61 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
         Hysteresis state is handled by base class, no additional state needed.
         """
         pass
+
+
+def _prepared_scaling_implementation(autoscaler: Any) -> str | None:
+    """Identify an unmodified built-in shape-aware public implementation.
+
+    The controller adapter must not assume that every Autoscaler subclass (or
+    duck-typed implementation) accepts new methods or keyword arguments. A
+    bound method's ``__func__`` proves the public implementation is one of the
+    two built-ins whose private prepared-input path we own. Instance-level
+    replacements and subclasses that override the public method therefore
+    retain the historical two-positional-argument call.
+    """
+    public_method = getattr(autoscaler, 'generate_scaling_decisions', None)
+    public_function = getattr(public_method, '__func__', None)
+    if (isinstance(autoscaler, InstanceAwareRequestRateAutoscaler) and
+            public_function
+            is InstanceAwareRequestRateAutoscaler.generate_scaling_decisions):
+        return 'instance-aware-request-rate'
+    if (isinstance(autoscaler, ConcurrencyAutoscaler) and public_function
+            is ConcurrencyAutoscaler.generate_scaling_decisions):
+        return 'concurrency'
+    return None
+
+
+def prepare_controller_scaling_decision_inputs(
+    autoscaler: Any,
+    replica_infos: list['replica_managers.ReplicaInfo'],
+) -> ScalingDecisionInputs | None:
+    """Resolve blocking built-in inputs before controller serialization.
+
+    ``None`` means the implementation owns only the historical public method
+    and the controller must call that method unchanged.
+    """
+    if _prepared_scaling_implementation(autoscaler) is None:
+        return None
+    return autoscaler._prepare_scaling_decision_inputs(replica_infos)  # pylint: disable=protected-access
+
+
+def controller_prepares_scaling_decision_inputs(autoscaler: Any) -> bool:
+    """Whether the canonical controller adapter owns a blocking preload."""
+    return _prepared_scaling_implementation(autoscaler) is not None
+
+
+def generate_controller_scaling_decisions(
+    autoscaler: Any,
+    replica_infos: list['replica_managers.ReplicaInfo'],
+    active_versions: list[int],
+    decision_inputs: ScalingDecisionInputs | None,
+) -> list[AutoscalerDecision]:
+    """Consume prepared inputs or preserve the custom autoscaler contract."""
+    if decision_inputs is None:
+        return autoscaler.generate_scaling_decisions(replica_infos,
+                                                     active_versions)
+    if _prepared_scaling_implementation(autoscaler) is None:
+        raise RuntimeError('Autoscaler scaling implementation changed while '
+                           'its blocking inputs were prepared.')
+    return autoscaler._generate_scaling_decisions_with_inputs(  # pylint: disable=protected-access
+        replica_infos, active_versions, decision_inputs)

@@ -4137,6 +4137,37 @@ class TestGetServiceRuntimeSnapshot:
         assert counts['n'] == 1
 
 
+def test_scale_planning_fingerprint_tracks_replica_and_runtime_mutations(
+        _mock_serve_db):
+    _add_minimal_service('svc-planning-fingerprint')
+    replica = _replica(1)
+    assert serve_state.add_or_update_replica('svc-planning-fingerprint', 1,
+                                             replica)
+
+    initial = serve_state.get_scale_planning_state_fingerprint(
+        'svc-planning-fingerprint', require_version=True)
+    assert initial is not None
+
+    replica.resources_override = {'accelerators': {'A100': 1}}
+    assert serve_state.add_or_update_replica('svc-planning-fingerprint',
+                                             1,
+                                             replica,
+                                             expected_replica_exists=True)
+    changed_replica = serve_state.get_scale_planning_state_fingerprint(
+        'svc-planning-fingerprint', require_version=True)
+    assert changed_replica is not None
+    assert changed_replica != initial
+
+    serve_state.set_service_status_and_active_versions(
+        'svc-planning-fingerprint',
+        serve_state.ServiceStatus.CONTROLLER_INIT,
+        active_versions=[2])
+    changed_runtime = serve_state.get_scale_planning_state_fingerprint(
+        'svc-planning-fingerprint', require_version=True)
+    assert changed_runtime is not None
+    assert changed_runtime != changed_replica
+
+
 class TestGetServiceStatusSnapshot:
     """Control paths read one slim, version-backed service row."""
 

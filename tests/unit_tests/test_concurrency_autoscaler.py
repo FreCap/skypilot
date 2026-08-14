@@ -6903,7 +6903,7 @@ class TestUpdateVersion(unittest.TestCase):
         self.assertEqual(autoscaler._replica_capacity(old), 4.0)
         self.assertEqual(autoscaler._replica_capacity(new), 8.0)
 
-    def test_unknown_version_knob_rehydrates_from_spec(self):
+    def test_unknown_version_knob_rehydrates_from_prepared_batch(self):
         # Rebuilt autoscaler (controller restart mid-rolling-update):
         # version-1 entry is gone; the durable per-version spec restores
         # the old replicas' true capacity.
@@ -6911,24 +6911,39 @@ class TestUpdateVersion(unittest.TestCase):
                                                        _spec(knob=2.0),
                                                        version=2)
         old = _replica(1, gpu_count=1, version=1)
+        autoscaler._gpu_shape_cache[1] = ('L4', 1)
+        autoscaler._replica_cost_cache[1] = 0.0
+
+        def _resolve(*_args):
+            return [autoscaler._replica_capacity(old)]
+
         with mock.patch.object(autoscalers.serve_state,
-                               'get_spec',
-                               return_value=_spec(knob=0.5)):
-            self.assertEqual(autoscaler._replica_capacity(old), 0.5)
+                               'get_specs',
+                               return_value={1: _spec(knob=0.5)}) as mock_get, \
+             mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_resolve):
+            self.assertEqual(
+                autoscaler.generate_scaling_decisions([old], [1, 2]), [0.5])
         # Memoized: later ticks don't re-read the spec.
         with mock.patch.object(autoscalers.serve_state,
-                               'get_spec',
-                               side_effect=AssertionError):
-            self.assertEqual(autoscaler._replica_capacity(old), 0.5)
+                               'get_specs',
+                               side_effect=AssertionError), \
+             mock.patch.object(autoscaler,
+                               '_generate_scaling_decisions_locked',
+                               side_effect=_resolve):
+            self.assertEqual(
+                autoscaler.generate_scaling_decisions([old], [1, 2]), [0.5])
+        mock_get.assert_called_once_with('svc', [1])
 
-    def test_unavailable_version_spec_falls_back_to_latest_knob(self):
+    def test_unprepared_version_falls_back_without_db(self):
         autoscaler = autoscalers.ConcurrencyAutoscaler('svc',
                                                        _spec(knob=2.0),
                                                        version=2)
         old = _replica(1, gpu_count=1, version=1)
         with mock.patch.object(autoscalers.serve_state,
-                               'get_spec',
-                               return_value=None):
+                               'get_specs',
+                               side_effect=AssertionError):
             self.assertEqual(autoscaler._replica_capacity(old), 2.0)
 
     def test_version_fallback_read_once_per_tick_and_retries(self):
@@ -6936,29 +6951,33 @@ class TestUpdateVersion(unittest.TestCase):
                                                        _spec(knob=2.0),
                                                        version=2)
         old = _replica(1, gpu_count=1, version=1)
+        autoscaler._gpu_shape_cache[1] = ('L4', 1)
+        autoscaler._replica_cost_cache[1] = 0.0
         state = {'recovered': False}
 
-        def _get_spec(*_args):
+        def _get_specs(*_args):
             if not state['recovered']:
                 raise RuntimeError('state store unavailable')
-            return _spec(knob=0.5)
+            return {1: _spec(knob=0.5)}
 
         def _resolve_repeatedly(*_args):
             return [autoscaler._replica_capacity(old) for _ in range(3)]
 
         with mock.patch.object(autoscalers.serve_state,
-                               'get_spec',
-                               side_effect=_get_spec) as mock_get, \
+                               'get_specs',
+                               side_effect=_get_specs) as mock_get, \
              mock.patch.object(autoscaler,
                                '_generate_scaling_decisions_locked',
                                side_effect=_resolve_repeatedly):
-            self.assertEqual(autoscaler.generate_scaling_decisions([], [2]),
-                             [2.0, 2.0, 2.0])
-            mock_get.assert_called_once_with('svc', 1)
+            self.assertEqual(
+                autoscaler.generate_scaling_decisions([old], [1, 2]),
+                [2.0, 2.0, 2.0])
+            mock_get.assert_called_once_with('svc', [1])
 
             state['recovered'] = True
-            self.assertEqual(autoscaler.generate_scaling_decisions([], [2]),
-                             [0.5, 0.5, 0.5])
+            self.assertEqual(
+                autoscaler.generate_scaling_decisions([old], [1, 2]),
+                [0.5, 0.5, 0.5])
             self.assertEqual(mock_get.call_count, 2)
 
     def test_version_fallback_does_not_authorize_rolling_drain(self):
@@ -6978,15 +6997,16 @@ class TestUpdateVersion(unittest.TestCase):
                 queue_depth=60)
 
         with mock.patch.object(autoscalers.serve_state,
-                               'get_spec',
+                               'get_specs',
                                side_effect=[
-                                   RuntimeError('state store unavailable'),
-                                   _spec(knob=0.1)
+                                   RuntimeError('state store unavailable'), {
+                                       1: _spec(knob=0.1)
+                                   }
                                ]) as mock_get:
             first = _decisions(autoscaler, replicas, (1, 2))
             self.assertEqual(_scale_downs(first), [])
             self.assertEqual(len(_scale_ups(first)), 5)
-            mock_get.assert_called_once_with('svc', 1)
+            mock_get.assert_called_once_with('svc', [1])
 
             second = _decisions(autoscaler, replicas, (1, 2))
             self.assertEqual(_scale_downs(second), [])
