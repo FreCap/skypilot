@@ -2,7 +2,7 @@
 
 _Created: 2026-08-01_
 
-_Status: v0-v1d deployed; v1e implemented pending CI/merge/rollout_
+_Status: v0-v1e deployed; rollout verified_
 _Last updated: 2026-08-14_
 
 ## Problems
@@ -379,11 +379,43 @@ Local evidence on 2026-08-04:
 - The real-PostgreSQL aggregate/ID pricing test is collected, but skipped on
   this host because Docker and `SKYPILOT_TEST_POSTGRES_URL` are unavailable.
 
-The real-PostgreSQL pricing test must execute in the required PostgreSQL CI
-lane; its local skip does not close the merge gate. Manual `boltz-l4-fleet`
-verification, the full CI rollup on the exact pushed SHA, merge, and any
-production deployment remain open gates until their evidence is recorded
-here.
+Production v1e evidence on 2026-08-14:
+
+- Before v1e, controller-backed metadata took 6.18 seconds, controller-backed
+  summary took 6.55 seconds, and full status took 27.97 seconds for 4.1 MB and
+  9,195 retained replica rows. The existing direct PostgreSQL summary took
+  0.13 seconds. Per-service metadata calls retained the same floor, including
+  services with no replicas, isolating controller compatibility transport as
+  the delay rather than SQL volume or browser rendering.
+- The focused backend suite passed 57 tests, the dashboard connector/component
+  suites passed 64 tests, `format.sh` completed YAPF/isort, mypy (929 source
+  files), pylint (10.00/10), dashboard ESLint, and Prettier, and the optimized
+  dashboard build completed successfully.
+- PR #1479 merged as `c24ae4fe08a03101180c8401a34a1b241444116b`. The
+  immutable image `1.1.1273` resolved to
+  `sha256:f7b749d5fcb0949e9ff432829d56d08d8b4d2e3f1aa48f2c9ad5b4edc165b1fb`,
+  and the matching chart resolved to
+  `sha256:81cdea45fd2c43778ddba24fe25210c0369367b3084daaaf2f8132a5559ab762`.
+  Helm revision 389 deployed atomically with existing values and login-init
+  images preserved. The API reports healthy at version `1.1.1273` and the
+  exact merge commit.
+- After rollout, the direct projection returned all six services and every
+  first-paint lifecycle field in 0.15 seconds. The live services bundle
+  contains the mixed-version capability contract. Controller metadata still
+  took 5.02 seconds and now enriches the already-visible rows instead of
+  blocking them.
+- `boltz-l4-fleet` remained `READY`; both warm-standby load-balancer slots were
+  1/1 ready, and the new API pod emitted no error-like log lines during the
+  rollout verification window.
+- The broad feature-head unit job passed 17,020 tests and exposed one stale
+  exact-response assertion for the new non-consolidated capability marker.
+  PR #1480 updates that assertion; its focused API test file and the full local
+  formatting/type/lint gate pass. The exact-head CI rollup remains its merge
+  gate and does not change the deployed runtime contract.
+
+The real-PostgreSQL pricing test remains assigned to its required PostgreSQL CI
+lane. There are no remaining v1e runtime rollout gates; PR #1480 is the
+assertion-only CI closeout.
 
 ## Release and rollback
 
