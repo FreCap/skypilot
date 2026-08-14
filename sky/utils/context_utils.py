@@ -225,10 +225,11 @@ def sleep_with_cancellation(seconds: float) -> None:
     cancelled = threading.Event()
     ctx.register_cancel_callback(cancelled.set)
     try:
-        if cancelled.wait(seconds) or ctx.is_canceled():
-            raise asyncio.CancelledError('Request cancelled during wait')
+        cancelled_during_wait = cancelled.wait(seconds)
     finally:
         ctx.unregister_cancel_callback(cancelled.set)
+    if cancelled_during_wait or ctx.is_canceled():
+        raise asyncio.CancelledError('Request cancelled during wait')
 
 
 P = ParamSpec('P')
