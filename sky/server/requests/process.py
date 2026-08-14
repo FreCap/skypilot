@@ -155,6 +155,17 @@ class _HandlerReport:
     outcome: InvocationOutcome
 
 
+@dataclasses.dataclass(frozen=True)
+class _Invocation:
+    """Opaque invocation decoded only inside the isolated handler process."""
+
+    fn: Callable
+    initializer: Callable | None
+    initargs: tuple
+    args: tuple
+    kwargs: dict[str, Any]
+
+
 @dataclasses.dataclass
 class _InvocationRecord:
     guardian: multiprocessing_process.BaseProcess
@@ -211,14 +222,60 @@ def _make_process_non_dumpable() -> None:
         raise OSError('Kernel did not disable process dumpability.')
 
 
-def _close_unrelated_fds(keep_fds: frozenset[int]) -> None:
-    """Close raw descriptors inherited across an internal ``fork()``.
+def _quarantine_fd_slots(open_fds: tuple[int, ...],
+                         keep_fds: frozenset[int]) -> None:
+    """Replace unwanted descriptor slots without making them reusable.
+
+    ``os.close()`` cannot invalidate the Python objects that owned an inherited
+    descriptor before ``fork()``.  If a protocol pipe later reuses that numeric
+    slot, the stale object's normal cleanup can close the live pipe.  Replacing
+    the underlying descriptor atomically with ``/dev/null`` removes access to
+    the inherited resource while reserving its number until the stale owner
+    closes it.  The one-shot process then provides the final lifetime bound for
+    any ownerless quarantine slots.
+
+    Callers run this in a single-threaded fork child before allocating any
+    later protocol descriptors or executing invocation-specific Python code.
+    A stale owner therefore cannot release a placeholder early enough for a
+    later protocol descriptor to reuse its number.
+    """
+    quarantine_fds = tuple(fd for fd in open_fds if fd not in keep_fds)
+    if not quarantine_fds:
+        return
+    flags = os.O_RDWR
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+    null_fd = os.open(os.devnull, flags)
+    try:
+        for fd in quarantine_fds:
+            if fd == null_fd:
+                continue
+            try:
+                os.fstat(fd)
+            except OSError as e:
+                if e.errno == errno.EBADF:
+                    continue
+                raise BoundaryExecutionError(
+                    f'Could not inspect inherited descriptor {fd}: {e}') from e
+            try:
+                os.dup2(null_fd, fd, inheritable=False)
+            except OSError as e:
+                raise BoundaryExecutionError(
+                    f'Could not quarantine inherited descriptor {fd}: {e}'
+                ) from e
+    finally:
+        os.close(null_fd)
+
+
+def _quarantine_unrelated_fds(keep_fds: frozenset[int]) -> None:
+    """Remove inherited access without permitting stale descriptor aliases.
 
     In particular, Python's spawn implementation leaves the guardian side of
     its multiprocessing sentinel open.  A forked handler retaining that writer
     would make the API's ``Process.join()`` wait forever after both owners die.
-    Internal descendants therefore inherit only their explicit protocol
-    endpoints and standard streams.
+    Internal descendants therefore retain access only to their explicit
+    protocol endpoints and standard streams; every other numeric descriptor
+    slot is quarantined until its stale Python owner or the process exits.
     """
     keep_fds = keep_fds | frozenset({0, 1, 2})
     try:
@@ -227,15 +284,7 @@ def _close_unrelated_fds(keep_fds: frozenset[int]) -> None:
     except OSError as e:
         raise BoundaryExecutionError(
             f'Could not enumerate inherited process descriptors: {e}') from e
-    for fd in open_fds:
-        if fd in keep_fds:
-            continue
-        try:
-            os.close(fd)
-        except OSError as e:
-            if e.errno != errno.EBADF:
-                raise BoundaryExecutionError(
-                    f'Could not close inherited descriptor {fd}: {e}') from e
+    _quarantine_fd_slots(open_fds, keep_fds)
 
 
 def _identity_matches(identity: ProcessIdentity) -> bool:
@@ -408,11 +457,26 @@ def _normalize_outcome(value: Any) -> InvocationOutcome:
     return InvocationOutcome(InvocationOutcomeKind.SUCCEEDED, value=value)
 
 
-def _handler_main(fn: Callable, initializer: Callable | None, initargs: tuple,
+def _serialize_invocation(fn: Callable, initializer: Callable | None,
+                          initargs: tuple, args: tuple,
+                          kwargs: dict[str, Any]) -> bytes:
+    """Freeze an invocation for decoding only in the isolated handler."""
+    return pickle.dumps(_Invocation(fn, initializer, initargs, args, kwargs),
+                        protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _deserialize_invocation(payload: bytes) -> _Invocation:
+    """Decode one parent-created invocation after raw FD isolation."""
+    invocation = pickle.loads(payload)
+    if not isinstance(invocation, _Invocation):
+        raise BoundaryExecutionError('Invocation payload has an invalid type.')
+    return invocation
+
+
+def _handler_main(invocation_payload: bytes,
                   report_connection: multiprocessing_connection.Connection,
                   finalize_connection: multiprocessing_connection.Connection,
-                  capability_fd: int | None, args: tuple,
-                  kwargs: dict[str, Any]) -> None:
+                  capability_fd: int | None) -> None:
     """Run one handler, report its outcome, then retain its family root."""
     try:
         os.setsid()
@@ -429,9 +493,11 @@ def _handler_main(fn: Callable, initializer: Callable | None, initargs: tuple,
                 capability_fd = None
             setproctitle.setproctitle(
                 f'SkyPilot:executor:handler:{os.getpid()}')
-            if initializer is not None:
-                initializer(*initargs)
-            outcome = _normalize_outcome(fn(*args, **kwargs))
+            invocation = _deserialize_invocation(invocation_payload)
+            if invocation.initializer is not None:
+                invocation.initializer(*invocation.initargs)
+            outcome = _normalize_outcome(
+                invocation.fn(*invocation.args, **invocation.kwargs))
         except KeyboardInterrupt as e:
             outcome = InvocationOutcome(InvocationOutcomeKind.CANCELLED,
                                         error=_transportable_error(e))
@@ -485,11 +551,7 @@ def _handler_main(fn: Callable, initializer: Callable | None, initargs: tuple,
 
 
 def _spawn_handler(
-    fn: Callable,
-    initializer: Callable | None,
-    initargs: tuple,
-    args: tuple,
-    kwargs: dict[str, Any],
+    invocation_payload: bytes,
     capability_fd: int | None,
     inherited_connections: tuple[multiprocessing_connection.Connection, ...],
 ) -> tuple[ProcessIdentity, multiprocessing_connection.Connection,
@@ -508,10 +570,10 @@ def _spawn_handler(
         kept_fds = {report_child.fileno(), finalize_child.fileno()}
         if capability_fd is not None:
             kept_fds.add(capability_fd)
-        _close_unrelated_fds(frozenset(kept_fds))
+        _quarantine_unrelated_fds(frozenset(kept_fds))
         try:
-            _handler_main(fn, initializer, initargs, report_child,
-                          finalize_child, capability_fd, args, kwargs)
+            _handler_main(invocation_payload, report_child, finalize_child,
+                          capability_fd)
         finally:
             os._exit(0)  # pylint: disable=protected-access
     report_child.close()
@@ -610,12 +672,8 @@ def _inner_warden_main(
     parent_connection: multiprocessing_connection.Connection,
     guardian: ProcessIdentity,
     boundary_token: str,
-    fn: Callable,
-    initializer: Callable | None,
-    initargs: tuple,
+    invocation_payload: bytes,
     capability_fd: int | None,
-    args: tuple,
-    kwargs: dict[str, Any],
 ) -> None:
     """Own handler effects and take over publication if the outer dies."""
     termination_requested = threading.Event()
@@ -656,11 +714,7 @@ def _inner_warden_main(
                 error=concurrent.futures.CancelledError())
         else:
             handler, report_connection, finalize_connection = _spawn_handler(
-                fn,
-                initializer,
-                initargs,
-                args,
-                kwargs,
+                invocation_payload,
                 capability_fd,
                 inherited_connections=(outer_connection, parent_connection))
             if capability_fd is not None:
@@ -727,12 +781,8 @@ def _inner_warden_main(
 def _outer_guardian_main(
     parent_connection: multiprocessing_connection.Connection,
     boundary_token: str,
-    fn: Callable,
-    initializer: Callable | None,
-    initargs: tuple,
+    invocation_payload: bytes,
     capability_handle: Any | None,
-    args: tuple,
-    kwargs: dict[str, Any],
 ) -> None:
     """Publish admission identity and own the final invocation boundary."""
     termination_requested = threading.Event()
@@ -761,11 +811,11 @@ def _outer_guardian_main(
         kept_fds = {inner_connection.fileno(), parent_connection.fileno()}
         if capability_fd is not None:
             kept_fds.add(capability_fd)
-        _close_unrelated_fds(frozenset(kept_fds))
+        _quarantine_unrelated_fds(frozenset(kept_fds))
         try:
             _inner_warden_main(inner_connection, parent_connection, guardian,
-                               boundary_token, fn, initializer, initargs,
-                               capability_fd, args, kwargs)
+                               boundary_token, invocation_payload,
+                               capability_fd)
         finally:
             os._exit(0)  # pylint: disable=protected-access
     if capability_fd is not None:
@@ -1022,7 +1072,10 @@ class InvocationFuture(concurrent.futures.Future):
 
 
 class DisposableExecutor:
-    """Finite executor that creates one owned process boundary per task."""
+    """Finite executor that creates one owned process boundary per task.
+
+    Callables, initializer state, and arguments must support standard pickle.
+    """
 
     def __init__(
         self,
@@ -1255,14 +1308,21 @@ class DisposableExecutor:
         startup_proof_seen = False
         registered = False
         try:
+            # Keep invocation-specific deserialization, reducers, and their
+            # descriptor-backed objects out of both boundary owners.  The final
+            # handler decodes this payload only after quarantining inherited raw
+            # descriptors; a stale object can therefore never close a reused
+            # protocol FD.
+            invocation_payload = _serialize_invocation(fn, self._initializer,
+                                                       self._initargs, args,
+                                                       kwargs)
             parent_connection, guardian_connection = multiprocessing.Pipe(
                 duplex=True)
             guardian = _SPAWN_CONTEXT.Process(
                 target=_outer_guardian_main,
-                args=(guardian_connection, boundary_token, fn,
-                      self._initializer, self._initargs,
+                args=(guardian_connection, boundary_token, invocation_payload,
                       (multiprocessing_reduction.DupFd(capability_fd)
-                       if capability_fd is not None else None), args, kwargs),
+                       if capability_fd is not None else None)),
                 daemon=False)
             guardian.start()
             guardian_connection.close()
