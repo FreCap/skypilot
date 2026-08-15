@@ -897,20 +897,20 @@ def get_task_id_name_status_log(
     job_id: int, task_id: int
 ) -> tuple[int, str, ManagedJobStatus, str | None, float | None] | None:
     """Return one task row used by the terminal log-follow path."""
+    # Reuse the gateway's duplicate-collapse policy while keeping this legacy
+    # projection free of task-count and routing work.
+    matching_task = state_task_lookups._preferred_log_task(  # pylint: disable=protected-access
+        job_id, task_id=task_id)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
             sqlalchemy.select(
-                spot_table.c.task_id,
-                spot_table.c.task_name,
-                spot_table.c.status,
-                spot_table.c.local_log_file,
-                spot_table.c.logs_cleaned_at,
-            ).where(
-                sqlalchemy.and_(
-                    spot_table.c.spot_job_id == job_id,
-                    spot_table.c.task_id == task_id,
-                ))).fetchone()
+                matching_task.c.task_id,
+                matching_task.c.task_name,
+                matching_task.c.status,
+                matching_task.c.local_log_file,
+                matching_task.c.logs_cleaned_at,
+            )).fetchone()
     if row is None:
         return None
     return row[0], row[1], ManagedJobStatus(row[2]), row[3], row[4]

@@ -52,6 +52,49 @@ def _task_wait_lookup(row: Any) -> TaskWaitStatusLookup:
     )
 
 
+def _preferred_log_task(job_id: int,
+                        task_id: int | None = None,
+                        task_name: str | None = None) -> Any:
+    """Select one coherent row for a possibly duplicated task identity."""
+    assert (task_id is None) != (task_name is None), (task_id, task_name)
+    if task_name is not None:
+        selected_task_id = sqlalchemy.select(
+            sqlalchemy.func.min(  # pylint: disable=not-callable
+                spot_table.c.task_id)).where(
+                    sqlalchemy.and_(
+                        spot_table.c.spot_job_id == job_id,
+                        spot_table.c.task_name == task_name,
+                    )).scalar_subquery()
+    else:
+        selected_task_id = task_id
+
+    terminal_values = [
+        status.value for status in ManagedJobStatus.terminal_statuses()
+    ]
+    preferred_job_id = sqlalchemy.select(
+        sqlalchemy.func.coalesce(  # pylint: disable=not-callable
+            sqlalchemy.func.max(
+                sqlalchemy.case(
+                    (~spot_table.c.status.in_(terminal_values),
+                     spot_table.c.job_id),
+                    else_=None,
+                )),
+            sqlalchemy.func.max(spot_table.c.job_id),
+        )).where(
+            sqlalchemy.and_(
+                spot_table.c.spot_job_id == job_id,
+                spot_table.c.task_id == selected_task_id,
+            )).scalar_subquery()
+    return sqlalchemy.select(
+        spot_table.c.spot_job_id,
+        spot_table.c.task_id,
+        spot_table.c.status,
+        spot_table.c.task_name,
+        spot_table.c.local_log_file,
+        spot_table.c.logs_cleaned_at,
+    ).where(spot_table.c.job_id == preferred_job_id).subquery()
+
+
 @db_retries.retry
 def get_task_wait_status_lookup(job_id: int,
                                 task_id: int) -> TaskWaitStatusLookup:
@@ -140,28 +183,26 @@ def get_task_log_stream_lookup(job_id: int,
         sqlalchemy.literal(job_id).label('spot_job_id'),
         task_count.label('num_tasks'),
     ).subquery()
+    matching_task = _preferred_log_task(job_id, task_id=task_id)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(
             sqlalchemy.select(
-                spot_table.c.task_id,
-                spot_table.c.status,
+                matching_task.c.task_id,
+                matching_task.c.status,
                 job_info_table.c.pool,
                 job_info_table.c.current_cluster_name,
                 job_info_table.c.job_id_on_pool_cluster,
-                spot_table.c.task_name,
-                spot_table.c.local_log_file,
-                spot_table.c.logs_cleaned_at,
+                matching_task.c.task_name,
+                matching_task.c.local_log_file,
+                matching_task.c.logs_cleaned_at,
                 job_scope.c.num_tasks,
             ).select_from(
                 job_scope.outerjoin(
-                    spot_table,
-                    sqlalchemy.and_(
-                        spot_table.c.spot_job_id == job_scope.c.spot_job_id,
-                        spot_table.c.task_id == task_id,
-                    )).outerjoin(
+                    matching_task, matching_task.c.spot_job_id ==
+                    job_scope.c.spot_job_id).outerjoin(
                         job_info_table, job_info_table.c.spot_job_id ==
-                        spot_table.c.spot_job_id))).fetchone()
+                        matching_task.c.spot_job_id))).fetchone()
     assert row is not None, (job_id, task_id)
     snapshot = JobLogStreamSnapshot(
         row.task_id,
@@ -195,18 +236,7 @@ def get_task_log_stream_lookup_by_name(job_id: int,
         sqlalchemy.literal(job_id).label('spot_job_id'),
         task_count.label('num_tasks'),
     ).subquery()
-    matching_task = sqlalchemy.select(
-        spot_table.c.spot_job_id,
-        spot_table.c.task_id,
-        spot_table.c.status,
-        spot_table.c.task_name,
-        spot_table.c.local_log_file,
-        spot_table.c.logs_cleaned_at,
-    ).where(
-        sqlalchemy.and_(
-            spot_table.c.spot_job_id == job_id,
-            spot_table.c.task_name == task_name,
-        )).order_by(spot_table.c.task_id.asc()).limit(1).subquery()
+    matching_task = _preferred_log_task(job_id, task_name=task_name)
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         row = session.execute(

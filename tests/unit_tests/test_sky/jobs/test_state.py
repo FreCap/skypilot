@@ -1159,6 +1159,96 @@ def test_get_task_log_stream_lookup_reads_one_task_snapshot(
     assert counts['n'] == 1, counts
 
 
+@pytest.mark.parametrize('terminal_first', [True, False])
+def test_task_log_lookups_prefer_active_duplicate(_mock_managed_jobs_db_conn,
+                                                  terminal_first):
+    engine = _mock_managed_jobs_db_conn
+    terminal = {
+        'spot_job_id': 42,
+        'task_id': 0,
+        'task_name': 'task-0',
+        'status': ManagedJobStatus.SUCCEEDED.value,
+        'local_log_file': '/tmp/stale.log',
+        'logs_cleaned_at': 1.0,
+    }
+    active = {
+        'spot_job_id': 42,
+        'task_id': 0,
+        'task_name': 'task-0',
+        'status': ManagedJobStatus.RECOVERING.value,
+        'local_log_file': '/tmp/active.log',
+        'logs_cleaned_at': None,
+    }
+    rows = [terminal, active] if terminal_first else [active, terminal]
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), rows)
+
+    expected = state.TaskLogStreamLookup(
+        snapshot=state.JobLogStreamSnapshot(0, ManagedJobStatus.RECOVERING,
+                                            None, None, None, 'task-0'),
+        local_log_file='/tmp/active.log',
+        logs_cleaned_at=None,
+        num_tasks=2,
+    )
+    for lookup in (
+            lambda: state.get_task_log_stream_lookup(42, 0),
+            lambda: state.get_task_log_stream_lookup_by_name(42, 'task-0')):
+        with _count_sql_statements(engine) as counts:
+            assert lookup() == expected
+        assert counts['n'] == 1, counts
+
+    with _count_sql_statements(engine) as counts:
+        terminal_row = state.get_task_id_name_status_log(42, 0)
+    assert terminal_row == (0, 'task-0', ManagedJobStatus.RECOVERING,
+                            '/tmp/active.log', None)
+    assert counts['n'] == 1, counts
+
+
+@pytest.mark.parametrize(
+    ('older_status', 'newer_status'),
+    [(ManagedJobStatus.SUCCEEDED, ManagedJobStatus.FAILED),
+     (ManagedJobStatus.PENDING, ManagedJobStatus.RECOVERING)],
+)
+def test_task_log_lookups_choose_newest_duplicate_in_lifecycle_class(
+        _mock_managed_jobs_db_conn, older_status, newer_status):
+    engine = _mock_managed_jobs_db_conn
+    with engine.begin() as connection:
+        connection.execute(state.spot_table.insert(), [{
+            'spot_job_id': 42,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': older_status.value,
+            'local_log_file': '/tmp/old.log',
+            'logs_cleaned_at': 1.0,
+        }, {
+            'spot_job_id': 42,
+            'task_id': 0,
+            'task_name': 'task-0',
+            'status': newer_status.value,
+            'local_log_file': '/tmp/new.log',
+            'logs_cleaned_at': 2.0,
+        }])
+
+    lookup = state.get_task_log_stream_lookup(42, 0)
+    assert lookup == state.TaskLogStreamLookup(
+        snapshot=state.JobLogStreamSnapshot(0, newer_status, None, None, None,
+                                            'task-0'),
+        local_log_file='/tmp/new.log',
+        logs_cleaned_at=2.0,
+        num_tasks=2,
+    )
+
+
+def test_preferred_log_task_compiles_for_postgresql():
+    query = sqlalchemy.select(
+        state_task_lookups._preferred_log_task(42, task_name='task-0'))
+    sql = str(query.compile(dialect=state.postgresql.dialect()))
+
+    assert 'coalesce' in sql.lower()
+    assert 'max(CASE WHEN' in sql
+    assert 'spot.task_id = (SELECT min(spot.task_id)' in sql
+
+
 def test_get_task_log_stream_lookup_missing_task_counts_existing_job(
         _mock_managed_jobs_db_conn):
     engine = _mock_managed_jobs_db_conn

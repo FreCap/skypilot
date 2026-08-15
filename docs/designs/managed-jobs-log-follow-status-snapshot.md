@@ -38,6 +38,16 @@ stays available. The active filtered path keeps split reads: lifecycle and
 routing come from the explicitly selected task snapshot rather than the latest
 whole-job task.
 
+The `spot` schema indexes but does not uniquely constrain
+`(spot_job_id, task_id)`, so an exact identity can retain stale rows from an
+older incarnation. Task-filtered log lookups must collapse that identity to one
+coherent row before materialization. Any non-terminal row wins over terminal
+duplicates so a stale completion cannot stop an active retry. Within the
+selected active or terminal class, the greatest surrogate `spot.job_id` wins,
+so status, task name, routing, log path, and cleanup timestamp all describe the
+same newest incarnation. Numeric and task-name filters use the same duplicate
+policy after resolving the logical task ID.
+
 An initial task inventory is never authoritative after a terminal latest-task
 status is observed. The inventory read precedes the status read, so a job can
 become terminal between them without passing through an observed `None`
@@ -79,6 +89,11 @@ managed-job poll interval. Integer task-ID validation changes from an O(tasks) i
 to one O(1) point lookup. Only a missing task-ID adds one O(1) aggregate count;
 it does not materialize task status rows.
 
+Duplicate collapse stays inside the same statement and returns exactly one
+row. It scans only rows sharing the selected indexed task identity and adds no
+poll, backend call, session, thread, or timer. Valid unique identities retain
+the existing one-row query shape and result.
+
 Waiting for the next JobGroup task performs one combined database read per poll
 cycle. The successful handoff reuses that read for routing, reducing the
 transition from N scalar polls plus one combined routing read to N combined
@@ -98,6 +113,13 @@ job initialization. A point lookup alone cannot distinguish a missing task
 from a missing job, so the miss-only aggregate count preserves that boundary
 without restoring the whole-task scan.
 
+Treating `(spot_job_id, task_id)` as unique is unsafe because the schema only
+provides a non-unique index and older task rows are compatibility data. A plain
+`fetchone()` makes insertion order user-visible. Returning every duplicate
+would restore the pre-optimization row volume and mix lifecycle incarnations;
+selecting one preferred surrogate row preserves both bounded reads and coherent
+metadata.
+
 ## Rollout and rollback
 
 This changes only process-local read coordination. It adds no schema, API, or
@@ -116,6 +138,11 @@ resumed following after a broken tail or a failed-task restart.
 missing tasks, missing jobs, and exact read counts.
 `tests/unit_tests/test_sky/jobs/test_status_refresh_snapshot.py` proves task
 counting uses one aggregate query without materializing status rows.
+`tests/unit_tests/test_sky/jobs/test_state.py` covers both duplicate insertion
+orders, active-over-terminal precedence, newest-terminal selection, coherent
+row metadata, one-row materialization, and one-statement query counts for the
+legacy terminal helper and the active log lookup gateway. PostgreSQL dialect
+compilation pins the same selection shape across supported databases.
 Pull-request CI runs all three under `Python Tests - Unit Tests`;
 `Python Tests - Jobs & API Tests` and
 `Python Tests - Limited Deps - Jobs, Serve & CLI (3.14)` cover the broader
@@ -127,5 +154,6 @@ cover the changed Python paths.
 | Changed path | Invariants | Concrete tests and commands |
 | --- | --- | --- |
 | `sky/jobs/log_streaming.py` | Exact integer task filters avoid whole-task scans; missing jobs and missing tasks remain distinct; terminal and cancelling snapshots stop without handle lookup; same-task snapshots keep the existing polling cadence; an iteration entered without a carried snapshot re-reads the target instead of failing. | `tests/unit_tests/test_sky/jobs/test_utils.py` task-filter cases and `tests/unit_tests/test_sky/jobs/test_log_follow_lifecycle.py` filtered lifecycle cases plus `test_broken_tail_refetches_routing_snapshot` and `test_failed_task_restart_refetches_routing_snapshot`; run both focused files, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
-| `sky/jobs/state.py` | Task counting is one aggregate query and does not materialize status rows. | `tests/unit_tests/test_sky/jobs/test_status_refresh_snapshot.py::TestGetJobsToCheckStatusInfo::test_get_num_tasks_uses_one_count_select`. |
+| `sky/jobs/state.py` | Task counting is one aggregate query; the legacy exact-task terminal helper prefers an active duplicate and otherwise selects the newest terminal row. | `tests/unit_tests/test_sky/jobs/test_status_refresh_snapshot.py::TestGetJobsToCheckStatusInfo::test_get_num_tasks_uses_one_count_select` and the duplicate exact-task lookup cases in `tests/unit_tests/test_sky/jobs/test_state.py`. |
+| `sky/jobs/state_task_lookups.py` | Numeric and name-filtered log lookups collapse duplicate task identities to one coherent preferred incarnation without another statement. | Duplicate insertion-order, newest-terminal, one-row, one-query, and PostgreSQL compilation cases in `tests/unit_tests/test_sky/jobs/test_state.py`; run the focused state and log-follow files, then `pytest -n 0 --dist no tests/unit_tests/test_sky/jobs/`. |
 | `docs/designs/managed-jobs-log-follow-status-snapshot.md` | The lifecycle, failure, concurrency, and performance contracts remain synchronized with the implementation. | The focused task-filter and lifecycle tests above plus the one-SQL count assertion. |
