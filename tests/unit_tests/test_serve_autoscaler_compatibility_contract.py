@@ -1,7 +1,10 @@
 """Characterization tests for autoscaler compatibility policy helpers."""
 # pylint: disable=protected-access
 import inspect
+import os
 import pickle
+import subprocess
+import sys
 import types
 
 from sky.serve import autoscaler_compatibility
@@ -75,6 +78,34 @@ def test_historical_helper_identity_and_signatures():
         assert helper.__module__ == 'sky.serve.autoscalers'
         assert str(inspect.signature(helper)) == expected_signatures[name]
         assert pickle.loads(pickle.dumps(helper)) is helper
+
+
+def test_fresh_process_import_orders_preserve_identity(tmp_path):
+    import_orders = (
+        ('from sky.serve import autoscaler_compatibility as compatibility\n'
+         'from sky.serve import autoscalers as facade'),
+        ('from sky.serve import autoscalers as facade\n'
+         'from sky.serve import autoscaler_compatibility as compatibility'),
+    )
+    for index, imports in enumerate(import_orders):
+        code = f'''{imports}
+import pickle
+
+names = {_HELPER_NAMES!r}
+for name in names:
+    helper = getattr(facade, name)
+    assert helper is getattr(compatibility, name)
+    assert helper.__module__ == 'sky.serve.autoscalers'
+    assert pickle.loads(pickle.dumps(helper)) is helper
+'''
+        env = os.environ.copy()
+        env['SKY_RUNTIME_DIR'] = str(tmp_path / f'order-{index}')
+        result = subprocess.run([sys.executable, '-c', code],
+                                env=env,
+                                text=True,
+                                capture_output=True,
+                                check=False)
+        assert result.returncode == 0, result.stderr
 
 
 def test_allocate_respects_bounded_per_card_floors():
