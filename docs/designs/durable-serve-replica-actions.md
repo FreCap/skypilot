@@ -512,6 +512,20 @@ rows start immediately and continue. The legacy cluster-name scan is retained
 during transition only for already-durable unbound rows and may gather typed
 provider evidence; it never synthesizes a binding or authorizes a successor.
 
+Serve047 also adds one transition-only append-only legacy-reconciliation
+evidence table. It is not an association, request-admission path, queue, or
+source of launch authority. A row names the exact service, replica record,
+cluster name, request, Kubernetes context, and physical-cluster UID; preserves
+the observed request facts; records an explicit old-executor termination
+attestation and its digest; and then records a provider observation made after
+that attestation. Only the monotonic
+`LEGACY_EFFECT_AMBIGUOUS -> CLEANUP_AUTHORIZED -> PROJECTED` reduction is
+allowed. `CLEANUP_AUTHORIZED` requires exact provider `ABSENT` observed after
+the attested executor termination. It permits only exact UID-fenced cleanup of
+that legacy replica and never supplies a receipt, association, retry, or
+successor-launch proof. G2 removes the writer and active transition surface
+after the zero-legacy gate while retaining its audit tombstones.
+
 The service row has a non-null controller-incarnation UUID, monotonic
 `controller_owner_epoch`, capability bound to that exact incarnation,
 `ordinary_launch_binding_mode` (`legacy` or `bound`), and monotonic binding

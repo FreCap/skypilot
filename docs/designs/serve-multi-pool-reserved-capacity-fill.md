@@ -2121,6 +2121,14 @@ ambiguous row conservatively debits only its pool/card and cannot be retried.
 Start provider probes, the reconciliation coordinator, and route publication
 without a global recovery lock; schedule association repair per row.
 
+For these pre-binding rows, Serve047's transition-only legacy-reconciliation
+evidence table preserves the exact request and replica identity, an explicit
+old-executor termination attestation, and a later physical-UID-scoped provider
+observation. Only a later exact `ABSENT` observation can authorize cleanup; the
+record cannot authorize a retry, fabricate request quiescence, or become a
+synthetic association. The audit tombstone is retained when G2 removes the
+transition writer.
+
 G2/C is authored with G1 but blocked. It owns API012 and Serve048, including
 the final permanent reserved-fill authorization and combined-role cleanup that
 earlier drafts assigned to API011/Serve047. API009/010 and Serve042--046 remain
