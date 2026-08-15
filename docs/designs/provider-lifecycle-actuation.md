@@ -54,14 +54,25 @@ M3 action lease are superseded for central SkyServe launch/down; the broader
 provider ownership, placement, volume, cluster, jobs, image, and SQLite
 compatibility program remains owned here.
 
-Last updated: 2026-08-08. The dedicated Serve M4/M5a authority stack is
-retired. The only accepted continuation is the evidence-gated, localized
-ordinary-launch request-binding/adoption contract in the two companion files.
-It reuses the existing API request executor and provider path. It does not
-activate or write the retained Serve038/039 schema, or add a dedicated
-worker/cohort, private transport, native provider rendering, or an
-authority-policy rotation. Existing pool, SQLite, cleanup, paid-capacity,
-reserved-fill, spot/fallback, and placement behavior is unchanged.
+Last updated: 2026-08-15. The dedicated Serve M4/M5a authority stack is
+retired. The accepted continuation is one typed execution binding for every
+central-PostgreSQL non-pool Serve launch in the two companion files. It extends
+the existing Serve042 association in place, reuses the existing API request
+queue/executor and provider path, and leaves profile policy with the existing
+ordinary, paid/zero-cost, reserved-fill, unknown-capacity, cost-rebalance, and
+system-OOM planners. Pools remain separate. It does not activate or write the
+retained Serve038/039 schema, add a dedicated worker, private transport, native
+provider rendering, shared capacity scanner/ledger, or universal mutation
+authority.
+
+The 2026-08-15 incident established that an old mixed-version executor caused
+real provider effects without current quiescence receipts; generation zero,
+missing process identity, and a false quiescence-required bit are not absence
+proof. The companions therefore own the exact capability cohort, typed
+reconciliation, no-receipt-fabrication rule, per-row nonblocking recovery,
+API011/Serve047 transition, and blocked API012/Serve048 cleanup. Any ordinary-
+only continuation below is historical and cannot preserve separate unbound
+non-pool launch paths.
 
 ## Summary
 
