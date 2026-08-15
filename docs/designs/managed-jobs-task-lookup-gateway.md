@@ -63,6 +63,12 @@ or new package level.
   `sky.jobs.state`.
 - Numeric task filters match exactly. String filters continue selecting the
   first matching task in ascending `task_id` order.
+- Because `(spot_job_id, task_id)` is not unique in the persisted schema, log
+  lookups collapse duplicate rows before materialization. Any non-terminal
+  incarnation wins over terminal duplicates; otherwise the newest terminal
+  row wins. The selected row supplies status, task name, log metadata, and
+  routing context together. Name filters resolve the first logical task ID,
+  then apply the same duplicate policy.
 - Missing jobs return `num_tasks == 0`; missing tasks in existing jobs return
   the exact positive task count. Neither case raises.
 - Each lookup remains one database statement and one database snapshot.
@@ -103,6 +109,9 @@ Before moving behavior, add and run characterization that pins:
   `get_task_log_stream_snapshot()`;
 - existing one-query, missing-task, missing-job, duplicate-name ordering, row
   projection, and recovery-snapshot behavior.
+- both insertion orders for duplicate task identities, active-over-terminal
+  precedence, newest-terminal selection, coherent selected-row metadata, and
+  exactly one materialized row from one statement.
 
 After extraction, extend the characterization to prove facade-to-owner object
 identity. Run the focused state lookup tests, log-follow lifecycle and utility
