@@ -583,6 +583,39 @@ def test_ready_or_removed_artifact_requires_terminal_dependencies(tmp_path):
                in error for error in errors)
 
 
+def test_dependency_cycle_check_supports_deep_acyclic_manifests(tmp_path):
+    (tmp_path / 'sample.py').write_text('class Legacy:\n    pass\n',
+                                        encoding='utf-8')
+    artifacts = []
+    for index in range(1200):
+        milestone = index // 1000 + 1
+        artifact_id = f'PLA-M{milestone}-{index % 1000:03d}'
+        artifact = _artifact(artifact_id=artifact_id)
+        if index:
+            artifacts[-1]['dependencies'] = [artifact_id]
+        artifacts.append(artifact)
+
+    assert _check(tmp_path, artifacts) == []
+
+
+def test_dependency_cycle_error_is_deterministic(tmp_path):
+    (tmp_path / 'sample.py').write_text('class Legacy:\n    pass\n',
+                                        encoding='utf-8')
+    artifacts = [
+        _artifact(artifact_id=f'PLA-M1-{index:03d}') for index in range(3)
+    ]
+    artifacts[0]['dependencies'] = ['PLA-M1-001']
+    artifacts[1]['dependencies'] = ['PLA-M1-002']
+    artifacts[2]['dependencies'] = ['PLA-M1-001']
+
+    errors = _check(tmp_path, artifacts)
+
+    assert errors == [
+        'PLA-M1-001: dependency cycle: '
+        'PLA-M1-001 -> PLA-M1-002 -> PLA-M1-001'
+    ]
+
+
 def test_closed_values_transitions_and_wildcards_are_rejected(tmp_path):
     (tmp_path / 'sample.py').write_text('class Legacy:\n    pass\n',
                                         encoding='utf-8')

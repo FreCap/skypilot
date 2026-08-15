@@ -12999,6 +12999,9 @@ a commit on the checked HEAD ancestry. CI therefore fetches full history for
 this job. A dependency must already be `removed`, or `retained_verified` for a
 retention obligation, before a dependent artifact can become
 `ready_to_remove`, `removal_in_progress`, or `removed`.
+Dependency-cycle validation uses an iterative traversal, so every acyclic
+manifest representable by the schema remains checkable without depending on
+the Python interpreter's recursion limit.
 
 The checker rejects YAML aliases that share mutable gate or evidence objects
 between artifacts. It validates exact qualified calls without accepting a

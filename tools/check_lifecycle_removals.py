@@ -1477,29 +1477,41 @@ class ManifestChecker:
 
     def _check_dependency_cycles(self) -> None:
         visited: typing.Set[str] = set()
-        active: typing.Set[str] = set()
+        for root_id in sorted(self._artifacts_by_id):
+            if root_id in visited:
+                continue
+            active_path = [root_id]
+            active_positions = {root_id: 0}
+            stack = [(root_id, iter(self._dependency_ids(root_id)))]
+            while stack:
+                artifact_id, dependencies = stack[-1]
+                try:
+                    dependency = next(dependencies)
+                except StopIteration:
+                    stack.pop()
+                    active_path.pop()
+                    active_positions.pop(artifact_id)
+                    visited.add(artifact_id)
+                    continue
+                if dependency in visited:
+                    continue
+                cycle_start = active_positions.get(dependency)
+                if cycle_start is not None:
+                    cycle = active_path[cycle_start:] + [dependency]
+                    self._error(dependency,
+                                f'dependency cycle: {" -> ".join(cycle)}')
+                    continue
+                active_positions[dependency] = len(active_path)
+                active_path.append(dependency)
+                stack.append(
+                    (dependency, iter(self._dependency_ids(dependency))))
 
-        def visit(artifact_id: str, path: typing.List[str]) -> None:
-            if artifact_id in active:
-                cycle_start = path.index(artifact_id)
-                cycle = path[cycle_start:] + [artifact_id]
-                self._error(artifact_id,
-                            f'dependency cycle: {" -> ".join(cycle)}')
-                return
-            if artifact_id in visited:
-                return
-            active.add(artifact_id)
-            artifact = self._artifacts_by_id[artifact_id]
-            dependencies = artifact.get('dependencies')
-            if isinstance(dependencies, list):
-                for dependency in sorted(item for item in dependencies
-                                         if item in self._artifacts_by_id):
-                    visit(dependency, path + [artifact_id])
-            active.remove(artifact_id)
-            visited.add(artifact_id)
-
-        for artifact_id in sorted(self._artifacts_by_id):
-            visit(artifact_id, [])
+    def _dependency_ids(self, artifact_id: str) -> typing.List[str]:
+        dependencies = self._artifacts_by_id[artifact_id].get('dependencies')
+        if not isinstance(dependencies, list):
+            return []
+        return sorted(
+            item for item in dependencies if item in self._artifacts_by_id)
 
 
 def check_manifest(
