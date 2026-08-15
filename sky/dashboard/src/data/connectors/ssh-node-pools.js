@@ -207,14 +207,14 @@ async function streamSSHLogs({ requestId, signal, onNewLog, streamLabel }) {
 
   // Measure timeout from last received data, not from start of request.
   const inactivityTimeout = SSH_LOG_INACTIVITY_TIMEOUT_MS;
-  let lastActivity = Date.now();
+  let lastActivity = performance.now();
   let timeoutId;
 
   // Create an activity-based timeout promise
   const createTimeoutPromise = () => {
     return new Promise((resolve) => {
       const checkActivity = () => {
-        const timeSinceLastActivity = Date.now() - lastActivity;
+        const timeSinceLastActivity = performance.now() - lastActivity;
 
         if (timeSinceLastActivity >= inactivityTimeout) {
           resolve({ timeout: true });
@@ -271,7 +271,7 @@ async function streamSSHLogs({ requestId, signal, onNewLog, streamLabel }) {
           }
 
           // Update activity timestamp when we receive data
-          lastActivity = Date.now();
+          lastActivity = performance.now();
 
           const chunk = decoder.decode(value, { stream: true });
           if (chunk) onNewLog(chunk);

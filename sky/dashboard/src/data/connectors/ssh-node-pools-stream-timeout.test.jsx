@@ -231,6 +231,38 @@ it('measures inactivity from the most recently received chunk', async () => {
   expect(jest.getTimerCount()).toBe(0);
 });
 
+it('bounds inactivity when the wall clock moves backward', async () => {
+  jest.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+  const stream = installStream();
+  const caller = new AbortController();
+  let settled = false;
+  const promise = streamSSHDeploymentLogs({
+    requestId: 'request-42',
+    signal: caller.signal,
+    onNewLog: jest.fn(),
+  }).then(() => {
+    settled = true;
+  });
+
+  await Promise.resolve();
+  expect(stream.reader.read).toHaveBeenCalledTimes(1);
+  jest.setSystemTime(new Date('2025-01-01T00:00:00Z'));
+  await jest.advanceTimersByTimeAsync(300000);
+  await Promise.resolve();
+  const settledAtDeadline = settled;
+
+  caller.abort();
+  await promise;
+
+  expect(settledAtDeadline).toBe(true);
+  expect(stream.requestSignal.aborted).toBe(true);
+  expect(showToast).toHaveBeenCalledWith(
+    'SSH deployment log stream timed out after 300s of inactivity',
+    'warning'
+  );
+  expect(jest.getTimerCount()).toBe(0);
+});
+
 it('detaches caller cancellation after a fetch failure', async () => {
   let requestSignal;
   global.fetch.mockImplementation(async (_url, { signal }) => {
