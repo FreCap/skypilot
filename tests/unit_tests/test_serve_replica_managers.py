@@ -12237,7 +12237,7 @@ class TestFailedCleanupReconciliation:
         legacy_state['replica_info_version'] = 13
         legacy_state['status_property'].pop('drain_started_at')
 
-        with pytest.raises(ValueError, match='v17 collision records'):
+        with pytest.raises(ValueError, match='invalid top-level shape'):
             replica_managers.ReplicaInfo.from_storage_dict(legacy_state)
 
     def test_cleanup_retry_respects_capped_backoff_deadline(self):

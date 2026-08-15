@@ -450,7 +450,7 @@ def test_revision_terminal_quarantine_and_demotion_are_absorbing(
                 serve_state.replicas_table.c.service_name == _SERVICE_NAME,
                 serve_state.replicas_table.c.replica_id == 9).values(
                     replica_state=partial))
-    with pytest.raises(ValueError, match='v17 collision records'):
+    with pytest.raises(ValueError, match='invalid top-level shape'):
         serve_state.get_replica_info_from_id(_SERVICE_NAME, 9)
 
 
@@ -748,7 +748,7 @@ def test_all_fields_absent_v13_is_not_a_runtime_read_path(
                 serve_state.replicas_table.c.replica_id == 7).values(
                     replica_state=rollback))
 
-    with pytest.raises(ValueError, match='v17 collision records'):
+    with pytest.raises(ValueError, match='invalid top-level shape'):
         serve_state.get_replica_info_from_id(_SERVICE_NAME, 7)
     persisted = _raw_replica_row(engine, 7)
     assert not set(replica_info.V13_ADDITIVE_STORAGE_FIELDS).intersection(

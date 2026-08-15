@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import logging
 import pickle
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -18,6 +19,7 @@ from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
+from sky.serve import system_recovery_state
 from sky.utils import common_utils
 
 _RECONCILIATION_GATE_GENERATION = 29
@@ -31,6 +33,119 @@ _RECLAIM_ATTRIBUTION_FIELDS = (
     'reserved_fill_reclaim_policy_revision',
     'reserved_fill_reclaim_provider_inventory_sha256',
     'reserved_fill_worker_projection_sha256',
+)
+_LIVE_LEGACY_TOP_BASE = frozenset((
+    'replica_info_version',
+    'replica_id',
+    'cluster_name',
+    'version',
+    'replica_port',
+    'created_at',
+    'first_not_ready_time',
+    'first_consecutive_failure_time',
+    'status_property',
+    'is_spot',
+    'location',
+    'resources_override',
+    'reserved_fill',
+    'cost_rebalance_for_replica_id',
+))
+_LIVE_LEGACY_TOP_CAPACITY = frozenset((
+    'planned_capacity',
+    'unknown_capacity_replacement',
+    'logical_bridge_capacity_verified',
+))
+_LIVE_LEGACY_TOP_ECONOMIC = frozenset((
+    'is_zero_cost',
+    'paid_capacity_pool_key',
+))
+_LIVE_LEGACY_TOP_RECOVERY = frozenset((
+    'replica_record_id',
+    'system_recovery_launch_intent',
+    'system_recovery_disposition',
+    'launch_request_id',
+    'service_job_id',
+    'candidate_ready_observed_at',
+    'ordinary_release_not_before',
+    'system_recovery_revision',
+    'system_recovery',
+    'system_recovery_quarantine',
+))
+_LIVE_LEGACY_TOP_FILL_IDENTITY_V13 = frozenset((
+    'reserved_fill_pool_key',
+    'reserved_fill_service_generation',
+    'reserved_fill_physical_cluster_uid',
+))
+_LIVE_LEGACY_TOP_FILL_IDENTITY_V14 = frozenset((
+    *_LIVE_LEGACY_TOP_FILL_IDENTITY_V13,
+    'reserved_fill_kubernetes_context',
+))
+_LIVE_LEGACY_STATUS_BASE = frozenset((
+    'sky_launch_status',
+    'user_app_failed',
+    'service_ready_now',
+    'first_ready_time',
+    'sky_down_status',
+    'is_scale_down',
+    'preempted',
+    'purged',
+    'failed_spot_availability',
+    'drain_cap_seconds',
+    'wait_for_idle_before_termination',
+))
+_LIVE_LEGACY_STATUS_CURRENT = frozenset((
+    *_LIVE_LEGACY_STATUS_BASE,
+    'drain_started_at',
+    'logical_retirement_version',
+    'logical_retirement_controller_epoch',
+    'logical_retirement_generation',
+    'logical_retirement_target_capacity',
+    'logical_retirement_confirmed_generation',
+    'logical_retirement_bounded_deadline',
+    'logical_retirement_committed',
+))
+_LIVE_LEGACY_TOP_CAPACITY_SHAPE = (_LIVE_LEGACY_TOP_BASE |
+                                   _LIVE_LEGACY_TOP_CAPACITY)
+_LIVE_LEGACY_TOP_ECONOMIC_SHAPE = (_LIVE_LEGACY_TOP_CAPACITY_SHAPE |
+                                   _LIVE_LEGACY_TOP_ECONOMIC)
+_LIVE_LEGACY_TOP_RECOVERY_SHAPE = (_LIVE_LEGACY_TOP_ECONOMIC_SHAPE |
+                                   _LIVE_LEGACY_TOP_RECOVERY)
+_LIVE_LEGACY_CENSUS_CASES = (
+    pytest.param(3,
+                 _LIVE_LEGACY_TOP_BASE,
+                 _LIVE_LEGACY_STATUS_BASE,
+                 id='v3-base'),
+    pytest.param(6,
+                 _LIVE_LEGACY_TOP_CAPACITY_SHAPE,
+                 _LIVE_LEGACY_STATUS_CURRENT,
+                 id='v6-capacity'),
+    pytest.param(7,
+                 _LIVE_LEGACY_TOP_BASE,
+                 _LIVE_LEGACY_STATUS_BASE,
+                 id='v7-base'),
+    pytest.param(12,
+                 _LIVE_LEGACY_TOP_ECONOMIC_SHAPE,
+                 _LIVE_LEGACY_STATUS_CURRENT,
+                 id='v12-economic'),
+    pytest.param(13,
+                 _LIVE_LEGACY_TOP_RECOVERY_SHAPE,
+                 _LIVE_LEGACY_STATUS_CURRENT,
+                 id='v13-no-fill-identity'),
+    pytest.param(13,
+                 _LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                 _LIVE_LEGACY_TOP_FILL_IDENTITY_V13,
+                 _LIVE_LEGACY_STATUS_CURRENT,
+                 id='v13-location-derived-context'),
+    pytest.param(13,
+                 _LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                 _LIVE_LEGACY_TOP_FILL_IDENTITY_V14,
+                 _LIVE_LEGACY_STATUS_CURRENT,
+                 id='v13-explicit-context'),
+    pytest.param(14,
+                 _LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                 _LIVE_LEGACY_TOP_FILL_IDENTITY_V14,
+                 _LIVE_LEGACY_STATUS_CURRENT,
+                 id='v14-explicit-context'),
 )
 
 
@@ -128,6 +243,110 @@ def _attributed_protocol_v2_replica() -> replica_managers.ReplicaInfo:
     replica.zero_cost_admission_sequence = 19
     replica.zero_cost_materialization_sequence = 13
     return replica
+
+
+def _live_legacy_state(version: int, top_fields: frozenset[str],
+                       status_fields: frozenset[str]) -> dict[str, Any]:
+    """Build one value-bearing state with an exact live-census key shape."""
+    state = _protocol_v2_replica().to_storage_dict()
+    state['replica_info_version'] = version
+    state['status_property'] = {
+        field: state['status_property'][field] for field in status_fields
+    }
+    return {field: copy.deepcopy(state[field]) for field in top_fields}
+
+
+def _golden_v7_state() -> dict[str, Any]:
+    """Literal v1.1.1276 fixture, independent of the current serializer."""
+    return {
+        'replica_info_version': 7,
+        'replica_id': '41',
+        'cluster_name': 9001,
+        'version': '5',
+        'replica_port': 8081,
+        'created_at': 101.25,
+        'first_not_ready_time': None,
+        'first_consecutive_failure_time': 109.5,
+        'status_property': {
+            'sky_launch_status': 'SUCCEEDED',
+            'user_app_failed': 0,
+            'service_ready_now': 1,
+            'first_ready_time': 105.0,
+            'sky_down_status': None,
+            'is_scale_down': 0,
+            'preempted': False,
+            'purged': False,
+            'failed_spot_availability': 0,
+            'drain_cap_seconds': 45,
+            'wait_for_idle_before_termination': 1,
+        },
+        'is_spot': 0,
+        'location': {
+            'cloud': 'Kubernetes',
+            'region': 'phx-context',
+            'zone': None,
+            'accelerators': {
+                'H200': 1,
+            },
+            'use_spot': False,
+            'image_id': None,
+            'container_image': None,
+            'disk_tier': None,
+            'ephemeral_storage': None,
+            'instance_type': None,
+        },
+        'resources_override': {
+            'cloud': 'Kubernetes',
+            'region': 'phx-context',
+            'accelerators': {
+                'H200': 1,
+            },
+            'image_id': {
+                'null': 'global-image',
+                'phx-context': 'regional-image',
+            },
+        },
+        'reserved_fill': True,
+        'cost_rebalance_for_replica_id': 2,
+    }
+
+
+def _golden_v13_i3_state() -> dict[str, Any]:
+    """Literal value-bearing v13/I3 fixture with the complete recovery R."""
+    state = _golden_v7_state()
+    state['replica_info_version'] = 13
+    state.update({
+        'planned_capacity': 4,
+        'unknown_capacity_replacement': True,
+        'logical_bridge_capacity_verified': True,
+        'is_zero_cost': True,
+        'paid_capacity_pool_key': 'paid-pool',
+        'replica_record_id': '12345678-1234-5678-9234-567812345678',
+        'system_recovery_launch_intent': None,
+        'system_recovery_disposition': 'ORDINARY',
+        'launch_request_id': None,
+        'service_job_id': None,
+        'candidate_ready_observed_at': None,
+        'ordinary_release_not_before': None,
+        'system_recovery_revision': 0,
+        'system_recovery': None,
+        'system_recovery_quarantine': None,
+        'reserved_fill_pool_key': '["v2", "physical-uid", "h200"]',
+        'reserved_fill_service_generation': 7,
+        'reserved_fill_physical_cluster_uid': 'physical-uid',
+    })
+    status = state['status_property']
+    status.update({
+        'drain_started_at': 0.0,
+        'logical_retirement_version': 4,
+        'logical_retirement_controller_epoch': 'controller-epoch',
+        'logical_retirement_generation': 11,
+        'logical_retirement_target_capacity': 5,
+        'logical_retirement_confirmed_generation': 10,
+        'logical_retirement_bounded_deadline': 1,
+        'logical_retirement_committed': 'true',
+    })
+    return state
 
 
 def _protocol_v2_handle(
@@ -619,11 +838,318 @@ def test_pool_probe_propagates_explicit_provider_phase_admission():
     ]
 
 
-def test_pre_v17_json_is_not_a_runtime_read_path():
-    state = _replica().to_storage_dict()
-    state['replica_info_version'] = 13
-    with pytest.raises(ValueError, match='v17 collision records'):
+def test_golden_v7_reader_pins_v1_1_1276_materialization():
+    state = _golden_v7_state()
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+    canonical = restored.to_storage_dict()
+
+    assert {
+        field: canonical[field]
+        for field in ('replica_info_version', 'replica_id', 'cluster_name',
+                      'version', 'replica_port', 'created_at', 'is_spot',
+                      'planned_capacity', 'unknown_capacity_replacement',
+                      'logical_bridge_capacity_verified', 'reserved_fill',
+                      'is_zero_cost', 'cost_rebalance_for_replica_id',
+                      'paid_capacity_pool_key', 'replica_record_id')
+    } == {
+        'replica_info_version': 18,
+        'replica_id': 41,
+        'cluster_name': '9001',
+        'version': 5,
+        'replica_port': '8081',
+        'created_at': 101.25,
+        'is_spot': False,
+        'planned_capacity': 1,
+        'unknown_capacity_replacement': False,
+        'logical_bridge_capacity_verified': False,
+        'reserved_fill': True,
+        'is_zero_cost': False,
+        'cost_rebalance_for_replica_id': 2,
+        'paid_capacity_pool_key': None,
+        'replica_record_id': '6b04d5d4-2013-50e8-b67e-d18f5875a5e8',
+    }
+    assert canonical['resources_override'] == {
+        'cloud': 'Kubernetes',
+        'region': 'phx-context',
+        'accelerators': {
+            'H200': 1,
+        },
+        'image_id': [[None, 'global-image'], ['phx-context', 'regional-image']],
+    }
+    assert canonical['status_property'] == {
+        'sky_launch_status': 'SUCCEEDED',
+        'user_app_failed': False,
+        'service_ready_now': True,
+        'first_ready_time': 105.0,
+        'sky_down_status': None,
+        'is_scale_down': False,
+        'preempted': False,
+        'purged': False,
+        'failed_spot_availability': False,
+        'drain_cap_seconds': 45,
+        'drain_started_at': None,
+        'wait_for_idle_before_termination': True,
+        'logical_retirement_version': None,
+        'logical_retirement_controller_epoch': None,
+        'logical_retirement_generation': None,
+        'logical_retirement_target_capacity': None,
+        'logical_retirement_confirmed_generation': None,
+        'logical_retirement_bounded_deadline': False,
+        'logical_retirement_committed': None,
+    }
+    assert {
+        field: canonical[field]
+        for field in replica_info.V13_ADDITIVE_STORAGE_FIELDS
+    } == {
+        'replica_record_id': '6b04d5d4-2013-50e8-b67e-d18f5875a5e8',
+        'system_recovery_launch_intent': None,
+        'system_recovery_disposition': 'ORDINARY',
+        'launch_request_id': None,
+        'service_job_id': None,
+        'candidate_ready_observed_at': None,
+        'ordinary_release_not_before': None,
+        'system_recovery_revision': 0,
+        'system_recovery': None,
+        'system_recovery_quarantine': None,
+    }
+    assert all(canonical[field] is None
+               for field in replica_info.V17_COLLISION_OPTIONAL_STORAGE_FIELDS)
+
+
+def test_golden_v13_i3_reader_pins_recovery_and_status_semantics():
+    state = _golden_v13_i3_state()
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+    canonical = restored.to_storage_dict()
+
+    assert canonical['replica_info_version'] == 18
+    assert canonical['replica_record_id'] == (
+        '12345678-1234-5678-9234-567812345678')
+    assert {
+        field: canonical[field]
+        for field in replica_info.SYSTEM_RECOVERY_STORAGE_FIELDS
+    } == {
+        'system_recovery_launch_intent': None,
+        'system_recovery_disposition': 'ORDINARY',
+        'launch_request_id': None,
+        'service_job_id': None,
+        'candidate_ready_observed_at': None,
+        'ordinary_release_not_before': None,
+        'system_recovery_revision': 0,
+        'system_recovery': None,
+        'system_recovery_quarantine': None,
+    }
+    assert canonical['reserved_fill'] is True
+    assert canonical['is_zero_cost'] is True
+    assert canonical['reserved_fill_pool_key'] == (
+        '["v2", "physical-uid", "h200"]')
+    assert canonical['reserved_fill_service_generation'] == 7
+    assert canonical['reserved_fill_physical_cluster_uid'] == 'physical-uid'
+    assert canonical['reserved_fill_kubernetes_context'] is None
+    assert canonical['status_property']['drain_started_at'] is None
+    assert canonical['status_property'][
+        'logical_retirement_bounded_deadline'] is False
+    assert canonical['status_property']['logical_retirement_committed'] is None
+    assert reserved_capacity.parse_protocol_v2_cleanup_fence(
+        restored) == reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context='phx-context',
+            physical_cluster_uid='physical-uid')
+    assert all(canonical[field] is None
+               for field in replica_info.V17_COLLISION_OPTIONAL_STORAGE_FIELDS)
+
+
+@pytest.mark.parametrize(('version', 'top_fields', 'status_fields'),
+                         _LIVE_LEGACY_CENSUS_CASES)
+def test_live_legacy_json_shapes_materialize_canonical_v18(
+        version, top_fields, status_fields):
+    state = _live_legacy_state(version, top_fields, status_fields)
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+    restored_again = replica_managers.ReplicaInfo.from_storage_dict(state)
+    rewritten = restored.to_storage_dict()
+
+    assert restored._version == 18
+    assert set(vars(restored)) == {
+        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS
+    }
+    assert set(vars(restored.status_property)) == set(_status_field_names())
+    assert rewritten['replica_info_version'] == 18
+    assert set(rewritten) == set(replica_info._REPLICA_INFO_STORAGE_FIELDS)
+    assert set(rewritten['status_property']) == set(_status_field_names())
+    for field in top_fields - {'replica_info_version', 'status_property'}:
+        assert rewritten[field] == state[field]
+    for field in status_fields:
+        assert rewritten['status_property'][field] == state['status_property'][
+            field]
+    for field, default in replica_info._REPLICA_INFO_LEGACY_DEFAULTS.items():
+        if field not in top_fields:
+            assert getattr(restored, field) == default
+    for field, default in (
+            replica_info._REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS.items()):
+        if field not in status_fields:
+            assert getattr(restored.status_property, field) == default
+    for field in replica_info.V17_COLLISION_OPTIONAL_STORAGE_FIELDS:
+        assert getattr(restored, field) is None
+
+    if version < 13:
+        assert (restored.system_recovery_disposition ==
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY)
+        assert restored.replica_record_id == restored_again.replica_record_id
+    else:
+        assert restored.replica_record_id == state['replica_record_id']
+
+
+@pytest.mark.parametrize(
+    ('version', 'top_fields', 'expected_context'),
+    [
+        pytest.param(13,
+                     _LIVE_LEGACY_TOP_RECOVERY_SHAPE,
+                     None,
+                     id='v13-no-fill-identity'),
+        pytest.param(13,
+                     _LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                     _LIVE_LEGACY_TOP_FILL_IDENTITY_V13,
+                     'phx-context',
+                     id='v13-location-derived-context'),
+        pytest.param(13,
+                     _LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                     _LIVE_LEGACY_TOP_FILL_IDENTITY_V14,
+                     'phx-context',
+                     id='v13-explicit-context'),
+        pytest.param(14,
+                     _LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                     _LIVE_LEGACY_TOP_FILL_IDENTITY_V14,
+                     'phx-context',
+                     id='v14-explicit-context'),
+    ],
+)
+def test_live_legacy_reserved_fill_rows_preserve_cleanup_fence(
+        version, top_fields, expected_context):
+    state = _live_legacy_state(version, top_fields, _LIVE_LEGACY_STATUS_CURRENT)
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert restored.reserved_fill is True
+    assert restored.is_zero_cost is True
+    fence = reserved_capacity.parse_protocol_v2_cleanup_fence(restored)
+    if expected_context is None:
+        assert fence is None
+    else:
+        assert fence == reserved_capacity.ProtocolV2CleanupFence(
+            kubernetes_context=expected_context,
+            physical_cluster_uid='physical-uid')
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='Policy-bound reserved-fill launch'):
+        replica_info.validate_reserved_fill_allocation_attribution(
+            restored, require_policy_bound_admission=True)
+
+
+@pytest.mark.parametrize(('version', 'top_fields', 'status_fields'),
+                         _LIVE_LEGACY_CENSUS_CASES)
+@pytest.mark.parametrize('malformation', ['missing', 'unexpected'])
+def test_live_legacy_json_rejects_unsanctioned_top_level_shape(
+        version, top_fields, status_fields, malformation):
+    state = _live_legacy_state(version, top_fields, status_fields)
+    if malformation == 'missing':
+        state.pop('cluster_name')
+    else:
+        state['unexpected_legacy_field'] = None
+
+    with pytest.raises(ValueError, match='invalid top-level shape'):
         replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize(('version', 'top_fields', 'status_fields'),
+                         _LIVE_LEGACY_CENSUS_CASES)
+@pytest.mark.parametrize('malformation', ['missing', 'unexpected'])
+def test_live_legacy_json_rejects_unsanctioned_status_shape(
+        version, top_fields, status_fields, malformation):
+    state = _live_legacy_state(version, top_fields, status_fields)
+    if malformation == 'missing':
+        state['status_property'].pop('sky_launch_status')
+    else:
+        state['status_property']['unexpected_legacy_field'] = None
+
+    with pytest.raises(ValueError, match='invalid status_property shape'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('version',
+                         [-1, 0, 1, 2, 4, 5, 8, 9, 10, 11, 15, 16, 19, 99])
+def test_legacy_json_rejects_unsanctioned_and_future_versions(version):
+    state = _live_legacy_state(3, _LIVE_LEGACY_TOP_BASE,
+                               _LIVE_LEGACY_STATUS_BASE)
+    state['replica_info_version'] = version
+
+    with pytest.raises(ValueError, match='Unsupported ReplicaInfo'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('version', [True, False, 13.0, '13', None])
+def test_legacy_json_rejects_non_integer_versions(version):
+    state = _live_legacy_state(13, _LIVE_LEGACY_TOP_RECOVERY_SHAPE,
+                               _LIVE_LEGACY_STATUS_CURRENT)
+    state['replica_info_version'] = version
+
+    with pytest.raises(ValueError, match='version must be an integer'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('value', [0, 1, 'true', None])
+def test_legacy_json_requires_exact_reserved_fill_boolean(value):
+    state = _golden_v7_state()
+    state['reserved_fill'] = value
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='reserved_fill marker must be a boolean'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('value', [0, 1, 'true', None])
+def test_legacy_json_requires_exact_zero_cost_boolean(value):
+    state = _golden_v13_i3_state()
+    state['is_zero_cost'] = value
+
+    with pytest.raises(exceptions.KubernetesPhysicalClusterIdentityError,
+                       match='is_zero_cost must be an exact boolean'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('value', [True, 0, -1, '4', None])
+def test_legacy_json_requires_positive_integer_planned_capacity(value):
+    state = _golden_v13_i3_state()
+    state['planned_capacity'] = value
+
+    with pytest.raises(ValueError,
+                       match='planned_capacity must be a positive integer'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+def test_legacy_json_rejects_malformed_nested_image_id():
+    state = _golden_v7_state()
+    resources_override = state['resources_override']
+    assert isinstance(resources_override, dict)
+    resources_override['image_id'] = [['missing-image-value']]
+
+    with pytest.raises(ValueError, match='Invalid replica image_id'):
+        replica_managers.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('version', [13, 14])
+def test_legacy_json_malformed_recovery_bundle_is_quarantined(version):
+    top_fields = (_LIVE_LEGACY_TOP_RECOVERY_SHAPE |
+                  _LIVE_LEGACY_TOP_FILL_IDENTITY_V14)
+    state = _live_legacy_state(version, top_fields, _LIVE_LEGACY_STATUS_CURRENT)
+    state['system_recovery_disposition'] = 'not-a-disposition'
+
+    restored = replica_managers.ReplicaInfo.from_storage_dict(state)
+
+    assert restored._version == 18
+    assert restored.system_recovery_quarantine is not None
+    assert (restored.system_recovery_quarantine.reason ==
+            system_recovery_state.RecoveryQuarantineReason.MALFORMED_V13_BUNDLE)
+    assert not restored.is_ready
+    assert restored.to_storage_dict()['replica_info_version'] == 18
 
 
 def test_v17_collision_requires_exact_status_shape():

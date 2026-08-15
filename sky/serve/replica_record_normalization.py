@@ -3,7 +3,9 @@
 import argparse
 import copy
 import json
+import math
 from typing import Any
+import uuid
 
 import sqlalchemy
 from sqlalchemy import orm
@@ -20,6 +22,55 @@ _CONTRACT = 'skyserve.replica-info-v18-normalization/v1'
 _CONSTRAINT = 'ck_replicas_replica_info_version_18'
 _CURRENT_VERSION = 18
 _ATTRIBUTION_FIELDS = replica_info.V17_COLLISION_OPTIONAL_STORAGE_FIELDS
+_LEGACY_VERSIONS = frozenset((3, 6, 7, 12, 13, 14))
+_NORMALIZABLE_VERSIONS = _LEGACY_VERSIONS | {17, _CURRENT_VERSION}
+_TRANSITION_RECORD_ID_NAMESPACE = uuid.UUID(
+    '3b448973-9e2f-58aa-a640-27fb7c6a8884')
+_LEGACY_TOP_LEVEL_DEFAULTS = {
+    'planned_capacity': 1,
+    'unknown_capacity_replacement': False,
+    'logical_bridge_capacity_verified': False,
+    'reserved_fill_pool_key': None,
+    'reserved_fill_service_generation': None,
+    'reserved_fill_physical_cluster_uid': None,
+    'reserved_fill_kubernetes_context': None,
+    'reserved_fill_allocation_generation': None,
+    'reserved_fill_allocation_input_sha256': None,
+    'reserved_fill_allocation_claim_generation': None,
+    'reserved_fill_reconciliation_gate_generation': None,
+    'reserved_fill_reclaim_fleet_bundle_sha256': None,
+    'reserved_fill_reclaim_policy_revision': None,
+    'reserved_fill_reclaim_provider_inventory_sha256': None,
+    'reserved_fill_worker_projection_sha256': None,
+    'reserved_fill_observation_generation': None,
+    'reserved_fill_observation_sequence': None,
+    'reserved_fill_intent_idempotency_key': None,
+    'zero_cost_admission_sequence': None,
+    'zero_cost_materialization_sequence': None,
+    'is_zero_cost': False,
+    'paid_capacity_pool_key': None,
+}
+_LEGACY_STATUS_DEFAULTS = {
+    'drain_started_at': None,
+    'logical_retirement_version': None,
+    'logical_retirement_controller_epoch': None,
+    'logical_retirement_generation': None,
+    'logical_retirement_target_capacity': None,
+    'logical_retirement_confirmed_generation': None,
+    'logical_retirement_bounded_deadline': False,
+    'logical_retirement_committed': None,
+}
+_LEGACY_SYSTEM_RECOVERY_DEFAULTS = {
+    'system_recovery_launch_intent': None,
+    'system_recovery_disposition': 'ORDINARY',
+    'launch_request_id': None,
+    'service_job_id': None,
+    'candidate_ready_observed_at': None,
+    'ordinary_release_not_before': None,
+    'system_recovery_revision': 0,
+    'system_recovery': None,
+    'system_recovery_quarantine': None,
+}
 _CONSTRAINT_EXPRESSION = (
     "replica_state_version IS NOT NULL AND replica_state_version = 1 AND "
     "replica_state IS NOT NULL AND replica_state @> "
@@ -62,6 +113,47 @@ def _record_key(row: sqlalchemy.engine.Row) -> tuple[str, int]:
     return service_name, replica_id
 
 
+def _expected_transition_record_id(state: dict[str, Any]) -> str:
+    """Pin v1.1.1276's deterministic identity for pre-v13 rows."""
+    replica_id = state['replica_id']
+    cluster_name = state['cluster_name']
+    created_at = state['created_at']
+    if created_at is None:
+        created_at_token = 'none'
+    else:
+        timestamp = float(created_at)
+        if not math.isfinite(timestamp):
+            raise ValueError('Invalid legacy creation timestamp.')
+        created_at_token = timestamp.hex()
+    identity_material = (f'{replica_id}:{len(cluster_name)}:{cluster_name}:'
+                         f'{created_at_token}')
+    return str(uuid.uuid5(_TRANSITION_RECORD_ID_NAMESPACE, identity_material))
+
+
+def _expected_legacy_canonical_state(
+        original: dict[str, Any]) -> dict[str, Any]:
+    """Materialize only the bounded v1.1.1276-to-v18 deltas."""
+    raw_version = original['replica_info_version']
+    assert raw_version in _LEGACY_VERSIONS
+    expected = copy.deepcopy(original)
+    expected['replica_info_version'] = _CURRENT_VERSION
+    for field, default in _LEGACY_TOP_LEVEL_DEFAULTS.items():
+        expected.setdefault(field, copy.deepcopy(default))
+    # Normalization is stricter than the bounded runtime reader: the reader
+    # retains v1.1.1276's conversions, but this atomic rewrite refuses to
+    # persist any present-field value or JSON-type change. The archived live
+    # preflight proved recursive present-field parity for every retained row.
+    if raw_version < 13:
+        expected['replica_record_id'] = _expected_transition_record_id(expected)
+        expected.update(_LEGACY_SYSTEM_RECOVERY_DEFAULTS)
+
+    status = expected['status_property']
+    assert isinstance(status, dict)
+    for field, default in _LEGACY_STATUS_DEFAULTS.items():
+        status.setdefault(field, copy.deepcopy(default))
+    return expected
+
+
 def _canonical_state(row: sqlalchemy.engine.Row,
                      row_ordinal: int) -> dict[str, Any]:
     _record_key(row)
@@ -72,32 +164,44 @@ def _canonical_state(row: sqlalchemy.engine.Row,
             f'{row_label} has invalid JSON state.')
     original = copy.deepcopy(row.replica_state)
     raw_version = original.get('replica_info_version')
-    if type(raw_version) is not int or raw_version not in (17,
-                                                           _CURRENT_VERSION):
+    if type(raw_version
+           ) is not int or raw_version not in _NORMALIZABLE_VERSIONS:
         raise ReplicaRecordNormalizationError(
             f'{row_label} has an unsupported ReplicaInfo version.')
     try:
         info = replica_info.ReplicaInfo.from_storage_dict(original)
         canonical = info.to_storage_dict()
+        repeated = replica_info.ReplicaInfo.from_storage_dict(
+            copy.deepcopy(original)).to_storage_dict()
         verified = replica_info.ReplicaInfo.from_storage_dict(
             copy.deepcopy(canonical)).to_storage_dict()
     except Exception as error:  # pylint: disable=broad-except
         raise ReplicaRecordNormalizationError(
             f'{row_label} cannot be canonically normalized '
             f'({type(error).__name__}).') from None
-    if not _exact_json_equal(canonical, verified) or canonical.get(
-            'replica_info_version') != _CURRENT_VERSION:
+    if (not _exact_json_equal(canonical, repeated) or
+            not _exact_json_equal(canonical, verified) or
+            canonical.get('replica_info_version') != _CURRENT_VERSION):
         raise ReplicaRecordNormalizationError(
             f'{row_label} did not reach stable v18 state.')
-    expected = copy.deepcopy(original)
-    expected['replica_info_version'] = _CURRENT_VERSION
-    for field in _ATTRIBUTION_FIELDS:
-        if field not in expected:
-            expected[field] = None
+    try:
+        if raw_version in _LEGACY_VERSIONS:
+            expected = _expected_legacy_canonical_state(original)
+            expected_delta = 'bounded legacy-to-v18 materialization'
+        else:
+            expected = copy.deepcopy(original)
+            expected['replica_info_version'] = _CURRENT_VERSION
+            for field in _ATTRIBUTION_FIELDS:
+                if field not in expected:
+                    expected[field] = None
+            expected_delta = 'exact v17-to-v18 version/null expansion'
+    except Exception as error:  # pylint: disable=broad-except
+        raise ReplicaRecordNormalizationError(
+            f'{row_label} cannot verify its canonical delta '
+            f'({type(error).__name__}).') from None
     if not _exact_json_equal(canonical, expected):
         raise ReplicaRecordNormalizationError(
-            f'{row_label} would change state outside the exact '
-            'v17-to-v18 version/null expansion.')
+            f'{row_label} would change state outside the {expected_delta}.')
     if canonical.get('replica_id') != row.replica_id:
         raise ReplicaRecordNormalizationError(
             f'{row_label} disagrees with its physical key.')

@@ -124,13 +124,23 @@ def test_v13_exact_additive_field_list_and_random_record_identity() -> None:
     assert first.replica_record_id != second.replica_record_id
 
 
-@pytest.mark.parametrize('version', [-1, 0, 12, 13, 15, 16, 19])
-def test_runtime_json_decoder_rejects_every_nontransitional_version(
+@pytest.mark.parametrize('version', [-1, 0, 15, 16, 19])
+def test_runtime_json_decoder_rejects_unsupported_version(version: int) -> None:
+    state = _replica().to_storage_dict()
+    state['replica_info_version'] = version
+
+    with pytest.raises(ValueError,
+                       match='Unsupported ReplicaInfo storage version'):
+        replica_info.ReplicaInfo.from_storage_dict(state)
+
+
+@pytest.mark.parametrize('version', [12, 13])
+def test_runtime_json_decoder_rejects_supported_version_with_wrong_shape(
         version: int) -> None:
     state = _replica().to_storage_dict()
     state['replica_info_version'] = version
 
-    with pytest.raises(ValueError, match='v17 collision records'):
+    with pytest.raises(ValueError, match='invalid top-level shape'):
         replica_info.ReplicaInfo.from_storage_dict(state)
 
 
@@ -141,7 +151,7 @@ def test_rejected_legacy_json_never_logs_payload(caplog) -> None:
     partial['system_recovery_launch_intent'] = {'raw-secret': 'do-not-log'}
 
     with caplog.at_level(logging.WARNING):
-        with pytest.raises(ValueError, match='v17 collision records'):
+        with pytest.raises(ValueError, match='invalid top-level shape'):
             replica_info.ReplicaInfo.from_storage_dict(partial)
 
     assert 'raw-secret' not in caplog.text

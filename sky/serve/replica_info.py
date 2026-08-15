@@ -437,6 +437,85 @@ _REPLICA_INFO_OWNED_FIELDS = (
 )
 _REPLICA_INFO_STORAGE_FIELDS = ('replica_info_version',
                                 *_REPLICA_INFO_OWNED_FIELDS)
+_SUPPORTED_LEGACY_JSON_VERSIONS = frozenset((3, 6, 7, 12, 13, 14))
+_LEGACY_JSON_BASE_STORAGE_FIELDS = frozenset((
+    'replica_info_version',
+    'replica_id',
+    'cluster_name',
+    'version',
+    'replica_port',
+    'created_at',
+    'first_not_ready_time',
+    'first_consecutive_failure_time',
+    'status_property',
+    'is_spot',
+    'location',
+    'resources_override',
+    'reserved_fill',
+    'cost_rebalance_for_replica_id',
+))
+_LEGACY_JSON_CAPACITY_STORAGE_FIELDS = frozenset((
+    'planned_capacity',
+    'unknown_capacity_replacement',
+    'logical_bridge_capacity_verified',
+))
+_LEGACY_JSON_ECONOMIC_STORAGE_FIELDS = frozenset((
+    'is_zero_cost',
+    'paid_capacity_pool_key',
+))
+_LEGACY_JSON_RECOVERY_STORAGE_FIELDS = frozenset(V13_ADDITIVE_STORAGE_FIELDS)
+_LEGACY_JSON_RESERVED_FILL_IDENTITY_V13_FIELDS = frozenset((
+    'reserved_fill_pool_key',
+    'reserved_fill_service_generation',
+    'reserved_fill_physical_cluster_uid',
+))
+_LEGACY_JSON_RESERVED_FILL_IDENTITY_V14_FIELDS = frozenset((
+    *_LEGACY_JSON_RESERVED_FILL_IDENTITY_V13_FIELDS,
+    'reserved_fill_kubernetes_context',
+))
+_LEGACY_JSON_CAPACITY_SHAPE = (_LEGACY_JSON_BASE_STORAGE_FIELDS |
+                               _LEGACY_JSON_CAPACITY_STORAGE_FIELDS)
+_LEGACY_JSON_ECONOMIC_SHAPE = (_LEGACY_JSON_CAPACITY_SHAPE |
+                               _LEGACY_JSON_ECONOMIC_STORAGE_FIELDS)
+_LEGACY_JSON_RECOVERY_SHAPE = (_LEGACY_JSON_ECONOMIC_SHAPE |
+                               _LEGACY_JSON_RECOVERY_STORAGE_FIELDS)
+_LEGACY_JSON_STORAGE_SHAPES = {
+    3: (_LEGACY_JSON_BASE_STORAGE_FIELDS,),
+    6: (_LEGACY_JSON_CAPACITY_SHAPE,),
+    7: (_LEGACY_JSON_BASE_STORAGE_FIELDS,),
+    12: (_LEGACY_JSON_ECONOMIC_SHAPE,),
+    13: (
+        _LEGACY_JSON_RECOVERY_SHAPE,
+        _LEGACY_JSON_RECOVERY_SHAPE |
+        _LEGACY_JSON_RESERVED_FILL_IDENTITY_V13_FIELDS,
+        _LEGACY_JSON_RECOVERY_SHAPE |
+        _LEGACY_JSON_RESERVED_FILL_IDENTITY_V14_FIELDS,
+    ),
+    14: (_LEGACY_JSON_RECOVERY_SHAPE |
+         _LEGACY_JSON_RESERVED_FILL_IDENTITY_V14_FIELDS,),
+}
+_LEGACY_JSON_STATUS_BASE_FIELDS = frozenset((
+    'sky_launch_status',
+    'user_app_failed',
+    'service_ready_now',
+    'first_ready_time',
+    'sky_down_status',
+    'is_scale_down',
+    'preempted',
+    'purged',
+    'failed_spot_availability',
+    'drain_cap_seconds',
+    'wait_for_idle_before_termination',
+))
+_LEGACY_JSON_STATUS_CURRENT_FIELDS = frozenset(_REPLICA_STATUS_PROPERTY_FIELDS)
+_LEGACY_JSON_STATUS_SHAPES = {
+    3: _LEGACY_JSON_STATUS_BASE_FIELDS,
+    6: _LEGACY_JSON_STATUS_CURRENT_FIELDS,
+    7: _LEGACY_JSON_STATUS_BASE_FIELDS,
+    12: _LEGACY_JSON_STATUS_CURRENT_FIELDS,
+    13: _LEGACY_JSON_STATUS_CURRENT_FIELDS,
+    14: _LEGACY_JSON_STATUS_CURRENT_FIELDS,
+}
 _REPLICA_INFO_LEGACY_DEFAULTS = {
     'created_at': None,
     'first_not_ready_time': None,
@@ -545,6 +624,43 @@ def _require_v17_collision_storage_fields(state: dict[str, Any]) -> None:
         owner='ReplicaInfo v17 collision',
         optional=(V17_COLLISION_OPTIONAL_STORAGE_FIELDS
                   if not present_attribution else ()))
+
+
+def _require_legacy_json_storage_fields(state: dict[str, Any],
+                                        version: int) -> None:
+    """Accept only the closed pre-v17 shapes observed in the live census."""
+    allowed_shapes = _LEGACY_JSON_STORAGE_SHAPES[version]
+    observed = frozenset(state)
+    if observed not in allowed_shapes:
+        nearest = min(
+            allowed_shapes,
+            key=lambda shape: len(shape.symmetric_difference(observed)))
+        missing = sorted(nearest - observed)
+        unexpected = sorted(observed - nearest)
+        details = []
+        if missing:
+            details.append(f'missing fields: {", ".join(missing)}')
+        if unexpected:
+            details.append(f'unexpected fields: {", ".join(unexpected)}')
+        raise ValueError(f'Legacy ReplicaInfo v{version} has an invalid '
+                         f'top-level shape ({"; ".join(details)}).')
+
+    status_state = state['status_property']
+    if not isinstance(status_state, dict):
+        raise ValueError(
+            f'Legacy ReplicaInfo v{version} status_property must be a dict.')
+    expected_status = _LEGACY_JSON_STATUS_SHAPES[version]
+    observed_status = frozenset(status_state)
+    missing_status = sorted(expected_status - observed_status)
+    unexpected_status = sorted(observed_status - expected_status)
+    if missing_status or unexpected_status:
+        details = []
+        if missing_status:
+            details.append(f'missing fields: {", ".join(missing_status)}')
+        if unexpected_status:
+            details.append(f'unexpected fields: {", ".join(unexpected_status)}')
+        raise ValueError(f'Legacy ReplicaInfo v{version} has an invalid '
+                         f'status_property shape ({"; ".join(details)}).')
 
 
 def _require_current_pickle_fields(state: dict[str, Any], version: int) -> None:
@@ -1274,14 +1390,20 @@ class ReplicaInfo:
             _require_current_storage_fields(state)
         elif record_version == 17:
             _require_v17_collision_storage_fields(state)
+        elif record_version in _SUPPORTED_LEGACY_JSON_VERSIONS:
+            _require_legacy_json_storage_fields(state, record_version)
         else:
-            raise ValueError('Only ReplicaInfo v17 collision records and '
-                             f'v{cls._VERSION} records are readable; got '
-                             f'{record_version!r}.')
+            raise ValueError(
+                'Unsupported ReplicaInfo storage version; readable versions '
+                f'are {sorted(_SUPPORTED_LEGACY_JSON_VERSIONS)}, 17, and '
+                f'{cls._VERSION}; got {record_version!r}.')
         status_state = state['status_property']
 
         def _status_value(field: str) -> Any:
-            return status_state[field]
+            if record_version in (17, cls._VERSION):
+                return status_state[field]
+            return status_state.get(
+                field, _REPLICA_STATUS_PROPERTY_LEGACY_DEFAULTS[field])
 
         def _process_status(
             value: common_utils.ProcessStatus | str | None,
@@ -1357,43 +1479,49 @@ class ReplicaInfo:
         replica.cost_rebalance_for_replica_id = state.get(
             'cost_rebalance_for_replica_id')
         replica.paid_capacity_pool_key = state.get('paid_capacity_pool_key')
-        _set_ordinary_system_recovery_defaults(replica)
-        try:
-            replica.replica_record_id = state['replica_record_id']
-            intent_state = state['system_recovery_launch_intent']
-            replica.system_recovery_launch_intent = (
-                system_recovery_state.SystemRecoveryLaunchIntent.from_dict(
-                    intent_state) if intent_state is not None else None)
-            replica.system_recovery_disposition = (
-                system_recovery_state.SystemRecoveryDisposition(
-                    state['system_recovery_disposition']))
-            replica.launch_request_id = state['launch_request_id']
-            replica.service_job_id = state['service_job_id']
-            replica.candidate_ready_observed_at = state[
-                'candidate_ready_observed_at']
-            replica.ordinary_release_not_before = state[
-                'ordinary_release_not_before']
-            replica.system_recovery_revision = state['system_recovery_revision']
-            nested_state = state['system_recovery']
-            replica.system_recovery = (
-                system_recovery_state.ReplicaSystemRecovery.from_dict(
-                    nested_state) if nested_state is not None else None)
-            quarantine_state = state['system_recovery_quarantine']
-            replica.system_recovery_quarantine = (
-                system_recovery_state.SystemRecoveryQuarantine.from_dict(
-                    quarantine_state) if quarantine_state is not None else None)
-        except (system_recovery_state.RecoveryStateError, TypeError,
-                ValueError):
-            _quarantine_system_recovery(
-                replica, system_recovery_state.RecoveryQuarantineReason.
-                MALFORMED_V13_BUNDLE)
+        if record_version < 13:
+            _set_ordinary_system_recovery_defaults(replica)
+            _set_transition_replica_record_id(replica)
         else:
+            _set_ordinary_system_recovery_defaults(replica)
             try:
-                _validate_system_recovery_fields(replica)
-            except system_recovery_state.RecoveryStateError:
+                replica.replica_record_id = state['replica_record_id']
+                intent_state = state['system_recovery_launch_intent']
+                replica.system_recovery_launch_intent = (
+                    system_recovery_state.SystemRecoveryLaunchIntent.from_dict(
+                        intent_state) if intent_state is not None else None)
+                replica.system_recovery_disposition = (
+                    system_recovery_state.SystemRecoveryDisposition(
+                        state['system_recovery_disposition']))
+                replica.launch_request_id = state['launch_request_id']
+                replica.service_job_id = state['service_job_id']
+                replica.candidate_ready_observed_at = state[
+                    'candidate_ready_observed_at']
+                replica.ordinary_release_not_before = state[
+                    'ordinary_release_not_before']
+                replica.system_recovery_revision = state[
+                    'system_recovery_revision']
+                nested_state = state['system_recovery']
+                replica.system_recovery = (
+                    system_recovery_state.ReplicaSystemRecovery.from_dict(
+                        nested_state) if nested_state is not None else None)
+                quarantine_state = state['system_recovery_quarantine']
+                replica.system_recovery_quarantine = (
+                    system_recovery_state.SystemRecoveryQuarantine.from_dict(
+                        quarantine_state)
+                    if quarantine_state is not None else None)
+            except (system_recovery_state.RecoveryStateError, TypeError,
+                    ValueError):
                 _quarantine_system_recovery(
                     replica, system_recovery_state.RecoveryQuarantineReason.
-                    INCONSISTENT_V13_BUNDLE)
+                    MALFORMED_V13_BUNDLE)
+            else:
+                try:
+                    _validate_system_recovery_fields(replica)
+                except system_recovery_state.RecoveryStateError:
+                    _quarantine_system_recovery(
+                        replica, system_recovery_state.RecoveryQuarantineReason.
+                        INCONSISTENT_V13_BUNDLE)
         drain_started_at = _status_value('drain_started_at')
         logical_retirement_committed = _status_value(
             'logical_retirement_committed')
@@ -1443,6 +1571,9 @@ class ReplicaInfo:
                 replica.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.SUCCEEDED)
                 replica.status_property.user_app_failed = True
+        if record_version in _SUPPORTED_LEGACY_JSON_VERSIONS:
+            _materialize_legacy_replica_info_fields(replica)
+            replica._version = cls._VERSION
         _require_replica_info_fields(
             replica, owner=f'decoded ReplicaInfo v{record_version}')
         _validate_reserved_fill_allocation_attribution(replica)

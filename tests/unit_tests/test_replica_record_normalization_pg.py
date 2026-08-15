@@ -18,10 +18,168 @@ from sky import clouds
 from sky.serve import replica_info
 from sky.serve import replica_managers
 from sky.serve import replica_record_normalization as normalization
+from sky.serve import reserved_capacity
+from sky.serve import reserved_capacity_broker
 from sky.serve import serve_state
 from sky.serve import spot_placer
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
+
+_LEGACY_TOP_BASE = frozenset((
+    'replica_info_version',
+    'replica_id',
+    'cluster_name',
+    'version',
+    'replica_port',
+    'created_at',
+    'first_not_ready_time',
+    'first_consecutive_failure_time',
+    'status_property',
+    'is_spot',
+    'location',
+    'resources_override',
+    'reserved_fill',
+    'cost_rebalance_for_replica_id',
+))
+_LEGACY_TOP_CAPACITY = frozenset((
+    'planned_capacity',
+    'unknown_capacity_replacement',
+    'logical_bridge_capacity_verified',
+))
+_LEGACY_TOP_ECONOMIC = frozenset((
+    'is_zero_cost',
+    'paid_capacity_pool_key',
+))
+_LEGACY_TOP_RECOVERY = frozenset((
+    'replica_record_id',
+    'system_recovery_launch_intent',
+    'system_recovery_disposition',
+    'launch_request_id',
+    'service_job_id',
+    'candidate_ready_observed_at',
+    'ordinary_release_not_before',
+    'system_recovery_revision',
+    'system_recovery',
+    'system_recovery_quarantine',
+))
+_LEGACY_TOP_FILL_IDENTITY_V13 = frozenset((
+    'reserved_fill_pool_key',
+    'reserved_fill_service_generation',
+    'reserved_fill_physical_cluster_uid',
+))
+_LEGACY_TOP_FILL_IDENTITY_V14 = frozenset((
+    *_LEGACY_TOP_FILL_IDENTITY_V13,
+    'reserved_fill_kubernetes_context',
+))
+_LEGACY_STATUS_BASE = frozenset((
+    'sky_launch_status',
+    'user_app_failed',
+    'service_ready_now',
+    'first_ready_time',
+    'sky_down_status',
+    'is_scale_down',
+    'preempted',
+    'purged',
+    'failed_spot_availability',
+    'drain_cap_seconds',
+    'wait_for_idle_before_termination',
+))
+_LEGACY_STATUS_CURRENT = frozenset((
+    *_LEGACY_STATUS_BASE,
+    'drain_started_at',
+    'logical_retirement_version',
+    'logical_retirement_controller_epoch',
+    'logical_retirement_generation',
+    'logical_retirement_target_capacity',
+    'logical_retirement_confirmed_generation',
+    'logical_retirement_bounded_deadline',
+    'logical_retirement_committed',
+))
+_LEGACY_TOP_CAPACITY_SHAPE = _LEGACY_TOP_BASE | _LEGACY_TOP_CAPACITY
+_LEGACY_TOP_ECONOMIC_SHAPE = (_LEGACY_TOP_CAPACITY_SHAPE | _LEGACY_TOP_ECONOMIC)
+_LEGACY_TOP_RECOVERY_SHAPE = (_LEGACY_TOP_ECONOMIC_SHAPE | _LEGACY_TOP_RECOVERY)
+_LEGACY_CENSUS_CASES = (
+    (3, _LEGACY_TOP_BASE, _LEGACY_STATUS_BASE),
+    (6, _LEGACY_TOP_CAPACITY_SHAPE, _LEGACY_STATUS_CURRENT),
+    (7, _LEGACY_TOP_BASE, _LEGACY_STATUS_BASE),
+    (12, _LEGACY_TOP_ECONOMIC_SHAPE, _LEGACY_STATUS_CURRENT),
+    (13, _LEGACY_TOP_RECOVERY_SHAPE, _LEGACY_STATUS_CURRENT),
+    (13, _LEGACY_TOP_RECOVERY_SHAPE | _LEGACY_TOP_FILL_IDENTITY_V13,
+     _LEGACY_STATUS_CURRENT),
+    (13, _LEGACY_TOP_RECOVERY_SHAPE | _LEGACY_TOP_FILL_IDENTITY_V14,
+     _LEGACY_STATUS_CURRENT),
+    (14, _LEGACY_TOP_RECOVERY_SHAPE | _LEGACY_TOP_FILL_IDENTITY_V14,
+     _LEGACY_STATUS_CURRENT),
+)
+_LEGACY_ATTRIBUTION_FIELDS = frozenset((
+    'reserved_fill_allocation_generation',
+    'reserved_fill_allocation_input_sha256',
+    'reserved_fill_allocation_claim_generation',
+    'reserved_fill_reconciliation_gate_generation',
+    'reserved_fill_reclaim_fleet_bundle_sha256',
+    'reserved_fill_reclaim_policy_revision',
+    'reserved_fill_reclaim_provider_inventory_sha256',
+    'reserved_fill_worker_projection_sha256',
+    'reserved_fill_observation_generation',
+    'reserved_fill_observation_sequence',
+    'reserved_fill_intent_idempotency_key',
+    'zero_cost_admission_sequence',
+    'zero_cost_materialization_sequence',
+))
+_CURRENT_TOP_LEVEL_FIELDS = (_LEGACY_TOP_RECOVERY_SHAPE |
+                             _LEGACY_TOP_FILL_IDENTITY_V14 |
+                             _LEGACY_ATTRIBUTION_FIELDS)
+_LEGACY_TOP_LEVEL_DEFAULTS = {
+    'planned_capacity': 1,
+    'unknown_capacity_replacement': False,
+    'logical_bridge_capacity_verified': False,
+    'reserved_fill_pool_key': None,
+    'reserved_fill_service_generation': None,
+    'reserved_fill_physical_cluster_uid': None,
+    'reserved_fill_kubernetes_context': None,
+    'reserved_fill_allocation_generation': None,
+    'reserved_fill_allocation_input_sha256': None,
+    'reserved_fill_allocation_claim_generation': None,
+    'reserved_fill_reconciliation_gate_generation': None,
+    'reserved_fill_reclaim_fleet_bundle_sha256': None,
+    'reserved_fill_reclaim_policy_revision': None,
+    'reserved_fill_reclaim_provider_inventory_sha256': None,
+    'reserved_fill_worker_projection_sha256': None,
+    'reserved_fill_observation_generation': None,
+    'reserved_fill_observation_sequence': None,
+    'reserved_fill_intent_idempotency_key': None,
+    'zero_cost_admission_sequence': None,
+    'zero_cost_materialization_sequence': None,
+    'is_zero_cost': False,
+    'paid_capacity_pool_key': None,
+}
+_LEGACY_STATUS_DEFAULTS = {
+    'drain_started_at': None,
+    'logical_retirement_version': None,
+    'logical_retirement_controller_epoch': None,
+    'logical_retirement_generation': None,
+    'logical_retirement_target_capacity': None,
+    'logical_retirement_confirmed_generation': None,
+    'logical_retirement_bounded_deadline': False,
+    'logical_retirement_committed': None,
+}
+_LEGACY_SYSTEM_RECOVERY_DEFAULTS = {
+    'system_recovery_launch_intent': None,
+    'system_recovery_disposition': 'ORDINARY',
+    'launch_request_id': None,
+    'service_job_id': None,
+    'candidate_ready_observed_at': None,
+    'ordinary_release_not_before': None,
+    'system_recovery_revision': 0,
+    'system_recovery': None,
+    'system_recovery_quarantine': None,
+}
+_EXPECTED_PRE_V13_RECORD_IDS = {
+    100: '3a8f71cf-df76-5780-a16c-9776220a1dde',
+    101: 'b84a4e3f-455d-52e0-b1b0-87357586e1d1',
+    102: 'bce08e9d-b91d-5420-ba8b-1b6002a23296',
+    103: '8c14e31e-2b79-53c1-a8fd-22634c96dc78',
+}
 
 
 @pytest.fixture(scope='session')
@@ -132,6 +290,77 @@ def _v17_collision_state(replica_id: int = 7) -> dict[str, object]:
     return state
 
 
+def _legacy_state(replica_id: int, version: int, top_fields: frozenset[str],
+                  status_fields: frozenset[str]) -> dict[str, object]:
+    state = _replica(replica_id).to_storage_dict()
+    state['created_at'] = float(1000 + replica_id)
+    state['location'] = {
+        'cloud': 'Kubernetes',
+        'region': 'phx-context',
+        'zone': None,
+        'accelerators': {
+            'H200': 1,
+        },
+        'use_spot': False,
+        'image_id': None,
+        'container_image': None,
+        'disk_tier': None,
+        'ephemeral_storage': None,
+        'instance_type': None,
+    }
+    state['resources_override'] = {
+        'cloud': 'Kubernetes',
+        'region': 'phx-context',
+        'accelerators': {
+            'H200': 1,
+        },
+        'image_id': [[None, 'global-image'], ['phx-context', 'regional-image']],
+    }
+    state['planned_capacity'] = 4
+    state['unknown_capacity_replacement'] = True
+    state['logical_bridge_capacity_verified'] = True
+    state['reserved_fill'] = True
+    state['is_zero_cost'] = True
+    state['cost_rebalance_for_replica_id'] = 91
+    state['paid_capacity_pool_key'] = 'paid-capacity-pool'
+    state['reserved_fill_pool_key'] = reserved_capacity_broker.make_pool_key(
+        'phx-context',
+        'H200',
+        protocol_version=reserved_capacity_broker.PROTOCOL_V2,
+        physical_cluster_uid='physical-uid')
+    state['reserved_fill_service_generation'] = 7
+    state['reserved_fill_physical_cluster_uid'] = 'physical-uid'
+    state['reserved_fill_kubernetes_context'] = 'phx-context'
+    state['replica_info_version'] = version
+    status = state['status_property']
+    assert isinstance(status, dict)
+    status['drain_started_at'] = 123.5
+    status['logical_retirement_version'] = 3
+    status['logical_retirement_controller_epoch'] = 'controller-epoch'
+    status['logical_retirement_generation'] = 11
+    status['logical_retirement_target_capacity'] = 5
+    status['logical_retirement_confirmed_generation'] = 10
+    status['logical_retirement_bounded_deadline'] = True
+    status['logical_retirement_committed'] = True
+    state['status_property'] = {
+        field: copy.deepcopy(status[field]) for field in status_fields
+    }
+    return {field: copy.deepcopy(state[field]) for field in top_fields}
+
+
+def _json_exact(left, right) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return (set(left) == set(right) and
+                all(_json_exact(left[key], right[key]) for key in left))
+    if isinstance(left, list):
+        return (len(left) == len(right) and all(
+            _json_exact(left_item, right_item)
+            for left_item, right_item in zip(left, right)))
+    return left == right
+
+
 def test_normalizer_rewrites_exact_v17_collision_and_fences_old_writer(
         normalization_engine) -> None:
     collision = _v17_collision_state()
@@ -195,6 +424,217 @@ def test_normalizer_rewrites_exact_v17_collision_and_fences_old_writer(
             connection.execute(
                 sqlalchemy.update(serve_state.replicas_table).values(
                     replica_info=pickle.dumps(_replica(7))))
+
+
+def test_normalizer_rewrites_all_eight_observed_legacy_shapes(
+        normalization_engine) -> None:
+    originals = []
+    for offset, (version, top_fields,
+                 status_fields) in enumerate(_LEGACY_CENSUS_CASES):
+        state = _legacy_state(100 + offset, version, top_fields, status_fields)
+        originals.append(state)
+        _insert_state(normalization_engine, state)
+
+    receipt = normalization.normalize_retained_replica_records()
+
+    assert receipt['scanned_records'] == 8
+    assert receipt['rewritten_records'] == 8
+    assert receipt['already_current_records'] == 0
+    assert receipt['invalid_records'] == 0
+    assert receipt['remaining_noncurrent_records'] == 0
+    assert receipt['remaining_legacy_pickle_records'] == 0
+    with normalization_engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(
+                serve_state.replicas_table.c.replica_id,
+                serve_state.replicas_table.c.replica_state,
+                serve_state.replicas_table.c.replica_info).order_by(
+                    serve_state.replicas_table.c.replica_id)).all()
+    assert [row.replica_id for row in rows] == list(range(100, 108))
+    for original, row in zip(originals, rows):
+        state = row.replica_state
+        assert row.replica_info is None
+        assert state['replica_info_version'] == 18
+        assert set(state) == _CURRENT_TOP_LEVEL_FIELDS
+        assert set(state['status_property']) == _LEGACY_STATUS_CURRENT
+
+        for field in set(original) - {
+                'replica_info_version', 'status_property'
+        }:
+            assert _json_exact(state[field], original[field])
+        original_status = original['status_property']
+        assert isinstance(original_status, dict)
+        for field, value in original_status.items():
+            assert _json_exact(state['status_property'][field], value)
+
+        expected_additions = {
+            field: copy.deepcopy(default)
+            for field, default in _LEGACY_TOP_LEVEL_DEFAULTS.items()
+            if field not in original
+        }
+        version = original['replica_info_version']
+        assert isinstance(version, int)
+        if version < 13:
+            expected_additions.update(_LEGACY_SYSTEM_RECOVERY_DEFAULTS)
+            expected_additions['replica_record_id'] = (
+                _EXPECTED_PRE_V13_RECORD_IDS[row.replica_id])
+        actual_additions = {
+            field: state[field]
+            for field in _CURRENT_TOP_LEVEL_FIELDS - set(original)
+        }
+        assert _json_exact(actual_additions, expected_additions)
+        expected_status_additions = {
+            field: default
+            for field, default in _LEGACY_STATUS_DEFAULTS.items()
+            if field not in original_status
+        }
+        actual_status_additions = {
+            field: state['status_property'][field]
+            for field in _LEGACY_STATUS_CURRENT - set(original_status)
+        }
+        assert _json_exact(actual_status_additions, expected_status_additions)
+
+        restored = replica_info.ReplicaInfo.from_storage_dict(
+            copy.deepcopy(state))
+        if row.replica_id in (105, 106, 107):
+            assert reserved_capacity.parse_protocol_v2_cleanup_fence(
+                restored) == reserved_capacity.ProtocolV2CleanupFence(
+                    kubernetes_context='phx-context',
+                    physical_cluster_uid='physical-uid')
+
+    second = normalization.normalize_retained_replica_records()
+    assert second['already_current_records'] == 8
+    assert second['rewritten_records'] == 0
+
+
+def test_normalizer_rejects_legacy_present_field_type_coercion(
+        normalization_engine) -> None:
+    state = _legacy_state(108, 12, _LEGACY_TOP_ECONOMIC_SHAPE,
+                          _LEGACY_STATUS_CURRENT)
+    status = state['status_property']
+    assert isinstance(status, dict)
+    status['service_ready_now'] = 1
+    _insert_state(normalization_engine, state)
+
+    with pytest.raises(normalization.ReplicaRecordNormalizationError,
+                       match='bounded legacy-to-v18 materialization'):
+        normalization.normalize_retained_replica_records()
+
+    with normalization_engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(serve_state.replicas_table.c.replica_state,
+                              serve_state.replicas_table.c.replica_info)).one()
+    assert _json_exact(row.replica_state, state)
+    assert row.replica_info is not None
+
+
+def test_normalizer_sanitizes_legacy_delta_derivation_failure(
+        normalization_engine) -> None:
+    state = _legacy_state(112, 7, _LEGACY_TOP_BASE, _LEGACY_STATUS_BASE)
+    _insert_state(normalization_engine, state)
+    malformed = copy.deepcopy(state)
+    malformed['cluster_name'] = 987654321
+    with normalization_engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                serve_state.replicas_table).values(replica_state=malformed))
+
+    with pytest.raises(normalization.ReplicaRecordNormalizationError,
+                       match='cannot verify its canonical delta') as exc:
+        normalization.normalize_retained_replica_records()
+
+    assert '987654321' not in str(exc.value)
+    assert exc.value.__cause__ is None
+    with normalization_engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(serve_state.replicas_table.c.replica_state,
+                              serve_state.replicas_table.c.replica_info)).one()
+    assert _json_exact(row.replica_state, malformed)
+    assert row.replica_info is not None
+    assert 'ck_replicas_replica_info_version_18' not in {
+        item['name'] for item in sqlalchemy.inspect(
+            normalization_engine).get_check_constraints('replicas')
+    }
+
+
+@pytest.mark.parametrize('version', [13, 14])
+def test_normalizer_rejects_legacy_recovery_quarantine_delta_atomically(
+        normalization_engine, version: int) -> None:
+    state = _legacy_state(
+        109, version,
+        _LEGACY_TOP_RECOVERY_SHAPE | _LEGACY_TOP_FILL_IDENTITY_V14,
+        _LEGACY_STATUS_CURRENT)
+    state['system_recovery_disposition'] = 'not-a-disposition'
+    _insert_state(normalization_engine, state)
+
+    with pytest.raises(normalization.ReplicaRecordNormalizationError,
+                       match='bounded legacy-to-v18 materialization'):
+        normalization.normalize_retained_replica_records()
+
+    with normalization_engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(serve_state.replicas_table.c.replica_state,
+                              serve_state.replicas_table.c.replica_info)).one()
+    assert _json_exact(row.replica_state, state)
+    assert row.replica_info is not None
+
+
+def test_normalizer_preserves_complete_v17_attribution(
+        normalization_engine) -> None:
+    state = _legacy_state(
+        110, 14, _LEGACY_TOP_RECOVERY_SHAPE | _LEGACY_TOP_FILL_IDENTITY_V14,
+        _LEGACY_STATUS_CURRENT)
+    canonical = replica_info.ReplicaInfo.from_storage_dict(
+        state).to_storage_dict()
+    canonical.update({
+        'replica_info_version': 17,
+        'reserved_fill_allocation_generation': 5,
+        'reserved_fill_allocation_input_sha256': 'a' * 64,
+        'reserved_fill_allocation_claim_generation': 7,
+        'reserved_fill_reconciliation_gate_generation': 29,
+        'reserved_fill_reclaim_fleet_bundle_sha256': 'c' * 64,
+        'reserved_fill_reclaim_policy_revision': 'reclaim-v1',
+        'reserved_fill_reclaim_provider_inventory_sha256': 'd' * 64,
+        'reserved_fill_worker_projection_sha256': 'e' * 64,
+        'reserved_fill_observation_generation': 13,
+        'reserved_fill_observation_sequence': 17,
+        'reserved_fill_intent_idempotency_key': 'b' * 64,
+        'zero_cost_admission_sequence': 19,
+        'zero_cost_materialization_sequence': 23,
+    })
+    _insert_state(normalization_engine, canonical)
+
+    receipt = normalization.normalize_retained_replica_records()
+
+    assert receipt['rewritten_records'] == 1
+    with normalization_engine.connect() as connection:
+        persisted = connection.execute(
+            sqlalchemy.select(
+                serve_state.replicas_table.c.replica_state)).scalar_one()
+    expected = copy.deepcopy(canonical)
+    expected['replica_info_version'] = 18
+    assert _json_exact(persisted, expected)
+
+
+def test_normalizer_clears_stale_pickle_from_exact_v18_then_is_idempotent(
+        normalization_engine) -> None:
+    state = _replica(111).to_storage_dict()
+    _insert_state(normalization_engine, state)
+
+    first = normalization.normalize_retained_replica_records()
+
+    assert first['rewritten_records'] == 1
+    assert first['already_current_records'] == 0
+    with normalization_engine.connect() as connection:
+        row = connection.execute(
+            sqlalchemy.select(serve_state.replicas_table.c.replica_state,
+                              serve_state.replicas_table.c.replica_info)).one()
+    assert _json_exact(row.replica_state, state)
+    assert row.replica_info is None
+
+    second = normalization.normalize_retained_replica_records()
+    assert second['rewritten_records'] == 0
+    assert second['already_current_records'] == 1
 
 
 def test_normalizer_rolls_back_unknown_record_version(

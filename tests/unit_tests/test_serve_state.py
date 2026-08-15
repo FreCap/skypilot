@@ -6785,7 +6785,7 @@ class TestExpectedExistingReplicaPersistence:
                         replica_state=row))
             session.commit()
 
-        with pytest.raises(ValueError, match='v17 collision records'):
+        with pytest.raises(ValueError, match='invalid top-level shape'):
             serve_state.get_replica_info_from_id('svc', 1)
 
     def test_recreated_numeric_id_rejects_stale_updates_and_deletes(

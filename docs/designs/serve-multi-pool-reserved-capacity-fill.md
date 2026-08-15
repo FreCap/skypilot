@@ -8,16 +8,21 @@ as `v1.1.1277`. That published precursor is historical evidence only and is
 activation-ineligible: it predates the capacity, generated-Service annotation,
 and audit-target contracts in this design and the corresponding CI-isolation
 fix. Activation successor A is the single current source successor. It
-subsumes that v18-only precursor and adds all three pre-activation contracts;
-it is not yet merged, published, or deployed. Exact-only publisher B and final
-Serve047 cleanup C are pending. The prior review record is historical. A
-requires independent security/contract review and CI before merge; three
-consecutive pragmatic adversarial rounds are required later against the frozen
-final A/B/C and platform heads before final deployment/completion. Platform PRs
-14, 17, 18, and 19 remain unapplied, reserved-fill activation has not occurred,
-and cleanup remains blocked on the documented live receipt gates.
+subsumes that v18-only precursor and adds all three pre-activation contracts.
+A read-only production census on 2026-08-15 disproved the prior assumption that
+all retained JSON rows were already v17: exact historical v3, v6, v7, v12,
+v13, and v14 rows remain. A narrowly bounded reader bridge for only their
+observed closed shapes is therefore part of A's `LEGACY_ACTIVE` rollout; it
+does not weaken v17/v18 validation or authorize sequenced fill. A is not yet
+merged, published, or deployed. Exact-only publisher B and final Serve047
+cleanup C are pending. The prior review record is historical. A requires
+independent security/contract review and CI before merge; three consecutive
+pragmatic adversarial rounds are required later against the frozen final A/B/C
+and platform heads before final deployment/completion. Platform PRs 14, 17,
+18, and 19 remain unapplied, reserved-fill activation has not occurred, and
+cleanup remains blocked on the documented live receipt gates.
 
-Last updated: 2026-08-14 (activation-successor pre-activation contracts)
+Last updated: 2026-08-15 (bounded live ReplicaInfo reader bridge)
 
 Canonical owner: this file
 
@@ -71,12 +76,18 @@ activation is repaired by deploying a successor image and authorizing one new
 gate generation through the same command and transaction used for first
 activation. The prior generation then fails closed.
 
-The cross-repository rollout has one ordered fix-forward stack:
+An earlier ordinary-FEV2-only rollout may replace A in place on the existing
+single-`all` Recreate topology solely to restore bounded historical reads and
+authenticated queue capacity while the gate remains `LEGACY_ACTIVE`. That
+rollout neither invokes normalization nor participates in reserved-fill
+activation. The reserved-fill cross-repository rollout then has one ordered
+fix-forward stack:
 
 1. Activation successor A is the final release produced by the old publisher.
-   It carries ReplicaInfo v18 and its one-shot normalizer together with the
-   authenticated queue-capacity, generic generated-Service annotation, and
-   audit-target contracts below. Platform PR 14 pins A's one immutable source,
+   It carries ReplicaInfo v18, the six-version/eight-shape reader bridge and
+   one-shot normalizer together with the authenticated queue-capacity, generic
+   generated-Service annotation, and audit-target contracts below. For the
+   reserved-fill sequence, platform PR 14 pins A's one immutable source,
    image, chart, and module tuple, migrates the live one-pod `all` topology to
    an exact 2/2/2 `api`/`controller`/`executor` cohort, physically deletes
    `all`, and proves all six Ready writers run that tuple.
@@ -664,8 +675,9 @@ zero-cost. Stale whole-row updates merge the immutable database-assigned event
 markers from the locked row, so a retry cannot erase or replace either one.
 
 Replica state version 18 persists the complete typed fill attribution. The
-precursor's narrowly bounded v17 reader exists only to normalize the two exact
-observed v17 shapes described in the deployment gate below:
+transitional reader accepts only the six sanctioned legacy versions/eight
+exact pre-v17 shapes and the two exact observed v17 shapes described in the
+deployment gate below:
 
 - allocation generation, input hash, and claim generation;
 - observation generation and sequence;
@@ -677,17 +689,18 @@ observed v17 shapes described in the deployment gate below:
 - database-assigned zero-cost admission sequence; and
 - database-assigned first-success materialization sequence, once launched.
 
-The six historical allocation/observation/intent fields are all present or all
-absent. The five gate/policy/projection fields are likewise all present or all
-absent and require the historical tuple. A v15 row with only the historical
-tuple remains readable, but it cannot authorize a sequenced launch; that
-terminal fence requires the complete successor tuple to match current durable
-authority. Worktree-only v16 was never merged or deployed and is not a durable
-compatibility format. The
-materialization marker is null before launch success and a positive integer
-afterward. Missing event attribution is a conservative debit in sequenced
-rounds, and only fully attributed current rows count as same-allocation replay
-debits.
+For v17, the six historical allocation/observation/intent fields are all
+present or all absent. The five gate/policy/projection fields are likewise all
+present or all absent and require the historical tuple. The v17 collision
+branch admits only the complete current shape or the exact observed shape with
+all 13 attribution fields absent. The complete successor tuple must match
+current durable authority before it can authorize a sequenced launch. The
+closed readable version set is therefore `3`, `6`, `7`, `12`, `13`, `14`,
+`17`, and `18`; v15, worktree-only v16, every other version, and every partial
+or extra-field shape fail closed. The materialization marker is null before
+launch success and a positive integer afterward. Missing event attribution is
+a conservative debit in sequenced rounds, and only fully attributed current
+rows count as same-allocation replay debits.
 
 ### 2a. Durable reclaim authorization receipt
 
@@ -1727,10 +1740,12 @@ before activation. If it does not, the new image may deploy but the gate stays
   ordinary-launch decoder pending cleanup PR #1452.
 - API capability 77 advertises projection protocol v2; allocation-map schema 5
   binds service version and the closed digest map; ReplicaInfo v18 persists the
-  selected scalar digest. Activation successor A reads only the two exact
-  historical
-  v17 shapes long enough to produce the required normalization receipt;
-  historical v15 and worktree-only v16 are not live formats.
+  selected scalar digest. Activation successor A reads only the six sanctioned
+  legacy versions/eight exact pre-v17 shapes and the two exact v17 shapes long
+  enough to produce the required normalization receipt. The closed readable
+  version set is `3`, `6`, `7`, `12`, `13`, `14`, `17`, and `18`; v15,
+  worktree-only v16, every other version, and every partial or extra-field
+  shape fail closed.
 - Concurrent provider-free pool observer and typed blackouts.
 - Committed-observation broker rounds and complete authenticated maps.
 - Ordinary zero-cost commit sequencing and complete v18 attribution.
@@ -1962,6 +1977,8 @@ either case.
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
 | 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045/046 reclaim-policy identity | Merged in source PR #1451. Its prior freeze/reviews are historical evidence, not a pass for the current stack. |
 | 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
+| 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Required in A and removable only after the v18 normalization receipt; rollout is `LEGACY_ACTIVE` only. |
+| 1d | Narrow ordinary-FEV2 rollout of A on the existing single-`all` Recreate topology | Permitted only for backward reads and authenticated queue capacity at `LEGACY_ACTIVE`; it performs no normalization, role split, publisher migration, or reserved-fill activation. |
 | 2a | Activation successor A and platform PR 14: publish/pin A, migrate one-pod `all` directly to exact split 2/2/2 on A, and delete `all` | A is local and PR 14 is not applied; both are blocked on A review, CI, publication, and exact tuple binding. |
 | 2b | Platform PR 17: invoke normalization and accept its receipt on the unchanged PR 14 A tuple | Blocked until PR 14's exact split-A rollout/readback passes; PR 17 creates no rollout or Helm revision. |
 | 2c | Publisher B and platform PR 18: exact-only source publication, expected pre-adoption no-publish, then separate registry/role adoption and readbacks with no Helm revision | Not merged or applied. |
@@ -2066,20 +2083,137 @@ activation.
 
 ### ReplicaInfo v18 expand-and-normalize gate
 
-Production exposed a v17 label collision: retained rows were labelled current
-while some omitted the 13 sequenced-attribution keys introduced during the
-Serve046 development sequence. Generic legacy materialization would conceal
-that collision and could invent authority. PR #1483 therefore moved the writer
-to v18, and activation successor A carries that writer and normalizer together
-with its other pre-activation contracts. Runtime accepts exact v18, while
-the transitional v17 reader accepts exactly two closed v17 shapes: complete
-v17, or the one observed v17 collision shape with all 13 known collision
-fields absent. The collision shape becomes 13 explicit `null` values; a
-complete v17 value is preserved exactly. A partially missing attribution
-bundle, unknown field, a
-missing non-collision field, an incomplete status subdocument, and every other
-record version fail closed. A also stops all live pickle
-dual-writes; the nullable column remains only until Serve047 drops it.
+Production first exposed a v17 label collision: retained rows were labelled
+current while some omitted the 13 sequenced-attribution keys introduced during
+the Serve046 development sequence. A later read-only transaction on
+2026-08-15 established that the live JSON inventory is broader. It returned no
+payload values or row/service identifiers and found this exact version and
+closed-key-shape census:
+
+| Version | Rows | Exact top-level shape | Exact status shape |
+|---:|---:|---|---|
+| 3 | 1 | `B` | `S11` |
+| 6 | 1 | `B + C` | `S19` |
+| 7 | 128 | `B` | `S11` |
+| 12 | 2,888 | `B + C + E` | `S19` |
+| 13 | 385 | `B + C + E + R` | `S19` |
+| 13 | 32 | `B + C + E + R + I3` | `S19` |
+| 13 | 515 | `B + C + E + R + I4` | `S19` |
+| 14 | 5,006 | `B + C + E + R + I4` | `S19` |
+| 17 | 390 | Complete v17 including all 13 collision fields | `S19` |
+| 17 | 1 | Complete non-collision v17 fields with all 13 collision fields absent | `S19` |
+
+A separate read-only bounded preflight routed pre-v17 rows through the exact
+v1.1.1276 legacy semantics followed by canonical v17 serialization and routed
+v17 through the exact v1.1.1283 collision-aware branch; every result then
+passed canonical v18 serialization. It passed all 9,347 retained rows. Across
+all 8,956 pre-v17 rows it found zero recursive present-field value or JSON-type
+mismatches, including nested `location` and `resources_override`, and produced
+deterministic/idempotent round trips. All 3,809 pre-v17 `reserved_fill` rows
+passed with zero present-field mismatches and no recovery quarantine. The one
+v17 row with all 13 attribution fields absent passed only through v1.1.1283's
+existing exact v17 collision branch, as intended. The pre-v17 bridge never
+handles v17.
+
+The symbols above are exact sets, not minimum-field descriptions:
+
+- `B` is `replica_info_version`, `replica_id`, `cluster_name`, `version`,
+  `replica_port`, `created_at`, `first_not_ready_time`,
+  `first_consecutive_failure_time`, `status_property`, `is_spot`, `location`,
+  `resources_override`, `reserved_fill`, and
+  `cost_rebalance_for_replica_id`.
+- `C` is `planned_capacity`, `unknown_capacity_replacement`, and
+  `logical_bridge_capacity_verified`.
+- `E` is `is_zero_cost` and `paid_capacity_pool_key`.
+- `R` is `replica_record_id` plus all nine
+  `system_recovery_*`/association fields:
+  `system_recovery_launch_intent`, `system_recovery_disposition`,
+  `launch_request_id`, `service_job_id`, `candidate_ready_observed_at`,
+  `ordinary_release_not_before`, `system_recovery_revision`,
+  `system_recovery`, and `system_recovery_quarantine`.
+- `I3` is `reserved_fill_pool_key`,
+  `reserved_fill_service_generation`, and
+  `reserved_fill_physical_cluster_uid`. `I4` is `I3` plus
+  `reserved_fill_kubernetes_context`.
+- `S11` is `sky_launch_status`, `user_app_failed`, `service_ready_now`,
+  `first_ready_time`, `sky_down_status`, `is_scale_down`, `preempted`,
+  `purged`, `failed_spot_availability`, `drain_cap_seconds`, and
+  `wait_for_idle_before_termination`.
+- `S19` is `S11` plus `drain_started_at`,
+  `logical_retirement_version`, `logical_retirement_controller_epoch`,
+  `logical_retirement_generation`, `logical_retirement_target_capacity`,
+  `logical_retirement_confirmed_generation`,
+  `logical_retirement_bounded_deadline`, and
+  `logical_retirement_committed`.
+
+The pre-v17 inventory includes historical reserved-fill and zero-cost rows;
+those markers and every present protocol-v2 pool-identity field are durable
+facts, not defaults to erase. The bridge therefore restores the v1.1.1276
+decode semantics only behind the exact eight sanctioned pre-v17 shapes in the
+table, including that reader's frozen scalar, status, and resource
+canonicalization. The bounded preflight proved that this canonicalization
+changes no present field value or JSON type anywhere in the censused live
+inventory. The bridge materializes only the version-appropriate conservative
+defaults and immediately owns a complete v18 in-memory interface. The
+operator-only normalizer applies the stronger invariant: it atomically refuses
+any present-field delta before rewriting a row. A subsequent ordinary
+persistence writes the one canonical closed v18 shape. In particular:
+
+- pre-v13 rows get the deterministic transition record ID and ordinary system
+  recovery defaults;
+- v13/v14 rows preserve and validate their complete recovery bundle; malformed
+  recovery state enters the existing absorbing off-route quarantine;
+- absent capacity, economic, reserved-fill identity, allocation attribution,
+  observation, admission, and materialization fields become only their
+  historical `1`, `false`, or `null` defaults—no allocation authority,
+  sequence, or cleanup identity is synthesized;
+- the historical v13 `I3` form remains cleanup-safe through the existing rule
+  that derives its missing explicit context from the immutable Kubernetes
+  location, while a missing or contradictory location still fails closed; and
+- legacy reserved-fill rows without complete sequenced attribution remain
+  readable and cleanable but continue to fail the policy-bound admission
+  validator, so they cannot authorize new sequenced capacity.
+
+This is not generic `<17` compatibility. Versions outside
+`{3, 6, 7, 12, 13, 14, 17, 18}`, a sanctioned version with any other
+top-level or nested key set, malformed required state, and unknown/future
+versions fail closed. Exact v17/v18 behavior remains unchanged: the
+transitional v17 reader accepts only complete v17 or the one collision shape
+with all 13 fields absent. The collision shape becomes 13 explicit `null`
+values; a complete v17 value is preserved exactly. A partially missing
+attribution bundle, unknown field, missing non-collision field, or incomplete
+status subdocument fails closed.
+
+The bridge may roll only while the reconciliation gate is proven
+`LEGACY_ACTIVE`. Deploying it neither runs normalization nor changes the gate,
+and no `SEQUENCED_ACTIVE` activation is allowed while any pre-v18 row remains.
+For the ordinary FEV2 queue prerequisite, A may first replace the current
+single `all` Pod in place and retain that exact topology. This narrow rollout
+exists only to restore backward reads and expose A's authenticated queue
+capacity. It must not run the normalizer, create the 2/2/2 role split, change
+publisher or registry ownership, migrate storage, or invoke reserved-fill
+activation; all of those remain later independently reviewed gates.
+The Helm rollout must keep the chart's `Recreate` writer strategy and prove
+that every old writer Pod has terminated before any bridge writer becomes
+Ready; a mixed old/new API/controller/executor or compatibility-`all` writer
+window is forbidden. Post-rollout inventory must show only the reviewed
+immutable bridge digest and no old writer process or lease before ordinary
+Serve mutation resumes.
+It exists solely to let the current v18 writer read the retained fleet safely
+until the source-owned atomic normalizer rewrites it. The already-required
+normalization receipt must report zero invalid, noncurrent, and legacy-pickle
+rows before activation. The stacked cleanup change removes the bridge for the
+six sanctioned legacy versions/eight observed shapes (and later the existing
+v17 collision reader at its established gate); it cannot merge until that
+receipt and one full current-writer rollout prove no sanctioned legacy version
+remains. A also stops all live pickle dual-writes; the nullable column remains
+only until Serve047 drops it.
+
+The first successful persistence by an A writer irreversibly converts that row
+to v18. From that point a rollback to v1.1.1276 is forbidden because the old
+runtime cannot read the v17-collision/v18 fleet safely. Any rollout defect is
+fixed forward with another complete Recreate writer rollout; restoring an old
+image is not a recovery path.
 
 Platform PR 14 establishes the split topology directly on A and deletes `all`.
 Only after exactly two `api`, two `controller`, and two `executor` Pods and
@@ -2102,9 +2236,15 @@ before the first update, including exact parity between JSON and every
 JSON-derived query scalar (`status`, `sky_down_status`, `version`,
 `cluster_name`, `created_at`, `is_spot`, and `paid_capacity_pool_key`). It does
 not repair denormalized scalar authority. It rewrites all rows atomically
-through the canonical serializer, preserves present
-attribution with exact JSON types and values, materializes only absent
-collision fields as null, and clears every legacy pickle. In the same atomic
+through the canonical serializer and requires every present legacy JSON field,
+nested value, and exact JSON type to survive unchanged. For the six sanctioned
+pre-v17 versions/eight observed shapes it may add only frozen
+version-and-shape defaults, deterministic pre-v13 record identity and ordinary
+recovery fields, plus the 13 null attribution fields. For v17 it may change
+only the version and materialize the 13 absent collision fields as null. Any
+coercible present scalar, resource-representation change, recovery-quarantine
+delta, or other difference aborts the whole transaction. It clears every
+legacy pickle. In the same atomic
 boundary it installs an enforced check requiring non-null outer version 1,
 non-null v18 JSON, and a null pickle column, so neither a v17 writer, a
 SQL-NULL outer version, nor stale pickle repopulation can return. Constraint
@@ -2372,6 +2512,26 @@ exhaust a small server's shared lock table without exercising feature
 correctness. Formatting, typing, lint, and diff integrity must also pass for
 every changed file.
 
+The replica-record contract tests must instantiate all eight exact pre-v17
+top-level/status census shapes, including all three v13 identity variants.
+They prove lossless preservation of every present field, conservative
+materialization of every absent field, deterministic pre-v13 record identity,
+v13/v14 recovery quarantine semantics, canonical v18 output on the next
+persistence, and cleanup-fence preservation for historical reserved-fill rows.
+Negative cases reject every unsanctioned version, missing or extra field,
+wrong status shape, and v17 partial-collision bundle. Policy-bound admission
+must still reject a decoded legacy reserved-fill row without complete
+sequenced attribution.
+
+The PostgreSQL normalizer test independently freezes those same eight input
+shapes, all missing-field defaults, known pre-v13 UUID5 outputs, value-bearing
+protocol-v2 `I3`/`I4` cleanup identity, and exact recursive preservation of
+every present value/type. It must also prove atomic rollback for a coercible
+legacy value and a v13/v14 recovery-quarantine delta, preserve complete v17
+attribution, clear a stale pickle from an already-v18 row, and remain
+idempotent. These assertions must not derive their expected additions from the
+current decoder or serializer.
+
 The generated values schema is a required enforcement layer, not decorative
 documentation: `serviceAnnotations.additionalProperties` must remain
 `type: string`. The Helm helper independently rejects a non-map or non-string
@@ -2620,21 +2780,27 @@ Source PR #1451 is the already-merged Serve046 base, not an open transition
 PR. The current source stack is:
 
 1. activation successor A, targeting `improvements`: the already-merged v18
-   live reader/writer and one-shot normalizer plus the queue-capacity,
-   generated-Service annotation, and audit-target contracts required for
-   platform PR 14's direct split-and-roll;
-2. independently releasable publisher B: the exact-only publication contract
+   writer and one-shot normalizer, the exact-shape v3/v6/v7/v12/v13/v14
+   reader bridge, plus the queue-capacity, generated-Service annotation, and
+   audit-target contracts required for platform PR 14's direct split-and-roll;
+2. a stacked pre-v17 reader-removal change, held until the archived v18
+   normalization receipt proves that none of the six sanctioned legacy
+   versions/eight observed shapes remains; it removes only the bridge added to
+   A and preserves the already-existing exact v17/v18 boundary;
+3. independently releasable publisher B: the exact-only publication contract
    and physical deletion of superseded publisher paths, with no runtime or
    schema behavior change; and
-3. final cleanup C: forward-only Serve047 plus physical deletion of every live
+4. final cleanup C: forward-only Serve047 plus physical deletion of every live
    compatibility and transition path. C retains
    `reserved_fill_reconciliation_transition status/activate` as the sole
    first-authorization and reauthorization surface.
 
-Platform PR 14 alone pins and deploys A while creating the split topology; PR
-17 normalizes retained rows on that unchanged tuple and creates no Helm
-revision; PR 18 follows B and also creates no Helm revision; PR 19 alone pins
-and deploys C. The remote draft cleanup PR
+Within the reserved-fill activation stack, platform PR 14 pins A while creating
+the split topology; the earlier narrow ordinary-FEV2 single-`all` rollout is
+not an activation step and cannot normalize. PR 17 normalizes retained rows on
+the unchanged PR 14 tuple and creates no Helm revision; PR 18 follows B and
+also creates no Helm revision; PR 19 alone pins and deploys C. The remote draft
+cleanup PR
 [#1452](https://github.com/boltz-bio/skypilot/pull/1452) is a stale predecessor,
 not current C or merge/deployment evidence. It must be replaced or updated to
 the exact reviewed C revision. Historical cleanup PR #1263 is unrelated.
@@ -2662,12 +2828,14 @@ same canonical command authorizes `UNAUTHORIZED` to
 `SEQUENCED_ACTIVE` after a fix-forward rollout; cleanup does not introduce a
 second bootstrap actuator.
 
-The cleanup change removes, rather than perpetuates:
+The cleanup stack removes, rather than perpetuates:
 
-- the `replica_info` pickle column, live v17 reader, one-shot v18 normalizer,
-  its command/tests, and every transition-only receipt consumer after the exact
-  archived receipt passes; frozen revisions 010/026 migration replay is the
-  only historical pickle code retained;
+- first, the exact-shape v3/v6/v7/v12/v13/v14 live reader and its census tests
+  after the archived receipt proves zero non-v18 rows; then, in final cleanup
+  C, the `replica_info` pickle column, live v17 reader, one-shot v18
+  normalizer, its command/tests, and every transition-only receipt consumer
+  after the exact archived receipt passes. Frozen revisions 010/026 migration
+  replay is the only historical pickle code retained;
 - the one-pod/all runtime role and corresponding Helm values, templates,
   conditionals, tests, and operator knobs after the exact split-role receipt;
 - transition-only acceptance of a generated inference Service without
