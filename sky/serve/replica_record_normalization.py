@@ -80,7 +80,7 @@ _POSTGRES_CONSTRAINT_EXPRESSION = (
     "(replica_state_version = 1) AND (replica_state IS NOT NULL) AND "
     "(replica_state @> '{\"replica_info_version\": 18}'::jsonb) AND "
     "(replica_info IS NULL))")
-_REQUIRED_SERVE_DATABASE_REVISION = '046'
+_REQUIRED_SERVE_DATABASE_REVISION = '047'
 _SPLIT_WRITER_ROLES = ('api', 'controller', 'executor')
 
 

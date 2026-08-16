@@ -32,6 +32,17 @@ _BOUND_CONTEXT_FIELDS = frozenset({
     'sky_serve_ordinary_launch_request_id',
     'sky_serve_ordinary_launch_input_digest',
     'sky_serve_ordinary_launch_owner_revision',
+    'sky_serve_non_pool_binding_protocol_version',
+    'sky_serve_non_pool_profile_kind',
+    'sky_serve_non_pool_profile_version',
+    'sky_serve_non_pool_profile_digest',
+    'sky_serve_non_pool_capability_cohort_epoch',
+    'sky_serve_non_pool_capability_profile_set_digest',
+    'sky_serve_non_pool_receipt_protocol_version',
+    'sky_serve_non_pool_authorization_kind',
+    'sky_serve_non_pool_authorization_reference',
+    'sky_serve_non_pool_authorization_generation',
+    'sky_serve_non_pool_authorization_digest',
 })
 
 
@@ -42,7 +53,12 @@ def _has_bound_context_fields(context: Mapping[str, Any]) -> bool:
 def _validate_bound_entrypoint_context(
         extra_launch_context: Mapping[str, Any]) -> None:
     """Strictly parse a bound context before bypassing the legacy owner fence."""
-    ordinary_launch_binding.parse_bound_launch_context(extra_launch_context)
+    if ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY in (
+            extra_launch_context):
+        ordinary_launch_binding.parse_bound_non_pool_launch_context(
+            extra_launch_context)
+    else:
+        ordinary_launch_binding.parse_bound_launch_context(extra_launch_context)
 
 
 def _provider_effect_guard(extra_launch_context: Mapping[str, Any]) -> Any:
@@ -51,11 +67,20 @@ def _provider_effect_guard(extra_launch_context: Mapping[str, Any]) -> Any:
         return contextlib.nullcontext()
     # Parse before claim lookup so stale, server-owned fields can never fall
     # through to legacy execution merely because the context is incomplete.
+    is_non_pool = ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY in (
+        extra_launch_context)
     _validate_bound_entrypoint_context(extra_launch_context)
     claim = request_storage.active_execution_claim()
     if claim is None or claim.worker_instance_id is None:
         raise exceptions.RequestCancelled(
             'Bound ordinary launch has no exact durable execution claim.')
+    if is_non_pool:
+        return ordinary_launch_binding.non_pool_provider_effect_guard(
+            extra_launch_context,
+            claim,
+            claim_validator=(
+                request_postgres.
+                validate_bound_non_pool_launch_claim_in_transaction))
     return ordinary_launch_binding.provider_effect_guard(
         extra_launch_context,
         claim,

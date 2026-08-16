@@ -72,6 +72,7 @@ _BUILTIN_HANDLER_MODULES = (
     'sky.provision.slurm.utils',
     'sky.recipes.core',
     'sky.serve.server.core',
+    'sky.server.requests.non_pool_launch',
     'sky.server.requests.ordinary_launch',
     'sky.server.requests.requests',
     'sky.ssh_node_pools.core',

@@ -286,7 +286,7 @@ def _install_clients(monkeypatch,
         assert lock.held
         return {
             broker.migration_utils.SERVE_DB_NAME: serve_revision,
-            broker.migration_utils.API_REQUESTS_DB_NAME: '010',
+            broker.migration_utils.API_REQUESTS_DB_NAME: '011',
         }[section]
 
     monkeypatch.setattr(broker.migration_utils, 'get_current_alembic_revision',
@@ -1151,7 +1151,7 @@ def test_activation_rejects_schema_outside_compatible_set(monkeypatch):
     setter.assert_not_called()
 
 
-def test_activation_rejects_api_request_schema_other_than_exact_010(
+def test_activation_rejects_api_request_schema_other_than_exact_011(
         monkeypatch):
     lock = _TrackedLock()
     engine = object()
@@ -1176,7 +1176,7 @@ def test_activation_rejects_api_request_schema_other_than_exact_010(
                         setter)
 
     with pytest.raises(broker.ProtocolV2ActivationError,
-                       match='exact API-request schema revision 010'):
+                       match='exact API-request schema revision 011'):
         broker.activate_protocol_v2()
     token_reader.assert_not_called()
     setter.assert_not_called()
@@ -1193,7 +1193,7 @@ def test_activation_rejects_already_active_protocol_before_observing_rollout(
         mock.Mock(
             side_effect=lambda _engine, section: {
                 broker.migration_utils.SERVE_DB_NAME: '035',
-                broker.migration_utils.API_REQUESTS_DB_NAME: '010',
+                broker.migration_utils.API_REQUESTS_DB_NAME: '011',
             }[section]))
     monkeypatch.setattr(serve_state, 'get_reserved_fill_protocol_state',
                         mock.Mock(return_value={'protocol_version': 2}))

@@ -12,6 +12,8 @@ import contextlib
 import dataclasses
 import datetime
 import enum
+import hashlib
+import json
 import math
 import os
 import signal
@@ -37,6 +39,7 @@ from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server.events import emission as event_emission
 from sky.server.events import models as event_models
+from sky.server.requests import non_pool_launch as non_pool_launch_request
 from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import postgres_schema
@@ -107,6 +110,8 @@ _LEGACY_ORDINARY_LAUNCH_PAYLOAD_TYPE = (
 _PROVIDER_MUTATION_HANDLER_KINDS = {
     ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME:
         queue_base.ProviderMutationRequestKind.BOUND_ORDINARY_LAUNCH,
+    non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME:
+        queue_base.ProviderMutationRequestKind.NON_POOL_LAUNCH,
 }
 _PROVIDER_MUTATION_HANDLER_NAMES = tuple(
     _PROVIDER_MUTATION_HANDLER_KINDS.keys())
@@ -143,6 +148,139 @@ class BoundOrdinaryLaunchRequestFacts:
     return_value: Any
     error: Any
     error_decode_failed: bool
+
+
+def _canonical_evidence_sha256(value: Mapping[str, Any]) -> str:
+    canonical = json.dumps(dict(value),
+                           sort_keys=True,
+                           separators=(',', ':'),
+                           ensure_ascii=False,
+                           allow_nan=False).encode('utf-8')
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _evidence_value(value: Any) -> Any:
+    if isinstance(value, datetime.datetime):
+        return value.astimezone(datetime.timezone.utc).isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    return value
+
+
+def read_legacy_launch_request_evidence(
+    identity: ordinary_launch_binding_lib.LegacyLaunchIdentity,
+    *,
+    executor_terminated_at: datetime.datetime | None = None,
+    executor_termination_evidence: Mapping[str, Any] | None = None,
+) -> ordinary_launch_binding_lib.LegacyReconciliationEvidence:
+    """Snapshot one historical unbound ``sky.launch`` request.
+
+    This deliberately reports the stored facts as they are. In particular,
+    generation zero, a false quiescence-required bit, and a missing
+    ``finished_at`` never become quiescence or effect-absence evidence.
+    """
+    if not isinstance(identity, ordinary_launch_binding.LegacyLaunchIdentity):
+        raise TypeError('identity must be LegacyLaunchIdentity.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Legacy request evidence requires central PostgreSQL state.')
+    with engine.begin() as connection:
+        request_row = connection.execute(
+            sqlalchemy.select(REQUESTS).where(
+                REQUESTS.c.request_id == identity.request_id).with_for_update()
+        ).mappings().one_or_none()
+        queue_row = connection.execute(
+            sqlalchemy.select(QUEUE).where(
+                QUEUE.c.request_id == identity.request_id).with_for_update()
+        ).mappings().one_or_none()
+        if (request_row is None or request_row['handler_name']
+                != _LEGACY_ORDINARY_LAUNCH_HANDLER_NAME or
+                request_row['cluster_name'] != identity.cluster_name or
+                request_row['ordinary_launch_association_id'] is not None or
+                request_row['binding_protocol_version'] is not None):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Legacy request evidence does not name the exact historical '
+                'unbound launch.')
+        worker_row = None
+        worker_instance_id = request_row['worker_instance_id']
+        if worker_instance_id is not None:
+            worker_row = connection.execute(
+                sqlalchemy.select(SERVER_INSTANCES).where(
+                    SERVER_INSTANCES.c.instance_id == worker_instance_id).
+                with_for_update()).mappings().one_or_none()
+        observed_at = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+
+    result_payload = {
+        'error': request_row['error'],
+        'return_value': request_row['return_value'],
+    }
+    result_digest = (None if all(
+        value is None for value in result_payload.values()) else
+                     _canonical_evidence_sha256(result_payload))
+    request_payload = request_row['payload_json']
+    request_evidence = {
+        'cancel_acknowledged_at': _evidence_value(
+            request_row['cancel_acknowledged_at']),
+        'cancel_requested_at': _evidence_value(
+            request_row['cancel_requested_at']),
+        'claim_token': _evidence_value(request_row['claim_token']),
+        'cluster_name': request_row['cluster_name'],
+        'execution_process_start_time_ticks':
+            request_row['execution_process_start_time_ticks'],
+        'execution_quiesced_at': _evidence_value(
+            request_row['execution_quiesced_at']),
+        'execution_quiesced_generation':
+            request_row['execution_quiesced_generation'],
+        'execution_quiescence_required':
+            request_row['execution_quiescence_required'],
+        'finished_at': _evidence_value(request_row['finished_at']),
+        'handler_name': request_row['handler_name'],
+        'lease_expires_at': _evidence_value(request_row['lease_expires_at']),
+        'payload_sha256': _canonical_evidence_sha256({
+            'payload': request_payload,
+            'payload_format': request_row['payload_format'],
+            'payload_type': request_row['payload_type'],
+            'payload_version': request_row['payload_version'],
+        }),
+        'pid': request_row['pid'],
+        'queue_claim_generation':
+            (None if queue_row is None else queue_row['claim_generation']),
+        'queue_delivery_state':
+            (None if queue_row is None else queue_row['delivery_state']),
+        'request_id': request_row['request_id'],
+        'terminal_cause': request_row['terminal_cause'],
+        'worker_instance': (None if worker_row is None else {
+            'draining_at': _evidence_value(worker_row['draining_at']),
+            'heartbeat_at': _evidence_value(worker_row['heartbeat_at']),
+            'instance_id': _evidence_value(worker_row['instance_id']),
+            'pod_name': worker_row['pod_name'],
+            'pod_uid': worker_row['pod_uid'],
+            'ready': worker_row['ready'],
+            'role': worker_row['role'],
+            'version': worker_row['version'],
+        }),
+        'worker_instance_id': _evidence_value(worker_instance_id),
+    }
+    claim_present = any(request_row[field] is not None
+                        for field in ('claim_token', 'worker_instance_id',
+                                      'lease_expires_at', 'pid',
+                                      'execution_process_start_time_ticks'))
+    return ordinary_launch_binding.LegacyReconciliationEvidence(
+        observed_request_status=str(request_row['status']),
+        observed_request_execution_generation=int(
+            request_row['execution_generation']),
+        observed_request_queue_present=queue_row is not None,
+        observed_request_claim_present=claim_present,
+        observed_request_result_digest=result_digest,
+        observed_request_at=observed_at,
+        observed_request_evidence=request_evidence,
+        executor_terminated_at=executor_terminated_at,
+        executor_termination_evidence=executor_termination_evidence,
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.NOT_QUERIED,
+        provider_evidence_observed_at=None,
+        provider_evidence_payload=None)
 
 
 class OrdinaryLaunchReductionDisposition(str, enum.Enum):
@@ -186,6 +324,8 @@ class BoundOrdinaryLaunchProjectionInput:
     pre_effect_terminal: bool
     cancel_reason: str | None
     paid_capacity_pool_key: str | None
+    provider_evidence: ordinary_launch_binding_lib.ProviderEvidence | None = (
+        None)
 
 
 class BoundOrdinaryLaunchReplicaProjector(typing.Protocol):
@@ -425,6 +565,23 @@ def _ordinary_launch_binding_process_capable(role: str,
     return True
 
 
+def _non_pool_launch_binding_process_capable(role: str,
+                                             backend_capable: bool) -> bool:
+    """Whether this process implements every API011 profile duty."""
+    if not backend_capable:
+        return False
+    registered = {
+        registration.name
+        for registration in request_registry.registered_handlers()
+    }
+    if non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME not in registered:
+        return False
+    if role in ('all', 'executor'):
+        return (non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME
+                in _supported_handlers(role))
+    return True
+
+
 def execution_quiescence_backend_guard_enabled() -> bool:
     return os.environ.get(EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR) == 'true'
 
@@ -485,6 +642,8 @@ class ServerInstanceLease:
             _resolved_request_backend_capability())
         binding_capable = _ordinary_launch_binding_process_capable(
             self.role, quiescence_capable)
+        non_pool_capable = _non_pool_launch_binding_process_capable(
+            self.role, quiescence_capable)
         with self._state_lock:
             ready = self._ready
             draining = self._draining
@@ -513,6 +672,19 @@ class ServerInstanceLease:
             # handler retain the API009 false default so mixed fleets fail
             # admission closed.
             'ordinary_launch_binding_capable': binding_capable,
+            'non_pool_launch_binding_capable': non_pool_capable,
+            'non_pool_launch_binding_protocol_version':
+                (ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+                 if non_pool_capable else None),
+            'non_pool_launch_capability_profile_set_digest': (
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+                if non_pool_capable else None),
+            'non_pool_launch_capability_cohort_epoch':
+                (ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                 if non_pool_capable else None),
+            'non_pool_launch_receipt_protocol_version':
+                (ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION
+                 if non_pool_capable else None),
         }
         if include_started_at:
             values['started_at'] = now
@@ -694,6 +866,70 @@ def ordinary_launch_binding_fleet_capable(
                         BOUND_ORDINARY_LAUNCH_HANDLER_NAME not in handlers):
                     return False
         return bool(acceptors and executors)
+
+    if connection is not None:
+        return _read(connection)
+    with engine.connect() as owned_connection:
+        return _read(owned_connection)
+
+
+def non_pool_launch_binding_fleet_capable(
+    *,
+    connection: sqlalchemy.engine.Connection | None = None,
+    quiescence_seconds: float = (
+        ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS),
+) -> bool:
+    """Require one exact API011 capability cohort across live participants."""
+    if (isinstance(quiescence_seconds, bool) or
+            not isinstance(quiescence_seconds, (int, float)) or
+            not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
+        raise ValueError('quiescence_seconds must be finite and non-negative.')
+    engine = initialize_and_get_db()
+    expected_digest = (
+        ordinary_launch_binding.supported_non_pool_profile_set_digest())
+
+    def _read(active_connection: sqlalchemy.engine.Connection) -> bool:
+        rows = active_connection.execute(
+            sqlalchemy.select(
+                SERVER_INSTANCES.c.role, SERVER_INSTANCES.c.ready,
+                SERVER_INSTANCES.c.draining_at,
+                SERVER_INSTANCES.c.supported_handlers,
+                SERVER_INSTANCES.c.non_pool_launch_binding_capable,
+                SERVER_INSTANCES.c.non_pool_launch_binding_protocol_version,
+                SERVER_INSTANCES.c.
+                non_pool_launch_capability_profile_set_digest,
+                SERVER_INSTANCES.c.non_pool_launch_capability_cohort_epoch,
+                SERVER_INSTANCES.c.non_pool_launch_receipt_protocol_version).
+            where(
+                SERVER_INSTANCES.c.role.in_(
+                    ('all', 'api', 'executor', 'controller')),
+                SERVER_INSTANCES.c.heartbeat_at
+                >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                    seconds=quiescence_seconds))).mappings().all()
+        acceptor = False
+        executor = False
+        for row in rows:
+            if (row['non_pool_launch_binding_capable'] is not True or
+                    row['non_pool_launch_binding_protocol_version']
+                    != ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+                    or row['non_pool_launch_capability_profile_set_digest']
+                    != expected_digest or
+                    row['non_pool_launch_capability_cohort_epoch']
+                    != ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+                    or row['non_pool_launch_receipt_protocol_version'] !=
+                    ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION):
+                return False
+            ready = row['ready'] and row['draining_at'] is None
+            if ready and row['role'] in ('all', 'api'):
+                acceptor = True
+            if ready and row['role'] in ('all', 'executor'):
+                handlers = row['supported_handlers']
+                if (not isinstance(handlers, list) or
+                        non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME
+                        not in handlers):
+                    return False
+                executor = True
+        return bool(acceptor and executor)
 
     if connection is not None:
         return _read(connection)
@@ -1824,6 +2060,7 @@ def _insert_request_and_queue(
     resource_action_id: uuid.UUID | None = None,
     resource_action_attempt: int | None = None,
     ordinary_launch_association_id: uuid.UUID | None = None,
+    non_pool_profile_values: Mapping[str, Any] | None = None,
 ) -> bool:
     """Insert one request and its queue row in the caller's transaction."""
     if ((resource_action_id is None) != (resource_action_attempt is None)):
@@ -1845,6 +2082,21 @@ def _insert_request_and_queue(
     values['resource_action_id'] = resource_action_id
     values['resource_action_attempt'] = resource_action_attempt
     values['ordinary_launch_association_id'] = (ordinary_launch_association_id)
+    if non_pool_profile_values is not None:
+        expected_fields = frozenset({
+            'binding_protocol_version',
+            'profile_kind',
+            'profile_version',
+            'profile_digest',
+            'capability_cohort_epoch',
+            'capability_profile_set_digest',
+            'receipt_protocol_version',
+        })
+        if (ordinary_launch_association_id is None or
+                frozenset(non_pool_profile_values) != expected_fields):
+            raise ValueError(
+                'Generic launch request profile values are incomplete.')
+        values.update(non_pool_profile_values)
     result = connection.execute(
         postgresql.insert(REQUESTS).values(**values).on_conflict_do_nothing(
             index_elements=[REQUESTS.c.request_id]).returning(
@@ -1940,10 +2192,13 @@ def request_retention_pin_is_active_in_transaction(
     return bool(result)
 
 
-def validate_bound_ordinary_launch_claim_in_transaction(
+def _validate_bound_launch_claim_in_transaction(
     connection: sqlalchemy.engine.Connection,
     association_id: uuid.UUID,
     claim: request_storage.ExecutionClaim,
+    *,
+    handler_name: str,
+    require_non_pool_profile: bool,
 ) -> bool:
     """Lock and validate the exact request/queue/pin effect authority.
 
@@ -1960,22 +2215,44 @@ def validate_bound_ordinary_launch_claim_in_transaction(
         worker_instance_id = uuid.UUID(claim.worker_instance_id)
     except (TypeError, ValueError):
         return False
+    associations = ordinary_launch_binding.ordinary_launch_associations_table
+    predicates: list[sqlalchemy.ColumnElement[bool]] = [
+        REQUESTS.c.request_id == claim.request_id,
+        REQUESTS.c.handler_name == handler_name,
+        REQUESTS.c.ordinary_launch_association_id == association_id,
+        REQUESTS.c.status == requests_lib.RequestStatus.RUNNING.value,
+        REQUESTS.c.execution_generation == claim.execution_generation,
+        REQUESTS.c.claim_token == claim_token,
+        REQUESTS.c.worker_instance_id == worker_instance_id,
+        REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
+        REQUESTS.c.execution_quiescence_required,
+        QUEUE.c.delivery_state == 'claimed',
+        QUEUE.c.claim_generation == claim.execution_generation,
+        associations.c.association_id == association_id,
+    ]
+    if require_non_pool_profile:
+        predicates.extend((
+            REQUESTS.c.binding_protocol_version ==
+            associations.c.binding_protocol_version,
+            REQUESTS.c.profile_kind == associations.c.profile_kind,
+            REQUESTS.c.profile_version == associations.c.profile_version,
+            REQUESTS.c.profile_digest == associations.c.profile_digest,
+            REQUESTS.c.capability_cohort_epoch ==
+            associations.c.capability_cohort_epoch,
+            REQUESTS.c.capability_profile_set_digest ==
+            associations.c.capability_profile_set_digest,
+            REQUESTS.c.receipt_protocol_version ==
+            associations.c.receipt_protocol_version,
+        ))
+    else:
+        predicates.append(REQUESTS.c.binding_protocol_version.is_(None))
     row = connection.execute(
-        sqlalchemy.select(REQUESTS.c.request_id).join(
-            QUEUE, QUEUE.c.request_id == REQUESTS.c.request_id).where(
-                REQUESTS.c.request_id == claim.request_id,
-                REQUESTS.c.handler_name ==
-                ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME,
-                REQUESTS.c.ordinary_launch_association_id == association_id,
-                REQUESTS.c.status == requests_lib.RequestStatus.RUNNING.value,
-                REQUESTS.c.execution_generation == claim.execution_generation,
-                REQUESTS.c.claim_token == claim_token,
-                REQUESTS.c.worker_instance_id == worker_instance_id,
-                REQUESTS.c.lease_expires_at > sqlalchemy.func.clock_timestamp(),
-                REQUESTS.c.execution_quiescence_required,
-                QUEUE.c.delivery_state == 'claimed',
-                QUEUE.c.claim_generation == claim.execution_generation).
-        with_for_update()).scalar_one_or_none()
+        sqlalchemy.select(REQUESTS.c.request_id).select_from(
+            REQUESTS.join(
+                QUEUE, QUEUE.c.request_id == REQUESTS.c.request_id).join(
+                    associations, associations.c.association_id ==
+                    REQUESTS.c.ordinary_launch_association_id)).where(
+                        *predicates).with_for_update()).scalar_one_or_none()
     if row is None:
         return False
     pin = connection.execute(
@@ -1986,6 +2263,35 @@ def validate_bound_ordinary_launch_claim_in_transaction(
             REQUEST_RETENTION_PINS.c.request_id ==
             claim.request_id).with_for_update()).scalar_one_or_none()
     return pin == association_id
+
+
+def validate_bound_ordinary_launch_claim_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    association_id: uuid.UUID,
+    claim: request_storage.ExecutionClaim,
+) -> bool:
+    """Validate one exact protocol-v1 ordinary execution claim."""
+    return _validate_bound_launch_claim_in_transaction(
+        connection,
+        association_id,
+        claim,
+        handler_name=(
+            ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME),
+        require_non_pool_profile=False)
+
+
+def validate_bound_non_pool_launch_claim_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    association_id: uuid.UUID,
+    claim: request_storage.ExecutionClaim,
+) -> bool:
+    """Validate one exact protocol-v2 request/profile execution claim."""
+    return _validate_bound_launch_claim_in_transaction(
+        connection,
+        association_id,
+        claim,
+        handler_name=non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME,
+        require_non_pool_profile=True)
 
 
 def _request_has_no_active_retention_pin() -> sqlalchemy.ColumnElement[bool]:
@@ -2042,6 +2348,49 @@ def insert_bound_request_and_queue_in_transaction(
     return inserted
 
 
+def _non_pool_request_profile_values(
+    identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
+) -> dict[str, Any]:
+    """Return the API011 tuple correlated with the Serve047 association."""
+    return {
+        'binding_protocol_version':
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+        'profile_kind': identity.profile.kind.value,
+        'profile_version': identity.profile.version,
+        'profile_digest': identity.profile.digest,
+        'capability_cohort_epoch': identity.capability_cohort_epoch,
+        'capability_profile_set_digest': identity.capability_profile_set_digest,
+        'receipt_protocol_version': identity.receipt_protocol_version,
+    }
+
+
+def insert_bound_non_pool_request_and_queue_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    request: requests_lib.Request,
+    *,
+    identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
+) -> bool:
+    """Insert one generic request, queue delivery, and pin atomically."""
+    if not request.should_enqueue or request.retryable:
+        raise ValueError(
+            'Generic bound request requires one non-retryable delivery.')
+    if not isinstance(identity, ordinary_launch_binding.NonPoolBindingIdentity):
+        raise ValueError('Generic request requires a v2 binding identity.')
+    registration = request_registry.registration_for_handler(request.entrypoint)
+    if registration.name != non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME:
+        raise ValueError('Generic bound request requires its distinct handler.')
+    inserted = _insert_request_and_queue(
+        connection,
+        request,
+        ordinary_launch_association_id=identity.association_id,
+        non_pool_profile_values=_non_pool_request_profile_values(identity))
+    if inserted:
+        insert_request_retention_pin_in_transaction(
+            connection, request.request_id, ORDINARY_LAUNCH_RETENTION_PIN_KIND,
+            identity.association_id)
+    return inserted
+
+
 def _validate_existing_bound_request_in_transaction(
     connection: sqlalchemy.engine.Connection,
     request: requests_lib.Request,
@@ -2080,6 +2429,15 @@ def _validate_existing_bound_request_in_transaction(
                    for column in immutable_columns)):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Existing API request does not match the exact binding intent.')
+    if isinstance(identity, ordinary_launch_binding.NonPoolBindingIdentity):
+        profile_values = _non_pool_request_profile_values(identity)
+        if any(request_row[field] != value
+               for field, value in profile_values.items()):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Existing API request has a different generic profile.')
+    elif request_row['binding_protocol_version'] is not None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Historical ordinary request unexpectedly has a generic profile.')
 
     # Global cross-lineage lock suffix: request, queue, then active pin.
     queue_row = connection.execute(
@@ -2188,19 +2546,65 @@ def bind_and_enqueue_ordinary_launch(
         return admission
 
 
+def bind_and_enqueue_non_pool_launch(
+    request: requests_lib.Request,
+    identity: ordinary_launch_binding_lib.NonPoolBindingIdentity,
+) -> ordinary_launch_binding_lib.BindingAdmission:
+    """Atomically commit one generic association/request/queue/pin tuple."""
+    if not isinstance(identity, ordinary_launch_binding.NonPoolBindingIdentity):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic launch admission requires a protocol-v2 identity.')
+    if (request.request_id != identity.request_id or request.retryable or
+            not request.should_enqueue):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic launch requires its exact non-retryable queue delivery.')
+    registration = request_registry.registration_for_handler(request.entrypoint)
+    if registration.name != non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Generic launch requires its distinct durable handler.')
+    _, _, backend_capable = _resolved_request_backend_capability()
+    if not backend_capable:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding requires the built-in PostgreSQL '
+            'request and queue backends.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic launch binding requires central PostgreSQL state.')
+    with engine.begin() as connection:
+        if not non_pool_launch_binding_fleet_capable(connection=connection):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+                'Generic launch binding is waiting for one exact capable '
+                'API/executor cohort stale window.')
+        admission = ordinary_launch_binding.insert_or_get_locked(
+            connection, identity)
+        if (admission.association_id != str(identity.association_id) or
+                admission.request_id != identity.request_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Generic admission returned a different deterministic '
+                'identity.')
+        (ordinary_launch_binding.
+         validate_non_pool_submission_execution_context_in_connection(
+             connection, identity, request.request_body.extra_launch_context))
+        ordinary_launch_binding.install_bound_non_pool_context(
+            request.request_body, identity, admission.launch_generation)
+        if admission.created:
+            inserted = insert_bound_non_pool_request_and_queue_in_transaction(
+                connection, request, identity=identity)
+            if not inserted:
+                raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                    'New generic association collided with an API request ID.')
+        else:
+            _validate_existing_bound_request_in_transaction(
+                connection, request, identity, admission)
+        return admission
+
+
 def _bound_context_from_association(
     association: Mapping[str, Any],
 ) -> ordinary_launch_binding_lib.BoundLaunchContext:
     """Build the immutable controller view without trusting process state."""
-    return ordinary_launch_binding.BoundLaunchContext(
-        association_id=uuid.UUID(str(association['association_id'])),
-        request_id=str(association['request_id']),
-        service_name=str(association['service_name']),
-        replica_id=int(association['replica_id']),
-        replica_record_id=uuid.UUID(str(association['replica_record_id'])),
-        launch_generation=int(association['launch_generation']),
-        input_digest=str(association['input_digest']),
-    )
+    return ordinary_launch_binding.bound_context_from_association(association)
 
 
 def _lock_bound_request_evidence(
@@ -2255,12 +2659,38 @@ def _lock_bound_request_evidence(
             error=None,
             error_decode_failed=False)
         return facts, None, queue_row, pin_row
-    if (request_row['handler_name']
-            != ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME or
+    is_non_pool = isinstance(context,
+                             ordinary_launch_binding.BoundNonPoolLaunchContext)
+    expected_handler = (
+        non_pool_launch_request.NON_POOL_LAUNCH_HANDLER_NAME if is_non_pool else
+        ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME)
+    if (request_row['handler_name'] != expected_handler or
             request_row['ordinary_launch_association_id']
             != context.association_id):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
-            'Correlated request does not name the bound ordinary handler.')
+            'Correlated request does not name the exact bound handler.')
+    if is_non_pool:
+        assert isinstance(context,
+                          ordinary_launch_binding.BoundNonPoolLaunchContext)
+        expected_profile = {
+            'binding_protocol_version':
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION,
+            'profile_kind': context.profile.kind.value,
+            'profile_version': context.profile.version,
+            'profile_digest': context.profile.digest,
+            'capability_cohort_epoch': context.capability_cohort_epoch,
+            'capability_profile_set_digest':
+                context.capability_profile_set_digest,
+            'receipt_protocol_version': context.receipt_protocol_version,
+        }
+        if any(request_row[field] != value
+               for field, value in expected_profile.items()):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Correlated request generic profile does not match its '
+                'association.')
+    elif request_row['binding_protocol_version'] is not None:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Protocol-v1 request unexpectedly carries a generic profile.')
 
     generation = int(request_row['execution_generation'])
     claim_token = request_row['claim_token']
@@ -2665,8 +3095,11 @@ def _settle_projected_paid_capacity_claim_in_transaction(
     *,
     pre_effect: bool,
 ) -> bool:
-    """Retain only a non-cancelled pre-effect retry's exact paid claim."""
-    if pre_effect and association['cancel_reason'] is None:
+    """Release the exact claim when one action reaches a settled result."""
+    if (pre_effect and association['cancel_reason'] is None and not isinstance(
+            context, ordinary_launch_binding.BoundNonPoolLaunchContext)):
+        # Protocol-v1 retains its historical same-record generation+1 retry
+        # until the stacked cleanup removes that transition path.
         return True
     return (ordinary_launch_binding.
             release_projected_paid_capacity_claim_in_connection(
@@ -2951,11 +3384,9 @@ def reduce_bound_ordinary_launch_in_transaction(
     if not projected:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Exact ordinary launch result was not projectable.')
-    # A non-cancelled pre-effect settlement is a retry boundary, not a demand
-    # completion boundary.  Keep its exact paid claim through the pointer
-    # clear so generation+1 can atomically snapshot the same claim.  Exact
-    # teardown/supersession records cancel_reason before reduction and, like
-    # every post-effect terminal result, releases the claim here.
+    # One planner intent owns one action. Every settled result releases its
+    # exact claim; PRE_EFFECT terminal rows are retired and replanned instead
+    # of retaining authority for a same-record generation+1 path.
     if not _settle_projected_paid_capacity_claim_in_transaction(
             connection, context, association, pre_effect=pre_effect):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -2991,6 +3422,136 @@ def reduce_bound_ordinary_launch(
             context,
             authority,
             project_replica_result=project_replica_result)
+
+
+def record_bound_non_pool_provider_evidence(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    evidence: ordinary_launch_binding_lib.ProviderEvidence,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Atomically require exact request quiescence and record provider data."""
+
+    def _request_terminal_evidence(
+        connection: sqlalchemy.engine.Connection,
+        locked_context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    ) -> ordinary_launch_binding_lib.TerminalEvidence | None:
+        facts, _, queue_row, _ = _lock_bound_request_evidence(
+            connection, locked_context)
+        ready = bool(
+            facts.exists and
+            facts.status in requests_lib.RequestStatus.finished_status() and
+            facts.quiescent and queue_row is None and
+            facts.retention_pin_active and facts.terminal_cause is not None)
+        return _terminal_evidence(facts) if ready else None
+
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic provider reconciliation requires PostgreSQL.')
+    with engine.begin() as connection:
+        return ordinary_launch_binding.record_non_pool_provider_evidence(
+            connection, context, authority, evidence, payload,
+            _request_terminal_evidence)
+
+
+def project_bound_non_pool_provider_absence(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> bool:
+    """Atomically project one exact quiescent reserved-fill absence."""
+    if not callable(project_replica_result):
+        raise TypeError('project_replica_result must be callable.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic provider reconciliation requires PostgreSQL.')
+    with engine.begin() as connection:
+        # The ReplicaInfo projector can touch the zero-cost materialization
+        # sequencer. Preserve its global lock order even though exact absence
+        # must never stamp a successful materialization.
+        serve_state.lock_zero_cost_protocol_for_bound_launch_projection(
+            connection)
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if not _controller_authority_matches_reduction(association, authority):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence writer no longer owns this association.')
+        facts, _, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        if (not facts.exists or facts.status
+                not in requests_lib.RequestStatus.finished_status() or
+                facts.terminal_cause is None or not facts.quiescent or
+                queue_row is not None or not facts.retention_pin_active):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence projection requires exact terminal request '
+                'quiescence and its active retention pin.')
+        terminal_evidence = _terminal_evidence(facts)
+        checked_association, locked_replica_info = (
+            ordinary_launch_binding.
+            provider_absence_projection_authority_in_connection(
+                connection, context, terminal_evidence))
+        if not _paid_capacity_claim_is_exact(connection, checked_association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence projection found unexpected paid capacity.')
+        projection = BoundOrdinaryLaunchProjectionInput(
+            context=context,
+            request=facts,
+            locked_replica_info=locked_replica_info,
+            status=facts.status,
+            cause=facts.terminal_cause,
+            service_job_id=None,
+            pre_effect_terminal=False,
+            cancel_reason=checked_association.get('cancel_reason'),
+            paid_capacity_pool_key=None,
+            provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT)
+        if project_replica_result(connection, projection) is not True:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence replica projection lost its exact row.')
+        if not _paid_capacity_claim_is_exact(connection, checked_association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence projection changed paid-capacity identity.')
+        ordinary_launch_binding.project_provider_absence_in_connection(
+            connection, context, terminal_evidence)
+        if not delete_request_retention_pin_in_transaction(
+                connection, context.request_id,
+                ORDINARY_LAUNCH_RETENTION_PIN_KIND, context.association_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence could not release its exact request pin.')
+        if not (ordinary_launch_binding.
+                release_projected_paid_capacity_claim_in_connection(
+                    connection, context)):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence could not close paid-capacity authority.')
+    return True
+
+
+def bound_non_pool_provider_reconciliation_ready(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Fence a provider read behind exact terminal executor quiescence."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if (not _controller_authority_matches_reduction(association, authority)
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value or
+                association['reconciliation_outcome'] != ordinary_launch_binding
+                .ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value):
+            return False
+        facts, _, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        return bool(
+            facts.exists and
+            facts.status in requests_lib.RequestStatus.finished_status() and
+            facts.quiescent and queue_row is None and
+            facts.retention_pin_active)
 
 
 def _commit_bound_ordinary_launch_cancel_intent(
@@ -3210,6 +3771,15 @@ def _transition_authority_is_current(
         row['controller_incarnation'] == authority.controller_incarnation and
         row['controller_owner_epoch'] == authority.controller_owner_epoch and
         row['ordinary_launch_binding_capable'] is True and
+        row['non_pool_launch_binding_capable'] is authority.non_pool_capable and
+        row['non_pool_launch_binding_protocol_version']
+        == authority.non_pool_binding_protocol_version and
+        row['non_pool_launch_capability_profile_set_digest']
+        == authority.non_pool_profile_set_digest and
+        row['non_pool_launch_capability_cohort_epoch']
+        == authority.non_pool_capability_cohort_epoch and
+        row['non_pool_launch_receipt_protocol_version']
+        == authority.non_pool_receipt_protocol_version and
         row['ordinary_launch_binding_mode'] == expected_mode.value and
         row['ordinary_launch_binding_mode'] == authority.binding_mode.value and
         row['ordinary_launch_binding_epoch'] == authority.binding_epoch)
@@ -3249,6 +3819,62 @@ def promote_ordinary_launch_binding_service(
             legacy_requests_drained=lambda conn:
             (_legacy_ordinary_launch_requests_drained_in_transaction(
                 conn, authority.service_name)))
+        session.commit()
+        return epoch
+
+
+def promote_non_pool_launch_binding_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
+    """Promote one bound service after exact v2 fleet and v1 drain gates."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        epoch = (
+            ordinary_launch_binding.
+            promote_non_pool_launch_service_in_connection(
+                connection,
+                service_name=authority.service_name,
+                controller_incarnation=authority.controller_incarnation,
+                controller_owner_epoch=authority.controller_owner_epoch,
+                expected_binding_epoch=authority.binding_epoch,
+                participant_barrier_passed=lambda conn:
+                (_transition_authority_is_current(
+                    conn, authority, ordinary_launch_binding.BindingMode.BOUND)
+                 and non_pool_launch_binding_fleet_capable(connection=conn)),
+                legacy_requests_drained=lambda conn:
+                (_bound_ordinary_launch_requests_clear_in_transaction(
+                    conn, authority.service_name) and
+                 _legacy_ordinary_launch_requests_drained_in_transaction(
+                     conn, authority.service_name))))
+        session.commit()
+        return epoch
+
+
+def demote_non_pool_launch_binding_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
+    """Rollback a generic service after every protocol-v2 request settles."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        epoch = (
+            ordinary_launch_binding.
+            demote_non_pool_launch_service_in_connection(
+                connection,
+                service_name=authority.service_name,
+                controller_incarnation=authority.controller_incarnation,
+                controller_owner_epoch=authority.controller_owner_epoch,
+                expected_binding_epoch=authority.binding_epoch,
+                request_barrier_clear=lambda conn:
+                (_transition_authority_is_current(
+                    conn, authority, ordinary_launch_binding.BindingMode.BOUND)
+                 and _bound_ordinary_launch_requests_clear_in_transaction(
+                     conn, authority.service_name))))
         session.commit()
         return epoch
 

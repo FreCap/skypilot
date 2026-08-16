@@ -78,6 +78,16 @@ REQUESTS = sqlalchemy.Table(
     # active pin without rewriting this evidence.
     sqlalchemy.Column('ordinary_launch_association_id',
                       postgresql.UUID(as_uuid=True)),
+    # API011 generic non-pool launch envelope.  The complete tuple is NULL on
+    # historical ordinary-bound and unrelated requests.  Only the distinct
+    # generic handler may carry the complete protocol-v2 tuple.
+    sqlalchemy.Column('binding_protocol_version', sqlalchemy.Integer),
+    sqlalchemy.Column('profile_kind', sqlalchemy.Text),
+    sqlalchemy.Column('profile_version', sqlalchemy.Integer),
+    sqlalchemy.Column('profile_digest', sqlalchemy.Text),
+    sqlalchemy.Column('capability_cohort_epoch', sqlalchemy.BigInteger),
+    sqlalchemy.Column('capability_profile_set_digest', sqlalchemy.Text),
+    sqlalchemy.Column('receipt_protocol_version', sqlalchemy.Integer),
     sqlalchemy.Column('updated_at',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
@@ -88,9 +98,42 @@ REQUESTS = sqlalchemy.Table(
         'execution_process_start_time_ticks > 0',
         name='ck_api_requests_process_start_time'),
     sqlalchemy.CheckConstraint(
-        '(ordinary_launch_association_id IS NULL) = '
-        "(handler_name <> 'sky.server.requests.ordinary_launch:launch')",
-        name='ck_api_requests_ordinary_launch_handler'),
+        "((handler_name = 'sky.server.requests.ordinary_launch:launch' AND "
+        'ordinary_launch_association_id IS NOT NULL AND '
+        'num_nonnulls(binding_protocol_version, profile_kind, '
+        'profile_version, profile_digest, capability_cohort_epoch, '
+        'capability_profile_set_digest, receipt_protocol_version) = 0) OR '
+        "(handler_name = 'sky.server.requests.non_pool_launch:launch' AND "
+        'ordinary_launch_association_id IS NOT NULL AND '
+        'num_nonnulls(binding_protocol_version, profile_kind, '
+        'profile_version, profile_digest, capability_cohort_epoch, '
+        'capability_profile_set_digest, receipt_protocol_version) = 7) OR '
+        "(handler_name NOT IN ('sky.server.requests.ordinary_launch:launch', "
+        "'sky.server.requests.non_pool_launch:launch') AND "
+        'ordinary_launch_association_id IS NULL AND '
+        'num_nonnulls(binding_protocol_version, profile_kind, '
+        'profile_version, profile_digest, capability_cohort_epoch, '
+        'capability_profile_set_digest, receipt_protocol_version) = 0))',
+        name='ck_api_requests_non_pool_launch_handler'),
+    sqlalchemy.CheckConstraint(
+        'num_nonnulls(binding_protocol_version, profile_kind, '
+        'profile_version, profile_digest, capability_cohort_epoch, '
+        'capability_profile_set_digest, receipt_protocol_version) IN (0, 7)',
+        name='ck_api_requests_non_pool_launch_profile_complete'),
+    sqlalchemy.CheckConstraint(
+        '(binding_protocol_version IS NULL OR '
+        'binding_protocol_version = 2) AND '
+        "(profile_kind IS NULL OR profile_kind IN ('ORDINARY_PAID', "
+        "'ORDINARY_ZERO_COST', 'RESERVED_FILL', "
+        "'UNKNOWN_CAPACITY_REPLACEMENT', 'COST_REBALANCE', "
+        "'SYSTEM_OOM_RECOVERY')) AND "
+        '(profile_version IS NULL OR profile_version = 1) AND '
+        "(profile_digest IS NULL OR profile_digest ~ '^[0-9a-f]{64}$') AND "
+        '(capability_cohort_epoch IS NULL OR capability_cohort_epoch > 0) AND '
+        '(capability_profile_set_digest IS NULL OR '
+        "capability_profile_set_digest ~ '^[0-9a-f]{64}$') AND "
+        '(receipt_protocol_version IS NULL OR receipt_protocol_version = 1)',
+        name='ck_api_requests_non_pool_launch_profile_values'),
     sqlalchemy.CheckConstraint(
         'num_nonnulls(managed_job_id, '
         'managed_job_controller_instance_id, '
@@ -295,6 +338,42 @@ SERVER_INSTANCES = sqlalchemy.Table(
                       sqlalchemy.Boolean,
                       nullable=False,
                       server_default=sqlalchemy.false()),
+    # API011 capability is independent from API009's ordinary-only bit. A
+    # process participates only with a complete exact profile-set tuple.
+    sqlalchemy.Column('non_pool_launch_binding_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('non_pool_launch_binding_protocol_version',
+                      sqlalchemy.Integer),
+    sqlalchemy.Column('non_pool_launch_capability_profile_set_digest',
+                      sqlalchemy.Text),
+    sqlalchemy.Column('non_pool_launch_capability_cohort_epoch',
+                      sqlalchemy.BigInteger),
+    sqlalchemy.Column('non_pool_launch_receipt_protocol_version',
+                      sqlalchemy.Integer),
+    sqlalchemy.CheckConstraint(
+        '((NOT non_pool_launch_binding_capable AND '
+        'num_nonnulls(non_pool_launch_binding_protocol_version, '
+        'non_pool_launch_capability_profile_set_digest, '
+        'non_pool_launch_capability_cohort_epoch, '
+        'non_pool_launch_receipt_protocol_version) = 0) OR '
+        '(non_pool_launch_binding_capable AND '
+        'num_nonnulls(non_pool_launch_binding_protocol_version, '
+        'non_pool_launch_capability_profile_set_digest, '
+        'non_pool_launch_capability_cohort_epoch, '
+        'non_pool_launch_receipt_protocol_version) = 4))',
+        name='ck_api_server_instances_non_pool_launch_capability_complete'),
+    sqlalchemy.CheckConstraint(
+        '(non_pool_launch_binding_protocol_version IS NULL OR '
+        'non_pool_launch_binding_protocol_version = 2) AND '
+        '(non_pool_launch_capability_profile_set_digest IS NULL OR '
+        "non_pool_launch_capability_profile_set_digest ~ '^[0-9a-f]{64}$') "
+        'AND (non_pool_launch_capability_cohort_epoch IS NULL OR '
+        'non_pool_launch_capability_cohort_epoch > 0) AND '
+        '(non_pool_launch_receipt_protocol_version IS NULL OR '
+        'non_pool_launch_receipt_protocol_version = 1)',
+        name='ck_api_server_instances_non_pool_launch_capability_values'),
 )
 CONTROLLER_LEADERSHIP = sqlalchemy.Table(
     'api_controller_leadership',

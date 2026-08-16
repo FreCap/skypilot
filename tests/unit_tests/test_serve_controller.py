@@ -1121,8 +1121,9 @@ def _register_update_test_routes(
     return fastapi_testclient.TestClient(ctrl._app)  # pylint: disable=protected-access
 
 
-def _binding_authority(mode: str, epoch: int):
-    return controller.ordinary_launch_binding.ControllerBindingAuthority(
+def _binding_authority(mode: str, epoch: int, *, generic: bool = False):
+    binding = controller.ordinary_launch_binding
+    return binding.ControllerBindingAuthority(
         service_name='svc',
         service_hash='incarnation-a',
         service_workspace='workspace-a',
@@ -1133,8 +1134,18 @@ def _binding_authority(mode: str, epoch: int):
             '33333333-3333-4333-8333-333333333333'),
         controller_owner_epoch=6,
         capable=True,
-        binding_mode=controller.ordinary_launch_binding.BindingMode(mode),
-        binding_epoch=epoch)
+        binding_mode=binding.BindingMode(mode),
+        binding_epoch=epoch,
+        non_pool_capable=generic,
+        non_pool_binding_protocol_version=(
+            binding.NON_POOL_BINDING_PROTOCOL_VERSION if generic else None),
+        non_pool_profile_set_digest=(
+            binding.supported_non_pool_profile_set_digest()
+            if generic else None),
+        non_pool_capability_cohort_epoch=(
+            binding.NON_POOL_CAPABILITY_COHORT_EPOCH if generic else None),
+        non_pool_receipt_protocol_version=(
+            binding.NON_POOL_RECEIPT_PROTOCOL_VERSION if generic else None))
 
 
 def test_binding_promotion_refreshes_controller_and_manager_in_transition_epoch(
@@ -1182,6 +1193,54 @@ def test_binding_promotion_refreshes_controller_and_manager_in_transition_epoch(
     assert installed == [refreshed]
     assert ctrl._ordinary_launch_binding_authority is refreshed  # pylint: disable=protected-access
     assert ctrl.get_actuation_generation() == 2
+
+
+@pytest.mark.parametrize('source,target,promote_name', [
+    ('bound', 'generic', 'promote_non_pool_launch_binding_service'),
+    ('generic', 'bound', 'demote_non_pool_launch_binding_service'),
+])
+def test_generic_binding_transition_refreshes_exact_capability_tuple(
+        monkeypatch, source, target, promote_name):
+    ctrl = _make_update_controller()
+    previous = _binding_authority('bound', 5, generic=source == 'generic')
+    refreshed = _binding_authority('bound', 6, generic=target == 'generic')
+    ctrl._ordinary_launch_binding_authority = previous  # pylint: disable=protected-access
+    installed = []
+
+    @contextlib.contextmanager
+    def _transition():
+        yield installed.append
+
+    ctrl._replica_manager.ordinary_launch_binding_transition.side_effect = (  # pylint: disable=protected-access
+        _transition)
+    transition = mock.Mock(return_value=6)
+    monkeypatch.setattr(controller.request_postgres, promote_name, transition)
+
+    @contextlib.contextmanager
+    def _refresh(authority):
+        assert authority is previous
+        yield refreshed
+
+    monkeypatch.setattr(controller.ordinary_launch_binding,
+                        'refresh_controller_authority', _refresh)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.post(
+        constants.CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH,
+        json={
+            'mode': target,
+            'expected_service_hash': 'incarnation-a',
+            'expected_binding_epoch': 5,
+        })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'binding_mode': target,
+        'binding_epoch': 6,
+    }
+    transition.assert_called_once_with(previous)
+    assert installed == [refreshed]
+    assert ctrl._ordinary_launch_binding_authority is refreshed  # pylint: disable=protected-access
+    assert refreshed.generic_launches_required is (target == 'generic')
 
 
 def test_binding_transition_lost_response_retry_uses_source_epoch(monkeypatch):

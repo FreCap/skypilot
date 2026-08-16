@@ -435,6 +435,9 @@ _REPLICA_INFO_OWNED_FIELDS = (
     'system_recovery',
     'system_recovery_quarantine',
 )
+# Process-local fields are part of the complete in-memory interface, but are
+# deliberately excluded from the versioned JSON storage contract.
+_REPLICA_INFO_TRANSIENT_FIELDS = ('non_pool_launch_authorization',)
 _REPLICA_INFO_STORAGE_FIELDS = ('replica_info_version',
                                 *_REPLICA_INFO_OWNED_FIELDS)
 _SUPPORTED_LEGACY_JSON_VERSIONS = frozenset((3, 6, 7, 12, 13, 14))
@@ -1203,6 +1206,11 @@ class ReplicaInfo:
         # Exact provider capacity pool whose unresolved-launch allowance this
         # row consumes. None for zero-cost, recovery-only, and pre-v12 rows.
         self.paid_capacity_pool_key: str | None = None
+        # Initial-insert-only planner authority is stored in its own
+        # PostgreSQL column, not in the versioned ReplicaInfo JSON. This
+        # process-local field carries it only across planner construction and
+        # the atomic row insert.
+        self.non_pool_launch_authorization: dict[str, Any] | None = None
         self.system_recovery_launch_intent: (
             system_recovery_state.SystemRecoveryLaunchIntent | None) = None
         self.system_recovery_disposition = (
@@ -1574,6 +1582,7 @@ class ReplicaInfo:
         if record_version in _SUPPORTED_LEGACY_JSON_VERSIONS:
             _materialize_legacy_replica_info_fields(replica)
             replica._version = cls._VERSION
+        replica.non_pool_launch_authorization = None
         _require_replica_info_fields(
             replica, owner=f'decoded ReplicaInfo v{record_version}')
         _validate_reserved_fill_allocation_attribution(replica)
@@ -2075,6 +2084,8 @@ class ReplicaInfo:
             self.planned_capacity = 1
 
         self.__dict__.update(state)
+        self.non_pool_launch_authorization = state.get(
+            'non_pool_launch_authorization')
         self._version = version if version >= 0 else 0
         if version < self._VERSION:
             _materialize_legacy_replica_info_fields(self)

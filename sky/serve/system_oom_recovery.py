@@ -775,6 +775,45 @@ def validate_bound_launch_context(value: object) -> dict[str, Any]:
     return _validate_v3_context(value, bound=True)
 
 
+def _extract_v3_context(value: object, *, bound: bool) -> dict[str, Any]:
+    """Extract one recovery envelope from a larger generic launch context.
+
+    The legacy ``/launch`` contract remains exact-key and continues to use
+    ``validate_*_launch_context`` directly.  The generalized non-pool binding
+    adds its own server-owned fields beside this envelope, so its profile
+    adapter must select the closed recovery key set without accepting unknown
+    recovery-owned fields.
+    """
+    if not isinstance(value, dict):
+        raise ValueError('recovery launch context must be a mapping')
+    fields = _V3_BOUND_CONTEXT_KEYS if bound else _V3_UNBOUND_CONTEXT_KEYS
+    recovery_owned = {
+        key for key in value if isinstance(key, str) and
+        key.startswith('sky_serve_system_oom_recovery_')
+    }
+    expected_recovery_owned = {
+        key for key in fields
+        if key.startswith('sky_serve_system_oom_recovery_')
+    }
+    if recovery_owned != expected_recovery_owned:
+        raise ValueError('recovery launch context has invalid owned fields')
+    try:
+        envelope = {key: value[key] for key in fields}
+    except KeyError as error:
+        raise ValueError('recovery launch context is incomplete') from error
+    return _validate_v3_context(envelope, bound=bound)
+
+
+def extract_unbound_launch_context(value: object) -> dict[str, Any]:
+    """Extract and validate an unbound envelope from a generic context."""
+    return _extract_v3_context(value, bound=False)
+
+
+def extract_bound_launch_context(value: object) -> dict[str, Any]:
+    """Extract and validate a bound envelope from a generic context."""
+    return _extract_v3_context(value, bound=True)
+
+
 def is_unbound_launch_context(value: object) -> bool:
     try:
         validate_unbound_launch_context(value)
@@ -864,7 +903,10 @@ def match_trusted_profile(
             != constants.SYSTEM_OOM_RECOVERY_CONTROLLER_CONTRACT_VERSION):
         return None
     try:
-        context = validate_bound_launch_context(launch_context)
+        if 'sky_serve_non_pool_binding_protocol_version' in launch_context:
+            context = extract_bound_launch_context(launch_context)
+        else:
+            context = validate_bound_launch_context(launch_context)
     except (TypeError, ValueError):
         return None
     service_name = context[constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]

@@ -99,17 +99,23 @@ version_specs_table = serve_state_schema.version_specs_table
 _SERVE038_SERVICE_COLUMN_NAMES = frozenset(
     column.name
     for column in resource_action_m4_state_schema.service_candidate_columns())
-_SERVE042_SERVICE_COLUMN_NAMES = frozenset({
+_POST_SERVE037_SERVICE_COLUMN_NAMES = frozenset({
     'controller_incarnation',
     'controller_owner_epoch',
     'ordinary_launch_binding_capable',
     'ordinary_launch_binding_mode',
     'ordinary_launch_binding_epoch',
+    'non_pool_launch_binding_capable',
+    'non_pool_launch_controller_incarnation',
+    'non_pool_launch_binding_protocol_version',
+    'non_pool_launch_capability_profile_set_digest',
+    'non_pool_launch_capability_cohort_epoch',
+    'non_pool_launch_receipt_protocol_version',
 })
 _SERVE037_SERVICE_COLUMNS = tuple(
     column for column in services_table.c
     if column.name not in (_SERVE038_SERVICE_COLUMN_NAMES |
-                           _SERVE042_SERVICE_COLUMN_NAMES))
+                           _POST_SERVE037_SERVICE_COLUMN_NAMES))
 placement_normalization_runs_table = (
     serve_state_schema.placement_normalization_runs_table)
 placement_normalization_rows_table = (
@@ -3161,6 +3167,7 @@ _ACTION_OWNED_REPLICA_COLUMNS = frozenset({
     'down_shadow_sample_id',
     'resource_action_spec_identity_sha256',
     'ordinary_launch_association_id',
+    'non_pool_launch_authorization',
 })
 _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PENDING.value,
@@ -3584,6 +3591,25 @@ def _replica_row_values(
         'replica_state': replica_state,
     }
     assert tuple(values) == _REPLICA_ROW_COLUMNS
+    return values
+
+
+def _initial_replica_row_values(
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+) -> dict[str, Any]:
+    """Add typed planner authority only to an initial PostgreSQL insert."""
+    values = _replica_row_values(service_name, replica_id, replica_info)
+    authorization = getattr(replica_info, 'non_pool_launch_authorization', None)
+    if authorization is None:
+        return values
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Non-pool planner authorization requires PostgreSQL.')
+    if not isinstance(authorization, dict):
+        raise ValueError('Non-pool planner authorization must be a mapping.')
+    values['non_pool_launch_authorization'] = copy.deepcopy(authorization)
     return values
 
 
@@ -4015,10 +4041,16 @@ def _upsert_replica_rows_in_session(
     insert_func = _upsert_insert_func(engine)
     for start in range(0, len(replica_infos), chunk_size):
         chunk = replica_infos[start:start + chunk_size]
-        insert_stmt = insert_func(replicas_table).values([
-            _replica_row_values(service_name, replica_id, replica_info)
+        insert_rows = [
+            _initial_replica_row_values(engine, service_name, replica_id,
+                                        replica_info)
             for replica_id, replica_info in chunk
-        ])
+        ]
+        if any('non_pool_launch_authorization' in values
+               for values in insert_rows):
+            for values in insert_rows:
+                values.setdefault('non_pool_launch_authorization', None)
+        insert_stmt = insert_func(replicas_table).values(insert_rows)
         session.execute(insert_stmt)
     return replica_infos
 
@@ -5109,8 +5141,8 @@ def try_add_replica_with_paid_capacity_claim(
                 return 'ownership_lost'
         else:
             replica_insert = _upsert_insert_func(engine)(replicas_table).values(
-                **_replica_row_values(service_name, replica_id,
-                                      transaction_replica_info))
+                **_initial_replica_row_values(engine, service_name, replica_id,
+                                              transaction_replica_info))
             session.execute(replica_insert)
         claim_insert = _upsert_insert_func(engine)(
             paid_capacity_claims_table).values(service_name=service_name,

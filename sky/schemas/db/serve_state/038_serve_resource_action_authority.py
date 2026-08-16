@@ -46,17 +46,23 @@ _SERVE037_PLACEMENT_TABLES = (
 )
 
 # The common runtime metadata is the steady-state schema, while a sequential
-# upgrade reaches revision 038 before Serve042 installs its PostgreSQL-only
-# ordinary-launch columns.  Project those future-owned fields out
+# upgrade reaches revision 038 before Serve042 and Serve047 install their
+# PostgreSQL-only launch-binding columns. Project those future-owned fields out
 # unconditionally: revision 038 must reject even a complete early lookalike,
-# leaving revision 042 as their sole DDL owner.
-_SERVE042_FUTURE_COLUMNS = {
+# leaving each later migration as its sole DDL owner.
+_POST_SERVE038_FUTURE_COLUMNS = {
     _SERVICES: frozenset({
         'controller_incarnation',
         'controller_owner_epoch',
         'ordinary_launch_binding_capable',
         'ordinary_launch_binding_mode',
         'ordinary_launch_binding_epoch',
+        'non_pool_launch_binding_capable',
+        'non_pool_launch_controller_incarnation',
+        'non_pool_launch_binding_protocol_version',
+        'non_pool_launch_capability_profile_set_digest',
+        'non_pool_launch_capability_cohort_epoch',
+        'non_pool_launch_receipt_protocol_version',
     }),
     _REPLICAS: frozenset({'ordinary_launch_association_id'}),
 }
@@ -489,22 +495,12 @@ def _common_runtime_table(table_name: str) -> sa.Table:
         _VERSION_SPECS: serve_state_schema.version_specs_table,
         _REPLICAS: serve_state_schema.replicas_table,
     }[table_name]
-    # These columns are owned by the frozen Serve042 migration.  Project them
-    # out of Serve038's historical relation contract so a fresh install does
-    # not require future fields before the revision that creates them.  Keep
-    # this list named and closed: arbitrary runtime metadata additions must
-    # continue to fail Serve038's exact catalog verification.
-    serve042_owned_columns = {
-        _SERVICES: frozenset({
-            'controller_incarnation',
-            'controller_owner_epoch',
-            'ordinary_launch_binding_capable',
-            'ordinary_launch_binding_mode',
-            'ordinary_launch_binding_epoch',
-        }),
-        _REPLICAS: frozenset({'ordinary_launch_association_id'}),
-    }.get(table_name, frozenset())
-    if not serve042_owned_columns:
+    # Project later migration-owned columns out of Serve038's historical
+    # relation contract. Keep the closed inventory shared with the independent
+    # catalog constructor below so fresh and replay validation cannot drift.
+    future_owned_columns = _POST_SERVE038_FUTURE_COLUMNS.get(
+        table_name, frozenset())
+    if not future_owned_columns:
         return runtime
     projected_metadata = sa.MetaData()
     # ``to_metadata()`` preserves string-declared foreign keys; copy all
@@ -515,7 +511,7 @@ def _common_runtime_table(table_name: str) -> sa.Table:
         if referenced_table.name not in projected_metadata.tables:
             referenced_table.to_metadata(projected_metadata)
     projected = runtime.to_metadata(projected_metadata)
-    for column_name in serve042_owned_columns:
+    for column_name in future_owned_columns:
         column = projected.c.get(column_name)
         if column is not None:
             projected._columns.remove(column)
@@ -530,7 +526,8 @@ def _common_revision_038_table(table_name: str,
     for table in serve_state_schema.Base.metadata.sorted_tables:
         table.to_metadata(metadata)
     expected = metadata.tables[table_name]
-    for column_name in _SERVE042_FUTURE_COLUMNS.get(table_name, frozenset()):
+    for column_name in _POST_SERVE038_FUTURE_COLUMNS.get(
+            table_name, frozenset()):
         column = expected.c.get(column_name)
         if column is not None:
             expected._columns.remove(column)

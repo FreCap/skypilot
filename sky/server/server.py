@@ -85,6 +85,7 @@ from sky.server.requests import access as request_access
 from sky.server.requests import executor
 from sky.server.requests import launch_identity
 from sky.server.requests import log_provider
+from sky.server.requests import non_pool_launch as non_pool_launch_request
 from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.server.requests import preconditions
@@ -124,6 +125,16 @@ class _OrdinaryServeLaunchSubmission(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='forbid')
 
     submission_uuid: str
+    launch: payloads.LaunchBody
+
+
+class _NonPoolServeLaunchSubmission(pydantic.BaseModel):
+    """Closed wire envelope for one idempotent generic Serve admission."""
+
+    model_config = pydantic.ConfigDict(extra='forbid')
+
+    submission_uuid: str
+    profile_kind: ordinary_launch_binding.NonPoolLaunchProfileKind
     launch: payloads.LaunchBody
 
 
@@ -167,6 +178,36 @@ def _resolve_ordinary_launch_tenant_id(launch_body: payloads.LaunchBody,
     return tenant_id
 
 
+async def _resolve_non_pool_launch_profile_for_admission(
+    service_name: str,
+    intent: ordinary_launch_binding.BindingIntent,
+    association_id: str,
+) -> ordinary_launch_binding.NonPoolLaunchProfile:
+    """Resolve immutable planner authority without awaiting in ``except``."""
+    profile = await asyncio.to_thread(
+        ordinary_launch_binding.get_existing_non_pool_launch_profile,
+        association_id)
+    if profile is not None:
+        return profile
+    resolution_conflict = None
+    try:
+        return await asyncio.to_thread(
+            ordinary_launch_binding.resolve_non_pool_launch_profile,
+            service_name, intent.replica_id, intent.replica_record_id)
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict as error:
+        resolution_conflict = error
+
+    # A concurrent identical submission can commit between the association
+    # read and live planner resolution. Close that race outside the exception
+    # handler, so cancellation cannot discard the active exception.
+    profile = await asyncio.to_thread(
+        ordinary_launch_binding.get_existing_non_pool_launch_profile,
+        association_id)
+    if profile is None:
+        raise resolution_conflict
+    return profile
+
+
 def _bind_and_enqueue_ordinary_launch(
     request_task: requests_lib.Request,
     identity: ordinary_launch_binding.BindingIdentity,
@@ -183,6 +224,25 @@ def _bind_and_enqueue_ordinary_launch(
         raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
             'The atomic ordinary launch request binding integration returned '
             'an invalid admission result.')
+    return admission
+
+
+def _bind_and_enqueue_non_pool_launch(
+    request_task: requests_lib.Request,
+    identity: ordinary_launch_binding.NonPoolBindingIdentity,
+) -> ordinary_launch_binding.BindingAdmission:
+    """Call the built-in PostgreSQL generic admission transaction."""
+    bind = getattr(_ordinary_launch_request_postgres,
+                   'bind_and_enqueue_non_pool_launch', None)
+    if not callable(bind):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'The atomic non-pool launch binding integration is not installed '
+            'on this API server.')
+    admission = bind(request_task, identity)
+    if not isinstance(admission, ordinary_launch_binding.BindingAdmission):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'The atomic non-pool launch binding integration returned an '
+            'invalid admission result.')
     return admission
 
 
@@ -1282,6 +1342,135 @@ async def ordinary_serve_launch(
         raise fastapi.HTTPException(
             status_code=409,
             detail='Ordinary Serve launch binding was rejected: '
+            f'{common_utils.format_exception(error)}') from error
+    if reservation.created:
+        request_task.log_path.touch()
+    return responses.OrdinaryLaunchBindingResponse(
+        submission_uuid=submission_uuid,
+        association_id=reservation.association_id,
+        request_id=reservation.request_id,
+        launch_generation=reservation.launch_generation,
+        created=reservation.created)
+
+
+@app.post(server_constants.NON_POOL_LAUNCH_BINDING_PATH)
+async def non_pool_serve_launch(
+    submission: _NonPoolServeLaunchSubmission,
+    request: fastapi.Request,
+) -> responses.OrdinaryLaunchBindingResponse:
+    """Atomically bind and enqueue one typed non-pool Serve launch."""
+    launch_body = submission.launch.model_copy(deep=True)
+    launch_context = launch_body.extra_launch_context
+    if (not launch_body.is_launched_by_sky_serve_controller or
+            launch_body.is_launched_by_jobs_controller or launch_body.dryrun or
+            launch_body.clone_disk_from is not None):
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Generic non-pool launches require an effectful SkyServe '
+            'controller request.')
+    try:
+        server_owned_context_keys = (
+            ordinary_launch_binding.SUBMISSION_ID_KEY,
+            ordinary_launch_binding.ASSOCIATION_ID_KEY,
+            ordinary_launch_binding.LAUNCH_GENERATION_KEY,
+            ordinary_launch_binding.BOUND_REQUEST_ID_KEY,
+            ordinary_launch_binding.INPUT_DIGEST_KEY,
+            ordinary_launch_binding.OWNER_REVISION_KEY,
+            ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY,
+            ordinary_launch_binding.PROFILE_KIND_KEY,
+            ordinary_launch_binding.PROFILE_VERSION_KEY,
+            ordinary_launch_binding.PROFILE_DIGEST_KEY,
+            ordinary_launch_binding.CAPABILITY_COHORT_EPOCH_KEY,
+            ordinary_launch_binding.CAPABILITY_PROFILE_SET_DIGEST_KEY,
+            ordinary_launch_binding.RECEIPT_PROTOCOL_VERSION_KEY,
+            ordinary_launch_binding.AUTHORIZATION_KIND_KEY,
+            ordinary_launch_binding.AUTHORIZATION_REFERENCE_KEY,
+            ordinary_launch_binding.AUTHORIZATION_GENERATION_KEY,
+            ordinary_launch_binding.AUTHORIZATION_DIGEST_KEY,
+        )
+        if any(key in launch_context for key in server_owned_context_keys):
+            raise ValueError(
+                'Non-pool binding identity must be server-generated.')
+        submission_uuid = _parse_ordinary_launch_submission_uuid(
+            submission.submission_uuid)
+        service_name = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY)
+        service_hash = launch_context.get(
+            serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+        if not isinstance(service_name, str) or not service_name:
+            raise ValueError('Non-pool launch service name must be non-empty.')
+        if not isinstance(service_hash, str) or not service_hash:
+            raise ValueError('Non-pool launch service hash must be non-empty.')
+        recovery_identity = await asyncio.to_thread(
+            serve_state.get_service_config_recovery_identity, service_name)
+        if (recovery_identity is None or recovery_identity[0] != service_hash):
+            raise ValueError(
+                'Non-pool launch service incarnation is not current.')
+        workspace = recovery_identity[1]
+        tenant_id = _resolve_ordinary_launch_tenant_id(launch_body,
+                                                       request.state.auth_user)
+        association_id, request_id = _derive_ordinary_launch_binding_ids(
+            submission_uuid, tenant_id, workspace)
+        intent = ordinary_launch_binding.parse_unbound_launch_context(
+            launch_context)
+        profile = await _resolve_non_pool_launch_profile_for_admission(
+            service_name, intent, association_id)
+        if profile.kind != submission.profile_kind:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Submitted profile kind does not match durable planner state.')
+        input_digest = ordinary_launch_binding.canonical_launch_digest(
+            submission.launch)
+        identity = ordinary_launch_binding.build_non_pool_binding_identity(
+            intent,
+            submission_id=submission_uuid,
+            tenant_scope=tenant_id,
+            service_workspace=workspace,
+            cluster_name=launch_body.cluster_name,
+            input_digest=input_digest,
+            profile=profile,
+            capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+        if (str(identity.association_id) != association_id or
+                identity.request_id != request_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Server-derived non-pool launch identity is inconsistent.')
+        binding_precondition = (preconditions.OrdinaryLaunchBindingPrecondition(
+            request_id, str(identity.association_id)))
+        request_task = await executor.build_request_async(
+            request_id=request_id,
+            request_name=request_names.RequestName.CLUSTER_LAUNCH,
+            request_body=launch_body,
+            func=non_pool_launch_request.launch,
+            request_cluster_name=launch_body.cluster_name,
+            schedule_type=requests_lib.ScheduleType.LONG,
+            retryable=False,
+            should_enqueue=True,
+            precondition=binding_precondition,
+            auth_user=request.state.auth_user,
+        )
+        reservation = await asyncio.to_thread(_bind_and_enqueue_non_pool_launch,
+                                              request_task, identity)
+        if (reservation.association_id != association_id or
+                reservation.request_id != request_id or
+                type(reservation.launch_generation) is not int or
+                reservation.launch_generation < 1 or
+                type(reservation.created) is not bool):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Transactional non-pool binding returned inconsistent '
+                'identity.')
+    except ordinary_launch_binding.OrdinaryLaunchBindingUnavailable as error:
+        raise fastapi.HTTPException(status_code=503,
+                                    detail=str(error)) from error
+    except (ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+            ValueError) as error:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Non-pool Serve launch binding was rejected: '
             f'{common_utils.format_exception(error)}') from error
     if reservation.created:
         request_task.log_path.touch()

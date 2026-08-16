@@ -90,6 +90,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/{service_name}/load-balancer/high-availability', 'POST'),
     ('/serve/_internal/{service_name}/ordinary-launch-binding', 'POST'),
     ('/internal/serve/ordinary-launch', 'POST'),
+    ('/internal/serve/non-pool-launch', 'POST'),
     ('/internal/resource-actions/v1/launch-identity/canonicalize', 'POST'),
     # --- Managed container image writes ---
     ('/images/publications', 'POST'),

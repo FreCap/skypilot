@@ -218,7 +218,7 @@ def _normalization_engine(request, monkeypatch):
     engine = _isolated_engine(request, 'replica_v18_normalization')
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(config, '046')
+    alembic_command.upgrade(config, '047')
     monkeypatch.setattr(
         serve_state._db_manager,  # pylint: disable=protected-access
         '_engine',
@@ -378,7 +378,7 @@ def test_normalizer_rewrites_exact_v17_collision_and_fences_old_writer(
         'scanned_records': 1,
         'scanned_services': 1,
         'schema_version': 18,
-        'serve_database_revision': '046',
+        'serve_database_revision': '047',
         'writer_deployment_roles': ['api', 'controller', 'executor'],
         'writer_image_digest': 'sha256:' + 'a' * 64,
         'writer_pod_inventory_count': 6,
@@ -812,7 +812,7 @@ def test_normalizer_requires_exact_database_revision_before_mutation(
                         'get_current_alembic_revision', lambda *_: '045')
 
     with pytest.raises(normalization.ReplicaRecordNormalizationError,
-                       match='exact Serve database revision 046'):
+                       match='exact Serve database revision 047'):
         normalization.normalize_retained_replica_records()
 
     with normalization_engine.connect() as connection:

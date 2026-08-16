@@ -3656,7 +3656,13 @@ class SkyServeController:
             if previous is None:
                 raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
                     'Controller has no durable binding authority.')
-            if previous.binding_mode.value == mode:
+            already_in_mode = (
+                (mode == 'legacy' and previous.binding_mode.value == mode) or
+                (mode == 'bound' and previous.binding_mode
+                 == ordinary_launch_binding.BindingMode.BOUND and
+                 previous.non_pool_capable is False) or
+                (mode == 'generic' and previous.generic_launches_required))
+            if already_in_mode:
                 if previous.binding_epoch != expected_binding_epoch + 1:
                     raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                         'Requested binding transition is not an exact '
@@ -3669,15 +3675,33 @@ class SkyServeController:
                 self._replica_manager.ordinary_launch_binding_transition)
             with transition() as install:
                 if mode == 'bound':
-                    epoch = request_postgres.promote_ordinary_launch_binding_service(
-                        previous)
+                    if previous.non_pool_capable:
+                        epoch = (
+                            request_postgres.
+                            demote_non_pool_launch_binding_service(previous))
+                    else:
+                        epoch = (
+                            request_postgres.
+                            promote_ordinary_launch_binding_service(previous))
+                elif mode == 'generic':
+                    epoch = (request_postgres.
+                             promote_non_pool_launch_binding_service(previous))
                 else:
                     epoch = request_postgres.demote_ordinary_launch_binding_service(
                         previous)
                 refresh = ordinary_launch_binding.refresh_controller_authority
                 with refresh(previous) as refreshed:
-                    if (refreshed.binding_mode.value != mode or
-                            refreshed.binding_epoch != epoch):
+                    mode_matches = (
+                        (mode == 'legacy' and refreshed.binding_mode
+                         == ordinary_launch_binding.BindingMode.LEGACY and
+                         refreshed.non_pool_capable is False) or
+                        (mode == 'bound' and refreshed.binding_mode
+                         == ordinary_launch_binding.BindingMode.BOUND and
+                         refreshed.non_pool_capable is False) or
+                        (mode == 'generic' and refreshed.binding_mode
+                         == ordinary_launch_binding.BindingMode.BOUND and
+                         refreshed.generic_launches_required))
+                    if (not mode_matches or refreshed.binding_epoch != epoch):
                         raise (
                             ordinary_launch_binding.
                             OrdinaryLaunchBindingConflict(
@@ -5726,10 +5750,11 @@ class SkyServeController:
             mode = request_data.get('mode')
             expected_service_hash = request_data.get('expected_service_hash')
             expected_binding_epoch = request_data.get('expected_binding_epoch')
-            if mode not in ('legacy', 'bound'):
-                return responses.JSONResponse(
-                    content={'message': 'mode must be legacy or bound.'},
-                    status_code=400)
+            if mode not in ('legacy', 'bound', 'generic'):
+                return responses.JSONResponse(content={
+                    'message': 'mode must be legacy, bound, or generic.'
+                },
+                                              status_code=400)
             if (isinstance(expected_binding_epoch, bool) or
                     not isinstance(expected_binding_epoch, int) or
                     expected_binding_epoch < 0):

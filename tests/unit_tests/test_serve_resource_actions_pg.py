@@ -457,7 +457,7 @@ def test_pg_constraints_cascade_and_schema_down_refusal(empty_postgres):
 
     config = migration_utils.get_alembic_config(engine,
                                                 migration_utils.SERVE_DB_NAME)
-    with pytest.raises(RuntimeError, match='Serve046 is forward-only'):
+    with pytest.raises(RuntimeError, match='Serve047 is forward-only'):
         alembic_command.downgrade(config, '031')
     assert migration_utils.get_current_alembic_revision(
         engine, migration_utils.SERVE_DB_NAME) == migration_utils.SERVE_VERSION
@@ -541,6 +541,7 @@ def test_pg_replica_updates_preserve_actions_and_admissions_reject_duplicates(
                 ),
             'resource_action_spec_identity_sha256': 'f' * 64,
             'ordinary_launch_association_id': None,
+            'non_pool_launch_authorization': None,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(engine) as session:
