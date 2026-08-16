@@ -8,64 +8,212 @@ import { trackInfraAction } from '@/lib/analytics';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { NonCapitalizedTooltip } from '@/components/utils';
 
+const PRIORITY_TIERS = [
+  {
+    code: 'MA',
+    rank: 1,
+    className: 'bg-red-100 text-red-800 border-red-200',
+  },
+  {
+    code: 'HA',
+    rank: 2,
+    className: 'bg-orange-100 text-orange-800 border-orange-200',
+  },
+  {
+    code: 'WA',
+    rank: 3,
+    className: 'bg-blue-100 text-blue-800 border-blue-200',
+  },
+  {
+    code: 'BE',
+    rank: 4,
+    className: 'bg-slate-100 text-slate-700 border-slate-200',
+  },
+];
+
+const PRIORITY_BY_CODE = Object.fromEntries(
+  PRIORITY_TIERS.map((tier) => [tier.code, tier])
+);
+
 const PRIORITY_POLICY_LINES = [
-  'Priority (highest to lowest): MA > HA > WA > BE',
-  'MA: PyTorch training | HA: development pods',
-  'WA: evaluations and research SkyPilot | BE: production SkyPilot',
-  'Free is immediate headroom; queued work can also progress through preemption and configured quotas.',
+  'PREEMPTION ORDER',
+  '1 MA → 2 HA → 3 WA → 4 BE',
+  'A tier can preempt tiers to its right when scheduling requires it.',
+  'Within one tier, the higher raw Kubernetes priority value preempts the lower value.',
 ];
 
 const withPriorityPolicy = (lines) =>
   [...lines, '', ...PRIORITY_POLICY_LINES].join('\n');
 
-const formatPriorityBreakdown = (breakdown) =>
-  Object.entries(breakdown || {})
-    .sort((a, b) => b[1] - a[1])
-    .map(([label, qty]) => {
-      const tier = label.match(/^(ma|ha|wa|be)(?:-|\s|\()/i)?.[1];
-      return `${label}: ${qty}${tier ? ` (${tier.toUpperCase()} tier)` : ''}`;
-    });
+const getPriorityTier = (label) => {
+  const code = label?.match(/^(ma|ha|wa|be)(?:-|\s|\()/i)?.[1];
+  return code ? PRIORITY_BY_CODE[code.toUpperCase()] : null;
+};
 
-// Tooltip text for the preemptible segment: the priority classes holding
-// those accelerators, largest first, e.g.
-//   "66 preemptible attributed to non-SkyServe pods
-//    inference-low (-1000): 60
-//    drill (-500): 6"
+const formatGpuCount = (qty) => `${qty} GPU${qty === 1 ? '' : 's'}`;
+
+const formatTierList = (tiers) =>
+  tiers.map((tier) => `${tier.rank} ${tier.code}`).join(', ');
+
+const formatPreemptionAction = (tier) => {
+  if (!tier) {
+    return 'unmapped tier; compare the raw Kubernetes value (higher preempts lower)';
+  }
+  const higher = PRIORITY_TIERS.filter(
+    (candidate) => candidate.rank < tier.rank
+  );
+  const lower = PRIORITY_TIERS.filter(
+    (candidate) => candidate.rank > tier.rank
+  );
+  const higherRanks = higher.length > 0 ? `${formatTierList(higher)} or ` : '';
+  const lowerRanks = lower.length > 0 ? `${formatTierList(lower)} and ` : '';
+  const preemptedBy = `preempted by ${higherRanks}higher raw ${tier.code} value`;
+  const preempts = `preempts ${lowerRanks}lower raw ${tier.code} value`;
+  return `${preemptedBy}; ${preempts}`;
+};
+
+const sortPriorityEntries = (breakdown) =>
+  Object.entries(breakdown || {}).sort(([labelA, qtyA], [labelB, qtyB]) => {
+    const tierA = getPriorityTier(labelA);
+    const tierB = getPriorityTier(labelB);
+    if (tierA && tierB && tierA.rank !== tierB.rank) {
+      return tierA.rank - tierB.rank;
+    }
+    if (tierA && !tierB) return -1;
+    if (!tierA && tierB) return 1;
+    return qtyB - qtyA || labelA.localeCompare(labelB);
+  });
+
+const formatPriorityBreakdown = (breakdown, indent = '') =>
+  sortPriorityEntries(breakdown).map(([label, qty]) => {
+    const tier = getPriorityTier(label);
+    const rank = tier ? `${tier.rank} ${tier.code}` : '? unmapped';
+    return (
+      `${indent}${rank} · ${formatGpuCount(qty)} · ${label} · ` +
+      formatPreemptionAction(tier)
+    );
+  });
+
+const subtractBreakdown = (total, subset) => {
+  const remaining = {};
+  for (const [label, qty] of Object.entries(total || {})) {
+    const value = Math.max(0, qty - (subset?.[label] || 0));
+    if (value > 0) remaining[label] = value;
+  }
+  return remaining;
+};
+
+const sumServicePriorityBreakdown = (serviceBreakdown) => {
+  if (serviceBreakdown == null) return null;
+  const total = {};
+  for (const breakdown of Object.values(serviceBreakdown)) {
+    for (const [label, qty] of Object.entries(breakdown || {})) {
+      total[label] = (total[label] || 0) + qty;
+    }
+  }
+  return total;
+};
+
+const compactTierLabel = (breakdown) => {
+  const entries = sortPriorityEntries(breakdown);
+  const hasUnmapped = entries.some(([label]) => !getPriorityTier(label));
+  const tiers = [
+    ...new Map(
+      entries
+        .map(([label]) => getPriorityTier(label))
+        .filter(Boolean)
+        .map((tier) => [tier.code, tier])
+    ).values(),
+  ];
+  if (tiers.length === 1 && !hasUnmapped) {
+    return `${tiers[0].rank} ${tiers[0].code}`;
+  }
+  if (tiers.length > 1 || (tiers.length > 0 && hasUnmapped)) {
+    return 'mixed tiers';
+  }
+  return hasUnmapped ? 'unmapped' : null;
+};
+
+const buildSegmentLabel = (qty, noun, breakdown) => {
+  const tier = compactTierLabel(breakdown);
+  return tier ? `${tier} · ${qty} ${noun}` : `${qty} ${noun}`;
+};
+
+// Operational tooltip for reclaimable non-SkyServe allocations.
 const buildPreemptibleTitle = (preemptible, breakdown) => {
-  const header =
-    `${preemptible} preemptible attributed to non-SkyServe pods ` +
-    `(reclaimable by higher-priority workloads)`;
   const entries = formatPriorityBreakdown(breakdown);
   return withPriorityPolicy([
-    header,
-    'Allocated now, not free; a higher-priority job may reclaim these GPUs.',
+    'RUNNING NOW',
+    `${formatGpuCount(preemptible)} · non-SkyServe workloads · reclaimable`,
     ...entries,
   ]);
 };
 
-const buildServicePreemptibleTitle = (preemptible, breakdown) => {
-  const header =
-    `${preemptible} preemptible attributed to SkyServe pods ` +
-    `(reclaimable by higher-priority workloads)`;
-  const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
+const buildServicePreemptibleTitle = (
+  preemptible,
+  breakdown,
+  servicePriorityBreakdown
+) => {
+  const serviceLines = [];
+  for (const [service, qty] of Object.entries(breakdown || {}).sort(
+    (a, b) => b[1] - a[1]
+  )) {
+    serviceLines.push(`${service} · ${formatGpuCount(qty)}`);
+    const priorities = servicePriorityBreakdown?.[service];
+    if (priorities && Object.keys(priorities).length > 0) {
+      serviceLines.push(...formatPriorityBreakdown(priorities, '  '));
+    } else {
+      serviceLines.push('  ? priority rank unavailable');
+    }
+  }
   return withPriorityPolicy([
-    header,
-    'Allocated now, not free; a higher-priority job may reclaim these GPUs.',
-    ...entries.map(([service, qty]) => `${service}: ${qty}`),
+    'RUNNING NOW',
+    `${formatGpuCount(preemptible)} · SkyServe · reclaimable`,
+    ...serviceLines,
   ]);
 };
 
 const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
-  const header =
-    `${preemptible} preemptible; SkyServe pod attribution unavailable ` +
-    `(pods lack durable SkyPilot workload identity)`;
   const entries = formatPriorityBreakdown(breakdown);
   return withPriorityPolicy([
-    header,
-    'Allocated now, not free; a higher-priority job may reclaim these GPUs.',
+    'RUNNING NOW',
+    `${formatGpuCount(preemptible)} · reclaimable · workload identity unavailable`,
     ...entries,
   ]);
 };
+
+const buildUsedTitle = (used, breakdown) => {
+  const entries = formatPriorityBreakdown(breakdown);
+  return withPriorityPolicy([
+    'RUNNING NOW',
+    `${formatGpuCount(used)} · highest active tier · not currently reclaimable`,
+    ...entries,
+  ]);
+};
+
+const PriorityBadge = ({ tier }) => (
+  <span
+    className={`inline-flex items-center rounded border px-1.5 py-0.5 font-semibold ${tier.className}`}
+  >
+    {tier.rank} {tier.code}
+  </span>
+);
+
+export const PriorityOrderLegend = ({ className = '' }) => (
+  <div
+    aria-label="Preemption order: 1 MA, 2 HA, 3 WA, 4 BE. Tiers on the left can preempt tiers to their right. Within a tier, a higher raw Kubernetes priority value preempts a lower value."
+    className={`flex flex-wrap items-center gap-1.5 text-[11px] text-gray-600 ${className}`.trim()}
+  >
+    <span className="font-medium text-gray-700">Preemption:</span>
+    {PRIORITY_TIERS.map((tier, index) => (
+      <React.Fragment key={tier.code}>
+        {index > 0 && <span aria-hidden="true">→</span>}
+        <PriorityBadge tier={tier} />
+      </React.Fragment>
+    ))}
+    <span>left preempts right; higher raw value wins within a tier</span>
+  </div>
+);
 
 const GpuBarSegment = ({ percentage, label, tooltip, className }) => {
   if (percentage <= 0) {
@@ -115,22 +263,48 @@ const GpuUtilizationBar = ({
     : 0;
   const unknownPreemptible = serviceAttributionKnown ? 0 : preemptible;
   const used = allUsed - preemptible;
+  const servicePriorityBreakdown =
+    gpu?.gpu_preemptible_service_priority_breakdown;
+  const servicePriorityTotals = sumServicePriorityBreakdown(
+    servicePriorityBreakdown
+  );
+  const otherPriorityBreakdown = serviceAttributionKnown
+    ? servicePriorityTotals != null
+      ? subtractBreakdown(gpu?.gpu_preemptible_breakdown, servicePriorityTotals)
+      : servicePreemptible === 0
+        ? gpu?.gpu_preemptible_breakdown
+        : {}
+    : {};
+  const usedPriorityBreakdown = subtractBreakdown(
+    gpu?.gpu_allocation_breakdown,
+    gpu?.gpu_preemptible_breakdown
+  );
   const notReadyLabel = `${notReady} not ready`;
-  const usedLabel = `${used} used`;
-  const servicePreemptibleLabel = `${servicePreemptible} SkyServe pods`;
-  const otherPreemptibleLabel = `${otherPreemptible} confirmed other`;
-  const unknownPreemptibleLabel = `${unknownPreemptible} attribution unknown`;
+  const usedLabel = showPriorityPolicy
+    ? buildSegmentLabel(used, 'running', usedPriorityBreakdown)
+    : `${used} used`;
+  const servicePreemptibleLabel = showPriorityPolicy
+    ? buildSegmentLabel(servicePreemptible, 'SkyServe', servicePriorityTotals)
+    : `${servicePreemptible} SkyServe pods`;
+  const otherPreemptibleLabel = showPriorityPolicy
+    ? buildSegmentLabel(otherPreemptible, 'other', otherPriorityBreakdown)
+    : `${otherPreemptible} confirmed other`;
+  const unknownPreemptibleLabel = showPriorityPolicy
+    ? buildSegmentLabel(
+        unknownPreemptible,
+        'unknown',
+        gpu?.gpu_preemptible_breakdown
+      )
+    : `${unknownPreemptible} attribution unknown`;
   const freeLabel = `${free} free`;
-  const notReadyTitle = `${notReady} not ready\nUnavailable for scheduling until the node recovers.`;
+  const notReadyTitle = `UNAVAILABLE\n${formatGpuCount(notReady)} · node not ready`;
   const usedTitle = showPriorityPolicy
-    ? withPriorityPolicy([
-        `${used} allocated at the highest observed priority`,
-        'In use; not immediately free or currently classified as reclaimable.',
-      ])
+    ? buildUsedTitle(used, usedPriorityBreakdown)
     : `${used} used\nAllocated, not free in this snapshot.`;
   const freeTitle = [
-    `${free} free now`,
-    'Unallocated in this snapshot. Placement still depends on GPU shape, node health, quota, and scheduling constraints.',
+    'FREE NOW',
+    `${formatGpuCount(free)} · unallocated in this snapshot`,
+    'Placement still depends on GPU shape, node health, quota, and scheduling constraints.',
   ].join('\n');
   const toPercentage = total > 0 ? (value) => (value / total) * 100 : () => 0;
   const notReadyPercentage = toPercentage(notReady);
@@ -161,7 +335,8 @@ const GpuUtilizationBar = ({
         label={servicePreemptibleLabel}
         tooltip={buildServicePreemptibleTitle(
           servicePreemptible,
-          gpu?.gpu_preemptible_service_breakdown
+          gpu?.gpu_preemptible_service_breakdown,
+          servicePriorityBreakdown
         )}
         className="bg-violet-300 text-violet-950"
       />
@@ -170,7 +345,7 @@ const GpuUtilizationBar = ({
         label={otherPreemptibleLabel}
         tooltip={buildPreemptibleTitle(
           otherPreemptible,
-          servicePreemptible === 0 ? gpu?.gpu_preemptible_breakdown : null
+          otherPriorityBreakdown
         )}
         className="bg-amber-300 text-amber-900"
       />
@@ -350,6 +525,9 @@ export function ContextDetails({
                     ? 'Free is immediate headroom. Reclaimable GPUs are allocated, not idle, and may be preempted by higher-priority work. Hover or focus a segment for workload and priority details.'
                     : 'Free is unallocated in this snapshot. Hover or focus a segment for utilization details.'}
                 </p>
+                {!isSSHContext && !isSlurm && (
+                  <PriorityOrderLegend className="mt-2" />
+                )}
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {gpusInContext.map((gpu) => {

@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 80  # Generic durable non-pool SkyServe launch binding
+API_VERSION = 81  # Kubernetes operational priority breakdown
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -157,6 +157,10 @@ MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 # Kubernetes node info includes the SkyServe-attributed subset of preemptible
 # accelerators. Older clients reject unknown KubernetesNodeInfo fields.
 MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION = 78
+
+# Kubernetes node info retains all active priority tiers and the priority tier
+# of each attributed preemptible SkyServe service.
+MIN_KUBERNETES_OPERATIONAL_PRIORITY_BREAKDOWN_API_VERSION = 81
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies

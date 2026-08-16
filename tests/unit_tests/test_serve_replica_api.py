@@ -53,6 +53,10 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     non_pool_launch_binding_version = (
         server_constants.MIN_NON_POOL_LAUNCH_BINDING_API_VERSION)
     assert non_pool_launch_binding_version == 80
+    operational_priority_breakdown_version = (
+        server_constants.
+        MIN_KUBERNETES_OPERATIONAL_PRIORITY_BREAKDOWN_API_VERSION)
+    assert operational_priority_breakdown_version == 81
     reserved_fill_status_version = (
         server_constants.
         MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION)
@@ -69,7 +73,9 @@ def test_replica_reads_have_a_distinct_api_capability_version():
             < preemptible_service_breakdown_version)
     assert (preemptible_service_breakdown_version
             < non_pool_launch_binding_version)
-    assert server_constants.API_VERSION == non_pool_launch_binding_version
+    assert non_pool_launch_binding_version < operational_priority_breakdown_version
+    assert (
+        server_constants.API_VERSION == operational_priority_breakdown_version)
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

@@ -117,28 +117,37 @@ export function hasAccelerator(accelerators) {
 }
 
 /**
- * Zero-valued preemptible accounting for a fresh per-GPU-type aggregate.
+ * Empty scheduling accounting for a fresh per-GPU-type aggregate.
  *
  * "Preemptible" accelerators are those held by pods below the cluster's top
  * scheduling priority tier, i.e. reclaimable by a higher-priority workload.
  * The Infra page aggregates GPU rows at three levels (per node into a context,
  * per context into a workspace view, and per GPU type across contexts); every
- * one of them must carry the total, service subset, and their breakdowns or
- * the split silently collapses back into a single "used" block.
+ * one of them must carry every active tier, the reclaimable total, and the
+ * SkyServe subset (including its service/tier matrix), or the split silently
+ * collapses back into a single "used" block.
  */
-export function emptyPreemptible() {
+export function emptySchedulingBreakdown() {
   return {
+    gpu_allocation_breakdown: {},
     gpu_preemptible: 0,
     gpu_preemptible_breakdown: {},
     gpu_preemptible_services: 0,
     gpu_preemptible_service_breakdown: {},
+    gpu_preemptible_service_priority_breakdown: {},
   };
 }
 
 /**
- * Fold one per-GPU-type aggregate's preemptible accounting into another.
+ * Fold one per-GPU-type aggregate's scheduling accounting into another.
  */
-export function mergePreemptible(target, source) {
+export function mergeSchedulingBreakdown(target, source) {
+  for (const [label, qty] of Object.entries(
+    source?.gpu_allocation_breakdown || {}
+  )) {
+    target.gpu_allocation_breakdown[label] =
+      (target.gpu_allocation_breakdown[label] || 0) + qty;
+  }
   target.gpu_preemptible += source?.gpu_preemptible || 0;
   if (source?.gpu_preemptible_services === null) {
     target.gpu_preemptible_services = null;
@@ -158,6 +167,22 @@ export function mergePreemptible(target, source) {
     )) {
       target.gpu_preemptible_service_breakdown[service] =
         (target.gpu_preemptible_service_breakdown[service] || 0) + qty;
+    }
+  }
+  if (source?.gpu_preemptible_service_priority_breakdown === null) {
+    target.gpu_preemptible_service_priority_breakdown = null;
+  } else if (target.gpu_preemptible_service_priority_breakdown !== null) {
+    for (const [service, breakdown] of Object.entries(
+      source?.gpu_preemptible_service_priority_breakdown || {}
+    )) {
+      if (!target.gpu_preemptible_service_priority_breakdown[service]) {
+        target.gpu_preemptible_service_priority_breakdown[service] = {};
+      }
+      for (const [label, qty] of Object.entries(breakdown || {})) {
+        const targetBreakdown =
+          target.gpu_preemptible_service_priority_breakdown[service];
+        targetBreakdown[label] = (targetBreakdown[label] || 0) + qty;
+      }
     }
   }
 }
@@ -180,13 +205,13 @@ export function summarizeGpusByType(perContextGPUs) {
         gpu_total: 0,
         gpu_free: 0,
         gpu_not_ready: 0,
-        ...emptyPreemptible(),
+        ...emptySchedulingBreakdown(),
       };
     }
     gpuSummary[gpuName].gpu_total += gpu.gpu_total || 0;
     gpuSummary[gpuName].gpu_free += gpu.gpu_free || 0;
     gpuSummary[gpuName].gpu_not_ready += gpu.gpu_not_ready || 0;
-    mergePreemptible(gpuSummary[gpuName], gpu);
+    mergeSchedulingBreakdown(gpuSummary[gpuName], gpu);
   });
   return Object.values(gpuSummary);
 }
