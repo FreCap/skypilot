@@ -442,6 +442,7 @@ export function InfrastructureSection({
                                   gpu={gpu}
                                   heightClass="h-5"
                                   wrapperClassName="flex-1 min-w-[100px] w-full"
+                                  showPriorityPolicy={!isSSH && !isSlurm}
                                 />
                               </div>
                             </td>
