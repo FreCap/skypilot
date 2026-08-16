@@ -1,7 +1,7 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: design accepted for implementation; production remains on the legacy
-controller-coupled demand path
+Status: implementation in review; the production compatibility precondition is
+satisfied, but production remains on the legacy controller-coupled demand path
 
 Last updated: 2026-08-16
 
@@ -276,11 +276,19 @@ runtime launch authority.
 
 ### P0: compatibility deployment
 
-Deploy v1.1.1284 directly through the reviewed Helm workflow with
-`--reuse-values`, the existing single-`all` `Recreate` topology, and
-`LEGACY_ACTIVE`. Do not normalize or activate reserved fill. This restores
-bounded reads of the exact retained ReplicaInfo shapes and enables subsequent
-source work to inspect the fleet safely.
+This precondition is satisfied by the later v1.1.1291 production deployment.
+The 2026-08-16 baseline uses the reviewed Helm release, the existing
+single-`all` `Recreate` topology, Serve schema 046, API schema 010, and
+`LEGACY_ACTIVE`. It has not activated the new generalized action, demand, or
+placement authorities. Subsequent rollouts must continue to use
+`--reuse-values`; they must not redeploy the older v1.1.1284 artifact merely to
+reproduce the originally proposed sequence.
+
+The same inspection found no surviving replica, request, coverage, shadow, or
+association records for historical replica IDs 52032--52038. Their earlier
+orphaned state remains incident evidence, but database absence is not executor
+quiescence and must not be converted into a synthetic receipt. Migration input
+is the exact retained inventory observed at migration time.
 
 ### P1: generalized durable non-pool actions
 
@@ -289,9 +297,11 @@ handler, six typed profiles, planner-intent commit followed by atomic
 association/request/queue/pin binding,
 pre-I/O revalidation, typed result/provider reconciliation, and per-association
 quarantine. Add reusable append-only legacy reconciliation scopes and register
-the seven production rows as one exact reviewed scope. Reconcile those rows
-only from old-executor termination plus fresh exact provider
-evidence. No synthetic quiescence or association backfill is permitted.
+only exact retained legacy rows found by the rollout inventory. Reconcile any
+such rows only from old-executor termination plus fresh exact provider
+evidence. The historical IDs 52032--52038 must not be recreated, backfilled,
+or registered as a scope when no source row remains. No synthetic quiescence
+or association backfill is permitted.
 
 Expected size: large, approximately 3,000--5,000 source/test lines by extending
 the already-merged ordinary binding. It must not include a deployment control
@@ -367,10 +377,12 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. live v1.1.1284 compatibility rollout with unchanged capacity and
-   `LEGACY_ACTIVE`;
-2. settlement of replica IDs 52032--52038 from exact evidence and independent
-   retirement of the two shutting-down Spot rows;
+1. the live v1.1.1291 compatibility baseline, with unchanged single-`all`
+   topology, Serve046/API010 schema heads, and `LEGACY_ACTIVE`;
+2. a fresh pre-migration inventory of retained legacy rows and unsettled
+   requests; reconcile only rows that actually remain. Record the historical
+   absence of IDs 52032--52038 without treating it as quiescence, recreating
+   rows, or backfilling associations;
 3. provider-phase latency and proof that one quarantined row does not block
    routes, demand, or sibling reconciliation;
 4. a fresh zero-traffic interval with target zero and no new paid request;
@@ -399,12 +411,15 @@ generation. The final cleanup removes their predecessor paths.
 
 ## Open gates
 
-- [ ] Deploy and verify v1.1.1284 in production without normalization or
-  reserved-fill activation.
+- [x] Verify the equivalent later v1.1.1291 production compatibility baseline
+  without generalized-action, demand-authority, or placement promotion
+  (2026-08-16: single-`all` `Recreate`, Serve046/API010, `LEGACY_ACTIVE`).
 - [ ] Publish P1 and its blocked P3 removal as a reviewed stack.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
-- [ ] Reconcile the exact seven-row production scope without fabricated
-  quiescence or manual row deletion.
+- [ ] Immediately before migration, inventory exact retained legacy rows and
+  unsettled requests, then reconcile only present rows without fabricated
+  quiescence or manual deletion. The historical seven-row scope is absent and
+  must not be reconstructed.
 - [ ] Publish P2 and update P3 for every transition-only demand/route path.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
