@@ -4,9 +4,11 @@
 
 import inspect
 import logging
+from unittest import mock
 
 from sqlalchemy import event
 from sqlalchemy import text
+from sqlalchemy.dialects import postgresql
 
 from sky import global_user_state
 from sky import global_user_state_cloud_checks
@@ -97,6 +99,51 @@ def test_facade_preserves_engine_and_statement_counts(tmp_path, monkeypatch):
                for statement in statements) == 3
     assert sum(statement.lstrip().upper().startswith('INSERT')
                for statement in statements) == 3
+
+
+def test_postgres_upsert_statements(monkeypatch):
+    engine = mock.MagicMock()
+    engine.dialect.name = db_utils.SQLAlchemyDialect.POSTGRESQL.value
+    session = mock.MagicMock()
+    session_context = mock.MagicMock()
+    session_context.__enter__.return_value = session
+    monkeypatch.setattr(global_user_state_cloud_checks.orm, 'Session',
+                        lambda _: session_context)
+
+    global_user_state_cloud_checks.set_enabled_clouds(engine, ['AWS'],
+                                                      CloudCapability.COMPUTE,
+                                                      'team')
+    global_user_state_cloud_checks.set_allowed_clouds(engine, ['AWS', 'GCP'],
+                                                      'team')
+    global_user_state_cloud_checks.set_check_results(
+        engine, {'AWS': {
+            '': {
+                'enabled': True
+            }
+        }},
+        'team',
+        mock.MagicMock(),
+        is_full_workspace_run=True)
+
+    expected_rows = [
+        ('enabled_clouds_team_compute', '["AWS"]'),
+        ('allowed_clouds_team', '["AWS", "GCP"]'),
+        ('check_results_team', '{"AWS": {"": {"enabled": true}}}'),
+    ]
+    assert session.execute.call_count == len(expected_rows)
+    assert session.commit.call_count == len(expected_rows)
+    assert session_context.__exit__.call_count == len(expected_rows)
+    for execute_call, (expected_key,
+                       expected_value) in zip(session.execute.call_args_list,
+                                              expected_rows):
+        statement = execute_call.args[0]
+        compiled = statement.compile(dialect=postgresql.dialect())
+        assert ('ON CONFLICT (key) DO UPDATE SET value = ' in str(compiled))
+        assert compiled.params == {
+            'key': expected_key,
+            'value': expected_value,
+            'param_1': expected_value,
+        }
 
 
 def test_corrupt_results_keep_historical_logger(tmp_path, monkeypatch, caplog):
