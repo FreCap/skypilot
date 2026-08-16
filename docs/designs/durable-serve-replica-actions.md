@@ -92,7 +92,18 @@ forward heads to API-request 012/Serve050 without promoting a service. The
 earlier audit incorrectly treated a checked-in platform runtime pin as the
 deployment authority. The production contract is a reviewed direct Helm
 fix-forward from merged SkyPilot artifacts; it requires no `boltz-platform`
-pin or Terragrunt apply. G1 adds
+pin or Terragrunt apply. Direct Helm revision 406 subsequently deployed PR
+#1521 as release `1.1.1305`, API version 86, image digest
+`sha256:b493c8a03d32f62307af9c4093ad94cbe20cf80fde4915f907548d8149954173`,
+and chart digest
+`sha256:170056bb3654f35ba52d6a42421d4feacf31233a9e028407ccb796a2fdfe7e62`.
+The migration hook succeeded, the API and both credential init containers
+converged on that exact image, all 14 warm-standby load-balancer Deployments
+became ready on the same digest, and the live demand read exposed a confirmed
+in-flight lower bound plus the unknown-occupancy backend count instead of
+hiding all processing activity. That telemetry correction is observability,
+not authority promotion; the service remained on legacy allocation authority.
+G1 adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
 pre-admission retirement, failure-isolated startup recovery, and exact
@@ -1229,15 +1240,14 @@ infrastructure evidence. G1Sc is the simultaneously authored blocked cleanup;
 it removes the mixed-version sleep-only behavior and transition-only
 compatibility surface only after the exact rollout gates pass.
 
-As of 2026-08-16, G1Sa is implemented and locally verified on
-`feat/serve-executor-retirement-hardening`; it remains draft and is not
-merge-eligible until G1Sb and G1Sc are authored and linked. Its focused Python
-runtime, executor, shutdown-deadline, and wire-contract suites pass; all 160
-focused API/controller/executor Helm tests pass; the generated values schema is
-exact; and repository-wide mypy, changed-file pylint, dashboard lint/format,
-Python compilation, and `git diff --check` pass. G1Sa is draft PR #1519 with
-implementation commit `5781701e05492cb76211a2d962c3f4cbd3f031cf`. G1Sb is
-authored as draft PR #1522 with implementation commit
+As of 2026-08-16, G1Sa is merged as PR #1519 at merge commit
+`8a9a0d5b6ecd21085e194c4cc46ad288bd719bec`. Its focused Python runtime,
+executor, shutdown-deadline, and wire-contract suites pass; all focused
+API/controller/executor Helm tests pass; the generated values schema is exact;
+and exact-head CI completed with format, mypy, pylint, dashboard, documentation,
+static-analysis, Helm, and every Python test shard green. G1Sb is authored as
+draft PR #1522, is restacked directly on `improvements`, and retains stable
+implementation commit
 `795c1e91ec49b74e169a1e13f06bc3b409a92b82`: API013, the controller-
 generation-owned observer, immutable evidence writer, transition Helm surface,
 and focused real-PostgreSQL/observer/Helm tests pass locally. G1Sc is authored
@@ -2551,10 +2561,12 @@ approved canary:
 
 - [x] Author, review, and merge G1 (API011/Serve047) and demand convergence
   (API012/Serve048--050).
-- [ ] G1Sb executor-termination evidence is authored on API013 as draft PR
-  #1522 and G1Sc is authored as draft PR #1523 with its exact merge gate.
-  Restack the blocked G2 cleanup onto API014/Serve051 before completing this
-  combined gate.
+- [x] Merge G1Sa as PR #1519; author G1Sb executor-termination evidence on
+  API013 as draft PR #1522 and G1Sc as draft PR #1523 with its exact merge
+  gate.
+- [ ] Restack the blocked G2 cleanup onto API014/Serve051. PR #1510 remains on
+  the stale pre-G1S lineage and must not merge until this restack and its
+  adversarial re-review are complete.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
