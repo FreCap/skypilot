@@ -704,6 +704,43 @@ class TestBackgroundDutyOwnershipLifecycle:
                                        serve_utils.UpdateMode.ROLLING,
                                        target_num_replicas=0)
 
+    @pytest.mark.parametrize(('complete', 'expected_calls'), [(True, 1),
+                                                              (False, 0)])
+    def test_prober_publishes_only_the_same_complete_probe_snapshot(
+            self, complete, expected_calls):
+        mgr = self._stopped_manager()
+        mgr._ownership_lost = threading.Event()
+        mgr._manager_daemon_stop = mock.Mock(spec=threading.Event)
+        mgr._manager_daemon_stop.is_set.return_value = False
+        mgr._manager_daemon_stop.wait.return_value = True
+        mgr._status_epoch_lock = threading.Lock()
+        mgr._status_epoch_generation = 0
+        mgr._tick_version_spec_cache = {}
+        mgr._get_endpoint_probe_interval_seconds = mock.Mock(return_value=1)
+        snapshot = []
+        route_result = replica_managers.ProbeRouteResult(
+            replica_infos=snapshot,
+            resolved_routes={},
+            identity_verified_replica_ids=set(),
+            complete=complete)
+
+        def _probe():
+            mgr._last_probe_route_result = route_result
+            return snapshot
+
+        mgr._probe_all_replicas = mock.Mock(side_effect=_probe)
+        mgr._set_service_status_from_replica_infos = mock.Mock()
+        publisher = mock.Mock()
+        mgr._route_projection_publisher = publisher
+
+        mgr._replica_prober()
+
+        mgr._set_service_status_from_replica_infos.assert_called_once_with(
+            snapshot, expected_status_epoch=0)
+        assert publisher.call_count == expected_calls
+        if complete:
+            publisher.assert_called_once_with(route_result)
+
     def test_autoscaler_target_publication_is_version_fenced(self):
         mgr = replica_managers.ReplicaManager.__new__(
             replica_managers.ReplicaManager)
@@ -1868,6 +1905,7 @@ def test_probe_url_conflicting_uids_for_one_context_fail_closed_as_a_wave():
         }
     mgr = _make_manager()
     mgr._record_provider_identity_uncertain = mock.Mock()
+    identity_rejected = set()
 
     def _provider_configs(handles):
         # Conflicting handles are removed before provider-config resolution;
@@ -1885,9 +1923,11 @@ def test_probe_url_conflicting_uids_for_one_context_fail_closed_as_a_wave():
                            'physical_cluster_uid_fence') as provider_fence, \
          mock.patch.object(replica_managers.backend_utils,
                            'get_endpoints') as endpoints:
-        urls = mgr._resolve_probe_urls(infos)
+        urls = mgr._resolve_probe_urls(
+            infos, identity_rejected_replica_ids=identity_rejected)
 
     assert urls == {1: None, 2: None}
+    assert identity_rejected == {1, 2}
     assert mgr._record_provider_identity_uncertain.call_count == 2
     provider_fence.assert_not_called()
     endpoints.assert_not_called()

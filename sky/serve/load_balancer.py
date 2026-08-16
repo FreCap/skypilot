@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import ssl
 import threading
 import time
@@ -313,6 +314,11 @@ class SkyServeLoadBalancer:
         self._ha_runtime_stats = lb_ha_obs.LbHaRuntimeStats()
         self._armed_generation: int | None = None
         self._routing_version: int | None = None
+        # Exact durable route snapshot applied with `_routing_version`.  These
+        # remain all-null on the legacy controller-proxy path.
+        self._route_projection_generation: int | None = None
+        self._route_projection_sha256: str | None = None
+        self._route_source_epoch: int | None = None
         # Strong references to owned background tasks (the event loop only
         # holds weak references to tasks).
         self._background_tasks: set[asyncio.Task] = set()
@@ -3467,6 +3473,9 @@ class SkyServeLoadBalancer:
         num_ready_replicas: int | None = None
         capacity_hint = None
         service_version: int | None = None
+        route_projection_generation: int | None = None
+        route_projection_sha256: str | None = None
+        route_source_epoch: int | None = None
 
         # Read the purpose-specific ring fresh for every sync. The primary is
         # tried first; overlap credentials are replayed only after a 401.
@@ -3623,6 +3632,24 @@ class SkyServeLoadBalancer:
                         if (isinstance(response_version, int) and
                                 not isinstance(response_version, bool)):
                             service_version = response_version
+                        projection_fields = (
+                            response_json.get('route_projection_generation'),
+                            response_json.get('route_projection_sha256'),
+                            response_json.get('route_source_epoch'))
+                        if any(value is not None
+                               for value in projection_fields):
+                            if not (type(projection_fields[0]) is int and
+                                    projection_fields[0] > 0 and
+                                    isinstance(projection_fields[1], str) and
+                                    re.fullmatch(r'[0-9a-f]{64}',
+                                                 projection_fields[1]) and
+                                    type(projection_fields[2]) is int and
+                                    projection_fields[2] > 0):
+                                raise ValueError(
+                                    'Route projection fence is malformed.')
+                            route_projection_generation = projection_fields[0]
+                            route_projection_sha256 = projection_fields[1]
+                            route_source_epoch = projection_fields[2]
                         ready_replica_urls = list(replica_info.keys())
                         break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -3793,6 +3820,10 @@ class SkyServeLoadBalancer:
                 # spurious-empty response retains the previous coherent state
                 # and must not advance this fence.
                 self._routing_version = service_version
+                self._route_projection_generation = (
+                    route_projection_generation)
+                self._route_projection_sha256 = route_projection_sha256
+                self._route_source_epoch = route_source_epoch
                 # Cache the controller's capacity hint for /_lb/capacity.
                 # Absence (older controller) resets to None rather than
                 # keeping a stale previous value: readers must see
@@ -3976,6 +4007,9 @@ class SkyServeLoadBalancer:
                                             ()),
             'request_accelerator_compatibility_version':
                 self._request_accelerator_compatibility_version,
+            'route_projection_generation': self._route_projection_generation,
+            'route_projection_sha256': self._route_projection_sha256,
+            'route_source_epoch': self._route_source_epoch,
             'queue_depth': self._queue_depth,
             'queued_requests_by_compatibility': self._request_queue_profiles(),
             'rejected_requests_by_compatibility':

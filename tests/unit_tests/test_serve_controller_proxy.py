@@ -11,6 +11,7 @@ from fastapi import testclient
 import pytest
 
 from sky.serve import constants
+from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve.server import controller_proxy
@@ -157,6 +158,59 @@ def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
     assert calls[0]['allow_redirects'] is False
     assert calls[0]['timeout'].total == (
         constants.LB_CONTROLLER_PROXY_TIMEOUT_SECONDS)
+
+
+def test_projected_sync_terminates_at_api_server(monkeypatch):
+    response_body = {
+        'replica_info': {},
+        'route_projection_generation': 9,
+        'route_projection_sha256': 'a' * 64,
+        'route_source_epoch': 2,
+    }
+    resolve = mock.Mock(return_value=route_projection.RouteSyncDecision(
+        mode=route_projection.RouteSourceMode.DURABLE_PROJECTED,
+        response=response_body))
+    repository = mock.Mock(resolve_sync=resolve)
+    monkeypatch.setattr(controller_proxy.route_projection,
+                        'RouteProjectionRepository',
+                        mock.Mock(return_value=repository))
+    owner_read = mock.AsyncMock()
+    monkeypatch.setattr(controller_proxy, '_read_controller_owner', owner_read)
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                     body=b'{"lb_session_id":"pod-a"}')))
+
+    assert response.status_code == 200
+    assert response.body == (
+        b'{"replica_info":{},"route_projection_generation":9,'
+        b'"route_projection_sha256":"' + b'a' * 64 +
+        b'","route_source_epoch":2}')
+    resolve.assert_called_once_with('svc', 'service-incarnation-a', 'pod-a')
+    owner_read.assert_not_awaited()
+
+
+def test_projected_sync_unavailable_never_falls_back_to_controller(monkeypatch):
+    resolve = mock.Mock(side_effect=route_projection.RouteProjectionUnavailable(
+        'snapshot is stale'))
+    repository = mock.Mock(resolve_sync=resolve)
+    monkeypatch.setattr(controller_proxy.route_projection,
+                        'RouteProjectionRepository',
+                        mock.Mock(return_value=repository))
+    owner_read = mock.AsyncMock()
+    monkeypatch.setattr(controller_proxy, '_read_controller_owner', owner_read)
+
+    response = asyncio.run(
+        controller_proxy.proxy_load_balancer_sync(
+            'svc',
+            _request('/api/internal/serve/svc/controller/load_balancer_sync',
+                     body=b'{"lb_session_id":"pod-a"}')))
+
+    assert response.status_code == 503
+    assert response.body == b'{"detail":"snapshot is stale"}'
+    owner_read.assert_not_awaited()
 
 
 def test_demand_report_terminates_at_api_server(monkeypatch):

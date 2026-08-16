@@ -157,6 +157,23 @@ services_table = sqlalchemy.Table(
                       sqlalchemy.BigInteger),
     sqlalchemy.Column('non_pool_launch_receipt_protocol_version',
                       sqlalchemy.Integer),
+    # Serve049 route publication is dark until an explicit promotion switches
+    # response ownership from the controller proxy to the durable projection.
+    sqlalchemy.Column('route_source_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='LEGACY_PROXY'),
+    sqlalchemy.Column('route_source_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('route_projection_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('route_projection_controller_incarnation',
+                      sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('route_projection_protocol_version', sqlalchemy.Integer),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that
@@ -235,6 +252,23 @@ services_table = sqlalchemy.Table(
         'cost_rebalance_state',
         sqlalchemy.JSON(none_as_null=True).with_variant(
             postgresql.JSONB(none_as_null=True), 'postgresql')),
+    sqlalchemy.CheckConstraint(
+        "route_source_mode IN ('LEGACY_PROXY', 'DURABLE_PROJECTED')",
+        name='serve049_route_source_mode_ck'),
+    sqlalchemy.CheckConstraint('route_source_epoch >= 0',
+                               name='serve049_route_source_epoch_ck'),
+    sqlalchemy.CheckConstraint(
+        '((NOT route_projection_capable AND '
+        'route_projection_controller_incarnation IS NULL AND '
+        'route_projection_protocol_version IS NULL) OR '
+        '(route_projection_capable AND '
+        'route_projection_controller_incarnation IS NOT NULL AND '
+        'route_projection_protocol_version = 1))',
+        name='serve049_route_capability_shape_ck'),
+    sqlalchemy.CheckConstraint(
+        "route_source_mode <> 'DURABLE_PROJECTED' OR "
+        '(route_source_epoch > 0 AND route_projection_capable)',
+        name='serve049_route_projected_capability_ck'),
 )
 
 replicas_table = sqlalchemy.Table(

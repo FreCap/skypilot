@@ -78,7 +78,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert durable_demand_version == 82
     assert non_pool_launch_binding_version < operational_priority_breakdown_version
     assert operational_priority_breakdown_version < durable_demand_version
-    assert server_constants.API_VERSION == durable_demand_version
+    route_projection_version = (
+        server_constants.MIN_SERVE_ROUTE_PROJECTION_API_VERSION)
+    assert route_projection_version == 83
+    assert durable_demand_version < route_projection_version
+    assert server_constants.API_VERSION == route_projection_version
 
 
 def test_current_demand_reads_database_without_controller():
