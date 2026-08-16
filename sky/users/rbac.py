@@ -198,6 +198,10 @@ _DEFAULT_VIEWER_ALLOWLIST = [
         'method': 'GET'
     },
     {
+        'path': '/serve/:service_name/demand',
+        'method': 'GET'
+    },
+    {
         'path': '/serve/replica-summaries',
         'method': 'GET'
     },
