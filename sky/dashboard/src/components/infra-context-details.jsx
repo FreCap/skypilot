@@ -41,7 +41,7 @@ const PRIORITY_BY_CODE = Object.fromEntries(
 
 const PRIORITY_POLICY_LINES = [
   'PROTECTION ORDER (HIGH → LOW)',
-  '1 HA → 2 MA → 3 WA → 4 BE',
+  'HA → MA → WA → BE',
   'Higher raw priority is protected over lower raw priority.',
   'Eviction still requires permission from the incoming Pod PriorityClass and the Kueue queue policy.',
 ];
@@ -80,6 +80,15 @@ const getLatencyMode = (label) => {
 };
 
 const formatGpuCount = (qty) => `${qty} GPU${qty === 1 ? '' : 's'}`;
+const formatJobCount = (qty) => `${qty} job${qty === 1 ? '' : 's'}`;
+
+const countWorkloads = (workloadIds) =>
+  workloadIds == null ? null : new Set(workloadIds).size;
+
+const formatWorkloadCount = (workloadIds) => {
+  const count = countWorkloads(workloadIds);
+  return count == null ? 'job count unavailable' : formatJobCount(count);
+};
 
 const sortPriorityEntries = (breakdown) =>
   Object.entries(breakdown || {}).sort(([labelA, qtyA], [labelB, qtyB]) => {
@@ -96,16 +105,17 @@ const sortPriorityEntries = (breakdown) =>
     return qtyB - qtyA || labelA.localeCompare(labelB);
   });
 
-const formatPriorityBreakdown = (breakdown, indent = '') =>
+const formatPriorityBreakdown = (breakdown, workloadBreakdown, indent = '') =>
   sortPriorityEntries(breakdown).map(([label, qty]) => {
     const tier = getPriorityTier(label);
     const rawPriority = getRawPriority(label);
     const workloadKind = getWorkloadKind(label);
     const className = getClassName(label);
     const latencyMode = getLatencyMode(label);
+    const workloadCount = formatWorkloadCount(workloadBreakdown?.[label]);
     if (!tier) {
       return [
-        `${indent}UNTAGGED · ${formatGpuCount(qty)}${workloadKind ? ` · ${workloadKind}` : ''}`,
+        `${indent}${workloadCount} · UNTAGGED · ${formatGpuCount(qty)}${workloadKind ? ` · ${workloadKind}` : ''}`,
         `${indent}  actual: ${className || 'no PriorityClass'} · raw priority ${rawPriority ?? 'unknown'}`,
         `${indent}  operational tier: not assigned; compare the raw value`,
       ].join('\n');
@@ -121,15 +131,15 @@ const formatPriorityBreakdown = (breakdown, indent = '') =>
     const higher = PRIORITY_TIERS.filter(
       (candidate) => candidate.rank < tier.rank
     )
-      .map((candidate) => `${candidate.rank} ${candidate.code}`)
+      .map((candidate) => candidate.code)
       .join(', ');
     const lower = PRIORITY_TIERS.filter(
       (candidate) => candidate.rank > tier.rank
     )
-      .map((candidate) => `${candidate.rank} ${candidate.code}`)
+      .map((candidate) => candidate.code)
       .join(', ');
     return [
-      `${indent}${tier.rank} ${tier.code} · ${formatGpuCount(qty)}${workloadKind ? ` · ${workloadKind}` : ''}`,
+      `${indent}${workloadCount} · ${tier.code} · ${formatGpuCount(qty)}${workloadKind ? ` · ${workloadKind}` : ''}`,
       `${indent}  ${detail}`,
       `${indent}  protected over: ${lower || 'no lower named tier'}; yields to: ${higher || 'no higher named tier'}`,
     ].join('\n');
@@ -144,12 +154,46 @@ const subtractBreakdown = (total, subset) => {
   return remaining;
 };
 
+const selectWorkloadBreakdown = (workloads, gpuBreakdown) => {
+  if (workloads == null) return null;
+  const selected = {};
+  for (const label of Object.keys(gpuBreakdown || {})) {
+    selected[label] = workloads[label] || [];
+  }
+  return selected;
+};
+
+const subtractWorkloadBreakdown = (total, subset) => {
+  if (total == null || subset == null) return null;
+  const remaining = {};
+  for (const [label, workloadIds] of Object.entries(total)) {
+    const excluded = new Set(subset[label] || []);
+    remaining[label] = (workloadIds || []).filter(
+      (workloadId) => !excluded.has(workloadId)
+    );
+  }
+  return remaining;
+};
+
 const sumServicePriorityBreakdown = (serviceBreakdown) => {
   if (serviceBreakdown == null) return null;
   const total = {};
   for (const breakdown of Object.values(serviceBreakdown)) {
     for (const [label, qty] of Object.entries(breakdown || {})) {
       total[label] = (total[label] || 0) + qty;
+    }
+  }
+  return total;
+};
+
+const sumServicePriorityWorkloadBreakdown = (serviceBreakdown) => {
+  if (serviceBreakdown == null) return null;
+  const total = {};
+  for (const breakdown of Object.values(serviceBreakdown)) {
+    for (const [label, workloadIds] of Object.entries(breakdown || {})) {
+      total[label] = [
+        ...new Set([...(total[label] || []), ...(workloadIds || [])]),
+      ];
     }
   }
   return total;
@@ -167,7 +211,7 @@ const compactTierLabel = (breakdown) => {
     ).values(),
   ];
   if (tiers.length === 1 && !hasUnmapped) {
-    return `${tiers[0].rank} ${tiers[0].code}`;
+    return tiers[0].code;
   }
   if (tiers.length > 1 || (tiers.length > 0 && hasUnmapped)) {
     return 'mixed tiers';
@@ -175,14 +219,19 @@ const compactTierLabel = (breakdown) => {
   return hasUnmapped ? 'untagged' : null;
 };
 
-const buildSegmentLabel = (qty, noun, breakdown) => {
+const buildSegmentLabel = (qty, noun, breakdown, workloadBreakdown) => {
   const tier = compactTierLabel(breakdown);
-  return tier ? `${tier} · ${qty} ${noun}` : `${qty} ${noun}`;
+  const jobs = formatWorkloadCount(
+    workloadBreakdown == null ? null : Object.values(workloadBreakdown).flat()
+  );
+  return tier
+    ? `${tier} · ${jobs} · ${qty} ${noun}`
+    : `${jobs} · ${qty} ${noun}`;
 };
 
 // Operational tooltip for lower-priority non-SkyServe allocations.
-const buildPreemptibleTitle = (preemptible, breakdown) => {
-  const entries = formatPriorityBreakdown(breakdown);
+const buildPreemptibleTitle = (preemptible, breakdown, workloadBreakdown) => {
+  const entries = formatPriorityBreakdown(breakdown, workloadBreakdown);
   return withPriorityPolicy([
     'LOWER PRIORITY NOW',
     `${formatGpuCount(preemptible)} · non-SkyServe workloads · may yield to higher-priority work`,
@@ -193,16 +242,30 @@ const buildPreemptibleTitle = (preemptible, breakdown) => {
 const buildServicePreemptibleTitle = (
   preemptible,
   breakdown,
-  servicePriorityBreakdown
+  servicePriorityBreakdown,
+  servicePriorityWorkloadBreakdown
 ) => {
   const serviceLines = [];
   for (const [service, qty] of Object.entries(breakdown || {}).sort(
     (a, b) => b[1] - a[1]
   )) {
-    serviceLines.push(`${service} · ${formatGpuCount(qty)}`);
+    const serviceWorkloads = Object.values(
+      servicePriorityWorkloadBreakdown?.[service] || {}
+    ).flat();
+    serviceLines.push(
+      `${service} · ${formatWorkloadCount(
+        servicePriorityWorkloadBreakdown == null ? null : serviceWorkloads
+      )} · ${formatGpuCount(qty)}`
+    );
     const priorities = servicePriorityBreakdown?.[service];
     if (priorities && Object.keys(priorities).length > 0) {
-      serviceLines.push(...formatPriorityBreakdown(priorities, '  '));
+      serviceLines.push(
+        ...formatPriorityBreakdown(
+          priorities,
+          servicePriorityWorkloadBreakdown?.[service],
+          '  '
+        )
+      );
     } else {
       serviceLines.push('  ? priority rank unavailable');
     }
@@ -214,8 +277,12 @@ const buildServicePreemptibleTitle = (
   ]);
 };
 
-const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
-  const entries = formatPriorityBreakdown(breakdown);
+const buildUnknownPreemptibleTitle = (
+  preemptible,
+  breakdown,
+  workloadBreakdown
+) => {
+  const entries = formatPriorityBreakdown(breakdown, workloadBreakdown);
   return withPriorityPolicy([
     'LOWER PRIORITY NOW',
     `${formatGpuCount(preemptible)} · workload identity unavailable · may yield to higher-priority work`,
@@ -223,8 +290,8 @@ const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
   ]);
 };
 
-const buildUsedTitle = (used, breakdown) => {
-  const entries = formatPriorityBreakdown(breakdown);
+const buildUsedTitle = (used, breakdown, workloadBreakdown) => {
+  const entries = formatPriorityBreakdown(breakdown, workloadBreakdown);
   return withPriorityPolicy([
     'TOP PRIORITY NOW',
     `${formatGpuCount(used)} · highest raw priority currently running`,
@@ -236,13 +303,13 @@ const PriorityBadge = ({ tier }) => (
   <span
     className={`inline-flex items-center rounded border px-1.5 py-0.5 font-semibold ${tier.className}`}
   >
-    {tier.rank} {tier.code}
+    {tier.code}
   </span>
 );
 
 export const PriorityOrderLegend = ({ className = '' }) => (
   <div
-    aria-label="Protection order from high to low: 1 HA, 2 MA, 3 WA, 4 BE. Higher raw priority is protected over lower raw priority. Actual eviction depends on Pod PriorityClass and Kueue queue policy."
+    aria-label="Protection order from high to low: HA, MA, WA, BE. Higher raw priority is protected over lower raw priority. Actual eviction depends on Pod PriorityClass and Kueue queue policy."
     className={`flex flex-wrap items-center gap-1.5 text-[11px] text-gray-600 ${className}`.trim()}
   >
     <span className="font-medium text-gray-700">Priority:</span>
@@ -306,8 +373,14 @@ const GpuUtilizationBar = ({
   const used = allUsed - preemptible;
   const servicePriorityBreakdown =
     gpu?.gpu_preemptible_service_priority_breakdown;
+  const allocationWorkloadBreakdown = gpu?.gpu_allocation_workload_breakdown;
+  const servicePriorityWorkloadBreakdown =
+    gpu?.gpu_preemptible_service_priority_workload_breakdown;
   const servicePriorityTotals = sumServicePriorityBreakdown(
     servicePriorityBreakdown
+  );
+  const servicePriorityWorkloadTotals = sumServicePriorityWorkloadBreakdown(
+    servicePriorityWorkloadBreakdown
   );
   const otherPriorityBreakdown = serviceAttributionKnown
     ? servicePriorityTotals != null
@@ -320,27 +393,57 @@ const GpuUtilizationBar = ({
     gpu?.gpu_allocation_breakdown,
     gpu?.gpu_preemptible_breakdown
   );
+  const preemptibleWorkloadBreakdown = selectWorkloadBreakdown(
+    allocationWorkloadBreakdown,
+    gpu?.gpu_preemptible_breakdown
+  );
+  const otherWorkloadBreakdown = serviceAttributionKnown
+    ? subtractWorkloadBreakdown(
+        preemptibleWorkloadBreakdown,
+        servicePriorityWorkloadTotals
+      )
+    : null;
+  const usedWorkloadBreakdown = selectWorkloadBreakdown(
+    allocationWorkloadBreakdown,
+    usedPriorityBreakdown
+  );
   const notReadyLabel = `${notReady} not ready`;
   const usedLabel = showPriorityPolicy
-    ? buildSegmentLabel(used, 'running', usedPriorityBreakdown)
+    ? buildSegmentLabel(
+        used,
+        'running',
+        usedPriorityBreakdown,
+        usedWorkloadBreakdown
+      )
     : `${used} used`;
   const servicePreemptibleLabel = showPriorityPolicy
-    ? buildSegmentLabel(servicePreemptible, 'SkyServe', servicePriorityTotals)
+    ? buildSegmentLabel(
+        servicePreemptible,
+        'SkyServe',
+        servicePriorityTotals,
+        servicePriorityWorkloadTotals
+      )
     : `${servicePreemptible} SkyServe pods`;
   const otherPreemptibleLabel = showPriorityPolicy
-    ? buildSegmentLabel(otherPreemptible, 'other', otherPriorityBreakdown)
+    ? buildSegmentLabel(
+        otherPreemptible,
+        'other',
+        otherPriorityBreakdown,
+        otherWorkloadBreakdown
+      )
     : `${otherPreemptible} confirmed other`;
   const unknownPreemptibleLabel = showPriorityPolicy
     ? buildSegmentLabel(
         unknownPreemptible,
         'unknown',
-        gpu?.gpu_preemptible_breakdown
+        gpu?.gpu_preemptible_breakdown,
+        preemptibleWorkloadBreakdown
       )
     : `${unknownPreemptible} attribution unknown`;
   const freeLabel = `${free} free`;
   const notReadyTitle = `UNAVAILABLE\n${formatGpuCount(notReady)} · node not ready`;
   const usedTitle = showPriorityPolicy
-    ? buildUsedTitle(used, usedPriorityBreakdown)
+    ? buildUsedTitle(used, usedPriorityBreakdown, usedWorkloadBreakdown)
     : `${used} used\nAllocated, not free in this snapshot.`;
   const freeTitle = [
     'FREE NOW',
@@ -377,7 +480,8 @@ const GpuUtilizationBar = ({
         tooltip={buildServicePreemptibleTitle(
           servicePreemptible,
           gpu?.gpu_preemptible_service_breakdown,
-          servicePriorityBreakdown
+          servicePriorityBreakdown,
+          servicePriorityWorkloadBreakdown
         )}
         className="bg-violet-300 text-violet-950"
       />
@@ -386,7 +490,8 @@ const GpuUtilizationBar = ({
         label={otherPreemptibleLabel}
         tooltip={buildPreemptibleTitle(
           otherPreemptible,
-          otherPriorityBreakdown
+          otherPriorityBreakdown,
+          otherWorkloadBreakdown
         )}
         className="bg-amber-300 text-amber-900"
       />
@@ -395,7 +500,8 @@ const GpuUtilizationBar = ({
         label={unknownPreemptibleLabel}
         tooltip={buildUnknownPreemptibleTitle(
           unknownPreemptible,
-          gpu?.gpu_preemptible_breakdown
+          gpu?.gpu_preemptible_breakdown,
+          preemptibleWorkloadBreakdown
         )}
         className="bg-orange-300 text-orange-950"
       />

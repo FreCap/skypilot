@@ -82,7 +82,12 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_ROUTE_PROJECTION_API_VERSION)
     assert route_projection_version == 83
     assert durable_demand_version < route_projection_version
-    assert server_constants.API_VERSION == route_projection_version
+    workload_breakdown_version = (
+        server_constants.
+        MIN_KUBERNETES_OPERATIONAL_WORKLOAD_BREAKDOWN_API_VERSION)
+    assert workload_breakdown_version == 84
+    assert route_projection_version < workload_breakdown_version
+    assert server_constants.API_VERSION == workload_breakdown_version
 
 
 def test_current_demand_reads_database_without_controller():

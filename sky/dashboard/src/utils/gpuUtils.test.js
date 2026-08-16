@@ -21,11 +21,20 @@ describe('summarizeGpusByType', () => {
           'ma-lt (31)': 258,
           'wa-eval (20)': 70,
         },
+        gpu_allocation_workload_breakdown: {
+          'ma-lt (31)': ['prod/train-a'],
+          'wa-eval (20)': ['prod/eval-a', 'prod/eval-b'],
+        },
         gpu_preemptible_breakdown: { 'inference-low (-1000)': 70 },
         gpu_preemptible_services: 60,
         gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 60 },
         gpu_preemptible_service_priority_breakdown: {
           'boltz-l4-fleet': { 'inference-low (-1000)': 60 },
+        },
+        gpu_preemptible_service_priority_workload_breakdown: {
+          'boltz-l4-fleet': {
+            'inference-low (-1000)': ['prod/replica-a', 'prod/replica-b'],
+          },
         },
         context: 'prod',
       },
@@ -40,6 +49,11 @@ describe('summarizeGpusByType', () => {
           'inference-low (-1000)': 1,
           'drill (-500)': 1,
         },
+        gpu_allocation_workload_breakdown: {
+          'ma-lt (31)': ['staging/train-a'],
+          'inference-low (-1000)': ['staging/replica-a'],
+          'drill (-500)': ['staging/drill-a'],
+        },
         gpu_preemptible_breakdown: {
           'inference-low (-1000)': 1,
           'drill (-500)': 1,
@@ -48,6 +62,11 @@ describe('summarizeGpusByType', () => {
         gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 1 },
         gpu_preemptible_service_priority_breakdown: {
           'boltz-l4-fleet': { 'inference-low (-1000)': 1 },
+        },
+        gpu_preemptible_service_priority_workload_breakdown: {
+          'boltz-l4-fleet': {
+            'inference-low (-1000)': ['staging/replica-a'],
+          },
         },
         context: 'staging',
       },
@@ -65,6 +84,12 @@ describe('summarizeGpusByType', () => {
         'inference-low (-1000)': 1,
         'drill (-500)': 1,
       },
+      gpu_allocation_workload_breakdown: {
+        'ma-lt (31)': ['prod/train-a', 'staging/train-a'],
+        'wa-eval (20)': ['prod/eval-a', 'prod/eval-b'],
+        'inference-low (-1000)': ['staging/replica-a'],
+        'drill (-500)': ['staging/drill-a'],
+      },
       gpu_preemptible: 72,
       gpu_preemptible_breakdown: {
         'inference-low (-1000)': 71,
@@ -74,6 +99,15 @@ describe('summarizeGpusByType', () => {
       gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 61 },
       gpu_preemptible_service_priority_breakdown: {
         'boltz-l4-fleet': { 'inference-low (-1000)': 61 },
+      },
+      gpu_preemptible_service_priority_workload_breakdown: {
+        'boltz-l4-fleet': {
+          'inference-low (-1000)': [
+            'prod/replica-a',
+            'prod/replica-b',
+            'staging/replica-a',
+          ],
+        },
       },
     });
   });
@@ -113,7 +147,11 @@ describe('summarizeGpusByType', () => {
     expect(summary[0].gpu_preemptible_services).toBe(0);
     expect(summary[0].gpu_preemptible_service_breakdown).toEqual({});
     expect(summary[0].gpu_allocation_breakdown).toEqual({});
+    expect(summary[0].gpu_allocation_workload_breakdown).toEqual({});
     expect(summary[0].gpu_preemptible_service_priority_breakdown).toEqual({});
+    expect(
+      summary[0].gpu_preemptible_service_priority_workload_breakdown
+    ).toEqual({});
   });
 
   it('returns nothing for empty or missing input', () => {
@@ -127,29 +165,52 @@ describe('mergeSchedulingBreakdown', () => {
     const target = emptySchedulingBreakdown();
     mergeSchedulingBreakdown(target, {
       gpu_allocation_breakdown: { top: 3, a: 4, b: 1 },
+      gpu_allocation_workload_breakdown: {
+        top: ['job-shared'],
+        a: ['job-a'],
+        b: ['job-b'],
+      },
       gpu_preemptible: 5,
       gpu_preemptible_breakdown: { a: 4, b: 1 },
       gpu_preemptible_services: 4,
       gpu_preemptible_service_breakdown: { fleet: 4 },
       gpu_preemptible_service_priority_breakdown: { fleet: { a: 4 } },
+      gpu_preemptible_service_priority_workload_breakdown: {
+        fleet: { a: ['job-a'] },
+      },
     });
     mergeSchedulingBreakdown(target, {
       gpu_allocation_breakdown: { top: 2, b: 2 },
+      gpu_allocation_workload_breakdown: {
+        top: ['job-shared'],
+        b: ['job-b', 'job-c'],
+      },
       gpu_preemptible: 2,
       gpu_preemptible_breakdown: { b: 2 },
       gpu_preemptible_services: 1,
       gpu_preemptible_service_breakdown: { fleet: 1 },
       gpu_preemptible_service_priority_breakdown: { fleet: { b: 1 } },
+      gpu_preemptible_service_priority_workload_breakdown: {
+        fleet: { b: ['job-b'] },
+      },
     });
 
     expect(target).toEqual({
       gpu_allocation_breakdown: { top: 5, a: 4, b: 3 },
+      gpu_allocation_workload_breakdown: {
+        top: ['job-shared'],
+        a: ['job-a'],
+        b: ['job-b', 'job-c'],
+      },
       gpu_preemptible: 7,
       gpu_preemptible_breakdown: { a: 4, b: 3 },
       gpu_preemptible_services: 5,
       gpu_preemptible_service_breakdown: { fleet: 5 },
       gpu_preemptible_service_priority_breakdown: {
         fleet: { a: 4, b: 1 },
+      },
+      gpu_preemptible_service_priority_workload_breakdown: {
+        fleet: { a: ['job-a'], b: ['job-b'] },
       },
     });
   });

@@ -33,6 +33,8 @@ function addSchedulingFromNode(aggregate, nodeData, isNodeNotReady) {
   if (isNodeNotReady) return;
   mergeSchedulingBreakdown(aggregate, {
     gpu_allocation_breakdown: nodeData['allocation_breakdown'] || {},
+    gpu_allocation_workload_breakdown:
+      nodeData['allocation_workload_breakdown'] ?? null,
     gpu_preemptible: nodeData['accelerators_preemptible'] || 0,
     gpu_preemptible_breakdown: nodeData['preemptible_breakdown'] || {},
     gpu_preemptible_services: nodeData['accelerators_preemptible_services'],
@@ -40,6 +42,8 @@ function addSchedulingFromNode(aggregate, nodeData, isNodeNotReady) {
       nodeData['preemptible_service_breakdown'],
     gpu_preemptible_service_priority_breakdown:
       nodeData['preemptible_service_priority_breakdown'],
+    gpu_preemptible_service_priority_workload_breakdown:
+      nodeData['preemptible_service_priority_workload_breakdown'] ?? null,
   });
 }
 
@@ -81,12 +85,16 @@ export async function getContextGPUData(context) {
           gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
           gpu_preemptible_breakdown: nodeData['preemptible_breakdown'] ?? null,
           gpu_allocation_breakdown: nodeData['allocation_breakdown'] ?? null,
+          gpu_allocation_workload_breakdown:
+            nodeData['allocation_workload_breakdown'] ?? null,
           gpu_preemptible_services:
             nodeData['accelerators_preemptible_services'] ?? null,
           gpu_preemptible_service_breakdown:
             nodeData['preemptible_service_breakdown'] ?? null,
           gpu_preemptible_service_priority_breakdown:
             nodeData['preemptible_service_priority_breakdown'] ?? null,
+          gpu_preemptible_service_priority_workload_breakdown:
+            nodeData['preemptible_service_priority_workload_breakdown'] ?? null,
         });
 
         // Aggregate GPU data per context
@@ -304,12 +312,17 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             gpu_preemptible_breakdown:
               nodeData['preemptible_breakdown'] ?? null,
             gpu_allocation_breakdown: nodeData['allocation_breakdown'] ?? null,
+            gpu_allocation_workload_breakdown:
+              nodeData['allocation_workload_breakdown'] ?? null,
             gpu_preemptible_services:
               nodeData['accelerators_preemptible_services'] ?? null,
             gpu_preemptible_service_breakdown:
               nodeData['preemptible_service_breakdown'] ?? null,
             gpu_preemptible_service_priority_breakdown:
               nodeData['preemptible_service_priority_breakdown'] ?? null,
+            gpu_preemptible_service_priority_workload_breakdown:
+              nodeData['preemptible_service_priority_workload_breakdown'] ??
+              null,
           };
 
           // If this node provides a GPU type not found via GPU availability,
