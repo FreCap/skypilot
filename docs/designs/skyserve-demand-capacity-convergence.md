@@ -1,8 +1,11 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 is implemented in PR #1498, P2a in PR #1499, and P2b1 in PR
-#1503; the production compatibility precondition is satisfied, but production
-remains on the legacy controller-coupled demand and route paths
+Status: P1 is merged in PR #1498, P2a in PR #1499, and P2b1 is in exact-head
+review in PR #1503. Production remains on the legacy controller-coupled demand
+and route paths. A production observation at Serve048 exposed that the closed
+revision-040 placement-normalization authority registry stopped at Serve047;
+P2b1 now recognizes the reviewed additive Serve048 and Serve049 heads before
+route publication can be promoted.
 
 Last updated: 2026-08-16
 
@@ -100,7 +103,7 @@ The implementation must reuse these checked-in mechanisms:
 - the generic non-pool binding and per-association reconciliation specified by
   `durable-serve-replica-actions.md`.
 
-The P2a draft PR #1499 now contains, but has not deployed or promoted:
+The merged P2a PR #1499 contains, but has not been promoted:
 
 - a PostgreSQL-clock-fenced latest-report table and stable authenticated
   ingestion endpoint;
