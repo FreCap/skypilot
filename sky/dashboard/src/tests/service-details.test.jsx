@@ -1710,6 +1710,114 @@ describe('useServiceHistory independent loading', () => {
     expect(onServiceHashMismatch).toHaveBeenCalledTimes(1);
     unmount();
   });
+
+  it('does not overlap persisted-history reads at the polling cadence', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const slowRefresh = deferred();
+    setDocumentVisibility('visible');
+    getServiceHistory
+      .mockResolvedValueOnce(directHistory())
+      .mockImplementation(() => slowRefresh.promise);
+
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    let mounted = true;
+
+    try {
+      await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+      expect(getServiceHistory).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        jest.advanceTimersByTime(2 * 60 * 1000);
+        await Promise.resolve();
+      });
+
+      expect(getServiceHistory).toHaveBeenCalledTimes(2);
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) unmount();
+      slowRefresh.resolve(directHistory());
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
+
+  it('supersedes a pre-hide history poll on visibility restoration', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    const pollRefresh = deferred();
+    const visibilityRefresh = deferred();
+    setDocumentVisibility('visible');
+    getServiceHistory
+      .mockResolvedValueOnce(directHistory())
+      .mockImplementationOnce(() => pollRefresh.promise)
+      .mockImplementationOnce(() => visibilityRefresh.promise);
+
+    const { result, unmount } = renderHook(() =>
+      useServiceHistory({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    let mounted = true;
+
+    try {
+      await waitFor(() => expect(result.current.replicaHistory).not.toBeNull());
+      await act(async () => {
+        jest.advanceTimersByTime(60 * 1000);
+        await Promise.resolve();
+      });
+      expect(getServiceHistory).toHaveBeenCalledTimes(2);
+
+      setDocumentVisibility('hidden');
+      setDocumentVisibility('visible');
+      await act(async () => {
+        window.document.dispatchEvent(new Event('visibilitychange'));
+        await Promise.resolve();
+      });
+      expect(getServiceHistory).toHaveBeenCalledTimes(3);
+
+      await act(async () => {
+        visibilityRefresh.resolve(directHistory());
+        await visibilityRefresh.promise;
+      });
+      unmount();
+      mounted = false;
+    } finally {
+      if (mounted) unmount();
+      pollRefresh.resolve(directHistory());
+      visibilityRefresh.resolve(directHistory());
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('useServiceDemand controller-independent loading', () => {

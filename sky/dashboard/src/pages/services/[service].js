@@ -605,7 +605,6 @@ export function useServiceHistory({
       if (
         active?.identity === identity &&
         active.hours >= requestedHours &&
-        !force &&
         !supersede
       ) {
         return active.promise;
@@ -757,12 +756,16 @@ export function useServiceHistory({
       }),
     [fetchHistory]
   );
-  const refreshWhenVisible = useCallback(() => {
-    void fetchHistory({
-      hours: desiredHoursRef.current,
-      force: true,
-    });
-  }, [fetchHistory]);
+  const refreshWhenVisible = useCallback(
+    (refreshSource) => {
+      void fetchHistory({
+        hours: desiredHoursRef.current,
+        force: true,
+        supersede: refreshSource === 'visibilitychange',
+      });
+    },
+    [fetchHistory]
+  );
 
   useVisibleRefreshInterval(
     Boolean(enabled && serviceName && hasMetadata),

@@ -242,6 +242,10 @@ Replica cursors are opaque, versioned keyset cursors over descending `replica_id
 
 The dashboard starts the list metadata and summary requests together and renders either phase as it arrives. On a cold consolidated detail route, the cheap existing metadata projection is the required identity anchor because it supplies the current service hash. As soon as that hash lands, the dashboard fans out one hour of direct history, the batched replica summary, the dedicated no-ID pricing aggregate, and the first current-replica page concurrently while the controller-backed live summary proceeds independently. After a current page lands, separate ID-mode pricing requests select only rows that do not already have a result, in chunks no larger than 100. Row responses never update aggregate state, preventing chunk order from replacing a newer aggregate. Direct responses are merged only when they match the anchored visible service incarnation. A refresh may reuse the visible hash to start those reads immediately, but a `409` invalidates that anchor and restarts from metadata. Each section has its own loading and unavailable state, and stale-response fencing checks both the route generation and service hash. Selecting 12 or 24 hours requests only that range; choosing a smaller range reuses already loaded data. A 404 from an older server or `available: false` from a non-consolidated server uses the existing v0 full-status path.
 
+History range state is local to one service hash and resets to one hour when
+that incarnation changes. Same-range interval polls reuse an active history
+read, while manual refreshes and visibility restoration may supersede it.
+
 For the services list in v1e, the batched replica-summary route also returns
 the compact persisted service status, uptime, policy, and requested-resource
 string from the same repeatable-read query. That projection is the canonical
