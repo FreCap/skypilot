@@ -218,7 +218,9 @@ def test_unknown_occupancy_never_displays_processing_zero(demand_database):
     assert summary['request_telemetry_state'] == 'fresh'
     assert summary['request_telemetry_reason'] == 'in_flight_incomplete'
     assert summary['in_flight_requests'] is None
-    assert summary['confirmed_in_flight_requests'] == 0
+    # The reporter's own admitted request remains a confirmed lower bound even
+    # though occupancy from the backend URL is unavailable.
+    assert summary['confirmed_in_flight_requests'] == 1
     assert summary['unknown_in_flight_replica_count'] == 1
     assert summary['recent_request_count'] == 1
 
