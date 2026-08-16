@@ -12,13 +12,16 @@ from sky import global_user_state
 from sky import skypilot_config
 from sky import task as task_lib
 from sky.clouds import kubernetes as kubernetes_cloud
+from sky.data import storage as storage_lib
 from sky.models import VolumeConfig
 from sky.provision.kubernetes import constants as kubernetes_constants
+from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.serve import spot_placer
 from sky.utils import volume as volume_utils
 
-PLACEMENT_PROJECTION_PROTOCOL_VERSION = 2
+PLACEMENT_PROJECTION_PROTOCOL_VERSION = (
+    kubernetes_pod_spec.SERVE_WORKER_PROJECTION_PROTOCOL_VERSION)
 
 _AWS_ROLE_ARN_PATTERN = re.compile(
     r'^arn:(?:aws|aws-us-gov|aws-cn):iam::[0-9]{12}:'
@@ -54,6 +57,7 @@ _WORKER_KUEUE_ADMISSION_KEYS = frozenset(
     {'local_queue_name', 'workload_priority_class_name'})
 _WORKER_V2_KEYS = (_WORKER_V1_KEYS | frozenset(
     {'projection_version', 'kueue_admission', 'scheduler_name'}))
+_WORKER_V3_KEYS = _WORKER_V2_KEYS | frozenset({'provision_timeout', 'scratch'})
 _ACCELERATOR_SCHEDULING_KEYS = frozenset(
     {'label_key', 'label_values', 'resource_key'})
 _MAX_ACCELERATOR_LABEL_VALUES = 16
@@ -88,6 +92,8 @@ _CACHE_NODE_LOCAL_KEYS = frozenset({
     'host_path',
     'attestation',
 })
+_WORKER_SCRATCH_NONE_KEYS = frozenset({'kind'})
+_WORKER_SCRATCH_CONFIG_MEMORY_KEYS = frozenset({'kind', 'size_limit_bytes'})
 _CONTROLLER_EMPTY_DIR_KEYS = frozenset({
     'kind', 'mount_path', 'required_bytes', 'required_inodes',
     'size_limit_bytes'
@@ -99,6 +105,8 @@ _CONTROLLER_NODE_LOCAL_KEYS = frozenset({
 
 CACHE_ENV_VAR = 'SKYPILOT_SERVE_CACHE_KIND'
 CACHE_ENV_PREFIX = 'SKYPILOT_SERVE_CACHE_'
+SCRATCH_ENV_VAR = 'SKYPILOT_SERVE_SCRATCH_KIND'
+SCRATCH_ENV_PREFIX = 'SKYPILOT_SERVE_SCRATCH_'
 _CACHE_ATTESTATION_ENV_KEYS = {
     'attestation_id': 'ATTESTATION_ID',
     'device_source_pattern': 'DEVICE_SOURCE_PATTERN',
@@ -112,6 +120,15 @@ _CACHE_ATTESTATION_ENV_KEYS = {
     'usable_inodes_per_node': 'USABLE_INODES_PER_NODE',
 }
 CONTROLLER_CACHE_ENV_PREFIX = 'SKYPILOT_CONTROLLER_WORK_CACHE_'
+WORKER_SCRATCH_MOUNT_PATH = (
+    kubernetes_pod_spec.SERVE_WORKER_SCRATCH_MOUNT_PATH)
+WORKER_SCRATCH_VOLUME_NAME = (
+    kubernetes_pod_spec.SERVE_WORKER_SCRATCH_VOLUME_NAME)
+
+
+def worker_scratch_mount_path_collides(value: object) -> bool:
+    """Whether an absolute mount path overlaps the server-owned /tmp tree."""
+    return kubernetes_pod_spec.worker_scratch_mount_path_collides(value)
 
 
 def _strict_nonempty_string(value: Any, description: str) -> str:
@@ -320,6 +337,11 @@ def validate_cache_projection(value: Any) -> dict[str, Any]:
     }
 
 
+def validate_worker_scratch_projection(value: Any) -> dict[str, Any]:
+    """Strictly validate one server-owned worker scratch projection."""
+    return dict(kubernetes_pod_spec.validate_projected_worker_scratch(value))
+
+
 def validate_controller_work_cache_projection(
     value: Any,
     *,
@@ -401,7 +423,8 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
 
     Protocol v1 intentionally has no discriminator.  Its old exact key set is
     the only implicit-v1 shape accepted during the ordinary-launch transition.
-    New rows must carry the explicit v2 discriminator and closed v2 key set.
+    Protocol v2 remains an isolated decoder for already-committed rows. New
+    rows carry the explicit v3 discriminator and closed v3 key set.
     """
     if not isinstance(projection, Mapping):
         raise ValueError('Worker placement projection must be a mapping.')
@@ -410,16 +433,46 @@ def worker_projection_protocol_version(projection: Mapping[str, Any]) -> int:
         return 1
     if keys == _WORKER_V2_KEYS:
         if (type(projection['projection_version']) is not int or
+                projection['projection_version'] != 2):
+            raise ValueError('Worker placement projection_version must be '
+                             'exactly 2 for the protocol-v2 key set.')
+        return 2
+    if keys == _WORKER_V3_KEYS:
+        if (type(projection['projection_version']) is not int or
                 projection['projection_version']
                 != PLACEMENT_PROJECTION_PROTOCOL_VERSION):
             raise ValueError('Worker placement projection_version must be '
                              f'exactly '
-                             f'{PLACEMENT_PROJECTION_PROTOCOL_VERSION}.')
+                             f'{PLACEMENT_PROJECTION_PROTOCOL_VERSION} for the '
+                             'protocol-v3 key set.')
         return PLACEMENT_PROJECTION_PROTOCOL_VERSION
     raise ValueError(
         'Worker placement projection must contain exactly the protocol-v1 '
         f'keys {sorted(_WORKER_V1_KEYS)!r} or protocol-v2 keys '
-        f'{sorted(_WORKER_V2_KEYS)!r}.')
+        f'{sorted(_WORKER_V2_KEYS)!r} or protocol-v3 keys '
+        f'{sorted(_WORKER_V3_KEYS)!r}.')
+
+
+def worker_projection_has_strict_admission(
+        projection: Mapping[str, Any]) -> bool:
+    """Whether a frozen projection owns scheduler and Kueue admission."""
+    return (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_strict_admission)(
+                worker_projection_protocol_version(projection))
+
+
+def worker_projection_has_scratch(projection: Mapping[str, Any]) -> bool:
+    """Whether a frozen projection carries the typed scratch contract."""
+    return kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
+        worker_projection_protocol_version(projection))
+
+
+def worker_projection_has_provision_timeout(
+        projection: Mapping[str, Any]) -> bool:
+    """Whether a frozen projection owns terminal provisioning wait."""
+    return (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_provision_timeout)(
+                worker_projection_protocol_version(projection))
 
 
 def _validate_worker_kueue_admission(value: Any) -> dict[str, str] | None:
@@ -448,16 +501,13 @@ def validate_worker_placement_projections(
 ) -> list[dict[str, Any]] | None:
     """Strictly validate and copy homogeneous worker projections.
 
-    V1 is an isolated compatibility decoder for ordinary historical launches.
-    Callers that authorize a v2-only behavior must set
-    ``require_protocol_version=2`` rather than accepting the implicit-v1
-    shape.
+    V1 and v2 are isolated compatibility decoders for historical launches.
+    Callers that require one exact persisted representation set
+    ``require_protocol_version`` rather than accepting any supported shape.
     """
-    if (require_protocol_version is not None and
-        (type(require_protocol_version) is not int or require_protocol_version
-         not in (1, PLACEMENT_PROJECTION_PROTOCOL_VERSION))):
-        raise ValueError('Required worker projection protocol version must be '
-                         '1 or 2.')
+    if require_protocol_version is not None:
+        kubernetes_pod_spec.validate_serve_worker_projection_protocol_version(
+            require_protocol_version)
     if value is None:
         if allow_none:
             return None
@@ -563,6 +613,7 @@ def validate_worker_placement_projections(
                                  'logical accelerators.')
             accelerator_by_scheduling_label[scheduling_label] = projection[
                 'accelerator_name'].lower()
+        cache = validate_cache_projection(projection['cache'])
         validated_projection = {
             'candidate_id': candidate_id,
             'kubernetes_context': projection['kubernetes_context'],
@@ -575,26 +626,42 @@ def validate_worker_placement_projections(
             'accelerator_name': projection['accelerator_name'],
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': scheduling,
-            'cache': validate_cache_projection(projection['cache']),
+            'cache': cache,
         }
-        if candidate_protocol_version == PLACEMENT_PROJECTION_PROTOCOL_VERSION:
+        if (kubernetes_pod_spec.
+                serve_worker_projection_protocol_has_strict_admission
+           )(candidate_protocol_version):
             validated_projection['scheduler_name'] = _strict_nonempty_string(
                 projection['scheduler_name'], 'Worker placement scheduler_name')
-            validated_projection['projection_version'] = (
-                PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+            validated_projection[
+                'projection_version'] = candidate_protocol_version
             validated_projection['kueue_admission'] = (
                 _validate_worker_kueue_admission(projection['kueue_admission']))
+        if kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
+                candidate_protocol_version):
+            validated_projection['provision_timeout'] = (
+                kubernetes_pod_spec.validate_projected_worker_provision_timeout(
+                    projection['provision_timeout']))
+            scratch = validate_worker_scratch_projection(projection['scratch'])
+            if (cache['kind'] == 'node_local' and
+                (cache['volume_name'] == WORKER_SCRATCH_VOLUME_NAME or
+                 worker_scratch_mount_path_collides(cache['mount_path']))):
+                raise ValueError('Worker cache and scratch volume names and '
+                                 'mount paths must not collide.')
+            validated_projection['scratch'] = scratch
         validated.append(validated_projection)
     return validated
 
 
 def worker_projection_sha256(projection: Mapping[str, Any]) -> str:
-    """Return the canonical SHA-256 digest of one complete v2 candidate."""
-    validated = validate_worker_placement_projections(
-        [dict(projection)],
-        allow_none=False,
-        require_protocol_version=PLACEMENT_PROJECTION_PROTOCOL_VERSION)
+    """Return the canonical SHA-256 digest of one strict candidate."""
+    validated = validate_worker_placement_projections([dict(projection)],
+                                                      allow_none=False)
     assert validated is not None and len(validated) == 1
+    if not (kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_strict_admission)(
+                worker_projection_protocol_version(validated[0])):
+        raise ValueError('Worker projection digest requires protocol 2 or 3.')
     canonical_json = json.dumps(validated[0],
                                 sort_keys=True,
                                 separators=(',', ':'),
@@ -760,44 +827,91 @@ def _project_worker_kueue_admission(
     }
 
 
-def _has_worker_admission_override(overrides: Mapping[str, Any]) -> bool:
-    """Whether request-scoped config tries to own projected admission."""
-    kubernetes_config = overrides.get('kubernetes')
-    if kubernetes_config is None and any(
-            key in overrides for key in ('kueue', 'quota', 'context_configs')):
-        # Accept the cloud-relative shape defensively for internal callers.
-        kubernetes_config = overrides
-    if not isinstance(kubernetes_config, Mapping):
-        return False
-
-    def _scope_has_override(scope: Any) -> bool:
-        if not isinstance(scope, Mapping):
-            return False
-        if 'kueue' in scope:
-            return True
-        quota = scope.get('quota')
-        return isinstance(quota, Mapping) and 'queue' in quota
-
-    if _scope_has_override(kubernetes_config):
-        return True
-    context_configs = kubernetes_config.get('context_configs')
-    return (isinstance(context_configs, Mapping) and any(
-        _scope_has_override(context_config)
-        for context_config in context_configs.values()))
+_TASK_OWNED_WORKER_CONFIG_KEYS = frozenset({
+    'auto_mounts',
+    'custom_metadata',
+    'enable_docker',
+    'namespace',
+    'pod_config',
+    'remote_identity',
+})
 
 
-def validate_no_task_worker_admission_overrides(task: 'task_lib.Task') -> None:
-    """Reject task-owned inputs that compete with a v2 projection."""
+def _has_task_worker_projection_override(
+    value: Any,
+    *,
+    forbid_provision_timeout: bool,
+) -> bool:
+    """Recursively detect config that can mutate projected worker Pods."""
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if (key in _TASK_OWNED_WORKER_CONFIG_KEYS or
+                (forbid_provision_timeout and key == 'provision_timeout') or
+                    str(key).startswith('serve_worker_') or key == 'kueue'):
+                return True
+            if (key == 'quota' and isinstance(child, Mapping) and
+                    'queue' in child):
+                return True
+            if _has_task_worker_projection_override(
+                    child, forbid_provision_timeout=forbid_provision_timeout):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(
+            _has_task_worker_projection_override(
+                child, forbid_provision_timeout=forbid_provision_timeout)
+            for child in value)
+    return False
+
+
+def validate_no_resource_worker_projection_overrides(
+    resource: Any,
+    *,
+    forbid_provision_timeout: bool = True,
+) -> None:
+    """Reject one resource's inputs that compete with the frozen Pod contract."""
+    if not _is_exact_kubernetes_cloud(resource.cloud):
+        return
+    if resource.labels:
+        raise ValueError('Projected SkyServe Kubernetes workers cannot set '
+                         'task resource labels; Pod labels that participate '
+                         'in admission are server-owned.')
+    if resource.priority_class is not None:
+        raise ValueError('Projected SkyServe Kubernetes workers cannot set '
+                         'task resource priority_class.')
+    overrides = resource.cluster_config_overrides
+    kubernetes_config = overrides.get('kubernetes', overrides)
+    if _has_task_worker_projection_override(
+            kubernetes_config,
+            forbid_provision_timeout=forbid_provision_timeout):
+        timeout_description = ('provision_timeout, '
+                               if forbid_provision_timeout else '')
+        raise ValueError('Projected SkyServe Kubernetes workers cannot accept '
+                         'task-owned auto_mounts, custom_metadata, '
+                         'enable_docker, pod_config, namespace, '
+                         f'{timeout_description}or remote_identity overrides, '
+                         'serve_worker_* '
+                         'projection inputs, or kubernetes.kueue / '
+                         'kubernetes.quota.queue admission.')
+
+
+def validate_no_task_worker_projection_overrides(
+    task: 'task_lib.Task',
+    *,
+    forbid_provision_timeout: bool = True,
+) -> None:
+    """Reject task-owned inputs that compete with the frozen Pod contract."""
+    derived_requires_fuse = any(
+        storage.mode in storage_lib.MOUNTABLE_STORAGE_MODES
+        for storage in (task.storage_mounts or {}).values())
     for resource in task.resources or []:
-        if not _is_exact_kubernetes_cloud(resource.cloud):
-            continue
-        if resource.priority_class is not None:
-            raise ValueError('Projected SkyServe Kubernetes workers cannot '
-                             'set task resource priority_class.')
-        if _has_worker_admission_override(resource.cluster_config_overrides):
-            raise ValueError('Projected SkyServe Kubernetes workers cannot '
-                             'set task-owned kubernetes.kueue or '
-                             'kubernetes.quota.queue overrides.')
+        validate_no_resource_worker_projection_overrides(
+            resource, forbid_provision_timeout=forbid_provision_timeout)
+        if (_is_exact_kubernetes_cloud(resource.cloud) and
+                resource.requires_fuse != derived_requires_fuse):
+            raise ValueError(
+                'Projected SkyServe Kubernetes workers require '
+                'resource._requires_fuse to match immutable MOUNT storage '
+                'declarations; direct FUSE activation is not accepted.')
 
 
 def _is_exact_kubernetes_cloud(cloud: clouds.Cloud | None) -> bool:
@@ -998,6 +1112,64 @@ def _project_cache(context: str, workspace: str | None) -> dict[str, Any]:
     return validate_cache_projection(projection)
 
 
+def _project_worker_scratch(context: str,
+                            workspace: str | None) -> dict[str, Any]:
+    """Freeze bounded memory-backed worker scratch for one exact context."""
+    configured = skypilot_config.get_effective_workspace_region_config(
+        cloud='kubernetes',
+        region=context,
+        keys=('serve_worker_scratch',),
+        workspace=workspace,
+        default_value={'kind': 'none'})
+    if not isinstance(configured, dict):
+        raise ValueError('Server-owned Serve worker scratch must be a mapping.')
+    kind = configured.get('kind')
+    if kind == 'none':
+        if set(configured) != _WORKER_SCRATCH_NONE_KEYS:
+            raise ValueError('Serve worker scratch kind none cannot contain '
+                             'other fields.')
+        return {'kind': 'none'}
+    if (kind != 'memory' or
+            set(configured) != _WORKER_SCRATCH_CONFIG_MEMORY_KEYS):
+        raise ValueError('Serve worker scratch must be exactly kind none or '
+                         'kind memory with size_limit_bytes.')
+    return validate_worker_scratch_projection({
+        'kind': 'memory',
+        'mount_path': WORKER_SCRATCH_MOUNT_PATH,
+        'volume_name': WORKER_SCRATCH_VOLUME_NAME,
+        'size_limit_bytes': configured['size_limit_bytes'],
+    })
+
+
+def _project_worker_provision_timeout(
+    context: str,
+    workspace: str | None,
+    *,
+    num_nodes: int,
+    volume_mounts: list[Any] | None,
+    kueue_admission: dict[str, str] | None,
+) -> int:
+    """Freeze the existing effective timeout under the version's config."""
+    dws_config = skypilot_config.get_effective_workspace_region_config(
+        cloud='kubernetes',
+        region=context,
+        keys=('dws',),
+        workspace=workspace,
+        default_value={})
+    enable_flex_start = bool(dws_config and dws_config.get('enabled', False))
+    default_timeout = kubernetes_cloud.Kubernetes.calculate_provision_timeout(
+        num_nodes, volume_mounts, enable_flex_start, kueue_admission
+        is not None)
+    configured = skypilot_config.get_effective_workspace_region_config(
+        cloud='kubernetes',
+        region=context,
+        keys=('provision_timeout',),
+        workspace=workspace,
+        default_value=default_timeout)
+    return kubernetes_pod_spec.validate_projected_worker_provision_timeout(
+        configured)
+
+
 def _project_accelerator_scheduling(
     context: str,
     accelerator_name: str,
@@ -1119,7 +1291,7 @@ def build_worker_placement_projections(
     # which candidates are eligible for platform-owned identity.
     if any(resource.cloud is None for resource in (task.resources or [])):
         return None
-    validate_no_task_worker_admission_overrides(task)
+    validate_no_task_worker_projection_overrides(task)
     candidates = _catalog_candidates(task, placement_catalog)
     if not candidates or any(cloud is None for _, cloud, _, _, _ in candidates):
         return None
@@ -1136,17 +1308,24 @@ def build_worker_placement_projections(
                 type(accelerator_count) is not int or accelerator_count < 1):
             return None
         identity = _project_worker_location(context, overrides, workspace)
+        kueue_admission = _project_worker_kueue_admission(context, workspace)
         projections.append({
             'projection_version': PLACEMENT_PROJECTION_PROTOCOL_VERSION,
             'candidate_id': f'kubernetes-{index:04d}',
             **identity,
-            'kueue_admission': _project_worker_kueue_admission(
-                context, workspace),
+            'kueue_admission': kueue_admission,
+            'provision_timeout': _project_worker_provision_timeout(
+                context,
+                workspace,
+                num_nodes=task.num_nodes,
+                volume_mounts=task.volume_mounts,
+                kueue_admission=kueue_admission),
             'accelerator_name': accelerator_name,
             'accelerator_count': accelerator_count,
             'accelerator_scheduling': _project_accelerator_scheduling(
                 context, accelerator_name, workspace),
             'cache': _project_cache(context, workspace),
+            'scratch': _project_worker_scratch(context, workspace),
         })
     if not projections:
         return None
@@ -1190,6 +1369,21 @@ def cache_environment(projection: dict[str, Any]) -> dict[str, str]:
     env[f'{CACHE_ENV_PREFIX}MOUNT_PATH'] = cache['mount_path']
     for key, suffix in _CACHE_ATTESTATION_ENV_KEYS.items():
         env[f'{CACHE_ENV_PREFIX}{suffix}'] = str(cache['attestation'][key])
+    return env
+
+
+def scratch_environment(projection: dict[str, Any]) -> dict[str, str]:
+    """Return server-owned runtime scratch environment for one v3 worker."""
+    if not kubernetes_pod_spec.serve_worker_projection_protocol_has_scratch(
+            worker_projection_protocol_version(projection)):
+        return {}
+    scratch = validate_worker_scratch_projection(projection['scratch'])
+    env = {SCRATCH_ENV_VAR: scratch['kind']}
+    if scratch['kind'] == 'none':
+        return env
+    env[f'{SCRATCH_ENV_PREFIX}MOUNT_PATH'] = scratch['mount_path']
+    env[f'{SCRATCH_ENV_PREFIX}SIZE_LIMIT_BYTES'] = str(
+        scratch['size_limit_bytes'])
     return env
 
 

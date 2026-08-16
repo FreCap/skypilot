@@ -143,16 +143,14 @@ def _load_service_worker_projections(
             f'SkyServe version {service_name!r}/{service_version} is no '
             'longer committed.')
     try:
-        required_protocol_version = None
-        if (reserved_fill_fence is not None and
-                reserved_fill_fence.policy_bound):
-            required_protocol_version = (
-                kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
         projections = kubernetes_identity.validate_worker_placement_projections(
-            stored_projections,
-            require_protocol_version=required_protocol_version)
+            stored_projections)
         if (reserved_fill_fence is not None and
                 reserved_fill_fence.policy_bound):
+            # Protocol v2 rows remain launchable only as immutable historical
+            # versions. The reclaim adapter accepts the exact v2/v3 strict
+            # representations and authenticates their stored digest; new
+            # commits are always v3.
             reserved_capacity.require_reclaim_worker_projection(
                 reserved_fill_fence, projections)
     except ValueError as e:
@@ -172,35 +170,21 @@ def _validate_projected_service_task_inputs(
         serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
     if projections is None:
         return
-    is_protocol_v2 = bool(
-        projections and
-        kubernetes_identity.worker_projection_protocol_version(projections[0])
-        == kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION)
-    server_owned_keys = frozenset(
-        {'pod_config', 'namespace', 'remote_identity'})
-
-    def _contains_server_owned_key(value: Any) -> bool:
-        if not isinstance(value, dict):
-            return False
-        for key, child in value.items():
-            if key in server_owned_keys:
-                return True
-            if (isinstance(child, dict) and _contains_server_owned_key(child)):
-                return True
-        return False
-
+    forbid_provision_timeout = any(
+        kubernetes_identity.worker_projection_has_provision_timeout(projection)
+        for projection in projections)
     for projected_task in dag.tasks:
-        if is_protocol_v2:
-            try:
-                (kubernetes_identity.validate_no_task_worker_admission_overrides
-                )(projected_task)
-            except ValueError as error:
-                raise exceptions.RequestCancelled(str(error)) from error
+        try:
+            kubernetes_identity.validate_no_task_worker_projection_overrides(
+                projected_task,
+                forbid_provision_timeout=forbid_provision_timeout)
+        except ValueError as error:
+            raise exceptions.RequestCancelled(str(error)) from error
         if projected_task.volumes or projected_task.volume_mounts is not None:
             raise exceptions.RequestCancelled(
                 'Projected SkyServe worker launches cannot accept campaign '
-                'volumes or volume_mounts. Use the server-owned cache '
-                'projection instead.')
+                'volumes or volume_mounts. Use the server-owned cache or '
+                'scratch projection instead.')
         for resource in projected_task.resources:
             if resource.volumes:
                 raise exceptions.RequestCancelled(
@@ -221,20 +205,14 @@ def _validate_projected_service_task_inputs(
                     raise exceptions.RequestCancelled(
                         'Projected SkyServe worker launches require every '
                         'Kubernetes context config to be a mapping.')
-            if _contains_server_owned_key(kubernetes_overrides):
-                raise exceptions.RequestCancelled(
-                    'Projected SkyServe worker launches cannot accept '
-                    'campaign pod_config, namespace, or remote_identity '
-                    'overrides. Configure trusted Kubernetes identity in the '
-                    'server workspace instead.')
 
 
-def _apply_service_worker_cache_to_task(
+def _apply_service_worker_runtime_projection_to_task(
     task: task_lib.Task,
     launch_context: dict[str, Any],
     resource: 'resources_lib.Resources',
 ) -> None:
-    """Override caller cache variables from the final frozen candidate."""
+    """Override caller runtime variables from the final frozen candidate."""
     projections = launch_context.get(
         serve_constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY)
     if projections is None:
@@ -252,12 +230,21 @@ def _apply_service_worker_cache_to_task(
         raise exceptions.RequestCancelled(
             'SkyServe replica launch does not match a frozen worker '
             'placement.')
+    has_projected_scratch = (
+        kubernetes_identity.worker_projection_has_scratch(projection))
     for task_environment in (task.envs, task.secrets):
         for key in list(task_environment):
             if key == kubernetes_identity.CACHE_ENV_VAR or key.startswith(
                     kubernetes_identity.CACHE_ENV_PREFIX):
                 task_environment.pop(key)
-    task.update_envs(kubernetes_identity.cache_environment(projection))
+            elif (has_projected_scratch and
+                  (key == kubernetes_identity.SCRATCH_ENV_VAR or
+                   key.startswith(kubernetes_identity.SCRATCH_ENV_PREFIX))):
+                task_environment.pop(key)
+    task.update_envs({
+        **kubernetes_identity.cache_environment(projection),
+        **kubernetes_identity.scratch_environment(projection),
+    })
 
 
 def _parse_reserved_fill_launch_fence(
@@ -956,8 +943,8 @@ def _execute_dag_under_provider_fence(
                 raise exceptions.RequestCancelled(
                     'A projected SkyServe replica launch has no final '
                     'provisioned resource.')
-            _apply_service_worker_cache_to_task(task, _extra_launch_context,
-                                                handle.launched_resources)
+            _apply_service_worker_runtime_projection_to_task(
+                task, _extra_launch_context, handle.launched_resources)
 
         def _materialized_effect_guard(
                 phase: str) -> typing.ContextManager[None]:

@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 78  # Kubernetes preemptible SkyServe attribution
+API_VERSION = 79  # SkyServe worker scratch projection protocol v3
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -148,7 +148,8 @@ ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
 
 # Minimum API version whose Serve version-history response exposes immutable
 # cross-context placement with Kubernetes/Kueue admission. Consumers must also
-# require placement_projection_protocol_version == 2.
+# require the exact advertised placement_projection_protocol_version; API 79
+# advances new writes to protocol 3 with typed worker scratch.
 MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 
 # Kubernetes node info includes the SkyServe-attributed subset of preemptible

@@ -64,8 +64,8 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert reserved_fill_status_version < placement_projection_version
     assert (placement_projection_version
             < preemptible_service_breakdown_version)
-    assert (
-        server_constants.API_VERSION == preemptible_service_breakdown_version)
+    assert preemptible_service_breakdown_version < server_constants.API_VERSION
+    assert server_constants.API_VERSION == 79
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():

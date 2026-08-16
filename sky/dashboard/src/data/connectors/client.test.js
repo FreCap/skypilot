@@ -17,8 +17,8 @@ import {
 import { TextDecoder as NodeTextDecoder, TextEncoder } from 'util';
 
 describe('dashboard API contract', () => {
-  it('advertises preemptible SkyServe attribution support', () => {
-    expect(CLIENT_API_VERSION).toBe('78');
+  it('advertises SkyServe worker scratch projection support', () => {
+    expect(CLIENT_API_VERSION).toBe('79');
   });
 });
 

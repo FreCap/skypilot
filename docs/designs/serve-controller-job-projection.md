@@ -1,8 +1,9 @@
 # Persisted SkyServe Controller and Worker Placement Projection
 
-**Status:** Core protocol-v2 worker/Kueue projection binding implemented; final
-validation, platform attestation, and non-compute deployment verification pending
-**Last updated:** 2026-08-13
+**Status:** Protocol-v3 typed worker scratch, provisioning timeout, and strict
+worker/Kueue projection binding implemented; platform startup integration and
+non-compute deployment verification pending
+**Last updated:** 2026-08-16
 
 ## Goals
 
@@ -10,14 +11,20 @@ validation, platform attestation, and non-compute deployment verification pendin
   committed SkyServe version independently from the version's worker routes.
 - Freeze every eligible Kubernetes worker candidate's context, namespace,
   service account, priority class, accelerator shape, and disposable-cache
-  contract so east and PHX can coexist in one heterogeneous service.
+  contract, plus its provisioning timeout, so east and PHX can coexist in one
+  heterogeneous service.
 - Freeze each worker's Kueue LocalQueue and WorkloadPriorityClass in the same
   candidate and expose one canonical digest for downstream claim and launch
   fences; mutable task/config input cannot select a second admission path.
-- Make protocol-v2 projection the sole scheduler and binding path: projected
-  Pods use the exact server-owned scheduler frozen in the candidate, cannot
-  carry a direct `nodeName`, and cannot be reported ready until the freshly
-  bound Node has the exact projected accelerator label.
+- Make protocol-v3 projection the sole new-write scheduler, binding, cache,
+  scratch, and provisioning-wait path. Projected Pods use the exact
+  server-owned scheduler and timeout frozen in the candidate, cannot carry a
+  direct `nodeName`, and cannot be reported ready until the freshly bound Node
+  has the exact projected accelerator label.
+- Give each new worker an explicit server-owned scratch contract: either no
+  owned `/tmp`, or one bounded memory-backed `/tmp` with a fixed volume and
+  mount identity. Task YAML and campaign configuration cannot select or mutate
+  this contract.
 - Expose authenticated, versioned metadata that a campaign launcher can consume
   without copying arbitrary `pod_config`, credentials, PVCs, or host paths.
 - Allow fresh campaigns to launch while explicitly deferring automated
@@ -43,7 +50,7 @@ validation, platform attestation, and non-compute deployment verification pendin
 ## Public contract
 
 The admin-only service-version-history response advertises
-`placement_projection_protocol_version: 2`. Each version entry adds two
+`placement_projection_protocol_version: 3`. Each version entry adds two
 nullable placement fields plus a nullable controller-cache field. A consumer
 must require the protocol field and strictly validate every non-null
 projection; API revision alone is not capability evidence.
@@ -51,7 +58,10 @@ projection; API revision alone is not capability evidence.
 API 75 introduced these retained placement fields. API 76 removes the
 abandoned storage-broker configuration and version-history field; it adds no
 replacement transport or compatibility branch. API 77 advances the retained
-worker placement projection to protocol v2 with immutable Kueue admission.
+worker placement projection to protocol v2 with immutable Kueue admission. API
+78 adds preemptible-attribution reporting without changing this projection.
+API 79 advances all new worker projection writes to protocol v3 with typed
+server-owned scratch and a frozen server-owned provisioning timeout.
 
 `controller_job_identity` is either null or exactly:
 
@@ -99,7 +109,7 @@ Kubernetes entry in the immutable placement catalog:
 
 ```json
 {
-  "projection_version": 2,
+  "projection_version": 3,
   "candidate_id": "kubernetes-0002",
   "kubernetes_context": "phx_research_cluster_eks",
   "namespace": "rescluster-k8s-phx",
@@ -112,6 +122,7 @@ Kubernetes entry in the immutable placement catalog:
     "local_queue_name": "inference",
     "workload_priority_class_name": "inference-low"
   },
+  "provision_timeout": -1,
   "pod_identity_role_arn": "arn:aws:iam::123456789012:role/skyserve-worker-phx",
   "accelerator_name": "H200",
   "accelerator_count": 1,
@@ -120,11 +131,18 @@ Kubernetes entry in the immutable placement catalog:
     "label_values": ["NVIDIA-H200"],
     "resource_key": "nvidia.com/gpu"
   },
-  "cache": {"kind": "none"}
+  "cache": {"kind": "none"},
+  "scratch": {
+    "kind": "memory",
+    "mount_path": "/tmp",
+    "volume_name": "skypilot-serve-worker-tmp",
+    "size_limit_bytes": 21474836480
+  }
 }
 ```
 
-`projection_version` is exactly `2`. `kueue_admission` is either null or
+`projection_version` is exactly `3` for every new write. `kueue_admission` is
+either null or
 exactly the two non-empty strings shown above. A non-null value means Kueue
 management is required; `require_managed` is derived and is not persisted as a
 second independently mutable boolean. The LocalQueue comes from the effective
@@ -135,6 +153,22 @@ both absent. The complete validated candidate is encoded as canonical sorted
 JSON and SHA-256 hashed; `worker_projection_sha256()` is the sole digest helper
 used by reserved-fill claims, allocations, replica provenance, and launch
 fences.
+
+`provision_timeout` is a non-boolean integer that is either `-1` (wait
+indefinitely) or non-negative. The builder freezes the effective
+server/workspace/context `kubernetes.provision_timeout`. When it is absent, the
+builder freezes the existing Kubernetes default once, using the same replica
+node count, volume state, DWS mode, and projected Kueue admission that would
+otherwise determine the launch default; a Kueue-managed candidate therefore
+defaults to 24 hours. Task/resource overrides are rejected recursively. A
+protocol-v3 terminal launch consumes only this signed value and never consults
+the API server's ambient config or launch-time cluster overrides. This timeout
+controls how long provisioning waits for a Pending Pod; it is not a capacity or
+reclaim classifier. `NO_CAPACITY`, queue waiting, scheduling, and initialization
+remain typed observer/provider states. In particular, a finite timeout must not
+be interpreted as proof of no capacity, while `-1` permits both Kubernetes
+contexts and sibling replicas to initialize concurrently without a wall-clock
+placement failure.
 
 `scheduler_name` is a non-empty string frozen from the effective server-owned
 context/workspace `pod_config.spec.schedulerName`, defaulting to
@@ -153,8 +187,9 @@ the ID. A non-null priority class requires a Kubernetes-range integer
 ordered unique 1..16 allowed values, and extended resource key used for this
 logical accelerator. It is not inferred again from live nodes, an autoscaler,
 `CUSTOM_GPU_RESOURCE_KEY`, or mutable configuration during replica launch.
-Projection protocol v2 owns the accelerator request across the whole Pod, not
-only the runtime container: after every custom/legacy merge it removes all
+The strict admission contract shared by protocol v2 and v3 owns the accelerator
+request across the whole Pod, not only the runtime container: after every
+custom/legacy merge it removes all
 supported GPU/TPU extended-resource requests and limits from every regular and
 init container, Pod-level `resources`, and Pod `overhead`, then installs the
 exact projected request and limit on the sole `ray-node` container. Any Pod-
@@ -163,14 +198,76 @@ opaque device selection cannot be proven equivalent to this resource-key
 contract.
 
 Historical protocol-v1 candidates have the exact old key set, without
-`projection_version`, `scheduler_name`, or `kueue_admission`. They remain
-readable only for ordinary launches during the pre-activation transition and
-can never authorize sequenced reserved fill. All new version commits emit v2.
-After active versions
-are recommitted and the removal gate in
-`serve-multi-pool-reserved-capacity-fill.md` passes, stacked cleanup PR #1452
-removes the v1 decoder and transition tests; there is no operator setting that
-selects v1.
+`projection_version`, `scheduler_name`, `kueue_admission`, `scratch`, or
+`provision_timeout`. They remain readable only for ordinary launches during the
+transition and can never authorize sequenced reserved fill. Historical
+protocol-v2 candidates have the exact v2 key set, without `scratch` or
+`provision_timeout`; they retain their strict Kueue, scheduler, digest,
+ordinary-launch, and reserved-fill semantics for already committed versions.
+The v2 decoder is isolated and hashes the exact historical v2 shape, so adding
+v3 cannot reinterpret or change an existing digest. V1/v2 terminal launches
+retain their historical launch-time timeout resolution. There is no operator
+setting that selects v1 or v2, and all new version commits emit v3.
+
+Stacked cleanup PR #1452 must be updated to remove both historical decoders and
+transition tests after the objective v1/v2 drain gate below passes. Until then,
+the compatibility code is read-only: it cannot create a second writer or add
+scratch to an existing immutable row.
+
+`scratch` is a closed protocol-v3 union. The default and explicit disabled form
+is exactly:
+
+```json
+{"kind": "none"}
+```
+
+The memory-backed form is exactly the expanded record shown in the worker
+example. `kind` is `memory`, `mount_path` is fixed to `/tmp`, `volume_name` is
+fixed to `skypilot-serve-worker-tmp`, and `size_limit_bytes` is a positive,
+non-boolean integer no larger than `2^63 - 1`. Operators select only `kind` and
+`size_limit_bytes` through the effective server/workspace/context
+`kubernetes.serve_worker_scratch`; the builder supplies the fixed path and
+volume identity. Context configuration overrides workspace configuration.
+Clients, service/task YAML, `pod_config`, resource labels, volumes, mounts, and
+replica-launch inputs cannot supply any part of the scratch contract. Resource
+labels are rejected before version commit and again before launch because a
+caller label can activate mutating or validating admission policy. This does
+not remove the trusted labels that the server renders after that boundary.
+
+For `memory`, final rendering creates exactly one volume and one runtime mount:
+
+```yaml
+volumes:
+  - name: skypilot-serve-worker-tmp
+    emptyDir:
+      medium: Memory
+      sizeLimit: "21474836480"
+containers:
+  - name: ray-node
+    volumeMounts:
+      - name: skypilot-serve-worker-tmp
+        mountPath: /tmp
+```
+
+The volume is mounted only into the sole `ray-node` runtime container. A
+pre-existing volume with the reserved name, any regular/init/ephemeral
+container mount that uses the reserved name or overlaps the `/tmp` root or any
+of its descendants, a volume device with the reserved name, an alternate
+source, duplicate, subpath,
+read-only or propagation mutation, or a cache using either reserved identity
+fails closed. A nested mount such as `/tmp/cache` could hide bytes from the
+bounded memory-backed filesystem and therefore collides with the same single
+owner. Exact already-rendered state is canonicalized after cache state, so a
+repeated render is byte-for-byte stable. For `none`, both the reserved volume
+and every mount that overlaps the `/tmp` tree must be absent; disabled scratch
+never silently inherits an older owner.
+
+Memory-backed `emptyDir` is disposable worker scratch, not a cache or durable
+workspace. Its pages count against Pod/container memory, and `sizeLimit` is a
+quota rather than a memory reservation; platform resource sizing must leave
+room for the chosen limit. An eviction, OOM, or replica replacement may discard
+all contents. Durable inputs and outputs remain in their separately authorized
+object-store prefixes.
 
 `controller_work_cache` is a separate nullable sibling. It is server/workspace
 owned and never inferred from worker volumes or a campaign PVC. A bounded
@@ -205,8 +302,8 @@ node-local controller cache is exactly:
 Its requirements cannot exceed the attestation's per-replica budgets. The
 controller cache is disposable and reconstructable from S3 in both cases.
 
-The only cache kinds in protocol v1 are `none` and `node_local`. `none` has no
-other keys. `node_local` is exactly:
+The only worker-cache kinds in every retained projection protocol are `none`
+and `node_local`. `none` has no other keys. `node_local` is exactly:
 
 ```json
 {
@@ -245,10 +342,11 @@ produces `{"kind":"none"}`, never a weaker node-local claim.
 
 ## Fresh-launch rollout boundary
 
-API 75 introduced protocol-v1 placement and identity projections, and API 77
-advances worker placement to protocol v2. Neither adds campaign recovery state
-or a load-balancer control API. The rollout is therefore limited to fresh
-campaigns. Before a nonempty Clin campaign is enabled, Clin must ship and
+API 75 introduced protocol-v1 placement and identity projections, API 77
+advanced worker placement to protocol v2, and API 79 advances new writes to
+protocol v3. None adds campaign recovery state or a load-balancer control API.
+The rollout is therefore limited to fresh campaigns. Before a nonempty Clin
+campaign is enabled, Clin must ship and
 verify an explicit fresh one-shot mode that launches and completes without
 depending on external campaign-controller recovery or replacement.
 
@@ -295,28 +393,46 @@ candidate must resolve exactly one entry. The east deployment freezes A100 to
 `nvidia.com/gpu`. These values came from direct cluster verification, not a
 generic autoscaler formatter. Identity is resolved independently per candidate, so east
 A100/A100-80GB and PHX H200 do not collapse into one tuple. An unconstrained
-cloud candidate, unpinned Kubernetes context, malformed accelerator shape, or
-missing per-context `serve_worker_pod_identity_role_arn`, or incomplete
-server-owned cache attestation makes worker projection null and external
-launchers fail closed. Each non-null tuple binds context, namespace, service
-account, and exact AWS Pod Identity role ARN. Explicit non-Kubernetes worker
+cloud candidate, unpinned Kubernetes context, malformed accelerator shape,
+incomplete server-owned cache attestation, or malformed server-owned scratch
+makes worker projection null and external launchers fail closed. Each non-null
+tuple binds context, namespace, service account, cache, and scratch. Its
+server-owned `pod_identity_role_arn` is either null (the context intentionally
+uses no AWS Pod Identity role) or one strict AWS role ARN; the service account
+remains exact in both cases. Explicit non-Kubernetes worker
 candidates do not prevent projection of exact Kubernetes candidates. Candidate
 projections must be unique by the runtime selection tuple `(context,
 case-insensitive accelerator name, count)`; ambiguous catalog alternatives are
 rejected at version commit rather than failing later at replica launch.
 
-Each v2 candidate also freezes the effective server-owned Kueue admission
-contract in the same workspace/context resolution pass. The LocalQueue uses
+Each strict candidate (historical v2 or canonical v3) also freezes the
+effective server-owned Kueue admission contract in the same workspace/context
+resolution pass. The LocalQueue uses
 the existing workspace-aware queue resolver with request overrides omitted.
 The WorkloadPriorityClass uses the context-aware
 `serve_worker_kueue_workload_priority_class_name`; a managed queue and class
-are an all-or-none pair. Task resource `priority_class` and task-owned
-`kubernetes.kueue` or `kubernetes.quota.queue` overrides are rejected at
-version commit and again at launch. They are not silently allowed to compete
-with the persisted projection. The strict validator accepts old exact v1 rows
-only through an isolated ordinary-launch compatibility decoder; its canonical
-v2 path requires the new exact key set and exposes a deterministic digest over
-the complete validated candidate.
+are an all-or-none pair. Task resource `priority_class`, nonempty task resource
+labels, and task-owned `kubernetes.kueue` or `kubernetes.quota.queue` overrides
+are rejected at version commit and again at launch. They are not silently
+allowed to compete with the persisted projection. The same recursive boundary
+rejects task-owned `auto_mounts`, `enable_docker`, and `custom_metadata`,
+including context-scoped and future nested forms. These settings can otherwise
+add PVCs, privileged sidecars, finalizers, or admission-triggering metadata
+after the service version has been committed. Server workspace/context
+configuration and the final renderer remain the only owners of Kubernetes
+settings and labels after this boundary. The validator has three closed, exact
+key sets:
+v1 is isolated ordinary-launch compatibility, v2 is isolated strict historical
+compatibility, and v3 is the canonical path. V2 and v3 expose a deterministic
+digest over their complete validated shape. No subset/superset recognition or
+field-presence inference is allowed.
+
+Canonical v3 additionally freezes the effective provisioning timeout during
+the same server/workspace/context build. The recursive task-input boundary
+rejects `provision_timeout` at cloud-relative, Kubernetes-root, context, list,
+and future nested scopes before commit and again before launch. V1/v2 retain
+their exact historical key sets and launch-time timeout behavior; only v3
+routes the signed candidate timeout into provider configuration.
 
 Projected rendering selects the frozen candidate before Kubernetes deployment
 variables are built. It bypasses live label discovery, GPU resource-key
@@ -325,14 +441,17 @@ environment overrides, then reapplies the exact accelerator affinity and
 request/limit after all Pod configuration merging and legacy YAML restoration.
 It also bypasses live LocalQueue resolution and task priority. Cloud deploy
 variables receive the selected candidate and derive `kueue_require_managed`,
-LocalQueue, and WorkloadPriorityClass solely from its `kueue_admission`.
+LocalQueue, WorkloadPriorityClass, and (for v3) `timeout` solely from that
+candidate. V3 timeout resolution is terminal: mutable API-server configuration
+and task cluster overrides are not fallback inputs.
 Post-merge and legacy-YAML restoration reapply the exact provider fields,
 Kueue queue/priority labels, and Pod PriorityClass so no restored caller value
 can reopen another admission path. The provider config carries the explicit
-`serve_worker_projection_protocol_version`; strict whole-Pod/Kueue behavior is
-selected only by value 2, never inferred from whichever projection fields
-happen to be present. Version 1 remains confined to its historical decoder.
-Protocol v2 also adds `scheduler_name` to the immutable candidate. It is read
+`serve_worker_projection_protocol_version`; one named strict-admission
+capability predicate selects the shared v2/v3 whole-Pod and Kueue behavior,
+never whichever fields happen to be present. Version 1 remains confined to its
+historical decoder. Protocol v2 introduced `scheduler_name` to the immutable
+candidate, and v3 retains it unchanged. It is read
 only from the effective server-owned context/workspace `pod_config.spec`,
 defaults to `default-scheduler`, and is included in the candidate digest and
 typed reclaim-policy view. Request/task overrides are ignored or rejected.
@@ -351,10 +470,10 @@ every required node-selector term. A missing or alternate OR term, changed
 label values, changed resource count, duplicate runtime container, hidden
 accelerator request, DRA claim, or stripped affinity fails provisioning closed.
 Immediate guarded rejection attempts exact deletion and confirms absence; a
-materialized protocol-v2 reserved-fill request that cannot confirm absence uses
+materialized strict-projection reserved-fill request that cannot confirm absence uses
 the durable-owner cleanup boundary below.
 
-The same provider boundary owns actual binding proof. Every protocol-v2 Pod
+The same provider boundary owns actual binding proof. Every strict v2/v3 Pod
 must retain its exact projected `schedulerName`. The immediate create response
 and any still-Kueue-gated adoption must have no `nodeName`; a webhook-injected
 direct binding is rejected and deleted. An admitted adoption may still be
@@ -366,7 +485,31 @@ authority guard must satisfy the same label check. Affinity on the Pod is thus
 necessary but never treated as proof that the workload actually landed on the
 projected accelerator class.
 
-Protocol-v2 Kueue admission uses the same explicit marker. Rendering strips
+Protocol v3 carries the complete frozen `scratch` record and
+`provision_timeout` through the provider config as
+`serve_worker_expected_scratch` and `timeout`. A v3 projection without either
+field, or a v1/v2 projection with either field, is malformed; historical v1/v2
+provider configs still carry their launch-time-resolved `timeout`. Final
+rendering strips caller scratch environment variables, installs the canonical
+cache-then-scratch volume/mount order, and passes exactly one runtime container
+into scratch injection. One
+exception-neutral Kubernetes Pod-spec helper owns protocol capabilities, the
+closed scratch identity, render-time rewrite, and admitted-object observation.
+Serve and the provisioner only translate its typed failures at their
+boundaries. The provisioner rechecks the fully finalized pre-create Pod with
+that same helper and attests the immediate create response, adopted Pod, and
+fresh post-Running Pod.
+Any admission mutation of the volume source, `Memory` medium, byte limit,
+reserved identity, mount semantics, container owner, or disabled state rejects
+and exactly deletes the unsafe Pod through the existing identity-cleanup path.
+Rendering uses a base-10 byte string; admitted-object attestation parses
+Kubernetes Quantity syntax so an API-canonicalized equivalent such as `20Gi`
+still proves the exact same byte limit.
+This is admission proof of the bounded Kubernetes object; the platform worker
+startup separately proves that `/tmp` is actually a `tmpfs` mount before model
+setup begins.
+
+Strict v2/v3 Kueue admission uses the same explicit marker. Rendering strips
 all caller-supplied Kueue-prefixed labels/annotations and scheduling gates,
 then installs one exact queue, group/count, `retriable-in-group=false`,
 WorkloadPriorityClass, and admission-gate request. The immediate response must
@@ -397,7 +540,7 @@ Pod if its class, numeric value, or preemption policy differs. Immediate
 rejection uses bounded deletion retries and confirms API absence before
 returning the attestation error. An ordinary fence-less request whose deletion
 cannot be confirmed fails provisioning closed and enters the ordinary
-whole-cluster teardown path. A materialized protocol-v2 reserved-fill request
+whole-cluster teardown path. A materialized strict-projection reserved-fill request
 instead returns a typed terminal fence, forbids request-owned broad teardown or
 placement failover, and leaves exact cleanup to the durable replica owner under
 fresh authority, as defined by the reserved-capacity-fill design. A null class
@@ -409,10 +552,11 @@ launch-time server configuration.
 
 Reserved fill binds this source projection without creating another ownership
 model. A sequenced claim stores the committed service version and candidate
-digest, allocation schema 5 authenticates them, replica state v17 and protocol
-v2 launch context echo them, and both locked replica admission and each
-provider-effect guard reselect the exact persisted candidate and recompute its
-digest. An opaque protocol-v2 provisioner is rejected before provider mutation;
+digest, allocation schema 5 authenticates them, and replica state v17 and the
+separate reserved-fill launch-context protocol v2 echo them. Both locked
+replica admission and each provider-effect guard reselect the exact persisted
+candidate and recompute its digest. An opaque strict-projection provisioner is
+rejected before provider mutation;
 only the instrumented in-tree Kubernetes path can create or adopt its Pod. The
 successful built-in bulk/adoption return is a one-way materialization boundary,
 and config-hash reuse is disabled so an existing Pod re-enters the same
@@ -437,7 +581,13 @@ server. Stable service YAML, runtime secrets, and file mounts are trusted,
 operator-owned immutable contents of the committed service version and may
 deliberately contain model runtime material. Mutable campaign and replica-launch
 inputs cannot add or alter those version-owned fields. Clin's prepared service
-YAML is separately audited to contain no direct S3 or KMS credentials.
+YAML is separately audited to contain no direct S3 or KMS credentials. This
+includes immutable `storage_mounts` in `MOUNT` or `MOUNT_CACHED` mode and their
+fixed in-tree FUSE scaffold. `resource._requires_fuse` is accepted only when it
+equals the state derived from those committed mount declarations; a direct
+FUSE activation without a mount is rejected at commit and launch. This does not
+authorize arbitrary task `hostPath`, PVC, `auto_mounts`, or Docker cache-volume
+injection.
 
 The workspace/context property `serve_worker_cache` may select `none` or refer
 to a node-local registered volume and its attestation. For `node_local`, the
@@ -480,6 +630,27 @@ generic variables to its own cache settings, but must not provide fallback
 values that turn a missing server contract into an unverified `/tmp`, rootfs,
 PVC, or host path.
 
+Protocol-v3 workers receive one separate scratch environment contract after all
+caller values with the reserved prefix are removed. `none` sets exactly:
+
+```text
+SKYPILOT_SERVE_SCRATCH_KIND=none
+```
+
+`memory` sets exactly these base values, with the integer rendered in base 10:
+
+```text
+SKYPILOT_SERVE_SCRATCH_KIND=memory
+SKYPILOT_SERVE_SCRATCH_MOUNT_PATH=/tmp
+SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES=21474836480
+```
+
+The trusted platform worker startup consumes these values. `memory` requires
+`findmnt` to resolve `/tmp` itself as `tmpfs` before model setup; `none` requires
+no server-reserved `/tmp` owner. The provisioner, rather than a workload-local
+`df` estimate, proves the exact Kubernetes `emptyDir.sizeLimit` from the
+admitted Pod object.
+
 The trusted Clin consumer must render
 `SKYPILOT_CONTROLLER_WORK_CACHE_KIND`, `_MOUNT_PATH`, `_REQUIRED_BYTES`, and
 `_REQUIRED_INODES` into the external campaign controller Job. EmptyDir adds
@@ -491,9 +662,10 @@ verification remain rollout gates.
 
 Replica launch remains fenced by service incarnation/version. This change does
 not accept caller `pod_config`, task `volumes`/`volume_mounts`, service
-accounts, priority classes, host paths, PVCs, storage classes, or cache
-assertions. Server-owned projected cache/workspace volumes are applied only
-after this rejection boundary.
+accounts, priority classes, host paths, PVCs, storage classes, cache assertions,
+scratch assertions, or provisioning-timeout overrides. Server-owned projected
+cache, scratch, timeout, and workspace volumes are applied only after this
+rejection boundary.
 
 ## Storage and migration
 
@@ -511,6 +683,39 @@ metadata. The Serve controller's separately supported local SQLite topology
 may use SQLAlchemy JSON for tests and local operation; there is no new
 central-API SQLite migration target.
 
+## Historical decoder removal gate
+
+Protocol v3 is the steady-state winner. V1 and v2 exist only as exact readers
+for immutable historical rows; they are not feature flags, fallbacks, or
+alternate happy paths. Stacked cleanup PR #1452 remains blocked until one
+retained evidence report proves all of the following at the same deployment
+revision:
+
+1. Every running API server, Serve controller, reserved-fill executor, and
+   platform consumer is API 79-or-newer and advertises/accepts projection v3.
+2. PostgreSQL contains zero non-null v1 or v2 worker projections across every
+   retained `version_specs` row, not merely the latest or active versions.
+   Immutable rows are drained and removed by the normal retention procedure;
+   they are never reconstructed from mutable configuration.
+3. There are zero nonterminal claims, allocations, replica launch records, or
+   durable cleanup records whose authenticated candidate discriminator/digest
+   refers to a v1 or v2 projection. Generation rotation has invalidated every
+   older claim before the census is taken.
+4. Ordinary-launch and reserved-fill telemetry has observed only v3 for one
+   complete version-retention and replica-cleanup window, and no external
+   consumer still requests a historical projection.
+5. The v3 render/admission/startup checks, including both `scratch.kind` values
+   and the exact projected provisioning timeout, have passed on every enabled
+   worker context.
+
+Once those gates pass, the cleanup removes the v1/v2 key sets and decoders,
+v2 digest branch, ordinary-launch compatibility, mixed-version tests, and all
+transition-only telemetry in one change. The supported and strict-admission
+sets then become exactly `{3}`. Because this initiative is fix-forward, there
+is no requirement to preserve a binary rollback path after the gate; a defect
+is corrected by a successor API/image while immutable v3 state remains the
+source of truth.
+
 ## Implementation phases
 
 1. Commit this canonical design and strict projection model/builder.
@@ -518,8 +723,7 @@ central-API SQLite migration target.
    and history fields with focused migration/state/API tests.
 3. Advance worker projection writes to protocol v2, freeze Kueue admission,
    reject caller admission overrides, and route rendering/restoration through
-   the selected persisted candidate. Retain v1 only in the isolated ordinary-
-   launch transition decoder until stacked cleanup PR #1452's census gate.
+   the selected persisted candidate.
 4. Bind the v2 digest and committed service version through Serve046 reserved-
    fill claims, allocation schema 5, replica state v17, and terminal policy
    authorization as specified by the reserved-fill design.
@@ -531,6 +735,11 @@ central-API SQLite migration target.
    accelerator scheduling maps, explicit priority values/policies, and fully
    attested caches;
    update the stable service and verify all old replicas are gone.
+7. Advance the sole new-write path to protocol v3/API 79; freeze typed worker
+   scratch and the effective provisioning timeout, reject task-owned timeout,
+   scratch, and Pod configuration, render and attest the final Pod, retain exact
+   v1/v2 readers only until the objective cleanup gate, and update stacked
+   cleanup PR #1452 to remove both readers.
 
 ## Deployment and fix forward
 
@@ -539,31 +748,50 @@ API 75 tolerates its absence. Deploy the database migrations before or with the
 API 77 server/controller/load-balancer binaries. Migration 043 is already
 present, and its historical nullable broker column remains inert so an older
 binary cannot fail during a rolling deployment; no current runtime or API path
-uses it. New service updates freeze protocol-v2 projections; historical v1
-versions remain ordinary-launch-only and are ineligible for sequenced reserved
-fill. Recommit every active reserved-fill version before activation. This is a
-fix-forward rollout: no version re-derives or deletes projections, and a
-successor image/version corrects defects. External campaign-controller takeover
-remains unavailable before, during, and after this rollout; an older binary
-cannot authorize campaign replay.
+uses it.
+
+Before API 79 can commit a v3 version, deploy the platform configuration with
+an explicit timeout for reserved contexts and worker startup that understands
+the exact scratch environment. Then replace the
+API, Serve controller, and every replica executor with the same API 79 image
+while service updates and new replica materialization are paused; resume only
+after all roles report the new image/API. New service updates then freeze v3.
+Historical v1 versions remain ordinary-launch-only; exact v2 versions continue
+through their historical strict path until naturally drained. An active
+service needs an explicit update to receive a v3 scratch/timeout
+contract—immutable v2 rows are never rewritten from current configuration.
+
+This is a fix-forward rollout: no version re-derives projections, a successor
+image/version corrects defects, and cleanup removes older rows only after their
+work has drained. A full binary rollback is not a supported gate. External
+campaign-controller takeover remains unavailable before, during, and after
+this rollout; an older binary cannot authorize campaign replay.
 
 ## Verification
 
 Automated tests must cover strict schemas, cross-context controller/worker
 projection, deterministic candidate IDs, configuration precedence, incomplete
 cache attestation, registered-volume/context/automount mismatch, packing
-inequalities, exact context/accelerator/count catalog coverage, caller
-`pod_config` and task-volume rejection, nullable legacy rows, immutable retries,
+inequalities, exact context/accelerator/count catalog coverage, scratch schema
+and context-over-workspace precedence, provisioning-timeout type/range,
+context-over-workspace precedence and default preservation, caller `pod_config`,
+task-volume, task-scratch and recursively nested task-timeout rejection, task
+resource-label rejection, recursive task
+`auto_mounts`/`enable_docker`/`custom_metadata` rejection, derived-FUSE
+consistency with trusted immutable
+storage mounts, nullable legacy rows, immutable retries,
 stored-only version history, suppression of all static worker credential
 mounts, zero-live-capacity rendering without discovery, frozen GPU resource-key
 provisioning, frozen LocalQueue/WorkloadPriorityClass, digest sensitivity to
 every candidate field, caller priority/queue rejection, projected rendering
-and legacy restoration that ignore mutable queue/task priority, v1 ordinary-
-launch-only compatibility, sequenced v1 rejection, stale version/digest claim
-and launch rejection, immediate guarded cleanup of admitted
+and legacy restoration that ignore mutable queue/task priority, exact v1/v2
+historical compatibility, mixed v2/v3 persisted-record rejection, sequenced v1
+rejection, frozen v2 digest/launch behavior, v3 digest stability and
+scratch/timeout sensitivity, stale version/digest
+claim and launch rejection, immediate guarded cleanup of admitted
 identity/scheduling/admission mismatches, and durable-owner cleanup when a
 materialized reserved-fill request cannot confirm immediate absence. Provider
-tests must also reject an opaque protocol-v2 provisioner before mutation, prove
+tests must also reject an opaque strict-projection provisioner before mutation, prove
 the one-way built-in materialization marker, disable config-hash shortcuts, and
 show that post-materialization failures cannot enter capacity failover or broad
 request-owned teardown while every later effect requires fresh authority.
@@ -582,17 +810,35 @@ acceptance, fail-closed queue-label-feature-off rejection, exact post-wait UID
 continuity, unknown response metadata/gates, and rejection of an ungated
 finalizer-only Pod.
 
+Scratch suites must cover exact v3 round-trip validation, default `none`,
+positive integer bounds, cache/scratch identity collision, pre-existing volume,
+mount, init/ephemeral-container and volume-device collisions, `/tmp` path
+aliases and descendant mounts, duplicate exact owners, one-runtime-container
+enforcement, deterministic
+cache-then-scratch ordering across repeated render/restoration, exact provider
+handoff, pre-create finalization drift, Kubernetes client-model admission,
+admission mutation/deletion, and the negative `none` contract. The combined
+test must prove Kueue, authenticated `hostPath.type: Directory` cache, and
+memory scratch coexist in one final Pod without reopening task `pod_config`,
+automatic mounts, Docker sidecars/cache PVCs, or custom admission metadata.
+
 Non-compute deployment verification must inspect immutable version history and
 existing admitted workers for the frozen service account, exact accelerator
 affinity/resource key and count, priority class (numeric `-1000`,
 `preemptionPolicy: Never`), exact Kueue LocalQueue, required-managed gate, and
-WorkloadPriorityClass. Fresh-read each admitted Pod's exact `nodeName`, inspect
+WorkloadPriorityClass, exact v3 provisioning timeout, and exact v3 scratch
+contract. Fresh-read each admitted Pod's exact `nodeName`, inspect
 that Node, and require the projected accelerator label key/value before
 counting it as usable capacity. On every already-advertised node-local
 candidate, use existing startup evidence to verify `findmnt`, source,
-filesystem, free bytes/inodes, and per-node packing. Restart the API and Serve
-controller and prove existing committed projections are unchanged by mutable
-queue, priority, namespace, and scheduling server configuration. Confirm external
+filesystem, free bytes/inodes, and per-node packing. For memory scratch, verify
+the final Pod has the fixed volume/mount, `medium: Memory`, and exact byte-value
+`sizeLimit` (allowing Kubernetes Quantity canonicalization), and startup
+accepted `/tmp` as `tmpfs`; for `none`, verify the
+reserved volume and `/tmp` owner are absent. Restart the API and Serve controller
+and prove existing committed projections and terminal provider timeouts are
+unchanged by mutable queue, priority, namespace, scheduling, timeout, and
+scratch server configuration. Confirm external
 campaign-controller recovery/takeover remains blocked rather than replaying
 ambiguous work. Do not deploy a synthetic service or launch a fresh campaign
 for this rollout.
@@ -603,18 +849,22 @@ for this rollout.
   encoded in the platform change. Deploy it and verify the admitted controller
   Job's identity, 64 GiB ephemeral-storage request, 80 GiB limit, and
   `/mnt/scratch` byte/inode checks. Its ambient role needs the controller's
-  S3/KMS permissions; worker service accounts must use their projected Pod
-  Identity roles for the approved input and output prefixes.
+  S3/KMS permissions; worker contexts with a non-null projected Pod Identity
+  role must use it for the approved input and output prefixes.
 - Live PHX H200 and east probes supplied the filesystem, source, free
   byte/inode, reserve, and maximum-packing evidence now encoded by the platform
-  change. After rollout, repeat the worker startup check on every admitted node;
-  any mismatch must fail that worker rather than weaken the cache contract.
+  change. Platform bootstrap must verify `/opt/dlami/nvme` is the expected
+  non-root device/filesystem before creating the exact
+  `/opt/dlami/nvme/foldeverything-v2-cache` directory. The registered volume and
+  final Pod must use `hostPath.type: Directory`, never `DirectoryOrCreate`.
+  After rollout, repeat the worker startup check on every admitted node; any
+  mismatch must fail that worker rather than weaken the cache contract.
 - The required inference priority class is encoded for both contexts. Verify
   admitted east and PHX workers resolve it to value `-1000` with
   `preemptionPolicy: Never` before bulk traffic.
 - Configure a server-owned inference LocalQueue and
   `serve_worker_kueue_workload_priority_class_name` for every projected
-  reserved context, and enable `AssignQueueLabelsForPods`. Verify projection v2
+  reserved context, and enable `AssignQueueLabelsForPods`. Verify projection v3
   freezes both, task/request overrides are rejected, the admitted Pod reports
   the exact preflight LocalQueue/ClusterQueue pair, Kueue reports the Workload
   at that exact class, and higher-priority BCL/research work shares a preempting
@@ -624,6 +874,15 @@ for this rollout.
   live PHX GPU nodes visible and prove no node, label, resource-key, autoscaler,
   or `CUSTOM_GPU_RESOURCE_KEY` lookup occurs; the Pod must still require
   `nvidia.com/gpu.product In [NVIDIA-H200]` and `nvidia.com/gpu: 1`.
+- Configure `provision_timeout: -1` and typed `serve_worker_scratch` for every
+  enabled reserved inference context,
+  deploy the matching platform startup verification first, and verify API 79
+  history, final Pods, and startup evidence agree on kind, `/tmp`, and exact
+  size. No task or service YAML may contain a scratch volume or `pod_config`;
+  task Kubernetes config also cannot select `provision_timeout`, `auto_mounts`,
+  `enable_docker`, or `custom_metadata`, and task resources cannot set labels
+  for projected workers. Verify a terminal v3 launch renders `timeout: -1`
+  even when the API server's ambient config differs.
 - The dedicated inference workspace must be updated without disrupting the
   existing shared service fleet, or migrated during a planned drain.
 - Do not enable nonempty campaigns until Clin ships and verifies a fresh
