@@ -3,7 +3,7 @@
 _Created: 2026-08-01_
 
 _Status: v0-v1e deployed; rollout verified_
-_Last updated: 2026-08-14_
+_Last updated: 2026-08-16_
 
 ## Problems
 
@@ -245,6 +245,15 @@ The dashboard starts the list metadata and summary requests together and renders
 History range state is local to one service hash and resets to one hour when
 that incarnation changes. Same-range interval polls reuse an active history
 read, while manual refreshes and visibility restoration may supersede it.
+
+Replica detail refresh ownership is likewise local to one service hash. The
+initial bounded fan-out and ordinary visible interval polls share one active
+owner, so a slow PostgreSQL summary or page read cannot accumulate one more
+concurrent query pair per timer boundary. Manual refresh may supersede
+automatic work, and visibility restoration may supersede a pre-hide automatic
+owner, while either path continues to reuse equivalent manual or visibility
+work. Superseded results remain generation-fenced, and failure or unmount
+releases ownership so the next refresh can retry.
 
 For the services list in v1e, the batched replica-summary route also returns
 the compact persisted service status, uptime, policy, and requested-resource

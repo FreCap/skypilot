@@ -838,6 +838,7 @@ export function useServiceReplicaData({
   const pastRequestRef = useRef(0);
   const legacyRequestRef = useRef(0);
   const fallbackRequestRef = useRef(null);
+  const refreshRequestRef = useRef(null);
   const pastRequestedRef = useRef(false);
   const currentPageRef = useRef(currentPage);
   const pastPageRef = useRef(pastPage);
@@ -1244,6 +1245,65 @@ export function useServiceReplicaData({
     ]
   );
 
+  const startReplicaRefresh = useCallback(
+    ({ kind = 'manual', forceLive = true } = {}) => {
+      const identity = identityRef.current;
+      const generation = generationRef.current;
+      if (!enabled || !identity) return Promise.resolve();
+
+      const active = refreshRequestRef.current;
+      const shouldReuse =
+        active?.identity === identity &&
+        (kind === 'automatic' ||
+          active.kind === kind ||
+          (kind === 'visibility' && active.kind === 'manual'));
+      if (shouldReuse) return active.promise;
+
+      const requests = [
+        fetchLiveSummary({ identity, generation, force: forceLive }),
+      ];
+      if (modeRef.current === 'legacy' || !serviceHash) {
+        requests.push(
+          fetchLegacyFull({ identity, generation, force: forceLive })
+        );
+      } else {
+        requests.push(
+          fetchReplicaSummary({ identity, generation }),
+          fetchReplicaPage({
+            identity,
+            generation,
+            scope: CURRENT_REPLICA_SCOPE,
+          })
+        );
+        if (pastRequestedRef.current) {
+          requests.push(
+            fetchReplicaPage({
+              identity,
+              generation,
+              scope: PAST_REPLICA_SCOPE,
+            })
+          );
+        }
+      }
+      let promise;
+      promise = Promise.allSettled(requests).finally(() => {
+        if (refreshRequestRef.current?.promise === promise) {
+          refreshRequestRef.current = null;
+        }
+      });
+      refreshRequestRef.current = { identity, kind, promise };
+      return promise;
+    },
+    [
+      enabled,
+      fetchLegacyFull,
+      fetchLiveSummary,
+      fetchReplicaPage,
+      fetchReplicaSummary,
+      serviceHash,
+    ]
+  );
+
   useEffect(() => {
     const identity =
       serviceName && hasMetadata
@@ -1254,6 +1314,7 @@ export function useServiceReplicaData({
     identityRef.current = identity;
     modeRef.current = serviceHash ? 'direct' : 'legacy';
     fallbackRequestRef.current = null;
+    refreshRequestRef.current = null;
     pastRequestedRef.current = false;
     setLiveService(null);
     setLiveSummaryUnavailable(false);
@@ -1267,67 +1328,18 @@ export function useServiceReplicaData({
       setReplicaSummaryLoading(false);
       return undefined;
     }
-    void fetchLiveSummary({ identity, generation });
-    if (!serviceHash) {
-      void fetchLegacyFull({ identity, generation });
-    } else {
-      void fetchReplicaSummary({ identity, generation });
-      void fetchReplicaPage({
-        identity,
-        generation,
-        scope: CURRENT_REPLICA_SCOPE,
-      });
-    }
+    void startReplicaRefresh({ kind: 'initial', forceLive: false });
     return () => {
       generationRef.current += 1;
       fallbackRequestRef.current = null;
+      refreshRequestRef.current = null;
     };
-  }, [
-    enabled,
-    fetchLegacyFull,
-    fetchLiveSummary,
-    fetchReplicaPage,
-    fetchReplicaSummary,
-    hasMetadata,
-    serviceHash,
-    serviceName,
-  ]);
+  }, [enabled, hasMetadata, serviceHash, serviceName, startReplicaRefresh]);
 
-  const refreshReplicas = useCallback(() => {
-    const identity = identityRef.current;
-    const generation = generationRef.current;
-    if (!enabled || !identity) return Promise.resolve();
-    const requests = [fetchLiveSummary({ identity, generation, force: true })];
-    if (modeRef.current === 'legacy' || !serviceHash) {
-      requests.push(fetchLegacyFull({ identity, generation, force: true }));
-    } else {
-      requests.push(
-        fetchReplicaSummary({ identity, generation }),
-        fetchReplicaPage({
-          identity,
-          generation,
-          scope: CURRENT_REPLICA_SCOPE,
-        })
-      );
-      if (pastRequestedRef.current) {
-        requests.push(
-          fetchReplicaPage({
-            identity,
-            generation,
-            scope: PAST_REPLICA_SCOPE,
-          })
-        );
-      }
-    }
-    return Promise.allSettled(requests);
-  }, [
-    enabled,
-    fetchLegacyFull,
-    fetchLiveSummary,
-    fetchReplicaPage,
-    fetchReplicaSummary,
-    serviceHash,
-  ]);
+  const refreshReplicas = useCallback(
+    () => startReplicaRefresh({ kind: 'manual' }),
+    [startReplicaRefresh]
+  );
 
   const refreshCurrentPage = useCallback(() => {
     const identity = identityRef.current;
@@ -1395,9 +1407,14 @@ export function useServiceReplicaData({
     });
   }, [fetchReplicaPage]);
 
-  const refreshWhenVisible = useCallback(() => {
-    void refreshReplicas();
-  }, [refreshReplicas]);
+  const refreshWhenVisible = useCallback(
+    (source) => {
+      void startReplicaRefresh({
+        kind: source === 'visibilitychange' ? 'visibility' : 'automatic',
+      });
+    },
+    [startReplicaRefresh]
+  );
   useVisibleRefreshInterval(
     Boolean(enabled && serviceName && hasMetadata),
     60 * 1000,
