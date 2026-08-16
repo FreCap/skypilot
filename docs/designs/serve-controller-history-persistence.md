@@ -96,6 +96,11 @@ class, or circular import. The helper module must not import the controller.
 - Existing `SkyServeController._persist_*`, `_record_*`, and
   `_get_accelerator_history_breakdown` names remain available and patchable,
   with their historical function module and qualified-name identities.
+- Replacing the historical `controller.asyncio`, `controller.time`,
+  `controller.common_utils`, `controller.serve_history`, or `controller.logger`
+  dependency continues to redirect the extracted legacy methods. Their code is
+  rebound once to the controller module globals at import time, without a
+  runtime forwarding wrapper.
 - The normal and history-only LB routes return the same acknowledgement fields
   and preserve their authority checks and ordering.
 - Missing history remains an accepted no-op. Invalid bounded input is
@@ -138,6 +143,9 @@ class, or circular import. The helper module must not import the controller.
 4. Prove source-AST equivalence for the moved bodies after normalizing the
    first-argument annotation, then run focused and Serve component tests.
 5. Measure import time and representative history projection/writer dispatch.
+6. Preserve replacement of controller-module dependencies by rebinding the
+   extracted legacy function globals, and pin that contract with a red/green
+   regression test.
 
 ## Test and CI plan
 

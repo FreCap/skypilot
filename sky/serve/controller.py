@@ -73,6 +73,12 @@ logger = sky_logging.init_logger(__name__)
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 # Keep the historical controller-module patch surface for tests and plugins.
 serve_history = controller_history.serve_history
+# The extracted legacy methods historically resolved dependencies from this
+# module. Rebind their function globals before assigning them to the facade so
+# replacing controller.asyncio/time/common_utils/serve_history/logger keeps
+# working without a runtime forwarding wrapper.
+controller_history._bind_controller_globals(  # pylint: disable=protected-access
+    globals())
 
 _LbControllerFence = tuple[str, tuple[int | None, str | None], int]
 
