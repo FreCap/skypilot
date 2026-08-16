@@ -218,6 +218,50 @@ The immediate cancel-then-rediscover correction is a bounded mitigation. It
 must preserve the may-have-effect classification and cannot become a second
 long-term recovery path.
 
+### 2026-08-16 executor-retirement correction
+
+The retained-row investigation exposed a second, independent lifecycle risk.
+In the HA chart, Kubernetes starts the Pod termination-grace countdown before
+running `preStop`, while `preStop` spends `readinessDrainSeconds` only touching
+the readiness marker and sleeping. The application still receives
+`SKYPILOT_GRACE_PERIOD_SECONDS` equal to the complete Pod grace period. It can
+therefore budget work past the real SIGKILL deadline. This timing defect is not
+claimed as the proven cause of replica 52689, but it can produce the same class
+of missing execution receipt during any rollout.
+
+The steady-state correction makes retirement an application-visible protocol,
+not an incidental signal sequence:
+
+1. the existing pod-local drain marker is the single early retirement input;
+   each API, executor, and controller runtime watches it, durably marks its
+   exact instance lease draining, stops new claims, and starts child/receipt
+   convergence before the readiness-propagation sleep;
+2. Helm exposes and validates disjoint readiness-propagation, execution-drain,
+   and final-commit margins. The application receives only its real remaining
+   budget, and chart rendering fails unless their sum fits inside
+   `terminationGracePeriodSeconds`;
+3. a graceful owner exits only after every exact claim and invocation warden it
+   owns has either published its real terminal/quiescence receipt or remains
+   durably classified as effect-ambiguous. A timeout never fabricates
+   quiescence;
+4. abnormal death uses a separate typed `EXECUTOR_TERMINATED` certificate. It
+   is not a request receipt and only proves that the named execution sandbox
+   can no longer perform effects. Automatic issuance requires authoritative
+   infrastructure evidence for the exact Kubernetes context, namespace, Pod
+   UID, and container termination outcome. Lease expiry, Pod `NotFound`, a
+   replacement Pod, or a missing process-map entry alone remain insufficient;
+   those cases require reviewed attestation and stay fail closed; and
+5. after executor termination, any request that may have crossed the effect
+   boundary remains `LEGACY_EFFECT_AMBIGUOUS` or its current-protocol typed
+   equivalent. Cleanup still requires a fresh physical-UID provider read that
+   starts after the certificate and is revalidated under the canonical row
+   locks. No successor is authorized from executor death alone.
+
+This extends the existing request-worker/guardian and association protocol. It
+does not add a second queue, executor topology, provider renderer, or recovery
+authority. Per-action isolation in G2 ensures an ambiguous action cannot block
+unrelated cards or services.
+
 ## Goals
 
 - Preserve the exact request identity for every non-pool Serve launch across a
@@ -1146,6 +1190,24 @@ automatic recovery path consumes them. Pools retain their separate lifecycle.
 The final topology has one non-pool handler, one association, one request queue,
 one executor topology, and the existing provider path.
 
+### G1S: additive executor-retirement hardening
+
+G1S is an additive PR above the deployed G1/P2 baseline and below the G2
+cleanup. It makes the existing drain marker active in API, executor, and
+controller runtimes; records drain-start and completion against the exact
+`api_server_instances` identity; splits and validates the Helm shutdown
+budgets; and adds the typed executor-termination evidence source without
+changing request terminal or quiescence fields. It retains the reviewed manual
+attestation path for historical or incomplete infrastructure evidence. A
+simultaneously authored stacked cleanup removes the old sleep-only hook and
+full-grace application environment once mixed chart versions have drained.
+
+The crash matrix includes drain-marker-before-SIGTERM, SIGTERM during provider
+I/O, SIGKILL before receipt commit, node loss, force deletion, database outage,
+old/new chart overlap, and launch during a rolling update. Every case asserts
+that no second effect starts without the canonical binding and that unknown
+termination evidence remains quarantined rather than synthesized.
+
 ## Deployment and rollback
 
 ### Generalized G1/G2 rollout
@@ -1204,6 +1266,16 @@ The generalized contract is a material design change. All prior adversarial
 rounds over an ordinary-only R2/R3 or a Serve047 reserved-fill cleanup are
 historical and the required consecutive review sequence restarts at zero on
 the exact G1/G2 heads.
+
+G1S rolls out dark with the existing binding modes unchanged. Qualification
+must observe one planned retirement for each runtime role, prove drain-start
+precedes readiness sleep and SIGTERM, prove every owned claim settles or is
+explicitly quarantined before exit, and inject one hard-kill case that leaves
+an ambiguous action isolated. Rollback may restore the prior binary only while
+the additive evidence schema remains unread-but-tolerated; it must not restore
+the sleep-only chart hook after the first service relies on early retirement.
+The stacked cleanup merges only after all old chart/runtime cohorts age beyond
+the stale-writer and quiescence horizons.
 
 ### Historical R0 deployment record
 
@@ -2411,6 +2483,14 @@ approved canary:
 - [ ] Run three new consecutive pragmatic adversarial reviews against the exact
   frozen G1/G2 and reserved-fill heads. The 2026-08-15 material correction
   resets prior ordinary-only and Serve047-cleanup review counts to zero.
+- [ ] Author G1S and its stacked sleep-only cleanup. Validate the three-part
+  Helm shutdown budget, exact drain-marker ownership transition, real receipt
+  completion, and typed executor-termination evidence across the complete
+  rollout/crash matrix. Do not treat Pod absence or lease expiry as automatic
+  execution proof.
+- [ ] Deploy G1S dark and pass one planned retirement per API, executor, and
+  controller role plus one injected hard-kill quarantine test before enabling
+  its automatic infrastructure certificate issuer or merging its cleanup.
 - [ ] Merge G2 only after zero legacy-capable participants, zero old-handler
   active/unsettled requests, and zero unbound non-pool rows requiring recovery.
   After G2, roll forward only.
