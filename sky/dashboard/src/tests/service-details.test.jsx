@@ -25,6 +25,7 @@ jest.mock('@/data/connectors/services', () => {
   const actual = jest.requireActual('@/data/connectors/services');
   return {
     ...actual,
+    getServiceDemand: jest.fn(),
     getServiceHistory: jest.fn(),
     getServicePricing: jest.fn(),
     getServiceReplicaSummaries: jest.fn(),
@@ -56,6 +57,7 @@ jest.mock('@/components/service-placement', () => ({
 
 import dashboardCache from '@/lib/cache';
 import {
+  getServiceDemand,
   getServiceHistory,
   getServicePricing,
   getServiceReplicaSummaries,
@@ -70,6 +72,7 @@ import ServiceDetailsPage, {
   ServiceDetailCard,
   sortReplicas,
   useServiceDetails,
+  useServiceDemand,
   useServiceHistory,
   useServicePricing,
   useServiceReplicaData,
@@ -1709,6 +1712,99 @@ describe('useServiceHistory independent loading', () => {
   });
 });
 
+describe('useServiceDemand controller-independent loading', () => {
+  beforeEach(() => {
+    jest.resetAllMocks();
+    getServiceDemand.mockImplementation(({ serviceHash }) =>
+      Promise.resolve({
+        serviceName: 'svc',
+        serviceHash,
+        requestTelemetryState: 'fresh',
+        requestTelemetryReason: 'complete',
+        recentRequestCount: 9,
+        requestWindowSeconds: 60,
+        requestRate: 0.15,
+        inFlightRequests: 2,
+        requestQueueDepth: 1,
+        rejectedRequests: 0,
+      })
+    );
+  });
+
+  it('waits for the service hash and reads demand directly', async () => {
+    const { result, rerender, unmount } = renderHook(
+      ({ serviceHash }) =>
+        useServiceDemand({ serviceName: 'svc', serviceHash }),
+      { initialProps: { serviceHash: null } }
+    );
+
+    expect(getServiceDemand).not.toHaveBeenCalled();
+    rerender({ serviceHash: 'hash-a' });
+    await waitFor(() =>
+      expect(result.current.demandData?.recentRequestCount).toBe(9)
+    );
+
+    expect(getServiceDemand).toHaveBeenCalledWith({
+      serviceName: 'svc',
+      serviceHash: 'hash-a',
+    });
+    unmount();
+  });
+
+  it('marks last-good demand stale when a refresh fails', async () => {
+    const consoleError = jest.spyOn(console, 'error').mockImplementation();
+    const { result, unmount } = renderHook(() =>
+      useServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    await waitFor(() =>
+      expect(result.current.demandData?.requestTelemetryState).toBe('fresh')
+    );
+
+    getServiceDemand.mockRejectedValueOnce(new Error('temporary failure'));
+    await act(async () => {
+      await result.current.refreshDemand();
+    });
+
+    expect(result.current.demandData).toMatchObject({
+      requestTelemetryState: 'stale',
+      requestTelemetryReason: 'dashboard_refresh_failed',
+      recentRequestCount: 9,
+    });
+    consoleError.mockRestore();
+    unmount();
+  });
+
+  it('coalesces refreshes while a direct demand read is in flight', async () => {
+    let resolveDemand;
+    getServiceDemand.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveDemand = resolve;
+      })
+    );
+    const { result, unmount } = renderHook(() =>
+      useServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    );
+    await waitFor(() => expect(getServiceDemand).toHaveBeenCalledTimes(1));
+
+    const first = result.current.refreshDemand();
+    const second = result.current.refreshDemand();
+
+    expect(first).toBe(second);
+    expect(getServiceDemand).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveDemand({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        requestTelemetryState: 'fresh',
+        requestTelemetryReason: 'complete',
+        inFlightRequests: 0,
+      });
+      await first;
+    });
+    unmount();
+  });
+});
+
 describe('useServiceReplicaData bounded loading', () => {
   const directSummary = (overrides = {}) => ({
     available: true,
@@ -2577,6 +2673,15 @@ describe('useServicePricing independent enrichment', () => {
 describe('ServiceDetails route ownership rendering', () => {
   beforeEach(() => {
     jest.resetAllMocks();
+    getServiceDemand.mockImplementation(({ serviceHash }) =>
+      Promise.resolve({
+        serviceName: 'svc',
+        serviceHash,
+        requestTelemetryState: 'unavailable',
+        requestTelemetryReason: 'unsupported',
+        legacyFallback: true,
+      })
+    );
     getServicePricing.mockResolvedValue(
       pricingAggregateResult({
         aggregate: {
@@ -3044,10 +3149,10 @@ describe('ServiceDetailCard cost and request estimates', () => {
         'Spot $1.50/hr · On-demand $4.00/hr · 2 active, stopping, or cleanup-uncertain replicas · Current catalog, compute only, not a provider bill'
       )
     ).toBeTruthy();
-    expect(screen.getByText('0.50 req/s')).toBeTruthy();
+    expect(screen.getByText('2 processing')).toBeTruthy();
     expect(
       screen.getByText(
-        '30 requests in 60s · 1,234 requests in last hour · 2 in flight · 1 queued · 3 rejected · activity report 4s old'
+        '0.50 req/s recent · 30 requests in 60s · 1,234 requests in last hour · 1 queued · 3 rejected · activity report 4s old'
       )
     ).toBeTruthy();
     expect(screen.getByText('$3.0556')).toBeTruthy();
@@ -3239,6 +3344,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
           requestQueueDepth: null,
           rejectedRequests: null,
           requestStatsAgeSeconds: null,
+          requestTelemetryState: 'stale',
           costPerThousandRequests: null,
         }}
       />
@@ -3380,12 +3486,48 @@ describe('ServiceDetailCard cost and request estimates', () => {
           requestQueueDepth: null,
           rejectedRequests: null,
           requestStatsAgeSeconds: null,
+          requestTelemetryState: 'stale',
           costPerThousandRequests: null,
         }}
       />
     );
 
     expect(screen.queryByText('0 requests in last hour')).toBeNull();
+    expect(screen.getByText('request telemetry stale')).toBeTruthy();
+  });
+
+  it('renders fresh zero as an observed request-processing count', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 0,
+          replicasTotal: 0,
+          replicasFailed: 0,
+          activeVersions: [1],
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: 0,
+          recentRequestCount: 0,
+          requestWindowSeconds: 60,
+          inFlightRequests: 0,
+          requestQueueDepth: 0,
+          rejectedRequests: 0,
+          requestStatsAgeSeconds: 2,
+          requestTelemetryState: 'fresh',
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('Requests now')).toBeTruthy();
+    expect(screen.getByText('0 processing')).toBeTruthy();
+    expect(
+      screen.getByText(
+        '0.00 req/s recent · 0 requests in 60s · 0 queued · 0 rejected · activity report 2s old'
+      )
+    ).toBeTruthy();
+    expect(screen.queryByText(/telemetry stale/)).toBeNull();
   });
 });
 

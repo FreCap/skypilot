@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 81  # Kubernetes operational priority breakdown
+API_VERSION = 82  # Durable SkyServe demand and operational GPU priority
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -146,6 +146,7 @@ MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
 MIN_ORDINARY_LAUNCH_BINDING_API_VERSION = 74
 ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
 MIN_NON_POOL_LAUNCH_BINDING_API_VERSION = 80
+MIN_SERVE_DURABLE_DEMAND_API_VERSION = 82
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
 # Minimum API version whose Serve version-history response exposes immutable

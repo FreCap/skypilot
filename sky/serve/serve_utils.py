@@ -45,6 +45,7 @@ from sky.jobs import state as managed_job_state
 from sky.serve import auth_tokens
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import demand_state
 from sky.serve import maintenance
 from sky.serve import provider_phase
 from sky.serve import request_aggregator
@@ -2914,7 +2915,8 @@ def _prepare_service_status(
             callers can skip the parse/dump work when they only need
             controller metadata.
         with_target_num_replicas: Whether to fetch autoscaler info
-            (``target_num_replicas`` and request stats) from the controller.
+            (including ``target_num_replicas``) from the controller and merge
+            controller-independent request telemetry when available.
             This is an HTTP round-trip to the controller process, so it is
             opt-in: control and liveness paths (HA recovery, termination,
             registration polling) must never block on a possibly-dead
@@ -2999,9 +3001,20 @@ def _prepare_service_status(
 
     if with_target_num_replicas:
         record['target_num_replicas'] = 0
+        durable_request_summary = None
+        if not pool:
+            durable_request_summary = demand_state.get_request_summary(
+                service_name, record['hash'])
         try:
+            controller_kwargs = {}
+            if (durable_request_summary is not None and
+                    durable_request_summary.get('request_telemetry_state')
+                    == 'fresh'):
+                controller_kwargs['timeout'] = (
+                    constants.DURABLE_DEMAND_CONTROLLER_STATUS_TIMEOUT_SECONDS)
             resp = _get_to_controller_with_retry(service_name, record['hash'],
-                                                 '/autoscaler/info')
+                                                 '/autoscaler/info',
+                                                 **controller_kwargs)
             autoscaler_info = resp.json()
             record['target_num_replicas'] = autoscaler_info[
                 'target_num_replicas']
@@ -3033,6 +3046,7 @@ def _prepare_service_status(
                 'committed_capacity': 'committed_capacity',
                 'target_utilization_percentage': 'target_utilization_percentage',
                 'latest_scale_up_wave_at': 'latest_scale_up_wave_at',
+                'observed_ready_replicas_age_seconds': 'report_age_seconds',
                 'request_stats_age_seconds': 'report_age_seconds',
                 'committed_version': 'committed_version',
                 'applied_version': 'applied_version',
@@ -3054,6 +3068,28 @@ def _prepare_service_status(
             logger.error(f'Failed to get autoscaler info for {service_name}: '
                          f'{common_utils.format_exception(e)}\n'
                          f'Traceback: {traceback.format_exc()}')
+
+        # Request telemetry has an independent data-plane-to-PostgreSQL path.
+        # Prefer it whenever fresh, including when the controller request
+        # above failed. During the dark-write rollout, preserve a usable
+        # legacy controller value until the first durable report arrives, but
+        # always expose the durable freshness state explicitly.
+        if not pool:
+            assert durable_request_summary is not None
+            telemetry_fields = {
+                'request_telemetry_state',
+                'request_telemetry_reason',
+                'request_telemetry_generation',
+                'request_telemetry_compatibility_complete',
+                'request_reporter_count',
+            }
+            for field in telemetry_fields:
+                record[field] = durable_request_summary.get(field)
+            if (durable_request_summary.get('request_telemetry_state') ==
+                    'fresh'):
+                record.update(durable_request_summary)
+            elif record.get('recent_request_count') is None:
+                record.update(durable_request_summary)
 
     if with_replica_counts and not with_replica_info:
         # Summary mode: give callers (the dashboard header, list views)
@@ -3433,7 +3469,12 @@ def _finalize_prepared_service_status(
                     job_ids = list(dict.fromkeys(pool_level_job_ids + job_ids))
                 replica_record['used_by'] = job_ids
     observed_ready = record.get('observed_ready_replicas')
-    report_age = record.get('request_stats_age_seconds')
+    # Demand telemetry and the controller's router-capacity observation have
+    # independent writers and freshness clocks. A fresh demand report must not
+    # revive stale ready capacity, and an unavailable demand report must not
+    # invalidate a fresh controller capacity observation during transition.
+    report_age = record.get('observed_ready_replicas_age_seconds',
+                            record.get('request_stats_age_seconds'))
     observed_ready_is_valid = (isinstance(observed_ready, int) and
                                not isinstance(observed_ready, bool) and
                                observed_ready >= 0)
@@ -3444,8 +3485,9 @@ def _finalize_prepared_service_status(
     if observed_ready_is_valid:
         record['observed_ready_replicas_fresh'] = observed_ready_is_fresh
     # The router observation is the best live logical-capacity count only
-    # while its demand report is fresh.  Once the LB stops reporting, replica
-    # reconciliation can remove backends while this value remains frozen;
+    # while the controller report carrying it is fresh. Once controller
+    # reporting stops, replica reconciliation can remove backends while this
+    # value remains frozen;
     # replacing the current snapshot would then produce impossible displays
     # such as 262 ready / 64 total.  Keep the stale observation as a diagnostic
     # but fall back to the provider/replica-state aggregate for readiness.

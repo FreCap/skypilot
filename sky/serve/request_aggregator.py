@@ -51,6 +51,10 @@ class RequestsAggregator:
         """Return request-history counters awaiting acknowledgement."""
         raise NotImplementedError
 
+    def demand_window_snapshot(self) -> dict[str, Any]:
+        """Return the complete bounded autoscaling window without draining."""
+        raise NotImplementedError
+
     def mark_request_history_accepted(self,
                                       snapshot: dict[str, Any] | None) -> None:
         """Mark a request-history snapshot as durably accepted."""
@@ -98,6 +102,13 @@ class RequestTimestamp(RequestsAggregator):
             maxlen=constants.LB_REQUEST_TIMESTAMP_CAP)
         self.compatibility_profiles: collections.deque[dict[str, Any]] = (
             collections.deque(maxlen=constants.LB_REQUEST_TIMESTAMP_CAP))
+        # The legacy controller channel drains ``timestamps`` on every sync.
+        # Keep a separate rolling snapshot for the durable demand feed so a
+        # successful controller round cannot erase the central feed's view.
+        self._demand_window_timestamps: collections.deque[float] = (
+            collections.deque(maxlen=constants.LB_REQUEST_TIMESTAMP_CAP))
+        self._demand_window_profiles: collections.deque[dict[str, Any]] = (
+            collections.deque(maxlen=constants.LB_REQUEST_TIMESTAMP_CAP))
         # Exact arrival counters are reported independently from the lossy,
         # bounded raw timestamp batch used by autoscaling. Counts remain in
         # memory through the current hour so another request in an already
@@ -134,6 +145,15 @@ class RequestTimestamp(RequestsAggregator):
                         constants.LB_REQUEST_PRIORITY_MIN)),
             # None distinguishes a legacy omitted-catalog request from an
             # explicit canonical set; an empty list is never valid.
+            'compatible_accelerators':
+                (list(compatible) if compatible is not None else None),
+        })
+        self._demand_window_timestamps.append(timestamp)
+        self._demand_window_profiles.append({
+            'timestamp': timestamp,
+            'priority': int(
+                getattr(request, '_skyserve_request_priority',
+                        constants.LB_REQUEST_PRIORITY_MIN)),
             'compatible_accelerators':
                 (list(compatible) if compatible is not None else None),
         })
@@ -201,6 +221,8 @@ class RequestTimestamp(RequestsAggregator):
         """Clear all current request aggregator."""
         self.timestamps.clear()
         self.compatibility_profiles.clear()
+        self._demand_window_timestamps.clear()
+        self._demand_window_profiles.clear()
         self._request_history.clear()
         self._acknowledged_request_history.clear()
         self._rejection_history.clear()
@@ -299,6 +321,60 @@ class RequestTimestamp(RequestsAggregator):
         return {
             'bucket_seconds': constants.LB_REQUEST_HISTORY_BUCKET_SECONDS,
             'buckets': buckets,
+        }
+
+    def demand_window_snapshot(self) -> dict[str, Any]:
+        """Return one non-destructive, bounded rolling demand snapshot."""
+        window_seconds = constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS
+        bucket_seconds = constants.LB_DEMAND_WINDOW_BUCKET_SECONDS
+        cutoff = time.time() - window_seconds
+        while (self._demand_window_timestamps and
+               self._demand_window_timestamps[0] < cutoff):
+            self._demand_window_timestamps.popleft()
+        while (self._demand_window_profiles and
+               self._demand_window_profiles[0]['timestamp'] < cutoff):
+            self._demand_window_profiles.popleft()
+        counts_by_bucket: dict[int, int] = {}
+        grouped: dict[tuple[int, int, frozenset[str]], dict[str, Any]] = {}
+        compatibility_complete = True
+        for timestamp in self._demand_window_timestamps:
+            bucket = int(timestamp // bucket_seconds) * bucket_seconds
+            counts_by_bucket[bucket] = counts_by_bucket.get(bucket, 0) + 1
+        for profile in self._demand_window_profiles:
+            accelerators = profile.get('compatible_accelerators')
+            if not isinstance(accelerators, list) or not accelerators:
+                compatibility_complete = False
+                continue
+            priority = int(profile['priority'])
+            bucket = int(
+                profile['timestamp'] // bucket_seconds) * bucket_seconds
+            key = (bucket, priority, frozenset(accelerators))
+            grouped_profile = grouped.get(key)
+            if grouped_profile is None:
+                grouped[key] = {
+                    'priority': priority,
+                    'compatible_accelerators': list(accelerators),
+                    'count': 1,
+                }
+            else:
+                grouped_profile['count'] += 1
+        saturated = (len(self._demand_window_timestamps) ==
+                     constants.LB_REQUEST_TIMESTAMP_CAP)
+        return {
+            'bucket_seconds': bucket_seconds,
+            'window_seconds': window_seconds,
+            'buckets': [{
+                'bucket_start': bucket,
+                'request_count': count,
+                'compatibility_profiles': [
+                    profile
+                    for (profile_bucket, _, _), profile in grouped.items()
+                    if profile_bucket == bucket
+                ],
+            }
+                        for bucket, count in sorted(counts_by_bucket.items())],
+            'compatibility_complete': compatibility_complete and not saturated,
+            'saturated': saturated,
         }
 
     def mark_request_history_accepted(self,

@@ -27,6 +27,7 @@ import {
 import { Card } from '@/components/ui/card';
 import { StatusBadge } from '@/components/elements/StatusBadge';
 import {
+  getServiceDemand,
   getServiceHistory,
   getServicePricing,
   getServiceReplicaSummaries,
@@ -434,6 +435,129 @@ export function useServiceDetails({ serviceName, loadFull = true }) {
   };
 }
 
+export function useServiceDemand({
+  serviceName,
+  serviceHash,
+  metadataReady,
+  enabled = true,
+  onServiceHashMismatch,
+}) {
+  const hasMetadata = metadataReady ?? Boolean(serviceHash);
+  const [demandData, setDemandData] = useState(null);
+  const [demandLoading, setDemandLoading] = useState(
+    Boolean(enabled && serviceName)
+  );
+  const identityRef = useRef(null);
+  const visibleDemandRef = useRef(null);
+  const requestVersionRef = useRef(0);
+  const activeRequestRef = useRef(null);
+
+  useEffect(() => {
+    visibleDemandRef.current = demandData;
+  }, [demandData]);
+
+  const fetchDemand = useCallback(() => {
+    if (!enabled || !serviceName || !hasMetadata || !serviceHash) {
+      setDemandLoading(Boolean(enabled && serviceName && !hasMetadata));
+      return Promise.resolve();
+    }
+    const identity = `${serviceName}:${serviceHash}`;
+    const active = activeRequestRef.current;
+    if (active?.identity === identity) return active.promise;
+    const requestVersion = requestVersionRef.current + 1;
+    requestVersionRef.current = requestVersion;
+    setDemandLoading(true);
+    const isCurrentRequest = () =>
+      requestVersionRef.current === requestVersion &&
+      identityRef.current === identity;
+    let requestPromise;
+    requestPromise = getServiceDemand({ serviceName, serviceHash })
+      .then((demand) => {
+        if (!isCurrentRequest()) return;
+        if (demand.requestTelemetryReason === 'not_found') {
+          const error = new Error('The service incarnation changed.');
+          error.code = 'SERVICE_HASH_MISMATCH';
+          throw error;
+        }
+        const ownedDemand = { ...demand, serviceHash };
+        visibleDemandRef.current = ownedDemand;
+        setDemandData(ownedDemand);
+      })
+      .catch((error) => {
+        if (!isCurrentRequest()) return;
+        if (error?.code === 'SERVICE_HASH_MISMATCH') {
+          const unavailable = {
+            serviceHash,
+            requestTelemetryState: 'unavailable',
+            requestTelemetryReason: 'service_changed',
+          };
+          visibleDemandRef.current = unavailable;
+          setDemandData(unavailable);
+          void onServiceHashMismatch?.();
+          return;
+        }
+        console.error('Failed to fetch service demand:', error);
+        const previous = visibleDemandRef.current;
+        const unavailable =
+          previous?.serviceHash === serviceHash
+            ? {
+                ...previous,
+                requestTelemetryState: 'stale',
+                requestTelemetryReason: 'dashboard_refresh_failed',
+                refreshUnavailable: true,
+              }
+            : {
+                serviceHash,
+                requestTelemetryState: 'unavailable',
+                requestTelemetryReason: 'temporarily_unavailable',
+                refreshUnavailable: true,
+              };
+        visibleDemandRef.current = unavailable;
+        setDemandData(unavailable);
+      })
+      .finally(() => {
+        if (isCurrentRequest()) setDemandLoading(false);
+        if (activeRequestRef.current?.promise === requestPromise) {
+          activeRequestRef.current = null;
+        }
+      });
+    activeRequestRef.current = { identity, promise: requestPromise };
+    return requestPromise;
+  }, [enabled, hasMetadata, onServiceHashMismatch, serviceHash, serviceName]);
+
+  useEffect(() => {
+    const identity =
+      enabled && serviceName && hasMetadata && serviceHash
+        ? `${serviceName}:${serviceHash}`
+        : null;
+    if (identityRef.current !== identity) {
+      identityRef.current = identity;
+      visibleDemandRef.current = null;
+      setDemandData(null);
+    }
+    requestVersionRef.current += 1;
+    activeRequestRef.current = null;
+    if (!identity) {
+      setDemandLoading(Boolean(enabled && serviceName && !hasMetadata));
+      return undefined;
+    }
+    void fetchDemand();
+    return () => {
+      requestVersionRef.current += 1;
+      activeRequestRef.current = null;
+    };
+  }, [enabled, fetchDemand, hasMetadata, serviceHash, serviceName]);
+
+  const refreshDemand = useCallback(() => fetchDemand(), [fetchDemand]);
+  useVisibleRefreshInterval(
+    Boolean(enabled && serviceName && hasMetadata && serviceHash),
+    10 * 1000,
+    refreshDemand
+  );
+
+  return { demandData, demandLoading, refreshDemand };
+}
+
 export function useServiceHistory({
   serviceName,
   serviceHash,
@@ -681,8 +805,9 @@ function dedupeReplicas(previous, incoming) {
 }
 
 // Owns the v1c replica projections. The controller summary stays independent
-// because it is the fresh authority for targets, request pressure, and the
-// endpoint. Persisted replica counts/pages are hash-anchored and never delay it.
+// because it remains the fresh authority for targets and the endpoint.
+// Durable demand and persisted replica counts/pages are hash-anchored and
+// never wait for it.
 export function useServiceReplicaData({
   serviceName,
   serviceHash,
@@ -1825,6 +1950,16 @@ function ServiceDetails() {
     enabled: activeTab === 'overview',
     onServiceHashMismatch: refreshData,
   });
+  const demand = useServiceDemand({
+    serviceName,
+    serviceHash:
+      serviceData?.name === serviceName ? serviceData.serviceHash : null,
+    metadataReady:
+      serviceData?.name === serviceName &&
+      Object.prototype.hasOwnProperty.call(serviceData, 'serviceHash'),
+    enabled: activeTab === 'overview',
+    onServiceHashMismatch: refreshData,
+  });
   const pricingData = useServicePricing({
     serviceName,
     serviceHash:
@@ -1914,11 +2049,49 @@ function ServiceDetails() {
           replicaSummaryObservedAt: persistedSummary.observedAt,
         }
       : {};
+    const directDemand =
+      demand.demandData?.serviceHash === anchoredHash &&
+      demand.demandData?.legacyFallback !== true
+        ? demand.demandData
+        : null;
+    const directDemandMetadata = directDemand
+      ? {
+          requestTelemetryState: directDemand.requestTelemetryState,
+          requestTelemetryReason: directDemand.requestTelemetryReason,
+          requestTelemetryGeneration:
+            directDemand.requestTelemetryGeneration ?? null,
+          requestTelemetryCompatibilityComplete:
+            directDemand.requestTelemetryCompatibilityComplete ?? null,
+          requestReporterCount: directDemand.requestReporterCount ?? null,
+          requestStatsAgeSeconds: directDemand.requestStatsAgeSeconds ?? null,
+        }
+      : {};
+    const directDemandMetrics =
+      directDemand &&
+      [
+        directDemand.recentRequestCount,
+        directDemand.requestRate,
+        directDemand.inFlightRequests,
+        directDemand.requestQueueDepth,
+        directDemand.rejectedRequests,
+      ].some((value) => value != null)
+        ? {
+            recentRequestCount: directDemand.recentRequestCount ?? null,
+            requestWindowSeconds: directDemand.requestWindowSeconds ?? null,
+            requestRate: directDemand.requestRate ?? null,
+            inFlightRequests: directDemand.inFlightRequests ?? null,
+            requestQueueDepth: directDemand.requestQueueDepth ?? null,
+            rejectedRequests: directDemand.rejectedRequests ?? null,
+            recentRejectedRequests: directDemand.recentRejectedRequests ?? null,
+          }
+        : {};
     const enriched = {
       ...serviceData,
       ...(persistedSummary || {}),
       ...(liveSummary || {}),
       ...directOnlyFields,
+      ...directDemandMetadata,
+      ...directDemandMetrics,
       ...persistedPricing,
       ...(legacy || {}),
       replicas: currentReplicas,
@@ -1947,13 +2120,21 @@ function ServiceDetails() {
     // erase an independently landed replica summary or page.
     if (liveSummary || legacy) enriched.metadataOnly = false;
     return enriched;
-  }, [ownsRouteState, pricingData, replicaData, serviceData, serviceName]);
+  }, [
+    demand.demandData,
+    ownsRouteState,
+    pricingData,
+    replicaData,
+    serviceData,
+    serviceName,
+  ]);
   const isRouteLoading = !router.isReady || !ownsRouteState || isInitialLoad;
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     await Promise.all([
       refreshData(),
+      demand.refreshDemand(),
       refreshHistory(),
       replicaData.refreshReplicas(),
       pricingData.refreshPricing(),
@@ -2350,6 +2531,9 @@ export function ServiceDetailCard({
     usesLogicalReplicas &&
     serviceData.observedReadyReplicas != null &&
     serviceData.observedReadyReplicasFresh === false;
+  if (serviceData.inFlightRequests != null && serviceData.requestRate != null) {
+    requestDetails.push(`${formatRequestRate(serviceData.requestRate)} recent`);
+  }
   if (
     serviceData.recentRequestCount != null &&
     serviceData.requestWindowSeconds != null
@@ -2366,9 +2550,6 @@ export function ServiceDetailCard({
       `${requestHistory.requestsLastHour.toLocaleString()} requests in last hour`
     );
   }
-  if (serviceData.inFlightRequests != null) {
-    requestDetails.push(`${serviceData.inFlightRequests} in flight`);
-  }
   if (serviceData.requestQueueDepth != null) {
     requestDetails.push(`${serviceData.requestQueueDepth} queued`);
   }
@@ -2378,6 +2559,18 @@ export function ServiceDetailCard({
   if (serviceData.requestStatsAgeSeconds != null) {
     requestDetails.push(
       `activity report ${Math.round(serviceData.requestStatsAgeSeconds)}s old`
+    );
+  }
+  if (
+    serviceData.requestTelemetryState != null &&
+    serviceData.requestTelemetryState !== 'fresh'
+  ) {
+    const legacySuffix =
+      serviceData.recentRequestCount != null
+        ? '; showing controller snapshot'
+        : '';
+    requestDetails.push(
+      `request telemetry ${serviceData.requestTelemetryState}${legacySuffix}`
     );
   }
 
@@ -2554,14 +2747,16 @@ export function ServiceDetailCard({
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">
-                Recent request rate
+                Requests now
               </div>
               <div className="text-base mt-1">
-                {serviceData.requestRate != null
-                  ? formatRequestRate(serviceData.requestRate)
-                  : metadataDeferred
-                    ? deferredValue
-                    : '-'}
+                {serviceData.inFlightRequests != null
+                  ? `${serviceData.inFlightRequests.toLocaleString()} processing`
+                  : serviceData.requestRate != null
+                    ? formatRequestRate(serviceData.requestRate)
+                    : metadataDeferred
+                      ? deferredValue
+                      : '-'}
               </div>
               {requestDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">

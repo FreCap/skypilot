@@ -18,6 +18,7 @@ import fastapi
 
 from sky import sky_logging
 from sky.serve import constants
+from sky.serve import demand_state
 from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -36,12 +37,15 @@ CONTROLLER_SYSTEM_RECOVERY_LEASE_ROUTE_PATH = (
     constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH)
 CONTROLLER_HISTORY_SYNC_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
                                       constants.LB_CONTROLLER_HISTORY_SYNC_PATH)
+DEMAND_REPORT_ROUTE_PATH = (_CONTROLLER_PROXY_ROUTE_PREFIX +
+                            constants.LB_DEMAND_REPORT_PATH)
 _CONTROLLER_SYNC_ROUTE_PREFIX = '/api/internal/serve/'
 _CONTROLLER_SYNC_ROUTE_SUFFIXES = (
     constants.LB_CONTROLLER_SYNC_PATH,
     constants.LB_CONTROLLER_ROLE_PATH,
     constants.LB_CONTROLLER_SYSTEM_RECOVERY_LEASE_PATH,
     constants.LB_CONTROLLER_HISTORY_SYNC_PATH,
+    constants.LB_DEMAND_REPORT_PATH,
 )
 
 # (durable service incarnation, controller process, normalized IP, port).
@@ -275,6 +279,54 @@ async def proxy_load_balancer_sync(
         service_name: str, request: fastapi.Request) -> fastapi.Response:
     return await _proxy_controller_sync(service_name, request,
                                         constants.LB_CONTROLLER_SYNC_PATH)
+
+
+@router.post(DEMAND_REPORT_ROUTE_PATH, include_in_schema=False)
+async def record_load_balancer_demand(
+        service_name: str, request: fastapi.Request) -> fastapi.Response:
+    """Persist demand at the stable API server, never at the controller."""
+    service_hash = request.headers.get(constants.SERVICE_HASH_HEADER)
+    if not service_hash:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'detail': 'Service incarnation header is required.'})
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > constants.LB_DEMAND_REPORT_MAX_BYTES:
+            return fastapi.responses.JSONResponse(
+                status_code=413,
+                content={'detail': 'Demand report exceeds the size limit.'})
+    try:
+        payload = json.loads(body)
+        receipt = await asyncio.to_thread(demand_state.ingest_report,
+                                          service_name, service_hash, payload)
+    except (json.JSONDecodeError, demand_state.DemandReportError) as e:
+        status = (409
+                  if isinstance(e, demand_state.DemandReportConflict) else 400)
+        return fastapi.responses.JSONResponse(status_code=status,
+                                              content={'detail': str(e)})
+    except demand_state.DemandReportUnavailable as e:
+        return fastapi.responses.JSONResponse(status_code=503,
+                                              content={'detail': str(e)})
+    except Exception as e:  # pylint: disable=broad-except
+        logger.exception('Failed to persist demand for %r.', service_name)
+        return fastapi.responses.JSONResponse(
+            status_code=503,
+            content={
+                'detail': f'Demand persistence failed: {type(e).__name__}'
+            })
+    return fastapi.responses.JSONResponse(
+        status_code=200,
+        content={
+            'generation': receipt.generation,
+            'duplicate': receipt.duplicate,
+            'request_history_accepted': receipt.request_history_accepted,
+            'request_classification_history_accepted':
+                receipt.request_classification_history_accepted,
+            'prediction_time_history_accepted':
+                receipt.prediction_time_history_accepted,
+        })
 
 
 @router.post(CONTROLLER_ROLE_ROUTE_PATH, include_in_schema=False)

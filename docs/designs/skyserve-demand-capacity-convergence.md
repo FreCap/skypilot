@@ -1,7 +1,8 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: implementation in review; the production compatibility precondition is
-satisfied, but production remains on the legacy controller-coupled demand path
+Status: P1 is implemented in PR #1498 and P2a in PR #1499; the production
+compatibility precondition is satisfied, but production remains on the legacy
+controller-coupled demand path
 
 Last updated: 2026-08-16
 
@@ -99,17 +100,26 @@ The implementation must reuse these checked-in mechanisms:
 - the generic non-pool binding and per-association reconciliation specified by
   `durable-serve-replica-actions.md`.
 
+The P2a draft PR #1499 now contains, but has not deployed or promoted:
+
+- a PostgreSQL-clock-fenced latest-report table and stable authenticated
+  ingestion endpoint;
+- a non-destructive five-second-bucket load-balancer demand window plus
+  existing cumulative minute history; and
+- a provider/controller-free direct read endpoint polled independently by the
+  dashboard, plus a status overlay for CLI/legacy consumers. Both prefer fresh
+  durable telemetry and report stale/unavailable explicitly.
+
 The following is not yet present:
 
-- a controller-independent live demand report table and ingestion endpoint;
 - an autoscaler reader that consumes that table as its sole demand source;
 - one atomic planner snapshot that orders zero-cost admission before paid
   admission for the same demand generation;
 - a paid-launch authority tuple that includes the demand and zero-cost
   allocation generations and is revalidated immediately before provider I/O;
 - a complete provider-free route projection used by the load balancer; and
-- an explicit dashboard state that distinguishes fresh zero, stale, and
-  unavailable request data.
+- the final dashboard placement explanation that binds paid decisions to their
+  demand and zero-cost generations.
 
 ## Public contract
 
@@ -119,12 +129,14 @@ Each load-balancer process sends a cumulative, idempotent report to the stable
 central API endpoint. Version 1 contains:
 
 - service name and exact service-incarnation hash;
-- load-balancer slot, Pod UID, LB session ID, and request-history session ID;
+- load-balancer slot, Pod UID as the durable LB session ID, and a
+  process-lifetime request-history/reporter session ID;
 - report protocol version and monotonically increasing reporter sequence;
 - reporter observation time for diagnostics; PostgreSQL computes `received_at`
   and `valid_until` from its own clock;
-- cumulative per-minute arrivals, completions by outcome, rejections, and
-  prediction-time histograms;
+- a non-destructive cumulative five-second arrival window for live scaling,
+  plus cumulative per-minute arrivals, completions by outcome, rejections, and
+  prediction-time histograms for operational history;
 - current in-flight, queued, and rejected-window gauges;
 - the closed accelerator-compatibility demand map and the routing-spec version
   under which it was measured; and
@@ -140,6 +152,14 @@ cumulative minute data is idempotent. A lower sequence, changed immutable
 reporter identity, malformed compatibility map, future protocol, or wrong
 service hash fails closed.
 
+Reporter wall-clock skew is bounded to 30 seconds. Live bucket ages are
+rebased onto PostgreSQL receipt time before aggregation, so even tolerated
+clock skew cannot extend the rolling demand window. Historical event buckets
+retain wall-clock timestamps for charts but never authorize capacity in P2a.
+Compatibility priorities are bounded to the public 0--100 range. A report with
+complete compatibility totals but contradictory per-priority profiles and
+gauges is rejected rather than becoming future placement authority.
+
 Minute history remains additive across distinct reporter sessions and
 greatest-value idempotent within one reporter minute. Live gauges remain one
 row per reporter incarnation. The aggregate includes every non-stale reporter:
@@ -151,7 +171,13 @@ never converted to a zero observation.
 
 Every consumer exposes one of three states:
 
-- `fresh`: at least one valid reporter and a complete compatibility map;
+- `fresh`: at least one valid reporter whose applied HA role is `ACTIVE`; a
+  fresh standby cannot conceal an expired or partitioned traffic owner. A
+  separate
+  `compatibility_complete` bit determines whether exact-card demand may become
+  scaling or launch authority. A current report with occupancy-unknown routes
+  keeps arrival/queue telemetry fresh but exposes the processing count as
+  unavailable rather than zero;
 - `stale`: the last report exists but its database-clock validity expired; or
 - `unavailable`: no valid report can be read or the protocol is unsupported.
 
@@ -171,6 +197,16 @@ For each demand compatibility class, one immutable planner snapshot contains:
   slots; and
 - service lifecycle, version, controller-owner, placement-policy, and binding
   epochs.
+
+The raw demand-feed generation is a telemetry receipt generation: it advances
+when any non-duplicate reporter heartbeat lands, including a heartbeat whose
+effective demand is unchanged. P2b therefore materializes a separate,
+content-addressed planner snapshot generation. Its digest changes only when
+the normalized authoritative demand inputs or fences change. Paid actions bind
+to that stable planner generation and its source demand receipt watermark;
+they do not bind directly to the continuously advancing heartbeat generation.
+This preserves pre-I/O freshness checks without livelocking launches behind a
+five-second reporting cadence.
 
 The planner computes:
 
@@ -225,9 +261,16 @@ decision.
 The service details page always renders a `Requests now` state:
 
 - fresh in-flight and queued counts;
-- completed/accepted/rejected counts over the current window;
+- accepted arrivals and rejected pressure over the current window;
 - report age and reporter count; or
 - an explicit stale/unavailable explanation.
+
+The page polls the hash-fenced stable API demand endpoint independently of the
+controller-backed status projection. A controller timeout therefore cannot
+delay fresh request counters. During the dark-write transition, an older API
+server or non-consolidated installation falls back to the existing status
+response; a new consolidated server never silently converts a failed direct
+read to zero.
 
 History continues to use the existing minute tables and charts. Empty history
 renders `0 requests observed` only when the selected interval is completely
@@ -303,25 +346,56 @@ evidence. The historical IDs 52032--52038 must not be recreated, backfilled,
 or registered as a scope when no source row remains. No synthetic quiescence
 or association backfill is permitted.
 
-Expected size: large, approximately 3,000--5,000 source/test lines by extending
-the already-merged ordinary binding. It must not include a deployment control
-plane.
+Actual draft size: approximately 6,300 source/test lines across 39 files,
+larger than estimated because it closes all six profiles, legacy evidence,
+lock-yielding recovery, process capability fencing, and PostgreSQL transition
+tests. It does not include a deployment control plane.
 
-### P2: demand feed, placement ordering, routes, and UI
+### P2a: durable demand telemetry and UI
 
-API012/Serve048 add the demand-report/live-gauge tables, stable API ingestion,
-route projection, planner-generation fields, paid-authority tuple, status
-projection, and dashboard contract in this document. During transition the LB
-may send both old controller sync data and the new durable report, but only one
-feed is authoritative per service epoch and usage is instrumented.
+API version 82/Serve048 add the demand-report/live-gauge tables, stable API
+ingestion, non-destructive reporter window, request-history acknowledgement,
+direct current-demand read, status projection, and dashboard freshness
+contract. During transition the LB sends both old controller sync data and the
+new durable report. The durable feed is authoritative for display only when
+fresh; it has no scaling or launch authority in P2a.
 
-Expected size: medium/large, approximately 2,000--3,500 source/test/UI lines,
-mostly reusing existing aggregators, history tables, proxy authentication, and
-components.
+The status projection keeps the durable request-report age and the
+controller's ready-capacity observation age as separate fields and freshness
+clocks. Overlaying a fresh or unavailable durable request report therefore
+cannot revive stale logical ready capacity or invalidate a fresh controller
+capacity observation.
+
+Current reviewed size: approximately 2,650 source/test/UI lines across 33
+files, mostly reusing existing aggregators, history tables, proxy
+authentication, and components. The additional direct-read hook, strict
+bounded report validation, and PostgreSQL migration matrix account for the
+increase over the 1,000--1,800 estimate.
+
+Local review evidence on 2026-08-16 includes all 9 real-PostgreSQL Serve048
+tests, 13 validation tests, 121 focused dashboard tests, repository-wide mypy
+over 940 source files, changed-file pylint at 10/10, dashboard ESLint and
+Prettier, and the exact HA cases where replica-global async occupancy must not
+be double-counted and a fresh standby must not turn an expired active report
+into a false zero. CI and live rollout evidence remain open.
+
+### P2b: one demand authority, routes, and ordered capacity admission
+
+API012/Serve049 add API-fleet capability identity, explicit per-service demand
+promotion, the autoscaler durable reader, route projection,
+content-addressed planner-generation fields, the source demand receipt
+watermark, and the paid-authority tuple. Serve049 also owns the demand
+promotion mode and epoch; Serve048 deliberately does not add authority fields.
+Promotion disables controller-sync demand mutation for that service epoch.
+Zero-cost admission is committed before paid residual planning, and both are
+revalidated before provider I/O. A heartbeat with unchanged normalized demand
+does not mint a new planner generation or invalidate already-admitted work.
+
+Expected size: medium/large, approximately 1,500--2,500 source/test/UI lines.
 
 ### P3: blocked steady-state cleanup
 
-Author API013/Serve049 with P1/P2 and keep it stacked and blocked. After the
+Author API013/Serve050 with P1/P2 and keep it stacked and blocked. After the
 documented rollout gates it removes controller-coupled telemetry ingestion,
 unbound non-pool admission/recovery, the ordinary-only handler alias, global
 startup recovery waiting, cluster-name/process-map authority, legacy incident
@@ -335,6 +409,8 @@ than the current system.
 
 All source branches target `boltz-bio/skypilot:improvements`. Production
 deployment authority is the reviewed live Helm release, not a platform pin.
+The release tuple is `skypilot` in namespace `skypilot`; `improvements` is the
+source branch and must never be substituted as the release name.
 Every upgrade captures live values/manifest, reviews the rendered diff, uses
 `--reuse-values`, pins the immutable image for every explicitly overridden
 role, and records the live Helm revision, image digest, schema heads, rollout,
@@ -414,13 +490,13 @@ generation. The final cleanup removes their predecessor paths.
 - [x] Verify the equivalent later v1.1.1291 production compatibility baseline
   without generalized-action, demand-authority, or placement promotion
   (2026-08-16: single-`all` `Recreate`, Serve046/API010, `LEGACY_ACTIVE`).
-- [ ] Publish P1 and its blocked P3 removal as a reviewed stack.
+- [x] Publish P1 as PR #1498, P2a as PR #1499, P2b as PRs #1503/#1504,
+  and the blocked P3 removals as draft PRs #1506/#1510.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
 - [ ] Immediately before migration, inventory exact retained legacy rows and
   unsettled requests, then reconcile only present rows without fabricated
   quiescence or manual deletion. The historical seven-row scope is absent and
   must not be reconstructed.
-- [ ] Publish P2 and update P3 for every transition-only demand/route path.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set

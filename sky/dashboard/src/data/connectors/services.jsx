@@ -5,6 +5,7 @@ import {
   SERVE_DASHBOARD_DIRECT_READS_API_VERSION,
   SERVE_DASHBOARD_PRICING_READS_API_VERSION,
   SERVE_DASHBOARD_REPLICA_READS_API_VERSION,
+  SERVE_DURABLE_DEMAND_API_VERSION,
 } from '@/data/connectors/constants';
 
 // Normalize a raw replica_info entry from the /serve/status response.
@@ -420,6 +421,66 @@ function normalizeAcceleratorCountMap(value) {
   );
 }
 
+function nullableNonnegativeNumber(value) {
+  if (value === null || value === undefined) return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function nullableNonnegativeInteger(value) {
+  const parsed = nullableNonnegativeNumber(value);
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+export function normalizeRequestTelemetry(record) {
+  const state = ['fresh', 'stale', 'unavailable'].includes(
+    record?.request_telemetry_state
+  )
+    ? record.request_telemetry_state
+    : null;
+  return {
+    recentRequestCount: nullableNonnegativeInteger(
+      record?.recent_request_count
+    ),
+    requestWindowSeconds: nullableNonnegativeInteger(
+      record?.request_window_seconds
+    ),
+    requestRate: nullableNonnegativeNumber(record?.requests_per_second),
+    inFlightRequests: nullableNonnegativeInteger(record?.in_flight_requests),
+    requestQueueDepth: nullableNonnegativeInteger(record?.request_queue_depth),
+    rejectedRequests: nullableNonnegativeInteger(record?.rejected_requests),
+    recentRejectedRequests: nullableNonnegativeInteger(
+      record?.recent_rejected_requests
+    ),
+    requestStatsAgeSeconds: nullableNonnegativeNumber(
+      record?.request_stats_age_seconds
+    ),
+    requestTelemetryState: state,
+    requestTelemetryReason: record?.request_telemetry_reason ?? null,
+    requestTelemetryGeneration: nullableNonnegativeInteger(
+      record?.request_telemetry_generation
+    ),
+    requestTelemetryCompatibilityComplete:
+      typeof record?.request_telemetry_compatibility_complete === 'boolean'
+        ? record.request_telemetry_compatibility_complete
+        : null,
+    requestReporterCount: nullableNonnegativeInteger(
+      record?.request_reporter_count
+    ),
+  };
+}
+
+export function normalizeServiceDemand(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return null;
+  }
+  return {
+    serviceName: record.service_name ?? null,
+    serviceHash: record.service_hash ?? null,
+    ...normalizeRequestTelemetry(record),
+  };
+}
+
 // Normalize a raw service record from the /serve/status response into the
 // shape consumed by the services pages. Statuses arrive as plain strings
 // (sky/serve/serve_state.py ServiceStatus values).
@@ -530,14 +591,6 @@ export function normalizeService(record) {
     .filter((replica) => !replica.is_spot)
     .reduce((total, replica) => total + replica.hourlyCost, 0);
   const hourlyCostExcludedReplicaCount = excludedReplicas.length;
-  const rawRequestRate = record.requests_per_second;
-  const requestRate =
-    rawRequestRate === null || rawRequestRate === undefined
-      ? null
-      : Number(rawRequestRate);
-  const normalizedRequestRate = Number.isFinite(requestRate)
-    ? requestRate
-    : null;
   const rawObservedReadyReplicas = record.observed_ready_replicas;
   const observedReadyReplicas =
     Number.isInteger(rawObservedReadyReplicas) && rawObservedReadyReplicas >= 0
@@ -547,6 +600,8 @@ export function normalizeService(record) {
     typeof record.observed_ready_replicas_fresh === 'boolean'
       ? record.observed_ready_replicas_fresh
       : null;
+  const requestTelemetry = normalizeRequestTelemetry(record);
+  const normalizedRequestRate = requestTelemetry.requestRate;
   const costPerThousandRequests =
     pricedReplicas.length > 0 && normalizedRequestRate > 0
       ? // Lower bound when replicas with unknown prices are excluded: known
@@ -673,13 +728,7 @@ export function normalizeService(record) {
     pricedReplicaCount: pricedReplicas.length,
     hourlyCostExcludedReplicaCount,
     hourlyCostExclusionReasons,
-    recentRequestCount: record.recent_request_count ?? null,
-    requestWindowSeconds: record.request_window_seconds ?? null,
-    requestRate: normalizedRequestRate,
-    inFlightRequests: record.in_flight_requests ?? null,
-    requestQueueDepth: record.request_queue_depth ?? null,
-    rejectedRequests: record.rejected_requests ?? null,
-    requestStatsAgeSeconds: record.request_stats_age_seconds ?? null,
+    ...requestTelemetry,
     observedReadyReplicas,
     observedReadyReplicasFresh,
     costPerThousandRequests,
@@ -824,6 +873,51 @@ export async function getServiceHistory({
   return {
     ...history,
     legacyFallback: history?.reason === 'non_consolidated',
+  };
+}
+
+export async function getServiceDemand({ serviceName, serviceHash }) {
+  const params = new URLSearchParams({
+    expected_service_hash: serviceHash,
+  });
+  const response = await apiClient.get(
+    `/serve/${encodeURIComponent(serviceName)}/demand?${params.toString()}`
+  );
+  const serverApiVersion = Number(response.headers?.get?.(API_VERSION_HEADER));
+  if (response.status === 404) {
+    const legacyFallback =
+      !Number.isInteger(serverApiVersion) ||
+      serverApiVersion < SERVE_DURABLE_DEMAND_API_VERSION;
+    return {
+      serviceName,
+      serviceHash,
+      requestTelemetryState: 'unavailable',
+      requestTelemetryReason: legacyFallback ? 'unsupported' : 'not_found',
+      legacyFallback,
+    };
+  }
+  if (response.status === 409) {
+    const error = new Error('The service incarnation changed.');
+    error.code = 'SERVICE_HASH_MISMATCH';
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error(
+      `Service demand request failed with status ${response.status}`
+    );
+  }
+  const demand = normalizeServiceDemand(await response.json());
+  if (
+    !demand ||
+    demand.serviceName !== serviceName ||
+    demand.serviceHash !== serviceHash ||
+    demand.requestTelemetryState === null
+  ) {
+    throw new Error('Service demand response was malformed');
+  }
+  return {
+    ...demand,
+    legacyFallback: demand.requestTelemetryReason === 'non_consolidated',
   };
 }
 

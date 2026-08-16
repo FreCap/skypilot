@@ -340,6 +340,7 @@ class SkyServeLoadBalancer:
         # a process incarnation too; otherwise a restarted LB in the same
         # minute could send a lower cumulative count under the old DB key.
         self._request_history_session_id = uuid.uuid4().hex
+        self._demand_report_sequence = 0
         self._completed_async_prediction_ids: collections.OrderedDict[
             str, None] = collections.OrderedDict()
         self._stream_timeout_seconds = constants.DEFAULT_LB_STREAM_TIMEOUT
@@ -1720,6 +1721,7 @@ class SkyServeLoadBalancer:
         """Start and own the load balancer's process-lifetime loops."""
         background_loops = (
             self._sync_with_controller,
+            self._sync_demand_feed,
             self._sync_role_with_controller,
             self._probe_occupancy_loop,
             self._sync_system_recovery_route_lease,
@@ -3948,6 +3950,112 @@ class SkyServeLoadBalancer:
                 # Without a delay, a bad token, unavailable proxy, or failed
                 # controller creates a CPU/network/log hot loop.
                 await asyncio.sleep(retry_delay)
+
+    def _build_demand_report(
+        self
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any],
+               dict[str, Any] | None]:
+        """Build one complete non-destructive central demand snapshot."""
+        request_history = self._request_aggregator.request_history_snapshot()
+        classification = (
+            self._request_aggregator.request_classification_history_snapshot())
+        prediction = (
+            self._request_aggregator.prediction_time_history_snapshot())
+        self._demand_report_sequence += 1
+        payload = {
+            **self._ha_role_payload(),
+            'protocol_version': constants.LB_DEMAND_REPORT_PROTOCOL_VERSION,
+            'sequence': self._demand_report_sequence,
+            'reporter_session_id': self._request_history_session_id,
+            'reporter_observed_at': time.time(),
+            'demand_window': self._request_aggregator.demand_window_snapshot(),
+            'request_history': request_history,
+            'request_classification_history': classification,
+            'prediction_time_history': prediction,
+            'configured_accelerators': list(self._configured_accelerators or
+                                            ()),
+            'request_accelerator_compatibility_version':
+                self._request_accelerator_compatibility_version,
+            'queue_depth': self._queue_depth,
+            'queued_requests_by_compatibility': self._request_queue_profiles(),
+            'rejected_requests_by_compatibility':
+                self._rejected_compatibility_profiles(),
+            'queue_depth_by_priority': self._queue_depth_priority_snapshot(),
+            'rejected_in_window': self._rejected_in_window(),
+            'rejected_in_recent_window': self._rejected_in_recent_window(),
+            'rejected_in_window_by_priority': self._rejected_by_priority(),
+            'rejected_in_recent_window_by_priority':
+                self._rejected_by_priority(recent=True),
+            **self._offered_arrival_counts(),
+        }
+        return payload, request_history, classification, prediction
+
+    async def _sync_demand_feed_once(self) -> None:
+        """Publish one authenticated snapshot without contacting controller."""
+        if self._service_hash is None:
+            return
+        payload, request_history, classification, prediction = (
+            self._build_demand_report())
+        sync_tokens = serve_utils.get_lb_sync_auth_tokens(required=True)
+        token_attempts: tuple[str | None,
+                              ...] = (sync_tokens if sync_tokens else (None,))
+        async with aiohttp.ClientSession() as session:
+            for token_index, controller_token in enumerate(token_attempts):
+                headers = {constants.SERVICE_HASH_HEADER: self._service_hash}
+                if controller_token is not None:
+                    headers['Authorization'] = f'Bearer {controller_token}'
+                async with session.post(
+                        self._controller_url + constants.LB_DEMAND_REPORT_PATH,
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(
+                            constants.LB_DEMAND_REPORT_TIMEOUT_SECONDS),
+                ) as response:
+                    if (response.status == 401 and
+                            token_index + 1 < len(token_attempts)):
+                        continue
+                    response.raise_for_status()
+                    response_json = await response.json()
+                    if response_json.get('request_history_accepted') is True:
+                        self._request_aggregator.mark_request_history_accepted(
+                            request_history)
+                    if response_json.get(
+                            'request_classification_history_accepted') is True:
+                        (self._request_aggregator.
+                         mark_request_classification_history_accepted(
+                             classification))
+                    if response_json.get(
+                            'prediction_time_history_accepted') is True:
+                        (self._request_aggregator.
+                         mark_prediction_time_history_accepted(prediction))
+                    return
+        raise RuntimeError('No demand-feed credential attempt ran.')
+
+    async def _sync_demand_feed(self) -> None:
+        """Maintain telemetry through controller outages and graceful drain."""
+        if self._service_hash is None:
+            return
+        failure_backoff = common_utils.Backoff(
+            initial_backoff=1,
+            max_backoff_factor=constants.LB_DEMAND_REPORT_INTERVAL_SECONDS)
+        while True:
+            round_started_at = time.monotonic()
+            try:
+                await self._sync_demand_feed_once()
+                failure_backoff = common_utils.Backoff(
+                    initial_backoff=1,
+                    max_backoff_factor=(
+                        constants.LB_DEMAND_REPORT_INTERVAL_SECONDS))
+                delay = max(
+                    0.0, constants.LB_DEMAND_REPORT_INTERVAL_SECONDS -
+                    (time.monotonic() - round_started_at))
+            except Exception as e:  # pylint: disable=broad-except
+                delay = min(failure_backoff.current_backoff(),
+                            constants.LB_DEMAND_REPORT_INTERVAL_SECONDS)
+                logger.warning('Durable demand report failed; retrying in '
+                               f'{delay:.1f}s: '
+                               f'{common_utils.format_exception(e)}')
+            await asyncio.sleep(delay)
 
     async def _sync_system_recovery_route_lease_once(self) -> bool:
         """Fetch and apply one authenticated bounded route-lease heartbeat."""

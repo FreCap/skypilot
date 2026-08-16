@@ -12,6 +12,7 @@ jest.mock('@/data/connectors/client', () => ({
 import { apiClient } from '@/data/connectors/client';
 import {
   electServiceVersion,
+  getServiceDemand,
   getServiceHistory,
   getServicePricing,
   getServiceReplicaSummaries,
@@ -22,6 +23,7 @@ import {
   normalizeAcceleratorBreakdown,
   normalizeReplicaHistory,
   normalizeService,
+  normalizeServiceDemand,
   normalizeServiceReplicaSummary,
   normalizeServicePlacement,
   normalizeReplica,
@@ -778,6 +780,109 @@ describe('getServiceHistory', () => {
         hours: 1,
       })
     ).rejects.toThrow('Service history response was malformed');
+  });
+});
+
+describe('getServiceDemand', () => {
+  it('reads and normalizes current telemetry directly', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '82' },
+      json: async () => ({
+        service_name: 'boltz/l4',
+        service_hash: 'hash/a',
+        request_telemetry_state: 'fresh',
+        request_telemetry_reason: 'complete',
+        request_telemetry_generation: 8,
+        request_telemetry_compatibility_complete: true,
+        request_reporter_count: 2,
+        recent_request_count: 12,
+        request_window_seconds: 60,
+        requests_per_second: 0.2,
+        in_flight_requests: 3,
+        request_queue_depth: 1,
+        rejected_requests: 0,
+        request_stats_age_seconds: 1.5,
+      }),
+    });
+
+    const demand = await getServiceDemand({
+      serviceName: 'boltz/l4',
+      serviceHash: 'hash/a',
+    });
+
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/boltz%2Fl4/demand?expected_service_hash=hash%2Fa'
+    );
+    expect(demand).toMatchObject({
+      serviceName: 'boltz/l4',
+      serviceHash: 'hash/a',
+      requestTelemetryState: 'fresh',
+      requestTelemetryGeneration: 8,
+      recentRequestCount: 12,
+      requestRate: 0.2,
+      inFlightRequests: 3,
+      legacyFallback: false,
+    });
+  });
+
+  it('uses legacy fallback only for an old-server 404', async () => {
+    apiClient.get.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      headers: { get: () => '81' },
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({
+      requestTelemetryReason: 'unsupported',
+      legacyFallback: true,
+    });
+
+    apiClient.get.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      headers: { get: () => '82' },
+    });
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).resolves.toMatchObject({
+      requestTelemetryReason: 'not_found',
+      legacyFallback: false,
+    });
+  });
+
+  it('rejects a malformed successful response', async () => {
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => '82' },
+      json: async () => null,
+    });
+
+    await expect(
+      getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
+    ).rejects.toThrow('Service demand response was malformed');
+  });
+
+  it('normalizes null and nonnegative demand fields', () => {
+    expect(
+      normalizeServiceDemand({
+        service_name: 'svc',
+        service_hash: 'hash-a',
+        request_telemetry_state: 'fresh',
+        recent_request_count: 0,
+        requests_per_second: 0,
+        in_flight_requests: -1,
+        request_telemetry_compatibility_complete: 'yes',
+      })
+    ).toMatchObject({
+      recentRequestCount: 0,
+      requestRate: 0,
+      inFlightRequests: null,
+      requestTelemetryCompatibilityComplete: null,
+    });
   });
 });
 

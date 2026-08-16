@@ -8,6 +8,7 @@ active, its target-qps map, the stored stream timeout) -- not on any logging.
 """
 # pylint: disable=invalid-name,protected-access
 import asyncio
+import types
 from unittest import mock
 
 from sky.serve import constants
@@ -269,6 +270,7 @@ class _FakeResp:
     def __init__(self, body, on_enter=None) -> None:
         self._body = body
         self._on_enter = on_enter
+        self.status = 200
 
     async def __aenter__(self):
         if self._on_enter is not None:
@@ -290,6 +292,7 @@ class _FakeSession:
 
     def __init__(self, resp: _FakeResp) -> None:
         self._resp = resp
+        self.post_calls = []
 
     async def __aenter__(self):
         return self
@@ -297,7 +300,8 @@ class _FakeSession:
     async def __aexit__(self, *exc) -> bool:
         return False
 
-    def post(self, *_args, **_kwargs) -> _FakeResp:
+    def post(self, *args, **kwargs) -> _FakeResp:
+        self.post_calls.append((args, kwargs))
         return self._resp
 
 
@@ -337,6 +341,49 @@ def test_large_ready_set_is_not_emitted_to_info_logs():
         _run_one_sync(lb, body)
 
     info.assert_not_called()
+
+
+def test_durable_demand_sync_posts_directly_and_acknowledges_history():
+    lb = _make_lb()
+    lb._service_hash = 'service-hash-a'
+    lb._routing_version = 3
+    lb._configured_accelerators = ('L4',)
+    lb._request_accelerator_compatibility_version = 1
+    lb._request_aggregator.add(
+        types.SimpleNamespace(_skyserve_compatible_accelerators=['L4'],
+                              _skyserve_request_priority=50))
+    response = _FakeResp({
+        'generation': 7,
+        'request_history_accepted': True,
+        'request_classification_history_accepted': True,
+        'prediction_time_history_accepted': True,
+    })
+    session = _FakeSession(response)
+
+    with mock.patch.object(load_balancer.aiohttp,
+                           'ClientSession',
+                           return_value=session), \
+         mock.patch.object(load_balancer.serve_utils,
+                           'get_lb_sync_auth_tokens',
+                           return_value=('sync-token',)), \
+         mock.patch.object(lb,
+                           '_get_lb_session_id',
+                           return_value='test-pod-uid'):
+        asyncio.run(lb._sync_demand_feed_once())
+
+    assert len(session.post_calls) == 1
+    args, kwargs = session.post_calls[0]
+    assert args == ('http://ctrl:8001/demand',)
+    assert kwargs['headers'] == {
+        'Authorization': 'Bearer sync-token',
+        constants.SERVICE_HASH_HEADER: 'service-hash-a',
+    }
+    assert kwargs['json']['protocol_version'] == 1
+    assert kwargs['json']['sequence'] == 1
+    assert kwargs['json']['configured_accelerators'] == ['L4']
+    assert kwargs['json']['demand_window']['buckets'][0]['request_count'] == 1
+    assert kwargs['timeout'].total == constants.LB_DEMAND_REPORT_TIMEOUT_SECONDS
+    assert lb._request_aggregator.request_history_snapshot() is None
 
 
 def test_queue_demand_capability_negotiates_and_downgrades():

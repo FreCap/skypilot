@@ -134,6 +134,9 @@ def test_background_loops_are_owned_until_completion():
                                '_sync_with_controller',
                                side_effect=_loop) as sync, \
              mock.patch.object(lb,
+                               '_sync_demand_feed',
+                               side_effect=_loop) as demand, \
+             mock.patch.object(lb,
                                '_sync_role_with_controller',
                                side_effect=_loop) as role, \
              mock.patch.object(lb,
@@ -145,13 +148,14 @@ def test_background_loops_are_owned_until_completion():
                  side_effect=_loop) as recovery_lease:
             lb._start_background_loops()
             await asyncio.sleep(0)
-            assert len(lb._background_tasks) == 4
+            assert len(lb._background_tasks) == 5
             release.set()
             await asyncio.gather(*tuple(lb._background_tasks))
             await asyncio.sleep(0)
 
         assert not lb._background_tasks
         sync.assert_awaited_once_with()
+        demand.assert_awaited_once_with()
         role.assert_awaited_once_with()
         occupancy.assert_awaited_once_with()
         recovery_lease.assert_awaited_once_with()
@@ -231,6 +235,9 @@ def test_background_loop_cancellation_is_quiet_and_released():
                                    '_sync_with_controller',
                                    side_effect=_loop), \
                  mock.patch.object(lb,
+                                   '_sync_demand_feed',
+                                   side_effect=_loop), \
+                 mock.patch.object(lb,
                                    '_sync_role_with_controller',
                                    side_effect=_loop), \
                  mock.patch.object(lb,
@@ -243,7 +250,7 @@ def test_background_loop_cancellation_is_quiet_and_released():
                 lb._start_background_loops()
                 await asyncio.wait_for(started.wait(), timeout=1)
                 tasks = tuple(lb._background_tasks)
-                assert len(tasks) == 4
+                assert len(tasks) == 5
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)

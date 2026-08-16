@@ -73,9 +73,109 @@ def test_replica_reads_have_a_distinct_api_capability_version():
             < preemptible_service_breakdown_version)
     assert (preemptible_service_breakdown_version
             < non_pool_launch_binding_version)
+    durable_demand_version = (
+        server_constants.MIN_SERVE_DURABLE_DEMAND_API_VERSION)
+    assert durable_demand_version == 82
     assert non_pool_launch_binding_version < operational_priority_breakdown_version
-    assert (
-        server_constants.API_VERSION == operational_priority_breakdown_version)
+    assert operational_priority_breakdown_version < durable_demand_version
+    assert server_constants.API_VERSION == durable_demand_version
+
+
+def test_current_demand_reads_database_without_controller():
+    snapshot = {
+        'hash': 'hash-a',
+        'pool': False,
+    }
+    summary = {
+        'request_telemetry_state': 'fresh',
+        'request_telemetry_generation': 7,
+        'recent_request_count': 12,
+    }
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value=snapshot), \
+         mock.patch.object(server.demand_state,
+                           'get_request_summary',
+                           return_value=summary) as get_summary, \
+         mock.patch.object(server.executor,
+                           'schedule_request_async',
+                           new_callable=mock.AsyncMock) as schedule:
+        response = _client().get('/serve/svc/demand',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'service_name': 'svc',
+        'service_hash': 'hash-a',
+        **summary,
+    }
+    get_summary.assert_called_once_with('svc', 'hash-a')
+    schedule.assert_not_awaited()
+
+
+@pytest.mark.parametrize(('snapshot', 'expected_status'), [(None, 404),
+                                                           ({
+                                                               'hash': 'hash-a',
+                                                               'pool': True
+                                                           }, 404),
+                                                           ({
+                                                               'hash': 'hash-b',
+                                                               'pool': False
+                                                           }, 409)])
+def test_current_demand_fences_service_incarnation(snapshot, expected_status):
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value=snapshot), \
+         mock.patch.object(server.demand_state,
+                           'get_request_summary') as get_summary:
+        response = _client().get('/serve/svc/demand',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == expected_status
+    get_summary.assert_not_called()
+
+
+def test_current_demand_reports_non_consolidated_capability():
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=False), \
+         mock.patch.object(server.demand_state,
+                           'get_request_summary') as get_summary:
+        response = _client().get('/serve/svc/demand',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == 200
+    assert response.json()['request_telemetry_reason'] == 'non_consolidated'
+    get_summary.assert_not_called()
+
+
+def test_current_demand_fences_a_race_after_service_snapshot():
+    with mock.patch.object(server.serve_utils,
+                           'is_consolidation_mode',
+                           return_value=True), \
+         mock.patch.object(server.serve_state,
+                           'get_service_status_snapshot',
+                           return_value={
+                               'hash': 'hash-a',
+                               'pool': False,
+                           }), \
+         mock.patch.object(
+             server.demand_state,
+             'get_request_summary',
+             return_value={
+                 'request_telemetry_state': 'unavailable',
+                 'request_telemetry_reason': 'service_incarnation_mismatch',
+             }):
+        response = _client().get('/serve/svc/demand',
+                                 params={'expected_service_hash': 'hash-a'})
+
+    assert response.status_code == 409
 
 
 def test_replica_summaries_batch_repeated_names_without_executor():
