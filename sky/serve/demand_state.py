@@ -290,6 +290,19 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
          isinstance(routing_version, bool) or routing_version < 1)):
         raise DemandReportError(
             'routing_version must be a positive integer or null.')
+    route_projection_generation = raw.get('route_projection_generation')
+    route_projection_sha256 = raw.get('route_projection_sha256')
+    route_source_epoch = raw.get('route_source_epoch')
+    route_fence = (route_projection_generation, route_projection_sha256,
+                   route_source_epoch)
+    if any(value is not None for value in route_fence):
+        _positive_int(route_projection_generation,
+                      'route_projection_generation')
+        if (not isinstance(route_projection_sha256, str) or
+                re.fullmatch(r'[0-9a-f]{64}', route_projection_sha256) is None):
+            raise DemandReportError(
+                'route_projection_sha256 must be SHA-256 or null.')
+        _positive_int(route_source_epoch, 'route_source_epoch')
     try:
         role = lb_ha.LbRole(raw.get('applied_role'))
     except (TypeError, ValueError):

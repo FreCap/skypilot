@@ -20,6 +20,7 @@ from sky import sky_logging
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import lb_ha_observability as lb_ha_obs
+from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_utils
 
@@ -277,6 +278,35 @@ async def _proxy_controller_sync(service_name: str, request: fastapi.Request,
 @router.post(CONTROLLER_SYNC_ROUTE_PATH, include_in_schema=False)
 async def proxy_load_balancer_sync(
         service_name: str, request: fastapi.Request) -> fastapi.Response:
+    service_hash = request.headers.get(constants.SERVICE_HASH_HEADER)
+    if not service_hash:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'detail': 'Service incarnation header is required.'})
+    try:
+        body = await request.body()
+        payload = json.loads(body)
+        lb_session_id = (payload.get('lb_session_id') if isinstance(
+            payload, dict) else None)
+    except json.JSONDecodeError:
+        # Legacy controllers own validation until a service is promoted.  A
+        # malformed body therefore still follows the exact historical proxy
+        # path when the durable mode says LEGACY_PROXY.
+        lb_session_id = None
+    try:
+        decision = await asyncio.to_thread(
+            route_projection.RouteProjectionRepository().resolve_sync,
+            service_name, service_hash, lb_session_id)
+    except route_projection.RouteProjectionConflict as error:
+        return fastapi.responses.JSONResponse(status_code=409,
+                                              content={'detail': str(error)})
+    except route_projection.RouteProjectionUnavailable as error:
+        return fastapi.responses.JSONResponse(status_code=503,
+                                              content={'detail': str(error)})
+    if decision.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED:
+        assert decision.response is not None
+        return fastapi.responses.JSONResponse(status_code=200,
+                                              content=decision.response)
     return await _proxy_controller_sync(service_name, request,
                                         constants.LB_CONTROLLER_SYNC_PATH)
 

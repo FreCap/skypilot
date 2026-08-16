@@ -85,6 +85,24 @@ def test_validate_report_accepts_complete_bounded_snapshot():
     assert complete is True
 
 
+def test_validate_report_accepts_only_complete_route_projection_fence():
+    report = _report()
+    report.update({
+        'route_projection_generation': 9,
+        'route_projection_sha256': 'a' * 64,
+        'route_source_epoch': 2,
+    })
+    normalized, _, _ = demand_state._validate_report(report)
+    assert normalized['route_projection_generation'] == 9
+
+    for field in ('route_projection_generation', 'route_projection_sha256',
+                  'route_source_epoch'):
+        partial = _report()
+        partial[field] = report[field]
+        with pytest.raises(demand_state.DemandReportError):
+            demand_state._validate_report(partial)
+
+
 def test_validate_report_rejects_occupancy_without_matching_freshness():
     report = _report()
     report['occupancy_sample_age_seconds'] = {}

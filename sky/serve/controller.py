@@ -55,6 +55,7 @@ from sky.serve import replica_managers
 from sky.serve import reserved_capacity
 from sky.serve import reserved_fill_allocation
 from sky.serve import reserved_fill_planner
+from sky.serve import route_projection
 from sky.serve import scale_reconciliation
 from sky.serve import serve_state
 from sky.serve import serve_utils
@@ -645,6 +646,10 @@ class SkyServeController:
         # advertise a newer routing policy than the runtime has actually
         # applied.
         self._routing_spec = self._build_routing_spec(service_spec)
+        if (self._ordinary_launch_binding_authority is not None and
+                not self._is_pool):
+            self._replica_manager.set_route_projection_publisher(
+                self._publish_route_projection)
         # Refreshed only by autoscaler/LB-sync paths that already hold a full
         # replica snapshot. Status polling reads this without new DB/API work.
         self._replica_counts_snapshot: dict[str, int | str] | None = None
@@ -2814,6 +2819,80 @@ class SkyServeController:
                 (owner.get('controller_pid'), owner.get('controller_ip'))
                 == controller_owner)
 
+    def _publish_route_projection(
+            self, probe_result: replica_managers.ProbeRouteResult) -> None:
+        """Publish one complete readiness result without new provider reads."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or self._is_pool or not self._owns_current_service(
+        ):
+            return
+        with self._routing_state_lock:
+            service_version = self._applied_version
+            routing_spec = self._get_routing_spec()
+        if routing_spec is None:
+            return
+        replica_infos = probe_result.replica_infos
+        replica_versions = sorted(
+            {service_version, *(info.version for info in replica_infos)})
+        version_specs = serve_state.get_specs(self._service_name,
+                                              replica_versions)
+        async_occupancy_by_version: dict[int, bool | None] = {}
+        logical_versions: set[int] = set()
+        for replica_version in replica_versions:
+            version_spec = version_specs.get(replica_version)
+            async_occupancy_by_version[replica_version] = (
+                None if version_spec is None else
+                version_spec.graceful_drain_async_occupancy)
+            if (version_spec is not None and
+                    version_spec.uses_logical_replicas is True):
+                logical_versions.add(replica_version)
+        runtime_snapshot = serve_state.get_service_runtime_snapshot(
+            self._service_name, require_version=True)
+        if (runtime_snapshot is None or
+                runtime_snapshot.get('hash') != self._service_hash or
+            (runtime_snapshot.get('controller_pid'),
+             runtime_snapshot.get('controller_ip')) != self._controller_owner):
+            return
+        active_versions = set(runtime_snapshot['active_versions'])
+        translation_cache = {
+            replica_id: (material.url, material.gpu_type, material.gpu_count)
+            for replica_id, material in probe_result.resolved_routes.items()
+        }
+        replica_counts = self._get_replica_counts(
+            replica_infos, translation_cache=translation_cache)
+        capacity_hint = self._get_capacity_hint(
+            replica_infos,
+            logical_versions,
+            replica_counts=replica_counts,
+            translation_cache=translation_cache)
+        route_view = route_projection.build_route_view(
+            replica_infos,
+            probe_result.resolved_routes,
+            probe_result.identity_verified_replica_ids,
+            active_versions,
+            async_occupancy_by_version,
+            service_version=service_version,
+            routing_spec=routing_spec,
+            capacity_hint=capacity_hint,
+            route_allowed=self._replica_manager.system_recovery_allows_routing,
+            marker_for_route=(
+                self._replica_manager.system_recovery_route_marker),
+            retire_route=self._replica_manager.retire_system_recovery_route)
+        latest_spec = version_specs.get(service_version)
+        if latest_spec is None:
+            return
+        ttl_seconds = max(
+            3 * int(latest_spec.endpoint_probe_interval_seconds),
+            3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+        repository = route_projection.RouteProjectionRepository()
+        repository.publish(
+            route_projection.publisher_identity_from_authority(authority),
+            service_version,
+            route_view.response,
+            route_view.identities,
+            route_view.live_record_ids,
+            ttl_seconds=ttl_seconds)
+
     def _snapshot_replica_occupancy(
         self
     ) -> tuple[list['replica_managers.ReplicaInfo'], dict[int, bool | None],
@@ -2844,6 +2923,7 @@ class SkyServeController:
         replica_infos: list['replica_managers.ReplicaInfo'],
         logical_versions: set[int] | None = None,
         replica_counts: dict[str, Any] | None = None,
+        translation_cache: dict[int, tuple[str, str, int]] | None = None,
     ) -> dict[str, Any]:
         """Build the capacity_hint block of the sync response.
 
@@ -2925,11 +3005,15 @@ class SkyServeController:
             hint['cold_launch_authority_by_accelerator'] = dict(
                 self._autoscaler.cold_launch_authority_by_accelerator)
         if logical:
+            effective_translation_cache = (self._lb_translation_cache
+                                           if translation_cache is None else
+                                           translation_cache)
             planned_capacity_by_url = {
                 cached[0]: info.planned_capacity for info in replica_infos
                 if (info.version in logical_versions or info.
                     logical_bridge_capacity_verified) and not info.is_terminal
-                for cached in [self._lb_translation_cache.get(info.replica_id)]
+                for cached in
+                [effective_translation_cache.get(info.replica_id)]
                 if cached is not None
             }
             hint['planned_capacity_by_url'] = planned_capacity_by_url
@@ -2939,6 +3023,7 @@ class SkyServeController:
     def _get_replica_counts(
         self,
         replica_infos: list['replica_managers.ReplicaInfo'],
+        translation_cache: dict[int, tuple[str, str, int]] | None = None,
     ) -> dict[str, Any]:
         """Return logical capacity and physical backend status aggregates."""
         autoscaler = self._autoscaler
@@ -2958,13 +3043,16 @@ class SkyServeController:
             serve_state.ReplicaStatus.STARTING,
             serve_state.ReplicaStatus.NOT_READY,
         }
+        effective_translation_cache = (self._lb_translation_cache
+                                       if translation_cache is None else
+                                       translation_cache)
         for info in replica_infos:
             status = info.status
             # Pre-activation bridge rows deserialize with planned_capacity=1;
             # every logical version keeps its selected width. This lets a
             # rolling activation count both generations without spec queries.
             width = info.planned_capacity if logical else 1
-            cached = self._lb_translation_cache.get(info.replica_id)
+            cached = effective_translation_cache.get(info.replica_id)
             accelerator = cached[1] if cached is not None else 'unknown'
             if accelerator == 'unknown':
                 accelerators = (info.resources_override or

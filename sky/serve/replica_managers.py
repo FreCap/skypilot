@@ -48,6 +48,7 @@ from sky.serve import replica_tls
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
+from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -113,6 +114,18 @@ _DEFAULT_LAUNCH_MAX_RETRY = 3
 _DEFAULT_DRAIN_SECONDS = 120
 # Poll cadence for the in-flight-aware drain wait during replica retirement.
 _DRAIN_POLL_SECONDS = 2
+
+
+@dataclasses.dataclass(frozen=True)
+class ProbeRouteResult:
+    """Provider observations belonging to one completed readiness round."""
+
+    replica_infos: list['ReplicaInfo']
+    resolved_routes: dict[int, route_projection.ResolvedRouteMaterial]
+    identity_verified_replica_ids: set[int]
+    complete: bool
+
+
 # Wall-clock persistence is the only way to carry a drain deadline across
 # process restarts. Accept ordinary NTP skew, but rewrite timestamps farther in
 # the future before admitting teardown so one corrupted row cannot postpone
@@ -2620,6 +2633,9 @@ class ReplicaManager:
         self._update_recovery_required = False
         self._pending_version: int | None = None
         self._drain_proof_stats_value = drain_observability.DrainProofStats()
+        self._last_probe_route_result: ProbeRouteResult | None = None
+        self._route_projection_publisher: Callable[[ProbeRouteResult],
+                                                   None] | None = None
 
     def __init__(self,
                  service_name: str,
@@ -3023,6 +3039,11 @@ class ReplicaManager:
     def get_active_replica_urls(self) -> list[str]:
         """Get the urls of the active replicas."""
         raise NotImplementedError
+
+    def set_route_projection_publisher(
+            self, publisher: Callable[[ProbeRouteResult], None] | None) -> None:
+        """Install the post-readiness publisher for complete probe rounds."""
+        self._route_projection_publisher = publisher
 
     def system_recovery_allows_routing(self, info: 'ReplicaInfo') -> bool:
         """Whether recovery state permits a READY row to route."""
@@ -13323,6 +13344,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         *,
         phase_admission: provider_phase.ProviderPhaseAdmission | None = None,
         deferred_replica_ids: set[int] | None = None,
+        identity_rejected_replica_ids: set[int] | None = None,
+        resolved_route_material: dict[int,
+                                      route_projection.ResolvedRouteMaterial] |
+        None = None,
     ) -> dict[int, str | None]:
         """Resolve one endpoint per replica from batched cluster state.
 
@@ -13349,6 +13374,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 error: exceptions.KubernetesPhysicalClusterIdentityError
         ) -> None:
             urls[info.replica_id] = None
+            if identity_rejected_replica_ids is not None:
+                identity_rejected_replica_ids.add(info.replica_id)
             self._record_provider_identity_uncertain(
                 info, 'endpoint resolution was fenced off: '
                 f'{common_utils.format_exception(error)}')
@@ -13414,11 +13441,31 @@ class SkyPilotReplicaManager(ReplicaManager):
             if cluster_record is None or handle is None:
                 urls[info.replica_id] = None
                 return
-            urls[info.replica_id] = info._resolve_url(  # pylint: disable=protected-access
+            resolved_url = info._resolve_url(  # pylint: disable=protected-access
                 cluster_record=cluster_record,
                 handle=handle,
                 provider_config=provider_configs.get(info.replica_id),
             )
+            urls[info.replica_id] = resolved_url
+            if resolved_url is not None and resolved_route_material is not None:
+                try:
+                    normalized_url = (system_recovery_route_lease.
+                                      normalize_route_url(resolved_url))
+                except system_recovery_route_lease.RouteLeaseError:
+                    normalized_url = None
+                if normalized_url is not None:
+                    gpu_type = 'unknown'
+                    gpu_count = 1
+                    accelerators = handle.launched_resources.accelerators
+                    if accelerators:
+                        gpu_type = next(iter(accelerators))
+                        try:
+                            gpu_count = max(1, int(accelerators[gpu_type]))
+                        except (TypeError, ValueError):
+                            gpu_count = 1
+                    resolved_route_material[info.replica_id] = (
+                        route_projection.ResolvedRouteMaterial(
+                            normalized_url, gpu_type, gpu_count))
             self._provider_identity_uncertain_replica_ids().discard(
                 info.replica_id)
 
@@ -13467,6 +13514,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                        wait_for_initializer=False)
             elif ordinary_infos:
                 _resolve_ordinary(phase_admission)
+            for info in infos:
+                urls.setdefault(info.replica_id, None)
             return urls
 
         # Standalone active-URL reads establish the process phase themselves,
@@ -13479,6 +13528,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             with provider_phase.provider_phase(provider_phase.ProviderPhaseMode.
                                                AMBIENT_LEGACY) as admission:
                 _resolve_ordinary(admission)
+        for info in infos:
+            urls.setdefault(info.replica_id, None)
         return urls
 
     def _reduce_candidate_probe(
@@ -13664,6 +13715,7 @@ class SkyPilotReplicaManager(ReplicaManager):
     @with_lock
     def _probe_all_replicas(self) -> list[ReplicaInfo]:
         """Run one probe round under one physical UID proof per pool."""
+        self._last_probe_route_result = None
         infos = serve_state.get_replica_infos(self._service_name)
         if self._update_recovery_required:
             return infos
@@ -13725,6 +13777,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         ]
         phased_snapshots: list[ReplicaInfo] = []
         participated_replica_ids: set[int] = set()
+        resolved_routes: dict[int, route_projection.ResolvedRouteMaterial] = {}
+        deferred_route_ids: set[int] = set()
+        identity_rejected_route_ids: set[int] = set()
+        projection_complete = True
         if fenced_infos:
             try:
                 with provider_phase.try_provider_phase(
@@ -13749,6 +13805,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 # An existing initializer cannot be joined while
                                 # self.lock is held. Preserve every row and retry
                                 # the complete group next tick with no evidence.
+                                projection_complete = False
                                 continue
                             if not isinstance(
                                     error, exceptions.
@@ -13771,13 +13828,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                             phased_snapshots.extend(
                                 self._probe_all_replicas_with_snapshot(
                                     admitted_infos,
-                                    phase_admission=phase_admission))
+                                    phase_admission=phase_admission,
+                                    resolved_route_material=resolved_routes,
+                                    deferred_route_ids=deferred_route_ids,
+                                    identity_rejected_route_ids=(
+                                        identity_rejected_route_ids)))
                             if self._update_recovery_required:
                                 return infos
                             participated_replica_ids.update(
                                 info.replica_id for info in admitted_infos)
             except exceptions.ProviderPhaseBusyError:
-                pass
+                projection_complete = False
 
         if ordinary_infos:
             try:
@@ -13788,13 +13849,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 ) as phase_admission:
                     phased_snapshots.extend(
                         self._probe_all_replicas_with_snapshot(
-                            ordinary_infos, phase_admission=phase_admission))
+                            ordinary_infos,
+                            phase_admission=phase_admission,
+                            resolved_route_material=resolved_routes,
+                            deferred_route_ids=deferred_route_ids,
+                            identity_rejected_route_ids=(
+                                identity_rejected_route_ids)))
                     if self._update_recovery_required:
                         return infos
                     participated_replica_ids.update(
                         info.replica_id for info in ordinary_infos)
             except exceptions.ProviderPhaseBusyError:
-                pass
+                projection_complete = False
 
         snapshot_by_id = {info.replica_id: info for info in phased_snapshots}
         snapshot: list[ReplicaInfo] = []
@@ -13808,6 +13874,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
             # Untracked, malformed, and admission-denied rows are unchanged.
             snapshot.append(info)
+        self._last_probe_route_result = ProbeRouteResult(
+            replica_infos=snapshot,
+            resolved_routes=resolved_routes,
+            identity_verified_replica_ids=(participated_replica_ids -
+                                           identity_rejected_route_ids),
+            complete=projection_complete and not deferred_route_ids)
         return snapshot
 
     def _probe_all_replicas_with_snapshot(
@@ -13815,6 +13887,11 @@ class SkyPilotReplicaManager(ReplicaManager):
         infos: list[ReplicaInfo],
         *,
         phase_admission: provider_phase.ProviderPhaseAdmission,
+        resolved_route_material: dict[int,
+                                      route_projection.ResolvedRouteMaterial] |
+        None = None,
+        deferred_route_ids: set[int] | None = None,
+        identity_rejected_route_ids: set[int] | None = None,
     ) -> list[ReplicaInfo]:
         """Readiness probe replicas.
 
@@ -13860,7 +13937,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                     f'{version_label} {missing_versions_str} not found.')
             self._tick_version_spec_cache.update(specs)
             probe_urls = self._resolve_probe_urls(
-                infos_to_probe, phase_admission=phase_admission)
+                infos_to_probe,
+                phase_admission=phase_admission,
+                deferred_replica_ids=deferred_route_ids,
+                identity_rejected_replica_ids=identity_rejected_route_ids,
+                resolved_route_material=resolved_route_material)
             if self._update_recovery_required:
                 return infos
         else:
@@ -14794,6 +14875,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # versions of all load balancers.
                 self._set_service_status_from_replica_infos(
                     replica_infos, expected_status_epoch=status_epoch)
+                route_result = self._last_probe_route_result
+                publisher = self._route_projection_publisher
+                if (publisher is not None and route_result is not None and
+                        route_result.replica_infos is replica_infos and
+                        route_result.complete and
+                        not self._manager_daemon_should_stop()):
+                    publisher(route_result)
 
             except Exception as e:  # pylint: disable=broad-except
                 # No matter what error happens, we should keep the

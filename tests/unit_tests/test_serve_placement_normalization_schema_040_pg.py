@@ -243,7 +243,7 @@ def _insert_manifest(connection: sqlalchemy.engine.Connection,
 
 
 def test_serve040_lineage_and_postgresql_only() -> None:
-    assert migration_utils.SERVE_VERSION == '048'
+    assert migration_utils.SERVE_VERSION == '049'
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)

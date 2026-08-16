@@ -1,8 +1,9 @@
 # SkyServe demand, capacity, and telemetry convergence
 
 Status: P1 is implemented in draft PR #1498; the rebased and locally reviewed
-P2a implementation is in draft PR #1499; production remains on the legacy
-controller-coupled demand path
+P2a implementation is in draft PR #1499; P2b1 route projection is implemented
+and locally reviewed on its stacked branch but not yet published; production
+remains on the legacy controller-coupled demand and route paths
 
 Last updated: 2026-08-16
 
@@ -243,18 +244,49 @@ positive residual. Reserved-fill admission can never select either market.
 ### Route projection
 
 The controller publishes a generation only after bounded readiness probes and
-the complete service/replica snapshot finish. The projection contains exact
-service hash, version, controller-owner epoch, route generation, routing-spec
-version, normalized endpoint, replica/record identity, accelerator/capacity,
-readiness, drain eligibility, and `valid_until`.
+the complete service/replica snapshot finish. Immutable snapshot metadata
+contains the exact service hash/lifecycle, applied service version,
+controller-owner tuple, protocol, generation, and digest. Its full response
+contains the routing spec, normalized routable endpoints, accelerator
+material, and capacity hint; its private identity payload binds current and
+bounded alias URLs to exact replica records. The freshness head owns
+`refreshed_at` and `valid_until`.
 
-Publication replaces one service generation transactionally. An ambiguous
-replica is omitted or marked unroutable without suppressing healthy siblings.
-The stable API and load balancer read the projection only; they perform no
-provider, Kubernetes, Ray, or cluster-database query. A stale projection keeps
-the last known route only under the existing bounded outage contract and is
-shown as stale. It cannot contribute ready capacity to a new paid-admission
-decision.
+Serve049 stores immutable, full route snapshots plus one freshness-bearing
+head per service. A semantic change inserts one snapshot and advances the head;
+an identical bounded probe round refreshes only the head. The snapshot owns the
+existing LB response document and a private normalized URL -> exact
+replica/record identity map. It does not add a second full/delta application
+protocol. Old snapshots are retained for longer than the demand-report TTL and
+are pruned by a fixed upper bound.
+
+Every projected response adds the snapshot generation, digest, and route-source
+epoch. The LB records those fields only after it atomically applies that same
+routing spec and ready set, then echoes them in its durable demand report.
+Future demand authority can therefore translate URL-keyed occupancy through
+the exact immutable snapshot the reporter observed; a current URL is never
+guessed to represent an older report.
+
+Publication locks the service row; reads use one PostgreSQL transaction and
+exact-match the service hash, lifecycle epoch, controller
+incarnation/owner epoch, PID/IP, applied version, and non-pool discriminator.
+The service row has one explicit
+`LEGACY_PROXY` or `DURABLE_PROJECTED` route mode and monotonic mode epoch.
+Promotion requires a fresh complete head published by the current capable
+controller incarnation. After promotion, a missing, corrupt, stale, or
+owner-mismatched projection fails closed; it never falls back to the controller
+proxy. The legacy proxy remains the only response owner before promotion.
+
+An ambiguous replica is omitted or marked unroutable without suppressing
+healthy siblings. Provider-phase contention with no observation makes the
+whole publication round incomplete and leaves the prior head untouched; an
+identity failure for one exact row is positive ambiguity evidence and only
+withholds that row. The stable API and load balancer read the projection only;
+they perform no provider, Kubernetes, Ray, or cluster-database query. A stale
+read returns unavailable, so a warm LB retains its already-applied routes under
+the existing sync-outage behavior while a cold LB cannot become ready from
+stale evidence. A stale generation is visible as stale telemetry and cannot
+contribute ready capacity to a new paid-admission decision.
 
 ### Dashboard
 
@@ -363,23 +395,58 @@ Prettier, and the exact HA cases where replica-global async occupancy must not
 be double-counted and a fresh standby must not turn an expired active report
 into a false zero. CI and live rollout evidence remain open.
 
-### P2b: one demand authority, routes, and ordered capacity admission
+### P2b1: provider-free route projection
 
-API012/Serve049 add API-fleet capability identity, explicit per-service demand
-promotion, the autoscaler durable reader, route projection,
-content-addressed planner-generation fields, the source demand receipt
-watermark, and the paid-authority tuple. Serve049 also owns the demand
-promotion mode and epoch; Serve048 deliberately does not add authority fields.
-Promotion disables controller-sync demand mutation for that service epoch.
-Zero-cost admission is committed before paid residual planning, and both are
-revalidated before provider I/O. A heartbeat with unchanged normalized demand
-does not mint a new planner generation or invalidate already-admitted work.
+API version 81/Serve049 add bounded immutable full route generations, one
+freshness-bearing head, and an explicit per-service route mode/epoch. The
+replica readiness owner publishes the complete route/routing-spec response
+from the bounded probe round's already-resolved endpoints and exact replica
+records. The stable API can answer the existing LB sync wire shape from
+PostgreSQL without a provider, Kubernetes, Ray, cluster-record, or
+service-controller read.
 
-Expected size: medium/large, approximately 1,500--2,500 source/test/UI lines.
+The projection is dark until one exact API/LB/controller cohort is capable and
+a fresh complete generation exists. Promotion changes only the response owner;
+it does not create a second LB application format. Legacy controller proxying
+is the temporary transition path and is removed by P3. A stale projection may
+retain an already-applied route only under the existing bounded LB outage
+contract; it is never ready capacity for planning.
+
+Current implementation size: approximately 2,000 source/test/design lines
+across 25 files, including about 600 lines of pure and real-PostgreSQL tests.
+The increase over the 900--1,500 estimate comes from closed persisted-payload
+validation, immutable URL/record alias evidence, and integration tests at the
+probe, proxy, LB-apply, and demand-report boundaries. The earlier experimental
+route branch is not a source of truth: it added roughly 5,500 lines, was not
+connected to runtime publication or reads, and duplicated full and delta
+application machinery that the existing LB wire contract does not need.
+
+Local P2b1 review evidence on 2026-08-16 includes the complete existing Serve
+replica-manager module, new route/proxy/LB/demand unit tests, all new Serve049
+real-PostgreSQL tests, the earlier Serve schema migration matrix, repository
+mypy, changed-source pylint, YAPF/isort, and whitespace checks. Adversarial
+review found and fixed a poisoned-row isolation bug: a malformed retained
+record identity is now withheld from both public routing and private identity
+translation without suppressing healthy siblings. CI, PR review, and live dark
+publication evidence remain open.
+
+### P2b2: one demand authority and ordered capacity admission
+
+API012/Serve050 add API-fleet capability identity, explicit per-service demand
+promotion, the autoscaler durable reader, content-addressed planner-generation
+fields, the source demand receipt watermark, and the paid-authority tuple.
+Serve050 owns the demand promotion mode and epoch; Serve048 deliberately does
+not add authority fields. Promotion disables controller-sync demand mutation
+for that service epoch. Zero-cost admission is committed before paid residual
+planning, and both are revalidated before provider I/O. A heartbeat with
+unchanged normalized demand does not mint a new planner generation or
+invalidate already-admitted work.
+
+Expected size: medium/large, approximately 1,200--2,000 source/test/UI lines.
 
 ### P3: blocked steady-state cleanup
 
-Author API013/Serve050 with P1/P2 and keep it stacked and blocked. After the
+Author API013/Serve051 with P1/P2 and keep it stacked and blocked. After the
 documented rollout gates it removes controller-coupled telemetry ingestion,
 unbound non-pool admission/recovery, the ordinary-only handler alias, global
 startup recovery waiting, cluster-name/process-map authority, legacy incident
@@ -465,6 +532,14 @@ reserved-broker, paid-claim, projection, and ordinary-binding abstractions. It
 adds two durable operational concepts only: a live demand report and a route
 generation. The final cleanup removes their predecessor paths.
 
+P2b1 adversarial review also rejected a mutable current-route row and a new
+full/delta LB protocol. The accepted implementation keeps immutable full
+snapshots with one freshness head, uses the existing full sync response, binds
+each response to an exact private URL/record map, and retains only bounded
+fixed-lifetime aliases for already-live records. It fails closed when route
+source ownership cannot be proven and isolates exact malformed or colliding
+rows instead of converting ambiguity into a fleet-wide publication barrier.
+
 ## Open gates
 
 - [ ] Deploy and verify v1.1.1284 in production without normalization or
@@ -476,7 +551,8 @@ generation. The final cleanup removes their predecessor paths.
 - [ ] Reconcile the exact seven-row production scope without fabricated
   quiescence or manual row deletion.
 - [x] Publish the P2a durable-demand/UI draft as PR #1499.
-- [ ] Publish P2b and update P3 for every transition-only demand/route path.
+- [ ] Publish P2b1/P2b2 and update P3 for every transition-only demand/route
+  path.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set

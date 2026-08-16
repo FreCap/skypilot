@@ -11,6 +11,8 @@ import asyncio
 import types
 from unittest import mock
 
+import pytest
+
 from sky.serve import constants
 from sky.serve import load_balancer
 from sky.serve import load_balancing_policies as lb_policies
@@ -409,6 +411,74 @@ def test_queue_demand_capability_negotiates_and_downgrades():
         'routing_spec': routing_spec,
     })
     assert lb._queued_compatibility_demand_supported is False
+
+
+def test_projected_route_fence_advances_only_after_full_route_apply():
+    lb = _make_lb()
+    digest = 'b' * 64
+    _run_one_sync(
+        lb, {
+            'replica_info': {
+                'http://replica:8080': {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                }
+            },
+            'num_ready_replicas': 1,
+            'routing_spec': {
+                'load_balancing_policy_name': 'least_load',
+            },
+            'service_version': 7,
+            'route_projection_generation': 11,
+            'route_projection_sha256': digest,
+            'route_source_epoch': 3,
+        })
+
+    assert lb._routing_version == 7
+    assert lb._route_projection_generation == 11
+    assert lb._route_projection_sha256 == digest
+    assert lb._route_source_epoch == 3
+    report, _, _, _ = lb._build_demand_report()
+    assert report['route_projection_generation'] == 11
+    assert report['route_projection_sha256'] == digest
+    assert report['route_source_epoch'] == 3
+
+    # A complete but temporarily unresolvable next generation retains both
+    # the already-applied routes and the exact acknowledgement fence.
+    _run_one_sync(
+        lb, {
+            'replica_info': {},
+            'num_ready_replicas': 1,
+            'routing_spec': {
+                'load_balancing_policy_name': 'least_load',
+            },
+            'service_version': 8,
+            'route_projection_generation': 12,
+            'route_projection_sha256': 'c' * 64,
+            'route_source_epoch': 3,
+        })
+    assert lb._routing_version == 7
+    assert lb._route_projection_generation == 11
+    assert lb._route_projection_sha256 == digest
+
+
+def test_partial_projected_route_fence_is_rejected_without_advancing():
+    lb = _make_lb()
+
+    with pytest.raises(ValueError, match='fence is malformed'):
+        _run_one_sync(
+            lb, {
+                'replica_info': {},
+                'num_ready_replicas': 0,
+                'routing_spec': {
+                    'load_balancing_policy_name': 'least_load',
+                },
+                'service_version': 7,
+                'route_projection_generation': 1,
+            })
+
+    assert lb._routing_version is None
+    assert lb._route_projection_generation is None
 
 
 def test_request_routing_does_not_emit_per_attempt_logs():
