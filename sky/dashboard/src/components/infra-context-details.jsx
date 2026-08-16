@@ -9,12 +9,12 @@ import { PluginSlot } from '@/plugins/PluginSlot';
 
 // Tooltip text for the preemptible segment: the priority classes holding
 // those accelerators, largest first, e.g.
-//   "66 other preemptible (reclaimable by higher-priority workloads)
+//   "66 preemptible attributed to non-SkyServe pods
 //    inference-low (-1000): 60
 //    drill (-500): 6"
 const buildPreemptibleTitle = (preemptible, breakdown) => {
   const header =
-    `${preemptible} other preemptible ` +
+    `${preemptible} preemptible attributed to non-SkyServe pods ` +
     `(reclaimable by higher-priority workloads)`;
   const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
   if (entries.length === 0) {
@@ -27,7 +27,7 @@ const buildPreemptibleTitle = (preemptible, breakdown) => {
 
 const buildServicePreemptibleTitle = (preemptible, breakdown) => {
   const header =
-    `${preemptible} SkyServe preemptible ` +
+    `${preemptible} preemptible attributed to SkyServe pods ` +
     `(reclaimable by higher-priority workloads)`;
   const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
   if (entries.length === 0) {
@@ -37,6 +37,19 @@ const buildServicePreemptibleTitle = (preemptible, breakdown) => {
     header,
     ...entries.map(([service, qty]) => `${service}: ${qty}`),
   ].join('\n');
+};
+
+const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
+  const header =
+    `${preemptible} preemptible; SkyServe pod attribution unavailable ` +
+    `(pods lack durable SkyPilot workload identity)`;
+  const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) {
+    return header;
+  }
+  return [header, ...entries.map(([label, qty]) => `${label}: ${qty}`)].join(
+    '\n'
+  );
 };
 
 const GpuUtilizationBar = ({
@@ -52,22 +65,31 @@ const GpuUtilizationBar = ({
   // is actually in use so a stale or partial reading can never render a
   // segment wider than the used block it splits.
   const preemptible = Math.min(Math.max(0, gpu?.gpu_preemptible || 0), allUsed);
+  const serviceAttributionKnown = gpu?.gpu_preemptible_services != null;
   const servicePreemptible = Math.min(
-    Math.max(0, gpu?.gpu_preemptible_services || 0),
+    Math.max(
+      0,
+      serviceAttributionKnown ? gpu?.gpu_preemptible_services || 0 : 0
+    ),
     preemptible
   );
-  const otherPreemptible = preemptible - servicePreemptible;
+  const otherPreemptible = serviceAttributionKnown
+    ? preemptible - servicePreemptible
+    : 0;
+  const unknownPreemptible = serviceAttributionKnown ? 0 : preemptible;
   const used = allUsed - preemptible;
   const notReadyLabel = `${notReady} not ready`;
   const usedLabel = `${used} used`;
-  const servicePreemptibleLabel = `${servicePreemptible} SkyServe`;
-  const otherPreemptibleLabel = `${otherPreemptible} other`;
+  const servicePreemptibleLabel = `${servicePreemptible} SkyServe pods`;
+  const otherPreemptibleLabel = `${otherPreemptible} confirmed other`;
+  const unknownPreemptibleLabel = `${unknownPreemptible} attribution unknown`;
   const freeLabel = `${free} free`;
   const toPercentage = total > 0 ? (value) => (value / total) * 100 : () => 0;
   const notReadyPercentage = toPercentage(notReady);
   const usedPercentage = toPercentage(used);
   const servicePreemptiblePercentage = toPercentage(servicePreemptible);
   const otherPreemptiblePercentage = toPercentage(otherPreemptible);
+  const unknownPreemptiblePercentage = toPercentage(unknownPreemptible);
   const freePercentage = toPercentage(free);
 
   return (
@@ -126,6 +148,21 @@ const GpuUtilizationBar = ({
           className="bg-amber-300 h-full flex items-center justify-center text-amber-900 font-medium overflow-hidden whitespace-nowrap px-1"
         >
           {otherPreemptiblePercentage > 15 && otherPreemptibleLabel}
+        </div>
+      )}
+      {unknownPreemptiblePercentage > 0 && (
+        <div
+          style={{
+            width: `${unknownPreemptiblePercentage}%`,
+            fontSize: 'clamp(8px, 1.2vw, 12px)',
+          }}
+          title={buildUnknownPreemptibleTitle(
+            unknownPreemptible,
+            gpu?.gpu_preemptible_breakdown
+          )}
+          className="bg-orange-300 h-full flex items-center justify-center text-orange-950 font-medium overflow-hidden whitespace-nowrap px-1"
+        >
+          {unknownPreemptiblePercentage > 15 && unknownPreemptibleLabel}
         </div>
       )}
       {freePercentage > 0 && (

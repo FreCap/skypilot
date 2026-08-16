@@ -946,4 +946,24 @@ describe('service operational semantics', () => {
       }).label
     ).toBe('Replica state needs verification');
   });
+
+  it('does not call stale logical capacity healthy before routing is ready', () => {
+    const state = getServiceOperationalState({
+      status: 'REPLICA_INIT',
+      replicaUnit: 'logical',
+      replicasReady: 279,
+      replicasTotal: 288,
+      targetReplicas: 0,
+      replicaStatusCounts: { READY: 279, PROVISIONING: 9 },
+      replicas: [],
+    });
+
+    expect(state).toMatchObject({
+      label: 'Routing unverified',
+      tone: 'warning',
+    });
+    expect(state.detail).toContain(
+      'Do not treat this snapshot as verified routable capacity.'
+    );
+  });
 });

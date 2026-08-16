@@ -140,18 +140,25 @@ export function emptyPreemptible() {
  */
 export function mergePreemptible(target, source) {
   target.gpu_preemptible += source?.gpu_preemptible || 0;
-  target.gpu_preemptible_services += source?.gpu_preemptible_services || 0;
+  if (source?.gpu_preemptible_services === null) {
+    target.gpu_preemptible_services = null;
+    target.gpu_preemptible_service_breakdown = null;
+  } else if (target.gpu_preemptible_services !== null) {
+    target.gpu_preemptible_services += source?.gpu_preemptible_services || 0;
+  }
   for (const [label, qty] of Object.entries(
     source?.gpu_preemptible_breakdown || {}
   )) {
     target.gpu_preemptible_breakdown[label] =
       (target.gpu_preemptible_breakdown[label] || 0) + qty;
   }
-  for (const [service, qty] of Object.entries(
-    source?.gpu_preemptible_service_breakdown || {}
-  )) {
-    target.gpu_preemptible_service_breakdown[service] =
-      (target.gpu_preemptible_service_breakdown[service] || 0) + qty;
+  if (target.gpu_preemptible_service_breakdown !== null) {
+    for (const [service, qty] of Object.entries(
+      source?.gpu_preemptible_service_breakdown || {}
+    )) {
+      target.gpu_preemptible_service_breakdown[service] =
+        (target.gpu_preemptible_service_breakdown[service] || 0) + qty;
+    }
   }
 }
 

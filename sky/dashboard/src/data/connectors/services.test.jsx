@@ -252,6 +252,9 @@ describe('getServices', () => {
       physical_ready_replicas: 1,
       physical_total_replicas: 2,
       physical_failed_replicas: 1,
+      observed_ready_replicas: 20,
+      observed_ready_replicas_fresh: false,
+      request_stats_age_seconds: 700,
       replica_info: [
         { replica_id: 1, status: 'READY', planned_capacity: 8 },
         { replica_id: 2, status: 'PROVISIONING', planned_capacity: 4 },
@@ -271,6 +274,9 @@ describe('getServices', () => {
       physicalReplicasReady: 1,
       physicalReplicasTotal: 2,
       physicalReplicasFailed: 1,
+      observedReadyReplicas: 20,
+      observedReadyReplicasFresh: false,
+      requestStatsAgeSeconds: 700,
     });
     expect(
       services[0].replicas.map((replica) => replica.plannedCapacity)
@@ -298,6 +304,18 @@ describe('getServices', () => {
       physicalReplicasTotal: 2,
       physicalReplicasFailed: 1,
     });
+  });
+
+  it('does not guess observation freshness for an older server', () => {
+    const service = normalizeService(
+      rawServiceRecord({
+        replica_unit: 'logical',
+        observed_ready_replicas: 8,
+      })
+    );
+
+    expect(service.observedReadyReplicas).toBe(8);
+    expect(service.observedReadyReplicasFresh).toBeNull();
   });
 
   it('excludes every failed-class replica status from the total', async () => {

@@ -2342,6 +2342,14 @@ export function ServiceDetailCard({
 
   const requestDetails = [];
   const usesLogicalReplicas = serviceData.replicaUnit === 'logical';
+  const logicalCapacityUnverified =
+    usesLogicalReplicas &&
+    serviceData.replicasReady != null &&
+    serviceData.status !== 'READY';
+  const staleLogicalCapacityObservation =
+    usesLogicalReplicas &&
+    serviceData.observedReadyReplicas != null &&
+    serviceData.observedReadyReplicasFresh === false;
   if (
     serviceData.recentRequestCount != null &&
     serviceData.requestWindowSeconds != null
@@ -2404,7 +2412,7 @@ export function ServiceDetailCard({
             <div>
               <div className="text-gray-600 font-medium text-base">
                 {usesLogicalReplicas
-                  ? 'Logical capacity (ready/non-failed)'
+                  ? 'Fleet-wide logical slots (ready/non-failed)'
                   : 'Replicas (ready/non-failed)'}
               </div>
               <div className="text-base mt-1">
@@ -2442,6 +2450,37 @@ export function ServiceDetailCard({
                     {' (ready/non-failed)'}
                   </div>
                 )}
+              {usesLogicalReplicas && (
+                <div className="text-sm text-gray-500 mt-1">
+                  Logical slots span every cloud and Kubernetes context in this
+                  service; they are not a GPU count for the current cluster.
+                </div>
+              )}
+              {staleLogicalCapacityObservation && (
+                <div
+                  role="alert"
+                  className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-sm text-amber-900"
+                >
+                  The last load-balancer observation (
+                  {serviceData.observedReadyReplicas} logical slots) is stale
+                  {serviceData.requestStatsAgeSeconds != null
+                    ? ` (${Math.round(
+                        serviceData.requestStatsAgeSeconds
+                      )}s old)`
+                    : ''}
+                  . The count above comes from current replica records.
+                </div>
+              )}
+              {logicalCapacityUnverified && (
+                <div
+                  role="alert"
+                  className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-sm text-amber-900"
+                >
+                  Routing readiness is unverified while SkyServe state is{' '}
+                  {serviceData.status}. These are controller-recorded slots, not
+                  confirmed live GPU endpoints.
+                </div>
+              )}
             </div>
             <div>
               <div className="text-gray-600 font-medium text-base">

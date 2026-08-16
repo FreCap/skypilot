@@ -132,6 +132,43 @@ describe('Kubernetes infrastructure gateway characterization', () => {
     expect(perContextGPUs[0].gpu_not_ready).toBe(8);
   });
 
+  it('preserves unknown service attribution across a GPU-type aggregate', async () => {
+    apiClient.post.mockResolvedValue(dispatchResponse('node-request'));
+    apiClient.get.mockResolvedValue(
+      resultResponse({
+        'node-a': {
+          name: 'node-a',
+          accelerator_type: 'H200',
+          total: { accelerator_count: 256 },
+          free: { accelerators_available: 0 },
+          is_ready: true,
+          accelerators_preemptible: 255,
+          preemptible_breakdown: { 'priority 0': 255 },
+          accelerators_preemptible_services: null,
+          preemptible_service_breakdown: null,
+        },
+        'node-b': {
+          name: 'node-b',
+          accelerator_type: 'H200',
+          total: { accelerator_count: 256 },
+          free: { accelerators_available: 79 },
+          is_ready: true,
+          accelerators_preemptible: 177,
+          preemptible_breakdown: { 'ma-lt (31)': 176, 'priority 0': 1 },
+          accelerators_preemptible_services: null,
+          preemptible_service_breakdown: null,
+        },
+      })
+    );
+
+    const { perContextGPUs } = await getContextGPUData('prod');
+    expect(perContextGPUs[0]).toMatchObject({
+      gpu_preemptible: 432,
+      gpu_preemptible_services: null,
+      gpu_preemptible_service_breakdown: null,
+    });
+  });
+
   it('submits and polls once while preserving node readiness projection', async () => {
     apiClient.post.mockResolvedValue(dispatchResponse('node-request'));
     apiClient.get.mockResolvedValue(

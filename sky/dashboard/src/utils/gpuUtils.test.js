@@ -127,4 +127,23 @@ describe('mergePreemptible', () => {
 
     expect(target).toEqual(emptyPreemptible());
   });
+
+  it('propagates unknown SkyServe attribution instead of summing it as zero', () => {
+    const target = emptyPreemptible();
+    mergePreemptible(target, {
+      gpu_preemptible: 432,
+      gpu_preemptible_breakdown: { 'ma-lt (31)': 176, 'priority 0': 256 },
+      gpu_preemptible_services: null,
+      gpu_preemptible_service_breakdown: null,
+    });
+    mergePreemptible(target, {
+      gpu_preemptible: 4,
+      gpu_preemptible_services: 4,
+      gpu_preemptible_service_breakdown: { fleet: 4 },
+    });
+
+    expect(target.gpu_preemptible).toBe(436);
+    expect(target.gpu_preemptible_services).toBeNull();
+    expect(target.gpu_preemptible_service_breakdown).toBeNull();
+  });
 });

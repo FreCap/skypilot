@@ -3073,35 +3073,63 @@ def get_allocated_resources_by_node(
                 allocated_cpu_memory_by_node[pod.spec.node_name] = (
                     current_cpu + pod_allocated_cpu,
                     current_memory + pod_allocated_memory_gb)
+        top_priority = max(
+            (tier.priority for _, tier, _, _ in observed_gpu_allocations),
+            default=None)
+        preemptible_allocations = [
+            allocation for allocation in observed_gpu_allocations if
+            top_priority is not None and allocation[1].priority < top_priority
+        ]
         cluster_names = sorted({
             cluster_name for _, _, _, cluster_name in observed_gpu_allocations
             if cluster_name
         })
+        preemptible_cluster_names = {
+            cluster_name for _, _, _, cluster_name in preemptible_allocations
+            if cluster_name
+        }
         allocated_qty_by_node_by_skyserve_service: dict[str,
                                                         dict[SkyServeAllocation,
                                                              int]] | None
-        try:
-            workload_fields = global_user_state.get_cluster_workload_fields(
-                cluster_names)
-        except Exception as e:  # pylint: disable=broad-except
-            logger.debug('Failed to read workload attribution for Kubernetes '
-                         f'GPU allocations: {common_utils.format_exception(e)}')
+        # SkyServe attribution is useful only when it is complete.  A pod
+        # without a SkyPilot cluster annotation, or an annotated cluster that
+        # is absent from durable state, cannot be proven to be either a
+        # service or a non-service workload.  Fail closed instead of turning
+        # that missing identity into a falsely precise zero.
+        if any(not cluster_name
+               for _, _, _, cluster_name in preemptible_allocations):
             allocated_qty_by_node_by_skyserve_service = None
         else:
-            service_allocations: dict[str, dict[
-                SkyServeAllocation, int]] = collections.defaultdict(
-                    lambda: collections.defaultdict(int))
-            for node_name, tier, quantity, cluster_name in (
-                    observed_gpu_allocations):
-                if cluster_name is None:
-                    continue
-                workload_type, workload_id = workload_fields.get(
-                    cluster_name, (None, None))
-                if workload_type != 'service' or not workload_id:
-                    continue
-                allocation = SkyServeAllocation(tier, workload_id)
-                service_allocations[node_name][allocation] += quantity
-            allocated_qty_by_node_by_skyserve_service = service_allocations
+            try:
+                workload_fields = (global_user_state.
+                                   get_cluster_workload_fields(cluster_names))
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(
+                    'Failed to read workload attribution for Kubernetes GPU '
+                    f'allocations: {common_utils.format_exception(e)}')
+                allocated_qty_by_node_by_skyserve_service = None
+            else:
+                if any(cluster_name not in workload_fields
+                       for cluster_name in preemptible_cluster_names):
+                    allocated_qty_by_node_by_skyserve_service = None
+                else:
+                    service_allocations: dict[str, dict[
+                        SkyServeAllocation, int]] = collections.defaultdict(
+                            lambda: collections.defaultdict(int))
+                    for node_name, tier, quantity, cluster_name in (
+                            observed_gpu_allocations):
+                        if not cluster_name:
+                            continue
+                        workload = workload_fields.get(cluster_name)
+                        if workload is None:
+                            continue
+                        workload_type, workload_id = workload
+                        if workload_type != 'service' or not workload_id:
+                            continue
+                        allocation = SkyServeAllocation(tier, workload_id)
+                        service_allocations[node_name][allocation] += quantity
+                    allocated_qty_by_node_by_skyserve_service = (
+                        service_allocations)
         return (allocated_qty_by_node, allocated_cpu_memory_by_node,
                 allocated_qty_by_node_by_priority,
                 allocated_qty_by_node_by_skyserve_service)

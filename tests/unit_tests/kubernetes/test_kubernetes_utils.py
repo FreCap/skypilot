@@ -585,6 +585,74 @@ def test_get_allocated_resources_attributes_skyserve_from_cluster_rows():
     response.release_conn.assert_called_once_with()
 
 
+def test_get_allocated_resources_fails_closed_without_workload_identity():
+    """An unattributed lower-priority pod is unknown, not non-SkyServe."""
+    response = mock.MagicMock()
+    pods = [{
+        'metadata': {
+            'name': 'production-pod',
+            'namespace': 'default',
+        },
+        'status': {
+            'phase': 'Running'
+        },
+        'spec': {
+            'nodeName': 'node-1',
+            'priority': 0,
+            'containers': [{
+                'resources': {
+                    'requests': {
+                        'nvidia.com/gpu': '1'
+                    }
+                }
+            }],
+        },
+    }, {
+        'metadata': {
+            'name': 'unattributed-preemptible-pod',
+            'namespace': 'default',
+        },
+        'status': {
+            'phase': 'Running'
+        },
+        'spec': {
+            'nodeName': 'node-1',
+            'priority': -1000,
+            'priorityClassName': 'inference-low',
+            'containers': [{
+                'resources': {
+                    'requests': {
+                        'nvidia.com/gpu': '2'
+                    }
+                }
+            }],
+        },
+    }]
+    core_api = mock.MagicMock()
+    core_api.list_pod_for_all_namespaces.return_value = response
+    with mock.patch('sky.provision.kubernetes.utils.kubernetes.core_api',
+                    return_value=core_api), \
+         mock.patch('sky.provision.kubernetes.utils.ijson.items',
+                    return_value=iter(pods)), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                    return_value='nvidia.com/gpu'), \
+         mock.patch('sky.provision.kubernetes.utils.global_user_state.'
+                    'get_cluster_workload_fields') as workload_lookup:
+        allocated, _, by_priority, by_service = (
+            utils.get_allocated_resources_by_node(context='prod'))
+
+    assert allocated == {'node-1': 3}
+    assert by_priority == {
+        'node-1': {
+            utils.PriorityTier(0, None): 1,
+            utils.PriorityTier(-1000, 'inference-low'): 2,
+        }
+    }
+    assert by_service is None
+    workload_lookup.assert_not_called()
+    response.release_conn.assert_called_once_with()
+
+
 def test_get_kubernetes_node_info_uniform_priority_is_not_preemptible():
     """A cluster running everything at one priority reports nothing to reclaim.
 

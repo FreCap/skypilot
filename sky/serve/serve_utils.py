@@ -3433,8 +3433,23 @@ def _finalize_prepared_service_status(
                     job_ids = list(dict.fromkeys(pool_level_job_ids + job_ids))
                 replica_record['used_by'] = job_ids
     observed_ready = record.get('observed_ready_replicas')
-    if ('ready_replicas' in record and isinstance(observed_ready, int) and
-            not isinstance(observed_ready, bool) and observed_ready >= 0):
+    report_age = record.get('request_stats_age_seconds')
+    observed_ready_is_valid = (isinstance(observed_ready, int) and
+                               not isinstance(observed_ready, bool) and
+                               observed_ready >= 0)
+    observed_ready_is_fresh = (
+        observed_ready_is_valid and isinstance(report_age, (int, float)) and
+        not isinstance(report_age, bool) and report_age >= 0 and
+        report_age <= 3 * constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+    if observed_ready_is_valid:
+        record['observed_ready_replicas_fresh'] = observed_ready_is_fresh
+    # The router observation is the best live logical-capacity count only
+    # while its demand report is fresh.  Once the LB stops reporting, replica
+    # reconciliation can remove backends while this value remains frozen;
+    # replacing the current snapshot would then produce impossible displays
+    # such as 262 ready / 64 total.  Keep the stale observation as a diagnostic
+    # but fall back to the provider/replica-state aggregate for readiness.
+    if 'ready_replicas' in record and observed_ready_is_fresh:
         record['ready_replicas'] = observed_ready
     return record
 

@@ -132,6 +132,18 @@ export function getServiceOperationalState(service) {
     };
   }
   if (
+    service.replicaUnit === 'logical' &&
+    rawStatus !== 'READY' &&
+    service.replicasReady > 0
+  ) {
+    return {
+      label: 'Routing unverified',
+      tone: 'warning',
+      detail: `The controller records ${service.replicasReady}/${service.replicasTotal} logical slots, but SkyServe state is ${rawStatus}, not READY. Do not treat this snapshot as verified routable capacity.`,
+    };
+  }
+  if (
+    rawStatus === 'READY' &&
     service.targetReplicas != null &&
     service.replicasReady >= service.targetReplicas
   ) {

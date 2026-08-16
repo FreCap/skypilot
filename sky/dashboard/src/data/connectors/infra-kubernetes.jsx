@@ -29,17 +29,24 @@ function isNodeNotReadyForGpus(nodeData) {
 function addPreemptibleFromNode(aggregate, nodeData, isNodeNotReady) {
   if (isNodeNotReady) return;
   aggregate.gpu_preemptible += nodeData['accelerators_preemptible'] || 0;
-  aggregate.gpu_preemptible_services +=
-    nodeData['accelerators_preemptible_services'] || 0;
+  if (nodeData['accelerators_preemptible_services'] === null) {
+    aggregate.gpu_preemptible_services = null;
+    aggregate.gpu_preemptible_service_breakdown = null;
+  } else if (aggregate.gpu_preemptible_services !== null) {
+    aggregate.gpu_preemptible_services +=
+      nodeData['accelerators_preemptible_services'] || 0;
+  }
   const breakdown = nodeData['preemptible_breakdown'];
   for (const [label, qty] of Object.entries(breakdown || {})) {
     aggregate.gpu_preemptible_breakdown[label] =
       (aggregate.gpu_preemptible_breakdown[label] || 0) + qty;
   }
   const serviceBreakdown = nodeData['preemptible_service_breakdown'];
-  for (const [service, qty] of Object.entries(serviceBreakdown || {})) {
-    aggregate.gpu_preemptible_service_breakdown[service] =
-      (aggregate.gpu_preemptible_service_breakdown[service] || 0) + qty;
+  if (aggregate.gpu_preemptible_service_breakdown !== null) {
+    for (const [service, qty] of Object.entries(serviceBreakdown || {})) {
+      aggregate.gpu_preemptible_service_breakdown[service] =
+        (aggregate.gpu_preemptible_service_breakdown[service] || 0) + qty;
+    }
   }
 }
 
@@ -246,9 +253,12 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
               },
               gpu_preemptible_services:
                 gpuToData[gpuName].gpu_preemptible_services,
-              gpu_preemptible_service_breakdown: {
-                ...gpuToData[gpuName].gpu_preemptible_service_breakdown,
-              },
+              gpu_preemptible_service_breakdown:
+                gpuToData[gpuName].gpu_preemptible_service_breakdown === null
+                  ? null
+                  : {
+                      ...gpuToData[gpuName].gpu_preemptible_service_breakdown,
+                    },
             };
           }
         }
