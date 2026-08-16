@@ -281,7 +281,7 @@ describe('ContextDetails', () => {
     expect(screen.getByLabelText(/^UNAVAILABLE\s+1 GPU/)).toBeInTheDocument();
     expect(
       screen.getByLabelText(
-        /^RUNNING NOW\s+2 GPUs · highest active tier · not currently reclaimable/
+        /^TOP PRIORITY NOW\s+2 GPUs · highest raw priority currently running/
       )
     ).toBeInTheDocument();
     expect(
@@ -345,30 +345,34 @@ describe('ContextDetails', () => {
     // 16 total - 2 free = 14 in use, of which 6 sit below the top tier.
     expect(
       screen.getByLabelText(
-        /^RUNNING NOW\s+8 GPUs · highest active tier · not currently reclaimable/
+        /^TOP PRIORITY NOW\s+8 GPUs · highest raw priority currently running/
       )
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/^FREE NOW\s+2 GPUs/)).toBeInTheDocument();
-    expect(screen.getByText('1 MA · 8 running')).toBeVisible();
+    expect(screen.getByText('2 MA · 8 running')).toBeVisible();
     expect(screen.getByText('mixed tiers · 6 other')).toBeVisible();
     const reclaimable = screen.getByLabelText(
-      /^RUNNING NOW\s+6 GPUs · non-SkyServe workloads · reclaimable/
+      /^LOWER PRIORITY NOW\s+6 GPUs · non-SkyServe workloads · may yield to higher-priority work/
     );
     // Active classes are listed in preemption order with a compact rank and
     // concrete operational effect.
     expect(reclaimable).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        '3 WA · 4 GPUs · wa-eval (20) · preempted by 1 MA, 2 HA or higher raw WA value; preempts 4 BE and lower raw WA value\n' +
-          '4 BE · 2 GPUs · be-prod (10)'
+        '3 WA · 4 GPUs\n' +
+          '  Weakly available · wa-eval · raw priority 20\n' +
+          '  protected over: 4 BE; yields to: 1 HA, 2 MA\n' +
+          '4 BE · 2 GPUs'
       )
     );
     expect(reclaimable).toHaveAttribute(
       'aria-label',
-      expect.stringContaining('1 MA → 2 HA → 3 WA → 4 BE')
+      expect.stringContaining('1 HA → 2 MA → 3 WA → 4 BE')
     );
     expect(
-      screen.getByLabelText(/Preemption order: 1 MA, 2 HA, 3 WA, 4 BE/)
+      screen.getByLabelText(
+        /Protection order from high to low: 1 HA, 2 MA, 3 WA, 4 BE/
+      )
     ).toBeVisible();
   });
 
@@ -385,18 +389,20 @@ describe('ContextDetails', () => {
             gpu_not_ready: 0,
             gpu_preemptible: 6,
             gpu_preemptible_breakdown: {
-              'be-prod (10)': 6,
+              'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster': 6,
             },
             gpu_allocation_breakdown: {
               'ma-lt (31)': 8,
-              'be-prod (10)': 6,
+              'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster': 6,
             },
             gpu_preemptible_services: 4,
             gpu_preemptible_service_breakdown: {
               'boltz-l4-fleet': 4,
             },
             gpu_preemptible_service_priority_breakdown: {
-              'boltz-l4-fleet': { 'be-prod (10)': 4 },
+              'boltz-l4-fleet': {
+                'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster': 4,
+              },
             },
           },
         ]}
@@ -406,26 +412,28 @@ describe('ContextDetails', () => {
 
     expect(
       screen.getByLabelText(
-        /^RUNNING NOW\s+8 GPUs · highest active tier · not currently reclaimable/
+        /^TOP PRIORITY NOW\s+8 GPUs · highest raw priority currently running/
       )
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/^FREE NOW\s+2 GPUs/)).toBeInTheDocument();
     expect(screen.getByText('4 BE · 4 SkyServe')).toBeVisible();
     expect(
-      screen.getByLabelText(/^RUNNING NOW\s+4 GPUs · SkyServe · reclaimable/)
+      screen.getByLabelText(
+        /^LOWER PRIORITY NOW\s+4 GPUs · SkyServe · may yield to higher-priority work/
+      )
     ).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        'boltz-l4-fleet · 4 GPUs\n  4 BE · 4 GPUs · be-prod (10)'
+        'boltz-l4-fleet · 4 GPUs\n  4 BE · 4 GPUs · SkyPilot cluster'
       )
     );
     expect(
       screen.getByLabelText(
-        /^RUNNING NOW\s+2 GPUs · non-SkyServe workloads · reclaimable/
+        /^LOWER PRIORITY NOW\s+2 GPUs · non-SkyServe workloads · may yield to higher-priority work/
       )
     ).toHaveAttribute(
       'aria-label',
-      expect.stringContaining('4 BE · 2 GPUs · be-prod (10)')
+      expect.stringContaining('4 BE · 2 GPUs · SkyPilot cluster')
     );
   });
 
@@ -443,12 +451,12 @@ describe('ContextDetails', () => {
             gpu_preemptible: 432,
             gpu_preemptible_breakdown: {
               'ma-lt (31)': 176,
-              'priority 0': 256,
+              'priority 0 · PyTorch training': 256,
             },
             gpu_allocation_breakdown: {
               'ma-top (32)': 1,
               'ma-lt (31)': 176,
-              'priority 0': 256,
+              'priority 0 · PyTorch training': 256,
             },
             gpu_preemptible_services: null,
             gpu_preemptible_service_breakdown: null,
@@ -461,13 +469,15 @@ describe('ContextDetails', () => {
 
     expect(
       screen.getByLabelText(
-        /^RUNNING NOW\s+432 GPUs · reclaimable · workload identity unavailable/
+        /^LOWER PRIORITY NOW\s+432 GPUs · workload identity unavailable · may yield to higher-priority work/
       )
     ).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        '1 MA · 176 GPUs · ma-lt (31) · preempted by higher raw MA value; preempts 2 HA, 3 WA, 4 BE and lower raw MA value\n' +
-          '? unmapped · 256 GPUs · priority 0'
+        '2 MA · 176 GPUs\n' +
+          '  Mostly available · latency tolerant · ma-lt · raw priority 31\n' +
+          '  protected over: 3 WA, 4 BE; yields to: 1 HA\n' +
+          'UNTAGGED · 256 GPUs · PyTorch training'
       )
     );
     expect(screen.queryByLabelText(/0 SkyServe/)).not.toBeInTheDocument();
@@ -506,15 +516,17 @@ describe('ContextDetails', () => {
     expect(within(row).getAllByText('3 of 8 free')).toHaveLength(2);
     expect(
       within(row).getByLabelText(
-        /^RUNNING NOW\s+3 GPUs · highest active tier · not currently reclaimable/
+        /^TOP PRIORITY NOW\s+3 GPUs · highest raw priority currently running/
       )
     ).toBeInTheDocument();
     const reclaimable = within(row).getByLabelText(
-      /^RUNNING NOW\s+2 GPUs · non-SkyServe workloads · reclaimable/
+      /^LOWER PRIORITY NOW\s+2 GPUs · non-SkyServe workloads · may yield to higher-priority work/
     );
     expect(reclaimable).toHaveAttribute(
       'aria-label',
-      expect.stringContaining('3 WA · 2 GPUs · wa-eval (20)')
+      expect.stringContaining(
+        '3 WA · 2 GPUs\n  Weakly available · wa-eval · raw priority 20'
+      )
     );
     expect(reclaimable).toHaveAttribute('tabindex', '0');
     expect(
@@ -545,7 +557,7 @@ describe('ContextDetails', () => {
 
     expect(
       screen.getByLabelText(
-        /^RUNNING NOW\s+6 GPUs · highest active tier · not currently reclaimable/
+        /^TOP PRIORITY NOW\s+6 GPUs · highest raw priority currently running/
       )
     ).toBeInTheDocument();
     expect(screen.queryByLabelText(/preemptible/)).not.toBeInTheDocument();
