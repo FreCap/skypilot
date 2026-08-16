@@ -70,7 +70,8 @@ real provider effects without current quiescence receipts; generation zero,
 missing process identity, and a false quiescence-required bit are not absence
 proof. The companions therefore own the exact capability cohort, typed
 reconciliation, no-receipt-fabrication rule, per-row nonblocking recovery,
-API011/Serve047 transition, and blocked API012/Serve048 cleanup. Any ordinary-
+API011/Serve047 transition, API012/Serve048 demand/route convergence, and
+blocked API013/Serve049 cleanup. Any ordinary-
 only continuation below is historical and cannot preserve separate unbound
 non-pool launch paths.
 

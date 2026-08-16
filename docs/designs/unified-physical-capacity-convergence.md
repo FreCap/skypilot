@@ -104,7 +104,9 @@ Serve probe evidence, not a revived capacity projector or provider reader.
 
 The transition is API011/Serve047 with exact all-participant capability cohort,
 typed per-row reconciliation, and no global recovery lock across provider
-waits. Its simultaneously authored blocked cleanup is API012/Serve048 and
+waits. API012/Serve048 then add the controller-independent demand feed and
+provider-free route projection without reviving this rejected capacity
+projector. Their simultaneously authored blocked cleanup is API013/Serve049 and
 removes every unbound non-pool launch/recovery path after the rollout gates.
 This numbering and scope supersede ordinary-only and Serve047-cleanup drafts.
 

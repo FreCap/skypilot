@@ -16,7 +16,8 @@ observed closed shapes shipped in PR #1492 as `v1.1.1284`. That bridge is a
 `LEGACY_ACTIVE` compatibility rollout only: it does not weaken v17/v18
 validation, run normalization, or authorize sequenced fill. Exact-only
 publisher B, the generalized non-pool binding transition (API011/Serve047),
-and final Serve048 cleanup C remain pending. The prior review record is
+the API012/Serve048 demand/route convergence, and final Serve049 cleanup C
+remain pending. The prior review record is
 historical; the 2026-08-15 material correction resets the final generalized
 binding/A/B/C review count to zero. Reserved-fill activation has not occurred,
 and cleanup remains blocked on the documented live receipt gates.
@@ -106,7 +107,7 @@ fix-forward stack:
    final cleanup C drops the pickle column and
    physically removes the temporary v17 runtime reader, normalizer, one-pod/
    `all` source controls, and every other transition-only executable path. The
-   canonical roles publish C's immutable Serve048 image/chart tuple. Platform
+   canonical roles publish C's immutable Serve049 image/chart tuple. Platform
    PR 19 alone pins that tuple, upgrades the already-split release in place,
    enables typed storage, and physically removes the remaining platform and
    publisher transition paths.
@@ -205,7 +206,7 @@ receipt gates even though A can still repair the marker without deleting an
 unknown provider-owned key.
 
 PR 14 must reconcile and read back every live generated inference Service with
-a canonical ledger. That receipt is cleanup C's exact removal gate: Serve048
+a canonical ledger. That receipt is cleanup C's exact removal gate: Serve049
 must physically remove markerless acceptance and reject a missing ledger while
 retaining the ledger and narrow merge behavior as the permanent single path.
 The cleanup absence tests must prove no `require_marker=False` call or
@@ -2095,7 +2096,8 @@ either case.
 | 2b | Platform PR 17: invoke normalization and accept its receipt on the unchanged PR 14 A tuple | Blocked until PR 14's exact split-A rollout/readback passes; PR 17 creates no rollout or Helm revision. |
 | 2c | Publisher B and platform PR 18: exact-only source publication, expected pre-adoption no-publish, then separate registry/role adoption and readbacks with no Helm revision | Not merged or applied. |
 | 2d | Deployment-owned Kueue bundle, unique entry-point policy, and generation-fenced authorization | Not activated; the live IAM/RBAC/Kueue attestation gates remain open. |
-| 3 | Source cleanup C/G2 and platform PR 19: publish/pin Serve048, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
+| 2e | Demand/route convergence: API012/Serve048 durable demand feed, zero-cost-before-paid ordering, and provider-free route projection | Planned after G1 and before cleanup. |
+| 3 | Source cleanup C/G2 and platform PR 19: publish/pin Serve049, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
 path through the generic non-pool handler, and
@@ -2129,10 +2131,12 @@ record cannot authorize a retry, fabricate request quiescence, or become a
 synthetic association. The audit tombstone is retained when G2 removes the
 transition writer.
 
-G2/C is authored with G1 but blocked. It owns API012 and Serve048, including
-the final permanent reserved-fill authorization and combined-role cleanup that
-earlier drafts assigned to API011/Serve047. API009/010 and Serve042--046 remain
-immutable. G2/C removes unbound non-pool launch/recovery, old handler aliases,
+API012/Serve048 next implement the durable demand feed, zero-cost-before-paid
+placement fence, and provider-free route projection. G2/C is authored with G1
+and that convergence but blocked. It owns API013 and Serve049, including the
+final permanent reserved-fill authorization and combined-role cleanup that
+earlier drafts assigned to API011/Serve047. API009--012 and Serve042--048
+remain immutable. G2/C removes unbound non-pool launch/recovery, old handler aliases,
 global startup recovery lock/backoff, cluster-name quiescence authority,
 process-map authority, demotion after the rollback window, and transition-only
 telemetry. After it lands, reserved fill and all other non-pool profiles use one
@@ -2443,8 +2447,8 @@ The counts are live values, not expected constants, but
 `serve_database_revision` is `046`, the role list, Pod count, process count,
 and inventory hash prove the exact 2/2/2 cohort, and `writer_image_digest`
 equals the digest proven on every split writer role. A
-failed or absent receipt blocks Serve048. Rerunning after an interrupted
-validation is safe and produces an idempotent receipt. Serve048 then asserts
+failed or absent receipt blocks Serve049. Rerunning after an interrupted
+validation is safe and produces an idempotent receipt. Serve049 then asserts
 the exact v18/key shape, drops the pickle column, and physically deletes the
 v17 runtime decoder and this normalization module; normalization is not a
 permanent happy path. Historical Alembic replay retains only the
@@ -2468,7 +2472,7 @@ Activation fails unless all of the following are true:
 - the database is central PostgreSQL;
 - reserved-fill protocol version is exactly 2;
 - the deployed transition is at least generalized-binding Serve047 and
-  API-request 011 (or final Serve048/API012 after G2/C), with no divergent
+  API-request 011 (or final Serve049/API013 after G2/C), with no divergent
   migration head;
 - Kubernetes and PostgreSQL inventory attest exactly the split roles
   `api`, `controller`, and `executor`, with no compatibility `all` writer;
@@ -2518,7 +2522,7 @@ No step below creates compute.
 
 1. Confirm the transition status reports protocol 2,
    `SEQUENCED_ACTIVE`, generalized-binding Serve047/API011 (or final
-   Serve048/API012), the exact generic capability cohort, and the expected
+   Serve049/API013), the exact generic capability cohort, and the expected
    durable reclaim identity.
    Confirm the full fleet reports public server API capability 77 and worker
    placement projection protocol 2.
@@ -2926,7 +2930,7 @@ consecutive sequence restarts from round 1 again.
 
 Those rows reviewed a now-superseded use of migration number Serve047 for
 cleanup. Serve047 now belongs to generalized binding G1 and cleanup is
-Serve048; none of the rows validates the mixed-version incident correction,
+Serve049; none of the rows validates the mixed-version incident correction,
 capability cohort, typed reconciliation, or atomic reserved-fill binding.
 
 Reviews should be pragmatic and fix-forward oriented. They must reject an
@@ -2954,7 +2958,9 @@ PR. The current source stack is:
    non-pool association profiles, exact capability cohort, atomic reserved-fill
    binding receipt, per-row typed recovery, and provider-free route projection;
    and
-5. final cleanup C/G2: forward-only API012/Serve048 plus physical deletion of
+5. demand/route convergence: forward-only API012/Serve048 implementing the
+   durable feed, ordered placement, and route projection; and
+6. final cleanup C/G2: forward-only API013/Serve049 plus physical deletion of
    every live compatibility and transition path. C retains
    `reserved_fill_reconciliation_transition status/activate` as the sole
    first-authorization and reauthorization surface.
@@ -2969,10 +2975,11 @@ cleanup PR
 not current C or merge/deployment evidence. It must be replaced or updated to
 the exact reviewed C revision. Historical cleanup PR #1263 is unrelated.
 
-The cleanup uses new forward-only API012 and Serve048 migrations; it never
+The cleanup uses new forward-only API013 and Serve049 migrations; it never
 edits or renumbers historical Serve044, Serve045, Serve046, or generalized-
-binding Serve047, nor API009--011. API012 owns the combined-role/old-handler final
-cleanup that an earlier draft assigned to API011. Serve048 preserves the
+binding Serve047 and demand Serve048, nor API009--012. API013 owns the combined-
+role/old-handler final cleanup that an earlier draft assigned to API011.
+Serve049 preserves the
 Serve045 reclaim receipt/generation and every Serve046 service-version and
 projection-digest column and constraint. It replaces the Serve045 gate check,
 default, and `ENABLE ALWAYS` trigger with the protocol-v2-only final two-state
@@ -3058,7 +3065,7 @@ and readbacks must have passed without creating a Helm revision. Missing
 evidence blocks C; it never permits a legacy path.
 
 After the runtime gates pass, C may merge and the canonical roles publish its
-immutable Serve048 image/chart tuple. PR 19 must not merge, plan, or apply until
+immutable Serve049 image/chart tuple. PR 19 must not merge, plan, or apply until
 that exact publication receipt and all final platform absence gates pass. PR 19
 then pins C and upgrades the existing split topology in place; it does not
 create or replace that topology.
@@ -3115,8 +3122,9 @@ legacy activation.
 
 ## Open gates
 
-- Author/review generalized binding G1 (API011/Serve047) and blocked C/G2
-  (API012/Serve048) together. Link the stack and record C/G2's exact merge
+- Author/review generalized binding G1 (API011/Serve047), demand convergence
+  (API012/Serve048), and blocked C/G2 (API013/Serve049) together. Link the
+  stack and record C/G2's exact merge
   gates; do not reuse the migration numbers claimed by superseded drafts.
 - Converge and drain the exact API/request-backend/executor/GC/controller/
   profile capability cohort. Prove the old handler cannot claim a generic

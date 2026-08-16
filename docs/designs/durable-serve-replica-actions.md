@@ -393,15 +393,16 @@ The forward schema contract is:
 - Serve047 retains the Serve042 association table and replica pointer. It adds
   the same protocol/profile/cohort tuple, a typed authority kind/reference/
   generation plus canonical authority digest, typed reconciliation and
-  provider-evidence fields, and service cohort epoch/digest. It also adds the
-  immutable route-projection head/generation tables described in the reserved-
-  fill companion.
+  provider-evidence fields, and service cohort epoch/digest.
 - Existing bound ordinary rows are backfilled only when exact immutable
   association/request/replica identity agrees. Historical unbound rows are not
   inserted into the association table. Every new field is closed by
   completeness, value, and digest-length constraints; nullable transition
   shapes are readable but have no generic effect authority.
-- API012/Serve048 are the blocked cleanup heads. They remove protocol-v1/new-
+- API012/Serve048 add the controller-independent demand feed, ordered
+  zero-cost-before-paid admission, and provider-free route projections owned by
+  `skyserve-demand-capacity-convergence.md`.
+- API013/Serve049 are the blocked cleanup heads. They remove protocol-v1/new-
   admission compatibility and transition columns/constraints only after G2's
   gates; they preserve immutable tombstones, typed profiles, current cohort,
   route history needed by live clients, and permanent reserved authorization.
@@ -976,11 +977,13 @@ effect disposition is unknown.
 
 ### G2: blocked steady-state cleanup
 
-G2 is authored with G1 and remains draft/blocked until every gate below is
-recorded. It owns forward-only API-request revision 012 and Serve revision 048.
+G2 is authored with G1 and the demand-convergence P2 change and remains
+draft/blocked until every gate below is recorded. It owns forward-only
+API-request revision 013 and Serve revision 049.
 Any earlier draft that assigned API011 to combined-role cleanup or Serve047 to
-reserved-fill final cleanup is renumbered to API012/Serve048; migration numbers
-must be globally unique and already-published revisions are immutable.
+reserved-fill final cleanup is renumbered to API013/Serve049; API012/Serve048
+belong to the intervening demand/route convergence. Migration numbers must be
+globally unique and already-published revisions are immutable.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
 only handler/profile alias, cluster-name quiescence as active authority, global
@@ -2214,11 +2217,11 @@ approved canary:
 
 ### Generalized non-pool binding gates (current)
 
-- [ ] Author and review G1 (API011/Serve047) and the blocked stacked G2
-  cleanup (API012/Serve048) together; link both PRs and state G2's exact merge
-  gate.
-- [ ] Restack any draft API011 combined-role cleanup to API012 and any draft
-  Serve047 reserved-fill permanent cleanup to Serve048. Prove each schema
+- [ ] Author and review G1 (API011/Serve047), demand convergence
+  (API012/Serve048), and the blocked stacked G2 cleanup (API013/Serve049)
+  together; link the PRs and state G2's exact merge gate.
+- [ ] Restack any draft API011 combined-role cleanup to API013 and any draft
+  Serve047 reserved-fill permanent cleanup to Serve049. Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [ ] Reconcile all seven incident rows from exact request, provider, and
   cluster-incarnation evidence. Preserve real old-executor effects; record no

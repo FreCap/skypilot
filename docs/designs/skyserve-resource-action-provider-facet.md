@@ -280,9 +280,11 @@ fill activation remains generation-fenced and one way: once active, rollback is
 only to a capability-compatible artifact after bound work drains, never to the
 unbound fill path.
 
-G2 is authored with G1 but remains blocked. It owns API012 and Serve048; any
-earlier API011 combined-role cleanup or Serve047 reserved-fill final cleanup is
-renumbered. After the rollback and monitoring gates, G2 removes unbound
+API012/Serve048 belong to the intervening demand-feed and provider-free route
+convergence. G2 is authored with G1 and that change but remains blocked. It
+owns API013 and Serve049; any earlier API011 combined-role cleanup or Serve047
+reserved-fill final cleanup is renumbered. After the rollback and monitoring
+gates, G2 removes unbound
 non-pool admission/recovery, old handler/profile aliases, global startup
 recovery locking/backoff, cluster-name quiescence authority, process-map
 authority, demotion/promotion transition surfaces, and transition telemetry.
