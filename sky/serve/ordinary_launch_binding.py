@@ -30,6 +30,7 @@ import sqlalchemy
 from sqlalchemy.dialects import postgresql
 
 from sky.adaptors import common as adaptors_common
+from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import serve_state
@@ -2141,12 +2142,22 @@ def _paid_claim_payload(
         raise OrdinaryLaunchBindingConflict(
             'Non-pool profile lost its exact paid-capacity claim.')
     row = rows[0]
-    return pool_key, {
+    payload = {
         'claimed_at': row['claimed_at'],
         'pool_key': pool_key,
         'priority': row['priority'],
         'service_hash': row['service_hash'],
     }
+    if row['capacity_plan_generation'] is not None:
+        payload.update({
+            'capacity_plan_generation': row['capacity_plan_generation'],
+            'capacity_plan_sha256': row['capacity_plan_sha256'],
+            'demand_feed_generation': row['demand_feed_generation'],
+            'demand_source_epoch': row['demand_source_epoch'],
+            'capacity_plan_accelerator': row['capacity_plan_accelerator'],
+            'capacity_plan_units': row['capacity_plan_units'],
+        })
+    return pool_key, payload
 
 
 def _zero_cost_sequence_payload(
@@ -2478,6 +2489,8 @@ def resolve_non_pool_launch_profile_in_connection(
         if paid_claim is None:
             raise OrdinaryLaunchBindingConflict(
                 'Ordinary paid profile has no paid-capacity claim.')
+        capacity_admission.validate_paid_claim_in_connection(
+            connection, service, paid_claim)
         reference = f'paid-capacity:{service["hash"]}:{record_id}:{pool_key}'
         generation = 0
         payload = {'claim': paid_claim, 'placement': placement}

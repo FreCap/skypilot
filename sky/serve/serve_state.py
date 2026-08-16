@@ -26,6 +26,7 @@ from sqlalchemy.dialects import sqlite
 
 from sky import sky_logging
 from sky.adaptors import common as adaptors_common
+from sky.serve import capacity_admission
 from sky.serve import constants
 from sky.serve import ephemeral_storage_contract
 from sky.serve import lb_cutover_state
@@ -116,6 +117,11 @@ _POST_SERVE037_SERVICE_COLUMN_NAMES = frozenset({
     'route_projection_capable',
     'route_projection_controller_incarnation',
     'route_projection_protocol_version',
+    'demand_source_mode',
+    'demand_source_epoch',
+    'demand_authority_capable',
+    'demand_authority_controller_incarnation',
+    'demand_authority_protocol_version',
 })
 _SERVE037_SERVICE_COLUMNS = tuple(
     column for column in services_table.c
@@ -4934,6 +4940,7 @@ def try_add_replica_with_paid_capacity_claim(
     frontier_limit: int | None = None,
     frontier_default_limit: int | None = None,
     frontier_limits_by_key: dict[paid_capacity.FrontierKey, int] | None = None,
+    capacity_plan_claim: Mapping[str, Any] | None = None,
 ) -> str:
     """Atomically persist one replica and its global paid-capacity claim."""
     _validate_replica_row_identity(replica_id, replica_info)
@@ -5053,6 +5060,34 @@ def try_add_replica_with_paid_capacity_claim(
         _delete_paid_capacity_claims_in_session(session, stale_claims)
 
         is_existing_claim = identity in valid_claims
+        locked_service = session.execute(
+            sqlalchemy.select(services_table).where(
+                services_table.c.name ==
+                service_name).with_for_update()).mappings().one()
+        if is_existing_claim:
+            existing_claim = session.execute(
+                sqlalchemy.select(paid_capacity_claims_table).where(
+                    paid_capacity_claims_table.c.service_name == service_name,
+                    paid_capacity_claims_table.c.service_hash == service_hash,
+                    paid_capacity_claims_table.c.replica_id ==
+                    replica_id)).mappings().one()
+            prospective_claim = dict(existing_claim)
+        else:
+            prospective_claim = dict(capacity_plan_claim or {})
+            prospective_claim.update(service_name=service_name,
+                                     service_hash=service_hash,
+                                     replica_id=replica_id)
+        capacity_admission.validate_paid_claim_in_connection(
+            session.connection(),
+            locked_service,
+            prospective_claim,
+            prospective=not is_existing_claim,
+            require_planner=not bool(
+                transaction_replica_info.cost_rebalance_for_replica_id
+                is not None or
+                transaction_replica_info.unknown_capacity_replacement or
+                transaction_replica_info.system_recovery_launch_intent
+                is not None))
         if is_existing_claim:
             existing_replica = session.execute(
                 sqlalchemy.select(
@@ -5149,13 +5184,17 @@ def try_add_replica_with_paid_capacity_claim(
                 **_initial_replica_row_values(engine, service_name, replica_id,
                                               transaction_replica_info))
             session.execute(replica_insert)
+        claim_values = {
+            'service_name': service_name,
+            'service_hash': service_hash,
+            'replica_id': replica_id,
+            'pool_key': pool_key,
+            'priority': priority,
+            'claimed_at': now,
+            **dict(capacity_plan_claim or {}),
+        }
         claim_insert = _upsert_insert_func(engine)(
-            paid_capacity_claims_table).values(service_name=service_name,
-                                               service_hash=service_hash,
-                                               replica_id=replica_id,
-                                               pool_key=pool_key,
-                                               priority=priority,
-                                               claimed_at=now)
+            paid_capacity_claims_table).values(**claim_values)
         session.execute(
             claim_insert.on_conflict_do_update(
                 index_elements=['service_name', 'service_hash', 'replica_id'],

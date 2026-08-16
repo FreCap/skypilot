@@ -29,7 +29,9 @@ def test_status_contract_has_distinct_api_capability_version() -> None:
             MIN_KUBERNETES_OPERATIONAL_WORKLOAD_BREAKDOWN_API_VERSION == 84)
     assert server_constants.MIN_SERVE_DURABLE_DEMAND_API_VERSION == 82
     assert server_constants.MIN_SERVE_ROUTE_PROJECTION_API_VERSION == 83
-    assert server_constants.API_VERSION == 84
+    assert (
+        server_constants.MIN_SERVE_ORDERED_CAPACITY_ADMISSION_API_VERSION == 85)
+    assert server_constants.API_VERSION == 85
 
 
 def _allocation(

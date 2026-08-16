@@ -1,11 +1,20 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 is merged in PR #1498, P2a in PR #1499, and P2b1 is in exact-head
-review in PR #1503. Production remains on the legacy controller-coupled demand
-and route paths. A production observation at Serve048 exposed that the closed
-revision-040 placement-normalization authority registry stopped at Serve047;
-P2b1 now recognizes the reviewed additive Serve048 and Serve049 heads before
-route publication can be promoted.
+Status: P1, P2a, and P2b1 are merged in PRs #1498, #1499, and #1503. P2b2 is
+in exact-head review in PR #1504. The complete additive stack has not been
+deployed. P2b2 includes the adversarial-review correction that
+separates cheapest-compatible demand attribution from supply-aware exact-card
+capacity accounting. A production observation at Serve048 exposed that the
+closed revision-040 placement-normalization authority registry stopped at
+Serve047; P2b1 now recognizes the reviewed additive Serve048 and Serve049 heads
+and P2b2 recognizes its additive Serve050 head before either path can be
+promoted. Production remains on the legacy controller-coupled demand and route
+paths.
+
+The exact post-#1503 P2b2 review scope is 42 files with 4,298 insertions and
+241 deletions relative to `improvements`. GitHub stack #1517 retains #1504
+above that trunk and the blocked draft removals #1506/#1510 above #1504; base
+retargeting did not detach or merge either cleanup.
 
 Last updated: 2026-08-16
 
@@ -58,8 +67,8 @@ routes, autoscaling, sibling pools, or the service dashboard.
 - Use one authenticated durable demand feed for both autoscaling and UI.
 - Account compatible ready and committed zero-cost capacity before any paid
   Spot or On-Demand launch is authorized.
-- Require fresh authenticated unmet demand at both paid admission and the
-  provider-I/O fence.
+- Require fresh authenticated unmet demand at both ordinary demand-driven paid
+  admission and the provider-I/O fence.
 - Publish complete routes from already-collected controller observations so
   load-balancer and API reads perform no provider queries.
 - Keep a poisoned launch local to its exact association and capacity claim.
@@ -103,7 +112,8 @@ The implementation must reuse these checked-in mechanisms:
 - the generic non-pool binding and per-association reconciliation specified by
   `durable-serve-replica-actions.md`.
 
-The merged P2a PR #1499 contains, but has not been promoted:
+Merged P2a PR #1499 contains, but is not present in the current production
+binary and has not been promoted:
 
 - a PostgreSQL-clock-fenced latest-report table and stable authenticated
   ingestion endpoint;
@@ -113,23 +123,121 @@ The merged P2a PR #1499 contains, but has not been promoted:
   dashboard, plus a status overlay for CLI/legacy consumers. Both prefer fresh
   durable telemetry and report stale/unavailable explicitly.
 
-The following is not yet present:
+P2b1 now adds the complete provider-free route projection, and the P2b2
+working branch now adds the promoted autoscaler reader, zero-cost-first
+replanning boundary, immutable capacity plan/head, and planner-bound paid
+claim revalidated immediately before provider I/O. These changes remain dark
+and unpromoted. The final dashboard placement explanation and P3 removal of
+the legacy demand/route paths are not yet implemented.
 
-- an autoscaler reader that consumes that table as its sole demand source;
-- one atomic planner snapshot that orders zero-cost admission before paid
-  admission for the same demand generation;
-- a paid-launch authority tuple that includes the demand and zero-cost
-  allocation generations and is revalidated immediately before provider I/O;
-- a complete provider-free route projection used by the load balancer; and
-- the final dashboard placement explanation that binds paid decisions to their
-  demand and zero-cost generations.
+The 2026-08-16 production read-only audit first found Helm revision 401 on
+v1.1.1296, commit `036c7a2627b34050e00b335b41c8cd7e329cdc2a`, API 81,
+API-request revision 011, and Serve revision 047. The API deployment and both
+`boltz-l4-fleet` load balancers used immutable digest
+`sha256:cb383b53e4723903d62c4115e961c3869b51b5a91e3e7bddec1460703ec54756`.
+A concurrent Terragrunt/Terraform apply then created Helm revision 402 and
+regressed the runtime to v1.1.1287, commit
+`88e6ea7dbd28c85d048fc2608c6c48ab33e1e3e1`, digest
+`sha256:04567b501cc4a35d93aca2ba95701fe9ad56bb39fdc89731997af6b2a84035b3`.
+The PostgreSQL heads correctly remained forward at API-request 011 and Serve
+047. EKS audit records attribute the mutation to Terraform's Helm provider
+under the operator session for `simone-boltz.bio`; Argo CD is installed on the
+hub but has no Application for the SkyPilot release. The declared production
+authority is the checked-in `skypilot-pin.json` in `boltz-platform`, which still
+pins v1.1.1287 and exact chart/image digests. The next deployment must update
+that pin in a dedicated clean platform worktree, review the Terragrunt plan,
+and apply the exact published release. A direct Helm upgrade would create
+temporary drift and is not the steady-state deployment path. Schema is rolled
+forward only; revision 401 is not replayed.
+
+While the additive stack was under review, a second direct Helm mutation
+created revision 403 with v1.1.1299, exact commit
+`8326c5f0490e745d8bd0fea61eb4fe2b16fafbc8`, API 82, and image digest
+`sha256:d0d53742eab3b613e2318def9fd1e55750f86b07da29c01f59df175df327e401`.
+EKS audit attributes that Helm 3.16.4 update to operator identity
+`francesco@boltz.bio`; it is not represented by the platform pin and therefore
+remains deployment drift. The final P2 rollout still goes through the reviewed
+pin and exact saved Terragrunt plan.
+
+While P2b2 exact-head CI was running, another independent direct Helm update
+created revision 404 with v1.1.1301, exact commit
+`b8c017dd6451e4373040d185634ffed5f7c2bf55`, API 84, and image digest
+`sha256:14f7c252bef9c5a1c3c9ec5a22df253a6e66102e9ca09091c93a04cb5a3adeb3`.
+The rollout completed with no restart and advanced the forward PostgreSQL
+heads to Serve049/API-request 011. Its active requests after readiness were
+read-only status, inventory, and managed-jobs queue reads; it created no
+launch/down provider mutation. It is also absent from the platform pin and
+does not replace the reviewed exact-head deployment path.
+
+The service remains `resource_action_mode=legacy`,
+`ordinary_launch_binding_mode=legacy`, and non-pool capability false. It has no
+generalized non-pool association, associated request, legacy
+scope/reconciliation, or paid claim. Historical replica IDs 52032--52038
+remain absent. Absence of those replica rows is not by itself quiescence
+evidence, so they must not be recreated or registered as a historical scope.
+
+The exact pre-migration inventory found 64 nonterminal current-version rows:
+46 `READY`, 15 `PENDING`, and three `PROVISIONING`. The 15 pending zero-cost
+rows had no provider-cluster record at observation time but are recent planner
+intents, so they are neither manually deleted nor used as absence proof. The
+three provisioning rows require typed reconciliation:
+
+- replica 52688 has a present A100-80GB provider cluster and a succeeded,
+  exactly quiesced launch request;
+- replica 52689 has a present A100 provider cluster and a cancelled request
+  whose execution lease expired without an execution-quiescence receipt. The
+  exact launch began at 13:51:14.086 UTC, its ReplicaSet deleted owner Pod UID
+  `c74d8735-f5f9-4e9a-8bd1-19e69f8b68ea` at 13:51:15.759 UTC, and Kubernetes
+  recorded the API container killed with exit 137 at the 60-second Pod grace
+  deadline at 13:52:16 UTC. The lease expired only afterward. This proves a
+  rollout retirement failure, including the chart's overlapping 20-second
+  readiness sleep and full-grace application budget, caused the missing
+  receipt. The exact failed-container audit record is executor-termination
+  evidence, not a fabricated request receipt. This one row caused the legacy
+  recovery pass to time out every 30 seconds; and
+- replica 52690 has an `INIT` H200 provider record and an exactly quiesced
+  failed request. Its PHX Kubernetes admission failed because the Pod omitted
+  the server-owned `kueue.x-k8s.io/queue-name` label. This is a separate
+  workspace/provider admission defect, not demand or reserved scarcity.
+
+Revision 403 restored P1's sanctioned legacy-reconciliation ledger. The
+operator sealed replica 52689's exact retained identity, recorded the reviewed
+termination evidence, observed the physical-UID-fenced provider effect as
+`PRESENT`, performed the exact fenced teardown, and only then recorded a new
+provider observation as `ABSENT`. Event
+`9f747a67-28f1-5883-a8d6-0b64903a5ef0` projected the row. The replica and
+cluster records are absent; the original request remains truthfully
+`CANCELLED` without a fabricated quiescence receipt, and no paid claim exists.
+
+The recovery loop subsequently cleared all 15 prior intents from nonterminal
+`PENDING` state and moved 52688 and 52690 into ordinary typed cleanup, leaving
+46 ready plus those two provisioning rows in the 2026-08-16 post-recovery
+snapshot. It then exposed a
+separate release-lineage defect: the closed revision-040 authority registry
+accepted only heads through Serve047, so the live Serve048 database is rejected
+before placement-normalization acknowledgement and cleanup. P2b1 fixes the
+registry through Serve049; P2b2 extends it through Serve050. The remaining two
+rows must converge after that reviewed runtime deploy, and their outcomes must
+be verified rather than assumed.
+
+The same audit reproduced the live economic defect before revision 400: one
+fresh interval had target 65, 28 ready zero-cost slots, 201 observed free
+reserved slots, and 11 paid L4 cold-launch authorizations. Broker grants were
+fresh and large enough (48 A100, 40 A100-80GB, and 144 H200), proving that the
+blocker was controller ordering/accounting rather than reserved scarcity. A
+later revision-400 sample with zero arrivals had 35 ready slots, 8 provisioning
+rows, 7 Spot rows shutting down, target 5/raw target 1, no paid cold-launch
+authority, 196 reserved-fill target slots, and 172 observed free reserved
+slots. The lack of paid authority in that later sample does not invalidate the
+earlier race; it confirms that the defect is reconcile-order dependent rather
+than permanent Spot scarcity.
 
 ## Public contract
 
 ### Demand report
 
 Each load-balancer process sends a cumulative, idempotent report to the stable
-central API endpoint. Version 1 contains:
+central API endpoint. The display-compatible version 1 contract contains:
 
 - service name and exact service-incarnation hash;
 - load-balancer slot, Pod UID as the durable LB session ID, and a
@@ -144,6 +252,14 @@ central API endpoint. Version 1 contains:
 - the closed accelerator-compatibility demand map and the routing-spec version
   under which it was measured; and
 - saturation/partial-observation flags already emitted by the load balancer.
+
+Version 2 is the only capacity-authoritative contract. It additionally binds
+the exact applied route generation/digest/source epoch and reports the complete
+set of URLs for which occupancy was sampled plus total slots by URL. Version 1
+remains readable for the P2a dashboard transition but is always incomplete for
+autoscaling and paid admission. Its sampled-URL, occupancy, freshness, and
+total-slot key sets must be identical, and every routed URL must be either in
+that set or explicitly occupancy-unknown.
 
 The outer internal-auth middleware authenticates the existing purpose-scoped
 LB sync credential. The endpoint locks the service row and requires the exact
@@ -168,7 +284,12 @@ greatest-value idempotent within one reporter minute. Live gauges remain one
 row per reporter incarnation. The aggregate includes every non-stale reporter:
 during an HA handoff the old draining reporter's in-flight work and the new
 active reporter's queue are both real demand. A reporter row expires; it is
-never converted to a zero observation.
+never converted to a zero observation. Capacity authority additionally
+requires a fresh `ACTIVE` report for the service row's exact selected LB slot
+and cutover generation; every fresh `ACTIVE`/`DRAINING` stream owner must name
+that current generation. A still-fresh pre-cutover report remains display
+history only and cannot promote demand, publish a plan, or preserve a paid
+claim.
 
 ### Freshness states
 
@@ -193,13 +314,13 @@ hysteresis and drain proof still apply.
 
 For each demand compatibility class, one immutable planner snapshot contains:
 
-- demand-feed generation and freshness deadline;
-- route-projection generation and ready compatible capacity;
-- nonterminal compatible zero-cost and paid committed capacity;
-- reserved broker allocation/observation generation and spendable zero-cost
-  slots; and
-- service lifecycle, version, controller-owner, placement-policy, and binding
-  epochs.
+- demand-feed generation and fresh reporter receipt watermark;
+- route-projection generation/digest/source epoch;
+- the complete supply-aware exact-card capacity target selected after
+  compatibility allocation, including zero entries for every configured card;
+- nonterminal compatible zero-cost and paid committed capacity, derived from
+  locked replica rows rather than supplied by the controller; and
+- service incarnation, lifecycle, version, and demand-source epoch.
 
 The raw demand-feed generation is a telemetry receipt generation: it advances
 when any non-duplicate reporter heartbeat lands, including a heartbeat whose
@@ -211,37 +332,71 @@ they do not bind directly to the continuously advancing heartbeat generation.
 This preserves pre-I/O freshness checks without livelocking launches behind a
 five-second reporting cadence.
 
-The planner computes:
+Every promoted reconcile follows one ordered path:
 
 ```text
-residual_before_zero_cost =
-  max(0, demand_target - ready_compatible - committed_compatible)
-
-zero_cost_to_admit =
-  min(residual_before_zero_cost, authenticated_spendable_zero_cost)
-
-paid_to_admit =
-  max(0, residual_before_zero_cost - accepted_zero_cost)
+fresh protocol-v2 demand + exact fresh route
+  -> autoscaler target
+  -> supply-aware exact-card capacity target
+  -> attempt ordinary/reserved zero-cost-only admission
+  -> if any zero-cost row commits: stop and replan
+  -> PostgreSQL locks service, reports, route, and all replica rows
+  -> paid_residual = max(0, target - committed_zero_cost - committed_paid)
+  -> publish/refresh plan head
+  -> admit paid claim only within that residual
 ```
 
-`accepted_zero_cost` means rows committed by the database admission ledger in
-this round, not in-memory intent. Deferred or rejected fill is not counted.
-The final paid transaction locks the same service/capacity ordering, rereads
-all compatible nonterminal rows, exact-matches the demand and allocation
-generations, recomputes the residual, and spends a paid claim. Concurrent
-controllers therefore cannot both consume the same deficit.
+The zero-cost phase uses the existing manager and reserved broker with paid
+selection hard-disabled. `Accepted` means a durable replica row was committed,
+not that an in-memory choice was attempted. Deferred or rejected fill is not
+counted. Any accepted row ends the reconcile so paid residual is never inferred
+from its pre-commit snapshot.
 
-A paid association persists demand generation, demand expiry, compatibility
-class, placement-decision digest, zero-cost allocation generation, and paid
-claim identity. The generic executor revalidates all of them at its
-commit-before-provider-I/O fence. Expired or satisfied demand terminates the
-request at `NOT_STARTED`; it never reaches a cloud API. Once provider I/O may
-have started, the durable action reconciliation contract owns the result and
-no telemetry change can pretend the effect did not happen.
+The public `demand_target_by_accelerator` remains an explanation of where
+flexible work would cold-start at current paid preference; it is not a durable
+capacity accounting class. For example, 65 headerless compatible requests may
+be displayed as L4 demand while already-materialized zero-cost A100 and H200
+slots satisfy that work. Paid residual is therefore computed against the
+autoscaler's supply-aware `capacity_target_by_accelerator`, never by
+subtracting exact-card inventory from the cheapest-compatible demand map.
+Using the display map would either over-authorize L4 Spot or fail every mixed-
+card plan closed. A missing, partial, or sum-inconsistent supply-aware target
+suppresses paid admission.
+
+Plan publication and claim admission share the service-row mutex and lock the
+fresh demand receipts, route head/snapshot, complete current-version replica
+inventory, plan head, and relevant claims. The repository derives exact-card
+or aggregate committed capacity from those rows. Promotion and planning
+require normalized ReplicaInfo v18 rows with explicit zero-cost and logical
+width attribution. An exact-card plan fails closed if any committed
+current-version row cannot be classified into its accounting set; ambiguity
+cannot be converted into a paid deficit. A semantic change treats all
+current rows as the new baseline and mints a new plan generation. For an
+unchanged heartbeat, it subtracts current-plan claim units from the full paid
+inventory to reconstruct the immutable baseline, refreshes the same semantic
+generation's head with the newest receipt generation/watermark, and preserves
+bounded queued work. Every fresh promoted reconcile publishes, including a
+zero target; a demand drop therefore mints a zero-residual generation that
+revokes the prior head.
+
+A paid claim persists plan generation/digest, source demand receipt generation,
+demand-source epoch, canonical accelerator accounting class, and positive
+capacity units. Its existing generic association/request authorization copies
+that immutable claim tuple. Admission and the generic executor revalidate the
+current plan head, receipt watermark, recomputed locked inventory, and the
+content-addressed route payload immediately before provider I/O. Expired,
+satisfied, corrupt, or owner-mismatched authority terminates the request at
+`NOT_STARTED`; it never reaches a cloud API. Once provider I/O may have
+started, the durable action reconciliation contract owns the result and no
+telemetry change can pretend the effect did not happen.
 
 Spot is a paid market for this contract. It may be preferred over On-Demand by
 the existing placement policy, but neither market is authorized without a
 positive residual. Reserved-fill admission can never select either market.
+Cost rebalance, unknown-capacity replacement, and system recovery remain
+separate generic profiles with their existing exact predecessor/recovery
+authority; they cannot consume an ordinary demand-plan residual or silently
+become ordinary scale-up.
 
 ### Route projection
 
@@ -353,13 +508,14 @@ runtime launch authority.
 
 ### P0: compatibility deployment
 
-This precondition is satisfied by the later v1.1.1291 production deployment.
-The 2026-08-16 baseline uses the reviewed Helm release, the existing
-single-`all` `Recreate` topology, Serve schema 046, API schema 010, and
-`LEGACY_ACTIVE`. It has not activated the new generalized action, demand, or
+This precondition was satisfied by the later v1.1.1291 and v1.1.1296
+production deployments. The live database remains compatible and forward at
+Serve047/API-request 011 after revision 402 regressed only the binary to
+v1.1.1287. It has not activated the new generalized action, demand, or
 placement authorities. Subsequent rollouts must continue to use
-`--reuse-values`; they must not redeploy the older v1.1.1284 artifact merely to
-reproduce the originally proposed sequence.
+`--reuse-values`; they must roll forward from a fresh revision-402 snapshot and
+must not redeploy an older artifact merely to reproduce the originally
+proposed sequence.
 
 The same inspection found no surviving replica, request, coverage, shadow, or
 association records for historical replica IDs 52032--52038. Their earlier
@@ -400,8 +556,8 @@ clocks. Overlaying a fresh or unavailable durable request report therefore
 cannot revive stale logical ready capacity or invalidate a fresh controller
 capacity observation.
 
-Current reviewed size: approximately 2,650 source/test/UI lines across 33
-files, mostly reusing existing aggregators, history tables, proxy
+Current reviewed size: 2,851 additions and 90 deletions across 38 files,
+mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
 bounded report validation, and PostgreSQL migration matrix account for the
 increase over the 1,000--1,800 estimate.
@@ -411,7 +567,17 @@ tests, 13 validation tests, 121 focused dashboard tests, repository-wide mypy
 over 940 source files, changed-file pylint at 10/10, dashboard ESLint and
 Prettier, and the exact HA cases where replica-global async occupancy must not
 be double-counted and a fresh standby must not turn an expired active report
-into a false zero. CI and live rollout evidence remain open.
+into a false zero. The first exact-head CI run also established four permanent
+integration gates: current-head forward-only tests derive the Serve revision
+instead of pinning the predecessor; all five load-balancer background loops,
+including demand publication, are owned and cancelled; the dashboard demand
+GET is viewer-readable while the internal reporter POST is explicitly denied;
+and controller-ready and durable-request observations retain independent
+freshness clocks. The last gate exposed and fixed a product bug, rather than
+only fixture contamination: fresh demand can no longer revive stale logical
+capacity, and unavailable demand can no longer erase fresh logical capacity.
+The exact regressions and the real-PostgreSQL case pass locally; corrected
+exact-head CI and live rollout evidence remain open.
 
 ### P2b1: provider-free route projection
 
@@ -430,8 +596,8 @@ is the temporary transition path and is removed by P3. A stale projection may
 retain an already-applied route only under the existing bounded LB outage
 contract; it is never ready capacity for planning.
 
-Current implementation size: approximately 2,000 source/test/design lines
-across 25 files, including about 600 lines of pure and real-PostgreSQL tests.
+Current implementation size: 2,146 additions and 59 deletions across 29 files,
+including about 600 lines of pure and real-PostgreSQL tests.
 The increase over the 900--1,500 estimate comes from closed persisted-payload
 validation, immutable URL/record alias evidence, and integration tests at the
 probe, proxy, LB-apply, and demand-report boundaries. The earlier experimental
@@ -450,9 +616,10 @@ publication evidence remain open.
 
 ### P2b2: one demand authority and ordered capacity admission
 
-API012/Serve050 add API-fleet capability identity, explicit per-service demand
-promotion, the autoscaler durable reader, content-addressed planner-generation
-fields, the source demand receipt watermark, and the paid-authority tuple.
+API version 85/API012/Serve050 add API-fleet capability identity, explicit
+per-service demand promotion, the autoscaler durable reader,
+content-addressed planner-generation fields, the source demand receipt
+watermark, and the paid-authority tuple.
 Serve050 owns the demand promotion mode and epoch; Serve048 deliberately does
 not add authority fields. Promotion disables controller-sync demand mutation
 for that service epoch. Zero-cost admission is committed before paid residual
@@ -460,7 +627,79 @@ planning, and both are revalidated before provider I/O. A heartbeat with
 unchanged normalized demand does not mint a new planner generation or
 invalidate already-admitted work.
 
-Expected size: medium/large, approximately 1,200--2,000 source/test/UI lines.
+The exact Serve050 shape is one `LEGACY_CONTROLLER` / `DURABLE_FEED` source
+mode and monotonic epoch on `services`; immutable `serve_capacity_plans` rows;
+and one freshness-bearing `serve_capacity_plan_heads` row per service. A plan
+binds the service incarnation/lifecycle/version, demand-source epoch, complete
+fresh reporter receipt watermark, exact route generation/digest/epoch,
+normalized demand, demand target, PostgreSQL-derived zero-cost and paid
+baseline capacity, the distinct supply-aware exact-card capacity target, and
+paid residual by accelerator. The semantic payload is
+content-addressed. The head carries the latest demand generation and
+receipt-watermark digest; an identical reconcile reconstructs its baseline by
+subtracting same-plan claims from locked paid inventory and refreshes those
+receipt fields and the expiry without minting a new semantic generation.
+
+The existing `paid_capacity_claims` row gains one all-or-none tuple containing
+plan generation, plan digest, demand-feed generation, demand-source epoch, and
+the canonical accelerator compatibility class debited by that claim.
+The tuple also stores the positive planner units consumed, so a multi-GPU
+logical backend cannot spend a one-backend claim as if it represented one
+unit.
+Planner-bound claims also have a database foreign key to the immutable
+`(service_name, plan_generation)` row, with service/plan deletion cascading;
+legacy claims keep the nullable transition shape.
+The existing generic non-pool profile includes that tuple in its paid-claim
+authorization. Admission and the shared pre-provider-I/O guard lock the claim,
+plan/head, service, route head, and demand generation and exact-match the
+tuple. They require an unexpired plan head and demand/route receipts, but do
+not require that their wall-clock freshness timestamps equal those observed at
+admission. This keeps freshness fail-closed while allowing an unchanged
+heartbeat to extend authority without changing content identity. A newer
+semantic plan invalidates old claims at the pre-I/O fence; their durable rows
+remain action/reconciliation evidence and their committed replicas become
+baseline capacity in the new plan.
+Capacity plans are operational fences rather than history. Plan publication
+removes superseded generations that are neither the current head nor
+referenced by a planner-bound claim; the claim foreign key retains every
+generation that can still authorize or explain unsettled work without allowing
+the table to grow with every semantic reconcile.
+
+Serve050's authoritative constraints remain PostgreSQL-only, while the shared
+controller metadata omits their PostgreSQL-specific expressions when a local
+controller creates its still-supported SQLite database. The migration and
+runtime authority stay on PostgreSQL; this prevents the central database
+contract from accidentally breaking the separate local-controller backend.
+
+API012 advertises one exact ordered-admission protocol capability on every
+live `all|api|executor|controller` participant. Per-service promotion locks the
+service, proves that fleet capability, a fresh complete durable demand report,
+a fresh matching projected route, current controller ownership, and no legacy
+demand mutation in flight, then advances the source epoch. After promotion the
+controller-sync endpoint may still accept routing/drain reports during the
+transition, but it cannot call `collect_request_information`; only the durable
+reader may advance autoscaler demand state.
+
+Reviewed P2b2 size after the API84 base collision was resolved: 46 files,
+4,316 additions and 246 deletions.
+This is large and above the original 1,200--2,000-line estimate because it
+includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
+races, controller ordering tests, strict route/content/LB-generation
+validation, bounded plan retention, and mixed-fleet capability tests.
+The 2026-08-16 post-review correction adds a cross-card PostgreSQL regression:
+L4-attributed compatible demand with an A100 actuation target debits the A100
+zero-cost row and authorizes only the remaining A100 residual. It also makes a
+sequenced reserved-fill commit return explicit progress to the ordered
+controller: any accepted row ends the promoted reconcile and forces a fresh
+plan, just like an ordinary zero-cost commit.
+
+Local P2b2 correction evidence on 2026-08-16 includes the complete Serve
+controller, concurrency/QPS autoscaler, compatibility-contract,
+decision-contract, and pure admission suites, plus all ten admission tests on
+a real local PostgreSQL 14 server, the complete PostgreSQL API-request suite,
+and 101 focused dashboard tests. Formatting, mypy over 947 source files,
+pylint, and dashboard lint all pass. Remote CI, injected provider failure, and
+production promotion evidence remain open.
 
 ### P3: blocked steady-state cleanup
 
@@ -476,16 +715,24 @@ than the current system.
 
 ## Deployment and rollback
 
-All source branches target `boltz-bio/skypilot:improvements`. Production
-deployment authority is the reviewed live Helm release, not a platform pin.
-The release tuple is `skypilot` in namespace `skypilot`; `improvements` is the
-source branch and must never be substituted as the release name.
-Every upgrade captures live values/manifest, reviews the rendered diff, uses
-`--reuse-values`, pins the immutable image for every explicitly overridden
-role, and records the live Helm revision, image digest, schema heads, rollout,
-and post-deploy observations.
+All SkyPilot source branches target `boltz-bio/skypilot:improvements`. The
+production deployment authority is the checked-in exact runtime pin consumed
+by the `boltz-platform` Terragrunt control-plane unit. The release tuple is
+`skypilot` in namespace `skypilot`; `improvements` is the source branch and
+must never be substituted as the release name. The runtime pin binds version,
+source commit, API version, image digest, and chart digest. Update it only from
+a dedicated clean platform branch/worktree rebased on `origin/main`; run the
+repository tests and Terragrunt plan before the authorized apply. Every rollout
+also captures the live Helm values/manifest immediately before mutation,
+reviews the rendered/plan diff, preserves the complete Terraform-owned Helm
+value flow, and records the live Helm revision, exact image/chart digests,
+schema heads, rollout, and post-deploy observations. A manual Helm mutation is
+an emergency drift operation, not a durable release promotion.
 
-P1 and P2 are additive and dark before per-service promotion. Promotion
+P1 and P2 are additive and dark before per-service promotion. Revision 402's
+older runtime is not capable of P1 legacy reconciliation even though its
+database is forward-compatible; restore one exact P1/P2-capable cohort before
+any reconciliation or promotion. Promotion
 requires one exact capable cohort, no unsettled unbound work for that service,
 fresh demand/route publications, and a successful injected-failure rehearsal.
 Rollback before P3 means disable new promotion, drain/project bound work, and
@@ -522,12 +769,16 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. the live v1.1.1291 compatibility baseline, with unchanged single-`all`
-   topology, Serve046/API010 schema heads, and `LEGACY_ACTIVE`;
-2. a fresh pre-migration inventory of retained legacy rows and unsettled
+1. the live deployment tuple at rollout time, including revision 404's
+   unpinned v1.1.1301 drift, unchanged single-`all` topology, and the forward
+   Serve049/API-request-011 database heads;
+2. the completed pre-migration inventory of retained legacy rows and unsettled
    requests; reconcile only rows that actually remain. Record the historical
    absence of IDs 52032--52038 without treating it as quiescence, recreating
-   rows, or backfilling associations;
+   rows, or backfilling associations. Preserve exact typed evidence for 52688,
+   52689, and 52690; retain 52689's completed P1 ledger and original unmodified
+   request, and let 52688/52690 use ordinary typed cleanup after the registry
+   fix;
 3. provider-phase latency and proof that one quarantined row does not block
    routes, demand, or sibling reconciliation;
 4. a fresh zero-traffic interval with target zero and no new paid request;
@@ -564,16 +815,26 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
 
 ## Open gates
 
-- [x] Verify the equivalent later v1.1.1291 production compatibility baseline
-  without generalized-action, demand-authority, or placement promotion
-  (2026-08-16: single-`all` `Recreate`, Serve046/API010, `LEGACY_ACTIVE`).
-- [x] Publish P1 as PR #1498, P2a as PR #1499, P2b as PRs #1503/#1504,
-  and the blocked P3 removals as draft PRs #1506/#1510.
+- [x] Verify the v1.1.1296 production compatibility baseline and the later
+  revision-402 binary-only regression without generalized-action,
+  demand-authority, or placement promotion (2026-08-16: single-`all`
+  `Recreate`, forward Serve047/API-request-011 heads, service resource-action
+  and binding modes legacy, non-pool capability false).
+- [x] Merge P1, P2a, and P2b1 as PRs #1498, #1499, and #1503; publish P2b2 as
+  PR #1504 and the blocked P3 removals as draft PRs #1506/#1510.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
-- [ ] Immediately before migration, inventory exact retained legacy rows and
-  unsettled requests, then reconcile only present rows without fabricated
-  quiescence or manual deletion. The historical seven-row scope is absent and
-  must not be reconstructed.
+- [x] Inventory exact retained legacy rows and unsettled requests immediately
+  before migration. The historical seven-row scope is absent and must not be
+  reconstructed; retained rows 52688--52690 are recorded above.
+- [x] Reconcile replica 52689 through reviewed executor-termination evidence,
+  deliberate exact provider teardown, and a subsequent fresh exact absence
+  observation through the P1 legacy ledger. Preserve its unmodified cancelled
+  request without fabricating quiescence.
+- [ ] Deploy the reviewed Serve049/050 registry lineage and verify ordinary
+  typed cleanup converges replicas 52688 and 52690 without manual deletion.
+- [ ] Repair the PHX server-owned Kubernetes admission configuration so an
+  H200 reserved-fill Pod carries the required Kueue queue label; prove the
+  admitted Pod still has the approved low preemptible priority class.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set

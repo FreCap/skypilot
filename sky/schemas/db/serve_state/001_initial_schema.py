@@ -46,15 +46,36 @@ _POST_REVISION_001_COLUMNS = {
         'route_projection_capable',
         'route_projection_controller_incarnation',
         'route_projection_protocol_version',
+        'demand_source_mode',
+        'demand_source_epoch',
+        'demand_authority_capable',
+        'demand_authority_controller_incarnation',
+        'demand_authority_protocol_version',
     }),
     'replicas': frozenset({'ordinary_launch_association_id'}),
+    'paid_capacity_claims': frozenset({
+        'capacity_plan_generation',
+        'capacity_plan_sha256',
+        'demand_feed_generation',
+        'demand_source_epoch',
+        'capacity_plan_accelerator',
+        'capacity_plan_units',
+    }),
 }
-_POST_REVISION_001_CHECKS = {
+_POST_REVISION_001_CONSTRAINTS = {
     'services': frozenset({
         'serve049_route_source_mode_ck',
         'serve049_route_source_epoch_ck',
         'serve049_route_capability_shape_ck',
         'serve049_route_projected_capability_ck',
+        'serve050_demand_source_mode_ck',
+        'serve050_demand_source_epoch_ck',
+        'serve050_demand_capability_shape_ck',
+        'serve050_durable_demand_capability_ck',
+    }),
+    'paid_capacity_claims': frozenset({
+        'serve050_paid_claim_plan_complete_ck',
+        'serve050_paid_claim_plan_values_ck',
     }),
 }
 
@@ -81,14 +102,16 @@ def _initial_metadata(bind: sa.engine.Connection) -> sa.MetaData:
     # exact migration defaults/constraints and SQLite stays at Serve037.
     for table_name, column_names in _POST_REVISION_001_COLUMNS.items():
         table = metadata.tables[table_name]
-        future_checks = _POST_REVISION_001_CHECKS.get(table_name, frozenset())
-        for constraint in tuple(table.constraints):
-            if constraint.name in future_checks:
-                table.constraints.remove(constraint)
         for column_name in column_names:
             column = table.c.get(column_name)
             if column is not None:
                 table._columns.remove(column)
+    for table_name, constraint_names in (
+            _POST_REVISION_001_CONSTRAINTS.items()):
+        table = metadata.tables[table_name]
+        for constraint in tuple(table.constraints):
+            if constraint.name in constraint_names:
+                table.constraints.remove(constraint)
     return metadata
 
 

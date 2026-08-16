@@ -63,7 +63,10 @@ def test_postgres_record_schema_topology() -> None:
              'non_pool_launch_binding_protocol_version',
              'non_pool_launch_capability_profile_set_digest',
              'non_pool_launch_capability_cohort_epoch',
-             'non_pool_launch_receipt_protocol_version'),
+             'non_pool_launch_receipt_protocol_version',
+             'ordered_capacity_admission_capable',
+             'ordered_capacity_admission_protocol_version',
+             'ordered_capacity_admission_cohort_epoch'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
              'generation_lock_key', 'origin_capability_sha256', 'acquired_at',

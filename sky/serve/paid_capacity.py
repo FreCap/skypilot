@@ -1269,6 +1269,7 @@ def try_persist_claim(
     location: spot_placer.Location,
     budget: LaunchBudget,
     priority: int,
+    capacity_plan_claim: Mapping[str, Any] | None = None,
 ) -> ClaimResult:
     """Atomically persist a replica row and exact-pool capacity claim."""
     if not budget.globally_managed or service_hash is None:
@@ -1300,7 +1301,8 @@ def try_persist_claim(
         frontier_default_limit=(budget.frontier_limit if budget.frontier_limit
                                 is not None else exploration_frontier()),
         frontier_limits_by_key=_frontier_limits_by_key(budget),
-        expected_controller_owner=controller_owner)
+        expected_controller_owner=controller_owner,
+        capacity_plan_claim=capacity_plan_claim)
     return ClaimResult(result)
 
 

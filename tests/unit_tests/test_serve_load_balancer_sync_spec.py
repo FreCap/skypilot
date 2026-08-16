@@ -380,9 +380,11 @@ def test_durable_demand_sync_posts_directly_and_acknowledges_history():
         'Authorization': 'Bearer sync-token',
         constants.SERVICE_HASH_HEADER: 'service-hash-a',
     }
-    assert kwargs['json']['protocol_version'] == 1
+    assert kwargs['json']['protocol_version'] == 2
     assert kwargs['json']['sequence'] == 1
     assert kwargs['json']['configured_accelerators'] == ['L4']
+    assert kwargs['json']['occupancy_sampled_urls'] == []
+    assert kwargs['json']['total_slots_by_url'] == {}
     assert kwargs['json']['demand_window']['buckets'][0]['request_count'] == 1
     assert kwargs['timeout'].total == constants.LB_DEMAND_REPORT_TIMEOUT_SECONDS
     assert lb._request_aggregator.request_history_snapshot() is None
@@ -440,7 +442,10 @@ def test_projected_route_fence_advances_only_after_full_route_apply(
     assert lb._route_projection_generation == 11
     assert lb._route_projection_sha256 == digest
     assert lb._route_source_epoch == 3
-    report, _, _, _ = lb._build_demand_report()
+    with mock.patch.object(lb,
+                           '_get_lb_session_id',
+                           return_value='test-pod-uid'):
+        report, _, _, _ = lb._build_demand_report()
     assert report['route_projection_generation'] == 11
     assert report['route_projection_sha256'] == digest
     assert report['route_source_epoch'] == 3

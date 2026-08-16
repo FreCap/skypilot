@@ -16,7 +16,7 @@ from sky.serve import demand_state_schema
 from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
-pytestmark = pytest.mark.xdist_group(name='serve_demand_state_schema_048_pg')
+pytestmark = pytest.mark.xdist_group(name='serve_demand_state_schema_050_pg')
 
 
 def _report(now: float, *, sequence: int = 1) -> dict:
@@ -45,6 +45,10 @@ def _report(now: float, *, sequence: int = 1) -> dict:
         },
         'occupancy_sample_age_seconds': {
             'http://replica': 0.1
+        },
+        'occupancy_sampled_urls': ['http://replica'],
+        'total_slots_by_url': {
+            'http://replica': 4
         },
         'routing_urls': ['http://replica'],
         'unknown_in_flight_urls': [],
@@ -100,7 +104,7 @@ def _report(now: float, *, sequence: int = 1) -> dict:
 def demand_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(serve_config, '048')
+    alembic_command.upgrade(serve_config, '050')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     with empty_postgres.begin() as connection:
@@ -115,7 +119,7 @@ def demand_database(empty_postgres, monkeypatch):
     return empty_postgres
 
 
-def test_serve048_schema_is_postgresql_only_and_complete(demand_database):
+def test_durable_demand_schema_is_postgresql_only_and_complete(demand_database):
     inspector = sqlalchemy.inspect(demand_database)
     assert inspector.has_table(
         demand_state_schema.serve_lb_demand_reports_table.name)
@@ -202,6 +206,8 @@ def test_unknown_occupancy_never_displays_processing_zero(demand_database):
     report['async_occupancy'] = {}
     report['occupancy_sample_generation'] = {}
     report['occupancy_sample_age_seconds'] = {}
+    report['occupancy_sampled_urls'] = []
+    report['total_slots_by_url'] = {}
     report['unknown_in_flight_urls'] = ['http://replica']
     demand_state.ingest_report('svc', 'svc-hash', report)
 
