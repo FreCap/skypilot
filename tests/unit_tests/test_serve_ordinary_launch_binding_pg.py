@@ -425,6 +425,120 @@ def _generic_controller_authority() -> binding.ControllerBindingAuthority:
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
 
 
+def _admit_generic_paid(
+    database,
+) -> tuple[binding.NonPoolBindingIdentity, binding.BoundNonPoolLaunchContext]:
+    with database.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    status='READY'))
+        binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=_CONTROLLER_ID,
+            controller_owner_epoch=6,
+            expected_binding_epoch=5,
+            participant_barrier_passed=lambda _connection: True,
+            legacy_requests_drained=lambda _connection: True)
+        state = _stored_replica_state({'paid_capacity_pool_key': 'pool-a'})
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    status='PROVISIONING',
+                    paid_capacity_pool_key='pool-a',
+                    replica_state=state))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key='pool-a',
+                    current_limit=1,
+                    successes_since_resize=0,
+                    updated_at=time.time()))
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.paid_capacity_claims_table).values(
+                    service_name='svc',
+                    service_hash='svc-hash',
+                    replica_id=3,
+                    pool_key='pool-a',
+                    priority=1,
+                    claimed_at=time.time()))
+
+    profile = binding.resolve_non_pool_launch_profile('svc', 3, _RECORD_ID)
+    launch_body = _body()
+    launch_body.extra_launch_context[binding.BINDING_EPOCH_KEY] = 6
+    intent = binding.parse_unbound_launch_context(
+        launch_body.extra_launch_context)
+    identity = binding.build_non_pool_binding_identity(
+        intent,
+        submission_id=_SUBMISSION_ID,
+        tenant_scope='tenant-a',
+        service_workspace='workspace-a',
+        cluster_name='svc-3',
+        input_digest=binding.canonical_launch_digest(launch_body),
+        profile=profile,
+        capability_cohort_epoch=binding.NON_POOL_CAPABILITY_COHORT_EPOCH,
+        capability_profile_set_digest=(
+            binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+    with database.begin() as connection:
+        admission = binding.insert_or_get_locked(connection, identity)
+    binding.install_bound_non_pool_context(launch_body, identity,
+                                           admission.launch_generation)
+    return identity, binding.parse_bound_non_pool_launch_context(
+        launch_body.extra_launch_context)
+
+
+def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
+        binding_database) -> None:
+    identity, context = _admit_generic_paid(binding_database)
+    with binding_database.begin() as connection:
+        assert binding.mark_ambiguous_in_connection(
+            connection, context, 'provider-result-uncertain')
+
+    def _record(evidence, result, *, quiescent=True):
+        with binding_database.begin() as connection:
+            return binding.record_non_pool_provider_evidence(
+                connection, context, _generic_controller_authority(), evidence,
+                {
+                    'cluster_name': 'svc-3',
+                    'probe_contract': 'test-provider-v1',
+                    'result': result,
+                }, lambda _connection, _context: quiescent)
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='exact request quiescence'):
+        _record(binding.ProviderEvidence.ABSENT, 'ABSENT', quiescent=False)
+    assert _record(binding.ProviderEvidence.PRESENT, 'PRESENT')
+    # A later unreadable provider must not erase stronger presence evidence.
+    assert not _record(binding.ProviderEvidence.UNKNOWN, 'UNKNOWN')
+    assert _record(binding.ProviderEvidence.ABSENT, 'ABSENT')
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='terminal classification'):
+        _record(binding.ProviderEvidence.PRESENT, 'PRESENT')
+
+    with binding_database.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(binding.ordinary_launch_associations_table).where(
+                binding.ordinary_launch_associations_table.c.association_id ==
+                identity.association_id)).mappings().one()
+    assert association['resolution'] == binding.Resolution.AMBIGUOUS.value
+    assert association['reconciliation_outcome'] == (
+        binding.ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value)
+    assert association['provider_evidence'] == (
+        binding.ProviderEvidence.ABSENT.value)
+    assert association['provider_evidence_observed_at'] is not None
+    assert association['provider_evidence_payload'] == {
+        'cluster_name': 'svc-3',
+        'probe_contract': 'test-provider-v1',
+        'result': 'ABSENT',
+    }
+    assert len(association['provider_evidence_digest']) == 64
+
+
 def test_pre_admission_generic_intent_retirement_is_effect_free_and_exact(
         binding_database) -> None:
     """A pointerless post-cutover row releases its planner debit only."""
@@ -455,6 +569,13 @@ def test_pre_admission_generic_intent_retirement_is_effect_free_and_exact(
                 replica_state=state))
         connection.execute(
             sqlalchemy.insert(
+                serve_state_schema.paid_capacity_pools_table).values(
+                    pool_key='pool-a',
+                    current_limit=1,
+                    successes_since_resize=0,
+                    updated_at=time.time()))
+        connection.execute(
+            sqlalchemy.insert(
                 serve_state_schema.paid_capacity_claims_table).values(
                     service_name='svc',
                     service_hash='svc-hash',
@@ -481,6 +602,44 @@ def test_pre_admission_generic_intent_retirement_is_effect_free_and_exact(
     assert binding.retire_pre_admission_non_pool_launch_intent(
         _generic_controller_authority(), 3, _RECORD_ID).disposition == (
             binding.PreAdmissionRetirementDisposition.ABSENT)
+
+
+def test_pre_admission_retirement_quarantines_incomplete_generic_profile(
+        binding_database) -> None:
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc'))
+        binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=_CONTROLLER_ID,
+            controller_owner_epoch=6,
+            expected_binding_epoch=5,
+            participant_barrier_passed=lambda _connection: True,
+            legacy_requests_drained=lambda _connection: True)
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                service_name='svc',
+                replica_id=3,
+                replica_state_version=1,
+                status='PROVISIONING',
+                version=2,
+                cluster_name='svc-3',
+                is_spot=False,
+                replica_state=_stored_replica_state({
+                    'reserved_fill': True,
+                })))
+
+    with pytest.raises(binding.OrdinaryLaunchBindingConflict,
+                       match='incomplete generic planner profile'):
+        binding.retire_pre_admission_non_pool_launch_intent(
+            _generic_controller_authority(), 3, _RECORD_ID)
+
+    with binding_database.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one() == 1
 
 
 def test_serve047_generic_capability_transition_is_adjacent_and_reversible(
@@ -553,6 +712,52 @@ def test_serve047_rejects_capability_change_without_binding_epoch_cas(
                             binding.supported_non_pool_profile_set_digest()),
                         non_pool_launch_capability_cohort_epoch=1,
                         non_pool_launch_receipt_protocol_version=1))
+
+
+def test_serve047_rejects_bound_epoch_advance_without_capability_change(
+        binding_database) -> None:
+    with pytest.raises(sqlalchemy.exc.DBAPIError,
+                       match='mode or non-pool capability transition'):
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.services_table).where(
+                    serve_state_schema.services_table.c.name == 'svc').values(
+                        ordinary_launch_binding_epoch=6))
+
+
+def test_serve047_replica_planner_authorization_is_initial_insert_only(
+        binding_database) -> None:
+    authorization = {'authorization_version': 1, 'profile_kind': 'test'}
+    with binding_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                service_name='svc',
+                replica_id=4,
+                replica_state_version=1,
+                status='READY',
+                version=2,
+                cluster_name='svc-4',
+                is_spot=False,
+                replica_state=_stored_replica_state(),
+                non_pool_launch_authorization=authorization))
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError, match='initial-insert-only'):
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 4).values(
+                        non_pool_launch_authorization={
+                            **authorization, 'profile_kind': 'changed'
+                        }))
+
+    with pytest.raises(sqlalchemy.exc.DBAPIError, match='initial-insert-only'):
+        with binding_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.update(serve_state_schema.replicas_table).where(
+                    serve_state_schema.replicas_table.c.service_name == 'svc',
+                    serve_state_schema.replicas_table.c.replica_id == 3).values(
+                        non_pool_launch_authorization=authorization))
 
 
 def test_serve047_rejects_incapable_controller_takeover(
@@ -1049,14 +1254,14 @@ def test_serve038_rejects_partial_and_malformed_complete_serve042_catalog(
         'serve_resource_actions')
 
 
-def test_serve042_downgrade_is_forward_only(binding_database) -> None:
+def test_serve047_downgrade_is_forward_only(binding_database) -> None:
     config = migration_utils.get_alembic_config(binding_database,
                                                 migration_utils.SERVE_DB_NAME)
-    with pytest.raises(RuntimeError, match='Serve042 is forward-only'):
-        alembic_command.downgrade(config, '041')
+    with pytest.raises(RuntimeError, match='Serve047 is forward-only'):
+        alembic_command.downgrade(config, '046')
 
     assert migration_utils.get_current_alembic_revision(
-        binding_database, migration_utils.SERVE_DB_NAME) == '042'
+        binding_database, migration_utils.SERVE_DB_NAME) == '047'
     assert binding.ordinary_launch_associations_table.name in sqlalchemy.inspect(
         binding_database).get_table_names()
 

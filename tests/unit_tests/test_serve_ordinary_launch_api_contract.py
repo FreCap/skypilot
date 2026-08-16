@@ -337,8 +337,13 @@ def test_non_pool_endpoint_recomputes_profile_and_uses_distinct_handler(
                         'get_service_config_recovery_identity',
                         lambda _service_name: ('svc-hash', 'workspace-a'))
     monkeypatch.setattr(ordinary_launch_binding,
-                        'resolve_non_pool_launch_profile',
-                        lambda *_args: profile)
+                        'get_existing_non_pool_launch_profile',
+                        lambda _association_id: profile)
+    monkeypatch.setattr(
+        ordinary_launch_binding, 'resolve_non_pool_launch_profile',
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError('exact retry must use its stored '
+                           'immutable profile')))
     monkeypatch.setattr(server.executor, 'build_request_async',
                         _build_request_async)
     monkeypatch.setattr(server, '_bind_and_enqueue_non_pool_launch',
@@ -380,6 +385,9 @@ def test_non_pool_endpoint_rejects_profile_claimed_by_controller_when_planner_di
     monkeypatch.setattr(server.serve_state,
                         'get_service_config_recovery_identity',
                         lambda _service_name: ('svc-hash', 'workspace-a'))
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'get_existing_non_pool_launch_profile',
+                        lambda _association_id: None)
     monkeypatch.setattr(ordinary_launch_binding,
                         'resolve_non_pool_launch_profile',
                         lambda *_args: durable_profile)

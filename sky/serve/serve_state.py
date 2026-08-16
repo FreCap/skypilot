@@ -3167,6 +3167,7 @@ _ACTION_OWNED_REPLICA_COLUMNS = frozenset({
     'down_shadow_sample_id',
     'resource_action_spec_identity_sha256',
     'ordinary_launch_association_id',
+    'non_pool_launch_authorization',
 })
 _PAID_CAPACITY_UNRESOLVED_STATUSES = (
     ReplicaStatus.PENDING.value,
@@ -3590,6 +3591,25 @@ def _replica_row_values(
         'replica_state': replica_state,
     }
     assert tuple(values) == _REPLICA_ROW_COLUMNS
+    return values
+
+
+def _initial_replica_row_values(
+    engine: sqlalchemy.engine.Engine,
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+) -> dict[str, Any]:
+    """Add typed planner authority only to an initial PostgreSQL insert."""
+    values = _replica_row_values(service_name, replica_id, replica_info)
+    authorization = getattr(replica_info, 'non_pool_launch_authorization', None)
+    if authorization is None:
+        return values
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Non-pool planner authorization requires PostgreSQL.')
+    if not isinstance(authorization, dict):
+        raise ValueError('Non-pool planner authorization must be a mapping.')
+    values['non_pool_launch_authorization'] = copy.deepcopy(authorization)
     return values
 
 
@@ -4021,10 +4041,16 @@ def _upsert_replica_rows_in_session(
     insert_func = _upsert_insert_func(engine)
     for start in range(0, len(replica_infos), chunk_size):
         chunk = replica_infos[start:start + chunk_size]
-        insert_stmt = insert_func(replicas_table).values([
-            _replica_row_values(service_name, replica_id, replica_info)
+        row_values = [
+            _initial_replica_row_values(engine, service_name, replica_id,
+                                        replica_info)
             for replica_id, replica_info in chunk
-        ])
+        ]
+        if any('non_pool_launch_authorization' in values
+               for values in row_values):
+            for values in row_values:
+                values.setdefault('non_pool_launch_authorization', None)
+        insert_stmt = insert_func(replicas_table).values(row_values)
         session.execute(insert_stmt)
     return replica_infos
 
@@ -5115,8 +5141,8 @@ def try_add_replica_with_paid_capacity_claim(
                 return 'ownership_lost'
         else:
             replica_insert = _upsert_insert_func(engine)(replicas_table).values(
-                **_replica_row_values(service_name, replica_id,
-                                      transaction_replica_info))
+                **_initial_replica_row_values(engine, service_name, replica_id,
+                                              transaction_replica_info))
             session.execute(replica_insert)
         claim_insert = _upsert_insert_func(engine)(
             paid_capacity_claims_table).values(service_name=service_name,

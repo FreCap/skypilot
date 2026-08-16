@@ -85,10 +85,13 @@ permanently unbound.
 
 As of 2026-08-16, the G1 implementation is authored but not deployed. It adds
 the generalized non-pool association/admission path, exact legacy-evidence
-ledger and bounded reconciler, pointerless pre-admission retirement, and
-failure-isolated startup recovery. Focused source tests and static analysis
-pass; PostgreSQL migration/reducer CI, stacked cleanup publication, rollout,
-and live evidence for the seven incident rows remain open gates.
+ledger, bounded current-protocol provider-evidence reconciler, pointerless
+pre-admission retirement, and failure-isolated startup recovery. Local evidence
+currently includes 58 focused source contracts, all 53 real-PostgreSQL
+Serve047 migration/binding/reducer tests, the real-PostgreSQL atomic API011
+admission/quiescence test, `git diff --check`, and Python compilation. CI,
+provider-absence projection, stacked cleanup publication, rollout, and live
+evidence for the seven incident rows remain open gates.
 
 ## Decision record
 
@@ -362,6 +365,24 @@ the association, `api_requests` row, generic request-retention pin, and
 association pointer. Queue visibility occurs only at transaction commit, after
 every effect fence and binding is durable.
 
+Serve047 adds one nullable `replicas.non_pool_launch_authorization` JSONB
+scalar for planner evidence that was previously process-local. It is populated
+only by the typed initial replica-intent insert, omitted by generic
+ReplicaInfo/status writers, and immutable after that insert. Unknown-capacity
+replacement records the exact predecessor record/version, stable service
+hash/lifecycle/binding identity, authoritative reconcile generation, `UNKNOWN`
+classification, and complete logical target/card shapes. Cost rebalance
+records the exact predecessor record/version and the same stable service
+identity; its target decision remains in the existing fenced service-level
+stabilization state. The envelope deliberately excludes controller
+incarnation/owner epoch: those are transferable association ownership, and an
+immutable planner intent must remain adoptable across a legitimate controller
+handoff. A service recreation or binding transition still invalidates the
+stable identity.
+Admission and pre-I/O require the exact predecessor still to exist and
+recompute the profile from both rows. This scalar is planner intent evidence,
+not an association, receipt, provider fact, or retry authority.
+
 That transaction also runs the selected profile adapter. Most profiles have no
 additional execution payload. `SYSTEM_OOM_RECOVERY/v1` is different: the
 adapter validates the complete unbound recovery envelope against the locked
@@ -386,9 +407,16 @@ then makes a fresh decision. Startup must not reconstruct a retained profile
 from a subset of fields or run provider cleanup. If concurrent admission won
 the row lock first, startup instead finds and adopts the exact association. A
 crash after binding likewise finds the exact association and adopts that
-request. A lost response retries the same submission UUID: exact identity and
-digest return the existing request; any mismatch fails closed. There is no
-second executor, fallback launch, or provider-discovery inference.
+request. A lost response retries the same submission UUID. The API first
+derives the deterministic association identity and, when it already exists,
+uses its immutable stored profile rather than re-resolving mutable planner
+observations. The admission transaction still locks and exact-matches the
+complete association/request bytes; only a first admission recomputes live
+planner authority. The shared pre-provider guard independently recomputes live
+authority before any external effect. Thus an exact identity and digest return
+the existing request after a lost acknowledgement, while any mismatch fails
+closed. There is no second executor, fallback launch, or provider-discovery
+inference.
 
 The same one-intent/one-action rule applies after an exact current-protocol
 `PRE_EFFECT_TERMINAL` result. The reducer clears the pointer and releases the
@@ -441,7 +469,9 @@ The forward schema contract is:
 - Serve047 retains the Serve042 association table and replica pointer. It adds
   the same protocol/profile/cohort tuple, a typed authority kind/reference/
   generation plus canonical authority digest, typed reconciliation and
-  provider-evidence fields, and service cohort epoch/digest.
+  provider-evidence fields, service cohort epoch/digest, and the immutable
+  initial-insert-only replica planner-authorization scalar used by replacement
+  profiles.
 - Existing protocol-v1 associations are never rewritten or given protocol-v2
   receipts. They must settle, project, unpin, and drain before per-service v2
   promotion. Historical unbound rows are not inserted into the association
@@ -514,8 +544,8 @@ canonical digest, not a duplicate planner payload:
 | `ORDINARY_PAID/v1` | Exact paid-capacity pool/claim identity and generation plus selected placement digest. |
 | `ORDINARY_ZERO_COST/v1` | Exact zero-cost placement identity and database-assigned admission sequence. |
 | `RESERVED_FILL/v1` | Gate, allocation, claim, and observation generations; exact pool/physical-UID/card; intent key; zero-cost admission sequence; committed service version; worker-projection digest; reclaim-policy identity and ticket reference. |
-| `UNKNOWN_CAPACITY_REPLACEMENT/v1` | Exact predecessor record/generation, replacement reason, observation identity/classification, and new-placement decision digest. |
-| `COST_REBALANCE/v1` | Exact predecessor record/generation, rebalance decision/target placement digest, and current paid/zero-cost claim reference. |
+| `UNKNOWN_CAPACITY_REPLACEMENT/v1` | Immutable replica planner authorization: exact predecessor record/version, stable service hash/lifecycle/binding identity, reconcile generation, `UNKNOWN` classification and complete logical target; plus new-placement digest and current paid/zero-cost authority. |
+| `COST_REBALANCE/v1` | Immutable replica planner authorization: exact predecessor record/version and stable service hash/lifecycle/binding identity; plus the current service-level stabilization decision/target-placement digest and current paid/zero-cost authority. |
 | `SYSTEM_OOM_RECOVERY/v1` | Exact recovery-intent launch generation and nonce, authorization/runtime/task/image/envelope identities, selected placement/funding, and candidate disposition. Mutable recovery-row revision and request/result fields are excluded. |
 
 The authoritative domain fields remain in the locked service, replica,
@@ -526,7 +556,8 @@ row is missing, stale, partial, or inconsistent.
 Mutable fields are current controller-owner incarnation/epoch,
 association-owner revision, effect phase, request terminal status/cause and
 quiesced generation, optional exact service-job ID, typed reconciliation and
-provider-evidence outcomes, projection state, and database-clock timestamps.
+provider-evidence outcomes, canonical evidence payload/digest, projection
+state, and database-clock timestamps.
 Effect phases are `NOT_STARTED`, `PROVIDER_IO`, `SERVICE_JOB_IO`, and
 `SERVICE_JOB_RECORDED`. Reconciliation outcomes are `ACTIVE_ADOPT`,
 `RESULT_RECORDED`, `PROJECTED`, `PRE_EFFECT_TERMINAL`,
@@ -565,6 +596,12 @@ provider evidence; it never synthesizes a binding or authorizes a successor.
 Provider absence used for legacy cleanup always comes from a fresh physical-
 cluster read started after the reviewed executor-termination attestation; the
 normal teardown snapshot cache is explicitly bypassed for this evidence.
+Current-protocol provider reconciliation is likewise two-sided: the exact
+request generation must be terminal and quiescent before the fresh provider
+read starts, and the evidence commit re-locks the association/request and
+requires that same quiescence and current controller owner after the read.
+This prevents an active executor from creating a resource after an `ABSENT`
+observation but before it publishes quiescence.
 
 Serve047 also adds one transition-only append-only legacy-reconciliation
 evidence table. It is not an association, request-admission path, queue, or
@@ -602,6 +639,16 @@ after every bound association is terminal,
 quiescent, copied, projected and unpinned and no launch generation is active;
 it increments the binding epoch. An incapable controller can never claim a
 service while its mode is `bound`.
+
+Serve047 extends, rather than bypasses, the Serve042 database guard for that
+single epoch. In addition to Serve042's `legacy <-> bound` transitions, the
+guard permits exactly one `bound -> bound` epoch advance when the same
+controller incarnation atomically changes the complete generic non-pool
+capability tuple. This is the per-service generic promotion/demotion fence;
+an epoch-only update, a partial capability tuple, a non-adjacent advance, or a
+combined controller handoff and capability-epoch transition fails in the
+database. No second capability epoch is introduced as a competing ownership
+clock.
 
 Atomic admission inserts a generic active-only retention pin separate from the
 request correlation. Its request FK uses `ON DELETE RESTRICT`/`NO ACTION`, not
@@ -1030,8 +1077,6 @@ and below a simultaneously authored blocked G2 cleanup PR. It:
   participant is capable and every older/recent lease has drained;
 - schedules per-row typed reconciliation without holding manager/global locks
   across provider reads, network waits, polling, or sleeps;
-- publishes complete provider-free route projections from the manager's
-  ordinary probe result so LB/API reads do not repeat provider work; and
 - retains legacy cluster-name discovery only for historical unbound rows. It
   never backfills an association or receipt for those rows.
 
@@ -1267,7 +1312,7 @@ obtain explicit management approval.
 
 G1 fault injection covers crashes before and after atomic commit, queue claim,
 each provider-I/O boundary, Kubernetes Pod create/adopt, service-job submission,
-terminal result, replica projection, and route publication. Lost-ACK retries
+terminal result, and replica projection. Lost-ACK retries
 must return the exact request; a stable-key or profile-digest conflict must
 write nothing. Old/new API, controller, executor, GC, and profile-participant
 permutations prove an old handler cannot claim a generic request and a stale
@@ -2302,6 +2347,11 @@ approved canary:
 - [ ] Pass the complete G1 crash/mixed-version matrix, including real legacy
   effects with misleading generation-zero fields, modern pre-effect generation
   zero, provider present/absent/unknown/replaced, and lost-ACK identity replay.
+- [ ] Add and review the exact current-protocol provider-absence projection
+  transition. Evidence collection is already two-sided by request quiescence,
+  owner-fenced, and per-row isolated; activation remains closed until exact
+  `ABSENT` can atomically project the replica, association, request pin, and
+  capacity claim without weakening the Serve042 transition invariants.
 - [ ] Pass reserved-fill conservation, no-paid-spill, exact binding receipt,
   provider-free route projection, bounded manager-lock, and poisoned-row
   progress tests.

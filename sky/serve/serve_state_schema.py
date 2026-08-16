@@ -261,6 +261,15 @@ replicas_table = sqlalchemy.Table(
     # durable binding by rewriting the JSON payload.
     sqlalchemy.Column('ordinary_launch_association_id',
                       sqlalchemy.Uuid(as_uuid=True)),
+    # Planner-owned authority committed with the initial replica intent.
+    # Generic status writers preserve this scalar; only the typed initial
+    # admission path may populate it.  Serve047 makes a non-NULL value
+    # immutable so generic binding can revalidate replacement observations
+    # without trusting process-local controller state.
+    sqlalchemy.Column(
+        'non_pool_launch_authorization',
+        sqlalchemy.JSON(none_as_null=True).with_variant(
+            postgresql.JSONB(none_as_null=True), 'postgresql')),
     # These columns are initialized and mutated only by typed resource-action
     # transitions.  Generic ReplicaInfo persistence deliberately omits them.
     # sqlalchemy.Uuid is native UUID on PostgreSQL and a portable CHAR-backed

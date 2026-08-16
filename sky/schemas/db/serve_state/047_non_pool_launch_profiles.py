@@ -25,6 +25,7 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 _ASSOCIATIONS = 'serve_ordinary_launch_associations'
+_REPLICAS = 'replicas'
 _SERVICES = 'services'
 _LEGACY_RECONCILIATIONS = 'serve_legacy_launch_reconciliations'
 _LEGACY_SCOPES = 'serve_legacy_launch_reconciliation_scopes'
@@ -73,6 +74,13 @@ _LEGACY_GUARD_FUNCTION = 'skyserve047_guard_legacy_reconciliation'
 _LEGACY_GUARD_TRIGGER = 'skyserve047_legacy_reconciliation_guard'
 _LEGACY_SCOPE_GUARD_FUNCTION = 'skyserve047_guard_legacy_scope'
 _LEGACY_SCOPE_GUARD_TRIGGER = 'skyserve047_legacy_scope_guard'
+_REPLICA_AUTHORIZATION_GUARD_FUNCTION = (
+    'skyserve047_guard_replica_non_pool_authorization')
+_REPLICA_AUTHORIZATION_GUARD_TRIGGER = (
+    'skyserve047_replica_non_pool_authorization_guard')
+_ORDINARY_SERVICE_GUARD_FUNCTION = 'skyserve042_guard_service_binding'
+_UNSETTLED_ASSOCIATIONS = (
+    "'BOUND', 'CANCEL_REQUESTED', 'RESULT_RECORDED', 'AMBIGUOUS'")
 
 
 def _sql_values(values: tuple[str, ...]) -> str:
@@ -125,6 +133,8 @@ def _add_profile_columns(bind: sa.engine.Connection) -> None:
         'provider_evidence': sa.Column('provider_evidence', sa.Text()),
         'provider_evidence_observed_at': sa.Column(
             'provider_evidence_observed_at', sa.DateTime(timezone=True)),
+        'provider_evidence_payload': sa.Column(
+            'provider_evidence_payload', postgresql.JSONB(none_as_null=True)),
         'provider_evidence_digest': sa.Column('provider_evidence_digest',
                                               sa.Text()),
     }
@@ -154,6 +164,13 @@ def _add_profile_columns(bind: sa.engine.Connection) -> None:
     for name, column in service_columns.items():
         if name not in existing:
             op.add_column(_SERVICES, column)
+
+    replica_columns = _column_names(bind, _REPLICAS)
+    if 'non_pool_launch_authorization' not in replica_columns:
+        op.add_column(
+            _REPLICAS,
+            sa.Column('non_pool_launch_authorization',
+                      postgresql.JSONB(none_as_null=True)))
 
 
 def _create_profile_constraints(bind: sa.engine.Connection) -> None:
@@ -221,12 +238,15 @@ def _create_profile_constraints(bind: sa.engine.Connection) -> None:
         'serve047_provider_evidence_shape_ck':
             '(provider_evidence IS NULL AND '
             'provider_evidence_observed_at IS NULL AND '
+            'provider_evidence_payload IS NULL AND '
             'provider_evidence_digest IS NULL) OR '
             "(provider_evidence = 'NOT_QUERIED' AND "
             'provider_evidence_observed_at IS NULL AND '
+            'provider_evidence_payload IS NULL AND '
             'provider_evidence_digest IS NULL) OR '
             "(provider_evidence IN ('PRESENT', 'ABSENT', 'UNKNOWN', "
             "'REPLACED') AND provider_evidence_observed_at IS NOT NULL AND "
+            "jsonb_typeof(provider_evidence_payload) = 'object' AND "
             "provider_evidence_digest ~ '^[0-9a-f]{64}$')",
     }
     for name, expression in checks.items():
@@ -264,6 +284,13 @@ def _create_profile_constraints(bind: sa.engine.Connection) -> None:
     for name, expression in service_checks.items():
         if name not in existing:
             op.create_check_constraint(name, _SERVICES, expression)
+
+    existing = _constraint_names(bind, _REPLICAS)
+    if 'serve047_replica_non_pool_authorization_shape_ck' not in existing:
+        op.create_check_constraint(
+            'serve047_replica_non_pool_authorization_shape_ck', _REPLICAS,
+            'non_pool_launch_authorization IS NULL OR '
+            "jsonb_typeof(non_pool_launch_authorization) = 'object'")
 
 
 def _create_legacy_tables(bind: sa.engine.Connection) -> None:
@@ -350,15 +377,18 @@ def _create_legacy_tables(bind: sa.engine.Connection) -> None:
                       sa.Text(),
                       nullable=False),
             sa.Column('executor_terminated_at', sa.DateTime(timezone=True)),
-            sa.Column('executor_termination_evidence', postgresql.JSONB),
+            sa.Column('executor_termination_evidence',
+                      postgresql.JSONB(none_as_null=True)),
             sa.Column('executor_termination_evidence_digest', sa.Text()),
             sa.Column('provider_evidence', sa.Text(), nullable=False),
             sa.Column('provider_evidence_observed_at',
                       sa.DateTime(timezone=True)),
-            sa.Column('provider_evidence_payload', postgresql.JSONB),
+            sa.Column('provider_evidence_payload',
+                      postgresql.JSONB(none_as_null=True)),
             sa.Column('provider_evidence_digest', sa.Text()),
             sa.Column('cleanup_completed_at', sa.DateTime(timezone=True)),
-            sa.Column('cleanup_completion_evidence', postgresql.JSONB),
+            sa.Column('cleanup_completion_evidence',
+                      postgresql.JSONB(none_as_null=True)),
             sa.Column('cleanup_completion_evidence_digest', sa.Text()),
             sa.Column('resolution', sa.Text(), nullable=False),
             sa.Column('actor', sa.Text(), nullable=False),
@@ -484,6 +514,27 @@ def _install_guards() -> None:
         FOR EACH ROW EXECUTE FUNCTION {_PROFILE_GUARD_FUNCTION}()
     """)
 
+    op.execute(f"""
+        CREATE OR REPLACE FUNCTION {_REPLICA_AUTHORIZATION_GUARD_FUNCTION}()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+            IF NEW.non_pool_launch_authorization IS DISTINCT FROM
+                    OLD.non_pool_launch_authorization THEN
+                RAISE EXCEPTION
+                    'replica non-pool launch authorization is initial-insert-only';
+            END IF;
+            RETURN NEW;
+        END;
+        $function$
+    """)
+    op.execute(f'DROP TRIGGER IF EXISTS {_REPLICA_AUTHORIZATION_GUARD_TRIGGER} '
+               f'ON {_REPLICAS}')
+    op.execute(f"""
+        CREATE TRIGGER {_REPLICA_AUTHORIZATION_GUARD_TRIGGER}
+        BEFORE UPDATE ON {_REPLICAS}
+        FOR EACH ROW EXECUTE FUNCTION {_REPLICA_AUTHORIZATION_GUARD_FUNCTION}()
+    """)
+
     capability_columns = (
         'non_pool_launch_binding_capable',
         'non_pool_launch_controller_incarnation',
@@ -495,6 +546,88 @@ def _install_guards() -> None:
     capability_changed = '\n               OR '.join(
         f'NEW.{column} IS DISTINCT FROM OLD.{column}'
         for column in capability_columns)
+
+    # Serve042 owns the canonical service authority and binding-epoch guard.
+    # Generic capability activation is a second transition within bound mode,
+    # so extend that guard in place instead of introducing a competing epoch.
+    op.execute(f"""
+        CREATE OR REPLACE FUNCTION {_ORDINARY_SERVICE_GUARD_FUNCTION}()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                IF EXISTS (
+                    SELECT 1 FROM {_ASSOCIATIONS} AS association
+                    WHERE association.service_name = OLD.name
+                      AND association.resolution IN (
+                          {_UNSETTLED_ASSOCIATIONS})
+                ) THEN
+                    RAISE EXCEPTION
+                        'unresolved ordinary-launch associations block service deletion';
+                END IF;
+                RETURN OLD;
+            END IF;
+
+            IF NEW.controller_owner_epoch < OLD.controller_owner_epoch THEN
+                RAISE EXCEPTION
+                    'ordinary-launch controller owner epoch regressed';
+            END IF;
+            IF NEW.controller_incarnation IS DISTINCT FROM
+                    OLD.controller_incarnation THEN
+                IF NEW.controller_owner_epoch <>
+                        OLD.controller_owner_epoch + 1 THEN
+                    RAISE EXCEPTION
+                        'controller incarnation change requires one owner-epoch advance';
+                END IF;
+            ELSIF NEW.controller_owner_epoch <>
+                    OLD.controller_owner_epoch THEN
+                RAISE EXCEPTION
+                    'controller owner epoch requires a fresh incarnation';
+            END IF;
+            IF NEW.ordinary_launch_binding_capable IS DISTINCT FROM
+                    OLD.ordinary_launch_binding_capable
+               AND NEW.controller_incarnation IS NOT DISTINCT FROM
+                    OLD.controller_incarnation THEN
+                RAISE EXCEPTION
+                    'ordinary-launch capability is bound to controller incarnation';
+            END IF;
+            IF NEW.ordinary_launch_binding_mode IS DISTINCT FROM
+                    OLD.ordinary_launch_binding_mode THEN
+                IF NEW.ordinary_launch_binding_epoch <>
+                        OLD.ordinary_launch_binding_epoch + 1 THEN
+                    RAISE EXCEPTION
+                        'binding mode change requires one binding-epoch advance';
+                END IF;
+            ELSIF NEW.ordinary_launch_binding_epoch IS DISTINCT FROM
+                    OLD.ordinary_launch_binding_epoch AND NOT (
+                OLD.ordinary_launch_binding_mode = 'bound' AND
+                NEW.ordinary_launch_binding_mode = 'bound' AND
+                NEW.ordinary_launch_binding_epoch =
+                    OLD.ordinary_launch_binding_epoch + 1 AND
+                NEW.controller_incarnation IS NOT DISTINCT FROM
+                    OLD.controller_incarnation AND
+                ({capability_changed})
+            ) THEN
+                RAISE EXCEPTION
+                    'binding epoch advance requires a mode or non-pool capability transition';
+            END IF;
+            IF NEW.ordinary_launch_binding_mode = 'bound' AND
+                    (NOT NEW.ordinary_launch_binding_capable OR NEW.pool <> 0 OR
+                     NEW.workspace IS NULL OR length(NEW.workspace) = 0) THEN
+                RAISE EXCEPTION 'bound ordinary-launch service is incapable';
+            END IF;
+            IF OLD.ordinary_launch_binding_mode = 'bound' AND
+                    (NEW.controller_pid IS DISTINCT FROM OLD.controller_pid OR
+                     NEW.controller_ip IS DISTINCT FROM OLD.controller_ip) AND
+                    NEW.controller_incarnation IS NOT DISTINCT FROM
+                        OLD.controller_incarnation THEN
+                RAISE EXCEPTION
+                    'bound routing owner change requires a fresh incarnation';
+            END IF;
+            RETURN NEW;
+        END;
+        $function$
+    """)
+
     op.execute(f"""
         CREATE OR REPLACE FUNCTION {_SERVICE_GUARD_FUNCTION}()
         RETURNS trigger LANGUAGE plpgsql AS $function$

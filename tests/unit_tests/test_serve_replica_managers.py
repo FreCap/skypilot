@@ -90,6 +90,54 @@ def _binding_authority(mode=ordinary_launch_binding.BindingMode.LEGACY,
             if generic else None))
 
 
+def _bound_non_pool_context(
+) -> ordinary_launch_binding.BoundNonPoolLaunchContext:
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid:test',
+        authorization_generation=1,
+        authorization_payload={'pool': 'paid'})
+    return ordinary_launch_binding.BoundNonPoolLaunchContext(
+        association_id=uuid.UUID('11111111-1111-4111-8111-111111111111'),
+        request_id='request-1',
+        service_name='svc',
+        replica_id=3,
+        replica_record_id=uuid.UUID('22222222-2222-4222-8222-222222222222'),
+        launch_generation=1,
+        input_digest='a' * 64,
+        profile=profile,
+        capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        capability_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+
+
+def test_non_pool_provider_reconciliation_is_scheduled_without_inline_io():
+    manager = replica_managers.SkyPilotReplicaManager.__new__(
+        replica_managers.SkyPilotReplicaManager)
+    authority = _binding_authority(ordinary_launch_binding.BindingMode.BOUND,
+                                   binding_epoch=2,
+                                   generic=True)
+    manager._ordinary_launch_binding_authority = authority
+    info = types.SimpleNamespace(replica_id=3)
+    context = _bound_non_pool_context()
+    worker = mock.Mock()
+
+    with mock.patch.object(replica_managers.thread_utils,
+                           'SafeThread',
+                           return_value=worker) as thread_constructor:
+        manager._schedule_non_pool_provider_reconciliation(info, context)
+
+    thread_constructor.assert_called_once_with(
+        target=replica_managers.non_pool_launch_reconciliation.reconcile,
+        name='replica-3-provider-reconciliation',
+        daemon=True,
+        args=(context, info, authority))
+    worker.start.assert_called_once_with()
+
+
 def _physical_service_spec_mock() -> mock.Mock:
     return mock.Mock(spot_placer=None,
                      placement_contract=_DISABLED_PLACEMENT_CONTRACT)
@@ -1359,6 +1407,98 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         assert update.call_args.kwargs['paid_capacity_pool_key'] == 'pool-a'
         assert (update.call_args.kwargs['paid_capacity_outcome'] ==
                 paid_capacity.LaunchOutcome.OTHER_FAILURE)
+
+    def test_system_oom_projection_binds_exact_request_and_job_atomically(self):
+        manager = _make_manager()
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        intent = recovery_state.SystemRecoveryLaunchIntent(
+            version=1,
+            controller_contract_version=2,
+            recovery_authorization_version=3,
+            recovery_authorization_profile_id='profile-v3',
+            recovery_authorization_sha256='a' * 64,
+            runtime_profile_version=2,
+            expected_runtime_capability=(
+                recovery_state.SYSTEM_RECOVERY_CAPABILITY),
+            service_hash='hash',
+            replica_id=1,
+            launch_generation=9,
+            launch_nonce='b' * 64,
+            workspace='default',
+            resource_envelope_sha256='c' * 64,
+            task_sha256='d' * 64,
+            runtime_image_digest=f'sha256:{"e" * 64}',
+            owned_container_spec_sha256='f' * 64,
+            execution_envelope_sha256='1' * 64)
+        info.system_recovery_launch_intent = intent
+        info.system_recovery_disposition = (
+            recovery_state.SystemRecoveryDisposition.CANDIDATE)
+        info.system_recovery_revision = 1
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.
+            SYSTEM_OOM_RECOVERY,
+            authorization_reference=f'system-oom:{intent.launch_nonce}',
+            authorization_generation=intent.launch_generation,
+            authorization_payload={'intent': intent.to_dict()})
+        context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=uuid.uuid4(),
+            request_id='request-id',
+            service_name='svc',
+            replica_id=1,
+            replica_record_id=uuid.UUID(info.replica_record_id),
+            launch_generation=1,
+            input_digest='a' * 64,
+            profile=profile,
+            capability_cohort_epoch=1,
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=1)
+        projection = types.SimpleNamespace(
+            locked_replica_info=info,
+            request=types.SimpleNamespace(error=None),
+            status=types.SimpleNamespace(value='SUCCEEDED'),
+            service_job_id=41,
+            pre_effect_terminal=False,
+            paid_capacity_pool_key=None,
+            context=context)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'update_replica_for_bound_ordinary_launch_in_transaction',
+                return_value=True) as update:
+            assert manager._project_bound_ordinary_launch(
+                None, mock.sentinel.connection, projection)
+
+        assert info.launch_request_id == 'request-id'
+        assert info.service_job_id == 41
+        assert info.system_recovery_revision == 2
+        update.assert_called_once()
+
+    def test_generic_pre_effect_result_retires_intent_for_fresh_planning(self):
+        manager = _make_manager()
+        authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        manager._ordinary_launch_binding_authority = authority
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        retirement = ordinary_launch_binding.PreAdmissionRetirement(
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
+            ordinary_launch_binding.NonPoolLaunchProfileKind.COST_REBALANCE)
+
+        with mock.patch.object(
+                ordinary_launch_binding,
+                'retire_pre_admission_non_pool_launch_intent',
+                return_value=retirement) as retire, \
+             mock.patch.object(manager, '_launch_replica') as launch:
+            assert manager._redrive_bound_ordinary_launch_after_pre_effect(info)
+
+        retire.assert_called_once_with(authority, 1, info.replica_record_id)
+        launch.assert_not_called()
+        assert manager._scale_reconciliation_event.is_set()
 
     @pytest.mark.parametrize('reason', ['capacity', 'quota'])
     def test_projection_classifies_decoded_durable_capacity_error(self, reason):
@@ -8531,6 +8671,8 @@ class TestLogicalCapacityPlanning:
 
     def test_unknown_capacity_replacement_launch_is_durably_attributed(self):
         mgr = _make_manager()
+        mgr._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
         mgr._uses_logical_replicas = True
         original = self._ready_backend(1, 8)
         mgr._logical_reconcile_snapshot = (
@@ -8544,6 +8686,7 @@ class TestLogicalCapacityPlanning:
         mgr._logical_target = (1, 9, 8)
         mgr._uses_shared_zero_cost_demand_budget = mock.Mock(return_value=True)
         launches = []
+        authorizations = []
         reservation_lock = mock.MagicMock()
         stale_replacement = self._ready_backend(2, 8)
         stale_replacement.unknown_capacity_replacement = True
@@ -8555,9 +8698,11 @@ class TestLogicalCapacityPlanning:
                 _budget,
                 logical_reconcile_fence,
                 logical_reconcile_fence_requires_exact_generation=False,
-                unknown_capacity_replacement=False):
+                unknown_capacity_replacement=False,
+                unknown_capacity_replacement_authorization=None):
             assert logical_reconcile_fence_requires_exact_generation is True
             launches.append(unknown_capacity_replacement)
+            authorizations.append(unknown_capacity_replacement_authorization)
             existing.append(
                 replica_managers.ReplicaInfo(replica_id=2,
                                              cluster_name='svc-2',
@@ -8592,6 +8737,18 @@ class TestLogicalCapacityPlanning:
                                              replace_unknown_replica_ids=(1,))
 
         assert launches == [True]
+        assert authorizations == [
+            ordinary_launch_binding.build_replacement_planner_authorization(
+                ordinary_launch_binding.NonPoolLaunchProfileKind.
+                UNKNOWN_CAPACITY_REPLACEMENT,
+                mgr._ordinary_launch_binding_authority,
+                predecessor_replica_id=1,
+                predecessor_record_id=original.replica_record_id,
+                predecessor_service_version=1,
+                observation_generation=9,
+                observation_service_version=1,
+                target_capacity=8)
+        ]
         local_scan.assert_not_called()
         grouped_scan.assert_called_once_with()
 

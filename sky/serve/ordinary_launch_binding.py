@@ -21,6 +21,7 @@ import datetime
 import enum
 import hashlib
 import json
+import math
 import re
 from typing import Any, Protocol
 import uuid
@@ -40,6 +41,8 @@ from sky.utils.db import migration_utils
 
 reserved_fill_planner = adaptors_common.LazyImport(
     'sky.serve.reserved_fill_planner')
+system_oom_recovery = adaptors_common.LazyImport(
+    'sky.serve.system_oom_recovery')
 
 SUBMISSION_ID_KEY = 'sky_serve_ordinary_launch_submission_id'
 ASSOCIATION_ID_KEY = 'sky_serve_ordinary_launch_association_id'
@@ -514,6 +517,8 @@ ordinary_launch_associations_table = sqlalchemy.Table(
     sqlalchemy.Column('provider_evidence', sqlalchemy.Text),
     sqlalchemy.Column('provider_evidence_observed_at',
                       sqlalchemy.DateTime(timezone=True)),
+    sqlalchemy.Column('provider_evidence_payload',
+                      postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('provider_evidence_digest', sqlalchemy.Text),
     sqlalchemy.CheckConstraint('length(tenant_scope) > 0',
                                name='serve_ordinary_binding_tenant_scope'),
@@ -613,12 +618,15 @@ ordinary_launch_associations_table = sqlalchemy.Table(
     sqlalchemy.CheckConstraint(
         '(provider_evidence IS NULL AND '
         'provider_evidence_observed_at IS NULL AND '
+        'provider_evidence_payload IS NULL AND '
         'provider_evidence_digest IS NULL) OR '
         "(provider_evidence = 'NOT_QUERIED' AND "
         'provider_evidence_observed_at IS NULL AND '
+        'provider_evidence_payload IS NULL AND '
         'provider_evidence_digest IS NULL) OR '
         "(provider_evidence IN ('PRESENT', 'ABSENT', 'UNKNOWN', 'REPLACED') "
         'AND provider_evidence_observed_at IS NOT NULL AND '
+        "jsonb_typeof(provider_evidence_payload) = 'object' AND "
         "provider_evidence_digest ~ '^[0-9a-f]{64}$')",
         name='serve047_provider_evidence_shape_ck'),
     sqlalchemy.CheckConstraint('owner_controller_epoch > 0',
@@ -809,16 +817,19 @@ legacy_reconciliations_table = sqlalchemy.Table(
                       nullable=False),
     sqlalchemy.Column('executor_terminated_at',
                       sqlalchemy.DateTime(timezone=True)),
-    sqlalchemy.Column('executor_termination_evidence', postgresql.JSONB),
+    sqlalchemy.Column('executor_termination_evidence',
+                      postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('executor_termination_evidence_digest', sqlalchemy.Text),
     sqlalchemy.Column('provider_evidence', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('provider_evidence_observed_at',
                       sqlalchemy.DateTime(timezone=True)),
-    sqlalchemy.Column('provider_evidence_payload', postgresql.JSONB),
+    sqlalchemy.Column('provider_evidence_payload',
+                      postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('provider_evidence_digest', sqlalchemy.Text),
     sqlalchemy.Column('cleanup_completed_at',
                       sqlalchemy.DateTime(timezone=True)),
-    sqlalchemy.Column('cleanup_completion_evidence', postgresql.JSONB),
+    sqlalchemy.Column('cleanup_completion_evidence',
+                      postgresql.JSONB(none_as_null=True)),
     sqlalchemy.Column('cleanup_completion_evidence_digest', sqlalchemy.Text),
     sqlalchemy.Column('resolution', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('actor', sqlalchemy.Text, nullable=False),
@@ -1534,6 +1545,23 @@ def install_bound_non_pool_context(request_body: Any,
     if not isinstance(identity, NonPoolBindingIdentity):
         raise ValueError('identity must be a NonPoolBindingIdentity.')
     identity.profile.validate()
+    recovery_context: dict[str, Any] | None = None
+    has_recovery_context = system_oom_recovery.has_v3_system_oom_recovery_context(
+        request_body.extra_launch_context)
+    if identity.profile.kind == NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY:
+        if not has_recovery_context:
+            raise ValueError(
+                'System-OOM profile has no recovery execution envelope.')
+        recovery_context = system_oom_recovery.extract_unbound_launch_context(
+            request_body.extra_launch_context)
+        nonce = recovery_context[
+            serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY]
+        if identity.profile.authorization_reference != f'system-oom:{nonce}':
+            raise ValueError(
+                'System-OOM profile does not name its execution nonce.')
+    elif has_recovery_context:
+        raise ValueError(
+            'A non-recovery profile contains a system-OOM envelope.')
     _install_bound_context_base(request_body, identity, launch_generation)
     context = dict(request_body.extra_launch_context)
     context.update({
@@ -1550,6 +1578,20 @@ def install_bound_non_pool_context(request_body: Any,
         AUTHORIZATION_GENERATION_KEY: identity.profile.authorization_generation,
         AUTHORIZATION_DIGEST_KEY: identity.profile.authorization_digest,
     })
+    if recovery_context is not None:
+        # Generic ownership is association/owner-epoch based. Preserve the
+        # legacy recovery matcher inputs, but make its mutable PID/IP fence
+        # impossible so an old execution path cannot authorize this request.
+        recovery_context[
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY] = (
+                LEGACY_FAIL_CLOSED_CONTROLLER_PID)
+        recovery_context[
+            serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY] = (
+                LEGACY_FAIL_CLOSED_CONTROLLER_IP)
+        bound_recovery = system_oom_recovery.bind_launch_context(
+            recovery_context, identity.request_id)
+        context.pop(serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY, None)
+        context.update(bound_recovery)
     request_body.extra_launch_context = context
 
 
@@ -1640,12 +1682,38 @@ def parse_bound_non_pool_launch_context(
         field.name: getattr(base, field.name)
         for field in dataclasses.fields(BoundLaunchContext)
     }
-    return BoundNonPoolLaunchContext(
+    parsed = BoundNonPoolLaunchContext(
         **base_values,
         profile=profile,
         capability_cohort_epoch=capability_cohort_epoch,
         capability_profile_set_digest=capability_profile_set_digest,
         receipt_protocol_version=receipt_protocol_version)
+    has_recovery_context = system_oom_recovery.has_v3_system_oom_recovery_context(
+        context)
+    if profile.kind == NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY:
+        if not has_recovery_context:
+            raise OrdinaryLaunchBindingConflict(
+                'System-OOM profile has no bound recovery envelope.')
+        try:
+            recovery_context = system_oom_recovery.extract_bound_launch_context(
+                dict(context))
+        except (TypeError, ValueError) as error:
+            raise OrdinaryLaunchBindingConflict(
+                'System-OOM bound recovery envelope is malformed.') from error
+        if (recovery_context[
+                serve_constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY]
+                != parsed.request_id or recovery_context[
+                    serve_constants.SYSTEM_OOM_RECOVERY_REPLICA_ID_KEY]
+                != parsed.replica_id or recovery_context[
+                    serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY]
+                != parsed.service_name):
+            raise OrdinaryLaunchBindingConflict(
+                'System-OOM bound recovery envelope has a different action '
+                'identity.')
+    elif has_recovery_context:
+        raise OrdinaryLaunchBindingConflict(
+            'A non-recovery profile contains a system-OOM envelope.')
+    return parsed
 
 
 def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
@@ -1900,6 +1968,146 @@ def _replica_placement_payload(info: Any) -> dict[str, Any]:
     }
 
 
+def build_replacement_planner_authorization(
+    kind: NonPoolLaunchProfileKind,
+    authority: ControllerBindingAuthority,
+    *,
+    predecessor_replica_id: int,
+    predecessor_record_id: str,
+    predecessor_service_version: int,
+    observation_generation: int | None = None,
+    observation_service_version: int | None = None,
+    target_capacity: int | None = None,
+    target_capacity_by_accelerator: Mapping[str, int] | None = None,
+    accelerator_shapes: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
+    """Build the immutable planner half of a replacement launch intent."""
+    if kind not in (NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+                    NonPoolLaunchProfileKind.COST_REBALANCE):
+        raise ValueError('Only replacement profiles own this authorization.')
+    predecessor = {
+        'replica_id': _positive_int(predecessor_replica_id,
+                                    'predecessor_replica_id'),
+        'replica_record_id': str(
+            _canonical_uuid(predecessor_record_id, 'predecessor_record_id')),
+        'service_version': _positive_int(predecessor_service_version,
+                                         'predecessor_service_version'),
+    }
+    result: dict[str, Any] = {
+        'authorization_version': 1,
+        'predecessor': predecessor,
+        'profile_kind': kind.value,
+        'service_binding_epoch': _positive_int(authority.binding_epoch,
+                                               'service_binding_epoch'),
+        'service_hash': _nonempty(authority.service_hash, 'service_hash'),
+        'service_lifecycle_epoch': _positive_int(
+            authority.service_lifecycle_epoch, 'service_lifecycle_epoch'),
+    }
+    if kind == NonPoolLaunchProfileKind.COST_REBALANCE:
+        if any(value is not None
+               for value in (observation_generation,
+                             observation_service_version, target_capacity,
+                             target_capacity_by_accelerator,
+                             accelerator_shapes)):
+            raise ValueError(
+                'Cost-rebalance authorization cannot carry an outage '
+                'observation.')
+        return result
+    generation = _positive_int(observation_generation, 'observation_generation')
+    service_version = _positive_int(observation_service_version,
+                                    'observation_service_version')
+    capacity = _nonnegative_int(target_capacity, 'target_capacity')
+
+    def _accelerator_state(values: Mapping[str, int] | None, *,
+                           positive: bool) -> list[list[Any]]:
+        if values is None:
+            return []
+        if not isinstance(values, Mapping):
+            raise ValueError('Accelerator state must be a mapping.')
+        normalized = []
+        for raw_card, raw_value in values.items():
+            card = _nonempty(raw_card, 'accelerator')
+            value = (_positive_int(raw_value, 'accelerator value') if positive
+                     else _nonnegative_int(raw_value, 'accelerator value'))
+            normalized.append([card, value])
+        normalized.sort(key=lambda item: item[0].casefold())
+        return normalized
+
+    result['observation'] = {
+        'accelerator_shapes': _accelerator_state(accelerator_shapes,
+                                                 positive=True),
+        'classification': 'UNKNOWN',
+        'reconcile_generation': generation,
+        'service_version': service_version,
+        'target_capacity': capacity,
+        'target_capacity_by_accelerator': _accelerator_state(
+            target_capacity_by_accelerator, positive=False),
+    }
+    return result
+
+
+def _replacement_planner_authorization(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    info: Any,
+    kind: NonPoolLaunchProfileKind,
+) -> tuple[dict[str, Any], Any]:
+    """Validate an immutable replacement intent and its predecessor row."""
+    raw = replica.get('non_pool_launch_authorization')
+    if not isinstance(raw, dict):
+        raise OrdinaryLaunchBindingConflict(
+            'Replacement profile has no durable planner authorization.')
+    expected_keys = {
+        'authorization_version', 'predecessor', 'profile_kind',
+        'service_binding_epoch', 'service_hash', 'service_lifecycle_epoch'
+    }
+    if kind == NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT:
+        expected_keys.add('observation')
+    if (set(raw) != expected_keys or raw.get('authorization_version') != 1 or
+            raw.get('profile_kind') != kind.value or
+            raw.get('service_binding_epoch')
+            != service.get('ordinary_launch_binding_epoch') or
+            raw.get('service_hash') != service.get('hash') or
+            raw.get('service_lifecycle_epoch')
+            != service.get('lifecycle_epoch')):
+        raise OrdinaryLaunchBindingConflict(
+            'Replacement planner authorization is malformed or stale.')
+    predecessor = raw.get('predecessor')
+    if not isinstance(predecessor, dict) or set(predecessor) != {
+            'replica_id', 'replica_record_id', 'service_version'
+    }:
+        raise OrdinaryLaunchBindingConflict(
+            'Replacement predecessor authority is malformed.')
+    try:
+        predecessor_id = _positive_int(predecessor.get('replica_id'),
+                                       'predecessor_replica_id')
+        predecessor_record_id = str(
+            _canonical_uuid(predecessor.get('replica_record_id'),
+                            'predecessor_record_id'))
+        predecessor_version = _positive_int(predecessor.get('service_version'),
+                                            'predecessor_service_version')
+    except ValueError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Replacement predecessor authority is malformed.') from error
+    predecessor_row = connection.execute(
+        sqlalchemy.select(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name == service['name'],
+            serve_state_schema.replicas_table.c.replica_id ==
+            predecessor_id)).mappings().one_or_none()
+    if predecessor_row is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Replacement predecessor no longer exists.')
+    predecessor_info = _locked_replica_info(predecessor_row)
+    if (predecessor_info.replica_record_id != predecessor_record_id or
+            predecessor_info.version != predecessor_version or
+            predecessor_info.version != info.version or
+            predecessor_info.is_terminal):
+        raise OrdinaryLaunchBindingConflict(
+            'Replacement predecessor identity or lifecycle changed.')
+    return raw, predecessor_info
+
+
 def _paid_claim_payload(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
@@ -1971,6 +2179,26 @@ def _zero_cost_sequence_payload(
         'materialization_sequence': materialization_sequence,
         'protocol_version': row['protocol_version'],
         'reconciliation_gate_generation': row['reconciliation_gate_generation'],
+    }
+
+
+def _non_pool_funding_payload(
+    connection: sqlalchemy.engine.Connection,
+    info: Any,
+    paid_claim: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return the exact paid claim or zero-cost admission for a profile."""
+    if paid_claim is not None:
+        if info.is_zero_cost:
+            raise OrdinaryLaunchBindingConflict(
+                'Non-pool profile cannot carry paid and zero-cost authority.')
+        return {'kind': 'PAID', 'claim': paid_claim}
+    if not info.is_zero_cost:
+        raise OrdinaryLaunchBindingConflict(
+            'Non-pool profile has neither paid nor zero-cost authority.')
+    return {
+        'kind': 'ZERO_COST',
+        'sequence': _zero_cost_sequence_payload(connection, info),
     }
 
 
@@ -2114,9 +2342,16 @@ def _reserved_fill_payload(
     }
 
 
-def _cost_rebalance_payload(service: Mapping[str, Any],
-                            info: Any) -> dict[str, Any]:
+def _cost_rebalance_payload(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    info: Any,
+) -> tuple[dict[str, Any], int]:
     """Resolve a replacement against the persisted stabilization decision."""
+    authorization, predecessor_info = _replacement_planner_authorization(
+        connection, service, replica, info,
+        NonPoolLaunchProfileKind.COST_REBALANCE)
     state = service.get('cost_rebalance_state')
     predecessor = info.cost_rebalance_for_replica_id
     if (not isinstance(state, dict) or state.get('version') != 1 or
@@ -2134,11 +2369,84 @@ def _cost_rebalance_payload(service: Mapping[str, Any],
         raise OrdinaryLaunchBindingConflict(
             'Cost-rebalance predecessor and target decision are no longer '
             'current.')
-    return {
+    decision = matching[0]
+    first_seen_at = decision.get('first_seen_at')
+    if (isinstance(first_seen_at, bool) or
+            not isinstance(first_seen_at, (int, float)) or
+            not math.isfinite(float(first_seen_at)) or first_seen_at < 0):
+        raise OrdinaryLaunchBindingConflict(
+            'Cost-rebalance decision has no stable generation.')
+    decision_generation = int(float(first_seen_at) * 1_000_000)
+    return ({
+        'authorization': authorization,
         'decision': matching[0],
         'placement': _replica_placement_payload(info),
         'predecessor_replica_id': predecessor,
+        'predecessor_record_id': predecessor_info.replica_record_id,
+    }, decision_generation)
+
+
+def _unknown_capacity_replacement_payload(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    info: Any,
+) -> tuple[dict[str, Any], int]:
+    """Resolve one exact UNKNOWN observation committed by the planner."""
+    authorization, predecessor_info = _replacement_planner_authorization(
+        connection, service, replica, info,
+        NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT)
+    observation = authorization.get('observation')
+    expected_observation_keys = {
+        'accelerator_shapes', 'classification', 'reconcile_generation',
+        'service_version', 'target_capacity', 'target_capacity_by_accelerator'
     }
+    if (not isinstance(observation, dict) or
+            set(observation) != expected_observation_keys or
+            observation.get('classification') != 'UNKNOWN'):
+        raise OrdinaryLaunchBindingConflict(
+            'Unknown-capacity observation authority is malformed.')
+    try:
+        generation = _positive_int(observation.get('reconcile_generation'),
+                                   'reconcile_generation')
+        observation_version = _positive_int(observation.get('service_version'),
+                                            'observation_service_version')
+        target_capacity = _nonnegative_int(observation.get('target_capacity'),
+                                           'target_capacity')
+    except ValueError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Unknown-capacity observation authority is malformed.') from error
+    if observation_version != info.version or target_capacity < int(
+            info.planned_capacity):
+        raise OrdinaryLaunchBindingConflict(
+            'Unknown-capacity observation no longer authorizes this shape.')
+    for field, positive in (('target_capacity_by_accelerator', False),
+                            ('accelerator_shapes', True)):
+        state = observation.get(field)
+        if not isinstance(state, list):
+            raise OrdinaryLaunchBindingConflict(
+                'Unknown-capacity accelerator authority is malformed.')
+        normalized_cards = []
+        for item in state:
+            if (not isinstance(item, list) or len(item) != 2 or
+                    not isinstance(item[0], str) or not item[0] or
+                    isinstance(item[1], bool) or not isinstance(item[1], int) or
+                    item[1] < int(positive)):
+                raise OrdinaryLaunchBindingConflict(
+                    'Unknown-capacity accelerator authority is malformed.')
+            normalized_cards.append(item[0].casefold())
+        if normalized_cards != sorted(normalized_cards) or len(
+                normalized_cards) != len(set(normalized_cards)):
+            raise OrdinaryLaunchBindingConflict(
+                'Unknown-capacity accelerator authority is not canonical.')
+    return ({
+        'authorization': authorization,
+        'funding': None,
+        'observation': observation,
+        'placement': _replica_placement_payload(info),
+        'predecessor_record_id': predecessor_info.replica_record_id,
+        'reason': 'logical-capacity-observation-unknown',
+    }, generation)
 
 
 def resolve_non_pool_launch_profile_in_connection(
@@ -2182,32 +2490,34 @@ def resolve_non_pool_launch_profile_in_connection(
         reference = f'reserved-fill:{info.reserved_fill_intent_idempotency_key}'
         generation = info.reserved_fill_allocation_generation
     elif kind == NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT:
-        payload = {
-            'funding': paid_claim,
-            'placement': placement,
-            'reason': 'logical-capacity-observation-unknown',
-        }
-        reference = f'unknown-capacity:{record_id}'
-        generation = 0
+        payload, generation = _unknown_capacity_replacement_payload(
+            connection, service, replica, info)
+        payload['funding'] = _non_pool_funding_payload(connection, info,
+                                                       paid_claim)
+        predecessor = payload['authorization']['predecessor']
+        reference = ('unknown-capacity:'
+                     f'{predecessor["replica_record_id"]}:{generation}')
     elif kind == NonPoolLaunchProfileKind.COST_REBALANCE:
-        payload = _cost_rebalance_payload(service, info)
-        payload['funding'] = paid_claim
-        reference = f'cost-rebalance:{record_id}:{info.cost_rebalance_for_replica_id}'
-        generation = 0
+        payload, generation = _cost_rebalance_payload(connection, service,
+                                                      replica, info)
+        payload['funding'] = _non_pool_funding_payload(connection, info,
+                                                       paid_claim)
+        predecessor = payload['authorization']['predecessor']
+        reference = ('cost-rebalance:'
+                     f'{predecessor["replica_record_id"]}:{generation}')
     else:
         intent = info.system_recovery_launch_intent
         if intent is None:
             raise OrdinaryLaunchBindingConflict(
                 'System-OOM recovery profile lost its launch intent.')
         payload = {
-            'funding': paid_claim,
+            'funding': _non_pool_funding_payload(connection, info, paid_claim),
             'intent': intent.to_dict(),
             'placement': placement,
             'recovery_disposition': info.system_recovery_disposition.value,
-            'recovery_revision': info.system_recovery_revision,
         }
         reference = f'system-oom:{intent.launch_nonce}'
-        generation = info.system_recovery_revision
+        generation = intent.launch_generation
     return NonPoolLaunchProfile.create(kind,
                                        authorization_reference=reference,
                                        authorization_generation=generation,
@@ -2243,6 +2553,94 @@ def resolve_non_pool_launch_profile(
                 'Generic profile target no longer names the exact replica.')
         return resolve_non_pool_launch_profile_in_connection(
             connection, service, replica)
+
+
+def get_existing_non_pool_launch_profile(
+    association_id: uuid.UUID | str,) -> NonPoolLaunchProfile | None:
+    """Return the immutable profile for an exact admission retry, if any.
+
+    This is a read hint only.  The admission transaction locks and validates
+    the complete association identity before returning it.  Looking up the
+    stored profile before recomputing mutable planner authority lets a retry
+    whose acknowledgement was lost submit the exact committed bytes even when
+    the planner observation has since expired.
+    """
+    association_uuid = _canonical_uuid(association_id, 'association_id')
+    engine = serve_state.get_database_engine()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise OrdinaryLaunchBindingUnavailable(
+            'Generic non-pool launch profiles require PostgreSQL.')
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(ordinary_launch_associations_table).where(
+                ordinary_launch_associations_table.c.association_id ==
+                association_uuid)).mappings().one_or_none()
+    if association is None:
+        return None
+    profile = _association_profile(association)
+    if profile is None:
+        raise OrdinaryLaunchBindingConflict(
+            'Exact admission retry names a protocol-v1 association.')
+    return profile
+
+
+def validate_non_pool_submission_execution_context_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    identity: NonPoolBindingIdentity,
+    launch_context: Mapping[str, Any],
+) -> None:
+    """Validate profile-owned request bytes under admission's row locks."""
+    _require_postgres(connection)
+    if not isinstance(identity, NonPoolBindingIdentity):
+        raise ValueError('identity must be a NonPoolBindingIdentity.')
+    has_recovery_context = system_oom_recovery.has_v3_system_oom_recovery_context(
+        launch_context)
+    if identity.profile.kind != NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY:
+        if has_recovery_context:
+            raise OrdinaryLaunchBindingConflict(
+                'A non-recovery profile contains a system-OOM envelope.')
+        return
+    if not has_recovery_context:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM profile has no recovery execution envelope.')
+
+    service = connection.execute(
+        sqlalchemy.select(serve_state_schema.services_table).where(
+            serve_state_schema.services_table.c.name ==
+            identity.service_name)).mappings().one_or_none()
+    replica = connection.execute(
+        sqlalchemy.select(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name ==
+            identity.service_name,
+            serve_state_schema.replicas_table.c.replica_id ==
+            identity.replica_id)).mappings().one_or_none()
+    if service is None or replica is None:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM execution envelope lost its locked planner rows.')
+    info = _locked_replica_info(replica)
+    intent = info.system_recovery_launch_intent
+    if intent is None:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM execution envelope lost its recovery intent.')
+    expected = system_oom_recovery.create_unbound_launch_context(
+        intent,
+        service_name=identity.service_name,
+        service_version=identity.service_version,
+        controller_pid=identity.controller_pid,
+        controller_ip=identity.controller_ip)
+    try:
+        submitted = system_oom_recovery.extract_unbound_launch_context(
+            dict(launch_context))
+    except (TypeError, ValueError) as error:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM execution envelope is incomplete or malformed.'
+        ) from error
+    if (submitted != expected or identity.profile.authorization_reference
+            != f'system-oom:{intent.launch_nonce}' or
+            identity.profile.authorization_generation
+            != intent.launch_generation):
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM execution envelope does not match the locked intent.')
 
 
 def retire_pre_admission_non_pool_launch_intent(
@@ -2367,6 +2765,24 @@ def retire_pre_admission_non_pool_launch_intent(
                 'association pointer.')
 
         profile_kind = classify_non_pool_launch_profile(info)
+        if profile_kind is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Pre-admission retirement found an incomplete generic '
+                'planner profile.')
+        if associations:
+            if len(associations) != 1:
+                raise OrdinaryLaunchBindingConflict(
+                    'Generic planner intent has unexpected action history.')
+            predecessor = associations[0]
+            if (predecessor['resolution']
+                    != Resolution.PRE_EFFECT_TERMINAL.value or
+                    predecessor.get('binding_protocol_version')
+                    != NON_POOL_BINDING_PROTOCOL_VERSION or
+                    predecessor.get('profile_kind') != profile_kind.value or
+                    predecessor.get('cancel_reason') is not None):
+                raise OrdinaryLaunchBindingConflict(
+                    'Only an exact non-cancelled pre-effect action may retire '
+                    'a generic planner intent.')
         connection.execute(
             sqlalchemy.delete(
                 serve_state_schema.paid_capacity_claims_table).where(
@@ -2563,6 +2979,50 @@ def _validate_profile_authority_in_connection(
             'Non-pool planner authorization changed before provider effect.')
 
 
+def _validate_profile_execution_context(
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    context: BoundNonPoolLaunchContext,
+    launch_context: Mapping[str, Any],
+) -> None:
+    """Exact-match profile-owned execution bytes to locked planner state."""
+    has_recovery_context = system_oom_recovery.has_v3_system_oom_recovery_context(
+        launch_context)
+    if context.profile.kind != NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY:
+        if has_recovery_context:
+            raise OrdinaryLaunchBindingConflict(
+                'A non-recovery action contains a system-OOM envelope.')
+        return
+    if not has_recovery_context:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM action lost its bound recovery envelope.')
+    info = _locked_replica_info(replica)
+    intent = info.system_recovery_launch_intent
+    if intent is None:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM action lost its locked recovery intent.')
+    expected_unbound = system_oom_recovery.create_unbound_launch_context(
+        intent,
+        service_name=str(service['name']),
+        service_version=info.version,
+        controller_pid=LEGACY_FAIL_CLOSED_CONTROLLER_PID,
+        controller_ip=LEGACY_FAIL_CLOSED_CONTROLLER_IP)
+    expected = system_oom_recovery.bind_launch_context(expected_unbound,
+                                                       context.request_id)
+    try:
+        actual = system_oom_recovery.extract_bound_launch_context(
+            dict(launch_context))
+    except (TypeError, ValueError) as error:
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM bound recovery envelope is malformed.') from error
+    if (actual != expected or context.profile.authorization_reference
+            != f'system-oom:{intent.launch_nonce}' or
+            context.profile.authorization_generation
+            != intent.launch_generation):
+        raise OrdinaryLaunchBindingConflict(
+            'System-OOM bound recovery envelope no longer matches its intent.')
+
+
 def _active_paid_capacity_pool_key(
     connection: sqlalchemy.engine.Connection,
     identity: BindingIdentity,
@@ -2651,11 +3111,12 @@ def _lock_admission_rows(
 
 
 def _validate_admission_target(connection: sqlalchemy.engine.Connection,
-                               lifecycle: Mapping[str, Any],
-                               service: Mapping[str,
-                                                Any], replica: Mapping[str,
-                                                                       Any],
-                               identity: BindingIdentity) -> None:
+                               lifecycle: Mapping[str,
+                                                  Any], service: Mapping[str,
+                                                                         Any],
+                               replica: Mapping[str,
+                                                Any], identity: BindingIdentity,
+                               *, validate_profile_authority: bool) -> None:
     derived = derive_binding_ids(identity.tenant_scope,
                                  identity.service_workspace,
                                  identity.submission_id)
@@ -2708,8 +3169,9 @@ def _validate_admission_target(connection: sqlalchemy.engine.Connection,
             capability_profile_set_digest=(
                 identity.capability_profile_set_digest),
             receipt_protocol_version=identity.receipt_protocol_version)
-        _validate_profile_authority_in_connection(connection, service, replica,
-                                                  identity.profile)
+        if validate_profile_authority:
+            _validate_profile_authority_in_connection(connection, service,
+                                                      replica, identity.profile)
 
 
 def _admission_from_row(row: Mapping[str, Any],
@@ -2740,15 +3202,24 @@ def insert_or_get_locked(
         raise ValueError('identity must be a BindingIdentity.')
     lifecycle, service, replica, current = _lock_admission_rows(
         connection, identity)
-    _validate_admission_target(connection, lifecycle, service, replica,
-                               identity)
-
     existing = current
     if existing is None or existing['association_id'] != identity.association_id:
         existing = connection.execute(
             sqlalchemy.select(ordinary_launch_associations_table).where(
                 ordinary_launch_associations_table.c.association_id == identity.
                 association_id).with_for_update()).mappings().one_or_none()
+    # A first admission must still be authorized by the live planner under the
+    # locked service/replica rows.  An exact retry instead validates the
+    # immutable stored profile below; re-resolving mutable observations here
+    # would make a committed request lose idempotency after a lost ACK.  The
+    # shared pre-provider guard independently revalidates live authority before
+    # any external effect.
+    _validate_admission_target(connection,
+                               lifecycle,
+                               service,
+                               replica,
+                               identity,
+                               validate_profile_authority=existing is None)
     if existing is not None:
         if not _existing_identity_matches(existing, identity):
             raise OrdinaryLaunchBindingConflict(
@@ -2780,6 +3251,10 @@ def insert_or_get_locked(
                 ordinary_launch_associations_table.c.launch_generation.desc()).
         with_for_update()).mappings().all()
     if history:
+        if isinstance(identity, NonPoolBindingIdentity):
+            raise OrdinaryLaunchBindingConflict(
+                'A settled planner record cannot admit another launch action; '
+                'retire it and create a fresh planner intent.')
         predecessor = history[0]
         if (predecessor['resolution'] != Resolution.PRE_EFFECT_TERMINAL.value or
                 predecessor['pin_released_at'] is None or
@@ -3226,6 +3701,8 @@ def validate_effect_authority_in_connection(
     context: BoundLaunchContext,
     claim: ExecutionClaim,
     claim_validator: ClaimValidator,
+    *,
+    launch_context: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     _require_postgres(connection)
     if (getattr(claim, 'request_id', None) != context.request_id or
@@ -3245,6 +3722,11 @@ def validate_effect_authority_in_connection(
     if isinstance(context, BoundNonPoolLaunchContext):
         _validate_profile_authority_in_connection(connection, service, replica,
                                                   context.profile)
+        if launch_context is None:
+            raise OrdinaryLaunchBindingConflict(
+                'Generic provider effect has no immutable launch context.')
+        _validate_profile_execution_context(service, replica, context,
+                                            launch_context)
     if (_elected_recovery_version_in_connection(connection,
                                                 context.service_name)
             != association['service_version']):
@@ -3265,9 +3747,14 @@ def _advance_effect_phase(
     target: EffectPhase,
     *,
     service_job_id: int | None = None,
+    launch_context: Mapping[str, Any] | None = None,
 ) -> int:
     association = validate_effect_authority_in_connection(
-        connection, context, claim, claim_validator)
+        connection,
+        context,
+        claim,
+        claim_validator,
+        launch_context=launch_context)
     if association['effect_phase'] == target.value:
         if (target != EffectPhase.SERVICE_JOB_RECORDED or
                 association['service_job_id'] == service_job_id):
@@ -3332,10 +3819,13 @@ def provider_effect_guard(
                 'Service launch authority guard lost its database session.')
         engine = serve_state.get_database_engine()
         with engine.begin() as connection:
-            next_revision = _advance_effect_phase(connection, context, claim,
+            next_revision = _advance_effect_phase(connection,
+                                                  context,
+                                                  claim,
                                                   claim_validator,
                                                   EffectPhase.NOT_STARTED,
-                                                  EffectPhase.PROVIDER_IO)
+                                                  EffectPhase.PROVIDER_IO,
+                                                  launch_context=launch_context)
         authorization = EffectAuthorization(context, claim, next_revision,
                                             guard, claim_validator)
         token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
@@ -3369,10 +3859,13 @@ def non_pool_provider_effect_guard(
                 'Service launch authority guard lost its database session.')
         engine = serve_state.get_database_engine()
         with engine.begin() as connection:
-            next_revision = _advance_effect_phase(connection, context, claim,
+            next_revision = _advance_effect_phase(connection,
+                                                  context,
+                                                  claim,
                                                   claim_validator,
                                                   EffectPhase.NOT_STARTED,
-                                                  EffectPhase.PROVIDER_IO)
+                                                  EffectPhase.PROVIDER_IO,
+                                                  launch_context=launch_context)
         authorization = EffectAuthorization(context, claim, next_revision,
                                             guard, claim_validator)
         token = _ACTIVE_EFFECT_AUTHORIZATION.set(authorization)
@@ -3423,11 +3916,13 @@ def begin_service_job_io(launch_context: Mapping[str, Any]) -> int | None:
         return None
     engine = serve_state.get_database_engine()
     with engine.begin() as connection:
-        next_revision = _advance_effect_phase(connection, authorization.context,
+        next_revision = _advance_effect_phase(connection,
+                                              authorization.context,
                                               authorization.claim,
                                               authorization.claim_validator,
                                               EffectPhase.PROVIDER_IO,
-                                              EffectPhase.SERVICE_JOB_IO)
+                                              EffectPhase.SERVICE_JOB_IO,
+                                              launch_context=launch_context)
     _ACTIVE_EFFECT_AUTHORIZATION.set(
         dataclasses.replace(authorization, owner_revision=next_revision))
     return next_revision
@@ -3446,7 +3941,8 @@ def record_service_job(launch_context: Mapping[str, Any],
                                               authorization.claim_validator,
                                               EffectPhase.SERVICE_JOB_IO,
                                               EffectPhase.SERVICE_JOB_RECORDED,
-                                              service_job_id=job_id)
+                                              service_job_id=job_id,
+                                              launch_context=launch_context)
     _ACTIVE_EFFECT_AUTHORIZATION.set(
         dataclasses.replace(authorization, owner_revision=next_revision))
     return next_revision
@@ -4607,6 +5103,101 @@ def mark_ambiguous_in_connection(
                 (Resolution.BOUND.value,
                  Resolution.CANCEL_REQUESTED.value))).values(**values))
     return result.rowcount == 1
+
+
+def record_non_pool_provider_evidence(
+    connection: sqlalchemy.engine.Connection,
+    context: BoundNonPoolLaunchContext,
+    authority: ControllerBindingAuthority,
+    evidence: ProviderEvidence,
+    payload: Mapping[str, Any],
+    request_quiescence_validator: Callable[
+        [sqlalchemy.engine.Connection, BoundNonPoolLaunchContext], bool],
+) -> bool:
+    """Record one fresh typed provider read for an ambiguous v2 action.
+
+    The provider call happens before this transaction and under no manager or
+    database lock.  This owner-fenced write never settles the association or
+    authorizes cleanup by itself; it only makes the exact row's quarantine
+    actionable and observable.
+    """
+    if not isinstance(context, BoundNonPoolLaunchContext):
+        raise TypeError('context must be a BoundNonPoolLaunchContext.')
+    if not isinstance(authority, ControllerBindingAuthority):
+        raise TypeError('authority must be a ControllerBindingAuthority.')
+    if (not isinstance(evidence, ProviderEvidence) or
+            evidence == ProviderEvidence.NOT_QUERIED):
+        raise ValueError('evidence must be a queried provider classification.')
+    if not isinstance(payload, Mapping):
+        raise TypeError('payload must be a mapping.')
+    canonical_payload = dict(payload)
+    evidence_digest = _canonical_sha256({
+        'association_id': str(context.association_id),
+        'evidence': evidence.value,
+        'payload': canonical_payload,
+        'profile_digest': context.profile.digest,
+    })
+    _require_postgres(connection)
+    if not callable(request_quiescence_validator):
+        raise TypeError('request_quiescence_validator must be callable.')
+    association = lock_reduction_authority_in_connection(connection, context)
+    if (association['resolution'] != Resolution.AMBIGUOUS.value or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider evidence requires one post-effect ambiguous action.')
+    expected_authority = (
+        authority.service_name == association['service_name'] and
+        authority.service_hash == association['service_hash'] and
+        authority.service_workspace == association['service_workspace'] and
+        authority.service_lifecycle_epoch
+        == association['service_lifecycle_epoch'] and
+        authority.binding_epoch == association['service_binding_epoch'] and
+        authority.controller_incarnation
+        == association['owner_controller_incarnation'] and
+        authority.controller_owner_epoch
+        == association['owner_controller_epoch'] and
+        authority.generic_launches_required)
+    if not expected_authority:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider evidence writer no longer owns this association.')
+    # The provider read happened before this transaction. Requiring the exact
+    # request generation to be terminal and quiescent now proves no admitted
+    # executor can create a resource after an ABSENT observation is recorded.
+    if not request_quiescence_validator(connection, context):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider evidence requires exact request quiescence.')
+
+    previous = ProviderEvidence(str(association['provider_evidence']))
+    # Do not let a failed later read erase a stronger observation. Exact
+    # absence and a retargeted physical identity are terminal evidence
+    # classifications for this association; contradictions remain quarantined
+    # for operator review rather than rewriting history.
+    if (previous in (ProviderEvidence.ABSENT, ProviderEvidence.REPLACED) and
+            evidence != previous):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider evidence contradicts a terminal classification.')
+    if (previous == ProviderEvidence.PRESENT and
+            evidence == ProviderEvidence.UNKNOWN):
+        return False
+    values = {
+        'provider_evidence': evidence.value,
+        'provider_evidence_observed_at': sqlalchemy.func.clock_timestamp(),
+        'provider_evidence_payload': canonical_payload,
+        'provider_evidence_digest': evidence_digest,
+        'owner_revision': int(association['owner_revision']) + 1,
+        'updated_at': sqlalchemy.func.clock_timestamp(),
+    }
+    changed = connection.execute(
+        sqlalchemy.update(ordinary_launch_associations_table).where(
+            ordinary_launch_associations_table.c.association_id ==
+            context.association_id,
+            ordinary_launch_associations_table.c.owner_revision ==
+            association['owner_revision']).values(**values))
+    if changed.rowcount != 1:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider evidence update lost its association CAS.')
+    return True
 
 
 def project_in_connection(

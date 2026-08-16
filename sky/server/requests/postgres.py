@@ -2581,6 +2581,9 @@ def bind_and_enqueue_non_pool_launch(
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Generic admission returned a different deterministic '
                 'identity.')
+        (ordinary_launch_binding.
+         validate_non_pool_submission_execution_context_in_connection(
+             connection, identity, request.request_body.extra_launch_context))
         ordinary_launch_binding.install_bound_non_pool_context(
             request.request_body, identity, admission.launch_generation)
         if admission.created:
@@ -3090,8 +3093,11 @@ def _settle_projected_paid_capacity_claim_in_transaction(
     *,
     pre_effect: bool,
 ) -> bool:
-    """Retain only a non-cancelled pre-effect retry's exact paid claim."""
-    if pre_effect and association['cancel_reason'] is None:
+    """Release the exact claim when one action reaches a settled result."""
+    if (pre_effect and association['cancel_reason'] is None and not isinstance(
+            context, ordinary_launch_binding.BoundNonPoolLaunchContext)):
+        # Protocol-v1 retains its historical same-record generation+1 retry
+        # until the stacked cleanup removes that transition path.
         return True
     return (ordinary_launch_binding.
             release_projected_paid_capacity_claim_in_connection(
@@ -3376,11 +3382,9 @@ def reduce_bound_ordinary_launch_in_transaction(
     if not projected:
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Exact ordinary launch result was not projectable.')
-    # A non-cancelled pre-effect settlement is a retry boundary, not a demand
-    # completion boundary.  Keep its exact paid claim through the pointer
-    # clear so generation+1 can atomically snapshot the same claim.  Exact
-    # teardown/supersession records cancel_reason before reduction and, like
-    # every post-effect terminal result, releases the claim here.
+    # One planner intent owns one action. Every settled result releases its
+    # exact claim; PRE_EFFECT terminal rows are retired and replanned instead
+    # of retaining authority for a same-record generation+1 path.
     if not _settle_projected_paid_capacity_claim_in_transaction(
             connection, context, association, pre_effect=pre_effect):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -3416,6 +3420,62 @@ def reduce_bound_ordinary_launch(
             context,
             authority,
             project_replica_result=project_replica_result)
+
+
+def record_bound_non_pool_provider_evidence(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    evidence: ordinary_launch_binding_lib.ProviderEvidence,
+    payload: Mapping[str, Any],
+) -> bool:
+    """Atomically require exact request quiescence and record provider data."""
+
+    def _request_is_quiescent(
+        connection: sqlalchemy.engine.Connection,
+        locked_context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    ) -> bool:
+        facts, _, queue_row, _ = _lock_bound_request_evidence(
+            connection, locked_context)
+        return bool(
+            facts.exists and
+            facts.status in requests_lib.RequestStatus.finished_status() and
+            facts.quiescent and queue_row is None and
+            facts.retention_pin_active)
+
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic provider reconciliation requires PostgreSQL.')
+    with engine.begin() as connection:
+        return ordinary_launch_binding.record_non_pool_provider_evidence(
+            connection, context, authority, evidence, payload,
+            _request_is_quiescent)
+
+
+def bound_non_pool_provider_reconciliation_ready(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Fence a provider read behind exact terminal executor quiescence."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    with engine.begin() as connection:
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if (not _controller_authority_matches_reduction(association, authority)
+                or association['resolution']
+                != ordinary_launch_binding.Resolution.AMBIGUOUS.value or
+                association['reconciliation_outcome'] != ordinary_launch_binding
+                .ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value):
+            return False
+        facts, _, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        return bool(
+            facts.exists and
+            facts.status in requests_lib.RequestStatus.finished_status() and
+            facts.quiescent and queue_row is None and
+            facts.retention_pin_active)
 
 
 def _commit_bound_ordinary_launch_cancel_intent(

@@ -1384,8 +1384,23 @@ async def non_pool_serve_launch(
         intent = ordinary_launch_binding.parse_unbound_launch_context(
             launch_context)
         profile = await asyncio.to_thread(
-            ordinary_launch_binding.resolve_non_pool_launch_profile,
-            service_name, intent.replica_id, intent.replica_record_id)
+            ordinary_launch_binding.get_existing_non_pool_launch_profile,
+            association_id)
+        if profile is None:
+            try:
+                profile = await asyncio.to_thread(
+                    ordinary_launch_binding.resolve_non_pool_launch_profile,
+                    service_name, intent.replica_id, intent.replica_record_id)
+            except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+                # A concurrent identical submission can commit between the
+                # first association read and live planner resolution.  Close
+                # that race by consulting the deterministic identity once
+                # more; the admission transaction remains authoritative.
+                profile = await asyncio.to_thread(
+                    ordinary_launch_binding.
+                    get_existing_non_pool_launch_profile, association_id)
+                if profile is None:
+                    raise
         if profile.kind != submission.profile_kind:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Submitted profile kind does not match durable planner state.')

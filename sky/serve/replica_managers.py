@@ -38,6 +38,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.client import sdk
 from sky.serve import constants as serve_constants
 from sky.serve import drain_observability
+from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
 from sky.serve import pool_capacity_observation
@@ -142,6 +143,9 @@ _WAIT_LAUNCH_THREAD_TIMEOUT_SECONDS = 15
 # bounds only rate-limit provider calls while an outage persists.
 _FAILED_CLEANUP_RETRY_BASE_SECONDS = 60
 _FAILED_CLEANUP_RETRY_MAX_SECONDS = 15 * 60
+_NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS = 30
+_NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS = 15 * 60
+_MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE = 16
 # A service can queue an arbitrarily large durable teardown wave. Keep the
 # queued intent, but bound live worker threads so one controller process cannot
 # exhaust its memory or refresh-loop CPU while the global budget is spacious.
@@ -3186,6 +3190,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._tick_version_spec_cache: dict[int,
                                             service_spec.SkyServiceSpec] = {}
         self._provider_identity_uncertain_ids: set[int] = set()
+        self._non_pool_reconciliation_threads: thread_utils.ThreadSafeDict[
+            int, thread_utils.SafeThread] = thread_utils.ThreadSafeDict()
+        self._non_pool_reconciliation_attempts: dict[int, int] = {}
+        self._non_pool_reconciliation_retry_at: dict[int, float] = {}
         self._ordinary_launch_binding_authority: (ControllerBindingAuthority |
                                                   None) = None
         self._ordinary_launch_binding_transition_lock = threading.Lock()
@@ -3790,6 +3798,37 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.failed_spot_availability = True
             else:
                 paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+        context = projection.context
+        if (isinstance(context,
+                       ordinary_launch_binding.BoundNonPoolLaunchContext) and
+                context.profile.kind == ordinary_launch_binding.
+                NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY):
+            intent = info.system_recovery_launch_intent
+            if (intent is None or info.system_recovery_quarantine is not None or
+                    info.system_recovery_disposition
+                    != system_recovery_state.SystemRecoveryDisposition.CANDIDATE
+                    or context.profile.authorization_reference
+                    != f'system-oom:{intent.launch_nonce}' or
+                    context.profile.authorization_generation
+                    != intent.launch_generation):
+                return False
+            if not projection.pre_effect_terminal:
+                job_id = projection.service_job_id
+                if (isinstance(job_id, bool) or not isinstance(job_id, int) or
+                        job_id < 1):
+                    return False
+                existing = (info.launch_request_id, info.service_job_id)
+                expected = (context.request_id, job_id)
+                if existing == (None, None):
+                    revision = info.system_recovery_revision
+                    if (isinstance(revision, bool) or
+                            not isinstance(revision, int) or revision < 1):
+                        return False
+                    info.launch_request_id = context.request_id
+                    info.service_job_id = job_id
+                    info.system_recovery_revision = revision + 1
+                elif existing != expected:
+                    return False
         if projection.paid_capacity_pool_key is None:
             paid_outcome = None
         authority = self._ordinary_launch_binding_authority
@@ -3859,9 +3898,78 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         return _inspect, _reduce, _cancel
 
+    def _schedule_non_pool_provider_reconciliation(
+        self,
+        info: ReplicaInfo,
+        context: Any,
+    ) -> None:
+        """Schedule one bounded provider read without blocking this manager."""
+        if not isinstance(context,
+                          ordinary_launch_binding.BoundNonPoolLaunchContext):
+            return
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or not authority.generic_launches_required:
+            return
+        replica_id = info.replica_id
+        existing = self._non_pool_reconciliation_threads.get(replica_id)
+        if existing is not None:
+            if existing.is_alive():
+                return
+            self._non_pool_reconciliation_threads.pop(replica_id)
+            if existing.exception is None:
+                self._non_pool_reconciliation_attempts.pop(replica_id, None)
+                self._non_pool_reconciliation_retry_at[replica_id] = (
+                    time.monotonic() +
+                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS)
+                return
+            else:
+                attempt = self._non_pool_reconciliation_attempts.get(
+                    replica_id, 0) + 1
+                self._non_pool_reconciliation_attempts[replica_id] = attempt
+                delay = min(
+                    _NON_POOL_RECONCILIATION_RETRY_BASE_SECONDS *
+                    2**min(attempt - 1, 30),
+                    _NON_POOL_RECONCILIATION_RETRY_MAX_SECONDS)
+                self._non_pool_reconciliation_retry_at[
+                    replica_id] = time.monotonic() + delay
+                logger.warning(
+                    'Provider reconciliation for replica %s failed; retrying '
+                    'in %.1f seconds: %s', replica_id, delay,
+                    common_utils.format_exception(existing.exception))
+                return
+        if time.monotonic() < self._non_pool_reconciliation_retry_at.get(
+                replica_id, 0):
+            return
+        active_workers = sum(
+            worker.is_alive()
+            for worker in self._non_pool_reconciliation_threads.values())
+        if active_workers >= (
+                _MAX_CONCURRENT_NON_POOL_RECONCILIATIONS_PER_SERVICE):
+            return
+        worker = thread_utils.SafeThread(
+            target=non_pool_launch_reconciliation.reconcile,
+            name=f'replica-{replica_id}-provider-reconciliation',
+            daemon=True,
+            args=(context, info, authority))
+        self._non_pool_reconciliation_threads[replica_id] = worker
+        worker.start()
+
     def _redrive_bound_ordinary_launch_after_pre_effect(
             self, info: ReplicaInfo) -> bool:
         """Re-enqueue one settled pre-effect row with its exact paid claim."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is not None and authority.generic_launches_required:
+            retirement = (ordinary_launch_binding.
+                          retire_pre_admission_non_pool_launch_intent(
+                              authority, info.replica_id,
+                              info.replica_record_id))
+            if retirement.disposition in (
+                    ordinary_launch_binding.PreAdmissionRetirementDisposition.
+                    RETIRED, ordinary_launch_binding.
+                    PreAdmissionRetirementDisposition.ABSENT):
+                self._scale_reconciliation_event.set()
+                return True
+            return False
         prior_planned_capacity = info.planned_capacity
         if (isinstance(prior_planned_capacity, bool) or
                 not isinstance(prior_planned_capacity, int) or
@@ -5779,6 +5887,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         prior_created_at: float | None = None,
         prior_planned_capacity: int | None = None,
         prior_unknown_capacity_replacement: bool = False,
+        unknown_capacity_replacement_authorization: dict[str, Any] |
+        None = None,
         prior_version: int | None = None,
         prior_yaml_content: str | None = None,
         zero_cost_demand_budget: _ZeroCostDemandBudget | None = None,
@@ -5918,6 +6028,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         fill_cloud_launch_guard: (Callable[[], bool | tuple[bool, str]] |
                                   None) = None
         cost_rebalance_for_replica_id = (prior_cost_rebalance_for_replica_id)
+        non_pool_launch_authorization = (
+            unknown_capacity_replacement_authorization)
         if (resources_override is not None and
                 serve_constants.RESERVED_CAPACITY_FILL_OVERRIDE_KEY
                 in resources_override):
@@ -5989,6 +6101,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         if (resources_override is not None and
                 serve_constants.COST_REBALANCE_FOR_REPLICA_OVERRIDE_KEY
                 in resources_override):
+            if non_pool_launch_authorization is not None:
+                raise ValueError('One replica intent cannot be both an '
+                                 'unknown-capacity and cost-rebalance action.')
             resources_override = dict(resources_override)
             cost_rebalance_for_replica_id = int(
                 resources_override.pop(
@@ -6076,6 +6191,30 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if existing_replica_infos is None:
                     existing_replica_infos = serve_state.get_replica_infos(
                         self._service_name)
+                predecessor_info = next(
+                    (candidate for candidate in existing_replica_infos
+                     if candidate.replica_id == cost_rebalance_for_replica_id
+                     and candidate.version == launch_version and
+                     not candidate.is_terminal), None)
+                binding_authority = self._ordinary_launch_binding_authority
+                if (binding_authority is not None and
+                        binding_authority.generic_launches_required):
+                    if predecessor_info is None:
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            'Cost-rebalance planner lost its exact predecessor '
+                            'before replica-intent admission.')
+                    non_pool_launch_authorization = (
+                        ordinary_launch_binding.
+                        build_replacement_planner_authorization(
+                            ordinary_launch_binding.NonPoolLaunchProfileKind.
+                            COST_REBALANCE,
+                            binding_authority,
+                            predecessor_replica_id=(
+                                predecessor_info.replica_id),
+                            predecessor_record_id=(
+                                predecessor_info.replica_record_id),
+                            predecessor_service_version=(
+                                predecessor_info.version)))
                 if paid_location_launch_budget is None:
                     paid_location_launch_budget = (
                         paid_capacity.build_launch_budget(
@@ -6750,6 +6889,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             resources_override,
             planned_capacity=planned_capacity,
             unknown_capacity_replacement=prior_unknown_capacity_replacement)
+        binding_authority = self._ordinary_launch_binding_authority
+        if (binding_authority is not None and
+                binding_authority.generic_launches_required and
+                prior_unknown_capacity_replacement and
+                non_pool_launch_authorization is None):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Unknown-capacity replacement has no exact durable '
+                'observation authorization.')
+        if non_pool_launch_authorization is not None:
+            info.non_pool_launch_authorization = (non_pool_launch_authorization)
         if recovering_existing_replica and prior_replica_record_id is not None:
             info.replica_record_id = prior_replica_record_id
             info.created_at = prior_created_at
@@ -6870,11 +7019,21 @@ class SkyPilotReplicaManager(ReplicaManager):
                     authoritative_service_spec=launch_spec,
                     service_name=self._service_name)
                 bound_cloud = next(iter(bound_task.resources)).cloud
+                base_launch_fence = launch_fence
+                if (generic_profile_kind == ordinary_launch_binding.
+                        NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY):
+                    recovery_context = recovery_launch_kwargs.get(
+                        'system_recovery_launch_context')
+                    if not isinstance(recovery_context, dict):
+                        raise _BoundOrdinaryLaunchUnresolvedError(
+                            'System-OOM profile has no recovery execution '
+                            'envelope.')
+                    base_launch_fence = recovery_context
                 effective_launch_fence = (
                     self._bound_ordinary_launch_fence_context(
                         info,
                         launch_version,
-                        base_launch_fence=(launch_fence
+                        base_launch_fence=(base_launch_fence
                                            if bound_non_pool_launch else None)))
                 inspect_bound, reduce_bound, cancel_bound = (
                     self._bound_ordinary_launch_callbacks(info, bound_cloud))
@@ -7596,6 +7755,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         logical_reconcile_fence: LogicalTargetState | None = None,
         logical_reconcile_fence_requires_exact_generation: bool = False,
         unknown_capacity_replacement: bool = False,
+        unknown_capacity_replacement_authorization: dict[str, Any] |
+        None = None,
         launch_priority: int = serve_constants.LB_REQUEST_PRIORITY_MIN,
         paid_launch_allowed: bool = True,
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
@@ -7624,8 +7785,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         # An aborted launch (zero-cost-only fill with no ACTIVE zero-cost
         # location) consumed nothing: keep the id free for the next
         # scale-up.
+        if (unknown_capacity_replacement_authorization is not None and
+                not unknown_capacity_replacement):
+            raise ValueError('Unknown-capacity authorization requires its '
+                             'replacement marker.')
         if existing_replica_infos is None:
             direct_launch_kwargs: dict[str, Any] = {}
+            if unknown_capacity_replacement:
+                direct_launch_kwargs['prior_unknown_capacity_replacement'] = (
+                    True)
+                if unknown_capacity_replacement_authorization is not None:
+                    direct_launch_kwargs[
+                        'unknown_capacity_replacement_authorization'] = (
+                            unknown_capacity_replacement_authorization)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 direct_launch_kwargs['launch_priority'] = launch_priority
             if not paid_launch_allowed:
@@ -7659,6 +7831,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                         logical_reconcile_fence_requires_exact_generation)
             if unknown_capacity_replacement:
                 launch_kwargs['prior_unknown_capacity_replacement'] = True
+                if unknown_capacity_replacement_authorization is not None:
+                    launch_kwargs[
+                        'unknown_capacity_replacement_authorization'] = (
+                            unknown_capacity_replacement_authorization)
             if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
                 launch_kwargs['launch_priority'] = launch_priority
             if not paid_launch_allowed:
@@ -8736,6 +8912,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             raw_card = next(iter(accelerators))
             return canonical_by_name.get(str(raw_card).casefold())
 
+        unknown_predecessors = {
+            info.replica_id: info
+            for info in existing_replica_infos
+            if info.replica_id in replace_unknown_replica_ids and
+            info.replica_id in snapshot.unknown_replica_ids and
+            info.version == version and not info.is_terminal
+        }
+        unpaired_unknown_predecessor_ids = set(unknown_predecessors)
+
         def _committed_capacity(
                 capacity_snapshot: LogicalReconcileSnapshot) -> int:
             committed = 0
@@ -8901,10 +9086,37 @@ class SkyPilotReplicaManager(ReplicaManager):
             if (selected_launch_priority
                     != serve_constants.LB_REQUEST_PRIORITY_MIN):
                 launch_kwargs['launch_priority'] = selected_launch_priority
-            if replace_unknown_replica_ids:
+            unknown_predecessor = next(
+                (unknown_predecessors[replica_id]
+                 for replica_id in sorted(unpaired_unknown_predecessor_ids)
+                 if selected_card is None or _replica_card(
+                     unknown_predecessors[replica_id]) == selected_card), None)
+            if unknown_predecessor is not None:
                 launch_kwargs['unknown_capacity_replacement'] = True
                 launch_kwargs[
                     'logical_reconcile_fence_requires_exact_generation'] = True
+                binding_authority = self._ordinary_launch_binding_authority
+                if (binding_authority is not None and
+                        binding_authority.generic_launches_required):
+                    launch_kwargs[
+                        'unknown_capacity_replacement_authorization'] = (
+                            ordinary_launch_binding.
+                            build_replacement_planner_authorization(
+                                ordinary_launch_binding.NonPoolLaunchProfileKind
+                                .UNKNOWN_CAPACITY_REPLACEMENT,
+                                binding_authority,
+                                predecessor_replica_id=(
+                                    unknown_predecessor.replica_id),
+                                predecessor_record_id=(
+                                    unknown_predecessor.replica_record_id),
+                                predecessor_service_version=(
+                                    unknown_predecessor.version),
+                                observation_generation=reconcile_generation,
+                                observation_service_version=version,
+                                target_capacity=target_capacity,
+                                target_capacity_by_accelerator=(
+                                    target_capacity_by_accelerator),
+                                accelerator_shapes=accelerator_shapes))
             launch_result = self._scale_up_one_locked(
                 resources_override,
                 used_replica_ids,
@@ -8929,6 +9141,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.info('Logical scale-up made no placement progress; '
                             'retrying on the next reconciliation tick.')
                 break
+            if unknown_predecessor is not None:
+                unpaired_unknown_predecessor_ids.discard(
+                    unknown_predecessor.replica_id)
             launched_capacity += launch_result.planned_capacity
             if (paid_authority_left is not None and
                     selected_card is not None and
@@ -11619,6 +11834,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             legacy_runtime.replica_to_request_id.pop(replica_id)
             legacy_runtime.replica_to_launch_cancelled.pop(replica_id)
             legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
+            self._non_pool_reconciliation_threads.pop(replica_id)
+            self._non_pool_reconciliation_attempts.pop(replica_id, None)
+            self._non_pool_reconciliation_retry_at.pop(replica_id, None)
         if stale_finished_launches:
             stale_replica_ids = set(stale_finished_launches)
             finished_launches = [(replica_id, t)
@@ -11721,6 +11939,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if (remaining is not None and
                             _bound_projection_classification(remaining)
                             == 'AMBIGUOUS'):
+                        self._schedule_non_pool_provider_reconciliation(
+                            info, remaining.context)
                         logger.error(
                             'Retaining finished bound ordinary-launch worker '
                             'for replica %s: its exact association is durably '
@@ -11963,8 +12183,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     legacy_runtime.launch_thread_pool[replica_id] = old_thread
                 continue
             logger.info(
-                'Queued generation+1 bound ordinary launch for replica %s '
-                'after exact pre-effect settlement.', replica_id)
+                'Completed bound launch recovery for replica %s after exact '
+                'pre-effect settlement.', replica_id)
 
         # Retire v2 failures before any ordinary log/drain provider work. The
         # worker remains registered until its row outcome has been persisted;

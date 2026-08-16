@@ -16,8 +16,10 @@ from sky.serve import ordinary_launch_binding as binding
 from sky.serve import replica_managers
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.serve import system_oom_recovery
 from sky.serve import system_recovery_state
 from sky.server import constants as server_constants
+from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
@@ -143,6 +145,90 @@ def test_generic_capability_requires_the_complete_exact_tuple() -> None:
     assert not dataclasses.replace(
         authority,
         non_pool_receipt_protocol_version=None).generic_launches_required
+
+
+def test_replacement_planner_authorization_is_exact_and_canonical() -> None:
+    authority = binding.ControllerBindingAuthority(
+        service_name='svc',
+        service_hash='svc-hash',
+        service_workspace='workspace-a',
+        service_lifecycle_epoch=4,
+        controller_pid=123,
+        controller_ip='10.0.0.2',
+        controller_incarnation=_CONTROLLER_ID,
+        controller_owner_epoch=7,
+        capable=True,
+        binding_mode=binding.BindingMode.BOUND,
+        binding_epoch=3)
+    predecessor = uuid.UUID('44444444-4444-4444-8444-444444444444')
+    authorization = binding.build_replacement_planner_authorization(
+        binding.NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+        authority,
+        predecessor_replica_id=9,
+        predecessor_record_id=str(predecessor),
+        predecessor_service_version=2,
+        observation_generation=41,
+        observation_service_version=2,
+        target_capacity=8,
+        target_capacity_by_accelerator={
+            'L4': 4,
+            'A100': 4,
+        },
+        accelerator_shapes={
+            'L4': 1,
+            'A100': 8,
+        })
+
+    assert authorization['predecessor'] == {
+        'replica_id': 9,
+        'replica_record_id': str(predecessor),
+        'service_version': 2,
+    }
+    assert {
+        key: authorization[key]
+        for key in ('service_hash', 'service_lifecycle_epoch',
+                    'service_binding_epoch')
+    } == {
+        'service_hash': 'svc-hash',
+        'service_lifecycle_epoch': 4,
+        'service_binding_epoch': 3,
+    }
+    assert authorization['observation'] == {
+        'accelerator_shapes': [['A100', 8], ['L4', 1]],
+        'classification': 'UNKNOWN',
+        'reconcile_generation': 41,
+        'service_version': 2,
+        'target_capacity': 8,
+        'target_capacity_by_accelerator': [['A100', 4], ['L4', 4]],
+    }
+    assert binding.build_replacement_planner_authorization(
+        binding.NonPoolLaunchProfileKind.UNKNOWN_CAPACITY_REPLACEMENT,
+        dataclasses.replace(authority,
+                            controller_incarnation=uuid.uuid4(),
+                            controller_owner_epoch=8),
+        predecessor_replica_id=9,
+        predecessor_record_id=str(predecessor),
+        predecessor_service_version=2,
+        observation_generation=41,
+        observation_service_version=2,
+        target_capacity=8,
+        target_capacity_by_accelerator={
+            'L4': 4,
+            'A100': 4,
+        },
+        accelerator_shapes={
+            'L4': 1,
+            'A100': 8,
+        }) == authorization
+
+    with pytest.raises(ValueError, match='cannot carry'):
+        binding.build_replacement_planner_authorization(
+            binding.NonPoolLaunchProfileKind.COST_REBALANCE,
+            authority,
+            predecessor_replica_id=9,
+            predecessor_record_id=str(predecessor),
+            predecessor_service_version=2,
+            observation_generation=41)
 
 
 def test_service_generic_capability_tuple_is_all_or_none_and_supported(
@@ -525,6 +611,49 @@ def _non_pool_identity(
         receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
 
 
+def _system_recovery_body_and_identity(
+) -> tuple[payloads.LaunchBody, binding.NonPoolBindingIdentity]:
+    intent = _system_recovery_intent()
+    recovery_context = system_oom_recovery.create_unbound_launch_context(
+        intent,
+        service_name='svc',
+        service_version=2,
+        controller_pid=123,
+        controller_ip='10.0.0.2')
+    recovery_context.update({
+        binding.REPLICA_ID_KEY: 3,
+        binding.REPLICA_RECORD_ID_KEY: str(_RECORD_ID),
+        binding.LIFECYCLE_EPOCH_KEY: 4,
+        binding.BINDING_EPOCH_KEY: 5,
+        binding.CONTROLLER_INCARNATION_KEY: str(_CONTROLLER_ID),
+        binding.CONTROLLER_OWNER_EPOCH_KEY: 6,
+    })
+    body = _body()
+    body.extra_launch_context = recovery_context
+    profile = binding.NonPoolLaunchProfile.create(
+        binding.NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY,
+        authorization_reference=f'system-oom:{intent.launch_nonce}',
+        authorization_generation=intent.launch_generation,
+        authorization_payload={
+            'intent': intent.to_dict(),
+            'placement': 'test',
+        })
+    parsed_intent = binding.parse_unbound_launch_context(recovery_context)
+    identity = binding.build_non_pool_binding_identity(
+        parsed_intent,
+        submission_id=_SUBMISSION_ID,
+        tenant_scope='tenant-a',
+        service_workspace='workspace-a',
+        cluster_name='svc-3',
+        input_digest=binding.canonical_launch_digest(body),
+        profile=profile,
+        capability_cohort_epoch=9,
+        capability_profile_set_digest=(
+            binding.supported_non_pool_profile_set_digest()),
+        receipt_protocol_version=binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)
+    return body, identity
+
+
 def test_unbound_parser_accepts_launch_facts_but_no_server_owned_ids() -> None:
     intent = binding.parse_unbound_launch_context(_context())
     assert intent.replica_record_id == _RECORD_ID
@@ -638,6 +767,39 @@ def test_non_pool_context_rejects_partial_profile() -> None:
         binding.parse_bound_non_pool_launch_context(body.extra_launch_context)
 
 
+def test_system_recovery_profile_binds_complete_execution_envelope() -> None:
+    body, identity = _system_recovery_body_and_identity()
+    binding.install_bound_non_pool_context(body, identity, 7)
+
+    context = body.extra_launch_context
+    parsed = binding.parse_bound_non_pool_launch_context(context)
+    recovery = system_oom_recovery.extract_bound_launch_context(context)
+    assert parsed.profile.kind == (
+        binding.NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY)
+    assert recovery[
+        serve_constants.SYSTEM_OOM_RECOVERY_BOUND_REQUEST_ID_KEY] == (
+            identity.request_id)
+    assert serve_constants.SYSTEM_OOM_RECOVERY_LAUNCH_NONCE_KEY not in context
+    assert recovery[
+        serve_constants.REPLICA_LAUNCH_FENCE_CONTROLLER_PID_KEY] == -1
+    assert recovery[serve_constants.
+                    REPLICA_LAUNCH_FENCE_CONTROLLER_IP_KEY].endswith('.invalid')
+
+
+def test_non_pool_profile_and_recovery_envelope_must_correspond() -> None:
+    recovery_body, _ = _system_recovery_body_and_identity()
+    ordinary_identity = _non_pool_identity(_body())
+    with pytest.raises(ValueError, match='non-recovery profile'):
+        binding.install_bound_non_pool_context(recovery_body, ordinary_identity,
+                                               7)
+
+    ordinary_body = _body()
+    _, recovery_identity = _system_recovery_body_and_identity()
+    with pytest.raises(ValueError, match='no recovery execution envelope'):
+        binding.install_bound_non_pool_context(ordinary_body, recovery_identity,
+                                               7)
+
+
 def test_partial_context_fails_closed_and_unbound_effect_helpers_noop() -> None:
     assert not binding.has_bound_launch_context({})
     assert binding.has_bound_launch_context(
@@ -649,6 +811,15 @@ def test_partial_context_fails_closed_and_unbound_effect_helpers_noop() -> None:
         pass
     else:
         raise AssertionError('Partial bound context was accepted.')
+
+    generic_partial = {
+        binding.PROFILE_KIND_KEY:
+            binding.NonPoolLaunchProfileKind.ORDINARY_PAID.value,
+    }
+    assert ordinary_launch_request._has_bound_context_fields(generic_partial)
+    with pytest.raises((ValueError, binding.OrdinaryLaunchBindingConflict)):
+        ordinary_launch_request._validate_bound_entrypoint_context(
+            generic_partial)
 
     with binding.provider_effect_guard(
         {}, None, claim_validator=lambda *_args: False) as authorization:

@@ -32,6 +32,17 @@ _BOUND_CONTEXT_FIELDS = frozenset({
     'sky_serve_ordinary_launch_request_id',
     'sky_serve_ordinary_launch_input_digest',
     'sky_serve_ordinary_launch_owner_revision',
+    'sky_serve_non_pool_binding_protocol_version',
+    'sky_serve_non_pool_profile_kind',
+    'sky_serve_non_pool_profile_version',
+    'sky_serve_non_pool_profile_digest',
+    'sky_serve_non_pool_capability_cohort_epoch',
+    'sky_serve_non_pool_capability_profile_set_digest',
+    'sky_serve_non_pool_receipt_protocol_version',
+    'sky_serve_non_pool_authorization_kind',
+    'sky_serve_non_pool_authorization_reference',
+    'sky_serve_non_pool_authorization_generation',
+    'sky_serve_non_pool_authorization_digest',
 })
 
 
