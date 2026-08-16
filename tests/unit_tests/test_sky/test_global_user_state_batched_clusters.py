@@ -82,6 +82,24 @@ def test_get_clusters_from_names_empty_input_returns_empty(
     assert not global_user_state.get_clusters_from_names([])
 
 
+def test_get_cluster_workload_fields_reads_only_attribution(
+        tmp_path, monkeypatch):
+    _fresh_db(tmp_path, monkeypatch)
+    _add_cluster('service-replica',
+                 is_managed=True,
+                 workload_type='service',
+                 workload_id='boltz-l4-fleet')
+    _add_cluster('ordinary')
+
+    result = global_user_state.get_cluster_workload_fields(
+        ['service-replica', 'ordinary', 'missing'])
+
+    assert result == {
+        'service-replica': ('service', 'boltz-l4-fleet'),
+        'ordinary': (None, None),
+    }
+
+
 def test_get_clusters_from_names_returns_record_per_name(tmp_path, monkeypatch):
     _fresh_db(tmp_path, monkeypatch)
     _add_cluster('alive-1')

@@ -84,6 +84,10 @@ def serialize_kubernetes_node_info(return_value: dict[str, Any]) -> str:
                 # don't recognize them
                 node_info.pop('is_cordoned', None)
                 node_info.pop('taints', None)
+            if (remote_api_version < server_constants.
+                    MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION):
+                node_info.pop('accelerators_preemptible_services', None)
+                node_info.pop('preemptible_service_breakdown', None)
     return orjson.dumps(return_value).decode('utf-8')
 
 

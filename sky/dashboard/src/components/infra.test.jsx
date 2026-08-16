@@ -329,11 +329,49 @@ describe('ContextDetails', () => {
     expect(screen.getByTitle('2 free')).toBeInTheDocument();
     // Classes are listed largest-first under the summary line. Asserted on the
     // raw attribute because title queries collapse the newlines away.
-    expect(screen.getByTitle(/6 preemptible/)).toHaveAttribute(
+    expect(screen.getByTitle(/6 other preemptible/)).toHaveAttribute(
       'title',
-      '6 preemptible (reclaimable by higher-priority workloads)\n' +
+      '6 other preemptible (reclaimable by higher-priority workloads)\n' +
         'inference-low (-1000): 4\n' +
         'drill (-500): 2'
+    );
+  });
+
+  it('separates preemptible SkyServe GPUs from other workloads', async () => {
+    render(
+      <ContextDetails
+        contextName="dev-cluster"
+        gpusInContext={[
+          {
+            gpu_name: 'A100',
+            gpu_requestable_qty_per_node: 8,
+            gpu_total: 16,
+            gpu_free: 2,
+            gpu_not_ready: 0,
+            gpu_preemptible: 6,
+            gpu_preemptible_breakdown: {
+              'inference-low (-1000)': 6,
+            },
+            gpu_preemptible_services: 4,
+            gpu_preemptible_service_breakdown: {
+              'boltz-l4-fleet': 4,
+            },
+          },
+        ]}
+        nodesInContext={[node]}
+      />
+    );
+
+    expect(screen.getByTitle('8 used')).toBeInTheDocument();
+    expect(screen.getByTitle('2 free')).toBeInTheDocument();
+    expect(screen.getByTitle(/4 SkyServe preemptible/)).toHaveAttribute(
+      'title',
+      '4 SkyServe preemptible (reclaimable by higher-priority workloads)\n' +
+        'boltz-l4-fleet: 4'
+    );
+    expect(screen.getByTitle(/2 other preemptible/)).toHaveAttribute(
+      'title',
+      '2 other preemptible (reclaimable by higher-priority workloads)'
     );
   });
 

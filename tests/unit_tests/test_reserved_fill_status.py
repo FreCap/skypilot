@@ -20,7 +20,9 @@ _WORKER_PROJECTION_SHA256 = 'e' * 64
 def test_status_contract_has_distinct_api_capability_version() -> None:
     assert (server_constants.
             MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION == 76)
-    assert server_constants.API_VERSION == 77
+    assert (server_constants.
+            MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION == 78)
+    assert server_constants.API_VERSION == 78
 
 
 def _allocation(

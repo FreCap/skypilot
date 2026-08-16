@@ -1456,6 +1456,7 @@ class V1ObjectMeta:
     name: str
     labels: dict[str, str]
     namespace: str = ''  # Used for pods, not nodes
+    annotations: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -2939,6 +2940,7 @@ class V1Pod:
                 name=data['metadata']['name'],
                 labels=data['metadata'].get('labels', {}),
                 namespace=data['metadata'].get('namespace'),
+                annotations=data['metadata'].get('annotations', {}) or {},
             ),
             status=V1PodStatus(phase=data['status'].get('phase'),),
             spec=V1PodSpec(
@@ -2970,12 +2972,18 @@ class PriorityTier(NamedTuple):
         return f'{self.class_name} ({self.priority})'
 
 
+class SkyServeAllocation(NamedTuple):
+    """One service's accelerator allocation at a scheduling priority tier."""
+    priority_tier: PriorityTier
+    service_name: str
+
+
 @_retry_on_error(resource_type='pod')
 def get_allocated_resources_by_node(
     *,
     context: str | None = None,
 ) -> tuple[dict[str, int], dict[str, tuple[float, float]], dict[str, dict[
-        PriorityTier, int]]]:
+        PriorityTier, int]], dict[str, dict[SkyServeAllocation, int]] | None]:
     """Gets allocated GPU, CPU, and memory by each node by fetching pods in
     all namespaces in kubernetes cluster indicated by context.
 
@@ -2984,11 +2992,15 @@ def get_allocated_resources_by_node(
 
     Returns:
         Tuple of (allocated_gpu_qty_by_node, allocated_cpu_memory_by_node,
-        allocated_gpu_qty_by_node_by_priority):
+        allocated_gpu_qty_by_node_by_priority,
+        allocated_gpu_qty_by_node_by_skyserve_service):
         - allocated_gpu_qty_by_node: Dict mapping node name to allocated GPU count
         - allocated_cpu_memory_by_node: Dict mapping node name to (allocated_cpu, allocated_memory_gb) tuple
         - allocated_gpu_qty_by_node_by_priority: Dict mapping node name to the
           GPU count allocated at each scheduling priority tier on that node
+        - allocated_gpu_qty_by_node_by_skyserve_service: Dict mapping node name
+          to service allocations with their priority tier. None means durable
+          workload attribution could not be read.
     """
     if context is None:
         context = get_current_kube_config_context_name()
@@ -3011,6 +3023,8 @@ def get_allocated_resources_by_node(
         allocated_qty_by_node_by_priority: dict[str, dict[
             PriorityTier, int]] = collections.defaultdict(
                 lambda: collections.defaultdict(int))
+        observed_gpu_allocations: list[tuple[str, PriorityTier, int,
+                                             str | None]] = []
         for item_dict in ijson.items(response,
                                      'items.item',
                                      buf_size=IJSON_BUFFER_SIZE):
@@ -3049,14 +3063,48 @@ def get_allocated_resources_by_node(
                                     pod.spec.priority_class_name)
                 allocated_qty_by_node_by_priority[
                     pod.spec.node_name][tier] += pod_allocated_qty
+                cluster_name = pod.metadata.annotations.get(
+                    provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
+                observed_gpu_allocations.append(
+                    (pod.spec.node_name, tier, pod_allocated_qty, cluster_name))
             if pod_allocated_cpu > 0 or pod_allocated_memory_gb > 0:
                 current_cpu, current_memory = allocated_cpu_memory_by_node[
                     pod.spec.node_name]
                 allocated_cpu_memory_by_node[pod.spec.node_name] = (
                     current_cpu + pod_allocated_cpu,
                     current_memory + pod_allocated_memory_gb)
+        cluster_names = sorted({
+            cluster_name for _, _, _, cluster_name in observed_gpu_allocations
+            if cluster_name
+        })
+        allocated_qty_by_node_by_skyserve_service: dict[str,
+                                                        dict[SkyServeAllocation,
+                                                             int]] | None
+        try:
+            workload_fields = global_user_state.get_cluster_workload_fields(
+                cluster_names)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug('Failed to read workload attribution for Kubernetes '
+                         f'GPU allocations: {common_utils.format_exception(e)}')
+            allocated_qty_by_node_by_skyserve_service = None
+        else:
+            service_allocations: dict[str, dict[
+                SkyServeAllocation, int]] = collections.defaultdict(
+                    lambda: collections.defaultdict(int))
+            for node_name, tier, quantity, cluster_name in (
+                    observed_gpu_allocations):
+                if cluster_name is None:
+                    continue
+                workload_type, workload_id = workload_fields.get(
+                    cluster_name, (None, None))
+                if workload_type != 'service' or not workload_id:
+                    continue
+                allocation = SkyServeAllocation(tier, workload_id)
+                service_allocations[node_name][allocation] += quantity
+            allocated_qty_by_node_by_skyserve_service = service_allocations
         return (allocated_qty_by_node, allocated_cpu_memory_by_node,
-                allocated_qty_by_node_by_priority)
+                allocated_qty_by_node_by_priority,
+                allocated_qty_by_node_by_skyserve_service)
     finally:
         response.release_conn()
 
@@ -3072,8 +3120,8 @@ def get_allocated_gpu_qty_by_node(
     Note: For better performance when you also need CPU/memory allocation,
     use get_allocated_resources_by_node() instead.
     """
-    allocated_qty_by_node, _, _ = get_allocated_resources_by_node(
-        context=context)
+    result = get_allocated_resources_by_node(context=context)
+    allocated_qty_by_node = result[0]
     return allocated_qty_by_node
 
 
@@ -4283,6 +4331,9 @@ def get_kubernetes_node_info(
     allocated_qty_by_node: dict[str, int] = collections.defaultdict(int)
     allocated_cpu_memory_by_node: dict[str, tuple[float, float]] = {}
     allocated_qty_by_node_by_priority: dict[str, dict[PriorityTier, int]] = {}
+    allocated_qty_by_node_by_skyserve_service: dict[str,
+                                                    dict[SkyServeAllocation,
+                                                         int]] | None = {}
     error_on_get_allocated_resources = False
     # Get resource allocation. For GPU allocation, only call if there are GPU nodes
     # (same as master branch). For CPU/memory, we always need it for all nodes.
@@ -4290,7 +4341,8 @@ def get_kubernetes_node_info(
         # When there are GPU nodes, get both GPU and CPU/memory in one call
         try:
             (allocated_qty_by_node, allocated_cpu_memory_by_node,
-             allocated_qty_by_node_by_priority) = (
+             allocated_qty_by_node_by_priority,
+             allocated_qty_by_node_by_skyserve_service) = (
                  get_allocated_resources_by_node(context=context))
         except kubernetes.api_exception() as e:
             if e.status == 403:
@@ -4302,8 +4354,8 @@ def get_kubernetes_node_info(
         # When there are no GPU nodes, we still need CPU/memory allocation
         # This is an extra API call compared to master branch
         try:
-            _, allocated_cpu_memory_by_node, _ = get_allocated_resources_by_node(
-                context=context)
+            (_, allocated_cpu_memory_by_node, _,
+             _) = get_allocated_resources_by_node(context=context)
         except kubernetes.api_exception() as e:
             if e.status == 403:
                 error_on_get_allocated_resources = True
@@ -4431,6 +4483,8 @@ def get_kubernetes_node_info(
         # "nothing is preemptible" apart from "we could not look".
         accelerators_preemptible: int | None = None
         preemptible_breakdown: dict[str, int] | None = None
+        accelerators_preemptible_services: int | None = None
+        preemptible_service_breakdown: dict[str, int] | None = None
         if not error_on_get_allocated_resources and top_priority is not None:
             preemptible_breakdown = {
                 tier.label: qty
@@ -4439,6 +4493,18 @@ def get_kubernetes_node_info(
                 if tier.priority < top_priority
             }
             accelerators_preemptible = sum(preemptible_breakdown.values())
+            if allocated_qty_by_node_by_skyserve_service is not None:
+                preemptible_service_breakdown = collections.defaultdict(int)
+                for allocation, quantity in (
+                        allocated_qty_by_node_by_skyserve_service.get(
+                            node.metadata.name, {}).items()):
+                    if allocation.priority_tier.priority < top_priority:
+                        preemptible_service_breakdown[
+                            allocation.service_name] += quantity
+                preemptible_service_breakdown = dict(
+                    preemptible_service_breakdown)
+                accelerators_preemptible_services = sum(
+                    preemptible_service_breakdown.values())
 
         # Exclude multi-host TPUs from being processed.
         # TODO(Doyoung): Remove the logic when adding support for
@@ -4462,6 +4528,9 @@ def get_kubernetes_node_info(
             taints=node_taints,
             accelerators_preemptible=accelerators_preemptible,
             preemptible_breakdown=preemptible_breakdown,
+            accelerators_preemptible_services=(
+                accelerators_preemptible_services),
+            preemptible_service_breakdown=preemptible_service_breakdown,
         )
     hint = ''
     if has_multi_host_tpu:

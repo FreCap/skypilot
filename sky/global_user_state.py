@@ -2216,6 +2216,19 @@ def get_cluster_status_fields(
 
 
 @metrics_lib.time_me
+def get_cluster_workload_fields(
+        cluster_names: list[str]) -> dict[str, tuple[str | None, str | None]]:
+    """Return raw workload attribution for named live clusters."""
+    return global_user_state_cluster_raw_snapshots.get_cluster_workload_fields(
+        _db_manager.get_engine,
+        orm.Session,
+        cluster_table,
+        _CLUSTER_IN_QUERY_CHUNK_SIZE,
+        cluster_names,
+    )
+
+
+@metrics_lib.time_me
 def get_cluster_status_fields_by_prefix(
     cluster_name_prefix: str,
     *,

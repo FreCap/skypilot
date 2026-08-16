@@ -41,6 +41,37 @@ def get_cluster_status_fields(
     return result
 
 
+def get_cluster_workload_fields(
+    engine_getter: Callable[[], sqlalchemy.engine.Engine],
+    session_factory: Any,
+    cluster_table: sqlalchemy.Table,
+    cluster_in_query_chunk_size: int,
+    cluster_names: list[str],
+) -> dict[str, tuple[str | None, str | None]]:
+    """Return workload type and ID for a bounded cluster-name batch.
+
+    This deliberately reads only the two attribution columns.  Infrastructure
+    inventory must not deserialize every cluster handle merely to identify the
+    SkyServe subset of accelerator allocations.
+    """
+    result: dict[str, tuple[str | None, str | None]] = {}
+    if not cluster_names:
+        return result
+    engine = engine_getter()
+    with session_factory(engine) as session:
+        query = session.query(
+            cluster_table.c.name,
+            cluster_table.c.workload_type,
+            cluster_table.c.workload_id,
+        )
+        for offset in range(0, len(cluster_names), cluster_in_query_chunk_size):
+            batch = cluster_names[offset:offset + cluster_in_query_chunk_size]
+            rows = query.filter(cluster_table.c.name.in_(batch)).all()
+            for row in rows:
+                result[row.name] = (row.workload_type, row.workload_id)
+    return result
+
+
 def get_cluster_status_fields_by_prefix(
     engine_getter: Callable[[], sqlalchemy.engine.Engine],
     session_factory: Any,

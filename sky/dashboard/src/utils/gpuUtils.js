@@ -123,11 +123,16 @@ export function hasAccelerator(accelerators) {
  * scheduling priority tier, i.e. reclaimable by a higher-priority workload.
  * The Infra page aggregates GPU rows at three levels (per node into a context,
  * per context into a workspace view, and per GPU type across contexts); every
- * one of them must carry these two fields or the split silently collapses back
- * into a single "used" block.
+ * one of them must carry the total, service subset, and their breakdowns or
+ * the split silently collapses back into a single "used" block.
  */
 export function emptyPreemptible() {
-  return { gpu_preemptible: 0, gpu_preemptible_breakdown: {} };
+  return {
+    gpu_preemptible: 0,
+    gpu_preemptible_breakdown: {},
+    gpu_preemptible_services: 0,
+    gpu_preemptible_service_breakdown: {},
+  };
 }
 
 /**
@@ -135,11 +140,18 @@ export function emptyPreemptible() {
  */
 export function mergePreemptible(target, source) {
   target.gpu_preemptible += source?.gpu_preemptible || 0;
+  target.gpu_preemptible_services += source?.gpu_preemptible_services || 0;
   for (const [label, qty] of Object.entries(
     source?.gpu_preemptible_breakdown || {}
   )) {
     target.gpu_preemptible_breakdown[label] =
       (target.gpu_preemptible_breakdown[label] || 0) + qty;
+  }
+  for (const [service, qty] of Object.entries(
+    source?.gpu_preemptible_service_breakdown || {}
+  )) {
+    target.gpu_preemptible_service_breakdown[service] =
+      (target.gpu_preemptible_service_breakdown[service] || 0) + qty;
   }
 }
 

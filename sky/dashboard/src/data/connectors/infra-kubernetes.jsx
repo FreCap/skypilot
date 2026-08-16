@@ -29,11 +29,17 @@ function isNodeNotReadyForGpus(nodeData) {
 function addPreemptibleFromNode(aggregate, nodeData, isNodeNotReady) {
   if (isNodeNotReady) return;
   aggregate.gpu_preemptible += nodeData['accelerators_preemptible'] || 0;
+  aggregate.gpu_preemptible_services +=
+    nodeData['accelerators_preemptible_services'] || 0;
   const breakdown = nodeData['preemptible_breakdown'];
-  if (!breakdown) return;
-  for (const [label, qty] of Object.entries(breakdown)) {
+  for (const [label, qty] of Object.entries(breakdown || {})) {
     aggregate.gpu_preemptible_breakdown[label] =
       (aggregate.gpu_preemptible_breakdown[label] || 0) + qty;
+  }
+  const serviceBreakdown = nodeData['preemptible_service_breakdown'];
+  for (const [service, qty] of Object.entries(serviceBreakdown || {})) {
+    aggregate.gpu_preemptible_service_breakdown[service] =
+      (aggregate.gpu_preemptible_service_breakdown[service] || 0) + qty;
   }
 }
 
@@ -74,6 +80,10 @@ export async function getContextGPUData(context) {
           memory_free_gb: nodeData['memory_free_gb'] ?? null,
           gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
           gpu_preemptible_breakdown: nodeData['preemptible_breakdown'] ?? null,
+          gpu_preemptible_services:
+            nodeData['accelerators_preemptible_services'] ?? null,
+          gpu_preemptible_service_breakdown:
+            nodeData['preemptible_service_breakdown'] ?? null,
         });
 
         // Aggregate GPU data per context
@@ -234,6 +244,11 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
               gpu_preemptible_breakdown: {
                 ...gpuToData[gpuName].gpu_preemptible_breakdown,
               },
+              gpu_preemptible_services:
+                gpuToData[gpuName].gpu_preemptible_services,
+              gpu_preemptible_service_breakdown: {
+                ...gpuToData[gpuName].gpu_preemptible_service_breakdown,
+              },
             };
           }
         }
@@ -292,6 +307,10 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
             gpu_preemptible_breakdown:
               nodeData['preemptible_breakdown'] ?? null,
+            gpu_preemptible_services:
+              nodeData['accelerators_preemptible_services'] ?? null,
+            gpu_preemptible_service_breakdown:
+              nodeData['preemptible_service_breakdown'] ?? null,
           };
 
           // If this node provides a GPU type not found via GPU availability,
