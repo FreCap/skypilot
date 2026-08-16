@@ -36,8 +36,6 @@ from sky.serve.load_balancer_http import _DrainableServer
 from sky.serve.load_balancer_http import _InboundAuthMiddleware
 from sky.serve.load_balancer_http import _ReleasingStreamingResponse
 from sky.serve.load_balancer_retry import _bind_facade_globals
-from sky.serve.load_balancer_retry import (
-    _IDEMPOTENT_METHODS as _RETRY_IDEMPOTENT_METHODS)
 from sky.serve.load_balancer_retry import _PreDispatchError
 from sky.serve.load_balancer_retry import _RetriableStatusError
 from sky.utils import common_utils
@@ -47,7 +45,6 @@ logger = sky_logging.init_logger(__name__)
 # Preserve the historical facade dependency-replacement surface without a
 # runtime forwarding wrapper. The extracted policy functions resolve their
 # globals from this module exactly as they did before extraction.
-_IDEMPOTENT_METHODS = _RETRY_IDEMPOTENT_METHODS
 (_is_dead_connection_error, _is_definitely_not_dispatched,
  _can_retry_proxy_failure) = _bind_facade_globals(globals())
 

@@ -82,6 +82,7 @@ def _bind_facade_globals(
 ) -> tuple[Callable[[Exception], bool], Callable[[Exception], bool], Callable[
     [str, Exception], bool]]:
     """Bind extracted policy functions to their historical facade globals."""
+    facade_globals['_IDEMPOTENT_METHODS'] = _IDEMPOTENT_METHODS
     for function_name in _FACADE_GLOBAL_FUNCTION_NAMES:
         function = globals()[function_name]
         rebound_function = types.FunctionType(
