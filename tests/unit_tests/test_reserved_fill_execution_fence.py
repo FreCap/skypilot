@@ -42,9 +42,9 @@ def _fill_context() -> dict[str, object]:
     return context
 
 
-def _worker_projection() -> dict[str, object]:
-    return {
-        'projection_version': 2,
+def _worker_projection(protocol_version: int = 2) -> dict[str, object]:
+    projection: dict[str, object] = {
+        'projection_version': protocol_version,
         'candidate_id': 'kubernetes-0000',
         'kubernetes_context': 'phx-context',
         'namespace': 'inference',
@@ -69,6 +69,15 @@ def _worker_projection() -> dict[str, object]:
             'workload_priority_class_name': 'inference-low',
         },
     }
+    if protocol_version == 3:
+        projection['provision_timeout'] = -1
+        projection['scratch'] = {
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        }
+    return projection
 
 
 def _policy_fill_context() -> dict[str, object]:
@@ -203,6 +212,39 @@ def test_policy_fill_reloads_and_authenticates_exact_v2_projection():
     assert context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY] == [
         projection
     ]
+
+
+def test_policy_fill_reloads_and_authenticates_exact_v3_projection():
+    projection = _worker_projection(protocol_version=3)
+    context = _fill_context()
+    context.update({
+        constants.RESERVED_FILL_LAUNCH_GATE_GENERATION_KEY: 11,
+        constants.RESERVED_FILL_LAUNCH_RECLAIM_FLEET_BUNDLE_SHA256_KEY: 'a' *
+                                                                        64,
+        constants.RESERVED_FILL_LAUNCH_RECLAIM_POLICY_REVISION_KEY: 'policy-v2',
+        constants.RESERVED_FILL_LAUNCH_RECLAIM_PROVIDER_INVENTORY_SHA256_KEY:
+            'b' * 64,
+        constants.RESERVED_FILL_LAUNCH_WORKER_PROJECTION_SHA256_KEY:
+            kubernetes_identity.worker_projection_sha256(projection),
+    })
+    fence = reserved_capacity.parse_protocol_v2_launch_fence(context)
+    assert fence is not None and fence.policy_bound
+
+    with mock.patch.object(execution.serve_state,
+                           'get_placement_projection_record',
+                           return_value=(True, None, None, [projection])):
+        execution._load_service_worker_projections(context, fence)
+
+    assert context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY] == [
+        projection
+    ]
+
+
+def test_worker_projection_versions_cannot_mix_in_one_persisted_record():
+    with pytest.raises(ValueError, match='must not mix protocol versions'):
+        kubernetes_identity.validate_worker_placement_projections(
+            [_worker_projection(2),
+             _worker_projection(3)])
 
 
 @pytest.mark.parametrize('mutation', ['digest', 'protocol'])

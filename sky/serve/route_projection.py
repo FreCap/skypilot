@@ -317,9 +317,9 @@ def build_route_view(
             continue
         url = _normalize_url(ready_material.url)
         if url not in collision_urls:
-            current_identity = current_identities.get(url)
-            if (current_identity is None or current_identity[  # pylint: disable=line-too-long
-                    'replica_record_id'] != info.replica_record_id):
+            ready_identity = current_identities.get(url)
+            if (ready_identity is None or ready_identity['replica_record_id']
+                    != info.replica_record_id):
                 continue
         advertised_sources.setdefault(url, []).append(info)
 

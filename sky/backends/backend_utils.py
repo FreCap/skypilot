@@ -1,7 +1,6 @@
 """Util constants/functions for the backends."""
 import asyncio
 from collections.abc import Callable
-from collections.abc import Mapping
 from collections.abc import Sequence
 import copy
 from datetime import datetime
@@ -916,41 +915,31 @@ def _select_worker_projection(
             'SkyServe Kubernetes placement has no exact immutable worker '
             f'projection for context {region.name!r} and accelerator '
             f'{to_provision.accelerators!r}.')
-    if kubernetes_identity.worker_projection_protocol_version(projection) == 2:
-        if to_provision.priority_class is not None:
-            raise exceptions.InvalidCloudConfigs(
-                'Projected SkyServe Kubernetes workers cannot set task '
-                'resource priority_class.')
-        overrides = to_provision.cluster_config_overrides
-        kubernetes_config = overrides.get('kubernetes')
-        if kubernetes_config is None and any(
-                key in overrides
-                for key in ('kueue', 'quota', 'context_configs')):
-            kubernetes_config = overrides
-
-        def _scope_has_admission_override(scope: Any) -> bool:
-            if not isinstance(scope, Mapping):
-                return False
-            if 'kueue' in scope:
-                return True
-            quota = scope.get('quota')
-            return isinstance(quota, Mapping) and 'queue' in quota
-
-        has_admission_override = _scope_has_admission_override(
-            kubernetes_config)
-        if isinstance(kubernetes_config, Mapping):
-            context_configs = kubernetes_config.get('context_configs')
-            has_admission_override = (
-                has_admission_override or
-                isinstance(context_configs, Mapping) and any(
-                    _scope_has_admission_override(context_config)
-                    for context_config in context_configs.values()))
-        if has_admission_override:
-            raise exceptions.InvalidCloudConfigs(
-                'Projected SkyServe Kubernetes workers cannot set '
-                'task-owned kubernetes.kueue or kubernetes.quota.queue '
-                'overrides.')
+    try:
+        kubernetes_identity.validate_no_resource_worker_projection_overrides(
+            to_provision,
+            forbid_provision_timeout=(
+                kubernetes_identity.worker_projection_has_provision_timeout(
+                    projection)))
+    except ValueError as error:
+        raise exceptions.InvalidCloudConfigs(str(error)) from error
     return projection
+
+
+def _enforce_worker_scratch_on_pod_spec(
+    pod_spec: dict[str, Any],
+    scratch: dict[str, Any],
+) -> None:
+    """Install and attest the one low-level owned worker scratch contract."""
+    try:
+        contract = k8s_pod_spec.enforce_projected_worker_scratch_contract(
+            pod_spec, scratch, rewrite=True)
+    except k8s_pod_spec.ProjectedScratchContractError as error:
+        raise exceptions.InvalidCloudConfigs(str(error)) from error
+    if not contract.matches:
+        raise exceptions.InvalidCloudConfigs(
+            'Projected SkyServe worker scratch canonicalization failed: '
+            f'{contract.actual!r}; expected {contract.expected!r}.')
 
 
 def _enforce_worker_projection_on_kubernetes_yaml(
@@ -958,14 +947,37 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     projection: dict[str, Any],
 ) -> None:
     """Apply server-owned identity and cache after all user config merging."""
+    try:
+        projection_version = (
+            kubernetes_identity.worker_projection_protocol_version(projection))
+        validated = kubernetes_identity.validate_worker_placement_projections(
+            [projection],
+            allow_none=False,
+            require_protocol_version=projection_version)
+    except ValueError as error:
+        raise exceptions.InvalidCloudConfigs(str(error)) from error
+    assert validated is not None
+    projection = validated[0]
     cluster_yaml['provider']['context'] = projection['kubernetes_context']
     cluster_yaml['provider']['namespace'] = projection['namespace']
-    projection_version = (
-        kubernetes_identity.worker_projection_protocol_version(projection))
     cluster_yaml['provider']['serve_worker_projection_protocol_version'] = (
         projection_version)
+    if (k8s_pod_spec.serve_worker_projection_protocol_has_provision_timeout(
+            projection_version)):
+        cluster_yaml['provider']['timeout'] = projection['provision_timeout']
+    has_projected_scratch = (
+        k8s_pod_spec.serve_worker_projection_protocol_has_scratch(
+            projection_version))
+    if has_projected_scratch:
+        cluster_yaml['provider'][
+            'serve_worker_expected_scratch'] = copy.deepcopy(
+                projection['scratch'])
+    else:
+        cluster_yaml['provider'].pop('serve_worker_expected_scratch', None)
     kueue_admission = None
-    if projection_version == 2:
+    has_strict_admission = (
+        kubernetes_identity.worker_projection_has_strict_admission(projection))
+    if has_strict_admission:
         kueue_admission = projection['kueue_admission']
         cluster_yaml['provider']['serve_worker_expected_scheduler_name'] = (
             projection['scheduler_name'])
@@ -1009,9 +1021,10 @@ def _enforce_worker_projection_on_kubernetes_yaml(
     }
     cache = projection['cache']
     cache_env = kubernetes_identity.cache_environment(projection)
+    scratch_env = kubernetes_identity.scratch_environment(projection)
     for node_type in cluster_yaml['available_node_types'].values():
         node_config = node_type['node_config']
-        if projection_version == 2:
+        if has_strict_admission:
             metadata = node_config.setdefault('metadata', {})
             if not isinstance(metadata, dict):
                 raise exceptions.InvalidCloudConfigs(
@@ -1047,7 +1060,7 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 labels[k8s_constants.KUEUE_WORKLOAD_PRIORITY_CLASS_LABEL] = (
                     kueue_admission['workload_priority_class_name'])
         pod_spec = node_config['spec']
-        if projection_version == 2:
+        if has_strict_admission:
             # This is the final post-merge/restoration owner.  A caller-selected
             # node bypasses every scheduler, while an alternate scheduler is
             # outside the persisted placement proof.
@@ -1136,7 +1149,11 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 entry for entry in container.setdefault('env', [])
                 if entry.get('name') != kubernetes_identity.CACHE_ENV_VAR and
                 not str(entry.get('name', '')).startswith(
-                    kubernetes_identity.CACHE_ENV_PREFIX)
+                    kubernetes_identity.CACHE_ENV_PREFIX) and
+                (not has_projected_scratch or
+                 entry.get('name') != kubernetes_identity.SCRATCH_ENV_VAR and
+                 not str(entry.get('name', '')).startswith(
+                     kubernetes_identity.SCRATCH_ENV_PREFIX))
             ]
             container['env'] = env
             if container.get('name') != 'ray-node':
@@ -1145,6 +1162,10 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 'name': key,
                 'value': value
             } for key, value in cache_env.items())
+            env.extend({
+                'name': key,
+                'value': value
+            } for key, value in scratch_env.items())
             if cache['kind'] == 'node_local':
                 mounts = [
                     mount for mount in container.setdefault('volumeMounts', [])
@@ -1171,6 +1192,8 @@ def _enforce_worker_projection_on_kubernetes_yaml(
                 },
             })
             pod_spec['volumes'] = volumes
+        if has_projected_scratch:
+            _enforce_worker_scratch_on_pod_spec(pod_spec, projection['scratch'])
 
 
 def _restore_projected_worker_kubernetes_fields(
@@ -1296,8 +1319,8 @@ def write_cluster_config(
             'service_account_name']
     rendered_priority_class = to_provision.priority_class
     if (worker_projection is not None and
-            kubernetes_identity.worker_projection_protocol_version(
-                worker_projection) == 2):
+            kubernetes_identity.worker_projection_has_strict_admission(
+                worker_projection)):
         projected_kueue_admission = worker_projection['kueue_admission']
         rendered_priority_class = (
             None if projected_kueue_admission is None else

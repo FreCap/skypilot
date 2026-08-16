@@ -32,8 +32,8 @@ def _status(
     gate_state: str = 'LEGACY_ACTIVE',
     gate_generation: int = 4,
     protocol_version: int = 2,
-    serve_revision: str = '046',
-    api_revision: str = '010',
+    serve_revision: str = '047',
+    api_revision: str = '011',
     reclaim_policy_identity: dict[str, str] | None = None,
     reclaim_activation_receipt: dict[str, Any] | None = None,
     reclaim_authorized_at: float | None = None,
@@ -172,10 +172,10 @@ def test_activation_schema_is_exact_and_protocol_v2() -> None:
                        match='protocol v2'):
         transition._require_activation_schema(_status(protocol_version=1))
     with pytest.raises(transition.ReconciliationTransitionError,
-                       match='Serve schema revision 046'):
+                       match='Serve schema revision 047'):
         transition._require_activation_schema(_status(serve_revision='042'))
     with pytest.raises(transition.ReconciliationTransitionError,
-                       match='API-request schema revision 010'):
+                       match='API-request schema revision 011'):
         transition._require_activation_schema(_status(api_revision='008'))
 
 

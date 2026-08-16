@@ -193,7 +193,7 @@ def bound_request_database(request_database, monkeypatch):
     # before its existing lifecycle/service/replica locks. Exercise the
     # current production schema boundary even while the reconciliation gate
     # remains in legacy mode.
-    alembic_command.upgrade(config, '047')
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
     with engine.begin() as connection:
         connection.execute(
@@ -892,9 +892,15 @@ def test_api009_upgrade_preserves_rows_as_legacy_unproven(postgres_engine):
             ).where(request_postgres.REQUESTS.c.request_id ==
                     request.request_id)).mappings().one()
         legacy_instance = connection.execute(
-            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
-                request_postgres.SERVER_INSTANCES.c.instance_id ==
-                legacy_instance_id)).mappings().one()
+            sqlalchemy.select(
+                request_postgres.SERVER_INSTANCES.c.request_storage_backend,
+                request_postgres.SERVER_INSTANCES.c.request_queue_backend,
+                request_postgres.SERVER_INSTANCES.c.
+                execution_quiescence_capable,
+                request_postgres.SERVER_INSTANCES.c.
+                ordinary_launch_binding_capable,
+            ).where(request_postgres.SERVER_INSTANCES.c.instance_id ==
+                    legacy_instance_id)).mappings().one()
     assert row['execution_quiescence_required'] is False
     assert row['execution_quiesced_generation'] is None
     assert row['execution_quiesced_at'] is None
@@ -954,9 +960,15 @@ def test_api010_upgrade_preserves_legacy_process_identity_as_unknown(
 
     with postgres_engine.connect() as connection:
         stored = connection.execute(
-            sqlalchemy.select(request_postgres.REQUESTS).where(
-                request_postgres.REQUESTS.c.request_id ==
-                request.request_id)).mappings().one()
+            sqlalchemy.select(
+                request_postgres.REQUESTS.c.execution_process_start_time_ticks,
+                request_postgres.REQUESTS.c.managed_job_id,
+                request_postgres.REQUESTS.c.managed_job_controller_instance_id,
+                request_postgres.REQUESTS.c.managed_job_controller_generation,
+                request_postgres.REQUESTS.c.managed_job_controller_slot_id,
+                request_postgres.REQUESTS.c.managed_job_controller_slot_attempt,
+            ).where(request_postgres.REQUESTS.c.request_id ==
+                    request.request_id)).mappings().one()
     assert stored['execution_process_start_time_ticks'] is None
     assert stored['managed_job_id'] is None
     assert stored['managed_job_controller_instance_id'] is None
@@ -1035,6 +1047,13 @@ def test_api009_upgrades_without_serve_schema_or_migration_order(
 
 
 def test_api009_binding_catalog_matches_literal_contract(postgres_engine):
+    with postgres_engine.begin() as connection:
+        connection.exec_driver_sql('DROP SCHEMA public CASCADE')
+        connection.exec_driver_sql('CREATE SCHEMA public')
+    migration_utils.safe_alembic_upgrade(postgres_engine,
+                                         migration_utils.API_REQUESTS_DB_NAME,
+                                         '009',
+                                         mode='upgrade')
     inspector = sqlalchemy.inspect(postgres_engine)
     assert [
         column['name']
@@ -1972,17 +1991,15 @@ def test_generic_handoff_failure_is_durable_and_quiescent(
 
 
 def test_bound_effect_claim_requires_exact_request_queue_pin_and_owner(
-        request_database):
-    engine, backend = request_database
-    request_id = 'bound-effect-claim'
-    association_id = uuid.uuid4()
-    with engine.begin() as connection:
-        assert request_postgres.insert_bound_request_and_queue_in_transaction(
-            connection,
-            _bound_request(request_id),
-            ordinary_launch_association_id=association_id)
-    item = _claim_bound(backend, request_id)
+        bound_request_database):
+    engine, backend = bound_request_database
+    identity, _, _, item = _claim_gc_bound_request(engine, backend)
+    request_id = identity.request_id
+    association_id = identity.association_id
     assert item.claim_token is not None
+    assert backend.try_mark_running(item.request_id, 1234,
+                                    item.execution_generation, item.claim_token,
+                                    424242)
     assert item.worker_instance_id is not None
     claim = storage.ExecutionClaim(item.request_id, item.execution_generation,
                                    item.claim_token, item.worker_instance_id)

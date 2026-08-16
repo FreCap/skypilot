@@ -46,8 +46,9 @@ _SERVE037_PLACEMENT_TABLES = (
 )
 
 # The common runtime metadata is the steady-state schema, while a sequential
-# upgrade reaches revision 038 before Serve042 and Serve047 install their
-# PostgreSQL-only launch-binding columns. Project those future-owned fields out
+# upgrade reaches revision 038 before Serve042, Serve047, Serve049, and
+# Serve050 install their PostgreSQL-only launch-binding, route-projection, and
+# demand-authority contracts. Project those future-owned fields and checks out
 # unconditionally: revision 038 must reject even a complete early lookalike,
 # leaving each later migration as its sole DDL owner.
 _POST_SERVE038_FUTURE_COLUMNS = {
@@ -75,6 +76,19 @@ _POST_SERVE038_FUTURE_COLUMNS = {
         'demand_authority_protocol_version',
     }),
     _REPLICAS: frozenset({'ordinary_launch_association_id'}),
+}
+
+_POST_SERVE038_FUTURE_CHECKS = {
+    _SERVICES: frozenset({
+        'serve049_route_source_mode_ck',
+        'serve049_route_source_epoch_ck',
+        'serve049_route_capability_shape_ck',
+        'serve049_route_projected_capability_ck',
+        'serve050_demand_source_mode_ck',
+        'serve050_demand_source_epoch_ck',
+        'serve050_demand_capability_shape_ck',
+        'serve050_durable_demand_capability_ck',
+    }),
 }
 
 _CHECK_ATTRIBUTE_PATTERN = re.compile(r' :(varattno|varattnosyn) (-?[0-9]+)')
@@ -521,6 +535,11 @@ def _common_runtime_table(table_name: str) -> sa.Table:
         if referenced_table.name not in projected_metadata.tables:
             referenced_table.to_metadata(projected_metadata)
     projected = runtime.to_metadata(projected_metadata)
+    future_owned_checks = _POST_SERVE038_FUTURE_CHECKS.get(
+        table_name, frozenset())
+    for constraint in tuple(projected.constraints):
+        if constraint.name in future_owned_checks:
+            projected.constraints.remove(constraint)
     for column_name in future_owned_columns:
         column = projected.c.get(column_name)
         if column is not None:
@@ -536,6 +555,11 @@ def _common_revision_038_table(table_name: str,
     for table in serve_state_schema.Base.metadata.sorted_tables:
         table.to_metadata(metadata)
     expected = metadata.tables[table_name]
+    future_owned_checks = _POST_SERVE038_FUTURE_CHECKS.get(
+        table_name, frozenset())
+    for constraint in tuple(expected.constraints):
+        if constraint.name in future_owned_checks:
+            expected.constraints.remove(constraint)
     for column_name in _POST_SERVE038_FUTURE_COLUMNS.get(
             table_name, frozenset()):
         column = expected.c.get(column_name)

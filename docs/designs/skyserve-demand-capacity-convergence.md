@@ -1,12 +1,11 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 is implemented in draft PR #1498; the rebased and locally reviewed
-P2a implementation is in draft PR #1499; P2b1 route projection is implemented
-and locally reviewed in draft PR #1503; P2b2 ordered capacity admission is
-implemented, locally adversarially reviewed, and ready for CI/review in PR
-#1504, including a post-review correction that separates cheapest-compatible
-demand attribution from supply-aware exact-card capacity accounting;
-production remains on the legacy controller-coupled demand and route paths
+Status: P1 is merged in PR #1498; P2a is implemented in PR #1499, P2b1 in
+PR #1503, and P2b2 in PR #1504. P2b2 includes the adversarial-review
+correction that separates cheapest-compatible demand attribution from
+supply-aware exact-card capacity accounting. The production compatibility
+precondition is satisfied, but production remains on the legacy
+controller-coupled demand and route paths.
 
 Last updated: 2026-08-16
 
@@ -407,11 +406,19 @@ runtime launch authority.
 
 ### P0: compatibility deployment
 
-Deploy v1.1.1284 directly through the reviewed Helm workflow with
-`--reuse-values`, the existing single-`all` `Recreate` topology, and
-`LEGACY_ACTIVE`. Do not normalize or activate reserved fill. This restores
-bounded reads of the exact retained ReplicaInfo shapes and enables subsequent
-source work to inspect the fleet safely.
+This precondition is satisfied by the later v1.1.1291 production deployment.
+The 2026-08-16 baseline uses the reviewed Helm release, the existing
+single-`all` `Recreate` topology, Serve schema 046, API schema 010, and
+`LEGACY_ACTIVE`. It has not activated the new generalized action, demand, or
+placement authorities. Subsequent rollouts must continue to use
+`--reuse-values`; they must not redeploy the older v1.1.1284 artifact merely to
+reproduce the originally proposed sequence.
+
+The same inspection found no surviving replica, request, coverage, shadow, or
+association records for historical replica IDs 52032--52038. Their earlier
+orphaned state remains incident evidence, but database absence is not executor
+quiescence and must not be converted into a synthetic receipt. Migration input
+is the exact retained inventory observed at migration time.
 
 ### P1: generalized durable non-pool actions
 
@@ -420,9 +427,11 @@ handler, six typed profiles, planner-intent commit followed by atomic
 association/request/queue/pin binding,
 pre-I/O revalidation, typed result/provider reconciliation, and per-association
 quarantine. Add reusable append-only legacy reconciliation scopes and register
-the seven production rows as one exact reviewed scope. Reconcile those rows
-only from old-executor termination plus fresh exact provider
-evidence. No synthetic quiescence or association backfill is permitted.
+only exact retained legacy rows found by the rollout inventory. Reconcile any
+such rows only from old-executor termination plus fresh exact provider
+evidence. The historical IDs 52032--52038 must not be recreated, backfilled,
+or registered as a scope when no source row remains. No synthetic quiescence
+or association backfill is permitted.
 
 Actual draft size: approximately 6,300 source/test lines across 39 files,
 larger than estimated because it closes all six profiles, legacy evidence,
@@ -431,7 +440,7 @@ tests. It does not include a deployment control plane.
 
 ### P2a: durable demand telemetry and UI
 
-API version 80/Serve048 add the demand-report/live-gauge tables, stable API
+API version 81/Serve048 add the demand-report/live-gauge tables, stable API
 ingestion, non-destructive reporter window, request-history acknowledgement,
 direct current-demand read, status projection, and dashboard freshness
 contract. During transition the LB sends both old controller sync data and the
@@ -453,7 +462,7 @@ into a false zero. CI and live rollout evidence remain open.
 
 ### P2b1: provider-free route projection
 
-API version 81/Serve049 add bounded immutable full route generations, one
+API version 82/Serve049 add bounded immutable full route generations, one
 freshness-bearing head, and an explicit per-service route mode/epoch. The
 replica readiness owner publishes the complete route/routing-spec response
 from the bounded probe round's already-resolved endpoints and exact replica
@@ -488,9 +497,10 @@ publication evidence remain open.
 
 ### P2b2: one demand authority and ordered capacity admission
 
-API012/Serve050 add API-fleet capability identity, explicit per-service demand
-promotion, the autoscaler durable reader, content-addressed planner-generation
-fields, the source demand receipt watermark, and the paid-authority tuple.
+API version 83/API012/Serve050 add API-fleet capability identity, explicit
+per-service demand promotion, the autoscaler durable reader,
+content-addressed planner-generation fields, the source demand receipt
+watermark, and the paid-authority tuple.
 Serve050 owns the demand promotion mode and epoch; Serve048 deliberately does
 not add authority fields. Promotion disables controller-sync demand mutation
 for that service epoch. Zero-cost admission is committed before paid residual
@@ -580,6 +590,8 @@ than the current system.
 
 All source branches target `boltz-bio/skypilot:improvements`. Production
 deployment authority is the reviewed live Helm release, not a platform pin.
+The release tuple is `skypilot` in namespace `skypilot`; `improvements` is the
+source branch and must never be substituted as the release name.
 Every upgrade captures live values/manifest, reviews the rendered diff, uses
 `--reuse-values`, pins the immutable image for every explicitly overridden
 role, and records the live Helm revision, image digest, schema heads, rollout,
@@ -622,10 +634,12 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. live v1.1.1291 compatibility baseline with unchanged capacity and
-   `LEGACY_ACTIVE`;
-2. settlement of replica IDs 52032--52038 from exact evidence and independent
-   retirement of the two shutting-down Spot rows;
+1. the live v1.1.1291 compatibility baseline, with unchanged single-`all`
+   topology, Serve046/API010 schema heads, and `LEGACY_ACTIVE`;
+2. a fresh pre-migration inventory of retained legacy rows and unsettled
+   requests; reconcile only rows that actually remain. Record the historical
+   absence of IDs 52032--52038 without treating it as quiescence, recreating
+   rows, or backfilling associations;
 3. provider-phase latency and proof that one quarantined row does not block
    routes, demand, or sibling reconciliation;
 4. a fresh zero-traffic interval with target zero and no new paid request;
@@ -662,18 +676,16 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
 
 ## Open gates
 
-- [x] Supersede the planned v1.1.1284 compatibility step with the live
-  v1.1.1291 production cohort; verify PostgreSQL Serve revision 046 and retain
-  legacy demand/route/action modes without activating this stack.
-- [x] Publish the P1 draft as PR #1498.
-- [ ] Publish the blocked P3 removal after P2b supplies the final replacement
-  path and keep it stacked until the removal gates pass.
+- [x] Verify the equivalent later v1.1.1291 production compatibility baseline
+  without generalized-action, demand-authority, or placement promotion
+  (2026-08-16: single-`all` `Recreate`, Serve046/API010, `LEGACY_ACTIVE`).
+- [x] Merge P1 as PR #1498 and publish P2a as PR #1499, P2b as PRs #1503/#1504,
+  and the blocked P3 removals as draft PRs #1506/#1510.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
-- [ ] Reconcile the exact seven-row production scope without fabricated
-  quiescence or manual row deletion.
-- [x] Publish the P2a durable-demand/UI draft as PR #1499.
-- [x] Publish the P2b1 provider-free route draft as PR #1503.
-- [x] Publish the P2b2 ordered-admission draft as PR #1504.
+- [ ] Immediately before migration, inventory exact retained legacy rows and
+  unsettled requests, then reconcile only present rows without fabricated
+  quiescence or manual deletion. The historical seven-row scope is absent and
+  must not be reconstructed.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set

@@ -788,7 +788,7 @@ describe('getServiceDemand', () => {
     apiClient.get.mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => '80' },
+      headers: { get: () => '81' },
       json: async () => ({
         service_name: 'boltz/l4',
         service_hash: 'hash/a',
@@ -843,7 +843,7 @@ describe('getServiceDemand', () => {
     apiClient.get.mockResolvedValueOnce({
       ok: false,
       status: 404,
-      headers: { get: () => '80' },
+      headers: { get: () => '81' },
     });
     await expect(
       getServiceDemand({ serviceName: 'svc', serviceHash: 'hash-a' })
@@ -857,7 +857,7 @@ describe('getServiceDemand', () => {
     apiClient.get.mockResolvedValue({
       ok: true,
       status: 200,
-      headers: { get: () => '80' },
+      headers: { get: () => '81' },
       json: async () => null,
     });
 
