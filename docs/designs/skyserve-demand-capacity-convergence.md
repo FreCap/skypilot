@@ -3,6 +3,8 @@
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. The complete additive stack is deployed in production as v1.1.1302 but
 its per-service demand, route, and ordered-capacity authorities remain dark.
+PR #1521 adds partial-coverage in-flight observability and corrects the
+canonical direct-Helm deployment contract.
 P2b2 includes the adversarial-review correction that
 separates cheapest-compatible demand attribution from supply-aware exact-card
 capacity accounting. A production observation at Serve048 exposed that the
@@ -115,8 +117,8 @@ The implementation must reuse these checked-in mechanisms:
 - the generic non-pool binding and per-association reconciliation specified by
   `durable-serve-replica-actions.md`.
 
-Merged P2a PR #1499 contains, but is not present in the current production
-binary and has not been promoted:
+Merged P2a PR #1499 is present in the current production binary but has not
+been promoted:
 
 - a PostgreSQL-clock-fenced latest-report table and stable authenticated
   ingestion endpoint;
@@ -126,12 +128,12 @@ binary and has not been promoted:
   dashboard, plus a status overlay for CLI/legacy consumers. Both prefer fresh
   durable telemetry and report stale/unavailable explicitly.
 
-P2b1 now adds the complete provider-free route projection, and the P2b2
-working branch now adds the promoted autoscaler reader, zero-cost-first
-replanning boundary, immutable capacity plan/head, and planner-bound paid
-claim revalidated immediately before provider I/O. These changes remain dark
-and unpromoted. The final dashboard placement explanation and P3 removal of
-the legacy demand/route paths are not yet implemented.
+P2b1 adds the complete provider-free route projection, and P2b2 adds the
+promoted autoscaler reader, zero-cost-first replanning boundary, immutable
+capacity plan/head, and planner-bound paid claim revalidated immediately
+before provider I/O. Both are deployed but remain dark and unpromoted. The
+final dashboard placement explanation and P3 removal of the legacy
+demand/route paths are not yet implemented.
 
 The 2026-08-16 production read-only audit first found Helm revision 401 on
 v1.1.1296, commit `036c7a2627b34050e00b335b41c8cd7e329cdc2a`, API 81,
@@ -180,6 +182,15 @@ exact image digest with zero restarts, PostgreSQL reached API-request 012 and
 Serve050, and both health endpoints returned 200. All new authorities remain
 dark for `boltz-l4-fleet`, which is still in legacy ordinary binding, legacy
 route, and legacy controller-demand modes.
+
+A subsequent zero-traffic observation found 53/53 physical replicas ready:
+34 A100, 13 A100-80GB, and six paid Spot L4s. Durable request telemetry was
+fresh and complete with zero arrivals, zero queue depth, and zero in-flight
+work, while the legacy controller still reported a supply-insensitive L4
+target of three (`raw_target_num_replicas=2`). The 47 compatible ready
+zero-cost backends did not debit that L4 target. This is direct production
+evidence for the ordered-capacity promotion: additive deployment alone cannot
+correct overlaunch while `LEGACY_CONTROLLER` remains authoritative.
 
 The service remains `resource_action_mode=legacy`,
 `ordinary_launch_binding_mode=legacy`, and non-pool capability false. It has no
@@ -803,9 +814,9 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. the live deployment tuple at rollout time, including revision 404's
-   unpinned v1.1.1301 drift, unchanged single-`all` topology, and the forward
-   Serve049/API-request-011 database heads;
+1. the live deployment tuple at rollout time, including direct Helm revision
+   405's exact v1.1.1302 artifacts, unchanged single-`all` topology, and the
+   forward Serve050/API-request-012 database heads;
 2. the completed pre-migration inventory of retained legacy rows and unsettled
    requests; reconcile only rows that actually remain. Record the historical
    absence of IDs 52032--52038 without treating it as quiescence, recreating
@@ -864,8 +875,10 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
   deliberate exact provider teardown, and a subsequent fresh exact absence
   observation through the P1 legacy ledger. Preserve its unmodified cancelled
   request without fabricating quiescence.
-- [ ] Deploy the reviewed Serve049/050 registry lineage and verify ordinary
-  typed cleanup converges replicas 52688 and 52690 without manual deletion.
+- [x] Deploy the reviewed Serve049/050 registry lineage as direct Helm
+  revision 405.
+- [ ] Verify ordinary typed cleanup converges replicas 52688 and 52690 without
+  manual deletion.
 - [ ] Repair the PHX server-owned Kubernetes admission configuration so an
   H200 reserved-fill Pod carries the required Kueue queue label; prove the
   admitted Pod still has the approved low preemptible priority class.
