@@ -83,7 +83,16 @@ work remains useful transition machinery, but it is not the long-term boundary
 and must not be deployed as though excluded launch profiles can remain
 permanently unbound.
 
-As of 2026-08-16, the G1 implementation is authored but not deployed. It adds
+As of 2026-08-16, G1 is merged as PR #1498. It was present in the v1.1.1296
+revision-401 artifact, but a concurrent Terragrunt/Terraform apply created Helm
+revision 402 and regressed the runtime to v1.1.1287 while PostgreSQL correctly
+remained forward at
+API-request 011/Serve047. The current runtime is therefore not capable of the
+G1 legacy-reconciliation operation; no legacy evidence or service authority
+write may be attempted until one exact G1-capable cohort is restored. EKS
+audit records attribute revision 402 to Terraform's Helm provider; the
+checked-in platform runtime pin, not a direct Helm mutation, is the durable
+deployment authority. G1 adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
 pre-admission retirement, failure-isolated startup recovery, and exact
@@ -96,9 +105,27 @@ no paid-capacity claim exists. Local evidence currently includes the focused
 source contracts, all 53 real-PostgreSQL Serve047 migration/binding/reducer
 tests, real-PostgreSQL API011 atomic admission/quiescence and rollback/projection
 tests, `git diff --check`, Python compilation, repository-wide mypy over 937
-source files, changed-file pylint, and dashboard lint/format. CI, stacked
-cleanup publication, rollout, and live evidence for the seven incident rows
-remain open gates.
+source files, changed-file pylint, and dashboard lint/format. CI and merge are
+complete; additive rollout, exact retained-row reconciliation, and stacked
+cleanup gates remain open.
+
+The fresh pre-migration inventory supersedes the historical seven-row recovery
+scope. Replica IDs 52032--52038 are absent and must not be recreated or treated
+as quiescent. The current service has 64 nonterminal current-version rows: 46
+`READY`, 15 recent zero-cost `PENDING` intents, and three zero-cost
+`PROVISIONING` rows. Replica 52689 is the current global legacy-recovery
+blocker: its A100 provider cluster is present, its request is cancelled after
+lease expiry, and it lacks exact execution quiescence. The exact old API Pod
+UID is absent, which can support a reviewed executor-termination attestation
+but cannot be written as a synthetic request receipt. G1 must seal only this
+retained identity, record `LEGACY_EFFECT_AMBIGUOUS`, reconcile the exact
+provider effect, and project only after a new physical-UID-fenced `ABSENT`
+observation starts after the termination evidence. Replica 52688 has a present
+provider cluster and a succeeded/quiesced request. Replica 52690 has a failed,
+quiesced request and a PHX Kubernetes admission failure caused by a missing
+server-owned Kueue queue label. Those rows remain ordinary typed-recovery work;
+the label defect is owned by the workspace/provider admission configuration,
+not by this action protocol.
 
 ## Decision record
 
@@ -2345,15 +2372,20 @@ approved canary:
 
 ### Generalized non-pool binding gates (current)
 
-- [ ] Author and review G1 (API011/Serve047), demand convergence
-  (API012/Serve048), and the blocked stacked G2 cleanup (API013/Serve049)
+- [x] Author, review, and merge G1 (API011/Serve047); author demand convergence
+  (API012/Serve048) and the blocked stacked G2 cleanup (API013/Serve049)
   together; link the PRs and state G2's exact merge gate.
 - [ ] Restack any draft API011 combined-role cleanup to API013 and any draft
   Serve047 reserved-fill permanent cleanup to Serve049. Prove each schema
   lineage has one forward-only head and no historical migration changed.
-- [ ] Reconcile all seven incident rows from exact request, provider, and
-  cluster-incarnation evidence. Preserve real old-executor effects; record no
-  fabricated quiescence receipt or synthetic association.
+- [x] Inventory the historical seven incident rows and prove that IDs
+  52032--52038 are absent. Do not recreate them or misstate absence as
+  quiescence.
+- [ ] Reconcile the current retained rows from exact request, provider, and
+  cluster-incarnation evidence. In particular, reconcile replica 52689 through
+  the exact G1 legacy ledger after restoring a capable runtime. Preserve real
+  old-executor effects; record no fabricated quiescence receipt or synthetic
+  association.
 - [ ] Converge every API acceptor, request backend, queue executor, GC
   participant, possible controller, and profile participant on one immutable
   generic handler/profile/capability digest; drain old and recent leases through
