@@ -111,6 +111,11 @@ _POST_SERVE037_SERVICE_COLUMN_NAMES = frozenset({
     'non_pool_launch_capability_profile_set_digest',
     'non_pool_launch_capability_cohort_epoch',
     'non_pool_launch_receipt_protocol_version',
+    'route_source_mode',
+    'route_source_epoch',
+    'route_projection_capable',
+    'route_projection_controller_incarnation',
+    'route_projection_protocol_version',
 })
 _SERVE037_SERVICE_COLUMNS = tuple(
     column for column in services_table.c

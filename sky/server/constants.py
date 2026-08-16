@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 83  # Distinct GPU workload counts in operational priority data
+API_VERSION = 84  # Distinct GPU workload counts in operational priority data
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -147,6 +147,7 @@ MIN_ORDINARY_LAUNCH_BINDING_API_VERSION = 74
 ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
 MIN_NON_POOL_LAUNCH_BINDING_API_VERSION = 80
 MIN_SERVE_DURABLE_DEMAND_API_VERSION = 82
+MIN_SERVE_ROUTE_PROJECTION_API_VERSION = 83
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
 # Minimum API version whose Serve version-history response exposes immutable
@@ -162,7 +163,7 @@ MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION = 78
 # Kubernetes node info retains all active priority tiers and the priority tier
 # of each attributed preemptible SkyServe service.
 MIN_KUBERNETES_OPERATIONAL_PRIORITY_BREAKDOWN_API_VERSION = 81
-MIN_KUBERNETES_OPERATIONAL_WORKLOAD_BREAKDOWN_API_VERSION = 83
+MIN_KUBERNETES_OPERATIONAL_WORKLOAD_BREAKDOWN_API_VERSION = 84
 
 # This exact method/path pair is the only unauthenticated capacity surface.
 # Keep the predicate centralized so every authentication middleware applies

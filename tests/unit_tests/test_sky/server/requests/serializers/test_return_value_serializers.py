@@ -255,7 +255,7 @@ class TestSerializeKubernetesNodeInfo:
                 'preemptible_service_priority_breakdown']
 
         data = {'node_info_dict': {'node1': dict(node)}}
-        mock_get_version.return_value = 82
+        mock_get_version.return_value = 83
         parsed = json.loads(
             return_value_serializers.serialize_kubernetes_node_info(data))
         assert 'allocation_workload_breakdown' not in parsed['node_info_dict'][
@@ -264,7 +264,7 @@ class TestSerializeKubernetesNodeInfo:
             'node_info_dict']['node1']
 
         data = {'node_info_dict': {'node1': dict(node)}}
-        mock_get_version.return_value = 83
+        mock_get_version.return_value = 84
         parsed = json.loads(
             return_value_serializers.serialize_kubernetes_node_info(data))
         assert parsed['node_info_dict']['node1'][

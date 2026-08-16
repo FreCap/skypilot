@@ -41,8 +41,21 @@ _POST_REVISION_001_COLUMNS = {
         'non_pool_launch_capability_profile_set_digest',
         'non_pool_launch_capability_cohort_epoch',
         'non_pool_launch_receipt_protocol_version',
+        'route_source_mode',
+        'route_source_epoch',
+        'route_projection_capable',
+        'route_projection_controller_incarnation',
+        'route_projection_protocol_version',
     }),
     'replicas': frozenset({'ordinary_launch_association_id'}),
+}
+_POST_REVISION_001_CHECKS = {
+    'services': frozenset({
+        'serve049_route_source_mode_ck',
+        'serve049_route_source_epoch_ck',
+        'serve049_route_capability_shape_ck',
+        'serve049_route_projected_capability_ck',
+    }),
 }
 
 
@@ -68,6 +81,10 @@ def _initial_metadata(bind: sa.engine.Connection) -> sa.MetaData:
     # exact migration defaults/constraints and SQLite stays at Serve037.
     for table_name, column_names in _POST_REVISION_001_COLUMNS.items():
         table = metadata.tables[table_name]
+        future_checks = _POST_REVISION_001_CHECKS.get(table_name, frozenset())
+        for constraint in tuple(table.constraints):
+            if constraint.name in future_checks:
+                table.constraints.remove(constraint)
         for column_name in column_names:
             column = table.c.get(column_name)
             if column is not None:
