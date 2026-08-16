@@ -1235,7 +1235,13 @@ merge-eligible until G1Sb and G1Sc are authored and linked. Its focused Python
 runtime, executor, shutdown-deadline, and wire-contract suites pass; all 160
 focused API/controller/executor Helm tests pass; the generated values schema is
 exact; and repository-wide mypy, changed-file pylint, dashboard lint/format,
-Python compilation, and `git diff --check` pass. G1Sb and G1Sc remain planned.
+Python compilation, and `git diff --check` pass. G1Sa is draft PR #1519 with
+implementation commit `5781701e05492cb76211a2d962c3f4cbd3f031cf`. G1Sb is
+authored as draft PR #1522 with implementation commit
+`795c1e91ec49b74e169a1e13f06bc3b409a92b82`. G1Sc is authored simultaneously
+as draft PR #1523 with cleanup commit
+`2fe5b0e25dea9830c7ff92b75b8e1812589fa7ea`; its exact merge gate is recorded
+in that PR and below. G1Sc remains blocked until qualification.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
