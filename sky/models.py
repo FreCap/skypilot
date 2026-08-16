@@ -111,8 +111,9 @@ class KubernetesNodeInfo:
     # `kubernetes.pod_config.spec.tolerations`).
     taints: list[dict[str, Any]] | None = None
     # Accelerators on this node held by pods scheduled below the cluster's top
-    # priority tier, i.e. reclaimable by a higher-priority workload. `None`
-    # when pod allocation could not be read (no permission to list pods).
+    # observed raw priority. This does not assert that Pod PriorityClass and
+    # Kueue policy permit eviction. `None` when pod allocation could not be
+    # read (no permission to list pods).
     accelerators_preemptible: int | None = None
     # Breakdown of `accelerators_preemptible` by priority class, keyed by a
     # display label such as 'inference-low (-1000)'.
