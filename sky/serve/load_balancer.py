@@ -35,14 +35,21 @@ from sky.serve import system_recovery_route_lease
 from sky.serve.load_balancer_http import _DrainableServer
 from sky.serve.load_balancer_http import _InboundAuthMiddleware
 from sky.serve.load_balancer_http import _ReleasingStreamingResponse
-from sky.serve.load_balancer_retry import _can_retry_proxy_failure
-from sky.serve.load_balancer_retry import _is_dead_connection_error
-from sky.serve.load_balancer_retry import _is_definitely_not_dispatched
+from sky.serve.load_balancer_retry import _bind_facade_globals
+from sky.serve.load_balancer_retry import (
+    _IDEMPOTENT_METHODS as _RETRY_IDEMPOTENT_METHODS)
 from sky.serve.load_balancer_retry import _PreDispatchError
 from sky.serve.load_balancer_retry import _RetriableStatusError
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
+
+# Preserve the historical facade dependency-replacement surface without a
+# runtime forwarding wrapper. The extracted policy functions resolve their
+# globals from this module exactly as they did before extraction.
+_IDEMPOTENT_METHODS = _RETRY_IDEMPOTENT_METHODS
+(_is_dead_connection_error, _is_definitely_not_dispatched,
+ _can_retry_proxy_failure) = _bind_facade_globals(globals())
 
 # Preserve historical private import and pickle identities while the ASGI
 # implementations live behind this module's facade.
@@ -51,9 +58,6 @@ _InboundAuthMiddleware.__module__ = __name__
 _ReleasingStreamingResponse.__module__ = __name__
 _RetriableStatusError.__module__ = __name__
 _PreDispatchError.__module__ = __name__
-_is_dead_connection_error.__module__ = __name__
-_is_definitely_not_dispatched.__module__ = __name__
-_can_retry_proxy_failure.__module__ = __name__
 
 # Per-client in-flight request counter attribute. Attached to the
 # httpx.AsyncClient OBJECT (not keyed by URL): a URL pruned and re-added

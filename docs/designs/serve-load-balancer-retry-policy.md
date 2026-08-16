@@ -97,8 +97,13 @@ Import those exact objects into `sky.serve.load_balancer`, which remains the
 stable facade for all existing callers and tests. Restore the historical
 module names on the two exception classes and three functions so imports,
 pickling of callable objects, tracebacks, and inspection remain compatible.
-There are no forwarding wrappers and the implementation module does not import
-the load balancer, so the boundary cannot create a circular dependency.
+The extracted functions must also retain the facade as their global namespace:
+replacing the historical exception types, idempotent-method set, or nested
+classifier on `sky.serve.load_balancer` must continue to redirect every policy
+decision. Rebind the three function objects once at facade import time and
+publish those same objects from the implementation module. There are no
+forwarding wrappers and the implementation module does not import the load
+balancer, so the boundary cannot create a circular dependency.
 
 A plain module is the right abstraction. There is no second algorithm,
 constructed object, lifecycle, or external interface translation, so a
@@ -115,6 +120,9 @@ layer would add a false concept.
   timeout saturation.
 - Preserve exception inheritance, messages, `status_code`, signatures,
   historical import paths, module and qualified names, and callable identity.
+- Preserve the historical `_IDEMPOTENT_METHODS` facade member and dependency
+  replacement surface. The three classifiers resolve policy globals from
+  `sky.serve.load_balancer`, exactly as they did before extraction.
 - Preserve every call site, lock boundary, request attempt count, response
   status, queue notification, client operation, and network operation.
 - Keep all imports at module scope and introduce no new data, config, wire,
@@ -145,6 +153,8 @@ layer would add a false concept.
    historical facade.
 4. Prove normalized AST equivalence and run focused load-balancer suites.
 5. Measure balanced cold imports and representative classifier calls.
+6. Pin facade dependency replacement and rebind the three extracted function
+   objects once to the historical global namespace without a runtime wrapper.
 
 ## Test and CI plan
 
@@ -169,6 +179,10 @@ The extraction uses direct aliases. It adds no wrapper, object, branch, lock,
 copy, query, I/O, or network operation. Compare balanced cold imports and a
 representative mix of classifier calls before and after. A repeatable material
 regression blocks publication.
+
+The post-merge compatibility correction creates three function objects once at
+facade import. Calls still enter the original code objects directly and add no
+runtime frame, branch, allocation, lookup, lock, I/O, or network operation.
 
 This is an internal structural change with no migration or feature flag.
 Rollback is a normal revert. Merge only after exact-head CI and review are
@@ -212,3 +226,23 @@ the changed production paths. A live cloud smoke test is not warranted for an
 AST-identical stateless policy extraction with no process, wire, configuration,
 or network change; the focused local HTTP and async-router tests exercise every
 moved call-site family.
+
+## Post-merge audit correction
+
+The original contract proved aliases, metadata, pickle identity, import order,
+and ordinary decisions, but did not exercise the historical facade dependency
+replacement surface. Four deterministic probes passed against the actual
+first parent and failed against the merged extraction: replacing
+`_PreDispatchError`, `_RetriableStatusError`, `_IDEMPOTENT_METHODS`, or
+`_is_definitely_not_dispatched` on `sky.serve.load_balancer` no longer
+redirected the policy. The correction must make those probes green while
+retaining exact code objects, direct helper/facade identity, and the complete
+ordinary retry and eviction matrix.
+
+The corrected facade binds the three original code objects once to its module
+globals and publishes those exact objects back through the helper module. The
+four parent-green/source-red probes now pass, as do 485 mapped load-balancer
+tests and nine subtests. Seven alternating current-base and correction samples
+measured a 1.325219-second versus 1.328234-second cold-import median and a
+0.035113-second versus 0.035196-second median for 200,000 mixed classifier
+calls. Both deltas are 0.23 percent, with no added per-call operation.
