@@ -4511,8 +4511,17 @@ def get_kubernetes_node_info(
         # "nothing is preemptible" apart from "we could not look".
         accelerators_preemptible: int | None = None
         preemptible_breakdown: dict[str, int] | None = None
+        allocation_breakdown: dict[str, int] | None = None
         accelerators_preemptible_services: int | None = None
         preemptible_service_breakdown: dict[str, int] | None = None
+        preemptible_service_priority_breakdown: (dict[str, dict[str, int]] |
+                                                 None) = None
+        if not error_on_get_allocated_resources:
+            allocation_breakdown = {
+                tier.label: qty
+                for tier, qty in allocated_qty_by_node_by_priority.get(
+                    node.metadata.name, {}).items()
+            }
         if not error_on_get_allocated_resources and top_priority is not None:
             preemptible_breakdown = {
                 tier.label: qty
@@ -4523,14 +4532,23 @@ def get_kubernetes_node_info(
             accelerators_preemptible = sum(preemptible_breakdown.values())
             if allocated_qty_by_node_by_skyserve_service is not None:
                 preemptible_service_breakdown = collections.defaultdict(int)
+                service_priority_breakdown: dict[str, dict[str, int]] = (
+                    collections.defaultdict(
+                        lambda: collections.defaultdict(int)))
                 for allocation, quantity in (
                         allocated_qty_by_node_by_skyserve_service.get(
                             node.metadata.name, {}).items()):
                     if allocation.priority_tier.priority < top_priority:
                         preemptible_service_breakdown[
                             allocation.service_name] += quantity
+                        service_priority_breakdown[allocation.service_name][
+                            allocation.priority_tier.label] += quantity
                 preemptible_service_breakdown = dict(
                     preemptible_service_breakdown)
+                preemptible_service_priority_breakdown = {
+                    service: dict(priority_breakdown) for service,
+                    priority_breakdown in service_priority_breakdown.items()
+                }
                 accelerators_preemptible_services = sum(
                     preemptible_service_breakdown.values())
 
@@ -4556,9 +4574,12 @@ def get_kubernetes_node_info(
             taints=node_taints,
             accelerators_preemptible=accelerators_preemptible,
             preemptible_breakdown=preemptible_breakdown,
+            allocation_breakdown=allocation_breakdown,
             accelerators_preemptible_services=(
                 accelerators_preemptible_services),
             preemptible_service_breakdown=preemptible_service_breakdown,
+            preemptible_service_priority_breakdown=(
+                preemptible_service_priority_breakdown),
         )
     hint = ''
     if has_multi_host_tpu:

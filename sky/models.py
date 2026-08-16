@@ -117,6 +117,10 @@ class KubernetesNodeInfo:
     # Breakdown of `accelerators_preemptible` by priority class, keyed by a
     # display label such as 'inference-low (-1000)'.
     preemptible_breakdown: dict[str, int] | None = None
+    # All accelerator allocations on this node by priority class, including
+    # the highest active tier. This lets operational views say what is running,
+    # rather than describing only the lower tiers that can be reclaimed.
+    allocation_breakdown: dict[str, int] | None = None
     # Subset of `accelerators_preemptible` held by pods durably attributed to
     # SkyServe replicas. `None` when pod allocation or complete durable
     # workload attribution could not be read.
@@ -127,6 +131,12 @@ class KubernetesNodeInfo:
     # workload. This does not describe capacity reserved or reclaimable by a
     # service when another workload currently holds the accelerator.
     preemptible_service_breakdown: dict[str, int] | None = None
+    # Same SkyServe-attributed subset, retaining the priority class for each
+    # service. Shape: service name -> priority display label -> accelerator
+    # count. `None` has the same fail-closed attribution meaning as
+    # `preemptible_service_breakdown`.
+    preemptible_service_priority_breakdown: (dict[str, dict[str, int]] |
+                                             None) = None
 
 
 @dataclasses.dataclass

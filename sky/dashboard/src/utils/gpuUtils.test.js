@@ -1,6 +1,6 @@
 import {
-  emptyPreemptible,
-  mergePreemptible,
+  emptySchedulingBreakdown,
+  mergeSchedulingBreakdown,
   summarizeGpusByType,
 } from '@/utils/gpuUtils';
 
@@ -17,9 +17,16 @@ describe('summarizeGpusByType', () => {
         gpu_free: 0,
         gpu_not_ready: 0,
         gpu_preemptible: 70,
+        gpu_allocation_breakdown: {
+          'ma-lt (31)': 258,
+          'wa-eval (20)': 70,
+        },
         gpu_preemptible_breakdown: { 'inference-low (-1000)': 70 },
         gpu_preemptible_services: 60,
         gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 60 },
+        gpu_preemptible_service_priority_breakdown: {
+          'boltz-l4-fleet': { 'inference-low (-1000)': 60 },
+        },
         context: 'prod',
       },
       {
@@ -28,12 +35,20 @@ describe('summarizeGpusByType', () => {
         gpu_free: 4,
         gpu_not_ready: 0,
         gpu_preemptible: 2,
+        gpu_allocation_breakdown: {
+          'ma-lt (31)': 10,
+          'inference-low (-1000)': 1,
+          'drill (-500)': 1,
+        },
         gpu_preemptible_breakdown: {
           'inference-low (-1000)': 1,
           'drill (-500)': 1,
         },
         gpu_preemptible_services: 1,
         gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 1 },
+        gpu_preemptible_service_priority_breakdown: {
+          'boltz-l4-fleet': { 'inference-low (-1000)': 1 },
+        },
         context: 'staging',
       },
     ]);
@@ -44,6 +59,12 @@ describe('summarizeGpusByType', () => {
       gpu_total: 344,
       gpu_free: 4,
       gpu_not_ready: 0,
+      gpu_allocation_breakdown: {
+        'ma-lt (31)': 268,
+        'wa-eval (20)': 70,
+        'inference-low (-1000)': 1,
+        'drill (-500)': 1,
+      },
       gpu_preemptible: 72,
       gpu_preemptible_breakdown: {
         'inference-low (-1000)': 71,
@@ -51,6 +72,9 @@ describe('summarizeGpusByType', () => {
       },
       gpu_preemptible_services: 61,
       gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 61 },
+      gpu_preemptible_service_priority_breakdown: {
+        'boltz-l4-fleet': { 'inference-low (-1000)': 61 },
+      },
     });
   });
 
@@ -88,6 +112,8 @@ describe('summarizeGpusByType', () => {
     expect(summary[0].gpu_preemptible_breakdown).toEqual({});
     expect(summary[0].gpu_preemptible_services).toBe(0);
     expect(summary[0].gpu_preemptible_service_breakdown).toEqual({});
+    expect(summary[0].gpu_allocation_breakdown).toEqual({});
+    expect(summary[0].gpu_preemptible_service_priority_breakdown).toEqual({});
   });
 
   it('returns nothing for empty or missing input', () => {
@@ -96,54 +122,65 @@ describe('summarizeGpusByType', () => {
   });
 });
 
-describe('mergePreemptible', () => {
+describe('mergeSchedulingBreakdown', () => {
   it('sums counts and unions the per-class breakdown', () => {
-    const target = emptyPreemptible();
-    mergePreemptible(target, {
+    const target = emptySchedulingBreakdown();
+    mergeSchedulingBreakdown(target, {
+      gpu_allocation_breakdown: { top: 3, a: 4, b: 1 },
       gpu_preemptible: 5,
       gpu_preemptible_breakdown: { a: 4, b: 1 },
       gpu_preemptible_services: 4,
       gpu_preemptible_service_breakdown: { fleet: 4 },
+      gpu_preemptible_service_priority_breakdown: { fleet: { a: 4 } },
     });
-    mergePreemptible(target, {
+    mergeSchedulingBreakdown(target, {
+      gpu_allocation_breakdown: { top: 2, b: 2 },
       gpu_preemptible: 2,
       gpu_preemptible_breakdown: { b: 2 },
       gpu_preemptible_services: 1,
       gpu_preemptible_service_breakdown: { fleet: 1 },
+      gpu_preemptible_service_priority_breakdown: { fleet: { b: 1 } },
     });
 
     expect(target).toEqual({
+      gpu_allocation_breakdown: { top: 5, a: 4, b: 3 },
       gpu_preemptible: 7,
       gpu_preemptible_breakdown: { a: 4, b: 3 },
       gpu_preemptible_services: 5,
       gpu_preemptible_service_breakdown: { fleet: 5 },
+      gpu_preemptible_service_priority_breakdown: {
+        fleet: { a: 4, b: 1 },
+      },
     });
   });
 
   it('tolerates sources with no preemptible fields', () => {
-    const target = emptyPreemptible();
-    mergePreemptible(target, { gpu_total: 8 });
-    mergePreemptible(target, undefined);
+    const target = emptySchedulingBreakdown();
+    mergeSchedulingBreakdown(target, { gpu_total: 8 });
+    mergeSchedulingBreakdown(target, undefined);
 
-    expect(target).toEqual(emptyPreemptible());
+    expect(target).toEqual(emptySchedulingBreakdown());
   });
 
   it('propagates unknown SkyServe attribution instead of summing it as zero', () => {
-    const target = emptyPreemptible();
-    mergePreemptible(target, {
+    const target = emptySchedulingBreakdown();
+    mergeSchedulingBreakdown(target, {
       gpu_preemptible: 432,
       gpu_preemptible_breakdown: { 'ma-lt (31)': 176, 'priority 0': 256 },
       gpu_preemptible_services: null,
       gpu_preemptible_service_breakdown: null,
+      gpu_preemptible_service_priority_breakdown: null,
     });
-    mergePreemptible(target, {
+    mergeSchedulingBreakdown(target, {
       gpu_preemptible: 4,
       gpu_preemptible_services: 4,
       gpu_preemptible_service_breakdown: { fleet: 4 },
+      gpu_preemptible_service_priority_breakdown: { fleet: { be: 4 } },
     });
 
     expect(target.gpu_preemptible).toBe(436);
     expect(target.gpu_preemptible_services).toBeNull();
     expect(target.gpu_preemptible_service_breakdown).toBeNull();
+    expect(target.gpu_preemptible_service_priority_breakdown).toBeNull();
   });
 });

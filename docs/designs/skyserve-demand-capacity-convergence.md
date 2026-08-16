@@ -440,7 +440,7 @@ tests. It does not include a deployment control plane.
 
 ### P2a: durable demand telemetry and UI
 
-API version 81/Serve048 add the demand-report/live-gauge tables, stable API
+API version 82/Serve048 add the demand-report/live-gauge tables, stable API
 ingestion, non-destructive reporter window, request-history acknowledgement,
 direct current-demand read, status projection, and dashboard freshness
 contract. During transition the LB sends both old controller sync data and the
@@ -462,7 +462,7 @@ into a false zero. CI and live rollout evidence remain open.
 
 ### P2b1: provider-free route projection
 
-API version 82/Serve049 add bounded immutable full route generations, one
+API version 83/Serve049 add bounded immutable full route generations, one
 freshness-bearing head, and an explicit per-service route mode/epoch. The
 replica readiness owner publishes the complete route/routing-spec response
 from the bounded probe round's already-resolved endpoints and exact replica
@@ -497,7 +497,7 @@ publication evidence remain open.
 
 ### P2b2: one demand authority and ordered capacity admission
 
-API version 83/API012/Serve050 add API-fleet capability identity, explicit
+API version 84/API012/Serve050 add API-fleet capability identity, explicit
 per-service demand promotion, the autoscaler durable reader,
 content-addressed planner-generation fields, the source demand receipt
 watermark, and the paid-authority tuple.

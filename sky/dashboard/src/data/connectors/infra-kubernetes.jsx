@@ -1,6 +1,9 @@
 import { apiClient } from '@/data/connectors/client';
 import { getErrorMessageFromResponse } from '@/data/utils';
-import { emptyPreemptible, mergePreemptible } from '@/utils/gpuUtils';
+import {
+  emptySchedulingBreakdown,
+  mergeSchedulingBreakdown,
+} from '@/utils/gpuUtils';
 
 /**
  * Returns true iff `nodeData` (a `KubernetesNodeInfo`-shaped object from
@@ -20,34 +23,24 @@ function isNodeNotReadyForGpus(nodeData) {
 }
 
 /**
- * Fold a node's preemptible accelerator counts into a per-GPU-type aggregate.
+ * Fold a node's active scheduling breakdown into a per-GPU-type aggregate.
  *
  * Not-ready nodes are skipped: their whole capacity is already reported as
  * `gpu_not_ready`, so it is not part of the used block that the preemptible
  * segment subdivides, and counting it here would overdraw the bar.
  */
-function addPreemptibleFromNode(aggregate, nodeData, isNodeNotReady) {
+function addSchedulingFromNode(aggregate, nodeData, isNodeNotReady) {
   if (isNodeNotReady) return;
-  aggregate.gpu_preemptible += nodeData['accelerators_preemptible'] || 0;
-  if (nodeData['accelerators_preemptible_services'] === null) {
-    aggregate.gpu_preemptible_services = null;
-    aggregate.gpu_preemptible_service_breakdown = null;
-  } else if (aggregate.gpu_preemptible_services !== null) {
-    aggregate.gpu_preemptible_services +=
-      nodeData['accelerators_preemptible_services'] || 0;
-  }
-  const breakdown = nodeData['preemptible_breakdown'];
-  for (const [label, qty] of Object.entries(breakdown || {})) {
-    aggregate.gpu_preemptible_breakdown[label] =
-      (aggregate.gpu_preemptible_breakdown[label] || 0) + qty;
-  }
-  const serviceBreakdown = nodeData['preemptible_service_breakdown'];
-  if (aggregate.gpu_preemptible_service_breakdown !== null) {
-    for (const [service, qty] of Object.entries(serviceBreakdown || {})) {
-      aggregate.gpu_preemptible_service_breakdown[service] =
-        (aggregate.gpu_preemptible_service_breakdown[service] || 0) + qty;
-    }
-  }
+  mergeSchedulingBreakdown(aggregate, {
+    gpu_allocation_breakdown: nodeData['allocation_breakdown'] || {},
+    gpu_preemptible: nodeData['accelerators_preemptible'] || 0,
+    gpu_preemptible_breakdown: nodeData['preemptible_breakdown'] || {},
+    gpu_preemptible_services: nodeData['accelerators_preemptible_services'],
+    gpu_preemptible_service_breakdown:
+      nodeData['preemptible_service_breakdown'],
+    gpu_preemptible_service_priority_breakdown:
+      nodeData['preemptible_service_priority_breakdown'],
+  });
 }
 
 // Fetch GPU data for a single context - used for progressive loading
@@ -87,10 +80,13 @@ export async function getContextGPUData(context) {
           memory_free_gb: nodeData['memory_free_gb'] ?? null,
           gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
           gpu_preemptible_breakdown: nodeData['preemptible_breakdown'] ?? null,
+          gpu_allocation_breakdown: nodeData['allocation_breakdown'] ?? null,
           gpu_preemptible_services:
             nodeData['accelerators_preemptible_services'] ?? null,
           gpu_preemptible_service_breakdown:
             nodeData['preemptible_service_breakdown'] ?? null,
+          gpu_preemptible_service_priority_breakdown:
+            nodeData['preemptible_service_priority_breakdown'] ?? null,
         });
 
         // Aggregate GPU data per context
@@ -103,7 +99,7 @@ export async function getContextGPUData(context) {
               gpu_free: 0,
               gpu_not_ready: 0,
               context: context,
-              ...emptyPreemptible(),
+              ...emptySchedulingBreakdown(),
             };
           }
           gpuToData[gpuName].gpu_total += totalCount;
@@ -111,7 +107,7 @@ export async function getContextGPUData(context) {
           if (isNodeNotReady) {
             gpuToData[gpuName].gpu_not_ready += totalCount;
           }
-          addPreemptibleFromNode(gpuToData[gpuName], nodeData, isNodeNotReady);
+          addSchedulingFromNode(gpuToData[gpuName], nodeData, isNodeNotReady);
           gpuToData[gpuName].gpu_requestable_qty_per_node = totalCount;
         }
       }
@@ -217,7 +213,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
                 gpu_free: 0,
                 gpu_not_ready: 0,
                 context: context,
-                ...emptyPreemptible(),
+                ...emptySchedulingBreakdown(),
               };
             }
             gpuToData[gpuName].gpu_total += totalCount;
@@ -225,11 +221,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             if (isNodeNotReady) {
               gpuToData[gpuName].gpu_not_ready += totalCount;
             }
-            addPreemptibleFromNode(
-              gpuToData[gpuName],
-              nodeData,
-              isNodeNotReady
-            );
+            addSchedulingFromNode(gpuToData[gpuName], nodeData, isNodeNotReady);
             gpuToData[gpuName].gpu_requestable_qty_per_node = totalCount;
           }
         }
@@ -240,25 +232,19 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             allGPUsSummary[gpuName].gpu_free += gpuToData[gpuName].gpu_free;
             allGPUsSummary[gpuName].gpu_not_ready +=
               gpuToData[gpuName].gpu_not_ready;
-            mergePreemptible(allGPUsSummary[gpuName], gpuToData[gpuName]);
+            mergeSchedulingBreakdown(
+              allGPUsSummary[gpuName],
+              gpuToData[gpuName]
+            );
           } else {
+            const schedulingBreakdown = emptySchedulingBreakdown();
+            mergeSchedulingBreakdown(schedulingBreakdown, gpuToData[gpuName]);
             allGPUsSummary[gpuName] = {
               gpu_total: gpuToData[gpuName].gpu_total,
               gpu_free: gpuToData[gpuName].gpu_free,
               gpu_not_ready: gpuToData[gpuName].gpu_not_ready,
               gpu_name: gpuName,
-              gpu_preemptible: gpuToData[gpuName].gpu_preemptible,
-              gpu_preemptible_breakdown: {
-                ...gpuToData[gpuName].gpu_preemptible_breakdown,
-              },
-              gpu_preemptible_services:
-                gpuToData[gpuName].gpu_preemptible_services,
-              gpu_preemptible_service_breakdown:
-                gpuToData[gpuName].gpu_preemptible_service_breakdown === null
-                  ? null
-                  : {
-                      ...gpuToData[gpuName].gpu_preemptible_service_breakdown,
-                    },
+              ...schedulingBreakdown,
             };
           }
         }
@@ -317,10 +303,13 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
             gpu_preemptible: nodeData['accelerators_preemptible'] ?? null,
             gpu_preemptible_breakdown:
               nodeData['preemptible_breakdown'] ?? null,
+            gpu_allocation_breakdown: nodeData['allocation_breakdown'] ?? null,
             gpu_preemptible_services:
               nodeData['accelerators_preemptible_services'] ?? null,
             gpu_preemptible_service_breakdown:
               nodeData['preemptible_service_breakdown'] ?? null,
+            gpu_preemptible_service_priority_breakdown:
+              nodeData['preemptible_service_priority_breakdown'] ?? null,
           };
 
           // If this node provides a GPU type not found via GPU availability,
@@ -338,7 +327,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
                 gpu_free: 0,
                 gpu_not_ready: 0,
                 gpu_name: acceleratorType,
-                ...emptyPreemptible(),
+                ...emptySchedulingBreakdown(),
               };
             }
             const existingGpuEntry = perContextGPUsData[context].find(
@@ -352,7 +341,7 @@ export async function getKubernetesGPUsFromContexts(contextNames) {
                 gpu_total: 0,
                 gpu_free: 0,
                 context: context,
-                ...emptyPreemptible(),
+                ...emptySchedulingBreakdown(),
               });
             }
           }
