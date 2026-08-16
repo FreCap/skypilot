@@ -226,6 +226,15 @@ class TestSerializeKubernetesNodeInfo:
                     'wa-eval (20)': 4
                 }
             },
+            'allocation_workload_breakdown': {
+                'ma-lt (31)': ['job-a'],
+                'wa-eval (20)': ['job-b', 'job-c'],
+            },
+            'preemptible_service_priority_workload_breakdown': {
+                'boltz-l4-fleet': {
+                    'wa-eval (20)': ['job-b']
+                }
+            },
         }
         data = {'node_info_dict': {'node1': dict(node)}}
         mock_get_version.return_value = 80
@@ -244,6 +253,26 @@ class TestSerializeKubernetesNodeInfo:
         assert parsed['node_info_dict']['node1'][
             'preemptible_service_priority_breakdown'] == node[
                 'preemptible_service_priority_breakdown']
+
+        data = {'node_info_dict': {'node1': dict(node)}}
+        mock_get_version.return_value = 83
+        parsed = json.loads(
+            return_value_serializers.serialize_kubernetes_node_info(data))
+        assert 'allocation_workload_breakdown' not in parsed['node_info_dict'][
+            'node1']
+        assert 'preemptible_service_priority_workload_breakdown' not in parsed[
+            'node_info_dict']['node1']
+
+        data = {'node_info_dict': {'node1': dict(node)}}
+        mock_get_version.return_value = 84
+        parsed = json.loads(
+            return_value_serializers.serialize_kubernetes_node_info(data))
+        assert parsed['node_info_dict']['node1'][
+            'allocation_workload_breakdown'] == node[
+                'allocation_workload_breakdown']
+        assert parsed['node_info_dict']['node1'][
+            'preemptible_service_priority_workload_breakdown'] == node[
+                'preemptible_service_priority_workload_breakdown']
 
     @mock.patch(
         'sky.server.requests.serializers.return_value_serializers.versions.get_remote_api_version'

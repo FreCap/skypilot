@@ -333,9 +333,15 @@ describe('ContextDetails', () => {
               'wa-eval (20)': 4,
               'be-prod (10)': 2,
             },
+            gpu_allocation_workload_breakdown: {
+              'ma-lt (31)': ['train-a'],
+              'wa-eval (20)': ['eval-a', 'eval-b'],
+              'be-prod (10)': ['research-a'],
+            },
             gpu_preemptible_services: 0,
             gpu_preemptible_service_breakdown: {},
             gpu_preemptible_service_priority_breakdown: {},
+            gpu_preemptible_service_priority_workload_breakdown: {},
           },
         ]}
         nodesInContext={[node]}
@@ -349,30 +355,28 @@ describe('ContextDetails', () => {
       )
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/^FREE NOW\s+2 GPUs/)).toBeInTheDocument();
-    expect(screen.getByText('2 MA · 8 running')).toBeVisible();
-    expect(screen.getByText('mixed tiers · 6 other')).toBeVisible();
+    expect(screen.getByText('MA · 1 job · 8 running')).toBeVisible();
+    expect(screen.getByText('mixed tiers · 3 jobs · 6 other')).toBeVisible();
     const reclaimable = screen.getByLabelText(
       /^LOWER PRIORITY NOW\s+6 GPUs · non-SkyServe workloads · may yield to higher-priority work/
     );
-    // Active classes are listed in preemption order with a compact rank and
-    // concrete operational effect.
+    // Active classes are listed in preemption order with distinct logical job
+    // counts and a concrete operational effect.
     expect(reclaimable).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        '3 WA · 4 GPUs\n' +
+        '2 jobs · WA · 4 GPUs\n' +
           '  Weakly available · wa-eval · raw priority 20\n' +
-          '  protected over: 4 BE; yields to: 1 HA, 2 MA\n' +
-          '4 BE · 2 GPUs'
+          '  protected over: BE; yields to: HA, MA\n' +
+          '1 job · BE · 2 GPUs'
       )
     );
     expect(reclaimable).toHaveAttribute(
       'aria-label',
-      expect.stringContaining('1 HA → 2 MA → 3 WA → 4 BE')
+      expect.stringContaining('HA → MA → WA → BE')
     );
     expect(
-      screen.getByLabelText(
-        /Protection order from high to low: 1 HA, 2 MA, 3 WA, 4 BE/
-      )
+      screen.getByLabelText(/Protection order from high to low: HA, MA, WA, BE/)
     ).toBeVisible();
   });
 
@@ -395,6 +399,18 @@ describe('ContextDetails', () => {
               'ma-lt (31)': 8,
               'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster': 6,
             },
+            gpu_allocation_workload_breakdown: {
+              'ma-lt (31)': ['training-a'],
+              'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster':
+                [
+                  'replica-1',
+                  'replica-2',
+                  'replica-3',
+                  'replica-4',
+                  'research-1',
+                  'research-2',
+                ],
+            },
             gpu_preemptible_services: 4,
             gpu_preemptible_service_breakdown: {
               'boltz-l4-fleet': 4,
@@ -402,6 +418,12 @@ describe('ContextDetails', () => {
             gpu_preemptible_service_priority_breakdown: {
               'boltz-l4-fleet': {
                 'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster': 4,
+              },
+            },
+            gpu_preemptible_service_priority_workload_breakdown: {
+              'boltz-l4-fleet': {
+                'rescluster-k8s-prod-east1-preemptible-inference-low (-1000) · SkyPilot cluster':
+                  ['replica-1', 'replica-2', 'replica-3', 'replica-4'],
               },
             },
           },
@@ -416,7 +438,7 @@ describe('ContextDetails', () => {
       )
     ).toBeInTheDocument();
     expect(screen.getByLabelText(/^FREE NOW\s+2 GPUs/)).toBeInTheDocument();
-    expect(screen.getByText('4 BE · 4 SkyServe')).toBeVisible();
+    expect(screen.getByText('BE · 4 jobs · 4 SkyServe')).toBeVisible();
     expect(
       screen.getByLabelText(
         /^LOWER PRIORITY NOW\s+4 GPUs · SkyServe · may yield to higher-priority work/
@@ -424,7 +446,8 @@ describe('ContextDetails', () => {
     ).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        'boltz-l4-fleet · 4 GPUs\n  4 BE · 4 GPUs · SkyPilot cluster'
+        'boltz-l4-fleet · 4 jobs · 4 GPUs\n' +
+          '  4 jobs · BE · 4 GPUs · SkyPilot cluster'
       )
     );
     expect(
@@ -433,7 +456,7 @@ describe('ContextDetails', () => {
       )
     ).toHaveAttribute(
       'aria-label',
-      expect.stringContaining('4 BE · 2 GPUs · SkyPilot cluster')
+      expect.stringContaining('2 jobs · BE · 2 GPUs · SkyPilot cluster')
     );
   });
 
@@ -461,6 +484,8 @@ describe('ContextDetails', () => {
             gpu_preemptible_services: null,
             gpu_preemptible_service_breakdown: null,
             gpu_preemptible_service_priority_breakdown: null,
+            gpu_allocation_workload_breakdown: null,
+            gpu_preemptible_service_priority_workload_breakdown: null,
           },
         ]}
         nodesInContext={[node]}
@@ -474,10 +499,10 @@ describe('ContextDetails', () => {
     ).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        '2 MA · 176 GPUs\n' +
+        'job count unavailable · MA · 176 GPUs\n' +
           '  Mostly available · latency tolerant · ma-lt · raw priority 31\n' +
-          '  protected over: 3 WA, 4 BE; yields to: 1 HA\n' +
-          'UNTAGGED · 256 GPUs · PyTorch training'
+          '  protected over: WA, BE; yields to: HA\n' +
+          'job count unavailable · UNTAGGED · 256 GPUs · PyTorch training'
       )
     );
     expect(screen.queryByLabelText(/0 SkyServe/)).not.toBeInTheDocument();
@@ -498,9 +523,14 @@ describe('ContextDetails', () => {
         'ma-lt (31)': 3,
         'wa-eval (20)': 2,
       },
+      gpu_allocation_workload_breakdown: {
+        'ma-lt (31)': ['training-a'],
+        'wa-eval (20)': ['eval-a'],
+      },
       gpu_preemptible_services: 0,
       gpu_preemptible_service_breakdown: {},
       gpu_preemptible_service_priority_breakdown: {},
+      gpu_preemptible_service_priority_workload_breakdown: {},
     };
 
     render(
@@ -525,7 +555,8 @@ describe('ContextDetails', () => {
     expect(reclaimable).toHaveAttribute(
       'aria-label',
       expect.stringContaining(
-        '3 WA · 2 GPUs\n  Weakly available · wa-eval · raw priority 20'
+        '1 job · WA · 2 GPUs\n' +
+          '  Weakly available · wa-eval · raw priority 20'
       )
     );
     expect(reclaimable).toHaveAttribute('tabindex', '0');

@@ -122,6 +122,11 @@ class KubernetesNodeInfo:
     # the highest active tier. This lets operational views say what is running,
     # rather than describing only the lower tiers that can be reclaimed.
     allocation_breakdown: dict[str, int] | None = None
+    # Distinct accelerator workload identities present on this node, grouped
+    # by the same priority/workload labels as `allocation_breakdown`. A
+    # distributed job may appear on several nodes; callers must union these
+    # opaque identities rather than summing their per-node lengths.
+    allocation_workload_breakdown: dict[str, list[str]] | None = None
     # Subset of `accelerators_preemptible` held by pods attributed to active
     # external-LB SkyServe services. `None` when pod allocation or the complete
     # service inventory could not be read.
@@ -138,6 +143,12 @@ class KubernetesNodeInfo:
     # `preemptible_service_breakdown`.
     preemptible_service_priority_breakdown: (dict[str, dict[str, int]] |
                                              None) = None
+    # Distinct SkyServe replica workload identities, retaining both service
+    # and priority label. Shape: service name -> priority display label ->
+    # opaque workload identities. `None` has the same fail-closed attribution
+    # meaning as `preemptible_service_priority_breakdown`.
+    preemptible_service_priority_workload_breakdown: (
+        dict[str, dict[str, list[str]]] | None) = None
 
 
 @dataclasses.dataclass

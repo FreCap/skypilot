@@ -131,12 +131,47 @@ export function hasAccelerator(accelerators) {
 export function emptySchedulingBreakdown() {
   return {
     gpu_allocation_breakdown: {},
+    gpu_allocation_workload_breakdown: {},
     gpu_preemptible: 0,
     gpu_preemptible_breakdown: {},
     gpu_preemptible_services: 0,
     gpu_preemptible_service_breakdown: {},
     gpu_preemptible_service_priority_breakdown: {},
+    gpu_preemptible_service_priority_workload_breakdown: {},
   };
+}
+
+function mergeWorkloadBreakdown(target, source, field) {
+  if (source?.[field] === null) {
+    target[field] = null;
+    return;
+  }
+  if (source?.[field] === undefined || target[field] === null) return;
+  for (const [label, workloadIds] of Object.entries(source[field] || {})) {
+    target[field][label] = [
+      ...new Set([...(target[field][label] || []), ...(workloadIds || [])]),
+    ].sort();
+  }
+}
+
+function mergeServicePriorityWorkloads(target, source) {
+  const field = 'gpu_preemptible_service_priority_workload_breakdown';
+  if (source?.[field] === null) {
+    target[field] = null;
+    return;
+  }
+  if (source?.[field] === undefined || target[field] === null) return;
+  for (const [service, breakdown] of Object.entries(source[field] || {})) {
+    if (!target[field][service]) target[field][service] = {};
+    for (const [label, workloadIds] of Object.entries(breakdown || {})) {
+      target[field][service][label] = [
+        ...new Set([
+          ...(target[field][service][label] || []),
+          ...(workloadIds || []),
+        ]),
+      ].sort();
+    }
+  }
 }
 
 /**
@@ -149,6 +184,7 @@ export function mergeSchedulingBreakdown(target, source) {
     target.gpu_allocation_breakdown[label] =
       (target.gpu_allocation_breakdown[label] || 0) + qty;
   }
+  mergeWorkloadBreakdown(target, source, 'gpu_allocation_workload_breakdown');
   target.gpu_preemptible += source?.gpu_preemptible || 0;
   if (source?.gpu_preemptible_services === null) {
     target.gpu_preemptible_services = null;
@@ -186,6 +222,7 @@ export function mergeSchedulingBreakdown(target, source) {
       }
     }
   }
+  mergeServicePriorityWorkloads(target, source);
 }
 
 /**

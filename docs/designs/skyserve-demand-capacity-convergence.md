@@ -606,7 +606,7 @@ publication evidence remain open.
 
 ### P2b2: one demand authority and ordered capacity admission
 
-API version 84/API012/Serve050 add API-fleet capability identity, explicit
+API version 85/API012/Serve050 add API-fleet capability identity, explicit
 per-service demand promotion, the autoscaler durable reader,
 content-addressed planner-generation fields, the source demand receipt
 watermark, and the paid-authority tuple.

@@ -84,7 +84,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_gpu_node_1, mock_gpu_node_2]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({mock_gpu_node_1.metadata.name: 2, mock_gpu_node_2.metadata.name: 4}, {}, {}, None)), \
+                   return_value=({mock_gpu_node_1.metadata.name: 2, mock_gpu_node_2.metadata.name: 4}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                     return_value='nvidia.com/gpu'):
         node_info = utils.get_kubernetes_node_info()
@@ -137,7 +137,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_gpu_node_1, mock_tpu_node_1]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=(collections.defaultdict(int, {mock_gpu_node_1.metadata.name: 2}), {}, {}, None)):
+                   return_value=(collections.defaultdict(int, {mock_gpu_node_1.metadata.name: 2}), {}, {}, None, {})):
         node_info = utils.get_kubernetes_node_info()
         assert isinstance(node_info, models.KubernetesNodesInfo)
         # Multi-host TPU node should be excluded
@@ -150,7 +150,7 @@ def test_get_kubernetes_node_info():
                    return_value=[]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({}, {}, {}, None)):
+                   return_value=({}, {}, {}, None, {})):
         node_info = utils.get_kubernetes_node_info()
         assert isinstance(node_info, models.KubernetesNodesInfo)
         assert len(node_info.node_info_dict) == 0
@@ -183,7 +183,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_cpu_node_1, mock_cpu_node_2]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({}, {}, {}, None)) as mock_get_allocated_resources:
+                   return_value=({}, {}, {}, None, {})) as mock_get_allocated_resources:
         node_info = utils.get_kubernetes_node_info()
 
         mock_get_allocated_resources.assert_called_once()
@@ -204,7 +204,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_cpu_node_1, mock_gpu_node_1]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({mock_gpu_node_1.metadata.name: 2}, {}, {}, None)) as mock_get_allocated_resources, \
+                   return_value=({mock_gpu_node_1.metadata.name: 2}, {}, {}, None, {})) as mock_get_allocated_resources, \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                    return_value='nvidia.com/gpu'):
         node_info = utils.get_kubernetes_node_info()
@@ -248,7 +248,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_cordoned_node]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({mock_cordoned_node.metadata.name: 2}, {}, {}, None)), \
+                   return_value=({mock_cordoned_node.metadata.name: 2}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                    return_value='nvidia.com/gpu'):
         node_info = utils.get_kubernetes_node_info()
@@ -290,7 +290,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_tainted_node]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({mock_tainted_node.metadata.name: 1}, {}, {}, None)), \
+                   return_value=({mock_tainted_node.metadata.name: 1}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                    return_value='nvidia.com/gpu'):
         node_info = utils.get_kubernetes_node_info()
@@ -340,7 +340,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_cordoned_and_tainted]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({mock_cordoned_and_tainted.metadata.name: 0}, {}, {}, None)), \
+                   return_value=({mock_cordoned_and_tainted.metadata.name: 0}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                    return_value='nvidia.com/gpu'):
         node_info = utils.get_kubernetes_node_info()
@@ -381,7 +381,7 @@ def test_get_kubernetes_node_info():
                    return_value=[mock_cpu_cordoned]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({}, {}, {}, None)):
+                   return_value=({}, {}, {}, None, {})):
         node_info = utils.get_kubernetes_node_info()
         assert isinstance(node_info, models.KubernetesNodesInfo)
         assert len(node_info.node_info_dict) == 1
@@ -522,7 +522,8 @@ def test_get_kubernetes_node_info_preemptible_split():
     top = utils.PriorityTier(0, None)
     low = utils.PriorityTier(-1000, 'inference-low')
     drill = utils.PriorityTier(-500, 'drill')
-    service_allocation = utils.SkyServeAllocation(low, 'boltz-l4-fleet')
+    service_allocation = utils.SkyServeAllocation(low, 'boltz-l4-fleet',
+                                                  'service-workload')
 
     # node-1: 1 GPU at the top tier, 7 below it. node-2: fully top tier.
     by_priority = {
@@ -547,6 +548,15 @@ def test_get_kubernetes_node_info_preemptible_split():
                         'node-1': {
                             service_allocation: 4
                         }
+                    }, {
+                        'node-1': {
+                            top: {'top-workload'},
+                            low: {'service-workload', 'other-low-workload'},
+                            drill: {'drill-workload'},
+                        },
+                        'node-2': {
+                            top: {'top-workload'}
+                        },
                     })), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                     return_value='nvidia.com/gpu'):
@@ -562,6 +572,11 @@ def test_get_kubernetes_node_info_preemptible_split():
         'inference-low (-1000)': 6,
         'drill (-500)': 1,
     }
+    assert node_info.node_info_dict['node-1'].allocation_workload_breakdown == {
+        'priority 0': ['top-workload'],
+        'inference-low (-1000)': ['other-low-workload', 'service-workload'],
+        'drill (-500)': ['drill-workload'],
+    }
     assert node_info.node_info_dict[
         'node-1'].accelerators_preemptible_services == 4
     assert node_info.node_info_dict['node-1'].preemptible_service_breakdown == {
@@ -571,6 +586,12 @@ def test_get_kubernetes_node_info_preemptible_split():
         'node-1'].preemptible_service_priority_breakdown == {
             'boltz-l4-fleet': {
                 'inference-low (-1000)': 4
+            }
+        }
+    assert node_info.node_info_dict[
+        'node-1'].preemptible_service_priority_workload_breakdown == {
+            'boltz-l4-fleet': {
+                'inference-low (-1000)': ['service-workload']
             }
         }
     # Everything on node-2 sits in the top tier, so none of it is reclaimable.
@@ -670,7 +691,7 @@ def test_get_allocated_resources_attributes_skyserve_from_external_inventory():
          mock.patch('sky.provision.kubernetes.utils.'
                     '_get_external_skyserve_service_names',
                     return_value={'boltz-l4-fleet'}) as service_lookup:
-        allocated, _, by_priority, by_service = (
+        allocated, _, by_priority, by_service, by_workload = (
             utils.get_allocated_resources_by_node(context='prod'))
 
     tier = utils.PriorityTier(-1000, 'inference-low', 'SkyPilot cluster')
@@ -683,11 +704,56 @@ def test_get_allocated_resources_attributes_skyserve_from_external_inventory():
     }
     assert by_service == {
         'node-1': {
-            utils.SkyServeAllocation(tier, 'boltz-l4-fleet'): 2
+            utils.SkyServeAllocation(tier, 'boltz-l4-fleet', ('prod/default/SkyPilotCluster/'
+                                                              'boltz-l4-fleet-1-0123456789-b673d4fd')): 2
+        }
+    }
+    assert by_workload == {
+        'node-1': {
+            tier: {
+                ('prod/default/SkyPilotCluster/'
+                 'boltz-l4-fleet-1-0123456789-b673d4fd'),
+                'prod/default/SkyPilotCluster/nsec3z-a0-5521-0ae18643',
+            },
+            utils.PriorityTier(31, 'ma-lt', 'PyTorch training'): {
+                'prod/default/Pod/training-pod'
+            },
         }
     }
     service_lookup.assert_called_once_with()
     response.release_conn.assert_called_once_with()
+
+
+def test_gpu_workload_id_groups_controller_pods():
+
+    def make_pod(name: str) -> utils.V1Pod:
+        return utils.V1Pod.from_dict({
+            'metadata': {
+                'name': name,
+                'namespace': 'research',
+                'uid': f'{name}-uid',
+                'ownerReferences': [{
+                    'kind': 'PyTorchJob',
+                    'name': 'distributed-training',
+                    'uid': 'training-uid',
+                    'controller': True,
+                }],
+            },
+            'status': {
+                'phase': 'Running'
+            },
+            'spec': {
+                'nodeName': 'node-1',
+                'containers': []
+            },
+        })
+
+    master = make_pod('training-master')
+    worker = make_pod('training-worker')
+    assert utils._gpu_workload_id(  # pylint: disable=protected-access
+        'prod', master) == 'prod/research/PyTorchJob/training-uid'
+    assert utils._gpu_workload_id(  # pylint: disable=protected-access
+        'prod', worker) == 'prod/research/PyTorchJob/training-uid'
 
 
 def test_get_allocated_resources_fails_closed_without_workload_identity():
@@ -743,7 +809,7 @@ def test_get_allocated_resources_fails_closed_without_workload_identity():
                     return_value='nvidia.com/gpu'), \
          mock.patch('sky.provision.kubernetes.utils.'
                     '_get_external_skyserve_service_names') as service_lookup:
-        allocated, _, by_priority, by_service = (
+        allocated, _, by_priority, by_service, by_workload = (
             utils.get_allocated_resources_by_node(context='prod'))
 
     assert allocated == {'node-1': 3}
@@ -754,6 +820,14 @@ def test_get_allocated_resources_fails_closed_without_workload_identity():
         }
     }
     assert by_service is None
+    assert by_workload == {
+        'node-1': {
+            utils.PriorityTier(0, None): {'prod/default/Pod/production-pod'},
+            utils.PriorityTier(-1000, 'inference-low'): {
+                'prod/default/Pod/unattributed-preemptible-pod'
+            },
+        }
+    }
     service_lookup.assert_not_called()
     response.release_conn.assert_called_once_with()
 
@@ -794,13 +868,14 @@ def test_get_allocated_resources_proves_labeled_jobs_are_not_skyserve():
                     return_value='nvidia.com/gpu'), \
          mock.patch('sky.provision.kubernetes.utils.'
                     '_get_external_skyserve_service_names') as service_lookup:
-        allocated, _, by_priority, by_service = (
+        allocated, _, by_priority, by_service, by_workload = (
             utils.get_allocated_resources_by_node(context='prod'))
 
     tier = utils.PriorityTier(31, 'ma-lt', 'PyTorch training')
     assert allocated == {'node-1': 2}
     assert by_priority == {'node-1': {tier: 2}}
     assert by_service == {}
+    assert by_workload == {'node-1': {tier: {'prod/research/Pod/training-pod'}}}
     service_lookup.assert_not_called()
 
 
@@ -818,7 +893,7 @@ def test_get_kubernetes_node_info_uniform_priority_is_not_preemptible():
          mock.patch('sky.provision.kubernetes.utils.'
                     'get_allocated_resources_by_node',
                     return_value=({'node-1': 8}, {}, {'node-1': {tier: 8}},
-                                  None)), \
+                                  None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                     return_value='nvidia.com/gpu'):
         node_info = utils.get_kubernetes_node_info()
@@ -1200,7 +1275,7 @@ def test_heterogenous_gpu_detection():
          mock.patch('sky.provision.kubernetes.utils.detect_accelerator_resource', return_value=True), \
          mock.patch('sky.provision.kubernetes.utils.detect_gpu_label_formatter', return_value=[utils.GKELabelFormatter(), None]), \
          mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes', return_value=[mock_node1, mock_node2]), \
-         mock.patch('sky.provision.kubernetes.utils.get_allocated_resources_by_node', return_value=({mock_node1.metadata.name: 1, mock_node2.metadata.name: 0}, {}, {}, None)), \
+         mock.patch('sky.provision.kubernetes.utils.get_allocated_resources_by_node', return_value=({mock_node1.metadata.name: 1, mock_node2.metadata.name: 0}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key', return_value='nvidia.com/gpu'):
 
         counts, capacity, available = kubernetes_catalog.list_accelerators_realtime(
@@ -1255,7 +1330,7 @@ def test_low_priority_pod_filtering():
                    return_value=[mock_node]), \
          mock.patch('sky.provision.kubernetes.utils.'
                    'get_allocated_resources_by_node',
-                   return_value=({mock_node.metadata.name: 2}, {}, {}, None)), \
+                   return_value=({mock_node.metadata.name: 2}, {}, {}, None, {})), \
          mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
                     return_value='nvidia.com/gpu'):
 
