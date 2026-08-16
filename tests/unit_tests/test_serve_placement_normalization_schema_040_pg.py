@@ -1075,7 +1075,8 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
                 connection))
 
 
-@pytest.mark.parametrize('revision', ['041', '042', '043', '044', '045', '046'])
+@pytest.mark.parametrize('revision',
+                         ['041', '042', '043', '044', '045', '046', '047'])
 def test_serve040_runtime_authority_accepts_recognized_additive_head(
         serve040, revision: str) -> None:
     _upgrade(serve040, revision)
@@ -1089,7 +1090,7 @@ def test_serve040_runtime_authority_accepts_recognized_additive_head(
 
 
 def test_later_head_still_rejects_revision_040_function_drift(serve040) -> None:
-    _upgrade(serve040, '046')
+    _upgrade(serve040, '047')
     function = placement_normalization_authority.AUTHORITY_FUNCTION
     with serve040.begin() as connection:
         connection.exec_driver_sql(

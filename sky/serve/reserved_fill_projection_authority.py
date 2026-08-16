@@ -16,20 +16,18 @@ def projected_admission_for_candidate(
     expected_sha256: str | None = None,
 ) -> tuple[dict[str, Any],
            reserved_fill_reclaim_attestation.ReclaimProjectedAdmission]:
-    """Select one exact v2 candidate and derive its typed policy view."""
+    """Select one strict candidate and derive its typed policy view."""
     validated = kubernetes_identity.validate_worker_placement_projections(
-        worker_projections,
-        allow_none=False,
-        require_protocol_version=(
-            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+        worker_projections, allow_none=False)
     assert validated is not None
+    if not kubernetes_identity.worker_projection_has_strict_admission(
+            validated[0]):
+        raise ValueError('Reclaim requires a protocol-v2 or protocol-v3 '
+                         'worker projection.')
     projection = kubernetes_identity.worker_projection_for_context(
-        validated,
-        kubernetes_context, {accelerator: accelerator_count},
-        require_protocol_version=(
-            kubernetes_identity.PLACEMENT_PROJECTION_PROTOCOL_VERSION))
+        validated, kubernetes_context, {accelerator: accelerator_count})
     if projection is None:
-        raise ValueError('Reclaim has no exact protocol-v2 worker projection.')
+        raise ValueError('Reclaim has no exact strict worker projection.')
     projection_sha256 = kubernetes_identity.worker_projection_sha256(projection)
     if (expected_sha256 is not None and projection_sha256 != expected_sha256):
         raise ValueError('Reclaim worker projection digest changed.')

@@ -50,6 +50,9 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.
         MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION)
     assert preemptible_service_breakdown_version == 78
+    non_pool_launch_binding_version = (
+        server_constants.MIN_NON_POOL_LAUNCH_BINDING_API_VERSION)
+    assert non_pool_launch_binding_version == 80
     reserved_fill_status_version = (
         server_constants.
         MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION)
@@ -64,9 +67,13 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert reserved_fill_status_version < placement_projection_version
     assert (placement_projection_version
             < preemptible_service_breakdown_version)
-    assert preemptible_service_breakdown_version < server_constants.API_VERSION
-    assert server_constants.MIN_SERVE_DURABLE_DEMAND_API_VERSION == 80
-    assert server_constants.API_VERSION == 80
+    assert (preemptible_service_breakdown_version
+            < non_pool_launch_binding_version)
+    durable_demand_version = (
+        server_constants.MIN_SERVE_DURABLE_DEMAND_API_VERSION)
+    assert durable_demand_version == 81
+    assert non_pool_launch_binding_version < durable_demand_version
+    assert server_constants.API_VERSION == durable_demand_version
 
 
 def test_current_demand_reads_database_without_controller():

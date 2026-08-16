@@ -14,6 +14,7 @@ from sky import skypilot_config
 from sky import task as task_lib
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.backends import backend_utils
+from sky.data import storage as storage_lib
 from sky.provision.kubernetes import config as kubernetes_config
 from sky.provision.kubernetes import instance as kubernetes_instance
 from sky.serve import constants
@@ -48,12 +49,35 @@ def _accelerator_scheduling(accelerator='H200'):
     }
 
 
+def _node_local_cache():
+    return {
+        'kind': 'node_local',
+        'mount_path': '/mnt/sky-cache',
+        'volume_name': 'phx-cache',
+        'host_path': '/mnt/local-nvme/sky-cache',
+        'attestation': {
+            'attestation_id': 'phx-cache-v1',
+            'device_source_pattern': '^/dev/nvme[0-9]+n[0-9]+$',
+            'filesystem_type': 'xfs',
+            'required_bytes_per_replica': 100,
+            'required_inodes_per_replica': 10,
+            'max_replicas_per_node': 1,
+            'reserved_bytes_per_node': 0,
+            'reserved_inodes_per_node': 0,
+            'usable_bytes_per_node': 100,
+            'usable_inodes_per_node': 10,
+        },
+    }
+
+
 def _worker_projection(*,
                        context='phx',
                        accelerator='H200',
                        protocol_version=1,
                        kueue_admission=None,
                        scheduler_name='default-scheduler',
+                       provision_timeout=-1,
+                       scratch=None,
                        pod_identity_role_arn=_USE_DEFAULT_WORKER_ROLE):
     if pod_identity_role_arn is _USE_DEFAULT_WORKER_ROLE:
         pod_identity_role_arn = _worker_role(context)
@@ -73,13 +97,18 @@ def _worker_projection(*,
             'kind': 'none'
         },
     }
-    if protocol_version == 2:
+    if protocol_version in (2, 3):
         projection = {
-            'projection_version': 2,
+            'projection_version': protocol_version,
             **projection,
             'scheduler_name': scheduler_name,
             'kueue_admission': kueue_admission,
         }
+    if protocol_version == 3:
+        projection['provision_timeout'] = provision_timeout
+        projection['scratch'] = ({
+            'kind': 'none'
+        } if scratch is None else scratch)
     return projection
 
 
@@ -118,6 +147,126 @@ def test_worker_projection_protocol_v2_is_explicit_and_v1_is_isolated():
         kubernetes_identity.worker_projection_protocol_version({
             **v2, 'unknown': True
         })
+    with pytest.raises(ValueError, match='protocol-v2 keys'):
+        kubernetes_identity.worker_projection_protocol_version({
+            **v2, 'provision_timeout': -1
+        })
+
+
+def test_worker_projection_protocol_v3_is_canonical_and_v2_is_isolated():
+    admission = {
+        'local_queue_name': 'inference',
+        'workload_priority_class_name': 'inference-low',
+    }
+    v2 = _worker_projection(protocol_version=2, kueue_admission=admission)
+    v3 = _worker_projection(protocol_version=3,
+                            kueue_admission=admission,
+                            scratch={
+                                'kind': 'memory',
+                                'mount_path': '/tmp',
+                                'volume_name': 'skypilot-serve-worker-tmp',
+                                'size_limit_bytes': 20 * 1024**3,
+                            })
+
+    assert kubernetes_identity.worker_projection_protocol_version(v2) == 2
+    assert kubernetes_identity.worker_projection_protocol_version(v3) == 3
+    assert kubernetes_identity.worker_projection_has_strict_admission(v2)
+    assert kubernetes_identity.worker_projection_has_strict_admission(v3)
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v2], require_protocol_version=2) == [v2]
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [v3], require_protocol_version=3) == [v3]
+    with pytest.raises(ValueError, match='must not mix protocol versions'):
+        kubernetes_identity.validate_worker_placement_projections([v2, v3])
+    with pytest.raises(ValueError, match='protocol-v3 keys'):
+        kubernetes_identity.worker_projection_protocol_version({
+            **v3, 'unknown': True
+        })
+    missing_timeout = copy.deepcopy(v3)
+    missing_timeout.pop('provision_timeout')
+    with pytest.raises(ValueError, match='protocol-v3 keys'):
+        kubernetes_identity.worker_projection_protocol_version(missing_timeout)
+
+
+def test_worker_projection_v3_digest_covers_scratch():
+    projection = _worker_projection(
+        protocol_version=3,
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
+    changed = copy.deepcopy(projection)
+    changed['scratch']['size_limit_bytes'] += 1
+
+    assert (kubernetes_identity.worker_projection_sha256(projection)
+            != kubernetes_identity.worker_projection_sha256(changed))
+
+
+def test_worker_projection_v3_digest_covers_provision_timeout():
+    projection = _worker_projection(protocol_version=3, provision_timeout=-1)
+    changed = copy.deepcopy(projection)
+    changed['provision_timeout'] = 30
+
+    assert (kubernetes_identity.worker_projection_sha256(projection)
+            != kubernetes_identity.worker_projection_sha256(changed))
+
+
+@pytest.mark.parametrize('provision_timeout', [-1, 0, 30])
+def test_worker_projection_v3_accepts_closed_provision_timeout(
+        provision_timeout):
+    projection = _worker_projection(protocol_version=3,
+                                    provision_timeout=provision_timeout)
+
+    assert kubernetes_identity.validate_worker_placement_projections(
+        [projection], require_protocol_version=3) == [projection]
+
+
+@pytest.mark.parametrize('provision_timeout', [True, -2, 1.5, '30', None])
+def test_worker_projection_v3_rejects_malformed_provision_timeout(
+        provision_timeout):
+    with pytest.raises(ValueError, match='provision_timeout'):
+        kubernetes_identity.validate_worker_placement_projections(
+            [
+                _worker_projection(protocol_version=3,
+                                   provision_timeout=provision_timeout)
+            ],
+            require_protocol_version=3)
+
+
+@pytest.mark.parametrize('scratch', [
+    {
+        'kind': 'memory',
+        'mount_path': '/var/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 1,
+    },
+    {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'caller-name',
+        'size_limit_bytes': 1,
+    },
+    {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': True,
+    },
+    {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 1,
+        'extra': True,
+    },
+])
+def test_worker_projection_v3_rejects_malformed_scratch(scratch):
+    with pytest.raises(ValueError):
+        kubernetes_identity.validate_worker_placement_projections(
+            [_worker_projection(protocol_version=3, scratch=scratch)],
+            require_protocol_version=3)
 
 
 def test_worker_projection_v2_hashes_explicit_identity_free_partition():
@@ -186,6 +335,8 @@ def test_worker_projection_v2_digest_covers_complete_validated_candidate():
                            ensure_ascii=False,
                            allow_nan=False)
     expected = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    assert expected == (
+        '465fa566ddb0198fa42a1b36b01a56e5cad9e3335e0b2a95dc0c50c0e160eee2')
     assert kubernetes_identity.worker_projection_sha256(projection) == expected
     assert kubernetes_identity.worker_projection_sha256(
         dict(reversed(list(projection.items())))) == expected
@@ -198,7 +349,7 @@ def test_worker_projection_v2_digest_covers_complete_validated_candidate():
     mutated_scheduler['scheduler_name'] = 'trusted-batch-scheduler'
     assert (kubernetes_identity.worker_projection_sha256(mutated_scheduler)
             != expected)
-    with pytest.raises(ValueError, match='does not satisfy required version'):
+    with pytest.raises(ValueError, match='requires protocol 2 or 3'):
         kubernetes_identity.worker_projection_sha256(_worker_projection())
 
 
@@ -474,6 +625,178 @@ def test_worker_priority_class_is_narrow_nullable_server_config(priority):
         skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
 
 
+def test_worker_scratch_is_context_owned_closed_server_config():
+    config = {
+        'kubernetes': {
+            'serve_worker_scratch': {
+                'kind': 'none',
+            },
+        },
+        'workspaces': {
+            'research': {
+                'kubernetes': {
+                    'serve_worker_scratch': {
+                        'kind': 'memory',
+                        'size_limit_bytes': 10,
+                    },
+                    'context_configs': {
+                        'phx': {
+                            'serve_worker_scratch': {
+                                'kind': 'memory',
+                                'size_limit_bytes': 20,
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    }
+    common_utils.validate_schema(config, schemas.get_config_schema(),
+                                 'Invalid config')
+    assert skypilot_config.get_effective_workspace_region_config_from_snapshot(
+        config_snapshot=config,
+        cloud='kubernetes',
+        region='phx',
+        keys=('serve_worker_scratch',),
+        workspace='research',
+        default_value=None) == {
+            'kind': 'memory',
+            'size_limit_bytes': 20,
+        }
+    assert ('kubernetes', 'serve_worker_scratch') in (
+        skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    assert ('kubernetes', 'context_configs', '*', 'serve_worker_scratch') in (
+        skylet_constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+
+    for malformed in ({
+            'kind': 'memory',
+            'size_limit_bytes': True,
+    }, {
+            'kind': 'memory',
+            'size_limit_bytes': 1,
+            'mount_path': '/tmp',
+    }):
+        with pytest.raises(exceptions.InvalidSkyPilotConfigError):
+            common_utils.validate_schema(
+                {'kubernetes': {
+                    'serve_worker_scratch': malformed,
+                }}, schemas.get_config_schema(), 'Invalid config')
+
+
+def test_worker_provision_timeout_uses_context_over_workspace_config():
+    config = {
+        'kubernetes': {
+            'provision_timeout': 30,
+        },
+        'workspaces': {
+            'research': {
+                'kubernetes': {
+                    'provision_timeout': 60,
+                    'context_configs': {
+                        'phx': {
+                            'provision_timeout': -1,
+                        },
+                    },
+                },
+            },
+        },
+    }
+    common_utils.validate_schema(config, schemas.get_config_schema(),
+                                 'Invalid config')
+
+    assert skypilot_config.get_effective_workspace_region_config_from_snapshot(
+        config_snapshot=config,
+        cloud='kubernetes',
+        region='phx',
+        keys=('provision_timeout',),
+        workspace='research',
+        default_value=10) == -1
+
+
+def test_worker_scratch_projection_uses_exact_context(monkeypatch):
+    resolver = mock.Mock(return_value={
+        'kind': 'memory',
+        'size_limit_bytes': 20 * 1024**3,
+    })
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_workspace_region_config', resolver)
+
+    assert kubernetes_identity._project_worker_scratch('phx', 'research') == {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 20 * 1024**3,
+    }
+    resolver.assert_called_once_with(cloud='kubernetes',
+                                     region='phx',
+                                     keys=('serve_worker_scratch',),
+                                     workspace='research',
+                                     default_value={'kind': 'none'})
+
+
+def test_worker_provision_timeout_projection_freezes_context_value(monkeypatch):
+    resolver = mock.Mock(side_effect=lambda *, keys, **_kwargs: ({
+        'enabled': False
+    } if keys == ('dws',) else -1))
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_workspace_region_config', resolver)
+
+    assert kubernetes_identity._project_worker_provision_timeout(
+        'phx',
+        'research',
+        num_nodes=1,
+        volume_mounts=None,
+        kueue_admission={
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        }) == -1
+    assert resolver.call_args_list == [
+        mock.call(cloud='kubernetes',
+                  region='phx',
+                  keys=('dws',),
+                  workspace='research',
+                  default_value={}),
+        mock.call(cloud='kubernetes',
+                  region='phx',
+                  keys=('provision_timeout',),
+                  workspace='research',
+                  default_value=24 * 60 * 60),
+    ]
+
+
+@pytest.mark.parametrize(
+    ('dws_config', 'kueue_admission', 'expected_default'), [
+        ({}, None, 10),
+        ({
+            'enabled': True
+        }, None, 1200),
+        ({
+            'enabled': True
+        }, {
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        }, 24 * 60 * 60),
+    ])
+def test_worker_provision_timeout_projection_preserves_existing_default(
+        monkeypatch, dws_config, kueue_admission, expected_default):
+
+    def resolver(*, keys, default_value, **_kwargs):
+        if keys == ('dws',):
+            return dws_config
+        assert keys == ('provision_timeout',)
+        return default_value
+
+    monkeypatch.setattr(skypilot_config,
+                        'get_effective_workspace_region_config', resolver)
+
+    assert kubernetes_identity._project_worker_provision_timeout(
+        'phx',
+        'research',
+        num_nodes=1,
+        volume_mounts=None,
+        kueue_admission=kueue_admission) == expected_default
+
+
 def test_worker_accelerator_scheduling_freezes_verified_east_and_phx_labels(
         monkeypatch):
     scheduling_by_context = {
@@ -720,7 +1043,184 @@ run: echo hi
     resource_mutator(resource)
 
     with pytest.raises(ValueError, match='Projected SkyServe Kubernetes'):
-        kubernetes_identity.validate_no_task_worker_admission_overrides(task)
+        kubernetes_identity.validate_no_task_worker_projection_overrides(task)
+
+
+def test_projected_worker_rejects_task_resource_labels_at_commit_and_launch():
+    task = task_lib.Task.from_yaml_str('''
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+  labels:
+    task.example/inject: "true"
+run: echo hi
+''')
+
+    with pytest.raises(ValueError, match='task resource labels'):
+        kubernetes_identity.build_worker_placement_projections(
+            task, workspace='research')
+
+    dag = execution.dag_utils.convert_entrypoint_to_dag(task)
+    launch_context = {
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=3)
+        ],
+    }
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='task resource labels'):
+        execution._validate_projected_service_task_inputs(dag, launch_context)
+
+
+_TASK_POD_MUTATION_CONFIGS = {
+    'provision_timeout': 30,
+    'auto_mounts': [{
+        'volume_name': 'caller-volume',
+    }],
+    'enable_docker': {
+        'mode': 'ALL',
+        'cache_volume': 'caller-pvc',
+    },
+    'custom_metadata': {
+        'finalizers': ['blocked.example/finalizer'],
+        'annotations': {
+            'task.example/inject': 'true',
+        },
+    },
+}
+
+
+def _task_override_shape(key, value, shape):
+    if shape == 'root':
+        return {'kubernetes': {key: value}}
+    if shape == 'cloud_relative':
+        return {key: value}
+    if shape == 'context':
+        return {
+            'kubernetes': {
+                'context_configs': {
+                    'phx': {
+                        key: value,
+                    },
+                },
+            },
+        }
+    assert shape == 'nested_list'
+    return {
+        'kubernetes': {
+            'context_configs': {
+                'phx': {
+                    'future_scopes': [{
+                        key: value,
+                    }],
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize('key', _TASK_POD_MUTATION_CONFIGS)
+@pytest.mark.parametrize('shape',
+                         ['root', 'cloud_relative', 'context', 'nested_list'])
+def test_projected_worker_rejects_task_pod_mutation_config_at_commit_and_launch(
+        key, shape):
+    task = task_lib.Task.from_yaml_str('''
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+run: echo hi
+''')
+    resource = next(iter(task.resources))
+    resource._cluster_config_overrides = _task_override_shape(  # pylint: disable=protected-access
+        key, _TASK_POD_MUTATION_CONFIGS[key], shape)
+
+    with pytest.raises(ValueError, match=key):
+        kubernetes_identity.build_worker_placement_projections(
+            task, workspace='research')
+
+    dag = execution.dag_utils.convert_entrypoint_to_dag(task)
+    launch_context = {
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=3)
+        ],
+    }
+    with pytest.raises(exceptions.RequestCancelled, match=key):
+        execution._validate_projected_service_task_inputs(dag, launch_context)
+
+
+def test_projected_worker_rejects_parsed_task_yaml_provision_timeout():
+    task = task_lib.Task.from_yaml_str('''
+config:
+  kubernetes:
+    provision_timeout: 30
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+run: echo hi
+''')
+    resource = next(iter(task.resources))
+    assert resource.cluster_config_overrides == {
+        'kubernetes': {
+            'provision_timeout': 30,
+        },
+    }
+
+    with pytest.raises(ValueError, match='provision_timeout'):
+        kubernetes_identity.build_worker_placement_projections(
+            task, workspace='research')
+
+    dag = execution.dag_utils.convert_entrypoint_to_dag(task)
+    launch_context = {
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=3)
+        ],
+    }
+    with pytest.raises(exceptions.RequestCancelled, match='provision_timeout'):
+        execution._validate_projected_service_task_inputs(dag, launch_context)
+
+    # Historical v2 did not own timeout and retains its launch-time override.
+    launch_context[constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY] = [
+        _worker_projection(protocol_version=2)
+    ]
+    execution._validate_projected_service_task_inputs(dag, launch_context)
+
+
+def test_projected_worker_rejects_direct_fuse_activation_without_mount():
+    task = task_lib.Task.from_yaml_str('''
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+  _requires_fuse: true
+run: echo hi
+''')
+
+    with pytest.raises(ValueError, match='direct FUSE activation'):
+        kubernetes_identity.build_worker_placement_projections(
+            task, workspace='research')
+
+    dag = execution.dag_utils.convert_entrypoint_to_dag(task)
+    launch_context = {
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=3)
+        ],
+    }
+    with pytest.raises(exceptions.RequestCancelled,
+                       match='direct FUSE activation'):
+        execution._validate_projected_service_task_inputs(dag, launch_context)
+
+
+def test_projected_worker_accepts_derived_fuse_for_committed_mount_storage():
+    task = task_lib.Task.from_yaml_str('''
+resources:
+  infra: k8s/phx
+  accelerators: H200:1
+run: echo hi
+''')
+    task.storage_mounts = {
+        '/mnt/dataset': mock.Mock(mode=storage_lib.StorageMode.MOUNT),
+    }
+    next(iter(task.resources)).set_requires_fuse(True)
+
+    kubernetes_identity.validate_no_task_worker_projection_overrides(task)
 
 
 def test_worker_role_is_server_owned_and_strict():
@@ -823,6 +1323,9 @@ run: echo hi
         kubernetes_identity, '_project_accelerator_scheduling',
         lambda _context, accelerator, _workspace: _accelerator_scheduling(
             'A100-SXM4-80GB' if accelerator == 'A100-80GB' else accelerator))
+    monkeypatch.setattr(kubernetes_identity,
+                        '_project_worker_provision_timeout',
+                        lambda *_args, **_kwargs: -1)
 
     projected = kubernetes_identity.build_worker_placement_projections(
         task, workspace='research', placement_catalog={})
@@ -835,7 +1338,9 @@ run: echo hi
         _worker_role('east'),
         _worker_role('phx'),
     ]
-    assert all(item['projection_version'] == 2 for item in projected)
+    assert all(item['projection_version'] == 3 for item in projected)
+    assert all(item['provision_timeout'] == -1 for item in projected)
+    assert all(item['scratch'] == {'kind': 'none'} for item in projected)
     assert all(
         item['kueue_admission'] == {
             'local_queue_name': 'inference',
@@ -844,7 +1349,7 @@ run: echo hi
     assert projected[1]['accelerator_scheduling'] == (_accelerator_scheduling())
 
 
-def test_worker_catalog_preserves_identity_free_v2_candidates(monkeypatch):
+def test_worker_catalog_preserves_identity_free_v3_candidates(monkeypatch):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -879,12 +1384,17 @@ run: echo hi
     monkeypatch.setattr(
         kubernetes_identity, '_project_accelerator_scheduling', lambda _context,
         accelerator, _workspace: _accelerator_scheduling(accelerator))
+    monkeypatch.setattr(kubernetes_identity,
+                        '_project_worker_provision_timeout',
+                        lambda *_args, **_kwargs: -1)
 
     projected = kubernetes_identity.build_worker_placement_projections(
         task, workspace='inference', placement_catalog={})
 
     assert projected is not None
-    assert projected[0]['projection_version'] == 2
+    assert projected[0]['projection_version'] == 3
+    assert projected[0]['provision_timeout'] == -1
+    assert projected[0]['scratch'] == {'kind': 'none'}
     assert projected[0]['pod_identity_role_arn'] is None
 
 
@@ -961,7 +1471,9 @@ run: echo hi
                                                            }
 
 
-def test_projected_worker_rejects_raw_task_volume_before_resolution():
+@pytest.mark.parametrize('protocol_version', [2, 3])
+def test_projected_worker_rejects_raw_task_volume_before_resolution(
+        protocol_version):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -973,7 +1485,7 @@ run: echo hi
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
         constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
-            _worker_projection(protocol_version=2)
+            _worker_projection(protocol_version=protocol_version)
         ],
     }
 
@@ -1024,14 +1536,20 @@ def test_projected_worker_preserves_trusted_version_runtime_inputs():
 }, {
     'remote_identity': 'LOCAL_CREDENTIALS',
 }, {
+    'serve_worker_scratch': {
+        'kind': 'memory',
+        'size_limit_bytes': 1,
+    },
+}, {
     'context_configs': {
         'phx': {
             'namespace': 'caller-namespace',
         },
     },
 }])
+@pytest.mark.parametrize('protocol_version', [2, 3])
 def test_projected_worker_rejects_task_kubernetes_identity_overrides(
-        task_kubernetes_config):
+        task_kubernetes_config, protocol_version):
     task = task_lib.Task.from_yaml_str('''
 resources:
   infra: k8s/phx
@@ -1045,12 +1563,13 @@ run: echo hi
     dag = execution.dag_utils.convert_entrypoint_to_dag(task)
     launch_context = {
         constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
-            _worker_projection(protocol_version=2)
+            _worker_projection(protocol_version=protocol_version)
         ],
     }
 
     with pytest.raises(exceptions.RequestCancelled,
-                       match='pod_config, namespace, or remote_identity'):
+                       match=('pod_config, namespace, '
+                              '(?:provision_timeout, )?or remote_identity')):
         execution._validate_projected_service_task_inputs(dag, launch_context)
 
 
@@ -1150,8 +1669,8 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: projections,
     }
 
-    execution._apply_service_worker_cache_to_task(task, launch_context,
-                                                  task.best_resources)
+    execution._apply_service_worker_runtime_projection_to_task(
+        task, launch_context, task.best_resources)
 
     assert task.envs['SKYPILOT_SERVE_CACHE_KIND'] == 'node_local'
     assert task.envs['SKYPILOT_SERVE_CACHE_MOUNT_PATH'] == '/mnt/sky-cache'
@@ -1160,6 +1679,40 @@ def test_runtime_cache_uses_final_h200_choice_from_heterogeneous_task():
         key.startswith(kubernetes_identity.CACHE_ENV_PREFIX)
         for key in task.secrets)
     assert task.envs_and_secrets['SKYPILOT_SERVE_CACHE_KIND'] == 'node_local'
+
+
+def test_runtime_scratch_uses_final_v3_projection_and_overrides_caller():
+    task = task_lib.Task()
+    task.set_resources(
+        resources_lib.Resources(cloud=kubernetes_identity.clouds.Kubernetes(),
+                                region='phx',
+                                accelerators={'H200': 1}))
+    task.update_envs({
+        'SKYPILOT_SERVE_SCRATCH_KIND': 'caller',
+        'SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES': '1',
+    })
+    task.update_secrets({'SKYPILOT_SERVE_SCRATCH_EVIL': 'secret'})
+    launch_context = {
+        constants.REPLICA_LAUNCH_WORKER_PROJECTIONS_KEY: [
+            _worker_projection(protocol_version=3,
+                               scratch={
+                                   'kind': 'memory',
+                                   'mount_path': '/tmp',
+                                   'volume_name': 'skypilot-serve-worker-tmp',
+                                   'size_limit_bytes': 20 * 1024**3,
+                               })
+        ],
+    }
+
+    execution._apply_service_worker_runtime_projection_to_task(
+        task, launch_context, next(iter(task.resources)))
+
+    assert task.envs['SKYPILOT_SERVE_SCRATCH_KIND'] == 'memory'
+    assert task.envs['SKYPILOT_SERVE_SCRATCH_MOUNT_PATH'] == '/tmp'
+    assert task.envs['SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES'] == str(20 *
+                                                                       1024**3)
+    assert not any(
+        key.startswith('SKYPILOT_SERVE_SCRATCH_') for key in task.secrets)
 
 
 def test_final_kubernetes_yaml_enforces_platform_identity_and_cache():
@@ -1349,6 +1902,7 @@ def test_final_kubernetes_yaml_reasserts_v2_kueue_admission():
         })
     cluster_yaml = {
         'provider': {
+            'timeout': 30,
             'kueue_local_queue_name': 'caller-queue',
             'kueue_require_managed': False,
             'kueue_workload_priority_class_name': 'caller-workload-priority',
@@ -1380,6 +1934,7 @@ def test_final_kubernetes_yaml_reasserts_v2_kueue_admission():
         cluster_yaml, projection)
 
     provider = cluster_yaml['provider']
+    assert provider['timeout'] == 30
     assert provider['kueue_local_queue_name'] == 'inference'
     assert provider['kueue_require_managed'] is True
     assert provider['kueue_workload_priority_class_name'] == 'inference-low'
@@ -1409,7 +1964,257 @@ def test_final_kubernetes_yaml_reasserts_v2_kueue_admission():
                     'kueue.x-k8s.io/priority-class', 'kueue.x-k8s.io/managed'))
 
 
-def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
+def test_final_v3_yaml_composes_kueue_cache_and_memory_scratch_idempotently():
+    projection = _worker_projection(
+        protocol_version=3,
+        scheduler_name='trusted-batch-scheduler',
+        kueue_admission={
+            'local_queue_name': 'inference',
+            'workload_priority_class_name': 'inference-low',
+        },
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
+    projection['cache'] = _node_local_cache()
+    cluster_yaml = {
+        'provider': {
+            'timeout': 30,
+        },
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'metadata': {},
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray-node',
+                            'env': [{
+                                'name': 'SKYPILOT_SERVE_SCRATCH_KIND',
+                                'value': 'caller',
+                            }],
+                        }],
+                    },
+                },
+            },
+        },
+    }
+
+    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+        cluster_yaml, projection)
+    first = copy.deepcopy(cluster_yaml)
+    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+        cluster_yaml, projection)
+
+    assert cluster_yaml == first
+    assert cluster_yaml['provider'][
+        'serve_worker_projection_protocol_version'] == 3
+    assert cluster_yaml['provider']['timeout'] == -1
+    assert cluster_yaml['provider']['serve_worker_expected_scratch'] == {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 20 * 1024**3,
+    }
+    node = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']
+    assert node['metadata']['labels'] == {
+        'kueue.x-k8s.io/queue-name': 'inference',
+        'kueue.x-k8s.io/priority-class': 'inference-low',
+    }
+    assert node['spec']['volumes'] == [{
+        'name': 'phx-cache',
+        'hostPath': {
+            'path': '/mnt/local-nvme/sky-cache',
+            'type': 'Directory',
+        },
+    }, {
+        'name': 'skypilot-serve-worker-tmp',
+        'emptyDir': {
+            'medium': 'Memory',
+            'sizeLimit': str(20 * 1024**3),
+        },
+    }]
+    runtime = node['spec']['containers'][0]
+    assert runtime['volumeMounts'] == [{
+        'name': 'phx-cache',
+        'mountPath': '/mnt/sky-cache',
+    }, {
+        'name': 'skypilot-serve-worker-tmp',
+        'mountPath': '/tmp',
+    }]
+    environment = {entry['name']: entry['value'] for entry in runtime['env']}
+    assert {
+        key: value
+        for key, value in environment.items()
+        if key.startswith('SKYPILOT_SERVE_SCRATCH_')
+    } == {
+        'SKYPILOT_SERVE_SCRATCH_KIND': 'memory',
+        'SKYPILOT_SERVE_SCRATCH_MOUNT_PATH': '/tmp',
+        'SKYPILOT_SERVE_SCRATCH_SIZE_LIMIT_BYTES': str(20 * 1024**3),
+    }
+
+
+def _v3_scratch_cluster_yaml():
+    return {
+        'provider': {},
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray-node',
+                        }],
+                    },
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize('mutate', [
+    lambda spec: spec.setdefault('volumes', []).append({
+        'name': 'skypilot-serve-worker-tmp',
+        'emptyDir': {
+            'medium': '',
+            'sizeLimit': '1',
+        },
+    }),
+    lambda spec: spec['containers'][0].setdefault('volumeMounts', []).append({
+        'name': 'caller-volume',
+        'mountPath': '/tmp',
+    }),
+    lambda spec: spec['containers'][0].setdefault('volumeMounts', []).append({
+        'name': 'caller-nested-volume',
+        'mountPath': '/tmp/private',
+    }),
+    lambda spec: spec.setdefault('initContainers', []).append({
+        'name': 'init',
+        'volumeMounts': [{
+            'name': 'skypilot-serve-worker-tmp',
+            'mountPath': '/work',
+        }],
+    }),
+    lambda spec: spec['containers'][0].setdefault('volumeDevices', []).append({
+        'name': 'skypilot-serve-worker-tmp',
+        'devicePath': '/dev/scratch',
+    }),
+])
+def test_final_v3_yaml_rejects_existing_scratch_identity_collisions(mutate):
+    projection = _worker_projection(
+        protocol_version=3,
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
+    cluster_yaml = _v3_scratch_cluster_yaml()
+    spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    mutate(spec)
+
+    with pytest.raises(exceptions.InvalidCloudConfigs, match='collides'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            cluster_yaml, projection)
+
+
+@pytest.mark.parametrize('duplicate', ['volume', 'mount'])
+def test_final_v3_yaml_rejects_duplicate_exact_scratch_identity(duplicate):
+    projection = _worker_projection(
+        protocol_version=3,
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
+    cluster_yaml = _v3_scratch_cluster_yaml()
+    spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    volume = {
+        'name': 'skypilot-serve-worker-tmp',
+        'emptyDir': {
+            'medium': 'Memory',
+            'sizeLimit': str(20 * 1024**3),
+        },
+    }
+    mount = {
+        'name': 'skypilot-serve-worker-tmp',
+        'mountPath': '/tmp',
+    }
+    if duplicate == 'volume':
+        spec['volumes'] = [copy.deepcopy(volume), copy.deepcopy(volume)]
+    else:
+        spec['volumes'] = [volume]
+        spec['containers'][0]['volumeMounts'] = [
+            copy.deepcopy(mount), copy.deepcopy(mount)
+        ]
+
+    with pytest.raises(exceptions.InvalidCloudConfigs, match='scratch'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            cluster_yaml, projection)
+
+
+def test_final_v3_yaml_rejects_cache_scratch_collision():
+    projection = _worker_projection(
+        protocol_version=3,
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
+    projection['cache'] = {
+        **_node_local_cache(),
+        'mount_path': '/tmp',
+    }
+
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='cache and scratch'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            _v3_scratch_cluster_yaml(), projection)
+
+
+def test_final_v3_none_rejects_cache_tmp_alias():
+    projection = _worker_projection(protocol_version=3)
+    projection['cache'] = {
+        **_node_local_cache(),
+        'mount_path': '/var/../tmp/',
+    }
+
+    with pytest.raises(exceptions.InvalidCloudConfigs,
+                       match='cache and scratch'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            _v3_scratch_cluster_yaml(), projection)
+
+
+@pytest.mark.parametrize('collision', ['volume', 'mount', 'nested_mount'])
+def test_final_v3_none_rejects_inherited_scratch_owner(collision):
+    cluster_yaml = _v3_scratch_cluster_yaml()
+    spec = cluster_yaml['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    if collision == 'volume':
+        spec['volumes'] = [{
+            'name': 'skypilot-serve-worker-tmp',
+            'emptyDir': {},
+        }]
+    else:
+        spec['containers'][0]['volumeMounts'] = [{
+            'name': 'caller-tmp',
+            'mountPath':
+                ('/tmp/private' if collision == 'nested_mount' else '/tmp'),
+        }]
+
+    with pytest.raises(exceptions.InvalidCloudConfigs, match='collides'):
+        backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+            cluster_yaml, _worker_projection(protocol_version=3))
+
+
+@pytest.mark.parametrize('protocol_version', [2, 3])
+def test_kubernetes_deploy_vars_use_only_strict_projected_admission(
+        monkeypatch, protocol_version):
     resources = mock.MagicMock()
     resources.instance_type = '8CPU--32GB--H200:1'
     resources.accelerators = {'H200': 1}
@@ -1423,7 +2228,7 @@ def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
     resources.extract_docker_image.return_value = None
     setattr(resources, 'assert_launchable', lambda: resources)
     projection = _worker_projection(
-        protocol_version=2,
+        protocol_version=protocol_version,
         kueue_admission={
             'local_queue_name': 'inference',
             'workload_priority_class_name': 'inference-low',
@@ -1433,15 +2238,15 @@ def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
     region.name = 'phx'
 
     queue_resolver = mock.Mock(
-        side_effect=AssertionError('v2 must not resolve a live queue'))
-    managed_resolver = mock.Mock(
-        side_effect=AssertionError('v2 must not resolve live management'))
+        side_effect=AssertionError('projection must not resolve a live queue'))
+    managed_resolver = mock.Mock(side_effect=AssertionError(
+        'projection must not resolve live management'))
     service_account_resolver = mock.Mock(
-        side_effect=AssertionError('v2 must not resolve live identity'))
+        side_effect=AssertionError('projection must not resolve live identity'))
     accelerator_resolver = mock.Mock(
-        side_effect=AssertionError('v2 must not discover live labels'))
-    resource_key_resolver = mock.Mock(
-        side_effect=AssertionError('v2 must not discover a resource key'))
+        side_effect=AssertionError('projection must not discover live labels'))
+    resource_key_resolver = mock.Mock(side_effect=AssertionError(
+        'projection must not discover a resource key'))
     monkeypatch.setattr(skypilot_config, 'get_effective_queue_name',
                         queue_resolver)
     monkeypatch.setattr(skypilot_config, 'get_effective_kueue_require_managed',
@@ -1455,7 +2260,8 @@ def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
                         'get_gpu_resource_key', resource_key_resolver)
     monkeypatch.setattr(
         kubernetes_identity.kubernetes_utils, 'adjust_resources_to_allocatable',
-        mock.Mock(side_effect=AssertionError('v2 must not inspect nodes')))
+        mock.Mock(
+            side_effect=AssertionError('projection must not inspect nodes')))
     monkeypatch.setattr(kubernetes_identity.kubernetes_utils,
                         'resolve_effective_pod_config',
                         lambda *_args, **_kwargs: {})
@@ -1465,10 +2271,11 @@ def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
     monkeypatch.setattr(kubernetes_identity.kubernetes_cloud.gcp_utils,
                         'get_dws_config',
                         mock.Mock(return_value=(False, False, None)))
-    monkeypatch.setattr(skypilot_config,
-                        'get_effective_region_config',
-                        lambda *, keys, default_value=None, **_kwargs: 30
-                        if keys == ('provision_timeout',) else default_value)
+    config_resolver = mock.Mock(
+        side_effect=lambda *, keys, default_value=None, **_kwargs: 30
+        if keys == ('provision_timeout',) else default_value)
+    monkeypatch.setattr(skypilot_config, 'get_effective_region_config',
+                        config_resolver)
     monkeypatch.setattr(kubernetes_identity.kubernetes_cloud.catalog,
                         'get_image_id_from_tag',
                         mock.Mock(return_value='worker-image'))
@@ -1494,6 +2301,16 @@ def test_kubernetes_deploy_vars_use_only_v2_projected_admission(monkeypatch):
         'k8s_kueue_workload_priority_class_name'] == 'inference-low'
     assert deploy_vars['k8s_acc_label_key'] == 'nvidia.com/gpu.product'
     assert deploy_vars['k8s_resource_key'] == 'nvidia.com/gpu'
+    timeout_calls = [
+        call for call in config_resolver.call_args_list
+        if call.kwargs['keys'] == ('provision_timeout',)
+    ]
+    if protocol_version == 3:
+        assert deploy_vars['timeout'] == '-1'
+        assert timeout_calls == []
+    else:
+        assert deploy_vars['timeout'] == '30'
+        assert len(timeout_calls) == 1
 
 
 def test_legacy_yaml_restore_cannot_replace_projected_identity_or_cache():
@@ -1692,6 +2509,7 @@ def test_legacy_yaml_restore_reasserts_v2_kueue_admission():
         'provider': {
             'context': 'phx',
             'namespace': 'inference',
+            'timeout': 60,
             'kueue_local_queue_name': 'inference',
             'kueue_require_managed': True,
             'kueue_workload_priority_class_name': 'inference-low',
@@ -1704,6 +2522,7 @@ def test_legacy_yaml_restore_reasserts_v2_kueue_admission():
         'provider': {
             'context': 'old',
             'namespace': 'old',
+            'timeout': 30,
             'kueue_local_queue_name': 'caller-queue',
             'kueue_require_managed': False,
             'kueue_workload_priority_class_name': 'caller-priority',
@@ -1717,6 +2536,7 @@ def test_legacy_yaml_restore_reasserts_v2_kueue_admission():
         yaml_utils.dump_yaml_str(fresh), yaml_utils.dump_yaml_str(stale),
         projection)
     restored_config = yaml_utils.safe_load(restored)
+    assert restored_config['provider']['timeout'] == 30
     assert restored_config['provider']['kueue_local_queue_name'] == 'inference'
     assert restored_config['provider']['kueue_require_managed'] is True
     assert restored_config['provider'][
@@ -1725,6 +2545,55 @@ def test_legacy_yaml_restore_reasserts_v2_kueue_admission():
         'node_config']['metadata']['labels']
     assert labels['kueue.x-k8s.io/queue-name'] == 'inference'
     assert labels['kueue.x-k8s.io/priority-class'] == 'inference-low'
+
+
+def test_legacy_yaml_restore_reasserts_v3_memory_scratch():
+    projection = _worker_projection(
+        protocol_version=3,
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
+    fresh = _v3_scratch_cluster_yaml()
+    backend_utils._enforce_worker_projection_on_kubernetes_yaml(
+        fresh, projection)
+    stale = copy.deepcopy(fresh)
+    stale['provider']['timeout'] = 30
+    stale_spec = stale['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+    stale_spec['volumes'] = [{
+        'name': 'caller-tmp',
+        'hostPath': {
+            'path': '/tmp',
+        },
+    }]
+    stale_spec['containers'][0]['volumeMounts'] = [{
+        'name': 'caller-tmp',
+        'mountPath': '/tmp',
+    }]
+
+    restored = backend_utils._restore_projected_worker_kubernetes_fields(
+        yaml_utils.dump_yaml_str(fresh), yaml_utils.dump_yaml_str(stale),
+        projection)
+    final_config = yaml_utils.safe_load(restored)
+    final_spec = final_config['available_node_types']['ray_head_default'][
+        'node_config']['spec']
+
+    assert final_config['provider']['timeout'] == -1
+    assert final_spec['volumes'][-1] == {
+        'name': 'skypilot-serve-worker-tmp',
+        'emptyDir': {
+            'medium': 'Memory',
+            'sizeLimit': str(20 * 1024**3),
+        },
+    }
+    assert final_spec['containers'][0]['volumeMounts'][-1] == {
+        'name': 'skypilot-serve-worker-tmp',
+        'mountPath': '/tmp',
+    }
+    assert 'caller-tmp' not in yaml_utils.dump_yaml_str(final_spec)
 
 
 def test_legacy_yaml_restore_rejects_changed_node_type_set():
@@ -1772,6 +2641,148 @@ def test_legacy_yaml_restore_rejects_changed_node_type_set():
         backend_utils._restore_projected_worker_kubernetes_fields(
             yaml_utils.dump_yaml_str(new_config),
             yaml_utils.dump_yaml_str(restored_config), projection)
+
+
+def _memory_scratch_contract():
+    return {
+        'kind': 'memory',
+        'mount_path': '/tmp',
+        'volume_name': 'skypilot-serve-worker-tmp',
+        'size_limit_bytes': 20 * 1024**3,
+    }
+
+
+def _admitted_memory_scratch_pod():
+    pod = mock.Mock()
+    pod.metadata.name = 'replica-head'
+    pod.spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'volumeMounts': [{
+                'name': 'skypilot-serve-worker-tmp',
+                'mountPath': '/tmp',
+            }],
+        }],
+        'volumes': [{
+            'name': 'skypilot-serve-worker-tmp',
+            'emptyDir': {
+                'medium': 'Memory',
+                'sizeLimit': str(20 * 1024**3),
+            },
+        }],
+    }
+    return pod
+
+
+def test_admitted_worker_memory_scratch_contract_is_accepted():
+    kubernetes_instance._attest_serve_worker_scratch(
+        _admitted_memory_scratch_pod(), 'inference', 'phx',
+        _memory_scratch_contract())
+
+
+def test_real_kubernetes_client_pod_memory_scratch_contract_is_accepted():
+    client = kubernetes_adaptor.kubernetes.client
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(name='replica-head'),
+        spec=client.V1PodSpec(containers=[
+            client.V1Container(name='ray-node',
+                               volume_mounts=[
+                                   client.V1VolumeMount(
+                                       name='skypilot-serve-worker-tmp',
+                                       mount_path='/tmp')
+                               ])
+        ],
+                              volumes=[
+                                  client.V1Volume(
+                                      name='skypilot-serve-worker-tmp',
+                                      empty_dir=client.V1EmptyDirVolumeSource(
+                                          medium='Memory', size_limit='20Gi'))
+                              ]))
+
+    kubernetes_instance._attest_serve_worker_scratch(pod, 'inference', 'phx',
+                                                     _memory_scratch_contract())
+
+
+@pytest.mark.parametrize('mutation',
+                         ['size', 'alternate_source', 'recursive_read_only'])
+def test_admitted_worker_scratch_mutation_is_deleted(monkeypatch, mutation):
+    pod = _admitted_memory_scratch_pod()
+    if mutation == 'size':
+        pod.spec['volumes'][0]['emptyDir']['sizeLimit'] = str(10 * 1024**3)
+    elif mutation == 'alternate_source':
+        pod.spec['volumes'][0]['secret'] = {}
+    else:
+        pod.spec['containers'][0]['volumeMounts'][0][
+            'recursiveReadOnly'] = 'Enabled'
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
+    monkeypatch.setattr(kubernetes_instance.kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(kubernetes_config.KubernetesError,
+                       match='worker scratch contract'):
+        kubernetes_instance._attest_serve_worker_scratch(
+            pod, 'inference', 'phx', _memory_scratch_contract())
+
+    core_api.delete_namespaced_pod.assert_called_once_with(
+        'replica-head',
+        'inference',
+        grace_period_seconds=0,
+        _request_timeout=kubernetes_config.DELETION_TIMEOUT)
+
+
+@pytest.mark.parametrize('mount_path', ['/var/../tmp/', '/tmp/private'])
+def test_admitted_worker_none_scratch_rejects_tmp_path_alias(
+        monkeypatch, mount_path):
+    pod = mock.Mock()
+    pod.metadata.name = 'replica-head'
+    pod.spec = {
+        'containers': [{
+            'name': 'ray-node',
+            'volumeMounts': [{
+                'name': 'caller-volume',
+                'mountPath': mount_path,
+            }],
+        }],
+        'volumes': [{
+            'name': 'caller-volume',
+            'emptyDir': {},
+        }],
+    }
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
+    monkeypatch.setattr(kubernetes_instance.kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(kubernetes_config.KubernetesError,
+                       match='worker scratch contract'):
+        kubernetes_instance._attest_serve_worker_scratch(
+            pod, 'inference', 'phx', {'kind': 'none'})
+
+    core_api.delete_namespaced_pod.assert_called_once()
+
+
+def test_admitted_worker_memory_scratch_rejects_nested_tmp_mount(monkeypatch):
+    pod = _admitted_memory_scratch_pod()
+    pod.spec['containers'][0]['volumeMounts'].append({
+        'name': 'webhook-volume',
+        'mountPath': '/tmp/webhook',
+    })
+    pod.spec['volumes'].append({
+        'name': 'webhook-volume',
+        'emptyDir': {},
+    })
+    core_api = mock.MagicMock()
+    core_api.read_namespaced_pod.side_effect = _kubernetes_api_error(404)
+    monkeypatch.setattr(kubernetes_instance.kubernetes, 'core_api',
+                        lambda *_args, **_kwargs: core_api)
+
+    with pytest.raises(kubernetes_config.KubernetesError,
+                       match='worker scratch contract'):
+        kubernetes_instance._attest_serve_worker_scratch(
+            pod, 'inference', 'phx', _memory_scratch_contract())
+
+    core_api.delete_namespaced_pod.assert_called_once()
 
 
 def test_admitted_worker_priority_mismatch_is_deleted(monkeypatch):
@@ -2114,22 +3125,14 @@ def test_admitted_worker_namespace_mismatch_is_deleted(monkeypatch):
 
 
 def test_final_kubernetes_yaml_requires_one_runtime_container():
-    projection = {
-        'candidate_id': 'kubernetes-0002',
-        'kubernetes_context': 'phx',
-        'namespace': 'inference',
-        'service_account_name': 'phx-worker',
-        'priority_class_name': None,
-        'priority_value': None,
-        'preemption_policy': None,
-        'pod_identity_role_arn': _worker_role('phx'),
-        'accelerator_name': 'H200',
-        'accelerator_count': 1,
-        'accelerator_scheduling': _accelerator_scheduling(),
-        'cache': {
-            'kind': 'none'
-        },
-    }
+    projection = _worker_projection(
+        protocol_version=3,
+        scratch={
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        })
     cluster_yaml = {
         'provider': {},
         'available_node_types': {

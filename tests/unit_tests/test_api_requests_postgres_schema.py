@@ -25,7 +25,10 @@ def test_postgres_record_schema_topology() -> None:
              'execution_quiescence_required', 'execution_quiesced_generation',
              'execution_quiesced_at', 'interrupted_reason', 'event_context',
              'resource_action_id', 'resource_action_attempt',
-             'ordinary_launch_association_id', 'updated_at'),
+             'ordinary_launch_association_id', 'binding_protocol_version',
+             'profile_kind', 'profile_version', 'profile_digest',
+             'capability_cohort_epoch', 'capability_profile_set_digest',
+             'receipt_protocol_version', 'updated_at'),
         'api_request_retention_pins':
             ('pin_kind', 'pin_id', 'request_id', 'created_at'),
         'api_resource_actions':
@@ -55,7 +58,12 @@ def test_postgres_record_schema_topology() -> None:
              'health_detail', 'supported_handlers',
              'supported_payload_versions', 'request_storage_backend',
              'request_queue_backend', 'execution_quiescence_capable',
-             'ordinary_launch_binding_capable'),
+             'ordinary_launch_binding_capable',
+             'non_pool_launch_binding_capable',
+             'non_pool_launch_binding_protocol_version',
+             'non_pool_launch_capability_profile_set_digest',
+             'non_pool_launch_capability_cohort_epoch',
+             'non_pool_launch_receipt_protocol_version'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
              'generation_lock_key', 'origin_capability_sha256', 'acquired_at',
