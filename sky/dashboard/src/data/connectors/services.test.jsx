@@ -875,12 +875,16 @@ describe('getServiceDemand', () => {
         recent_request_count: 0,
         requests_per_second: 0,
         in_flight_requests: -1,
+        confirmed_in_flight_requests: 2,
+        unknown_in_flight_replica_count: 3,
         request_telemetry_compatibility_complete: 'yes',
       })
     ).toMatchObject({
       recentRequestCount: 0,
       requestRate: 0,
       inFlightRequests: null,
+      confirmedInFlightRequests: 2,
+      unknownInFlightReplicaCount: 3,
       requestTelemetryCompatibilityComplete: null,
     });
   });

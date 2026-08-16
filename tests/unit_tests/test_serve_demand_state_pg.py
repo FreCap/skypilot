@@ -152,6 +152,8 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
     assert summary['request_telemetry_compatibility_complete'] is True
     assert summary['recent_request_count'] == 1
     assert summary['in_flight_requests'] == 3
+    assert summary['confirmed_in_flight_requests'] == 3
+    assert summary['unknown_in_flight_replica_count'] == 0
 
     conflict = copy.deepcopy(report)
     conflict['queue_depth'] = 1
@@ -216,6 +218,10 @@ def test_unknown_occupancy_never_displays_processing_zero(demand_database):
     assert summary['request_telemetry_state'] == 'fresh'
     assert summary['request_telemetry_reason'] == 'in_flight_incomplete'
     assert summary['in_flight_requests'] is None
+    # The reporter's own admitted request remains a confirmed lower bound even
+    # though occupancy from the backend URL is unavailable.
+    assert summary['confirmed_in_flight_requests'] == 1
+    assert summary['unknown_in_flight_replica_count'] == 1
     assert summary['recent_request_count'] == 1
 
 
@@ -251,6 +257,8 @@ def test_ha_handoff_adds_disjoint_work_without_double_counting_occupancy(
     # HTTP work belongs to each LB (1 + 4), while async occupancy is the same
     # replica-global observation and is selected once (2).
     assert summary['in_flight_requests'] == 7
+    assert summary['confirmed_in_flight_requests'] == 7
+    assert summary['unknown_in_flight_replica_count'] == 0
     assert summary['request_queue_depth'] == 1
 
 
