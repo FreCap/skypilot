@@ -191,8 +191,8 @@ def bound_request_database(request_database, monkeypatch):
                                                 migration_utils.SERVE_DB_NAME)
     # Bound launch reduction acquires the global zero-cost event sequencer
     # before its existing lifecycle/service/replica locks. Exercise the
-    # current production schema boundary even while the reconciliation gate
-    # remains in legacy mode.
+    # current additive-stack schema boundary even while the reconciliation
+    # gate remains in legacy mode.
     alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
     with engine.begin() as connection:

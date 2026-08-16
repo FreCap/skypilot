@@ -1,12 +1,15 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 and P2a are merged in PRs #1498 and #1499. P2b1 is in exact-head
-CI in PR #1503, and P2b2 is stacked in PR #1504. The complete additive stack
-has not been deployed. P2b2 includes the adversarial-review
-correction that separates cheapest-compatible demand attribution from
-supply-aware exact-card capacity accounting. The production compatibility
-precondition is satisfied, but production remains on the legacy
-controller-coupled demand and route paths.
+Status: P1 is merged in PR #1498, P2a in PR #1499, and P2b1 is in exact-head
+review in PR #1503; P2b2 is stacked in PR #1504. The complete additive stack
+has not been deployed. P2b2 includes the adversarial-review correction that
+separates cheapest-compatible demand attribution from supply-aware exact-card
+capacity accounting. A production observation at Serve048 exposed that the
+closed revision-040 placement-normalization authority registry stopped at
+Serve047; P2b1 now recognizes the reviewed additive Serve048 and Serve049 heads
+and P2b2 recognizes its additive Serve050 head before either path can be
+promoted. Production remains on the legacy controller-coupled demand and route
+paths.
 
 Last updated: 2026-08-16
 

@@ -67,6 +67,8 @@ DEFAULT_HOME_DIRECTORY = '/home/sky'
 HIGH_AVAILABILITY_DEPLOYMENT_VOLUME_MOUNT_PATH = DEFAULT_HOME_DIRECTORY
 
 IJSON_BUFFER_SIZE = 64 * 1024  # 64KB, default from ijson
+_EXTERNAL_SKYSERVE_SERVICE_LABEL_KEY = 'skypilot-serve-lb'
+_API_POD_NAMESPACE_ENV_VAR = 'SKYPILOT_POD_NAMESPACE'
 _MAX_OBSERVED_NODE_NAME_BYTES = 253
 _MAX_OBSERVED_RESOURCE_QUANTITY_BYTES = 128
 _MAX_OBSERVED_NODE_CONDITIONS = 256
@@ -2998,6 +3000,56 @@ def _is_proven_non_skyserve_workload(pod: V1Pod) -> bool:
     return pod.metadata.labels.get('job-type') is not None
 
 
+def _get_external_skyserve_service_names() -> set[str] | None:
+    """Returns the authoritative active external-LB service inventory.
+
+    Each inference service owns exactly one labeled Kubernetes Service in the
+    API server's cluster.  Reading that bounded inventory avoids coupling this
+    generic node observation to a user/controller database.  ``None`` means
+    the inventory cannot be proven complete in this process.
+    """
+    if not is_incluster_config_available():
+        return None
+    namespace = os.environ.get(_API_POD_NAMESPACE_ENV_VAR)
+    if not namespace:
+        return None
+    response = kubernetes.core_api(
+        kubernetes.in_cluster_context_name()).list_namespaced_service(
+            namespace,
+            label_selector=_EXTERNAL_SKYSERVE_SERVICE_LABEL_KEY,
+            _request_timeout=kubernetes.API_TIMEOUT)
+    service_names = set()
+    for service in response.items:
+        labels = service.metadata.labels or {}
+        service_name = labels.get(_EXTERNAL_SKYSERVE_SERVICE_LABEL_KEY)
+        if isinstance(service_name, str) and service_name:
+            service_names.add(service_name)
+    return service_names
+
+
+def _skyserve_service_from_cluster_name(
+    cluster_name_on_cloud: str,
+    service_names: set[str],
+) -> str | None:
+    """Matches one cloud cluster name to the exact SkyServe name grammar.
+
+    A service-name prefix alone is insufficient: ordinary clusters may share
+    it.  Require the generated replica id, optional 10-character resource
+    scope tag, and the appended 8-character user hash.  Longest-first matching
+    keeps overlapping service names unambiguous.
+    """
+    for service_name in sorted(service_names, key=len, reverse=True):
+        service_prefix = common_utils.make_cluster_name_on_cloud_for_user(
+            service_name, max_length=None, add_user_hash=False, user_hash='')
+        prefix = f'{service_prefix}-'
+        if not cluster_name_on_cloud.startswith(prefix):
+            continue
+        suffix = cluster_name_on_cloud[len(prefix):]
+        if re.fullmatch(r'\d+(?:-[a-z0-9]{10})?-[a-z0-9]{8}', suffix):
+            return service_name
+    return None
+
+
 class SkyServeAllocation(NamedTuple):
     """One service's accelerator allocation at a scheduling priority tier."""
     priority_tier: PriorityTier
@@ -3025,8 +3077,8 @@ def get_allocated_resources_by_node(
         - allocated_gpu_qty_by_node_by_priority: Dict mapping node name to the
           GPU count allocated at each scheduling priority tier on that node
         - allocated_gpu_qty_by_node_by_skyserve_service: Dict mapping node name
-          to service allocations with their priority tier. None means durable
-          workload attribution could not be read.
+          to service allocations with their priority tier. None means the
+          active external-LB service inventory could not be proven complete.
     """
     if context is None:
         context = get_current_kube_config_context_name()
@@ -3112,56 +3164,49 @@ def get_allocated_resources_by_node(
             allocation for allocation in observed_gpu_allocations if
             top_priority is not None and allocation[1].priority < top_priority
         ]
-        cluster_names = sorted({
-            cluster_name
-            for _, _, _, cluster_name, _ in observed_gpu_allocations
-            if cluster_name
-        })
-        preemptible_cluster_names = {
-            cluster_name for _, _, _, cluster_name, _ in preemptible_allocations
-            if cluster_name
-        }
         allocated_qty_by_node_by_skyserve_service: dict[str,
                                                         dict[SkyServeAllocation,
                                                              int]] | None
         # SkyServe attribution is useful only when it is complete.  A pod
         # without a SkyPilot cluster label or an explicit non-service workload
-        # label, or a labeled cluster that is absent from durable state, cannot
-        # be proven to be either a service or a non-service workload. Fail
-        # closed instead of turning that missing identity into a falsely
-        # precise zero.
+        # label cannot be proven to be either a service or a non-service
+        # workload. Fail closed instead of turning that missing identity into
+        # a falsely precise zero.
         if any(not cluster_name and not proven_non_service for _, _, _,
                cluster_name, proven_non_service in preemptible_allocations):
             allocated_qty_by_node_by_skyserve_service = None
         else:
-            try:
-                workload_fields = (
-                    global_user_state.get_cluster_workload_fields(cluster_names)
-                    if cluster_names else {})
-            except Exception as e:  # pylint: disable=broad-except
-                logger.debug(
-                    'Failed to read workload attribution for Kubernetes GPU '
-                    f'allocations: {common_utils.format_exception(e)}')
-                allocated_qty_by_node_by_skyserve_service = None
+            unattributed_cluster_names = {
+                cluster_name for _, _, _, cluster_name, proven_non_service in
+                preemptible_allocations
+                if cluster_name and not proven_non_service
+            }
+            if not unattributed_cluster_names:
+                allocated_qty_by_node_by_skyserve_service = {}
             else:
-                if any(cluster_name not in workload_fields
-                       for cluster_name in preemptible_cluster_names):
+                try:
+                    external_service_names = (
+                        _get_external_skyserve_service_names())
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.debug('Failed to read the external SkyServe service '
+                                 'inventory for Kubernetes GPU allocations: '
+                                 f'{common_utils.format_exception(e)}')
+                    external_service_names = None
+                if external_service_names is None:
                     allocated_qty_by_node_by_skyserve_service = None
                 else:
                     service_allocations: dict[str, dict[
                         SkyServeAllocation, int]] = collections.defaultdict(
                             lambda: collections.defaultdict(int))
-                    for node_name, tier, quantity, cluster_name, _ in (
-                            observed_gpu_allocations):
-                        if not cluster_name:
+                    for node_name, tier, quantity, cluster_name, (
+                            proven_non_service) in preemptible_allocations:
+                        if not cluster_name or proven_non_service:
                             continue
-                        workload = workload_fields.get(cluster_name)
-                        if workload is None:
+                        service_name = _skyserve_service_from_cluster_name(
+                            cluster_name, external_service_names)
+                        if service_name is None:
                             continue
-                        workload_type, workload_id = workload
-                        if workload_type != 'service' or not workload_id:
-                            continue
-                        allocation = SkyServeAllocation(tier, workload_id)
+                        allocation = SkyServeAllocation(tier, service_name)
                         service_allocations[node_name][allocation] += quantity
                     allocated_qty_by_node_by_skyserve_service = (
                         service_allocations)

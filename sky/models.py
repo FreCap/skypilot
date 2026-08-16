@@ -122,9 +122,9 @@ class KubernetesNodeInfo:
     # the highest active tier. This lets operational views say what is running,
     # rather than describing only the lower tiers that can be reclaimed.
     allocation_breakdown: dict[str, int] | None = None
-    # Subset of `accelerators_preemptible` held by pods durably attributed to
-    # SkyServe replicas. `None` when pod allocation or complete durable
-    # workload attribution could not be read.
+    # Subset of `accelerators_preemptible` held by pods attributed to active
+    # external-LB SkyServe services. `None` when pod allocation or the complete
+    # service inventory could not be read.
     accelerators_preemptible_services: int | None = None
     # Breakdown of `accelerators_preemptible_services` by SkyServe service
     # name. This remains separate from the priority-class breakdown above so

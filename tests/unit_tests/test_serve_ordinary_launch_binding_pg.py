@@ -27,7 +27,7 @@ from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
-    name='serve_ordinary_launch_binding_schema_047_pg')
+    name='serve_ordinary_launch_binding_schema_049_pg')
 
 _SUBMISSION_ID = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
@@ -83,7 +83,7 @@ def _stored_replica_state(
 def binding_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(serve_config, '047')
+    alembic_command.upgrade(serve_config, '049')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
 
@@ -1264,16 +1264,17 @@ def test_serve038_rejects_partial_and_malformed_complete_serve042_catalog(
         'serve_resource_actions')
 
 
-def test_serve047_downgrade_is_forward_only(binding_database) -> None:
-    config = migration_utils.get_alembic_config(binding_database,
+def test_serve047_downgrade_is_forward_only(empty_postgres) -> None:
+    config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '047')
     with pytest.raises(RuntimeError, match='Serve047 is forward-only'):
         alembic_command.downgrade(config, '046')
 
     assert migration_utils.get_current_alembic_revision(
-        binding_database, migration_utils.SERVE_DB_NAME) == '047'
+        empty_postgres, migration_utils.SERVE_DB_NAME) == '047'
     assert binding.ordinary_launch_associations_table.name in sqlalchemy.inspect(
-        binding_database).get_table_names()
+        empty_postgres).get_table_names()
 
 
 def test_admission_is_idempotent_and_conflicting_retry_fails_closed(
