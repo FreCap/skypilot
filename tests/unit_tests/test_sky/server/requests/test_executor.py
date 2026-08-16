@@ -93,6 +93,49 @@ def _provider_candidate() -> executor.queue_base.ProviderMutationCandidate:
               BOUND_ORDINARY_LAUNCH))
 
 
+def test_drain_marker_stops_dispatch_before_reserving_worker(monkeypatch):
+    monkeypatch.setattr(executor.request_storage, 'role_is_draining',
+                        lambda: True)
+    queue = mock.Mock()
+    proc_executor = mock.Mock()
+    worker = _provider_test_worker()
+
+    worker.process_request(proc_executor, queue)
+
+    assert worker._cancel_event.is_set()
+    proc_executor.try_reserve_idle_worker.assert_not_called()
+    queue.peek_provider_mutation.assert_not_called()
+
+
+def test_drain_racing_claim_returns_pre_effect_generation(monkeypatch):
+    draining = iter((False, True))
+    monkeypatch.setattr(executor.request_storage, 'role_is_draining',
+                        lambda: next(draining))
+    queue = mock.Mock()
+    candidate = _provider_candidate()
+    queue.peek_provider_mutation.return_value = candidate
+    claimed = executor.queue_base.QueueItem(
+        request_id='bound-provider-request',
+        ignore_return_value=False,
+        retryable=False,
+        execution_generation=3,
+        claim_token='claim-token',
+        worker_instance_id='worker-instance')
+    queue.claim_provider_mutation.return_value = claimed
+    reservation = mock.sentinel.reservation
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    worker = _provider_test_worker()
+
+    worker.process_request(proc_executor, queue)
+
+    assert worker._cancel_event.is_set()
+    queue.put.assert_called_once_with(claimed)
+    proc_executor.submit_reserved.assert_not_called()
+    proc_executor.release_idle_worker_reservation.assert_called_once_with(
+        reservation)
+
+
 def test_provider_request_is_not_claimed_without_idle_worker(monkeypatch):
     queue = mock.Mock()
     queue.peek_provider_mutation.return_value = _provider_candidate()
@@ -214,6 +257,67 @@ def test_provider_claim_submits_only_through_reserved_worker(monkeypatch):
         'bound-provider-request', guardian_pid, 3, 'claim-token',
         submitted_future.guardian_identity.start_time_ticks)
     submitted_future.admit.assert_called_once_with()
+
+
+def _provider_submission_at_drain_boundary(monkeypatch, draining_states):
+    monkeypatch.setattr(executor.request_storage, 'role_is_draining',
+                        mock.Mock(side_effect=draining_states))
+    queue = mock.Mock()
+    candidate = _provider_candidate()
+    queue.peek_provider_mutation.return_value = candidate
+    claimed = executor.queue_base.QueueItem(
+        request_id='bound-provider-request',
+        ignore_return_value=False,
+        retryable=False,
+        execution_generation=3,
+        claim_token='claim-token',
+        worker_instance_id='worker-instance')
+    queue.claim_provider_mutation.return_value = claimed
+    reservation = mock.sentinel.reservation
+    guardian_pid = os.getpid()
+    submitted_future = mock.Mock(guardian_identity=process.ProcessIdentity(
+        guardian_pid,
+        executor.request_storage.read_linux_process_start_time_ticks(
+            guardian_pid)))
+    proc_executor = mock.Mock()
+    proc_executor.try_reserve_idle_worker.return_value = reservation
+    proc_executor.submit_reserved.return_value = submitted_future
+    monkeypatch.setattr(
+        executor.api_requests, 'get_request', lambda *_args, **_kwargs: mock.
+        Mock(status=requests_lib.RequestStatus.PENDING, created_at=time.time()))
+    admission = mock.Mock(return_value=True)
+    monkeypatch.setattr(executor.api_requests, 'try_mark_running', admission)
+    worker = _provider_test_worker()
+    monkeypatch.setattr(worker, '_start_task_monitor',
+                        mock.Mock(return_value=True))
+    return worker, queue, proc_executor, submitted_future, admission
+
+
+def test_drain_after_boundary_creation_cancels_before_running(monkeypatch):
+    worker, queue, proc_executor, future, admission = (
+        _provider_submission_at_drain_boundary(monkeypatch,
+                                               (False, False, True)))
+
+    worker.process_request(proc_executor, queue)
+
+    assert worker._cancel_event.is_set()
+    future.request_cancel.assert_called_once_with()
+    admission.assert_not_called()
+    future.admit.assert_not_called()
+
+
+def test_drain_racing_running_transition_cancels_before_effect_gate(
+        monkeypatch):
+    worker, queue, proc_executor, future, admission = (
+        _provider_submission_at_drain_boundary(monkeypatch,
+                                               (False, False, False, True)))
+
+    worker.process_request(proc_executor, queue)
+
+    assert worker._cancel_event.is_set()
+    admission.assert_called_once()
+    future.request_cancel.assert_called_once_with()
+    future.admit.assert_not_called()
 
 
 def test_nested_controller_claim_gets_one_shot_capability(monkeypatch):
@@ -2123,7 +2227,7 @@ async def test_proven_boundary_failure_is_terminal_even_when_retryable(
                                        fields=['status', 'pid', 'status_msg'])
     assert updated is not None
     assert updated.status == requests_lib.RequestStatus.FAILED
-    assert queue_items == []
+    assert not queue_items
     assert not requests_lib.try_mark_running(request_id, pid=456)
 
 

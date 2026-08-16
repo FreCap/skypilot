@@ -78,7 +78,7 @@ SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
 CONTROLLER_GENERATION_ENV_VAR = (server_constants.CONTROLLER_GENERATION_ENV_VAR)
 CONTROLLER_INSTANCE_ID_ENV_VAR = (
     server_constants.CONTROLLER_INSTANCE_ID_ENV_VAR)
-ROLE_DRAIN_MARKER_PATH = '/var/run/skypilot/draining'
+ROLE_DRAIN_MARKER_PATH = request_storage.ROLE_DRAIN_MARKER_PATH
 
 _CLAIM_LEASE_SECONDS = 30
 _CLAIM_HEARTBEAT_INTERVAL_SECONDS = 10
@@ -737,6 +737,13 @@ class ServerInstanceLease:
             engine = initialize_and_get_db()
             values = self._values(include_started_at=False)
             values.pop('instance_id')
+            # ``draining_at`` is the start of the exact instance's retirement,
+            # not its latest heartbeat.  Keep that witness immutable while the
+            # draining owner continues heartbeating through child/receipt
+            # convergence.
+            if values['draining_at'] is not None:
+                values['draining_at'] = sqlalchemy.func.coalesce(
+                    SERVER_INSTANCES.c.draining_at, values['draining_at'])
             with engine.begin() as connection:
                 result = connection.execute(
                     sqlalchemy.update(SERVER_INSTANCES).where(
@@ -793,14 +800,20 @@ class ServerInstanceLease:
 
     def stop(self) -> None:
         """Mark the instance draining before stopping its heartbeat."""
-        with self._state_lock:
-            self._draining = True
-            self._ready = False
-            self._health_detail = {'phase': 'draining'}
+        self._set_draining_locally()
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1, self._heartbeat_interval_seconds *
                                           2))
+        self._publish_draining()
+
+    def _set_draining_locally(self) -> None:
+        with self._state_lock:
+            self._draining = True
+            self._ready = False
+            self._health_detail = {'phase': 'draining'}
+
+    def _publish_draining(self) -> None:
         try:
             if not self._heartbeat(lock_timeout=1):
                 logger.warning(f'Timed out marking {self.role} instance '
@@ -808,6 +821,11 @@ class ServerInstanceLease:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(f'Failed to mark {self.role} instance '
                            f'{self.instance_id} draining: {e}')
+
+    def begin_draining(self) -> None:
+        """Publish early retirement while retaining the instance heartbeat."""
+        self._set_draining_locally()
+        self._publish_draining()
 
 
 def current_instance_is_ready() -> bool:

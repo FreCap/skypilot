@@ -15,10 +15,29 @@ tests pin that (a) the sweep fires once the budgeted deadline passes, and
 (b) non-retriable requests are not interrupted before it.
 """
 # pylint: disable=protected-access
+import os
 import signal
+import subprocess
+import sys
 import unittest.mock as mock
 
 from sky.server import uvicorn as uvicorn_module
+
+
+def test_execution_drain_budget_precedes_legacy_full_grace():
+    env = dict(os.environ)
+    env['SKYPILOT_EXECUTION_DRAIN_SECONDS'] = '30'
+    env['SKYPILOT_GRACE_PERIOD_SECONDS'] = '60'
+    result = subprocess.run([
+        sys.executable, '-c', 'from sky.server import uvicorn; '
+        'print(uvicorn._WAIT_REQUESTS_TIMEOUT_SECONDS)'
+    ],
+                            env=env,
+                            check=True,
+                            capture_output=True,
+                            text=True)
+
+    assert result.stdout.splitlines()[-1] == '30'
 
 
 def _server_at_shutdown(monkeypatch, *, now):

@@ -110,6 +110,16 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_GRACE_PERIOD_SECONDS
+            value: "30"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_EXECUTION_DRAIN_SECONDS
+            value: "30"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS
             value: "true"
       - contains:

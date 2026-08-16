@@ -32,6 +32,15 @@ apiService:
     # probe failure-detection window; the chart validates that relationship.
     # @schema type: [integer]; minimum: 1
     readinessDrainSeconds: 20
+    # Seconds available to the application to settle owned execution after an
+    # early drain starts. During mixed-version rollout the chart also projects
+    # this value through the legacy grace-period environment variable.
+    # @schema type: [integer]; minimum: 1
+    executionDrainSeconds: 30
+    # Seconds reserved after execution drain for final durable commits and
+    # process exit before Kubernetes sends SIGKILL.
+    # @schema type: [integer]; minimum: 1
+    finalCommitSeconds: 10
   preDeployHook: |-
     # Run commands before deploying the API server, e.g. installing an admin policy.
     # Refer to https://docs.skypilot.co/en/latest/cloud-setup/policy.html for more details about admin policy.

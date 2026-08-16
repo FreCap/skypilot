@@ -580,7 +580,7 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API013/Serve049 are the blocked cleanup heads. They remove protocol-v1/new-
+- API014/Serve051 are the blocked cleanup heads. They remove protocol-v1/new-
   admission compatibility and transition columns/constraints only after G2's
   gates; they preserve immutable tombstones, typed profiles, current cohort,
   route history needed by live clients, and permanent reserved authorization.
@@ -1194,12 +1194,13 @@ disposition is unknown.
 ### G2: blocked steady-state cleanup
 
 G2 is authored with G1 and the demand-convergence P2 change and remains
-draft/blocked until every gate below is recorded. It owns forward-only
-API-request revision 013 and Serve revision 049.
-Any earlier draft that assigned API011 to combined-role cleanup or Serve047 to
-reserved-fill final cleanup is renumbered to API013/Serve049; API012/Serve048
-belong to the intervening demand/route convergence. Migration numbers must be
-globally unique and already-published revisions are immutable.
+draft/blocked until every gate below is recorded. Its migration-bearing cleanup
+must be restacked onto forward-only API-request revision 014 and Serve revision
+051. API012 and Serve048--050 are already published by demand, route, and
+ordered-admission convergence; API013 is reserved by G1Sb's executor-
+termination evidence. Any earlier cleanup draft using API013/Serve049 is stale
+and must not merge. Migration numbers are globally unique and already-published
+revisions are immutable.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
 only handler/profile alias, cluster-name quiescence as active authority, global
@@ -1213,15 +1214,37 @@ one executor topology, and the existing provider path.
 
 ### G1S: additive executor-retirement hardening
 
-G1S is an additive PR above the deployed G1/P2 baseline and below the G2
-cleanup. It makes the existing drain marker active in API, executor, and
-controller runtimes; records drain-start and completion against the exact
-`api_server_instances` identity; splits and validates the Helm shutdown
-budgets; and adds the typed executor-termination evidence source without
-changing request terminal or quiescence fields. It retains the reviewed manual
-attestation path for historical or incomplete infrastructure evidence. A
-simultaneously authored stacked cleanup removes the old sleep-only hook and
-full-grace application environment once mixed chart versions have drained.
+G1S is a three-PR stack above the deployed G1/P2 baseline and below the G2
+cleanup. G1Sa is schema-free: it makes the existing drain marker active in API,
+executor, and controller runtimes; records an immutable drain-start against the
+exact `api_server_instances` identity while retaining the heartbeat; fences new
+local claims; bounds the attempt to publish that early database witness so a
+database stall cannot consume the execution budget; clears only a marker whose
+mtime predates the current container process; and splits and validates the Helm
+readiness, execution, and final-commit budgets. G1Sb adds forward-only API013
+and the typed executor-termination
+evidence source without changing request terminal or quiescence fields. It
+retains the reviewed manual-attestation path for historical or incomplete
+infrastructure evidence. G1Sc is the simultaneously authored blocked cleanup;
+it removes the mixed-version sleep-only behavior and transition-only
+compatibility surface only after the exact rollout gates pass.
+
+As of 2026-08-16, G1Sa is implemented and locally verified on
+`feat/serve-executor-retirement-hardening`; it remains draft and is not
+merge-eligible until G1Sb and G1Sc are authored and linked. Its focused Python
+runtime, executor, shutdown-deadline, and wire-contract suites pass; all 160
+focused API/controller/executor Helm tests pass; the generated values schema is
+exact; and repository-wide mypy, changed-file pylint, dashboard lint/format,
+Python compilation, and `git diff --check` pass. G1Sa is draft PR #1519 with
+implementation commit `5781701e05492cb76211a2d962c3f4cbd3f031cf`. G1Sb is
+authored as draft PR #1522 with implementation commit
+`795c1e91ec49b74e169a1e13f06bc3b409a92b82`. G1Sc is authored simultaneously
+as draft PR #1523 with cleanup commit
+`2fe5b0e25dea9830c7ff92b75b8e1812589fa7ea`; its exact merge gate is recorded
+in that PR and below. G1Sc remains blocked until qualification.
+The steady-state winner is the marker-driven runtime protocol with the
+three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
+SIGTERM is transition-only.
 
 The crash matrix includes drain-marker-before-SIGTERM, SIGTERM during provider
 I/O, SIGKILL before receipt commit, node loss, force deletion, database outage,
@@ -2465,11 +2488,12 @@ approved canary:
 
 ### Generalized non-pool binding gates (current)
 
-- [x] Author, review, and merge G1 (API011/Serve047); author demand convergence
-  (API012/Serve048) and the blocked stacked G2 cleanup (API013/Serve049)
-  together; link the PRs and state G2's exact merge gate.
-- [ ] Restack any draft API011 combined-role cleanup to API013 and any draft
-  Serve047 reserved-fill permanent cleanup to Serve049. Prove each schema
+- [x] Author, review, and merge G1 (API011/Serve047) and demand convergence
+  (API012/Serve048--050).
+- [ ] Author G1Sb executor-termination evidence on API013 and restack the
+  blocked G2 cleanup onto API014/Serve051; link the PRs and state G1Sc/G2's
+  exact merge gates.
+- [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
   52032--52038 are absent. Do not recreate them or misstate absence as
