@@ -1,8 +1,8 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 is merged in PR #1498, P2a in PR #1499, and P2b1 is in exact-head
-review in PR #1503; P2b2 is stacked in PR #1504. The complete additive stack
-has not been deployed. P2b2 includes the adversarial-review correction that
+Status: P1, P2a, and P2b1 are merged in PRs #1498, #1499, and #1503. P2b2 is
+in exact-head review in PR #1504. The complete additive stack has not been
+deployed. P2b2 includes the adversarial-review correction that
 separates cheapest-compatible demand attribution from supply-aware exact-card
 capacity accounting. A production observation at Serve048 exposed that the
 closed revision-040 placement-normalization authority registry stopped at
@@ -145,6 +145,15 @@ and apply the exact published release. A direct Helm upgrade would create
 temporary drift and is not the steady-state deployment path. Schema is rolled
 forward only; revision 401 is not replayed.
 
+While the additive stack was under review, a second direct Helm mutation
+created revision 403 with v1.1.1299, exact commit
+`8326c5f0490e745d8bd0fea61eb4fe2b16fafbc8`, API 82, and image digest
+`sha256:d0d53742eab3b613e2318def9fd1e55750f86b07da29c01f59df175df327e401`.
+EKS audit attributes that Helm 3.16.4 update to operator identity
+`francesco@boltz.bio`; it is not represented by the platform pin and therefore
+remains deployment drift. The final P2 rollout still goes through the reviewed
+pin and exact saved Terragrunt plan.
+
 The service remains `resource_action_mode=legacy`,
 `ordinary_launch_binding_mode=legacy`, and non-pool capability false. It has no
 generalized non-pool association, associated request, legacy
@@ -169,21 +178,32 @@ three provisioning rows require typed reconciliation:
   rollout retirement failure, including the chart's overlapping 20-second
   readiness sleep and full-grace application budget, caused the missing
   receipt. The exact failed-container audit record is executor-termination
-  evidence, not a fabricated request receipt. This one row currently causes
-  the legacy recovery pass to time out every 30 seconds; and
+  evidence, not a fabricated request receipt. This one row caused the legacy
+  recovery pass to time out every 30 seconds; and
 - replica 52690 has an `INIT` H200 provider record and an exactly quiesced
   failed request. Its PHX Kubernetes admission failed because the Pod omitted
   the server-owned `kueue.x-k8s.io/queue-name` label. This is a separate
   workspace/provider admission defect, not demand or reserved scarcity.
 
-P1's sanctioned legacy-reconciliation ledger is the only cleanup path for
-replica 52689: seal its exact retained identity, record reviewed termination
-evidence, deliberately reconcile the exact provider effect, and authorize
-projection only after a fresh exact provider-absence observation begun after
-termination. The old v1.1.1287 runtime cannot perform that protocol, so all
-state writes remain blocked until a P1-capable binary is restored. Replicas
-52688 and 52690 are then allowed to converge through ordinary typed recovery;
-their outcomes must be verified rather than assumed.
+Revision 403 restored P1's sanctioned legacy-reconciliation ledger. The
+operator sealed replica 52689's exact retained identity, recorded the reviewed
+termination evidence, observed the physical-UID-fenced provider effect as
+`PRESENT`, performed the exact fenced teardown, and only then recorded a new
+provider observation as `ABSENT`. Event
+`9f747a67-28f1-5883-a8d6-0b64903a5ef0` projected the row. The replica and
+cluster records are absent; the original request remains truthfully
+`CANCELLED` without a fabricated quiescence receipt, and no paid claim exists.
+
+The recovery loop subsequently cleared all 15 prior intents from nonterminal
+`PENDING` state and moved 52688 and 52690 into ordinary typed cleanup, leaving
+46 ready plus those two provisioning rows in the 2026-08-16 post-recovery
+snapshot. It then exposed a
+separate release-lineage defect: the closed revision-040 authority registry
+accepted only heads through Serve047, so the live Serve048 database is rejected
+before placement-normalization acknowledgement and cleanup. P2b1 fixes the
+registry through Serve049; P2b2 extends it through Serve050. The remaining two
+rows must converge after that reviewed runtime deploy, and their outcomes must
+be verified rather than assumed.
 
 The same audit reproduced the live economic defect before revision 400: one
 fresh interval had target 65, 28 ready zero-cost slots, 201 observed free
@@ -733,14 +753,16 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. the live deployment tuple at rollout time, including the revision-402
-   v1.1.1287 binary regression, unchanged single-`all` topology, and the
-   forward Serve047/API-request-011 database heads;
+1. the live deployment tuple at rollout time, including revision 403's
+   unpinned v1.1.1299 drift, unchanged single-`all` topology, and the forward
+   Serve048/API-request-012 database heads;
 2. the completed pre-migration inventory of retained legacy rows and unsettled
    requests; reconcile only rows that actually remain. Record the historical
    absence of IDs 52032--52038 without treating it as quiescence, recreating
    rows, or backfilling associations. Preserve exact typed evidence for 52688,
-   52689, and 52690 and use the P1 ledger for 52689 only;
+   52689, and 52690; retain 52689's completed P1 ledger and original unmodified
+   request, and let 52688/52690 use ordinary typed cleanup after the registry
+   fix;
 3. provider-phase latency and proof that one quarantined row does not block
    routes, demand, or sibling reconciliation;
 4. a fresh zero-traffic interval with target zero and no new paid request;
@@ -782,16 +804,18 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
   demand-authority, or placement promotion (2026-08-16: single-`all`
   `Recreate`, forward Serve047/API-request-011 heads, service resource-action
   and binding modes legacy, non-pool capability false).
-- [x] Merge P1 as PR #1498 and P2a as PR #1499; publish P2b as PRs #1503/#1504,
-  and the blocked P3 removals as draft PRs #1506/#1510.
+- [x] Merge P1, P2a, and P2b1 as PRs #1498, #1499, and #1503; publish P2b2 as
+  PR #1504 and the blocked P3 removals as draft PRs #1506/#1510.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
 - [x] Inventory exact retained legacy rows and unsettled requests immediately
   before migration. The historical seven-row scope is absent and must not be
-  reconstructed; current retained rows 52688--52690 are recorded above.
-- [ ] Reconcile current retained rows without fabricated quiescence or manual
-  deletion. Replica 52689 requires reviewed executor-termination evidence,
-  deliberate exact provider reconciliation, and a subsequent fresh exact
-  absence observation through the P1 legacy ledger.
+  reconstructed; retained rows 52688--52690 are recorded above.
+- [x] Reconcile replica 52689 through reviewed executor-termination evidence,
+  deliberate exact provider teardown, and a subsequent fresh exact absence
+  observation through the P1 legacy ledger. Preserve its unmodified cancelled
+  request without fabricating quiescence.
+- [ ] Deploy the reviewed Serve049/050 registry lineage and verify ordinary
+  typed cleanup converges replicas 52688 and 52690 without manual deletion.
 - [ ] Repair the PHX server-owned Kubernetes admission configuration so an
   H200 reserved-fill Pod carries the required Kueue queue label; prove the
   admitted Pod still has the approved low preemptible priority class.

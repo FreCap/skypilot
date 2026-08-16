@@ -111,21 +111,29 @@ cleanup gates remain open.
 
 The fresh pre-migration inventory supersedes the historical seven-row recovery
 scope. Replica IDs 52032--52038 are absent and must not be recreated or treated
-as quiescent. The current service has 64 nonterminal current-version rows: 46
+as quiescent. The service initially had 64 nonterminal current-version rows: 46
 `READY`, 15 recent zero-cost `PENDING` intents, and three zero-cost
-`PROVISIONING` rows. Replica 52689 is the current global legacy-recovery
-blocker: its A100 provider cluster is present, its request is cancelled after
-lease expiry, and it lacks exact execution quiescence. The exact old API Pod
-UID is absent, which can support a reviewed executor-termination attestation
-but cannot be written as a synthetic request receipt. G1 must seal only this
-retained identity, record `LEGACY_EFFECT_AMBIGUOUS`, reconcile the exact
-provider effect, and project only after a new physical-UID-fenced `ABSENT`
-observation starts after the termination evidence. Replica 52688 has a present
-provider cluster and a succeeded/quiesced request. Replica 52690 has a failed,
-quiesced request and a PHX Kubernetes admission failure caused by a missing
-server-owned Kueue queue label. Those rows remain ordinary typed-recovery work;
-the label defect is owned by the workspace/provider admission configuration,
-not by this action protocol.
+`PROVISIONING` rows. Replica 52689 was the global legacy-recovery blocker: its
+A100 provider cluster was present, its request was cancelled after lease
+expiry, and it lacked exact execution quiescence. G1 sealed only that retained
+identity, recorded `LEGACY_EFFECT_AMBIGUOUS`, observed the provider effect as
+`PRESENT`, performed exact fenced teardown, and projected only after a new
+physical-UID-fenced `ABSENT` observation. The row and cluster are absent; the
+request remains cancelled without a synthetic receipt, and no paid claim
+exists.
+
+The recovery loop then cleared the prior intents from nonterminal `PENDING`
+state and admitted replicas 52688 and 52690 to ordinary typed cleanup. The live
+Serve048 runtime exposed a separate migration-lineage omission: revision-040
+authority recognized heads only through Serve047, so placement acknowledgement
+and the remaining cleanup fail closed. P2b1/P2b2 recognize the reviewed
+additive Serve048--050 heads.
+Replica 52688 still has a present provider cluster and a succeeded/quiesced
+request. Replica 52690 has a failed, quiesced request and a PHX Kubernetes
+admission failure caused by a missing server-owned Kueue queue label. Those
+rows remain ordinary typed-recovery work after the lineage fix; the label
+defect is owned by workspace/provider admission configuration, not this action
+protocol.
 
 ## Decision record
 
@@ -2466,11 +2474,12 @@ approved canary:
 - [x] Inventory the historical seven incident rows and prove that IDs
   52032--52038 are absent. Do not recreate them or misstate absence as
   quiescence.
-- [ ] Reconcile the current retained rows from exact request, provider, and
-  cluster-incarnation evidence. In particular, reconcile replica 52689 through
-  the exact G1 legacy ledger after restoring a capable runtime. Preserve real
-  old-executor effects; record no fabricated quiescence receipt or synthetic
-  association.
+- [x] Reconcile replica 52689 from exact request, executor-termination,
+  provider, and cluster-incarnation evidence through the G1 legacy ledger.
+  Preserve the real old-executor effect and original cancelled request; record
+  no fabricated quiescence receipt or synthetic association.
+- [ ] Deploy the reviewed Serve049/050 authority lineage and verify ordinary
+  typed cleanup converges replicas 52688 and 52690 without manual deletion.
 - [ ] Converge every API acceptor, request backend, queue executor, GC
   participant, possible controller, and profile participant on one immutable
   generic handler/profile/capability digest; drain old and recent leases through
