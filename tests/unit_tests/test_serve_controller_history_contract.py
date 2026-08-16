@@ -2,6 +2,8 @@
 
 import asyncio
 import inspect
+import pickle
+import types
 from unittest import mock
 
 import pytest
@@ -13,6 +15,18 @@ _HISTORY_METHODS = (
     '_record_request_history',
     '_persist_request_classification_history',
     '_record_request_classification_history',
+    '_persist_response_time_history',
+    '_record_response_time_history',
+    '_persist_prediction_time_history',
+    '_record_prediction_time_history',
+    '_persist_autoscaler_history',
+    '_record_autoscaler_history',
+    '_get_accelerator_history_breakdown',
+)
+
+_EXTRACTED_CONTROLLER_GLOBAL_METHODS = (
+    '_persist_request_history',
+    '_record_request_history',
     '_persist_response_time_history',
     '_record_response_time_history',
     '_persist_prediction_time_history',
@@ -50,6 +64,56 @@ def test_history_methods_are_direct_patchable_bindings():
         instance._persist_request_history(  # pylint: disable=protected-access
             request_data))
     recorder.assert_called_once_with(request_data)
+
+
+def test_extracted_history_methods_keep_controller_dependency_patch_surface():
+    instance = _controller()
+    for method_name in _EXTRACTED_CONTROLLER_GLOBAL_METHODS:
+        descriptor = inspect.getattr_static(controller.SkyServeController,
+                                            method_name)
+        assert descriptor.__globals__ is vars(controller)
+        assert getattr(controller.controller_history, method_name) is descriptor
+        assert pickle.loads(pickle.dumps(descriptor)) is descriptor
+
+    request_data = {
+        'lb_session_id': 'lb-a',
+        'request_history_session_id': 'a' * 32,
+        'request_history': {
+            'bucket_seconds': 60,
+            'buckets': [],
+        },
+    }
+    original_writer = mock.Mock(return_value=1)
+    replacement_writer = mock.Mock(return_value=1)
+    replacement_history = types.SimpleNamespace(
+        record_request_activity=replacement_writer)
+    with mock.patch.object(controller.controller_history.serve_history,
+                           'record_request_activity', original_writer), \
+         mock.patch.object(controller, 'serve_history', replacement_history):
+        assert instance._record_request_history(  # pylint: disable=protected-access
+            request_data)
+
+    replacement_writer.assert_called_once()
+    original_writer.assert_not_called()
+
+    original_time = mock.Mock(return_value=111.0)
+    replacement_time = mock.Mock(return_value=222.0)
+    instance._record_autoscaler_history = mock.Mock(return_value=1)  # pylint: disable=protected-access
+    with mock.patch.object(controller.controller_history.time, 'time',
+                           original_time), \
+         mock.patch.object(controller, 'time',
+                           types.SimpleNamespace(time=replacement_time)):
+        asyncio.run(
+            instance._persist_autoscaler_history(  # pylint: disable=protected-access
+                {
+                    'replica_unit': 'physical_backend',
+                    'ready_replicas': 0,
+                    'total_replicas': 0,
+                }, {'provisioning_replicas': 0}))
+
+    replacement_time.assert_called_once_with()
+    original_time.assert_not_called()
+    assert instance._record_autoscaler_history.call_args.args[-1] == 222.0  # pylint: disable=protected-access
 
 
 def test_history_writer_uses_controller_module_patch_surface_once():

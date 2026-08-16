@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import time
+import types
 from typing import Any
 
 from sky.serve import serve_history
@@ -360,19 +361,46 @@ def _get_accelerator_history_breakdown(
     }
 
 
+_CONTROLLER_GLOBAL_METHOD_NAMES = (
+    '_persist_request_history',
+    '_record_request_history',
+    '_persist_response_time_history',
+    '_record_response_time_history',
+    '_persist_prediction_time_history',
+    '_record_prediction_time_history',
+    '_persist_autoscaler_history',
+    '_record_autoscaler_history',
+    '_get_accelerator_history_breakdown',
+)
+
 for _method_name in (
-        '_persist_request_history',
-        '_record_request_history',
+        *_CONTROLLER_GLOBAL_METHOD_NAMES,
         '_persist_request_classification_history',
         '_record_request_classification_history',
-        '_persist_response_time_history',
-        '_record_response_time_history',
-        '_persist_prediction_time_history',
-        '_record_prediction_time_history',
-        '_persist_autoscaler_history',
-        '_record_autoscaler_history',
-        '_get_accelerator_history_breakdown',
 ):
     _history_method = globals()[_method_name]
     _history_method.__module__ = 'sky.serve.controller'
     _history_method.__qualname__ = f'SkyServeController.{_method_name}'
+
+
+def _bind_controller_globals(controller_globals: dict[str, Any]) -> None:
+    """Bind extracted legacy methods to their historical module globals."""
+    for method_name in _CONTROLLER_GLOBAL_METHOD_NAMES:
+        method = globals()[method_name]
+        rebound_method = types.FunctionType(
+            method.__code__,
+            controller_globals,
+            method.__name__,
+            method.__defaults__,
+            method.__closure__,
+        )
+        rebound_method.__kwdefaults__ = (None if method.__kwdefaults__ is None
+                                         else method.__kwdefaults__.copy())
+        rebound_method.__annotations__ = method.__annotations__.copy()
+        rebound_method.__module__ = method.__module__
+        rebound_method.__qualname__ = method.__qualname__
+        rebound_method.__dict__.update(method.__dict__)
+        type_params = getattr(method, '__type_params__', None)
+        if type_params is not None:
+            setattr(rebound_method, '__type_params__', type_params)
+        globals()[method_name] = rebound_method
