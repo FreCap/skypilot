@@ -78,7 +78,12 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert durable_demand_version == 82
     assert non_pool_launch_binding_version < operational_priority_breakdown_version
     assert operational_priority_breakdown_version < durable_demand_version
-    assert server_constants.API_VERSION == durable_demand_version
+    workload_breakdown_version = (
+        server_constants.
+        MIN_KUBERNETES_OPERATIONAL_WORKLOAD_BREAKDOWN_API_VERSION)
+    assert workload_breakdown_version == 83
+    assert durable_demand_version < workload_breakdown_version
+    assert server_constants.API_VERSION == workload_breakdown_version
 
 
 def test_current_demand_reads_database_without_controller():

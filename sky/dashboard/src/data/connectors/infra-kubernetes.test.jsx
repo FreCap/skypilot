@@ -88,11 +88,31 @@ describe('Kubernetes infrastructure gateway characterization', () => {
             'ma-lt (31)': 3,
             'inference-low (-1000)': 5,
           },
+          allocation_workload_breakdown: {
+            'ma-lt (31)': ['training-shared'],
+            'inference-low (-1000)': [
+              'replica-1',
+              'replica-2',
+              'replica-3',
+              'replica-4',
+              'research-shared',
+            ],
+          },
           preemptible_breakdown: { 'inference-low (-1000)': 5 },
           accelerators_preemptible_services: 4,
           preemptible_service_breakdown: { 'boltz-l4-fleet': 4 },
           preemptible_service_priority_breakdown: {
             'boltz-l4-fleet': { 'inference-low (-1000)': 4 },
+          },
+          preemptible_service_priority_workload_breakdown: {
+            'boltz-l4-fleet': {
+              'inference-low (-1000)': [
+                'replica-1',
+                'replica-2',
+                'replica-3',
+                'replica-4',
+              ],
+            },
           },
         },
         'node-b': {
@@ -107,6 +127,11 @@ describe('Kubernetes infrastructure gateway characterization', () => {
             'inference-low (-1000)': 2,
             'drill (-500)': 1,
           },
+          allocation_workload_breakdown: {
+            'ma-lt (31)': ['training-shared'],
+            'inference-low (-1000)': ['replica-4', 'research-shared'],
+            'drill (-500)': ['drill-a'],
+          },
           preemptible_breakdown: {
             'inference-low (-1000)': 2,
             'drill (-500)': 1,
@@ -115,6 +140,11 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           preemptible_service_breakdown: { 'boltz-l4-fleet': 1 },
           preemptible_service_priority_breakdown: {
             'boltz-l4-fleet': { 'inference-low (-1000)': 1 },
+          },
+          preemptible_service_priority_workload_breakdown: {
+            'boltz-l4-fleet': {
+              'inference-low (-1000)': ['replica-4'],
+            },
           },
         },
         // Not ready: its capacity is reported whole as `gpu_not_ready`, so its
@@ -153,10 +183,33 @@ describe('Kubernetes infrastructure gateway characterization', () => {
       'inference-low (-1000)': 7,
       'drill (-500)': 1,
     });
+    expect(perContextGPUs[0].gpu_allocation_workload_breakdown).toEqual({
+      'ma-lt (31)': ['training-shared'],
+      'inference-low (-1000)': [
+        'replica-1',
+        'replica-2',
+        'replica-3',
+        'replica-4',
+        'research-shared',
+      ],
+      'drill (-500)': ['drill-a'],
+    });
     expect(
       perContextGPUs[0].gpu_preemptible_service_priority_breakdown
     ).toEqual({
       'boltz-l4-fleet': { 'inference-low (-1000)': 5 },
+    });
+    expect(
+      perContextGPUs[0].gpu_preemptible_service_priority_workload_breakdown
+    ).toEqual({
+      'boltz-l4-fleet': {
+        'inference-low (-1000)': [
+          'replica-1',
+          'replica-2',
+          'replica-3',
+          'replica-4',
+        ],
+      },
     });
     expect(perContextGPUs[0].gpu_not_ready).toBe(8);
   });
@@ -241,10 +294,12 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           context: 'prod',
           gpu_preemptible: 0,
           gpu_allocation_breakdown: {},
+          gpu_allocation_workload_breakdown: {},
           gpu_preemptible_breakdown: {},
           gpu_preemptible_services: 0,
           gpu_preemptible_service_breakdown: {},
           gpu_preemptible_service_priority_breakdown: {},
+          gpu_preemptible_service_priority_workload_breakdown: {},
         },
         {
           gpu_name: 'A100',
@@ -255,10 +310,12 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           context: 'prod',
           gpu_preemptible: 0,
           gpu_allocation_breakdown: {},
+          gpu_allocation_workload_breakdown: {},
           gpu_preemptible_breakdown: {},
           gpu_preemptible_services: 0,
           gpu_preemptible_service_breakdown: {},
           gpu_preemptible_service_priority_breakdown: {},
+          gpu_preemptible_service_priority_workload_breakdown: {},
         },
       ],
       perNodeGPUs: [
@@ -279,9 +336,11 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_preemptible: null,
           gpu_preemptible_breakdown: null,
           gpu_allocation_breakdown: null,
+          gpu_allocation_workload_breakdown: null,
           gpu_preemptible_services: null,
           gpu_preemptible_service_breakdown: null,
           gpu_preemptible_service_priority_breakdown: null,
+          gpu_preemptible_service_priority_workload_breakdown: null,
         },
         {
           node_name: 'node-a',
@@ -300,9 +359,11 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_preemptible: null,
           gpu_preemptible_breakdown: null,
           gpu_allocation_breakdown: null,
+          gpu_allocation_workload_breakdown: null,
           gpu_preemptible_services: null,
           gpu_preemptible_service_breakdown: null,
           gpu_preemptible_service_priority_breakdown: null,
+          gpu_preemptible_service_priority_workload_breakdown: null,
         },
       ],
       error: null,
@@ -383,12 +444,14 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_free: 3,
           gpu_not_ready: 0,
           gpu_allocation_breakdown: {},
+          gpu_allocation_workload_breakdown: null,
           gpu_name: 'L4',
           gpu_preemptible: 0,
           gpu_preemptible_breakdown: {},
           gpu_preemptible_services: 0,
           gpu_preemptible_service_breakdown: {},
           gpu_preemptible_service_priority_breakdown: {},
+          gpu_preemptible_service_priority_workload_breakdown: null,
         },
       ],
       perContextGPUs: [
@@ -400,11 +463,13 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_not_ready: 0,
           context: 'alpha',
           gpu_allocation_breakdown: {},
+          gpu_allocation_workload_breakdown: null,
           gpu_preemptible: 0,
           gpu_preemptible_breakdown: {},
           gpu_preemptible_services: 0,
           gpu_preemptible_service_breakdown: {},
           gpu_preemptible_service_priority_breakdown: {},
+          gpu_preemptible_service_priority_workload_breakdown: null,
         },
       ],
       perNodeGPUs: [
@@ -425,9 +490,11 @@ describe('Kubernetes infrastructure gateway characterization', () => {
           gpu_preemptible: null,
           gpu_preemptible_breakdown: null,
           gpu_allocation_breakdown: null,
+          gpu_allocation_workload_breakdown: null,
           gpu_preemptible_services: null,
           gpu_preemptible_service_breakdown: null,
           gpu_preemptible_service_priority_breakdown: null,
+          gpu_preemptible_service_priority_workload_breakdown: null,
         },
       ],
       contextStats: {},
