@@ -3038,6 +3038,8 @@ def _prepare_service_status(
                 'requests_per_second': 'requests_per_second',
                 'observed_ready_replicas': 'ready_replicas',
                 'in_flight_requests': 'in_flight_total',
+                'confirmed_in_flight_requests': 'confirmed_in_flight_requests',
+                'unknown_in_flight_replica_count': 'unknown_in_flight_replica_count',
                 'request_queue_depth': 'queue_depth',
                 'rejected_requests': 'rejected_in_window',
                 'recent_rejected_requests': 'rejected_in_recent_window',

@@ -447,6 +447,12 @@ export function normalizeRequestTelemetry(record) {
     ),
     requestRate: nullableNonnegativeNumber(record?.requests_per_second),
     inFlightRequests: nullableNonnegativeInteger(record?.in_flight_requests),
+    confirmedInFlightRequests: nullableNonnegativeInteger(
+      record?.confirmed_in_flight_requests
+    ),
+    unknownInFlightReplicaCount: nullableNonnegativeInteger(
+      record?.unknown_in_flight_replica_count
+    ),
     requestQueueDepth: nullableNonnegativeInteger(record?.request_queue_depth),
     rejectedRequests: nullableNonnegativeInteger(record?.rejected_requests),
     recentRejectedRequests: nullableNonnegativeInteger(

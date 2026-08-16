@@ -1,20 +1,22 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1, P2a, and P2b1 are merged in PRs #1498, #1499, and #1503. P2b2 is
-in exact-head review in PR #1504. The complete additive stack has not been
-deployed. P2b2 includes the adversarial-review correction that
+Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
+#1504. The complete additive stack is deployed in production as v1.1.1302 but
+its per-service demand, route, and ordered-capacity authorities remain dark.
+PR #1521 adds partial-coverage in-flight observability and corrects the
+canonical direct-Helm deployment contract.
+P2b2 includes the adversarial-review correction that
 separates cheapest-compatible demand attribution from supply-aware exact-card
 capacity accounting. A production observation at Serve048 exposed that the
 closed revision-040 placement-normalization authority registry stopped at
 Serve047; P2b1 now recognizes the reviewed additive Serve048 and Serve049 heads
 and P2b2 recognizes its additive Serve050 head before either path can be
 promoted. Production remains on the legacy controller-coupled demand and route
-paths.
+paths pending the documented test-service promotion gates.
 
-The exact post-#1503 P2b2 review scope is 42 files with 4,298 insertions and
-241 deletions relative to `improvements`. GitHub stack #1517 retains #1504
-above that trunk and the blocked draft removals #1506/#1510 above #1504; base
-retargeting did not detach or merge either cleanup.
+The exact post-#1503 P2b2 review scope was 42 files with 4,298 insertions and
+241 deletions relative to `improvements`. The blocked draft removals #1506 and
+#1510 remain unmerged until the promotion and observation gates pass.
 
 Last updated: 2026-08-16
 
@@ -64,6 +66,9 @@ routes, autoscaling, sibling pools, or the service dashboard.
 
 - Make request counts, in-flight work, queue depth, rejection pressure, and
   freshness visible without waiting for the service controller.
+- Preserve useful request observability under partial occupancy coverage:
+  publish a confirmed in-flight lower bound and the exact number of unknown
+  replica URLs while keeping the exact in-flight total nullable.
 - Use one authenticated durable demand feed for both autoscaling and UI.
 - Account compatible ready and committed zero-cost capacity before any paid
   Spot or On-Demand launch is authorized.
@@ -112,8 +117,8 @@ The implementation must reuse these checked-in mechanisms:
 - the generic non-pool binding and per-association reconciliation specified by
   `durable-serve-replica-actions.md`.
 
-Merged P2a PR #1499 contains, but is not present in the current production
-binary and has not been promoted:
+Merged P2a PR #1499 is present in the current production binary but has not
+been promoted:
 
 - a PostgreSQL-clock-fenced latest-report table and stable authenticated
   ingestion endpoint;
@@ -123,12 +128,12 @@ binary and has not been promoted:
   dashboard, plus a status overlay for CLI/legacy consumers. Both prefer fresh
   durable telemetry and report stale/unavailable explicitly.
 
-P2b1 now adds the complete provider-free route projection, and the P2b2
-working branch now adds the promoted autoscaler reader, zero-cost-first
-replanning boundary, immutable capacity plan/head, and planner-bound paid
-claim revalidated immediately before provider I/O. These changes remain dark
-and unpromoted. The final dashboard placement explanation and P3 removal of
-the legacy demand/route paths are not yet implemented.
+P2b1 adds the complete provider-free route projection, and P2b2 adds the
+promoted autoscaler reader, zero-cost-first replanning boundary, immutable
+capacity plan/head, and planner-bound paid claim revalidated immediately
+before provider I/O. Both are deployed but remain dark and unpromoted. The
+final dashboard placement explanation and P3 removal of the legacy
+demand/route paths are not yet implemented.
 
 The 2026-08-16 production read-only audit first found Helm revision 401 on
 v1.1.1296, commit `036c7a2627b34050e00b335b41c8cd7e329cdc2a`, API 81,
@@ -142,22 +147,20 @@ regressed the runtime to v1.1.1287, commit
 The PostgreSQL heads correctly remained forward at API-request 011 and Serve
 047. EKS audit records attribute the mutation to Terraform's Helm provider
 under the operator session for `simone-boltz.bio`; Argo CD is installed on the
-hub but has no Application for the SkyPilot release. The declared production
-authority is the checked-in `skypilot-pin.json` in `boltz-platform`, which still
-pins v1.1.1287 and exact chart/image digests. The next deployment must update
-that pin in a dedicated clean platform worktree, review the Terragrunt plan,
-and apply the exact published release. A direct Helm upgrade would create
-temporary drift and is not the steady-state deployment path. Schema is rolled
-forward only; revision 401 is not replayed.
+hub but has no Application for the SkyPilot release. The audit initially
+mistook a checked-in `boltz-platform` pin for production deployment authority.
+That conclusion was wrong: SkyPilot production intentionally fixes forward
+from merged `boltz-bio/skypilot:improvements` artifacts with a direct,
+reviewed Helm upgrade. No `boltz-platform` pin update is required or desired.
+Schema is rolled forward only; revision 401 is not replayed.
 
 While the additive stack was under review, a second direct Helm mutation
 created revision 403 with v1.1.1299, exact commit
 `8326c5f0490e745d8bd0fea61eb4fe2b16fafbc8`, API 82, and image digest
 `sha256:d0d53742eab3b613e2318def9fd1e55750f86b07da29c01f59df175df327e401`.
 EKS audit attributes that Helm 3.16.4 update to operator identity
-`francesco@boltz.bio`; it is not represented by the platform pin and therefore
-remains deployment drift. The final P2 rollout still goes through the reviewed
-pin and exact saved Terragrunt plan.
+`francesco@boltz.bio`. It is an ordinary direct-Helm fix-forward deployment,
+not platform-pin drift.
 
 While P2b2 exact-head CI was running, another independent direct Helm update
 created revision 404 with v1.1.1301, exact commit
@@ -166,8 +169,28 @@ created revision 404 with v1.1.1301, exact commit
 The rollout completed with no restart and advanced the forward PostgreSQL
 heads to Serve049/API-request 011. Its active requests after readiness were
 read-only status, inventory, and managed-jobs queue reads; it created no
-launch/down provider mutation. It is also absent from the platform pin and
-does not replace the reviewed exact-head deployment path.
+launch/down provider mutation.
+
+The reviewed P2b2 artifact was then deployed directly with Helm as revision
+405: v1.1.1302, commit `895223b618ce0a3c013a90145395761eb7f29270`, API 85,
+image digest
+`sha256:3d88395de8ee87834f8a87af0ecdc98b1a08a64b287003a140231b9ce254b689`,
+and chart digest
+`sha256:d28233613d64207c0b9d873393536f510f36feae53f6109e94baf2e4d18ef4f3`.
+The migration job completed, the API and both provider init containers ran the
+exact image digest with zero restarts, PostgreSQL reached API-request 012 and
+Serve050, and both health endpoints returned 200. All new authorities remain
+dark for `boltz-l4-fleet`, which is still in legacy ordinary binding, legacy
+route, and legacy controller-demand modes.
+
+A subsequent zero-traffic observation found 53/53 physical replicas ready:
+34 A100, 13 A100-80GB, and six paid Spot L4s. Durable request telemetry was
+fresh and complete with zero arrivals, zero queue depth, and zero in-flight
+work, while the legacy controller still reported a supply-insensitive L4
+target of three (`raw_target_num_replicas=2`). The 47 compatible ready
+zero-cost backends did not debit that L4 target. This is direct production
+evidence for the ordered-capacity promotion: additive deployment alone cannot
+correct overlaunch while `LEGACY_CONTROLLER` remains authoritative.
 
 The service remains `resource_action_mode=legacy`,
 `ordinary_launch_binding_mode=legacy`, and non-pool capability false. It has no
@@ -300,8 +323,10 @@ Every consumer exposes one of three states:
   separate
   `compatibility_complete` bit determines whether exact-card demand may become
   scaling or launch authority. A current report with occupancy-unknown routes
-  keeps arrival/queue telemetry fresh but exposes the processing count as
-  unavailable rather than zero;
+  keeps arrival/queue telemetry fresh. It exposes `in_flight_requests` as null,
+  `confirmed_in_flight_requests` as the proven lower bound, and
+  `unknown_in_flight_replica_count` as the exact coverage gap; it never turns
+  partial coverage into an exact zero;
 - `stale`: the last report exists but its database-clock validity expired; or
 - `unavailable`: no valid report can be read or the protocol is unsupported.
 
@@ -450,6 +475,9 @@ contribute ready capacity to a new paid-admission decision.
 The service details page always renders a `Requests now` state:
 
 - fresh in-flight and queued counts;
+- when occupancy coverage is partial, the confirmed processing lower bound
+  and number of backends with unknown occupancy rather than a request-rate
+  substitute;
 - accepted arrivals and rejected pressure over the current window;
 - report age and reporter count; or
 - an explicit stale/unavailable explanation.
@@ -460,6 +488,15 @@ delay fresh request counters. During the dark-write transition, an older API
 server or non-consolidated installation falls back to the existing status
 response; a new consolidated server never silently converts a failed direct
 read to zero.
+
+The processing display and destructive idleness proof share authenticated
+report inputs but have different projections. Retirement and paid-capacity
+reconciliation continue to require a current-round proof for every relevant
+URL. Operator observability may carry the latest generation-valid per-URL
+sample through its bounded freshness TTL and reports coverage explicitly.
+The load balancer must eventually publish those two projections separately so
+one transient probe miss does not erase every confirmed processing count while
+never weakening the downscale fence.
 
 History continues to use the existing minute tables and charts. Empty history
 renders `0 requests observed` only when the selected interval is completely
@@ -513,9 +550,9 @@ production deployments. The live database remains compatible and forward at
 Serve047/API-request 011 after revision 402 regressed only the binary to
 v1.1.1287. It has not activated the new generalized action, demand, or
 placement authorities. Subsequent rollouts must continue to use
-`--reuse-values`; they must roll forward from a fresh revision-402 snapshot and
-must not redeploy an older artifact merely to reproduce the originally
-proposed sequence.
+`--reuse-values`; they must capture a fresh snapshot of the current live
+revision immediately before each upgrade and must not redeploy an older
+artifact merely to reproduce the originally proposed sequence.
 
 The same inspection found no surviving replica, request, coverage, shadow, or
 association records for historical replica IDs 52032--52038. Their earlier
@@ -716,23 +753,31 @@ than the current system.
 ## Deployment and rollback
 
 All SkyPilot source branches target `boltz-bio/skypilot:improvements`. The
-production deployment authority is the checked-in exact runtime pin consumed
-by the `boltz-platform` Terragrunt control-plane unit. The release tuple is
+production deployment path is a direct Helm fix-forward from an immutable
+artifact produced after the reviewed PR merges. The release tuple is
 `skypilot` in namespace `skypilot`; `improvements` is the source branch and
-must never be substituted as the release name. The runtime pin binds version,
-source commit, API version, image digest, and chart digest. Update it only from
-a dedicated clean platform branch/worktree rebased on `origin/main`; run the
-repository tests and Terragrunt plan before the authorized apply. Every rollout
-also captures the live Helm values/manifest immediately before mutation,
-reviews the rendered/plan diff, preserves the complete Terraform-owned Helm
-value flow, and records the live Helm revision, exact image/chart digests,
-schema heads, rollout, and post-deploy observations. A manual Helm mutation is
-an emergency drift operation, not a durable release promotion.
+must never be substituted as the release name. There is no required
+`boltz-platform` runtime pin and no Terragrunt apply in this path.
 
-P1 and P2 are additive and dark before per-service promotion. Revision 402's
-older runtime is not capable of P1 legacy reconciliation even though its
-database is forward-compatible; restore one exact P1/P2-capable cohort before
-any reconciliation or promotion. Promotion
+Before every upgrade, capture `helm history`, live user and all-values,
+manifest, current image IDs, and their hashes as rollback evidence. Pull the
+exact OCI chart and verify its digest. Render a server-side dry run from that
+chart with `--reuse-values`; any list-valued override must restate the complete
+list element rather than replacing it with a partial `--set` value. Confirm
+the diff contains only the intended immutable image/chart and configuration
+changes and gate the rollout on zero active mutating requests. Upgrade with
+`helm upgrade skypilot <exact-chart> -n skypilot --reuse-values --atomic
+--wait --wait-for-jobs`, plus a reviewed complete image override when needed.
+Afterward, record the new Helm revision and verify the migration job, exact
+image IDs for API and init/sidecar containers, PostgreSQL schema heads,
+readiness, health, and service behavior. Database migrations remain
+forward-only. Roll back the Helm revision only when the old binary is proven
+compatible with the current schema; otherwise merge, publish, and deploy a new
+fix-forward artifact.
+
+P1 and P2 are additive and dark before per-service promotion. Revision 405 is
+one exact P1/P2-capable cohort; deployment alone intentionally did not change
+any per-service authority mode. Promotion
 requires one exact capable cohort, no unsettled unbound work for that service,
 fresh demand/route publications, and a successful injected-failure rehearsal.
 Rollback before P3 means disable new promotion, drain/project bound work, and
@@ -769,9 +814,9 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. the live deployment tuple at rollout time, including revision 404's
-   unpinned v1.1.1301 drift, unchanged single-`all` topology, and the forward
-   Serve049/API-request-011 database heads;
+1. the live deployment tuple at rollout time, including direct Helm revision
+   405's exact v1.1.1302 artifacts, unchanged single-`all` topology, and the
+   forward Serve050/API-request-012 database heads;
 2. the completed pre-migration inventory of retained legacy rows and unsettled
    requests; reconcile only rows that actually remain. Record the historical
    absence of IDs 52032--52038 without treating it as quiescence, recreating
@@ -830,8 +875,10 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
   deliberate exact provider teardown, and a subsequent fresh exact absence
   observation through the P1 legacy ledger. Preserve its unmodified cancelled
   request without fabricating quiescence.
-- [ ] Deploy the reviewed Serve049/050 registry lineage and verify ordinary
-  typed cleanup converges replicas 52688 and 52690 without manual deletion.
+- [x] Deploy the reviewed Serve049/050 registry lineage as direct Helm
+  revision 405.
+- [ ] Verify ordinary typed cleanup converges replicas 52688 and 52690 without
+  manual deletion.
 - [ ] Repair the PHX server-owned Kubernetes admission configuration so an
   H200 reserved-fill Pod carries the required Kueue queue label; prove the
   admitted Pod still has the approved low preemptible priority class.

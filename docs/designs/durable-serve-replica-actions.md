@@ -86,13 +86,13 @@ permanently unbound.
 As of 2026-08-16, G1 is merged as PR #1498. It was present in the v1.1.1296
 revision-401 artifact, but a concurrent Terragrunt/Terraform apply created Helm
 revision 402 and regressed the runtime to v1.1.1287 while PostgreSQL correctly
-remained forward at
-API-request 011/Serve047. The current runtime is therefore not capable of the
-G1 legacy-reconciliation operation; no legacy evidence or service authority
-write may be attempted until one exact G1-capable cohort is restored. EKS
-audit records attribute revision 402 to Terraform's Helm provider; the
-checked-in platform runtime pin, not a direct Helm mutation, is the durable
-deployment authority. G1 adds
+remained forward at API-request 011/Serve047. Direct Helm revision 405 has
+since restored one exact G1/P2-capable v1.1.1302 cohort and advanced the
+forward heads to API-request 012/Serve050 without promoting a service. The
+earlier audit incorrectly treated a checked-in platform runtime pin as the
+deployment authority. The production contract is a reviewed direct Helm
+fix-forward from merged SkyPilot artifacts; it requires no `boltz-platform`
+pin or Terragrunt apply. G1 adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
 pre-admission retirement, failure-isolated startup recovery, and exact
