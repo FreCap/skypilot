@@ -23,8 +23,10 @@ def test_status_contract_has_distinct_api_capability_version() -> None:
     assert (server_constants.
             MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION == 78)
     assert server_constants.MIN_NON_POOL_LAUNCH_BINDING_API_VERSION == 80
-    assert server_constants.MIN_SERVE_DURABLE_DEMAND_API_VERSION == 81
-    assert server_constants.API_VERSION == 81
+    assert (server_constants.
+            MIN_KUBERNETES_OPERATIONAL_PRIORITY_BREAKDOWN_API_VERSION == 81)
+    assert server_constants.MIN_SERVE_DURABLE_DEMAND_API_VERSION == 82
+    assert server_constants.API_VERSION == 82
 
 
 def _allocation(

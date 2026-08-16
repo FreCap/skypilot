@@ -353,7 +353,7 @@ tests. It does not include a deployment control plane.
 
 ### P2a: durable demand telemetry and UI
 
-API version 81/Serve048 add the demand-report/live-gauge tables, stable API
+API version 82/Serve048 add the demand-report/live-gauge tables, stable API
 ingestion, non-destructive reporter window, request-history acknowledgement,
 direct current-demand read, status projection, and dashboard freshness
 contract. During transition the LB sends both old controller sync data and the

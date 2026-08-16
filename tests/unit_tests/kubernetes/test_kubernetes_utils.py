@@ -491,11 +491,22 @@ def test_get_kubernetes_node_info_preemptible_split():
         'inference-low (-1000)': 6,
         'drill (-500)': 1,
     }
+    assert node_info.node_info_dict['node-1'].allocation_breakdown == {
+        'priority 0': 1,
+        'inference-low (-1000)': 6,
+        'drill (-500)': 1,
+    }
     assert node_info.node_info_dict[
         'node-1'].accelerators_preemptible_services == 4
     assert node_info.node_info_dict['node-1'].preemptible_service_breakdown == {
         'boltz-l4-fleet': 4
     }
+    assert node_info.node_info_dict[
+        'node-1'].preemptible_service_priority_breakdown == {
+            'boltz-l4-fleet': {
+                'inference-low (-1000)': 4
+            }
+        }
     # Everything on node-2 sits in the top tier, so none of it is reclaimable.
     assert node_info.node_info_dict['node-2'].accelerators_preemptible == 0
     assert node_info.node_info_dict['node-2'].preemptible_breakdown == {}
@@ -503,6 +514,11 @@ def test_get_kubernetes_node_info_preemptible_split():
         'node-2'].accelerators_preemptible_services == 0
     assert node_info.node_info_dict[
         'node-2'].preemptible_service_breakdown == {}
+    assert node_info.node_info_dict['node-2'].allocation_breakdown == {
+        'priority 0': 8
+    }
+    assert node_info.node_info_dict[
+        'node-2'].preemptible_service_priority_breakdown == {}
 
 
 def test_get_allocated_resources_attributes_skyserve_from_cluster_rows():
@@ -674,6 +690,11 @@ def test_get_kubernetes_node_info_uniform_priority_is_not_preemptible():
 
     assert node_info.node_info_dict['node-1'].accelerators_preemptible == 0
     assert node_info.node_info_dict['node-1'].preemptible_breakdown == {}
+    assert node_info.node_info_dict['node-1'].allocation_breakdown == {
+        'inference-low (-1000)': 8
+    }
+    assert node_info.node_info_dict[
+        'node-1'].preemptible_service_priority_breakdown is None
 
 
 def test_get_kubernetes_node_info_preemptible_unknown_without_pod_access():
@@ -692,6 +713,9 @@ def test_get_kubernetes_node_info_preemptible_unknown_without_pod_access():
 
     assert node_info.node_info_dict['node-1'].accelerators_preemptible is None
     assert node_info.node_info_dict['node-1'].preemptible_breakdown is None
+    assert node_info.node_info_dict['node-1'].allocation_breakdown is None
+    assert node_info.node_info_dict[
+        'node-1'].preemptible_service_priority_breakdown is None
 
 
 def test_get_all_kube_context_names():
