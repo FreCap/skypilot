@@ -1,7 +1,8 @@
 # SkyServe demand, capacity, and telemetry convergence
 
 Status: P1 is merged in PR #1498; P2a is implemented in PR #1499, P2b1 in
-PR #1503, and P2b2 in PR #1504. P2b2 includes the adversarial-review
+PR #1503, and P2b2 in PR #1504. The additive stack is in exact-head CI and
+has not been deployed. P2b2 includes the adversarial-review
 correction that separates cheapest-compatible demand attribution from
 supply-aware exact-card capacity accounting. The production compatibility
 precondition is satisfied, but production remains on the legacy
@@ -447,8 +448,8 @@ contract. During transition the LB sends both old controller sync data and the
 new durable report. The durable feed is authoritative for display only when
 fresh; it has no scaling or launch authority in P2a.
 
-Current reviewed size: approximately 2,650 source/test/UI lines across 33
-files, mostly reusing existing aggregators, history tables, proxy
+Current reviewed size: 2,795 additions and 82 deletions across 34 files,
+mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
 bounded report validation, and PostgreSQL migration matrix account for the
 increase over the 1,000--1,800 estimate.
@@ -458,7 +459,15 @@ tests, 13 validation tests, 121 focused dashboard tests, repository-wide mypy
 over 940 source files, changed-file pylint at 10/10, dashboard ESLint and
 Prettier, and the exact HA cases where replica-global async occupancy must not
 be double-counted and a fresh standby must not turn an expired active report
-into a false zero. CI and live rollout evidence remain open.
+into a false zero. The first exact-head CI run also established four permanent
+integration gates: current-head forward-only tests derive the Serve revision
+instead of pinning the predecessor; all five load-balancer background loops,
+including demand publication, are owned and cancelled; the dashboard demand
+GET is viewer-readable while the internal reporter POST is explicitly denied;
+and controller-capacity tests stub durable demand so one authority cannot
+silently contaminate the other's fixture. The four exact regressions and the
+real-PostgreSQL case pass locally; the corrected exact-head CI and live rollout
+evidence remain open.
 
 ### P2b1: provider-free route projection
 
@@ -477,8 +486,8 @@ is the temporary transition path and is removed by P3. A stale projection may
 retain an already-applied route only under the existing bounded LB outage
 contract; it is never ready capacity for planning.
 
-Current implementation size: approximately 2,000 source/test/design lines
-across 25 files, including about 600 lines of pure and real-PostgreSQL tests.
+Current implementation size: 2,146 additions and 59 deletions across 29 files,
+including about 600 lines of pure and real-PostgreSQL tests.
 The increase over the 900--1,500 estimate comes from closed persisted-payload
 validation, immutable URL/record alias evidence, and integration tests at the
 probe, proxy, LB-apply, and demand-report boundaries. The earlier experimental
@@ -555,7 +564,7 @@ controller-sync endpoint may still accept routing/drain reports during the
 transition, but it cannot call `collect_request_information`; only the durable
 reader may advance autoscaler demand state.
 
-Reviewed P2b2 size: 32 files, 3,950 additions and 175 deletions.
+Reviewed P2b2 size: 40 files, 3,958 additions and 189 deletions.
 This is large and above the original 1,200--2,000-line estimate because it
 includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
 races, controller ordering tests, strict route/content/LB-generation
@@ -570,7 +579,8 @@ plan, just like an ordinary zero-cost commit.
 Local P2b2 correction evidence on 2026-08-16 includes the complete Serve
 controller, concurrency/QPS autoscaler, compatibility-contract,
 decision-contract, and pure admission suites, plus all ten admission tests on
-a real local PostgreSQL 14 server. Formatting, mypy over 947 source files,
+a real local PostgreSQL 14 server, the complete PostgreSQL API-request suite,
+and 101 focused dashboard tests. Formatting, mypy over 947 source files,
 pylint, and dashboard lint all pass. Remote CI, injected provider failure, and
 production promotion evidence remain open.
 
