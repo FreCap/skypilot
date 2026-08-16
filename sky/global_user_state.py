@@ -101,6 +101,7 @@ class ClusterRefreshFields(typing.NamedTuple):
 
 
 Base = global_user_state_schema.Base
+declarative = global_user_state_schema.declarative
 auth_session_table = global_user_state_schema.auth_session_table
 cluster_event_table = global_user_state_schema.cluster_event_table
 cluster_history_table = global_user_state_schema.cluster_history_table
