@@ -74,6 +74,7 @@ _EXPECTED_TABLE_COLUMNS = {
 
 
 def test_global_user_state_schema_contract() -> None:
+    assert global_user_state.declarative is global_user_state_schema.declarative
     assert set(global_user_state.Base.metadata.tables) == {
         table_name for table_name, _ in _EXPECTED_TABLE_COLUMNS.values()
     }
