@@ -215,7 +215,7 @@ class NonPoolLaunchProfile:
         authorization_reference: str,
         authorization_generation: int,
         authorization_payload: Mapping[str, Any],
-    ) -> 'NonPoolLaunchProfile':
+    ) -> NonPoolLaunchProfile:
         """Construct a canonical v1 profile from planner-owned evidence."""
         if not isinstance(kind, NonPoolLaunchProfileKind):
             raise ValueError('kind must be a closed non-pool launch profile.')
@@ -260,7 +260,7 @@ class NonPoolLaunchProfile:
             raise ValueError('Non-pool profile digest is not canonical.')
 
     @classmethod
-    def from_mapping(cls, values: Mapping[str, Any]) -> 'NonPoolLaunchProfile':
+    def from_mapping(cls, values: Mapping[str, Any]) -> NonPoolLaunchProfile:
         """Parse the exact profile tuple installed in a bound request."""
         try:
             profile = cls(

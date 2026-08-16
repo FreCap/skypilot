@@ -8,10 +8,11 @@ Kubernetes context/physical-cluster UID and logical cluster name.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import dataclasses
 import datetime
 import enum
-from typing import Any, Mapping
+from typing import Any
 import uuid
 
 import sqlalchemy

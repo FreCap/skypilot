@@ -168,11 +168,11 @@ def _evidence_value(value: Any) -> Any:
 
 
 def read_legacy_launch_request_evidence(
-    identity: 'ordinary_launch_binding_lib.LegacyLaunchIdentity',
+    identity: ordinary_launch_binding_lib.LegacyLaunchIdentity,
     *,
     executor_terminated_at: datetime.datetime | None = None,
     executor_termination_evidence: Mapping[str, Any] | None = None,
-) -> 'ordinary_launch_binding_lib.LegacyReconciliationEvidence':
+) -> ordinary_launch_binding_lib.LegacyReconciliationEvidence:
     """Snapshot one historical unbound ``sky.launch`` request.
 
     This deliberately reports the stored facts as they are. In particular,
@@ -324,7 +324,7 @@ class BoundOrdinaryLaunchProjectionInput:
     pre_effect_terminal: bool
     cancel_reason: str | None
     paid_capacity_pool_key: str | None
-    provider_evidence: 'ordinary_launch_binding_lib.ProviderEvidence | None' = (
+    provider_evidence: ordinary_launch_binding_lib.ProviderEvidence | None = (
         None)
 
 
