@@ -43,7 +43,7 @@ serve_lb_demand_reports_table = sqlalchemy.Table(
     sqlalchemy.Column('payload',
                       postgresql.JSONB(none_as_null=True),
                       nullable=False),
-    sqlalchemy.CheckConstraint('protocol_version = 1',
+    sqlalchemy.CheckConstraint('protocol_version IN (1, 2)',
                                name='serve048_demand_protocol_ck'),
     sqlalchemy.CheckConstraint('sequence > 0',
                                name='serve048_demand_sequence_positive_ck'),

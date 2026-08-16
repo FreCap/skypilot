@@ -312,14 +312,14 @@ def build_route_view(
     replica_info: dict[str, dict[str, str]] = {}
     advertised_sources: dict[str, list[Any]] = {}
     for info in ready_infos:
-        material = resolved_routes.get(info.replica_id)
-        if material is None:
+        ready_material = resolved_routes.get(info.replica_id)
+        if ready_material is None:
             continue
-        url = _normalize_url(material.url)
+        url = _normalize_url(ready_material.url)
         if url not in collision_urls:
-            identity = current_identities.get(url)
-            if (identity is None or
-                    identity['replica_record_id'] != info.replica_record_id):
+            current_identity = current_identities.get(url)
+            if (current_identity is None or current_identity[  # pylint: disable=line-too-long
+                    'replica_record_id'] != info.replica_record_id):
                 continue
         advertised_sources.setdefault(url, []).append(info)
 
@@ -336,7 +336,7 @@ def build_route_view(
             current_identities.pop(url, None)
             continue
         info = sources[0]
-        material = resolved_routes[info.replica_id]
+        advertised_material = resolved_routes[info.replica_id]
         marker = marker_for_route(info,
                                   url) if _is_recovery_capable(info) else None
         if _is_recovery_capable(info) and marker is None:
@@ -346,8 +346,8 @@ def build_route_view(
             }
             continue
         wire_info = {
-            'gpu_type': material.gpu_type,
-            'gpu_count': str(material.gpu_count),
+            'gpu_type': advertised_material.gpu_type,
+            'gpu_count': str(advertised_material.gpu_count),
         }
         if marker is not None:
             wire_info.update({
@@ -365,9 +365,9 @@ def build_route_view(
             wire_info['async_occupancy'] = ('true'
                                             if async_occupancy else 'false')
         replica_info[url] = wire_info
-        identity = current_identities.get(url)
-        if identity is not None:
-            identity['advertised'] = True
+        advertised_identity = current_identities.get(url)
+        if advertised_identity is not None:
+            advertised_identity['advertised'] = True
 
     response = {
         'replica_info': replica_info,
@@ -502,8 +502,9 @@ def _owner_matches(identity: RoutePublisherIdentity,
             owner.get('controller_ip') == identity.controller_ip)
 
 
-def _snapshot_owner_matches(snapshot: Mapping[str, Any],
-                            owner: Mapping[str, Any]) -> bool:
+def snapshot_owner_matches(snapshot: Mapping[str, Any],
+                           owner: Mapping[str, Any]) -> bool:
+    """Return whether one durable snapshot belongs to the current owner."""
     return (snapshot.get('service_hash') == owner.get('hash') and
             snapshot.get('service_lifecycle_epoch')
             == owner.get('lifecycle_epoch') and
@@ -580,9 +581,10 @@ class RouteProjectionRepository:
         return query.with_for_update() if for_update else query
 
     @staticmethod
-    def _snapshot_from_row(
+    def validate_snapshot_row(
         row: Mapping[str,
                      Any]) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """Validate and decode one persisted content-addressed snapshot."""
         try:
             if row['protocol_version'] != PROTOCOL_VERSION:
                 raise RouteProjectionValidationError(
@@ -669,7 +671,7 @@ class RouteProjectionRepository:
                     if previous_row is None:
                         raise RouteProjectionCorruption(
                             'Route head references no snapshot.')
-                    _, previous_identities = self._snapshot_from_row(
+                    _, previous_identities = self.validate_snapshot_row(
                         previous_row)
                 now = session.execute(
                     sqlalchemy.select(
@@ -679,11 +681,11 @@ class RouteProjectionRepository:
                                             previous_identities,
                                             canonical_records, now)
                 digest = _content_sha256(validated_response, identities)
-                duplicate = bool(
-                    previous_row is not None and
-                    _snapshot_owner_matches(previous_row, owner) and
-                    previous_row['content_sha256'] == digest)
+                duplicate = bool(previous_row is not None and
+                                 snapshot_owner_matches(previous_row, owner) and
+                                 previous_row['content_sha256'] == digest)
                 if duplicate:
+                    assert previous_row is not None
                     generation = int(previous_row['generation'])
                 else:
                     maximum = session.execute(
@@ -808,10 +810,10 @@ class RouteProjectionRepository:
                 if snapshot is None:
                     raise RouteProjectionCorruption(
                         'Route head references no snapshot.')
-                if not _snapshot_owner_matches(snapshot, owner):
+                if not snapshot_owner_matches(snapshot, owner):
                     raise RouteProjectionUnavailable(
                         'Route projection owner or version is stale.')
-                response, _ = self._snapshot_from_row(snapshot)
+                response, _ = self.validate_snapshot_row(snapshot)
                 response.update({
                     'route_projection_generation': int(head['generation']),
                     'route_projection_sha256': snapshot['content_sha256'],
@@ -863,10 +865,10 @@ class RouteProjectionRepository:
                         _SNAPSHOTS.c.generation ==
                         head['generation'])).mappings().one_or_none()
                 if (snapshot is None or
-                        not _snapshot_owner_matches(snapshot, owner)):
+                        not snapshot_owner_matches(snapshot, owner)):
                     raise RouteProjectionUnavailable(
                         'A current-owner route snapshot is required.')
-                self._snapshot_from_row(snapshot)
+                self.validate_snapshot_row(snapshot)
                 next_epoch = int(owner['route_source_epoch']) + 1
                 session.execute(
                     sqlalchemy.update(_SERVICES).where(

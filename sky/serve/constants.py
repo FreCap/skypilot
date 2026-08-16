@@ -481,7 +481,8 @@ LB_CONTROLLER_SYNC_PATH = '/controller/load_balancer_sync'
 # routes above, this path terminates at the stable API server and must never be
 # proxied to the per-service controller process.
 LB_DEMAND_REPORT_PATH = '/demand'
-LB_DEMAND_REPORT_PROTOCOL_VERSION = 1
+LB_DEMAND_REPORT_PROTOCOL_VERSION = 2
+LB_DEMAND_REPORT_MIN_PROTOCOL_VERSION = 1
 LB_DEMAND_REPORT_INTERVAL_SECONDS = 5
 LB_DEMAND_REPORT_TIMEOUT_SECONDS = 10
 LB_DEMAND_REPORT_MAX_CLOCK_SKEW_SECONDS = 30
@@ -489,6 +490,7 @@ LB_DEMAND_REPORT_MAX_CLOCK_SKEW_SECONDS = 30
 # from the PostgreSQL clock on receipt; reporter wall clocks are diagnostic
 # only and cannot extend launch authority.
 LB_DEMAND_REPORT_TTL_SECONDS = 15
+CAPACITY_PLAN_TTL_SECONDS = 15
 LB_DEMAND_REPORT_RETENTION_SECONDS = 60 * 60
 LB_DEMAND_REPORT_MAX_REPORTERS = 32
 LB_DEMAND_REPORT_MAX_BYTES = 512 * 1024
@@ -558,6 +560,7 @@ CONTROLLER_CONFIG_CLEANUP_ENDPOINT_PATH = (
     '/controller/cleanup_staged_update_config')
 CONTROLLER_ORDINARY_LAUNCH_BINDING_ENDPOINT_PATH = (
     '/controller/internal/ordinary_launch_binding')
+CONTROLLER_DEMAND_SOURCE_ENDPOINT_PATH = ('/controller/internal/demand_source')
 SERVE_UPDATE_CONFIG_SNAPSHOT_PROTOCOL_VERSION = 1
 VERSIONED_HA_CONFIG_RECOVERY_MARKER = (
     '# SKY_SERVE_VERSIONED_CONFIG_RECOVERY_V1')

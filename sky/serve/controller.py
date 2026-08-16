@@ -39,8 +39,10 @@ from sky import skypilot_config
 from sky import task as task_lib
 from sky.adaptors import common as adaptors_common
 from sky.serve import autoscalers
+from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
+from sky.serve import demand_state
 from sky.serve import kubernetes_identity
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
@@ -640,6 +642,8 @@ class SkyServeController:
         # intentionally process-local: after restart logical scale-down stays
         # disabled until the new controller consumes a fresh report.
         self._reconcile_generation = 0
+        self._durable_demand_snapshot: (demand_state.DurableAutoscalingSnapshot
+                                        | None) = None
         # Immutable routing configuration shipped to the external load
         # balancer. Stored in-memory and updated only after the controller's
         # live autoscaler / replica-manager state transitions, so syncs never
@@ -1478,6 +1482,18 @@ class SkyServeController:
             # Either genuine Pod may refresh routing during the two-Ready
             # maxSurge window, but it may not mutate demand state.
             return True
+        demand_source = capacity_admission.get_service_source_mode(
+            self._service_name)
+        if demand_source is None:
+            # A central-state failure cannot silently return demand ownership
+            # to the controller-sync path after promotion.
+            if self._service_hash is not None:
+                logger.warning('Suppressing controller-sync demand because '
+                               'the durable source mode is unavailable.')
+                return True
+        elif demand_source[0] is (
+                capacity_admission.DemandSourceMode.DURABLE_FEED):
+            return True
 
         # Parse reporter-controlled demand only after its dedicated gate.
         # Besides preventing state mutation, this keeps a stale/wrong Pod from
@@ -1506,6 +1522,16 @@ class SkyServeController:
         # generation become visible in one atomic publication, so a planner
         # can never observe a new generation paired with the previous gauges.
         with self._routing_state_lock:
+            # Promotion can commit after the unlocked parsing check above but
+            # before this mutation lock.  Re-read at the linearization point
+            # so an in-flight legacy sync cannot mutate demand after the
+            # durable source epoch becomes authoritative.
+            current_source = capacity_admission.get_service_source_mode(
+                self._service_name)
+            if (current_source is None and self._service_hash is not None) or (
+                    current_source is not None and current_source[0]
+                    is capacity_admission.DemandSourceMode.DURABLE_FEED):
+                return True
             self._reconcile_generation += 1
             reconcile_generation = self._reconcile_generation
             compatibility_demand_complete = (
@@ -3802,6 +3828,42 @@ class SkyServeController:
             if not self._actuation_stop.is_set():
                 self._finish_actuation_transition(transition_generation)
 
+    def _transition_demand_source(self, mode: str,
+                                  expected_source_epoch: int) -> int:
+        """Move one service between explicit, mutually exclusive sources."""
+        transition_generation = self._begin_actuation_transition()
+        try:
+            authority = self._ordinary_launch_binding_authority
+            if authority is None or not authority.generic_launches_required:
+                raise capacity_admission.CapacityAdmissionUnavailable(
+                    'Demand promotion requires generic non-pool launch '
+                    'authority first.')
+            # Serialize the source-epoch CAS with the legacy sync mutation
+            # linearization point.  Once promotion commits, no in-flight sync
+            # can still call collect_request_information under the old mode.
+            with self._routing_state_lock:
+                current = capacity_admission.get_service_source_mode(
+                    self._service_name)
+                if current is None or current[1] != expected_source_epoch:
+                    raise capacity_admission.CapacityAdmissionConflict(
+                        'Demand source epoch changed before transition.')
+                if mode == 'durable':
+                    if current[0] is (
+                            capacity_admission.DemandSourceMode.DURABLE_FEED):
+                        return current[1]
+                    return (
+                        request_postgres.
+                        promote_ordered_capacity_admission_service(authority))
+                if current[0] is (
+                        capacity_admission.DemandSourceMode.LEGACY_CONTROLLER):
+                    return current[1]
+                return (
+                    request_postgres.demote_ordered_capacity_admission_service(
+                        authority, expected_source_epoch))
+        finally:
+            if not self._actuation_stop.is_set():
+                self._finish_actuation_transition(transition_generation)
+
     def _get_actuation_stop(self) -> threading.Event:
         return self._actuation_stop
 
@@ -5356,6 +5418,64 @@ class SkyServeController:
             # provider-busy result relies on the bounded recovery wakeup.
             self._notify_scale_reconcile()
 
+    @staticmethod
+    def _ordered_demand_target(
+        decision_autoscaler: autoscalers.Autoscaler,) -> dict[str, int]:
+        """Return one exact-card map or one aggregate accounting class."""
+        final_target = max(
+            0, int(decision_autoscaler.get_final_target_num_replicas()))
+        raw_target = decision_autoscaler.info().get(
+            'demand_target_by_accelerator')
+        if isinstance(raw_target, dict):
+            exact_target = {
+                str(card).casefold(): int(count)
+                for card, count in raw_target.items()
+                if isinstance(card, str) and card and isinstance(count, int) and
+                not isinstance(count, bool) and count >= 0
+            }
+            if exact_target and sum(exact_target.values()) == final_target:
+                return exact_target
+        return {capacity_admission.AGGREGATE_ACCELERATOR: final_target}
+
+    def _publish_ordered_paid_authority(
+        self,
+        decision_autoscaler: autoscalers.Autoscaler,
+        decision_version: int,
+    ) -> capacity_admission.PaidLaunchAuthority | None:
+        """Bind a post-zero-cost residual to the current durable demand."""
+        snapshot = self._durable_demand_snapshot
+        binding = self._ordinary_launch_binding_authority
+        if (snapshot is None or binding is None or
+                snapshot.service_hash != self._service_hash or
+                snapshot.demand_source_epoch <= 0):
+            return None
+        demand_target = self._ordered_demand_target(decision_autoscaler)
+        normalized_demand = dict(snapshot.normalized_demand)
+        normalized_demand.update(autoscaler_target=(
+            decision_autoscaler.get_final_target_num_replicas()),
+                                 replica_unit=decision_autoscaler.replica_unit)
+        plan = capacity_admission.CapacityPlanInput(
+            service_name=self._service_name,
+            service_hash=snapshot.service_hash,
+            service_lifecycle_epoch=binding.service_lifecycle_epoch,
+            service_version=decision_version,
+            demand_source_epoch=snapshot.demand_source_epoch,
+            demand_feed_generation=snapshot.demand_feed_generation,
+            receipt_watermark=snapshot.receipt_watermark,
+            route_generation=snapshot.route_generation,
+            route_sha256=snapshot.route_sha256,
+            route_source_epoch=snapshot.route_source_epoch,
+            normalized_demand=normalized_demand,
+            demand_target_by_accelerator=demand_target)
+        try:
+            return capacity_admission.CapacityAdmissionRepository().publish(
+                plan)
+        except (capacity_admission.CapacityAdmissionError, ValueError) as error:
+            logger.warning('Suppressing paid launch because ordered capacity '
+                           'authority could not be published: '
+                           f'{common_utils.format_exception(error)}')
+            return None
+
     def _reconcile_scale_once(self, reconcile_generation: int) -> None:
         """Plan and actuate one optimistic, version-fenced scale epoch."""
         stop_event = self._get_actuation_stop()
@@ -5370,6 +5490,37 @@ class SkyServeController:
                                                         decision_autoscaler,
                                                         decision_version):
                     return
+                demand_source = capacity_admission.get_service_source_mode(
+                    self._service_name)
+                if demand_source is None and self._service_hash is not None:
+                    # A central-state read failure cannot silently revive the
+                    # legacy autoscaler path after a durable promotion.
+                    self._durable_demand_snapshot = None
+                    return
+                durable_demand_promoted = (
+                    demand_source is not None and demand_source[0]
+                    is capacity_admission.DemandSourceMode.DURABLE_FEED)
+                if durable_demand_promoted:
+                    durable_snapshot = demand_state.get_autoscaling_snapshot(
+                        self._service_name, self._service_hash or '')
+                    if durable_snapshot is None:
+                        # Stale or incomplete is unknown, never zero.  Do not
+                        # reuse the last promoted snapshot for either free or
+                        # paid capacity actuation.
+                        self._durable_demand_snapshot = None
+                        return
+                    request_information = dict(
+                        durable_snapshot.request_information)
+                    request_information['replace_request_window'] = True
+                    with self._routing_state_lock:
+                        if not self._scale_actuation_is_current(
+                                actuation_generation, decision_autoscaler,
+                                decision_version):
+                            return
+                        decision_autoscaler.collect_request_information(
+                            request_information)
+                        self._reconcile_generation += 1
+                        self._durable_demand_snapshot = durable_snapshot
                 with self._routing_state_lock:
                     notification_generation = (
                         self._scale_reconcile_coordinator.generation)
@@ -5469,6 +5620,80 @@ class SkyServeController:
                             actuation_generation, decision_autoscaler,
                             decision_version):
                         return
+                ordered_paid_authority = None
+                if durable_demand_promoted:
+                    ordinary_physical_overrides: list[dict[str, Any] | None] = [
+                        option.target
+                        for option in scaling_options
+                        if option.operator == autoscalers.
+                        AutoscalerDecisionOperator.SCALE_UP and option.reason !=
+                        autoscalers.AutoscalerDecisionReason.COST_REBALANCE and
+                        (option.target is None or
+                         isinstance(option.target, dict))
+                    ]
+                    ordinary_logical_targets = [
+                        option.target
+                        for option in scaling_options
+                        if option.operator ==
+                        autoscalers.AutoscalerDecisionOperator.SCALE_UP and
+                        option.reason != autoscalers.AutoscalerDecisionReason.
+                        COST_REBALANCE and isinstance(
+                            option.target, autoscalers.LogicalScaleTarget) and
+                        not option.target.replace_unknown_replica_ids
+                    ]
+                    zero_cost_progress = False
+                    if ordinary_physical_overrides:
+                        accepted = self._replica_manager.scale_up_batch(
+                            ordinary_physical_overrides,
+                            expected_version=decision_version,
+                            launch_priority=(
+                                decision_autoscaler.current_launch_priority()),
+                            paid_launch_allowed=False)
+                        zero_cost_progress = bool(accepted)
+                    for target in ordinary_logical_targets:
+                        zero_kwargs: dict[str, Any] = {
+                            'launch_priority': target.launch_priority,
+                            'paid_launch_allowed': False,
+                        }
+                        if target.launch_budget is not None:
+                            zero_kwargs['launch_budget'] = target.launch_budget
+                        if target.launch_priority_by_accelerator:
+                            zero_kwargs[
+                                'launch_priority_by_accelerator'] = dict(
+                                    target.launch_priority_by_accelerator)
+                        if target.target_capacity_by_accelerator:
+                            zero_kwargs[
+                                'target_capacity_by_accelerator'] = dict(
+                                    target.target_capacity_by_accelerator)
+                            zero_kwargs['accelerator_shapes'] = dict(
+                                target.accelerator_shapes)
+                        accepted = (
+                            self._replica_manager.scale_up_to_logical_capacity(
+                                target.target_capacity, target.version,
+                                target.reconcile_generation, **zero_kwargs))
+                        zero_cost_progress = zero_cost_progress or bool(
+                            accepted)
+                    if zero_cost_progress:
+                        # Replan from the newly committed zero-cost rows. Paid
+                        # residual is never inferred in the same pre-commit
+                        # snapshot.
+                        self._notify_scale_reconcile()
+                        return
+                    for target in ordinary_logical_targets:
+                        if target.cold_launch_authority_by_accelerator is None:
+                            logger.warning(
+                                'Suppressing promoted logical paid launch '
+                                'without exact-card residual authority.')
+                            return
+                    # Publish on every fresh promoted reconcile, including a
+                    # zero target.  Duplicate semantic content refreshes the
+                    # current head for queued claims; a demand drop mints a
+                    # new zero-residual generation and revokes the old one.
+                    ordered_paid_authority = (
+                        self._publish_ordered_paid_authority(
+                            decision_autoscaler, decision_version))
+                    if ordered_paid_authority is None:
+                        return
                 # Batch consecutive SCALE_UP decisions into ONE
                 # replica-manager call: each scale_up acquires the manager
                 # lock, which the readiness-probe round holds for tens of
@@ -5504,13 +5729,18 @@ class SkyServeController:
                         return
                     aggregate_priority = (
                         producer_autoscaler.current_launch_priority())
+                    paid_authority_kwargs: dict[str, Any] = {}
+                    if ordered_paid_authority is not None:
+                        paid_authority_kwargs['paid_launch_authority'] = (
+                            ordered_paid_authority)
                     if not isinstance(
                             producer_autoscaler,
                             autoscalers.InstanceAwareRequestRateAutoscaler):
                         self._replica_manager.scale_up_batch(
                             list(pending_scale_up),  # noqa: B023
                             expected_version=expected_version,
-                            launch_priority=aggregate_priority)
+                            launch_priority=aggregate_priority,
+                            **paid_authority_kwargs)
                         pending_scale_up.clear()  # noqa: B023
                         return
 
@@ -5545,7 +5775,8 @@ class SkyServeController:
                         self._replica_manager.scale_up_batch(
                             resources_overrides,
                             expected_version=expected_version,
-                            launch_priority=launch_priority)
+                            launch_priority=launch_priority,
+                            **paid_authority_kwargs)
                     pending_scale_up.clear()  # noqa: B023
 
                 def _flush_logical_scale_down() -> None:
@@ -5617,6 +5848,12 @@ class SkyServeController:
                                         target_capacity_by_accelerator)
                                 replacement_kwargs['accelerator_shapes'] = dict(
                                     logical_target.accelerator_shapes)
+                            if (not logical_target.replace_unknown_replica_ids
+                                    and scaling_option.reason != autoscalers.
+                                    AutoscalerDecisionReason.COST_REBALANCE and
+                                    ordered_paid_authority is not None):
+                                replacement_kwargs['paid_launch_authority'] = (
+                                    ordered_paid_authority)
                             self._replica_manager.scale_up_to_logical_capacity(
                                 logical_target.target_capacity,
                                 logical_target.version,
@@ -5625,7 +5862,16 @@ class SkyServeController:
                         else:
                             assert (scaling_option.target is None or isinstance(
                                 scaling_option.target, dict)), scaling_option
-                            pending_scale_up.append(scaling_option.target)
+                            if (scaling_option.reason == autoscalers.
+                                    AutoscalerDecisionReason.COST_REBALANCE):
+                                _flush_scale_up()
+                                self._replica_manager.scale_up_batch(
+                                    [scaling_option.target],
+                                    expected_version=decision_version,
+                                    launch_priority=(decision_autoscaler.
+                                                     current_launch_priority()))
+                            else:
+                                pending_scale_up.append(scaling_option.target)
                     else:
                         _flush_scale_up()
                         if isinstance(scaling_option.target,
@@ -5881,6 +6127,50 @@ class SkyServeController:
                     'message': common_utils.format_exception(error),
                 },
                                               status_code=500)
+
+        @self._app.post(
+            serve_constants.CONTROLLER_DEMAND_SOURCE_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        def set_demand_source_mode(request_data: dict[str, Any] = fastapi.Body(
+            ...)) -> fastapi.Response:
+            """Promote or demote the sole autoscaling demand source."""
+            mode = request_data.get('mode')
+            expected_service_hash = request_data.get('expected_service_hash')
+            expected_epoch = request_data.get('expected_source_epoch')
+            if mode not in ('legacy', 'durable'):
+                return responses.JSONResponse(
+                    content={'message': 'mode must be legacy or durable.'},
+                    status_code=400)
+            if (isinstance(expected_epoch, bool) or
+                    not isinstance(expected_epoch, int) or expected_epoch < 0):
+                return responses.JSONResponse(content={
+                    'message': ('expected_source_epoch must be a '
+                                'nonnegative integer.')
+                },
+                                              status_code=400)
+            if expected_service_hash != self._service_hash:
+                return responses.JSONResponse(
+                    content={'message': 'Service incarnation changed.'},
+                    status_code=409)
+            try:
+                epoch = self._transition_demand_source(mode, expected_epoch)
+                return responses.JSONResponse(content={
+                    'demand_source_mode': mode,
+                    'demand_source_epoch': epoch,
+                })
+            except (capacity_admission.CapacityAdmissionError,
+                    RuntimeError) as error:
+                logger.warning('Demand-source transition rejected for %s: %s',
+                               self._service_name,
+                               common_utils.format_exception(error))
+                return responses.JSONResponse(content={'message': str(error)},
+                                              status_code=409)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.exception('Demand-source transition failed for %s.',
+                                 self._service_name)
+                return responses.JSONResponse(
+                    content={'message': common_utils.format_exception(error)},
+                    status_code=500)
 
         # Deliberately a sync handler: parsing and committing the task YAML can
         # perform blocking file/DB I/O. Runtime application happens on the

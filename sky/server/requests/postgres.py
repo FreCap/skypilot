@@ -60,6 +60,7 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
+capacity_admission = adaptors_common.LazyImport('sky.serve.capacity_admission')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
 managed_job_state_schema = adaptors_common.LazyImport('sky.jobs.state_schema')
@@ -582,6 +583,13 @@ def _non_pool_launch_binding_process_capable(role: str,
     return True
 
 
+def _ordered_capacity_admission_process_capable(role: str,
+                                                backend_capable: bool) -> bool:
+    """Whether this process can enforce the API012 paid-authority tuple."""
+    return (_non_pool_launch_binding_process_capable(role, backend_capable) and
+            role in ('all', 'api', 'executor', 'controller'))
+
+
 def execution_quiescence_backend_guard_enabled() -> bool:
     return os.environ.get(EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR) == 'true'
 
@@ -644,6 +652,8 @@ class ServerInstanceLease:
             self.role, quiescence_capable)
         non_pool_capable = _non_pool_launch_binding_process_capable(
             self.role, quiescence_capable)
+        ordered_capacity_capable = (_ordered_capacity_admission_process_capable(
+            self.role, quiescence_capable))
         with self._state_lock:
             ready = self._ready
             draining = self._draining
@@ -685,6 +695,11 @@ class ServerInstanceLease:
             'non_pool_launch_receipt_protocol_version':
                 (ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION
                  if non_pool_capable else None),
+            'ordered_capacity_admission_capable': ordered_capacity_capable,
+            'ordered_capacity_admission_protocol_version':
+                (1 if ordered_capacity_capable else None),
+            'ordered_capacity_admission_cohort_epoch':
+                (1 if ordered_capacity_capable else None),
         }
         if include_started_at:
             values['started_at'] = now
@@ -930,6 +945,52 @@ def non_pool_launch_binding_fleet_capable(
                     return False
                 executor = True
         return bool(acceptor and executor)
+
+    if connection is not None:
+        return _read(connection)
+    with engine.connect() as owned_connection:
+        return _read(owned_connection)
+
+
+def ordered_capacity_admission_fleet_capable(
+    *,
+    connection: sqlalchemy.engine.Connection | None = None,
+    quiescence_seconds: float = (
+        ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS),
+) -> bool:
+    """Require one exact API012 cohort across every live participant."""
+    if (isinstance(quiescence_seconds, bool) or
+            not isinstance(quiescence_seconds, (int, float)) or
+            not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
+        raise ValueError('quiescence_seconds must be finite and non-negative.')
+    engine = initialize_and_get_db()
+
+    def _read(active_connection: sqlalchemy.engine.Connection) -> bool:
+        rows = active_connection.execute(
+            sqlalchemy.select(
+                SERVER_INSTANCES.c.role, SERVER_INSTANCES.c.ready,
+                SERVER_INSTANCES.c.draining_at,
+                SERVER_INSTANCES.c.ordered_capacity_admission_capable,
+                SERVER_INSTANCES.c.ordered_capacity_admission_protocol_version,
+                SERVER_INSTANCES.c.ordered_capacity_admission_cohort_epoch).
+            where(
+                SERVER_INSTANCES.c.role.in_(
+                    ('all', 'api', 'executor', 'controller')),
+                SERVER_INSTANCES.c.heartbeat_at
+                >= sqlalchemy.func.clock_timestamp() - datetime.timedelta(
+                    seconds=quiescence_seconds))).mappings().all()
+        acceptor = False
+        executor = False
+        for row in rows:
+            if (row['ordered_capacity_admission_capable'] is not True or
+                    row['ordered_capacity_admission_protocol_version'] != 1 or
+                    row['ordered_capacity_admission_cohort_epoch'] != 1):
+                return False
+            ready = row['ready'] and row['draining_at'] is None
+            acceptor = acceptor or bool(ready and row['role'] in ('all', 'api'))
+            executor = executor or bool(ready and
+                                        row['role'] in ('all', 'executor'))
+        return acceptor and executor
 
     if connection is not None:
         return _read(connection)
@@ -3849,6 +3910,46 @@ def promote_non_pool_launch_binding_service(
                     conn, authority.service_name) and
                  _legacy_ordinary_launch_requests_drained_in_transaction(
                      conn, authority.service_name))))
+        session.commit()
+        return epoch
+
+
+def promote_ordered_capacity_admission_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,) -> int:
+    """Promote durable demand after the exact API012 fleet barrier."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        connection.execute(
+            sqlalchemy.text('LOCK TABLE api_server_instances IN SHARE MODE'))
+        epoch = capacity_admission.promote_service_in_connection(
+            connection,
+            service_name=authority.service_name,
+            controller_incarnation=authority.controller_incarnation,
+            participant_barrier_passed=lambda conn:
+            ordered_capacity_admission_fleet_capable(connection=conn))
+        session.commit()
+        return epoch
+
+
+def demote_ordered_capacity_admission_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    expected_source_epoch: int,
+) -> int:
+    """Demote durable demand only after every planner claim settles."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        epoch = capacity_admission.demote_service_in_connection(
+            session.connection(),
+            service_name=authority.service_name,
+            controller_incarnation=authority.controller_incarnation,
+            expected_source_epoch=expected_source_epoch)
         session.commit()
         return epoch
 

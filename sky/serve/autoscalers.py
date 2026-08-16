@@ -3735,8 +3735,13 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             'timestamps': [timestamp1 (float), timestamp2 (float), ...]
         }
         """
-        self.request_timestamps.extend(
-            request_aggregator_info.get('timestamps', []))
+        replace_request_window = request_aggregator_info.get(
+            'replace_request_window') is True
+        incoming_timestamps = request_aggregator_info.get('timestamps', [])
+        if replace_request_window:
+            self.request_timestamps = list(incoming_timestamps)
+        else:
+            self.request_timestamps.extend(incoming_timestamps)
         current_time = time.time()
         index = bisect.bisect_left(self.request_timestamps,
                                    current_time - self.qps_window_size)
@@ -5841,8 +5846,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             'reconcile_generation': int,
         }
         """
-        self.request_timestamps.extend(
-            request_aggregator_info.get('timestamps', []))
+        replace_request_window = request_aggregator_info.get(
+            'replace_request_window') is True
+        incoming_timestamps = request_aggregator_info.get('timestamps', [])
+        if replace_request_window:
+            self.request_timestamps = list(incoming_timestamps)
+        else:
+            self.request_timestamps.extend(incoming_timestamps)
         current_time = time.time()
         index = bisect.bisect_left(self.request_timestamps,
                                    current_time - self.qps_window_size)
@@ -5865,9 +5875,12 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             request_aggregator_info.get('compatibility_demand_complete')
             is True)
         if compatibility_complete:
-            self.compatibility_profiles.extend(
-                self._parse_compatibility_arrivals(
-                    request_aggregator_info.get('compatibility_profiles', [])))
+            incoming_profiles = self._parse_compatibility_arrivals(
+                request_aggregator_info.get('compatibility_profiles', []))
+            if replace_request_window:
+                self.compatibility_profiles = incoming_profiles
+            else:
+                self.compatibility_profiles.extend(incoming_profiles)
             self.queued_compatibility_profiles = (
                 self._parse_compatibility_gauge(
                     request_aggregator_info.get(

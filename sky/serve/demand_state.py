@@ -14,7 +14,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any
+from typing import Any, Mapping
 
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
@@ -22,6 +22,8 @@ from sqlalchemy.dialects import postgresql
 from sky.serve import constants
 from sky.serve import demand_state_schema
 from sky.serve import lb_ha
+from sky.serve import route_projection
+from sky.serve import route_projection_schema
 from sky.serve import serve_history
 from sky.serve import serve_state_schema
 from sky.utils.db import db_utils
@@ -53,6 +55,22 @@ class DemandReportReceipt:
     request_history_accepted: bool
     request_classification_history_accepted: bool
     prediction_time_history_accepted: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class DurableAutoscalingSnapshot:
+    """One fresh, route-translated demand snapshot for the autoscaler."""
+
+    service_name: str
+    service_hash: str
+    demand_source_epoch: int
+    demand_feed_generation: int
+    route_generation: int
+    route_sha256: str
+    route_source_epoch: int
+    receipt_watermark: list[dict[str, Any]]
+    request_information: dict[str, Any]
+    normalized_demand: dict[str, Any]
 
 
 def _postgres_engine() -> sqlalchemy.engine.Engine:
@@ -273,7 +291,9 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
     if len(encoded) > constants.LB_DEMAND_REPORT_MAX_BYTES:
         raise DemandReportError('Demand report exceeds the size limit.')
     protocol = raw.get('protocol_version')
-    if protocol != constants.LB_DEMAND_REPORT_PROTOCOL_VERSION:
+    if (not isinstance(protocol, int) or isinstance(protocol, bool) or
+            not constants.LB_DEMAND_REPORT_MIN_PROTOCOL_VERSION <= protocol <=
+            constants.LB_DEMAND_REPORT_PROTOCOL_VERSION):
         raise DemandReportError('Demand report protocol is unsupported.')
     sequence = _positive_int(raw.get('sequence'), 'sequence')
     reporter_session_id = _identity(raw.get('reporter_session_id'),
@@ -322,6 +342,26 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
                            'occupancy_sample_age_seconds')
     for field in ('routing_urls', 'unknown_in_flight_urls', 'draining_urls'):
         _string_list(raw.get(field), field, max_items=_MAX_URLS)
+    if protocol >= 2:
+        total_slots = _nonnegative_map(raw.get('total_slots_by_url'),
+                                       'total_slots_by_url')
+        sampled_urls = _string_list(raw.get('occupancy_sampled_urls'),
+                                    'occupancy_sampled_urls',
+                                    max_items=_MAX_URLS)
+        sampled_set = set(sampled_urls)
+        occupancy_sets = (
+            set(raw['async_occupancy']),
+            set(raw['occupancy_sample_generation']),
+            set(raw['occupancy_sample_age_seconds']),
+        )
+        if (set(total_slots) != sampled_set or
+                any(urls != sampled_set for urls in occupancy_sets)):
+            raise DemandReportError(
+                'Protocol 2 slot and occupancy URLs must exactly match.')
+        if not set(raw['routing_urls']).issubset(
+                sampled_set | set(raw['unknown_in_flight_urls'])):
+            raise DemandReportError(
+                'Every routed URL must be sampled or explicitly unknown.')
 
     # Reuse the production HA parser for the three-way HTTP/async/unknown
     # accounting contract instead of maintaining a second interpretation.
@@ -440,7 +480,8 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
         demand_window=demand_window,
         configured_accelerators=configured_accelerators,
     )
-    complete = bool(routing_version is not None and configured_accelerators and
+    complete = bool(protocol >= 2 and routing_version is not None and
+                    configured_accelerators and
                     compatibility_version is not None and
                     compatibility_complete)
     digest = hashlib.sha256(encoded).hexdigest()
@@ -637,6 +678,41 @@ def unavailable_request_summary(reason: str) -> dict[str, Any]:
     return _empty_summary('unavailable', reason)
 
 
+def reports_match_current_lb_authority(
+    rows: list[Mapping[str, Any]],
+    service: Mapping[str, Any],
+) -> bool:
+    """Prove that fresh demand includes the currently selected ACTIVE LB.
+
+    HA cutover advances the service generation before a new role becomes
+    authoritative.  A still-fresh report from the previous generation must
+    therefore be display-only: it cannot promote durable demand, publish a
+    capacity plan, or keep a paid claim alive.
+    """
+    ha_enabled = service.get('lb_ha_enabled') == 1
+    active_slot = service.get('lb_active_slot')
+    generation = service.get('lb_cutover_generation')
+    current_active_present = False
+    for row in rows:
+        payload = row.get('payload')
+        if not isinstance(payload, Mapping):
+            return False
+        try:
+            role = lb_ha.LbRole(payload.get('applied_role'))
+        except (TypeError, ValueError):
+            return False
+        if role not in (lb_ha.LbRole.ACTIVE, lb_ha.LbRole.DRAINING):
+            continue
+        if ha_enabled and payload.get('applied_generation') != generation:
+            return False
+        if role is lb_ha.LbRole.ACTIVE:
+            if (not ha_enabled or
+                (row.get('lb_slot') == active_slot and
+                 payload.get('applied_generation') == generation)):
+                current_active_present = True
+    return current_active_present
+
+
 def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
                              now: datetime.datetime) -> dict[str, Any]:
     """Aggregate already-selected fresh rows, rejecting corrupt state."""
@@ -784,3 +860,284 @@ def get_request_summary(service_name: str, service_hash: str) -> dict[str, Any]:
         return _empty_summary('unavailable',
                               'invalid_durable_payload',
                               generation=generation)
+
+
+def get_autoscaling_snapshot(
+        service_name: str,
+        service_hash: str) -> DurableAutoscalingSnapshot | None:
+    """Read the sole promoted demand source and translate its exact routes.
+
+    Unlike the public summary, this read fails closed on every incomplete
+    reporter, mixed route generation, unknown URL identity, or source-mode
+    mismatch. It never calls a provider or controller.
+    """
+    engine = _postgres_engine()
+    reports_table = demand_state_schema.serve_lb_demand_reports_table
+    generations = demand_state_schema.serve_demand_feed_generations_table
+    routes = route_projection_schema.serve_route_snapshots_table
+    route_heads = route_projection_schema.serve_route_heads_table
+    services = serve_state_schema.services_table
+    with engine.connect() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        service = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == service_name)).mappings().one_or_none()
+        if (service is None or service['hash'] != service_hash or
+                service['pool'] != 0 or
+                service['demand_source_mode'] != 'DURABLE_FEED' or
+                service['demand_authority_capable'] is not True or
+                service['demand_authority_controller_incarnation']
+                != service['controller_incarnation'] or
+                service['demand_authority_protocol_version'] != 1 or
+                service['route_source_mode'] != 'DURABLE_PROJECTED' or
+                service['route_projection_capable'] is not True or
+                service['route_projection_controller_incarnation']
+                != service['controller_incarnation'] or
+                service['route_projection_protocol_version'] != 1):
+            return None
+        generation = connection.execute(
+            sqlalchemy.select(generations.c.generation).where(
+                generations.c.service_name == service_name,
+                generations.c.service_hash ==
+                service_hash)).scalar_one_or_none()
+        head = connection.execute(
+            sqlalchemy.select(route_heads).where(
+                route_heads.c.service_name ==
+                service_name)).mappings().one_or_none()
+        if (generation is None or head is None or head['valid_until'] <= now):
+            return None
+        route = connection.execute(
+            sqlalchemy.select(routes).where(
+                routes.c.service_name == service_name, routes.c.generation ==
+                head['generation'])).mappings().one_or_none()
+        rows = connection.execute(
+            sqlalchemy.select(reports_table).where(
+                reports_table.c.service_name == service_name,
+                reports_table.c.service_hash == service_hash,
+                reports_table.c.valid_until > now).order_by(
+                    reports_table.c.reporter_session_id)).mappings().all()
+    if (route is None or route['service_hash'] != service_hash or
+            route['service_lifecycle_epoch'] != service['lifecycle_epoch'] or
+            route['controller_incarnation'] != service['controller_incarnation']
+            or route['service_version'] != service['current_version'] or
+            route['protocol_version'] != 1 or not rows or
+            any(row['complete'] is not True for row in rows)):
+        return None
+    try:
+        _, identities = (route_projection.RouteProjectionRepository.
+                         validate_snapshot_row(route))
+    except route_projection.RouteProjectionError:
+        return None
+    if not route_projection.snapshot_owner_matches(route, service):
+        return None
+    route_generation = int(head['generation'])
+    route_sha256 = route['content_sha256']
+    route_epoch = int(service['route_source_epoch'])
+    ledger = lb_ha.LbSessionLedger(constants.LB_DEMAND_REPORT_TTL_SECONDS,
+                                   constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
+    if not reports_match_current_lb_authority(rows, service):
+        return None
+    stream_owners: set[str] = set()
+    watermark: list[dict[str, Any]] = []
+    timestamps: list[float] = []
+    compatibility_profiles: list[dict[str, Any]] = []
+    queued_profiles: list[dict[str, Any]] = []
+    rejected_profiles: list[dict[str, Any]] = []
+    queue_depth = 0
+    rejected = 0
+    recent_rejected = 0
+    queue_by_priority: dict[str, int] = {}
+    rejected_by_priority: dict[str, int] = {}
+    recent_rejected_by_priority: dict[str, int] = {}
+    observed_slots_by_url: dict[str, int] = {}
+    optional_counts = {
+        key: 0
+        for key in ('unique_job_arrivals_60s', 'unique_job_arrivals_300s',
+                    'headerless_arrivals_60s', 'headerless_arrivals_300s')
+    }
+    configured_accelerators: tuple[str, ...] | None = None
+    now_epoch = now.timestamp()
+
+    def _add_counts(target: dict[str, int], raw: Any) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        for key, count in raw.items():
+            if not isinstance(count, int) or isinstance(count,
+                                                        bool) or count < 0:
+                return False
+            target[str(key)] = target.get(str(key), 0) + count
+        return True
+
+    for row in rows:
+        payload = row['payload']
+        if (not isinstance(payload, dict) or
+                payload.get('protocol_version') != 2 or
+                payload.get('route_projection_generation') != route_generation
+                or payload.get('route_projection_sha256') != route_sha256 or
+                payload.get('route_source_epoch') != route_epoch):
+            return None
+        configured = tuple(payload.get('configured_accelerators', ()))
+        if configured_accelerators is None:
+            configured_accelerators = configured
+        elif configured != configured_accelerators:
+            return None
+        session = str(row['reporter_session_id'])
+        role = lb_ha.LbRole(payload['applied_role'])
+        if role in (lb_ha.LbRole.ACTIVE, lb_ha.LbRole.DRAINING):
+            stream_owners.add(session)
+        elapsed = max(0.0, now_epoch - row['received_at'].timestamp())
+        ledger_payload = dict(payload)
+        ledger_payload['occupancy_sample_age_seconds'] = {
+            url: float(age) + elapsed
+            for url, age in payload['occupancy_sample_age_seconds'].items()
+        }
+        slot = lb_ha.parse_slot(row['lb_slot']) or lb_ha.LbSlot.A
+        if not ledger.update(session,
+                             slot,
+                             role,
+                             int(payload['applied_generation']),
+                             ledger_payload,
+                             now=now_epoch):
+            return None
+        watermark.append({
+            'reporter_session_id': session,
+            'sequence': int(row['sequence']),
+            'payload_sha256': row['payload_sha256'],
+        })
+        reporter_epoch = row['reporter_observed_at'].timestamp()
+        window = payload['demand_window']
+        bucket_seconds = int(window['bucket_seconds'])
+        for bucket in window['buckets']:
+            effective_end = (row['received_at'].timestamp() +
+                             int(bucket['bucket_start']) + bucket_seconds -
+                             reporter_epoch)
+            if effective_end <= now_epoch - int(window['window_seconds']):
+                continue
+            count = int(bucket['request_count'])
+            if len(timestamps) + count > constants.LB_REQUEST_TIMESTAMP_CAP:
+                return None
+            timestamps.extend([effective_end] * count)
+            for raw_profile in bucket['compatibility_profiles']:
+                profile = dict(raw_profile)
+                profile['timestamp'] = effective_end
+                compatibility_profiles.append(profile)
+        queue_depth += int(payload['queue_depth'])
+        rejected += int(payload['rejected_in_window'])
+        recent_rejected += int(payload['rejected_in_recent_window'])
+        queued_profiles.extend(payload['queued_requests_by_compatibility'])
+        rejected_profiles.extend(payload['rejected_requests_by_compatibility'])
+        if (not _add_counts(queue_by_priority,
+                            payload['queue_depth_by_priority']) or
+                not _add_counts(rejected_by_priority,
+                                payload['rejected_in_window_by_priority']) or
+                not _add_counts(
+                    recent_rejected_by_priority,
+                    payload['rejected_in_recent_window_by_priority'])):
+            return None
+        for key in optional_counts:
+            optional_counts[key] += int(payload[key])
+        for url, slots in payload['total_slots_by_url'].items():
+            observed_slots_by_url[url] = max(observed_slots_by_url.get(url, 0),
+                                             int(slots))
+    if not stream_owners:
+        return None
+    aggregate = ledger.aggregate(stream_owners, now=now_epoch)
+    if not aggregate.complete:
+        return None
+
+    def _replica_id(url: str) -> int | None:
+        identity = identities.get(url)
+        if (not isinstance(identity, dict) or
+                not isinstance(identity.get('replica_id'), int) or
+                not isinstance(identity.get('replica_record_id'), str)):
+            return None
+        return int(identity['replica_id'])
+
+    translated_in_flight: dict[int, int] = {}
+    for url, count in aggregate.in_flight.items():
+        replica_id = _replica_id(url)
+        if replica_id is None:
+            return None
+        translated_in_flight[replica_id] = (
+            translated_in_flight.get(replica_id, 0) + int(count))
+    unknown_ids: set[int] = set()
+    for url in aggregate.unknown_urls:
+        replica_id = _replica_id(url)
+        if replica_id is None:
+            return None
+        unknown_ids.add(replica_id)
+    observed_slots: dict[int, int] = {}
+    for url, slots in observed_slots_by_url.items():
+        replica_id = _replica_id(url)
+        if replica_id is None:
+            return None
+        observed_slots[replica_id] = max(observed_slots.get(replica_id, 0),
+                                         slots)
+    request_information = {
+        'timestamps': sorted(timestamps),
+        'compatibility_profiles': compatibility_profiles,
+        'queued_requests_by_compatibility': queued_profiles,
+        'rejected_requests_by_compatibility': rejected_profiles,
+        'compatibility_demand_complete': True,
+        'in_flight_by_replica_id': translated_in_flight,
+        'unknown_in_flight_replica_ids': sorted(unknown_ids),
+        'observed_slots_by_replica_id': observed_slots,
+        'unknown_capacity_replica_ids': sorted(unknown_ids),
+        'reconcile_generation': int(generation),
+        'queue_depth': queue_depth,
+        'queue_depth_by_priority': queue_by_priority,
+        'rejected_in_window': rejected,
+        'rejected_in_recent_window': recent_rejected,
+        'rejected_in_window_by_priority': rejected_by_priority,
+        'rejected_in_recent_window_by_priority': recent_rejected_by_priority,
+        'offered_arrival_tracking_saturated': False,
+        **optional_counts,
+    }
+
+    def _compatibility_totals(
+        profiles: list[dict[str, Any]],) -> list[dict[str, Any]]:
+        totals: dict[tuple[int, tuple[str, ...]], tuple[int, int]] = {}
+        for profile in profiles:
+            key = (
+                int(profile['priority']),
+                tuple(str(card) for card in profile['compatible_accelerators']))
+            count, recent_count = totals.get(key, (0, 0))
+            totals[key] = (count + int(profile.get('count', 1)),
+                           recent_count + int(profile.get('recent_count', 0)))
+        return [{
+            'priority': priority,
+            'compatible_accelerators': list(accelerators),
+            'count': count,
+            'recent_count': recent_count,
+        } for (priority,
+               accelerators), (count, recent_count) in sorted(totals.items())]
+
+    normalized_demand = {
+        'configured_accelerators': list(configured_accelerators or ()),
+        'recent_request_count': len(timestamps),
+        'in_flight_by_replica_id': translated_in_flight,
+        'unknown_in_flight_replica_ids': sorted(unknown_ids),
+        'queue_depth': queue_depth,
+        'rejected_in_window': rejected,
+        'recent_rejected_in_window': recent_rejected,
+        # Exclude translated event timestamps: receipt time corrects reporter
+        # clock skew, so those floats may move slightly on a heartbeat even
+        # while the bounded demand classes and target are unchanged.
+        'compatibility_demand': {
+            'arrivals': _compatibility_totals(compatibility_profiles),
+            'queued': _compatibility_totals(queued_profiles),
+            'rejected': _compatibility_totals(rejected_profiles),
+        },
+    }
+    return DurableAutoscalingSnapshot(service_name=service_name,
+                                      service_hash=service_hash,
+                                      demand_source_epoch=int(
+                                          service['demand_source_epoch']),
+                                      demand_feed_generation=int(generation),
+                                      route_generation=route_generation,
+                                      route_sha256=str(route_sha256),
+                                      route_source_epoch=route_epoch,
+                                      receipt_watermark=watermark,
+                                      request_information=request_information,
+                                      normalized_demand=normalized_demand)

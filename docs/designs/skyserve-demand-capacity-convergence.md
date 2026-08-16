@@ -2,8 +2,9 @@
 
 Status: P1 is implemented in draft PR #1498; the rebased and locally reviewed
 P2a implementation is in draft PR #1499; P2b1 route projection is implemented
-and locally reviewed in draft PR #1503; production remains on the legacy
-controller-coupled demand and route paths
+and locally reviewed in draft PR #1503; P2b2 ordered capacity admission is
+implemented and locally adversarially reviewed in draft PR #1504;
+production remains on the legacy controller-coupled demand and route paths
 
 Last updated: 2026-08-16
 
@@ -56,8 +57,8 @@ routes, autoscaling, sibling pools, or the service dashboard.
 - Use one authenticated durable demand feed for both autoscaling and UI.
 - Account compatible ready and committed zero-cost capacity before any paid
   Spot or On-Demand launch is authorized.
-- Require fresh authenticated unmet demand at both paid admission and the
-  provider-I/O fence.
+- Require fresh authenticated unmet demand at both ordinary demand-driven paid
+  admission and the provider-I/O fence.
 - Publish complete routes from already-collected controller observations so
   load-balancer and API reads perform no provider queries.
 - Keep a poisoned launch local to its exact association and capacity claim.
@@ -111,23 +112,19 @@ The P2a draft PR #1499 now contains, but has not deployed or promoted:
   dashboard, plus a status overlay for CLI/legacy consumers. Both prefer fresh
   durable telemetry and report stale/unavailable explicitly.
 
-The following is not yet present:
-
-- an autoscaler reader that consumes that table as its sole demand source;
-- one atomic planner snapshot that orders zero-cost admission before paid
-  admission for the same demand generation;
-- a paid-launch authority tuple that includes the demand and zero-cost
-  allocation generations and is revalidated immediately before provider I/O;
-- a complete provider-free route projection used by the load balancer; and
-- the final dashboard placement explanation that binds paid decisions to their
-  demand and zero-cost generations.
+P2b1 now adds the complete provider-free route projection, and the P2b2
+working branch now adds the promoted autoscaler reader, zero-cost-first
+replanning boundary, immutable capacity plan/head, and planner-bound paid
+claim revalidated immediately before provider I/O. These changes remain dark
+and unpromoted. The final dashboard placement explanation and P3 removal of
+the legacy demand/route paths are not yet implemented.
 
 ## Public contract
 
 ### Demand report
 
 Each load-balancer process sends a cumulative, idempotent report to the stable
-central API endpoint. Version 1 contains:
+central API endpoint. The display-compatible version 1 contract contains:
 
 - service name and exact service-incarnation hash;
 - load-balancer slot, Pod UID as the durable LB session ID, and a
@@ -142,6 +139,14 @@ central API endpoint. Version 1 contains:
 - the closed accelerator-compatibility demand map and the routing-spec version
   under which it was measured; and
 - saturation/partial-observation flags already emitted by the load balancer.
+
+Version 2 is the only capacity-authoritative contract. It additionally binds
+the exact applied route generation/digest/source epoch and reports the complete
+set of URLs for which occupancy was sampled plus total slots by URL. Version 1
+remains readable for the P2a dashboard transition but is always incomplete for
+autoscaling and paid admission. Its sampled-URL, occupancy, freshness, and
+total-slot key sets must be identical, and every routed URL must be either in
+that set or explicitly occupancy-unknown.
 
 The outer internal-auth middleware authenticates the existing purpose-scoped
 LB sync credential. The endpoint locks the service row and requires the exact
@@ -166,7 +171,12 @@ greatest-value idempotent within one reporter minute. Live gauges remain one
 row per reporter incarnation. The aggregate includes every non-stale reporter:
 during an HA handoff the old draining reporter's in-flight work and the new
 active reporter's queue are both real demand. A reporter row expires; it is
-never converted to a zero observation.
+never converted to a zero observation. Capacity authority additionally
+requires a fresh `ACTIVE` report for the service row's exact selected LB slot
+and cutover generation; every fresh `ACTIVE`/`DRAINING` stream owner must name
+that current generation. A still-fresh pre-cutover report remains display
+history only and cannot promote demand, publish a plan, or preserve a paid
+claim.
 
 ### Freshness states
 
@@ -191,13 +201,11 @@ hysteresis and drain proof still apply.
 
 For each demand compatibility class, one immutable planner snapshot contains:
 
-- demand-feed generation and freshness deadline;
-- route-projection generation and ready compatible capacity;
-- nonterminal compatible zero-cost and paid committed capacity;
-- reserved broker allocation/observation generation and spendable zero-cost
-  slots; and
-- service lifecycle, version, controller-owner, placement-policy, and binding
-  epochs.
+- demand-feed generation and fresh reporter receipt watermark;
+- route-projection generation/digest/source epoch;
+- nonterminal compatible zero-cost and paid committed capacity, derived from
+  locked replica rows rather than supplied by the controller; and
+- service incarnation, lifecycle, version, and demand-source epoch.
 
 The raw demand-feed generation is a telemetry receipt generation: it advances
 when any non-duplicate reporter heartbeat lands, including a heartbeat whose
@@ -209,37 +217,59 @@ they do not bind directly to the continuously advancing heartbeat generation.
 This preserves pre-I/O freshness checks without livelocking launches behind a
 five-second reporting cadence.
 
-The planner computes:
+Every promoted reconcile follows one ordered path:
 
 ```text
-residual_before_zero_cost =
-  max(0, demand_target - ready_compatible - committed_compatible)
-
-zero_cost_to_admit =
-  min(residual_before_zero_cost, authenticated_spendable_zero_cost)
-
-paid_to_admit =
-  max(0, residual_before_zero_cost - accepted_zero_cost)
+fresh protocol-v2 demand + exact fresh route
+  -> autoscaler target
+  -> attempt ordinary/reserved zero-cost-only admission
+  -> if any zero-cost row commits: stop and replan
+  -> PostgreSQL locks service, reports, route, and all replica rows
+  -> paid_residual = max(0, target - committed_zero_cost - committed_paid)
+  -> publish/refresh plan head
+  -> admit paid claim only within that residual
 ```
 
-`accepted_zero_cost` means rows committed by the database admission ledger in
-this round, not in-memory intent. Deferred or rejected fill is not counted.
-The final paid transaction locks the same service/capacity ordering, rereads
-all compatible nonterminal rows, exact-matches the demand and allocation
-generations, recomputes the residual, and spends a paid claim. Concurrent
-controllers therefore cannot both consume the same deficit.
+The zero-cost phase uses the existing manager and reserved broker with paid
+selection hard-disabled. `Accepted` means a durable replica row was committed,
+not that an in-memory choice was attempted. Deferred or rejected fill is not
+counted. Any accepted row ends the reconcile so paid residual is never inferred
+from its pre-commit snapshot.
 
-A paid association persists demand generation, demand expiry, compatibility
-class, placement-decision digest, zero-cost allocation generation, and paid
-claim identity. The generic executor revalidates all of them at its
-commit-before-provider-I/O fence. Expired or satisfied demand terminates the
-request at `NOT_STARTED`; it never reaches a cloud API. Once provider I/O may
-have started, the durable action reconciliation contract owns the result and
-no telemetry change can pretend the effect did not happen.
+Plan publication and claim admission share the service-row mutex and lock the
+fresh demand receipts, route head/snapshot, complete current-version replica
+inventory, plan head, and relevant claims. The repository derives exact-card
+or aggregate committed capacity from those rows. Promotion and planning
+require normalized ReplicaInfo v18 rows with explicit zero-cost and logical
+width attribution. An exact-card plan fails closed if any committed
+current-version row cannot be classified into its accounting set; ambiguity
+cannot be converted into a paid deficit. A semantic change treats all
+current rows as the new baseline and mints a new plan generation. For an
+unchanged heartbeat, it subtracts current-plan claim units from the full paid
+inventory to reconstruct the immutable baseline, refreshes the same semantic
+generation's head with the newest receipt generation/watermark, and preserves
+bounded queued work. Every fresh promoted reconcile publishes, including a
+zero target; a demand drop therefore mints a zero-residual generation that
+revokes the prior head.
+
+A paid claim persists plan generation/digest, source demand receipt generation,
+demand-source epoch, canonical accelerator accounting class, and positive
+capacity units. Its existing generic association/request authorization copies
+that immutable claim tuple. Admission and the generic executor revalidate the
+current plan head, receipt watermark, recomputed locked inventory, and the
+content-addressed route payload immediately before provider I/O. Expired,
+satisfied, corrupt, or owner-mismatched authority terminates the request at
+`NOT_STARTED`; it never reaches a cloud API. Once provider I/O may have
+started, the durable action reconciliation contract owns the result and no
+telemetry change can pretend the effect did not happen.
 
 Spot is a paid market for this contract. It may be preferred over On-Demand by
 the existing placement policy, but neither market is authorized without a
 positive residual. Reserved-fill admission can never select either market.
+Cost rebalance, unknown-capacity replacement, and system recovery remain
+separate generic profiles with their existing exact predecessor/recovery
+authority; they cannot consume an ordinary demand-plan residual or silently
+become ordinary scale-up.
 
 ### Route projection
 
@@ -442,7 +472,57 @@ planning, and both are revalidated before provider I/O. A heartbeat with
 unchanged normalized demand does not mint a new planner generation or
 invalidate already-admitted work.
 
-Expected size: medium/large, approximately 1,200--2,000 source/test/UI lines.
+The exact Serve050 shape is one `LEGACY_CONTROLLER` / `DURABLE_FEED` source
+mode and monotonic epoch on `services`; immutable `serve_capacity_plans` rows;
+and one freshness-bearing `serve_capacity_plan_heads` row per service. A plan
+binds the service incarnation/lifecycle/version, demand-source epoch, complete
+fresh reporter receipt watermark, exact route generation/digest/epoch,
+normalized demand, demand target, PostgreSQL-derived zero-cost and paid
+baseline capacity, and paid residual by accelerator. The semantic payload is
+content-addressed. The head carries the latest demand generation and
+receipt-watermark digest; an identical reconcile reconstructs its baseline by
+subtracting same-plan claims from locked paid inventory and refreshes those
+receipt fields and the expiry without minting a new semantic generation.
+
+The existing `paid_capacity_claims` row gains one all-or-none tuple containing
+plan generation, plan digest, demand-feed generation, demand-source epoch, and
+the canonical accelerator compatibility class debited by that claim.
+The tuple also stores the positive planner units consumed, so a multi-GPU
+logical backend cannot spend a one-backend claim as if it represented one
+unit.
+Planner-bound claims also have a database foreign key to the immutable
+`(service_name, plan_generation)` row, with service/plan deletion cascading;
+legacy claims keep the nullable transition shape.
+The existing generic non-pool profile includes that tuple in its paid-claim
+authorization. Admission and the shared pre-provider-I/O guard lock the claim,
+plan/head, service, route head, and demand generation and exact-match the
+tuple. They require an unexpired plan head and demand/route receipts, but do
+not require that their wall-clock freshness timestamps equal those observed at
+admission. This keeps freshness fail-closed while allowing an unchanged
+heartbeat to extend authority without changing content identity. A newer
+semantic plan invalidates old claims at the pre-I/O fence; their durable rows
+remain action/reconciliation evidence and their committed replicas become
+baseline capacity in the new plan.
+Capacity plans are operational fences rather than history. Plan publication
+removes superseded generations that are neither the current head nor
+referenced by a planner-bound claim; the claim foreign key retains every
+generation that can still authorize or explain unsettled work without allowing
+the table to grow with every semantic reconcile.
+
+API012 advertises one exact ordered-admission protocol capability on every
+live `all|api|executor|controller` participant. Per-service promotion locks the
+service, proves that fleet capability, a fresh complete durable demand report,
+a fresh matching projected route, current controller ownership, and no legacy
+demand mutation in flight, then advances the source epoch. After promotion the
+controller-sync endpoint may still accept routing/drain reports during the
+transition, but it cannot call `collect_request_information`; only the durable
+reader may advance autoscaler demand state.
+
+Reviewed P2b2 size: 31 files, 3,694 additions and 161 deletions.
+This is large and above the original 1,200--2,000-line estimate because it
+includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
+races, controller ordering tests, strict route/content/LB-generation
+validation, bounded plan retention, and mixed-fleet capability tests.
 
 ### P3: blocked steady-state cleanup
 
@@ -552,7 +632,7 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
   quiescence or manual row deletion.
 - [x] Publish the P2a durable-demand/UI draft as PR #1499.
 - [x] Publish the P2b1 provider-free route draft as PR #1503.
-- [ ] Publish P2b2 and update P3 for every transition-only demand/route path.
+- [x] Publish the P2b2 ordered-admission draft as PR #1504.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set
