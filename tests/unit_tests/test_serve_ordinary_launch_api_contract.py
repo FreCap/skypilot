@@ -160,6 +160,57 @@ def test_deterministic_ids_are_retry_stable_and_scope_separated() -> None:
     assert all(str(uuid.UUID(value)) == value for value in first)
 
 
+def test_profile_resolution_adopts_concurrent_exact_association(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid-claim:svc:3',
+        authorization_generation=11,
+        authorization_payload={
+            'pool_key': 'paid-pool-a',
+            'claim_generation': 11,
+        })
+    reads = iter((None, profile))
+    conflict = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+        'concurrent association')
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'get_existing_non_pool_launch_profile',
+                        lambda _association_id: next(reads))
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'resolve_non_pool_launch_profile', lambda *_args:
+                        (_ for _ in ()).throw(conflict))
+
+    resolved = asyncio.run(
+        server._resolve_non_pool_launch_profile_for_admission(
+            'svc',
+            ordinary_launch_binding.parse_unbound_launch_context(
+                _launch_body().extra_launch_context), 'association-id'))
+
+    assert resolved == profile
+
+
+def test_profile_resolution_preserves_conflict_without_exact_association(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    conflict = ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+        'planner authority changed')
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'get_existing_non_pool_launch_profile',
+                        lambda _association_id: None)
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'resolve_non_pool_launch_profile', lambda *_args:
+                        (_ for _ in ()).throw(conflict))
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='planner authority changed') as raised:
+        asyncio.run(
+            server._resolve_non_pool_launch_profile_for_admission(
+                'svc',
+                ordinary_launch_binding.parse_unbound_launch_context(
+                    _launch_body().extra_launch_context), 'association-id'))
+
+    assert raised.value is conflict
+
+
 def test_authenticated_tenant_scope_ignores_submitted_identity() -> None:
     launch_body = _launch_body()
     assert server._resolve_ordinary_launch_tenant_id(

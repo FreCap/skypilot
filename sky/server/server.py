@@ -178,6 +178,36 @@ def _resolve_ordinary_launch_tenant_id(launch_body: payloads.LaunchBody,
     return tenant_id
 
 
+async def _resolve_non_pool_launch_profile_for_admission(
+    service_name: str,
+    intent: ordinary_launch_binding.BindingIntent,
+    association_id: str,
+) -> ordinary_launch_binding.NonPoolLaunchProfile:
+    """Resolve immutable planner authority without awaiting in ``except``."""
+    profile = await asyncio.to_thread(
+        ordinary_launch_binding.get_existing_non_pool_launch_profile,
+        association_id)
+    if profile is not None:
+        return profile
+    resolution_conflict = None
+    try:
+        return await asyncio.to_thread(
+            ordinary_launch_binding.resolve_non_pool_launch_profile,
+            service_name, intent.replica_id, intent.replica_record_id)
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict as error:
+        resolution_conflict = error
+
+    # A concurrent identical submission can commit between the association
+    # read and live planner resolution. Close that race outside the exception
+    # handler, so cancellation cannot discard the active exception.
+    profile = await asyncio.to_thread(
+        ordinary_launch_binding.get_existing_non_pool_launch_profile,
+        association_id)
+    if profile is None:
+        raise resolution_conflict
+    return profile
+
+
 def _bind_and_enqueue_ordinary_launch(
     request_task: requests_lib.Request,
     identity: ordinary_launch_binding.BindingIdentity,
@@ -1383,24 +1413,8 @@ async def non_pool_serve_launch(
             submission_uuid, tenant_id, workspace)
         intent = ordinary_launch_binding.parse_unbound_launch_context(
             launch_context)
-        profile = await asyncio.to_thread(
-            ordinary_launch_binding.get_existing_non_pool_launch_profile,
-            association_id)
-        if profile is None:
-            try:
-                profile = await asyncio.to_thread(
-                    ordinary_launch_binding.resolve_non_pool_launch_profile,
-                    service_name, intent.replica_id, intent.replica_record_id)
-            except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
-                # A concurrent identical submission can commit between the
-                # first association read and live planner resolution.  Close
-                # that race by consulting the deterministic identity once
-                # more; the admission transaction remains authoritative.
-                profile = await asyncio.to_thread(
-                    ordinary_launch_binding.
-                    get_existing_non_pool_launch_profile, association_id)
-                if profile is None:
-                    raise
+        profile = await _resolve_non_pool_launch_profile_for_admission(
+            service_name, intent, association_id)
         if profile.kind != submission.profile_kind:
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Submitted profile kind does not match durable planner state.')
