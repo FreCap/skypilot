@@ -9,12 +9,12 @@ import { PluginSlot } from '@/plugins/PluginSlot';
 
 // Tooltip text for the preemptible segment: the priority classes holding
 // those accelerators, largest first, e.g.
-//   "66 preemptible (reclaimable by higher-priority workloads)
+//   "66 other preemptible (reclaimable by higher-priority workloads)
 //    inference-low (-1000): 60
 //    drill (-500): 6"
 const buildPreemptibleTitle = (preemptible, breakdown) => {
   const header =
-    `${preemptible} preemptible ` +
+    `${preemptible} other preemptible ` +
     `(reclaimable by higher-priority workloads)`;
   const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
   if (entries.length === 0) {
@@ -23,6 +23,20 @@ const buildPreemptibleTitle = (preemptible, breakdown) => {
   return [header, ...entries.map(([label, qty]) => `${label}: ${qty}`)].join(
     '\n'
   );
+};
+
+const buildServicePreemptibleTitle = (preemptible, breakdown) => {
+  const header =
+    `${preemptible} SkyServe preemptible ` +
+    `(reclaimable by higher-priority workloads)`;
+  const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
+  if (entries.length === 0) {
+    return header;
+  }
+  return [
+    header,
+    ...entries.map(([service, qty]) => `${service}: ${qty}`),
+  ].join('\n');
 };
 
 const GpuUtilizationBar = ({
@@ -38,15 +52,22 @@ const GpuUtilizationBar = ({
   // is actually in use so a stale or partial reading can never render a
   // segment wider than the used block it splits.
   const preemptible = Math.min(Math.max(0, gpu?.gpu_preemptible || 0), allUsed);
+  const servicePreemptible = Math.min(
+    Math.max(0, gpu?.gpu_preemptible_services || 0),
+    preemptible
+  );
+  const otherPreemptible = preemptible - servicePreemptible;
   const used = allUsed - preemptible;
   const notReadyLabel = `${notReady} not ready`;
   const usedLabel = `${used} used`;
-  const preemptibleLabel = `${preemptible} preemptible`;
+  const servicePreemptibleLabel = `${servicePreemptible} SkyServe`;
+  const otherPreemptibleLabel = `${otherPreemptible} other`;
   const freeLabel = `${free} free`;
   const toPercentage = total > 0 ? (value) => (value / total) * 100 : () => 0;
   const notReadyPercentage = toPercentage(notReady);
   const usedPercentage = toPercentage(used);
-  const preemptiblePercentage = toPercentage(preemptible);
+  const servicePreemptiblePercentage = toPercentage(servicePreemptible);
+  const otherPreemptiblePercentage = toPercentage(otherPreemptible);
   const freePercentage = toPercentage(free);
 
   return (
@@ -77,19 +98,34 @@ const GpuUtilizationBar = ({
           {usedPercentage > 15 && usedLabel}
         </div>
       )}
-      {preemptiblePercentage > 0 && (
+      {servicePreemptiblePercentage > 0 && (
         <div
           style={{
-            width: `${preemptiblePercentage}%`,
+            width: `${servicePreemptiblePercentage}%`,
+            fontSize: 'clamp(8px, 1.2vw, 12px)',
+          }}
+          title={buildServicePreemptibleTitle(
+            servicePreemptible,
+            gpu?.gpu_preemptible_service_breakdown
+          )}
+          className="bg-violet-300 h-full flex items-center justify-center text-violet-950 font-medium overflow-hidden whitespace-nowrap px-1"
+        >
+          {servicePreemptiblePercentage > 15 && servicePreemptibleLabel}
+        </div>
+      )}
+      {otherPreemptiblePercentage > 0 && (
+        <div
+          style={{
+            width: `${otherPreemptiblePercentage}%`,
             fontSize: 'clamp(8px, 1.2vw, 12px)',
           }}
           title={buildPreemptibleTitle(
-            preemptible,
-            gpu?.gpu_preemptible_breakdown
+            otherPreemptible,
+            servicePreemptible === 0 ? gpu?.gpu_preemptible_breakdown : null
           )}
           className="bg-amber-300 h-full flex items-center justify-center text-amber-900 font-medium overflow-hidden whitespace-nowrap px-1"
         >
-          {preemptiblePercentage > 15 && preemptibleLabel}
+          {otherPreemptiblePercentage > 15 && otherPreemptibleLabel}
         </div>
       )}
       {freePercentage > 0 && (

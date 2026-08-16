@@ -172,6 +172,47 @@ class TestSerializeKubernetesNodeInfo:
     @mock.patch(
         'sky.server.requests.serializers.return_value_serializers.versions.get_remote_api_version'
     )
+    def test_preemptible_service_breakdown_is_version_gated(
+            self, mock_get_version):
+        data = {
+            'node_info_dict': {
+                'node1': {
+                    'name': 'node1',
+                    'accelerators_preemptible': 8,
+                    'accelerators_preemptible_services': 6,
+                    'preemptible_service_breakdown': {
+                        'boltz-l4-fleet': 6
+                    },
+                }
+            }
+        }
+        mock_get_version.return_value = 77
+        parsed = json.loads(
+            return_value_serializers.serialize_kubernetes_node_info(data))
+        assert 'accelerators_preemptible_services' not in parsed[
+            'node_info_dict']['node1']
+        assert 'preemptible_service_breakdown' not in parsed['node_info_dict'][
+            'node1']
+
+        data['node_info_dict']['node1'].update({
+            'accelerators_preemptible_services': 6,
+            'preemptible_service_breakdown': {
+                'boltz-l4-fleet': 6
+            },
+        })
+        mock_get_version.return_value = 78
+        parsed = json.loads(
+            return_value_serializers.serialize_kubernetes_node_info(data))
+        assert parsed['node_info_dict']['node1'][
+            'accelerators_preemptible_services'] == 6
+        assert parsed['node_info_dict']['node1'][
+            'preemptible_service_breakdown'] == {
+                'boltz-l4-fleet': 6
+            }
+
+    @mock.patch(
+        'sky.server.requests.serializers.return_value_serializers.versions.get_remote_api_version'
+    )
     def test_remote_version_none_keeps_is_ready(self, mock_get_version):
         """Test that is_ready is kept when remote_api_version is None."""
         mock_get_version.return_value = None

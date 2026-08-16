@@ -631,7 +631,7 @@ def test_api009_serve046_lineage_and_sqlite_stays_at_serve037(
     assert server_constants.MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION == 77
     assert (server_constants.
             MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION == 76)
-    assert server_constants.API_VERSION == 77
+    assert server_constants.API_VERSION == 78
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

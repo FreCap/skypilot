@@ -18,6 +18,8 @@ describe('summarizeGpusByType', () => {
         gpu_not_ready: 0,
         gpu_preemptible: 70,
         gpu_preemptible_breakdown: { 'inference-low (-1000)': 70 },
+        gpu_preemptible_services: 60,
+        gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 60 },
         context: 'prod',
       },
       {
@@ -30,6 +32,8 @@ describe('summarizeGpusByType', () => {
           'inference-low (-1000)': 1,
           'drill (-500)': 1,
         },
+        gpu_preemptible_services: 1,
+        gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 1 },
         context: 'staging',
       },
     ]);
@@ -45,6 +49,8 @@ describe('summarizeGpusByType', () => {
         'inference-low (-1000)': 71,
         'drill (-500)': 1,
       },
+      gpu_preemptible_services: 61,
+      gpu_preemptible_service_breakdown: { 'boltz-l4-fleet': 61 },
     });
   });
 
@@ -80,6 +86,8 @@ describe('summarizeGpusByType', () => {
 
     expect(summary[0].gpu_preemptible).toBe(0);
     expect(summary[0].gpu_preemptible_breakdown).toEqual({});
+    expect(summary[0].gpu_preemptible_services).toBe(0);
+    expect(summary[0].gpu_preemptible_service_breakdown).toEqual({});
   });
 
   it('returns nothing for empty or missing input', () => {
@@ -94,15 +102,21 @@ describe('mergePreemptible', () => {
     mergePreemptible(target, {
       gpu_preemptible: 5,
       gpu_preemptible_breakdown: { a: 4, b: 1 },
+      gpu_preemptible_services: 4,
+      gpu_preemptible_service_breakdown: { fleet: 4 },
     });
     mergePreemptible(target, {
       gpu_preemptible: 2,
       gpu_preemptible_breakdown: { b: 2 },
+      gpu_preemptible_services: 1,
+      gpu_preemptible_service_breakdown: { fleet: 1 },
     });
 
     expect(target).toEqual({
       gpu_preemptible: 7,
       gpu_preemptible_breakdown: { a: 4, b: 3 },
+      gpu_preemptible_services: 5,
+      gpu_preemptible_service_breakdown: { fleet: 5 },
     });
   });
 
