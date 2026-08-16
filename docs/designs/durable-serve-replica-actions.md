@@ -591,10 +591,12 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API014/Serve051 are the blocked cleanup heads. They remove protocol-v1/new-
-  admission compatibility and transition columns/constraints only after G2's
-  gates; they preserve immutable tombstones, typed profiles, current cohort,
-  route history needed by live clients, and permanent reserved authorization.
+- API014/Serve051 are the first blocked cleanup heads, and API015/Serve052 are
+  the immediately stacked final non-pool cleanup heads. They remove protocol-
+  v1/new-admission compatibility and transition columns/constraints only after
+  G2's gates; they preserve immutable tombstones, typed profiles, current
+  cohort, route history needed by live clients, and permanent reserved
+  authorization.
 
 An active correlated bound request without its queue row is invariant
 corruption, not an activation state. Startup locks and types the correlated
@@ -1205,13 +1207,14 @@ disposition is unknown.
 ### G2: blocked steady-state cleanup
 
 G2 is authored with G1 and the demand-convergence P2 change and remains
-draft/blocked until every gate below is recorded. Its migration-bearing cleanup
-must be restacked onto forward-only API-request revision 014 and Serve revision
-051. API012 and Serve048--050 are already published by demand, route, and
-ordered-admission convergence; API013 is reserved by G1Sb's executor-
-termination evidence. Any earlier cleanup draft using API013/Serve049 is stale
-and must not merge. Migration numbers are globally unique and already-published
-revisions are immutable.
+draft/blocked until every gate below is recorded. Its first migration-bearing
+cleanup must be restacked onto forward-only API-request revision 014 and Serve
+revision 051; its immediately stacked final non-pool cleanup must move to
+API-request revision 015 and Serve revision 052. API012 and Serve048--050 are
+already published by demand, route, and ordered-admission convergence; API013
+is reserved by G1Sb's executor-termination evidence. Any earlier cleanup draft
+using API013 is stale and must not merge. Migration numbers are globally unique
+and already-published revisions are immutable.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
 only handler/profile alias, cluster-name quiescence as active authority, global
@@ -2564,9 +2567,9 @@ approved canary:
 - [x] Merge G1Sa as PR #1519; author G1Sb executor-termination evidence on
   API013 as draft PR #1522 and G1Sc as draft PR #1523 with its exact merge
   gate.
-- [ ] Restack the blocked G2 cleanup onto API014/Serve051. PR #1510 remains on
-  the stale pre-G1S lineage and must not merge until this restack and its
-  adversarial re-review are complete.
+- [ ] Restack blocked G2 PR #1506 onto API014/Serve051 and PR #1510 immediately
+  above it onto API015/Serve052. Both remain on the stale pre-G1S lineage and
+  must not merge until the restack and adversarial re-review are complete.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
