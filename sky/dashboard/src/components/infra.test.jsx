@@ -278,12 +278,18 @@ describe('ContextDetails', () => {
       />
     );
 
-    expect(screen.getByTitle('1 not ready')).toBeInTheDocument();
-    expect(screen.getByTitle('2 used')).toBeInTheDocument();
-    expect(screen.getByTitle('1 free')).toBeInTheDocument();
+    expect(screen.getByLabelText(/^1 not ready/)).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/^2 allocated at the highest observed priority/)
+    ).toBeInTheDocument();
+    expect(screen.getAllByLabelText(/^1 free now/).length).toBeGreaterThan(0);
 
     const unhealthyRow = screen.getByText('worker-1').closest('tr');
     expect(unhealthyRow).not.toBeNull();
+    expect(within(unhealthyRow).getByText('0 of 4 free')).toBeVisible();
+    expect(
+      within(unhealthyRow).queryByLabelText(/free now/)
+    ).not.toBeInTheDocument();
     expect(within(unhealthyRow).getByText('NotReady, Cordoned')).toBeVisible();
     expect(
       within(unhealthyRow).getByText('NoSchedule Taint [dedicated]')
@@ -327,17 +333,25 @@ describe('ContextDetails', () => {
     );
 
     // 16 total - 2 free = 14 in use, of which 6 sit below the top tier.
-    expect(screen.getByTitle('8 used')).toBeInTheDocument();
-    expect(screen.getByTitle('2 free')).toBeInTheDocument();
-    // Classes are listed largest-first under the summary line. Asserted on the
-    // raw attribute because title queries collapse the newlines away.
     expect(
-      screen.getByTitle(/6 preemptible attributed to non-SkyServe pods/)
-    ).toHaveAttribute(
-      'title',
-      '6 preemptible attributed to non-SkyServe pods (reclaimable by higher-priority workloads)\n' +
-        'inference-low (-1000): 4\n' +
-        'drill (-500): 2'
+      screen.getByLabelText(/^8 allocated at the highest observed priority/)
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText(/^2 free now/)).toBeInTheDocument();
+    const reclaimable = screen.getByLabelText(
+      /^6 preemptible attributed to non-SkyServe pods/
+    );
+    // Classes are listed largest-first and the organization scheduling policy
+    // is included in the hover/focus tooltip.
+    expect(reclaimable).toHaveAttribute(
+      'aria-label',
+      expect.stringContaining(
+        'inference-low (-1000): 4\ndrill (-500): 2\n\n' +
+          'Priority (highest to lowest): MA > HA > WA > BE'
+      )
+    );
+    expect(reclaimable).toHaveAttribute(
+      'aria-label',
+      expect.stringContaining('WA: evaluations and research SkyPilot')
     );
   });
 
@@ -366,20 +380,21 @@ describe('ContextDetails', () => {
       />
     );
 
-    expect(screen.getByTitle('8 used')).toBeInTheDocument();
-    expect(screen.getByTitle('2 free')).toBeInTheDocument();
     expect(
-      screen.getByTitle(/4 preemptible attributed to SkyServe pods/)
+      screen.getByLabelText(/^8 allocated at the highest observed priority/)
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText(/^2 free now/)).toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/^4 preemptible attributed to SkyServe pods/)
     ).toHaveAttribute(
-      'title',
-      '4 preemptible attributed to SkyServe pods (reclaimable by higher-priority workloads)\n' +
-        'boltz-l4-fleet: 4'
+      'aria-label',
+      expect.stringContaining('boltz-l4-fleet: 4')
     );
     expect(
-      screen.getByTitle(/2 preemptible attributed to non-SkyServe pods/)
+      screen.getByLabelText(/^2 preemptible attributed to non-SkyServe pods/)
     ).toHaveAttribute(
-      'title',
-      '2 preemptible attributed to non-SkyServe pods (reclaimable by higher-priority workloads)'
+      'aria-label',
+      expect.stringContaining('MA: PyTorch training | HA: development pods')
     );
   });
 
@@ -408,14 +423,59 @@ describe('ContextDetails', () => {
     );
 
     expect(
-      screen.getByTitle(/432 preemptible; SkyServe pod attribution unavailable/)
+      screen.getByLabelText(
+        /^432 preemptible; SkyServe pod attribution unavailable/
+      )
     ).toHaveAttribute(
-      'title',
-      '432 preemptible; SkyServe pod attribution unavailable (pods lack durable SkyPilot workload identity)\n' +
-        'priority 0: 256\n' +
-        'ma-lt (31): 176'
+      'aria-label',
+      expect.stringContaining(
+        'priority 0: 256\nma-lt (31): 176 (MA tier)\n\n' +
+          'Priority (highest to lowest): MA > HA > WA > BE'
+      )
     );
-    expect(screen.queryByTitle(/0 SkyServe/)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/0 SkyServe/)).not.toBeInTheDocument();
+  });
+
+  it('shows segmented utilization and tooltip details for each node', () => {
+    const readyNode = {
+      ...node,
+      node_name: 'worker-partial',
+      is_ready: true,
+      is_cordoned: false,
+      taints: [],
+      gpu_total: 8,
+      gpu_free: 3,
+      gpu_preemptible: 2,
+      gpu_preemptible_breakdown: { 'wa-eval (20)': 2 },
+      gpu_preemptible_services: 0,
+      gpu_preemptible_service_breakdown: {},
+    };
+
+    render(
+      <ContextDetails
+        contextName="dev-cluster"
+        gpusInContext={[]}
+        nodesInContext={[readyNode]}
+      />
+    );
+
+    const row = screen.getByText('worker-partial').closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row).getAllByText('3 of 8 free')).toHaveLength(2);
+    expect(
+      within(row).getByLabelText(
+        /^3 allocated at the highest observed priority/
+      )
+    ).toBeInTheDocument();
+    const reclaimable = within(row).getByLabelText(
+      /^2 preemptible attributed to non-SkyServe pods/
+    );
+    expect(reclaimable).toHaveAttribute(
+      'aria-label',
+      expect.stringContaining('wa-eval (20): 2 (WA tier)')
+    );
+    expect(reclaimable).toHaveAttribute('tabindex', '0');
+    expect(within(row).getByLabelText(/^3 free now/)).toBeInTheDocument();
   });
 
   it('renders a single used block when nothing is preemptible', async () => {
@@ -437,8 +497,10 @@ describe('ContextDetails', () => {
       />
     );
 
-    expect(screen.getByTitle('6 used')).toBeInTheDocument();
-    expect(screen.queryByTitle(/preemptible/)).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText(/^6 allocated at the highest observed priority/)
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText(/preemptible/)).not.toBeInTheDocument();
   });
 
   it('keeps Grafana host discovery and filter updates bounded', async () => {

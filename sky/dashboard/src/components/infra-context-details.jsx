@@ -6,6 +6,25 @@ import { formatCpu } from '@/utils/resourceUtils';
 import { canonicalizeGpuName } from '@/utils/gpuUtils';
 import { trackInfraAction } from '@/lib/analytics';
 import { PluginSlot } from '@/plugins/PluginSlot';
+import { NonCapitalizedTooltip } from '@/components/utils';
+
+const PRIORITY_POLICY_LINES = [
+  'Priority (highest to lowest): MA > HA > WA > BE',
+  'MA: PyTorch training | HA: development pods',
+  'WA: evaluations and research SkyPilot | BE: production SkyPilot',
+  'Free is immediate headroom; queued work can also progress through preemption and configured quotas.',
+];
+
+const withPriorityPolicy = (lines) =>
+  [...lines, '', ...PRIORITY_POLICY_LINES].join('\n');
+
+const formatPriorityBreakdown = (breakdown) =>
+  Object.entries(breakdown || {})
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, qty]) => {
+      const tier = label.match(/^(ma|ha|wa|be)(?:-|\s|\()/i)?.[1];
+      return `${label}: ${qty}${tier ? ` (${tier.toUpperCase()} tier)` : ''}`;
+    });
 
 // Tooltip text for the preemptible segment: the priority classes holding
 // those accelerators, largest first, e.g.
@@ -16,13 +35,12 @@ const buildPreemptibleTitle = (preemptible, breakdown) => {
   const header =
     `${preemptible} preemptible attributed to non-SkyServe pods ` +
     `(reclaimable by higher-priority workloads)`;
-  const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
-  if (entries.length === 0) {
-    return header;
-  }
-  return [header, ...entries.map(([label, qty]) => `${label}: ${qty}`)].join(
-    '\n'
-  );
+  const entries = formatPriorityBreakdown(breakdown);
+  return withPriorityPolicy([
+    header,
+    'Allocated now, not free; a higher-priority job may reclaim these GPUs.',
+    ...entries,
+  ]);
 };
 
 const buildServicePreemptibleTitle = (preemptible, breakdown) => {
@@ -30,25 +48,43 @@ const buildServicePreemptibleTitle = (preemptible, breakdown) => {
     `${preemptible} preemptible attributed to SkyServe pods ` +
     `(reclaimable by higher-priority workloads)`;
   const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
-  if (entries.length === 0) {
-    return header;
-  }
-  return [
+  return withPriorityPolicy([
     header,
+    'Allocated now, not free; a higher-priority job may reclaim these GPUs.',
     ...entries.map(([service, qty]) => `${service}: ${qty}`),
-  ].join('\n');
+  ]);
 };
 
 const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
   const header =
     `${preemptible} preemptible; SkyServe pod attribution unavailable ` +
     `(pods lack durable SkyPilot workload identity)`;
-  const entries = Object.entries(breakdown || {}).sort((a, b) => b[1] - a[1]);
-  if (entries.length === 0) {
-    return header;
+  const entries = formatPriorityBreakdown(breakdown);
+  return withPriorityPolicy([
+    header,
+    'Allocated now, not free; a higher-priority job may reclaim these GPUs.',
+    ...entries,
+  ]);
+};
+
+const GpuBarSegment = ({ percentage, label, tooltip, className }) => {
+  if (percentage <= 0) {
+    return null;
   }
-  return [header, ...entries.map(([label, qty]) => `${label}: ${qty}`)].join(
-    '\n'
+  return (
+    <NonCapitalizedTooltip content={tooltip} placement="top" delay={0}>
+      <div
+        style={{
+          width: `${percentage}%`,
+          fontSize: 'clamp(8px, 1.2vw, 12px)',
+        }}
+        aria-label={tooltip}
+        tabIndex={0}
+        className={`${className} h-full flex items-center justify-center font-medium overflow-hidden whitespace-nowrap px-1 outline-none focus-visible:ring-2 focus-visible:ring-sky-600 focus-visible:ring-inset`}
+      >
+        {percentage > 15 && label}
+      </div>
+    </NonCapitalizedTooltip>
   );
 };
 
@@ -56,6 +92,7 @@ const GpuUtilizationBar = ({
   gpu,
   heightClass = 'h-4',
   wrapperClassName = '',
+  showPriorityPolicy = true,
 }) => {
   const total = gpu?.gpu_total || 0;
   const notReady = gpu?.gpu_not_ready || 0;
@@ -84,6 +121,17 @@ const GpuUtilizationBar = ({
   const otherPreemptibleLabel = `${otherPreemptible} confirmed other`;
   const unknownPreemptibleLabel = `${unknownPreemptible} attribution unknown`;
   const freeLabel = `${free} free`;
+  const notReadyTitle = `${notReady} not ready\nUnavailable for scheduling until the node recovers.`;
+  const usedTitle = showPriorityPolicy
+    ? withPriorityPolicy([
+        `${used} allocated at the highest observed priority`,
+        'In use; not immediately free or currently classified as reclaimable.',
+      ])
+    : `${used} used\nAllocated, not free in this snapshot.`;
+  const freeTitle = [
+    `${free} free now`,
+    'Unallocated in this snapshot. Placement still depends on GPU shape, node health, quota, and scheduling constraints.',
+  ].join('\n');
   const toPercentage = total > 0 ? (value) => (value / total) * 100 : () => 0;
   const notReadyPercentage = toPercentage(notReady);
   const usedPercentage = toPercentage(used);
@@ -96,87 +144,51 @@ const GpuUtilizationBar = ({
     <div
       className={`bg-gray-100 rounded-md flex overflow-hidden shadow-sm ${heightClass} ${wrapperClassName}`.trim()}
     >
-      {notReadyPercentage > 0 && (
-        <div
-          style={{
-            width: `${notReadyPercentage}%`,
-            fontSize: 'clamp(8px, 1.2vw, 12px)',
-          }}
-          title={notReadyLabel}
-          className="bg-gray-400 h-full flex items-center justify-center text-white font-medium overflow-hidden whitespace-nowrap px-1"
-        >
-          {notReadyPercentage > 15 && notReadyLabel}
-        </div>
-      )}
-      {usedPercentage > 0 && (
-        <div
-          style={{
-            width: `${usedPercentage}%`,
-            fontSize: 'clamp(8px, 1.2vw, 12px)',
-          }}
-          title={usedLabel}
-          className="bg-yellow-500 h-full flex items-center justify-center text-white font-medium overflow-hidden whitespace-nowrap px-1"
-        >
-          {usedPercentage > 15 && usedLabel}
-        </div>
-      )}
-      {servicePreemptiblePercentage > 0 && (
-        <div
-          style={{
-            width: `${servicePreemptiblePercentage}%`,
-            fontSize: 'clamp(8px, 1.2vw, 12px)',
-          }}
-          title={buildServicePreemptibleTitle(
-            servicePreemptible,
-            gpu?.gpu_preemptible_service_breakdown
-          )}
-          className="bg-violet-300 h-full flex items-center justify-center text-violet-950 font-medium overflow-hidden whitespace-nowrap px-1"
-        >
-          {servicePreemptiblePercentage > 15 && servicePreemptibleLabel}
-        </div>
-      )}
-      {otherPreemptiblePercentage > 0 && (
-        <div
-          style={{
-            width: `${otherPreemptiblePercentage}%`,
-            fontSize: 'clamp(8px, 1.2vw, 12px)',
-          }}
-          title={buildPreemptibleTitle(
-            otherPreemptible,
-            servicePreemptible === 0 ? gpu?.gpu_preemptible_breakdown : null
-          )}
-          className="bg-amber-300 h-full flex items-center justify-center text-amber-900 font-medium overflow-hidden whitespace-nowrap px-1"
-        >
-          {otherPreemptiblePercentage > 15 && otherPreemptibleLabel}
-        </div>
-      )}
-      {unknownPreemptiblePercentage > 0 && (
-        <div
-          style={{
-            width: `${unknownPreemptiblePercentage}%`,
-            fontSize: 'clamp(8px, 1.2vw, 12px)',
-          }}
-          title={buildUnknownPreemptibleTitle(
-            unknownPreemptible,
-            gpu?.gpu_preemptible_breakdown
-          )}
-          className="bg-orange-300 h-full flex items-center justify-center text-orange-950 font-medium overflow-hidden whitespace-nowrap px-1"
-        >
-          {unknownPreemptiblePercentage > 15 && unknownPreemptibleLabel}
-        </div>
-      )}
-      {freePercentage > 0 && (
-        <div
-          style={{
-            width: `${freePercentage}%`,
-            fontSize: 'clamp(8px, 1.2vw, 12px)',
-          }}
-          title={freeLabel}
-          className="bg-green-700 h-full flex items-center justify-center text-white font-medium overflow-hidden whitespace-nowrap px-1"
-        >
-          {freePercentage > 15 && freeLabel}
-        </div>
-      )}
+      <GpuBarSegment
+        percentage={notReadyPercentage}
+        label={notReadyLabel}
+        tooltip={notReadyTitle}
+        className="bg-gray-400 text-white"
+      />
+      <GpuBarSegment
+        percentage={usedPercentage}
+        label={usedLabel}
+        tooltip={usedTitle}
+        className="bg-yellow-500 text-white"
+      />
+      <GpuBarSegment
+        percentage={servicePreemptiblePercentage}
+        label={servicePreemptibleLabel}
+        tooltip={buildServicePreemptibleTitle(
+          servicePreemptible,
+          gpu?.gpu_preemptible_service_breakdown
+        )}
+        className="bg-violet-300 text-violet-950"
+      />
+      <GpuBarSegment
+        percentage={otherPreemptiblePercentage}
+        label={otherPreemptibleLabel}
+        tooltip={buildPreemptibleTitle(
+          otherPreemptible,
+          servicePreemptible === 0 ? gpu?.gpu_preemptible_breakdown : null
+        )}
+        className="bg-amber-300 text-amber-900"
+      />
+      <GpuBarSegment
+        percentage={unknownPreemptiblePercentage}
+        label={unknownPreemptibleLabel}
+        tooltip={buildUnknownPreemptibleTitle(
+          unknownPreemptible,
+          gpu?.gpu_preemptible_breakdown
+        )}
+        className="bg-orange-300 text-orange-950"
+      />
+      <GpuBarSegment
+        percentage={freePercentage}
+        label={freeLabel}
+        tooltip={freeTitle}
+        className="bg-green-700 text-white"
+      />
     </div>
   );
 };
@@ -331,7 +343,14 @@ export function ContextDetails({
           </div>
           {gpusInContext.length > 0 && (
             <div className="mb-6">
-              <h4 className="text-base font-semibold mb-3">Available GPUs</h4>
+              <div className="mb-3">
+                <h4 className="text-base font-semibold">GPU capacity</h4>
+                <p className="mt-1 text-xs text-gray-600">
+                  {!isSSHContext && !isSlurm
+                    ? 'Free is immediate headroom. Reclaimable GPUs are allocated, not idle, and may be preempted by higher-priority work. Hover or focus a segment for workload and priority details.'
+                    : 'Free is unallocated in this snapshot. Hover or focus a segment for utilization details.'}
+                </p>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {gpusInContext.map((gpu) => {
                   return (
@@ -356,6 +375,7 @@ export function ContextDetails({
                           gpu={gpu}
                           heightClass="h-4"
                           wrapperClassName="w-full"
+                          showPriorityPolicy={!isSSHContext && !isSlurm}
                         />
                       </div>
                     </div>
@@ -436,8 +456,20 @@ export function ContextDetails({
                       }
                     }
 
-                    // Build utilization string
-                    const utilizationStr = `${node.gpu_free} of ${node.gpu_total} free`;
+                    // Build utilization string and the per-node bar. A node
+                    // that is not ready contributes its full GPU capacity to
+                    // the unavailable segment, matching the aggregate view;
+                    // accelerators on it are not immediately free even when
+                    // its last pod snapshot reports them as unallocated.
+                    const nodeFree =
+                      node.is_ready === false ? 0 : node.gpu_free;
+                    const utilizationStr = `${nodeFree} of ${node.gpu_total} free`;
+                    const nodeGpu = {
+                      ...node,
+                      gpu_free: nodeFree,
+                      gpu_not_ready:
+                        node.is_ready === false ? node.gpu_total : 0,
+                    };
 
                     // Build node status string
                     const statusInfo = [];
@@ -511,8 +543,18 @@ export function ContextDetails({
                         <td className="p-3 whitespace-nowrap text-gray-700">
                           {canonicalizeGpuName(node.gpu_name)}
                         </td>
-                        <td className="p-3 whitespace-nowrap text-gray-700">
-                          {utilizationStr}
+                        <td className="p-3 min-w-[220px] text-gray-700">
+                          <div className="flex flex-col gap-1.5">
+                            <span className="text-xs">{utilizationStr}</span>
+                            {node.gpu_total > 0 && (
+                              <GpuUtilizationBar
+                                gpu={nodeGpu}
+                                heightClass="h-3"
+                                wrapperClassName="w-full min-w-[180px]"
+                                showPriorityPolicy={!isSSHContext && !isSlurm}
+                              />
+                            )}
+                          </div>
                         </td>
                         <td className="p-3 max-w-xs">
                           <div className="flex flex-col gap-1.5">
