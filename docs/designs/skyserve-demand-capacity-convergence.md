@@ -1,10 +1,17 @@
 # SkyServe demand, capacity, and telemetry convergence
 
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
-#1504. The complete additive stack is deployed in production as v1.1.1302 but
-its per-service demand, route, and ordered-capacity authorities remain dark.
-PR #1521 adds partial-coverage in-flight observability and corrects the
-canonical direct-Helm deployment contract.
+#1504. The complete additive stack is deployed in production; its per-service
+demand, route, and ordered-capacity authorities remain dark. PR #1521's
+partial-coverage in-flight observability is merged and deployed as direct Helm
+revision 406 / release `1.1.1305` at image digest
+`sha256:b493c8a03d32f62307af9c4093ad94cbe20cf80fde4915f907548d8149954173`
+and chart digest
+`sha256:170056bb3654f35ba52d6a42421d4feacf31233a9e028407ccb796a2fdfe7e62`.
+The API reports version 86 and all 14 warm-standby LB Deployments converged on
+the image. Live incomplete occupancy now exposes the confirmed in-flight lower
+bound and unknown-backend count rather than suppressing processing activity.
+This corrects observability only; it does not promote authority.
 P2b2 includes the adversarial-review correction that
 separates cheapest-compatible demand attribution from supply-aware exact-card
 capacity accounting. A production observation at Serve048 exposed that the
@@ -740,8 +747,10 @@ production promotion evidence remain open.
 
 ### P3: blocked steady-state cleanup
 
-Author API013/Serve051 with P1/P2 and keep it stacked and blocked. After the
-documented rollout gates it removes controller-coupled telemetry ingestion,
+Restack the first cleanup onto API014/Serve051 and keep it stacked and blocked;
+API013 is owned by G1Sb executor-termination evidence. Restack the second
+cleanup immediately above it onto API015/Serve052. After the documented rollout
+gates, the two cleanup PRs remove controller-coupled telemetry ingestion,
 unbound non-pool admission/recovery, the ordinary-only handler alias, global
 startup recovery waiting, cluster-name/process-map authority, legacy incident
 writers, dual-feed selection, and transition-only metrics/tests. Historical
@@ -761,11 +770,12 @@ must never be substituted as the release name. There is no required
 
 Before every upgrade, capture `helm history`, live user and all-values,
 manifest, current image IDs, and their hashes as rollback evidence. Pull the
-exact OCI chart and verify its digest. Render a server-side dry run from that
-chart with `--reuse-values`; any list-valued override must restate the complete
-list element rather than replacing it with a partial `--set` value. Confirm
-the diff contains only the intended immutable image/chart and configuration
-changes and gate the rollout on zero active mutating requests. Upgrade with
+exact OCI chart and verify its digest. Render a client-side dry run from that
+chart with `--reuse-values`; a server-side dry run is forbidden because hooks
+may mutate the live release. Any list-valued override must restate the complete
+list element rather than replacing it with a partial `--set` value. Confirm the
+diff contains only the intended immutable image/chart and configuration changes
+and gate the rollout on zero active mutating requests. Upgrade with
 `helm upgrade skypilot <exact-chart> -n skypilot --reuse-values --atomic
 --wait --wait-for-jobs`, plus a reviewed complete image override when needed.
 Afterward, record the new Helm revision and verify the migration job, exact
@@ -867,6 +877,9 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
   and binding modes legacy, non-pool capability false).
 - [x] Merge P1, P2a, and P2b1 as PRs #1498, #1499, and #1503; publish P2b2 as
   PR #1504 and the blocked P3 removals as draft PRs #1506/#1510.
+- [ ] Restack draft PR #1506 on the G1S cleanup lineage as API014/Serve051 and
+  draft PR #1510 immediately above it as API015/Serve052; adversarially
+  re-review both exact diffs before either is eligible to merge.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
 - [x] Inventory exact retained legacy rows and unsettled requests immediately
   before migration. The historical seven-row scope is absent and must not be
