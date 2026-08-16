@@ -12,17 +12,17 @@ subsumes that v18-only precursor and adds all three pre-activation contracts.
 A read-only production census on 2026-08-15 disproved the prior assumption that
 all retained JSON rows were already v17: exact historical v3, v6, v7, v12,
 v13, and v14 rows remain. A narrowly bounded reader bridge for only their
-observed closed shapes is therefore part of A's `LEGACY_ACTIVE` rollout; it
-does not weaken v17/v18 validation or authorize sequenced fill. A is not yet
-merged, published, or deployed. Exact-only publisher B and final Serve047
-cleanup C are pending. The prior review record is historical. A requires
-independent security/contract review and CI before merge; three consecutive
-pragmatic adversarial rounds are required later against the frozen final A/B/C
-and platform heads before final deployment/completion. Platform PRs 14, 17,
-18, and 19 remain unapplied, reserved-fill activation has not occurred, and
-cleanup remains blocked on the documented live receipt gates.
+observed closed shapes shipped in PR #1492 as `v1.1.1284`. That bridge is a
+`LEGACY_ACTIVE` compatibility rollout only: it does not weaken v17/v18
+validation, run normalization, or authorize sequenced fill. Exact-only
+publisher B, the generalized non-pool binding transition (API011/Serve047),
+the API012/Serve048 demand/route convergence, and final Serve049 cleanup C
+remain pending. The prior review record is
+historical; the 2026-08-15 material correction resets the final generalized
+binding/A/B/C review count to zero. Reserved-fill activation has not occurred,
+and cleanup remains blocked on the documented live receipt gates.
 
-Last updated: 2026-08-15 (bounded live ReplicaInfo reader bridge)
+Last updated: 2026-08-16 (v1.1.1284 bridge and generalized binding plan)
 
 Canonical owner: this file
 
@@ -42,13 +42,15 @@ concurrent physical-pool observation
   -> one authenticated service-wide allocation map
   -> the ordinary autoscaler reconciliation coordinator
   -> pure typed fill plan
-  -> locked durable capacity admission and replica-row acceptance
-  -> exact accepted/deferred commit receipt
+  -> locked durable capacity admission plus atomic replica-row, typed launch
+     association, API request, queue, and retention-pin acceptance
+  -> exact accepted/deferred commit receipt carrying association/request IDs
   -> exact projection revalidation and deployment-policy authorization at the
      terminal provider boundary
   -> one-way Pod materialization boundary and fresh authority around every
      bounded post-Pod runtime or workload effect
-  -> existing asynchronous launch path
+  -> existing asynchronous launch/provider path through the generic non-pool
+     request handler
 ```
 
 The target correction removes the two root causes of the 2026-08-11 underfill:
@@ -101,10 +103,11 @@ fix-forward stack:
    canonical role does not exist yet. Platform PR 18 then adopts and hardens
    the Rainier runtime and Como chart registries and publisher roles in
    separate account applies/readbacks; it creates no Helm revision.
-4. Only after both PR 18 readbacks, final cleanup C drops the pickle column and
+4. Only after both PR 18 readbacks and generalized binding G1 qualification,
+   final cleanup C drops the pickle column and
    physically removes the temporary v17 runtime reader, normalizer, one-pod/
    `all` source controls, and every other transition-only executable path. The
-   canonical roles publish C's immutable Serve047 image/chart tuple. Platform
+   canonical roles publish C's immutable Serve049 image/chart tuple. Platform
    PR 19 alone pins that tuple, upgrades the already-split release in place,
    enables typed storage, and physically removes the remaining platform and
    publisher transition paths.
@@ -203,7 +206,7 @@ receipt gates even though A can still repair the marker without deleting an
 unknown provider-owned key.
 
 PR 14 must reconcile and read back every live generated inference Service with
-a canonical ledger. That receipt is cleanup C's exact removal gate: Serve047
+a canonical ledger. That receipt is cleanup C's exact removal gate: Serve049
 must physically remove markerless acceptance and reject a missing ledger while
 retaining the ledger and narrow merge behavior as the permanent single path.
 The cleanup absence tests must prove no `require_marker=False` call or
@@ -305,6 +308,50 @@ module deployment were not the underfill cause. RBAC drift should still be
 reconciled declaratively, but neither a permission change nor a larger timeout
 fixes these two defects.
 
+### 2026-08-15 mixed-version launch incident correction
+
+A separate production incident corrected the launch-boundary premise shared by
+the first reserved-fill plan. An old mixed-version executor claimed requests
+and caused real provider effects without the current process/quiescence receipt
+protocol. Later cancellation/storage could show
+`execution_generation = 0`, no PID or entrypoint, and
+`execution_quiescence_required = false`. Those surviving fields do not prove
+that no Pod or other provider effect was created.
+
+Therefore reserved-fill durable row acceptance may not hand work to an unbound
+special launch path. It joins the one generalized non-pool Serve association
+defined by `durable-serve-replica-actions.md` and
+`skyserve-resource-action-provider-facet.md`. The existing Serve042 association
+is extended in place; no reserved-fill association, request queue, executor,
+scheduler, or dual write is added. Its immutable `RESERVED_FILL/v1` profile
+digest references the locked gate, allocation, claim, observation, exact
+pool/physical-UID/card, intent, zero-cost admission sequence, committed service
+version, worker-projection digest, and reclaim-policy identity/ticket. The
+locked replica/profile rows remain the detailed authority; both atomic
+admission and the terminal provider fence revalidate them.
+
+`FillCommitResult` is extended so every accepted intent names the exact durable
+replica, association, and API request IDs. Those objects, the queue row, and
+retention pin commit atomically under the existing demand/reserved-fill lock
+order. A row cannot first become accepted and later acquire a binding. Receipt
+loss retries the same stable key and returns the same identities; a payload,
+profile, authority, or digest mismatch fails closed.
+
+Recovery is typed per association. A legacy/mixed-version request is
+`LEGACY_EFFECT_AMBIGUOUS` unless exact result and provider readback prove its
+disposition; no migration, reducer, repair command, or operator may fabricate
+quiescence or backfill a synthetic association. Provider timeout, partial
+enumeration, RBAC denial, malformed identity, and same-name/new-UID mismatch are
+`UNKNOWN`, not absence. While ambiguous, the row conservatively debits its
+exact pool/card and blocks only that grant/successor. Physical observations,
+route publication, autoscaling, and independent pools continue.
+
+Only a request admitted entirely by the exact current generic handler,
+`RESERVED_FILL/v1` profile, capability cohort, and receipt protocol may classify
+generation zero plus no claim and `NOT_STARTED` as
+`PRE_EFFECT_TERMINAL`. The immediate cancel-then-rediscover repair remains a
+bounded mitigation and must preserve real-effect ambiguity.
+
 ## Prior-plan reconciliation and intentional departures
 
 This file remains the one canonical design. Its detailed pre-implementation
@@ -327,7 +374,7 @@ mechanisms before activation:
 | Advance a capacity counter when observation begins | Snapshot three non-advancing commit counters: total admission, ordinary admission, and first-success materialization | Observation start is not a capacity-consuming event. Commit order, rather than wall time, closes admission and provider-visibility races. |
 | Direct single-context broker polling under the actuation path | Bounded concurrent observation cohorts, per-edge alias failover, immutable PostgreSQL results, and post-commit notification | Provider latency must not consume observation freshness or serialize unrelated physical pools. |
 | Ordered-prefix receipt | A bijective sparse receipt: pool-local failures skip only their intents; global authority loss defers the remaining ordered tail | One unavailable cluster must not starve an independent cluster, while service-wide fences remain atomic. |
-| A new durable intent state machine, provider scheduler, mutation arbiter, and debt path | Durable replica-row acceptance is the receipt boundary; accepted rows use the existing asynchronous launch/request path | A second scheduler and actuator would create another happy path and duplicate lifecycle ownership. |
+| A new durable intent state machine, provider scheduler, mutation arbiter, and debt path | Durable replica-row acceptance plus the existing generalized non-pool association/request/queue transaction is the receipt boundary; accepted rows use the existing asynchronous provider path | A second scheduler and actuator would create another happy path and duplicate lifecycle ownership, while an unbound special launch would repeat the incident defect. |
 | Pod `PriorityClass`, task-owned Kueue priority, mutable launch-time queue resolution, or activation-time attestation as sufficient reclaim proof | The immutable worker projection is the sole admission owner; one entry-point-loaded deployment policy must prove and durably identify the shared Kueue domain, then authorize every sequenced claim set and terminal provider launch against the exact service version and projection digest | Kueue can withhold higher-priority BCL Pods before kube-scheduler priority can act, and a one-time census or Pod-only identity cannot govern later claims, service updates, or restarted executors. |
 | External release supervisor, phase-0 authority reset, bootstrap/maintenance modes, capacity canary, rollback, and fixed 24-hour soak | Full immutable split-role rollout at `LEGACY_ACTIVE`, exact activation prerequisites, then generation-fenced fix forward; no capacity canary or supported demotion | The Serve045 gate/reclaim receipt plus Serve046 version/projection binding form one smaller fail-closed transition and match the current lightly used service. |
 | Provider-progress status as launch authority | Provider-free `reserved_fill_reconciliation` diagnostics derived from authenticated allocation and durable rows | Observability must not perform provider I/O or become a second authorization source. |
@@ -355,6 +402,8 @@ required for this fix-forward rollout.
   intents.
 - Count capacity as spent and advance pool rotation only from a validated
   durable commit receipt.
+- Atomically bind every accepted fill row to the exact generic non-pool API
+  request and return its association/request identities in that receipt.
 - Revalidate the exact intent, current service ceiling, and remaining
   aggregate and accelerator-card feed in the same transaction that inserts
   each sequenced fill row.
@@ -396,6 +445,9 @@ required for this fix-forward rollout.
 - No status-side provider calls, mutation authority, or new provider-progress
   scheduler. Diagnostics are a read-only projection of already authenticated
   PostgreSQL authority and exact durable replica attribution.
+- No reserved-fill-specific association, queue, handler, executor, effect
+  receipt, or recovery lock. The common binding carries a typed reserved-fill
+  profile while this design retains broker and reclaim authority.
 
 ## Public contract
 
@@ -573,9 +625,13 @@ In `SEQUENCED_ACTIVE`, an ordinary zero-cost insert atomically advances both
 counters and stores its database-assigned total sequence on `ReplicaInfo`. A
 typed fill insert carries the allocation's ordinary high-water, requires it to
 still equal the locked singleton, and only then advances the total counter.
-The manager performs that final revalidation and row insert while participating
-in the same global demand-admission lock as ordinary placement. Provider
-preflight stays outside that lock. This closes both directions of the race:
+The manager performs that final revalidation and the generic binding admission
+while participating in the same global demand-admission lock as ordinary
+placement. In the same PostgreSQL transaction it inserts the replica row,
+inserts `RESERVED_FILL/v1` in the existing association table, inserts the
+correlated API request, queue row and retention pin, and returns their exact
+identities. Provider preflight stays outside that lock. This closes both
+directions of the race:
 ordinary demand cannot commit between fill revalidation and persistence, and a
 fill cannot consume stale evidence while an ordinary placement transaction is
 in flight.
@@ -934,7 +990,9 @@ intent exactly once as accepted or deferred. A pool-local identity or preflight
 failure produces a sparse receipt and does not starve healthy independent
 contexts; a service-global owner, version, sequence, headroom, or provider-phase
 failure defers the remaining ordered tail. Each accepted entry names its intent
-hash and durable replica ID. The controller advances pool rotation only from
+hash, durable replica ID, generalized launch association ID, and exact API
+request ID. All four identities were committed in the same admission
+transaction. The controller advances pool rotation only from
 durably accepted rows. If authority remains current while any intent is
 deferred, the controller immediately coalesces another reconciliation pass.
 
@@ -1022,6 +1080,55 @@ scope: it must return V2 evidence under a correspondingly reviewed policy
 identity and full-fleet bundle. Any already active experimental generation
 would require normal fix-forward reauthorization, which advances the gate and
 invalidates its allocation maps.
+
+### 7. Provider-free external load-balancer route projection
+
+Endpoint and accelerator resolution remains provider-bearing work in the
+replica manager's ordinary readiness-probe round. The external load balancer
+and API paths do not repeat it: they read no Kubernetes object, provider phase,
+cluster handle, endpoint resolver, or process-local provider-derived route
+cache.
+
+After applying a complete probe round, the manager classifies every current
+replica under its bounded manager lock as routable with exact URL/accelerator,
+intentionally off-route, or fail-closed with a typed reason. A provider-phase
+deferral, owner transition, incomplete fleet read, missing version/profile
+contract, or unclassified row aborts publication; it never publishes a partial
+or spuriously empty route set. Provider calls and waits have already completed
+before this short classification/publication boundary.
+
+The semantic projection is ordered by `(replica_id, replica_record_id)` and
+binds service version, row version, normalized URL, accelerator/count,
+zero-cost provenance, asynchronous occupancy, system-recovery marker, service
+owner epoch, binding epoch, and capability-cohort epoch. URL collisions fail
+closed for every colliding record. Canonical semantic and wire digests are
+validated on every read. One transaction inserts an immutable generation,
+advances the service head only for a semantic change, and prunes history to a
+bounded eight generations.
+
+Serve047 creates the projection head/generation tables in the same additive
+transition that generalizes the existing launch association. It is not another
+Serve revision or authority path. `read_current()` joins the current service
+owner, cohort, head, and immutable generation and returns nothing on mismatch.
+A replacement controller therefore starts cold and fails closed until its own
+first complete publication; it does not wait for association reconciliation.
+A warm LB may retain its last already-applied coherent snapshot during that
+bounded gap, while a cold LB remains unready.
+
+Each route client is bound to exact `(replica_id, replica_record_id)` identity.
+Reusing a URL for a successor drains the predecessor client and creates a new
+identity-bound client. Demand and occupancy reports echo projection generation
+and record identity; stale evidence cannot affect a successor. Raw URLs remain
+only in the existing identity-validated drain report. URL-to-replica caches are
+deleted.
+
+The route read is one indexed PostgreSQL head/generation join plus bounded
+canonical decoding. Tests instrument provider/Kubernetes adapters and require
+zero calls, complete owner replacement, exact successor isolation, and one
+poisoned launch association among hundreds without blocking fresh route
+publication for healthy rows. The generous regression ceilings are one cold
+840-route read within ten seconds and 100 subsequent reads with p99 below one
+second; they are not permission to add another in-process cache.
 
 ### Boltz deployment policy bundle
 
@@ -1175,12 +1282,15 @@ are unchanged.
 Provider and Kubernetes reads for activation and claims complete before the
 broker and PostgreSQL row locks are acquired. Launch authorization completes
 before the fleet-wide reclaim guard and before any PostgreSQL transaction or
-row lock. Reserved fill cannot also carry the ordinary bound-launch context.
+row lock; the short-lived typed result is then revalidated by the atomic row
+and generalized binding admission. Reserved fill must carry the
+`RESERVED_FILL/v1` bound-launch profile and exact authorization references. It
+does not carry ordinary defaults or create a second association.
 For built-in Kubernetes reserved fill, every provider-mutation factory call
 acquires the service-owner guard, obtains a fresh deployment-policy ticket,
 then acquires the fleet guard, revalidates exact durable authority, performs
-one bounded mutation, and releases all three before any passive wait. Ordinary
-bound launches and opaque provisioners retain their existing whole-call
+one bounded mutation, and releases all three before any passive wait. Other
+bound profiles and opaque provisioners retain their existing whole-call
 service guard. The deployment policy call receives one absolute five-second
 monotonic deadline and must be cancellation-aware; a result returned after
 that deadline is rejected before any authority lock or mutation. No path
@@ -1752,6 +1862,8 @@ before activation. If it does not, the new image may deploy but the gate stays
 - Lost-wakeup-free controller coordinator and optimistic actuation generation.
 - Pure planner, autoscaler adapter, manager sparse receipt, and receipt-driven
   rotation.
+- The generalized non-pool association/profile/cohort and atomic binding IDs
+  described above are design-required but not present in this worktree.
 - Fleet transition CLI requiring protocol v2, Serve046, API010, an exact stable
   split-role `api`/`controller`/`executor` writer cohort on one immutable image
   digest, and one entry-point-loaded deployment reclaim policy. The same
@@ -1977,19 +2089,58 @@ either case.
 | 0 | Historical multi-pool protocol v2, UID fences, claims, grants, and zero-cost-only launch seam | Already present before this correction. |
 | 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045/046 reclaim-policy identity | Merged in source PR #1451. Its prior freeze/reviews are historical evidence, not a pass for the current stack. |
 | 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
-| 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Required in A and removable only after the v18 normalization receipt; rollout is `LEGACY_ACTIVE` only. |
-| 1d | Narrow ordinary-FEV2 rollout of A on the existing single-`all` Recreate topology | Permitted only for backward reads and authenticated queue capacity at `LEGACY_ACTIVE`; it performs no normalization, role split, publisher migration, or reserved-fill activation. |
+| 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Merged in PR #1492 and published as v1.1.1284; removable only after the v18 normalization receipt. Its rollout is `LEGACY_ACTIVE` only. |
+| 1d | Narrow ordinary-FEV2 rollout of v1.1.1284 on the existing single-`all` Recreate topology | Pending production deployment; permitted only for backward reads and authenticated queue capacity at `LEGACY_ACTIVE`. It performs no normalization, role split, publisher migration, or reserved-fill activation. |
+| 1e | Generalized binding G1: API011/Serve047, typed non-pool profiles, atomic reserved-fill association/request admission, per-row reconciliation, and provider-free routes | Planned and required before activation. Its blocked cleanup G2 is authored simultaneously. |
 | 2a | Activation successor A and platform PR 14: publish/pin A, migrate one-pod `all` directly to exact split 2/2/2 on A, and delete `all` | A is local and PR 14 is not applied; both are blocked on A review, CI, publication, and exact tuple binding. |
 | 2b | Platform PR 17: invoke normalization and accept its receipt on the unchanged PR 14 A tuple | Blocked until PR 14's exact split-A rollout/readback passes; PR 17 creates no rollout or Helm revision. |
 | 2c | Publisher B and platform PR 18: exact-only source publication, expected pre-adoption no-publish, then separate registry/role adoption and readbacks with no Helm revision | Not merged or applied. |
 | 2d | Deployment-owned Kueue bundle, unique entry-point policy, and generation-fenced authorization | Not activated; the live IAM/RBAC/Kueue attestation gates remain open. |
-| 3 | Source cleanup C and platform PR 19: publish/pin Serve047, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
+| 2e | Demand/route convergence: API012/Serve048 durable demand feed, zero-cost-before-paid ordering, and provider-free route projection | Planned after G1 and before cleanup. |
+| 3 | Source cleanup C/G2 and platform PR 19: publish/pin Serve049, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
 
-Durable acceptance hands rows to the existing asynchronous launch path, and
+Durable acceptance atomically binds rows to the existing asynchronous launch
+path through the generic non-pool handler, and
 status projects the same allocation/observation evidence used by
 reconciliation; neither is a second source of launch authority.
 
 ## Deployment, activation, and fix-forward reauthorization
+
+### Generalized binding prerequisite
+
+G1 ships API011 and Serve047 readers/schema before writers, then converges all
+API acceptors, request backends, queue executors, GC participants, possible
+service controllers, and profile participants on one immutable generic-handler/
+profile/receipt digest. Old ready and non-ready-recent leases drain through the
+maximum stale/quiescence horizon. Initial reserved-fill activation is blocked
+until the `RESERVED_FILL/v1` profile is in that cohort and every accepted fill
+row atomically returns its association/request IDs.
+
+Before per-service cutover, require zero unbound active request and zero
+unbound `PENDING`/`PROVISIONING` row. Settle the seven incident rows from exact
+provider/result evidence without fabricating a receipt. A remaining legacy
+ambiguous row conservatively debits only its pool/card and cannot be retried.
+Start provider probes, the reconciliation coordinator, and route publication
+without a global recovery lock; schedule association repair per row.
+
+For these pre-binding rows, Serve047's transition-only legacy-reconciliation
+evidence table preserves the exact request and replica identity, an explicit
+old-executor termination attestation, and a later physical-UID-scoped provider
+observation. Only a later exact `ABSENT` observation can authorize cleanup; the
+record cannot authorize a retry, fabricate request quiescence, or become a
+synthetic association. The audit tombstone is retained when G2 removes the
+transition writer.
+
+API012/Serve048 next implement the durable demand feed, zero-cost-before-paid
+placement fence, and provider-free route projection. G2/C is authored with G1
+and that convergence but blocked. It owns API013 and Serve049, including the
+final permanent reserved-fill authorization and combined-role cleanup that
+earlier drafts assigned to API011/Serve047. API009--012 and Serve042--048
+remain immutable. G2/C removes unbound non-pool launch/recovery, old handler aliases,
+global startup recovery lock/backoff, cluster-name quiescence authority,
+process-map authority, demotion after the rollback window, and transition-only
+telemetry. After it lands, reserved fill and all other non-pool profiles use one
+binding and fix forward.
 
 ### Preconditions
 
@@ -2296,8 +2447,8 @@ The counts are live values, not expected constants, but
 `serve_database_revision` is `046`, the role list, Pod count, process count,
 and inventory hash prove the exact 2/2/2 cohort, and `writer_image_digest`
 equals the digest proven on every split writer role. A
-failed or absent receipt blocks Serve047. Rerunning after an interrupted
-validation is safe and produces an idempotent receipt. Serve047 then asserts
+failed or absent receipt blocks Serve049. Rerunning after an interrupted
+validation is safe and produces an idempotent receipt. Serve049 then asserts
 the exact v18/key shape, drops the pickle column, and physically deletes the
 v17 runtime decoder and this normalization module; normalization is not a
 permanent happy path. Historical Alembic replay retains only the
@@ -2320,12 +2471,19 @@ Activation fails unless all of the following are true:
 
 - the database is central PostgreSQL;
 - reserved-fill protocol version is exactly 2;
-- Serve and API-request schema revisions are exactly 046 and 010;
+- the deployed transition is at least generalized-binding Serve047 and
+  API-request 011 (or final Serve049/API013 after G2/C), with no divergent
+  migration head;
 - Kubernetes and PostgreSQL inventory attest exactly the split roles
   `api`, `controller`, and `executor`, with no compatibility `all` writer;
 - all attested writer pods are Ready and all recent process leases match that
   exact pod cohort; and
 - every writer Deployment uses one immutable image digest; and
+- every API/request-backend/executor/GC/controller/profile participant carries
+  the exact same generic handler/profile/receipt capability digest and cohort
+  epoch, with old/recent leases drained; and
+- every accepted reserved-fill row commits one `RESERVED_FILL/v1` association,
+  request, queue row, and retention pin atomically; and
 - exactly one deployment-installed `ReservedFillReclaimPolicy` returns fresh
   typed evidence for the exact current claims and the global future-claim and
   terminal-launch enforcement contract. The activation CAS binds its exact
@@ -2363,8 +2521,9 @@ reserved-capacity underfill, not duplicate fill or paid spill.
 No step below creates compute.
 
 1. Confirm the transition status reports protocol 2,
-   `SEQUENCED_ACTIVE`, Serve046, API010, and the exact expected durable reclaim
-   identity.
+   `SEQUENCED_ACTIVE`, generalized-binding Serve047/API011 (or final
+   Serve049/API013), the exact generic capability cohort, and the expected
+   durable reclaim identity.
    Confirm the full fleet reports public server API capability 77 and worker
    placement projection protocol 2.
 2. Confirm every claimed physical pool is producing completed `SUCCESS` or
@@ -2377,8 +2536,8 @@ No step below creates compute.
    durable reclaim identity.
 4. Confirm newly accepted fill replica rows carry the full allocation,
    observation, intent, reclaim identity, service version, exact worker
-   projection digest, and positive
-   `zero_cost_admission_sequence` tuple.
+   projection digest, positive `zero_cost_admission_sequence`, and exact
+   `RESERVED_FILL/v1` association/request IDs from `FillCommitResult`.
    After its first successful launch persistence, confirm the row also carries
    one immutable positive `zero_cost_materialization_sequence`.
 5. Confirm an ordinary zero-cost row created after allocation publication
@@ -2769,6 +2928,11 @@ consecutive sequence restarts from round 1 again.
 | 2 | feature/design `a0fe24207854cdc3f98a4d2a879cc9dce4bfa0f7`; stacked Serve047 cleanup `175e04e8376d8507c9d08428f2f2a34516df8b2e`; design SHA-256 `b6037bab7e8de936aa5d447b7547f7ea2faf012395bfb36ccc1eb8006cecf486` | pass | No material or non-material findings. Independent review reverified the terminal PostgreSQL admission ledger, exact projection-to-Node accelerator scheduling atom, disjoint physical-card contracts, fail-closed zero-cost launch, live-attested bounded Kueue borrowing and BCL/research reclaim, and Serve047's sole forward authorization path. All non-design blobs remained byte-identical to round 1. |
 | 3 | feature/design `cea111a5ddcf7f84e7426d75920e23cae7d33b65`; stacked Serve047 cleanup `c4a46c2debe54a832916cd64408c8306a50dc266`; feature design SHA-256 `fb9a88be168ac3a951a51c053f054a86d97ad5f363504c005a4c1be10bd2d398`; cleanup design SHA-256 `793fc1b5000f3d2ec46da066798645c9e36fc703f4faade9ef4fbc35bc4a89e5` | pass | No material or non-material findings. Final independent review reconfirmed bounded generation-fenced observation, complete terminal admission revalidation, exact-card zero-cost-only launch, projection and deployment-policy identity, zero-nominal inference borrowing with research reclaim, and Serve047's two-state forward-only authority. Every non-design blob remained byte-identical to round 2. |
 
+Those rows reviewed a now-superseded use of migration number Serve047 for
+cleanup. Serve047 now belongs to generalized binding G1 and cleanup is
+Serve049; none of the rows validates the mixed-version incident correction,
+capability cohort, typed reconciliation, or atomic reserved-fill binding.
+
 Reviews should be pragmatic and fix-forward oriented. They must reject an
 oversubscription, stale-authority, duplicate-happy-path, paid-spill, or BCL
 priority regression, but should not require a canary or a general rollback
@@ -2789,9 +2953,15 @@ PR. The current source stack is:
    A and preserves the already-existing exact v17/v18 boundary;
 3. independently releasable publisher B: the exact-only publication contract
    and physical deletion of superseded publisher paths, with no runtime or
-   schema behavior change; and
-4. final cleanup C: forward-only Serve047 plus physical deletion of every live
-   compatibility and transition path. C retains
+   schema behavior change;
+4. generalized binding G1: forward-only API011/Serve047, in-place typed
+   non-pool association profiles, exact capability cohort, atomic reserved-fill
+   binding receipt, per-row typed recovery, and provider-free route projection;
+   and
+5. demand/route convergence: forward-only API012/Serve048 implementing the
+   durable feed, ordered placement, and route projection; and
+6. final cleanup C/G2: forward-only API013/Serve049 plus physical deletion of
+   every live compatibility and transition path. C retains
    `reserved_fill_reconciliation_transition status/activate` as the sole
    first-authorization and reauthorization surface.
 
@@ -2805,8 +2975,11 @@ cleanup PR
 not current C or merge/deployment evidence. It must be replaced or updated to
 the exact reviewed C revision. Historical cleanup PR #1263 is unrelated.
 
-The cleanup uses a new forward-only Serve047 migration; it never edits or
-renumbers historical Serve044, Serve045, or Serve046. Serve047 preserves the
+The cleanup uses new forward-only API013 and Serve049 migrations; it never
+edits or renumbers historical Serve044, Serve045, Serve046, or generalized-
+binding Serve047 and demand Serve048, nor API009--012. API013 owns the combined-
+role/old-handler final cleanup that an earlier draft assigned to API011.
+Serve049 preserves the
 Serve045 reclaim receipt/generation and every Serve046 service-version and
 projection-digest column and constraint. It replaces the Serve045 gate check,
 default, and `ENABLE ALWAYS` trigger with the protocol-v2-only final two-state
@@ -2829,6 +3002,11 @@ same canonical command authorizes `UNAUTHORIZED` to
 second bootstrap actuator.
 
 The cleanup stack removes, rather than perpetuates:
+
+- every unbound non-pool admission/recovery path, the old ordinary-only
+  handler/profile alias, cluster-name quiescence as launch authority, global
+  startup recovery lock/backoff, process-map authority, rollback demotion after
+  its rehearsal window, and generalized-binding transition telemetry;
 
 - first, the exact-shape v3/v6/v7/v12/v13/v14 live reader and its census tests
   after the archived receipt proves zero non-v18 rows; then, in final cleanup
@@ -2887,10 +3065,20 @@ and readbacks must have passed without creating a Helm revision. Missing
 evidence blocks C; it never permits a legacy path.
 
 After the runtime gates pass, C may merge and the canonical roles publish its
-immutable Serve047 image/chart tuple. PR 19 must not merge, plan, or apply until
+immutable Serve049 image/chart tuple. PR 19 must not merge, plan, or apply until
 that exact publication receipt and all final platform absence gates pass. PR 19
 then pins C and upgrades the existing split topology in place; it does not
 create or replace that topology.
+
+Generalized-binding removal additionally requires zero legacy-capable
+participants, zero active or unsettled old-handler requests, zero unbound
+non-pool rows requiring recovery, and typed settlement of all seven incident
+rows without fabricated receipts. It requires one controller restart and
+ordinary service update, readiness/+10/+30, one full 180-second authority
+horizon plus the longer stale-writer/quiescence horizon, bounded manager-lock
+hold time, fresh provider-free routes, broker conservation/no paid spill, and a
+rollback rehearsal. One poisoned association must not block healthy probe,
+route, autoscaler, or sibling-pool progress.
 
 1. source PR #1451 and the v18 precursor PR #1483 are merged, PR 14's exact
    split-A receipt is accepted, and PR 17's normalization receipt names the
@@ -2922,7 +3110,10 @@ create or replace that topology.
     require the stable Pod -> ReplicaSet -> Deployment owner chain. Tests also
     prove chart RBAC retains `get` on ReplicaSets, the protocol-v1 worker
     projection decoder is physically absent, and schema-5 allocations plus
-    exact v18 replica attribution still round-trip and fence correctly.
+    exact v18 replica attribution still round-trip and fence correctly. Source-
+    absence checks reject an unbound non-pool handler/recovery branch, old
+    ordinary handler alias, global recovery wait, cluster-name authority,
+    process-map authority, or synthetic quiescence/backfill helper.
 
 This gate is intentionally short and fix-forward compatible. It proves the
 old path is no longer needed without imposing a 24-hour soak or a GPU/BCL
@@ -2930,6 +3121,25 @@ canary. If it fails, fix the feature or cleanup branch forward; do not reopen
 legacy activation.
 
 ## Open gates
+
+- Author/review generalized binding G1 (API011/Serve047), demand convergence
+  (API012/Serve048), and blocked C/G2 (API013/Serve049) together. Link the
+  stack and record C/G2's exact merge
+  gates; do not reuse the migration numbers claimed by superseded drafts.
+- Converge and drain the exact API/request-backend/executor/GC/controller/
+  profile capability cohort. Prove the old handler cannot claim a generic
+  `RESERVED_FILL/v1` request.
+- Reconcile the seven mixed-version incident rows from real provider/result
+  evidence. Never fabricate quiescence, synthesize an association, or infer
+  absence from generation zero, missing process identity, or
+  `execution_quiescence_required = false`.
+- Before reserved activation, prove zero unbound active request and zero
+  unbound `PENDING`/`PROVISIONING` row; prove each accepted fill receipt names
+  the atomic replica/association/request identities.
+- Pass the typed provider present/absent/unknown/replaced, legacy-real-effect,
+  modern-pre-effect, lost-ACK, crash-boundary, poisoned-row progress,
+  provider-free route, bounded-lock, broker-conservation, and no-paid-spill
+  tests.
 
 - Complete A's independent security/contract review, exact validation, and CI;
   merge and publish A through the old publisher, then bind that exact tuple to
@@ -2959,13 +3169,16 @@ legacy activation.
   Converge the full split-role fleet on that one digest and repeat the
   pre-activation proof; no generic assertion bypass or generic-only image path
   exists.
-- Perform initial activation of A and non-compute manual verification through
-  the one generation-fenced command. Keep A live until every cleanup-C runtime
-  gate and removal horizon passes; later fixes use the same command.
+- Perform initial activation only after A and generalized-binding G1 are in the
+  exact capable cohort, then run non-compute manual verification through the
+  one generation-fenced command. Keep that compatible artifact live until every
+  cleanup-C runtime gate and removal horizon passes; later fixes use the same
+  command.
 - Only then complete C, merge it, and archive its canonical immutable
   image/chart publication receipt. Amend PR 19 with that exact tuple, freeze
-  every final A/B/C/platform head, then pass three consecutive pragmatic
-  adversarial rounds; any material change resets the sequence.
+  every final generalized-binding/A/B/C/platform head, then pass three
+  consecutive pragmatic adversarial rounds; the 2026-08-15 correction resets
+  the prior count to zero and any further material change resets it again.
 - Pass every final absence gate, then apply PR 19 to upgrade the already-split
   release in place, delete all remaining transition paths, and reauthorize C
   through the same generation-fenced command.

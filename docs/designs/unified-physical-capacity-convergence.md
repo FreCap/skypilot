@@ -9,7 +9,7 @@ all three roles as a verified descendant containing that merge. No payoff gate
 was satisfied, and every materialized or authoritative capacity product remains
 unauthorized.
 
-Last updated: 2026-08-11
+Last updated: 2026-08-15
 
 Canonical owner: this file. Rejected materialized/active-control drafts remain
 recoverable from branch history and the review record; they are not a second
@@ -81,13 +81,34 @@ capacity001 and its five empty additive tables while the C2 runtime remains
 absent. The proposed Serve M4/M5a authority continuation was never activated
 and is now also retired; it supplied no evidence for the capacity hypothesis.
 
-The only surviving Serve issue is localized ordinary-launch API request
-binding across controller restart. Its bounded design explicitly reuses the
-normal request executor with a distinct bound handler, atomically commits the
-Serve association, request, retention pin, and durable queue row in one central
-PostgreSQL transaction, and adopts that exact request under a durable service-
-owner epoch. It does not introduce a shared capacity projector,
-reservation/occupancy ledger, provider renderer, or mutation authority.
+The only surviving Serve issue is the generalized non-pool API request binding
+across controller restart. The 2026-08-15 incident proved that an old mixed-
+version executor caused real provider effects even though later storage showed
+generation zero, missing process identity, and no quiescence requirement. The
+correct design therefore extends the existing Serve042 association in place
+with closed ordinary-paid, ordinary-zero-cost, reserved-fill, unknown-capacity,
+cost-rebalance, and system-OOM profiles. It atomically commits replica row,
+association, request, retention pin, and durable queue row through the normal
+request executor and adopts/reconciles that exact request under a durable
+service-owner and capability-cohort epoch. It never fabricates a missing
+receipt.
+
+That generalization is Serve-local effect-envelope convergence, not the
+rejected physical-capacity product. Profile planners retain capacity,
+reservation, broker, pool/card, placement, and recovery authority. The binding
+adds no shared capacity scanner, provider-observation cache, reservation or
+occupancy ledger, provider renderer, action worker, mutation scheduler, or
+cross-domain absence oracle. Pools remain outside the non-pool association.
+Provider-free LB route projection is a deterministic publication of completed
+Serve probe evidence, not a revived capacity projector or provider reader.
+
+The transition is API011/Serve047 with exact all-participant capability cohort,
+typed per-row reconciliation, and no global recovery lock across provider
+waits. API012/Serve048 then add the controller-independent demand feed and
+provider-free route projection without reviving this rejected capacity
+projector. Their simultaneously authored blocked cleanup is API013/Serve049 and
+removes every unbound non-pool launch/recovery path after the rollout gates.
+This numbering and scope supersede ordinary-only and Serve047-cleanup drafts.
 
 No capacity runtime may return without a newly accepted design based on
 30--60 days of production evidence across at least two domains. That design

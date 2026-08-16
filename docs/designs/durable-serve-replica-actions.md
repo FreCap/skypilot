@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-11
+Last updated: 2026-08-15
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -72,6 +72,17 @@ behavior. R4, the already-planned legacy-fallback removal, remains blocked on
 the rollout and migration gates below. None of R1--R3 is treated as deployed
 merely because its stacked source is authored.
 
+The 2026-08-15 mixed-version incident materially changes the accepted steady
+state. An old executor claimed launch requests, ran real provider effects, and
+later left terminal request state without the newer execution-quiescence
+receipt. Consequently, `execution_generation = 0`, a missing PID or process
+entrypoint, and `execution_quiescence_required = false` are not proof that no
+effect occurred. The earlier ordinary-only scope and R4 cleanup are superseded
+by the generalized non-pool launch-binding stack below. The existing R1--R3
+work remains useful transition machinery, but it is not the long-term boundary
+and must not be deployed as though excluded launch profiles can remain
+permanently unbound.
+
 ## Decision record
 
 The original 2026-07-30 request was an evaluation of whether a unified
@@ -117,35 +128,83 @@ eligible production volume. It does not reverse the capacity-scanner no-go,
 revive the universal kernel or retired authority topology, waive the R1-first
 sequence, or authorize a capacity-creating canary.
 
-The stack therefore starts with the diagnostic-only R1 change below, followed
-by R2's bounded machinery and R3's mandatory fresh-service adoption. Binding
-activation in production and R4 legacy-path removal remain subject to their
-compatibility, crash-matrix, migration, and rollout gates.
+At that time, the stack started with the diagnostic-only R1 change below,
+followed by R2's bounded machinery and R3's mandatory fresh-service adoption.
+Binding activation in production and R4 legacy-path removal remain subject to their
+historical compatibility, crash-matrix, migration, and rollout gates. The next
+section supersedes R4.
+
+### 2026-08-15 generalized non-pool correction
+
+The canonical steady state is one typed execution binding for every central-
+PostgreSQL, non-pool SkyServe launch. It extends the existing Serve042
+association in place; it does not add a second association table, request
+queue, executor, provider renderer, capacity scanner, or mutation worker.
+`ORDINARY_PAID`, `ORDINARY_ZERO_COST`, `RESERVED_FILL`,
+`UNKNOWN_CAPACITY_REPLACEMENT`, `COST_REBALANCE`, and
+`SYSTEM_OOM_RECOVERY` are closed versioned profiles on that one binding.
+Pools remain outside it because they have a different lifecycle and no
+inference endpoint.
+
+Profile planners retain all domain authority. In particular, reserved-fill
+broker generations, zero-cost admission sequencing, exact pool/card grants,
+worker-projection digests, and reclaim-policy tickets remain mandatory and
+fail closed. The generalized binding owns only the common effect envelope:
+exact request identity, atomic row/association/request/queue/pin commit,
+execution generation and effect phase, owner transfer, adoption, cancellation,
+terminal result, quiescence, and typed reconciliation. Existing `sky.launch`
+and provider paths remain the only effect implementation.
+
+The incident correction is evidence preserving:
+
+- the old mixed-version executor did perform real effects; it did not merely
+  fabricate a terminal row;
+- no migration, reducer, repair script, or operator may fabricate a
+  quiescence receipt, backfill a fake claim, or mutate terminal state to claim
+  the old execution was safe;
+- a legacy or mixed-version row without exact current-protocol proof is
+  `LEGACY_EFFECT_AMBIGUOUS` until exact request result plus provider readback
+  proves its disposition; and
+- only a request admitted and observed entirely by the exact current handler,
+  capability cohort, and receipt protocol may use generation zero plus no
+  claim and `NOT_STARTED` as `PRE_EFFECT_TERMINAL` evidence.
+
+The immediate cancel-then-rediscover correction is a bounded mitigation. It
+must preserve the may-have-effect classification and cannot become a second
+long-term recovery path.
 
 ## Goals
 
-- Preserve the exact request identity for an ordinary Serve launch across a
+- Preserve the exact request identity for every non-pool Serve launch across a
   controller restart.
 - Adopt the same request after restart rather than submit an untracked second
   request.
-- Keep launch intent, request binding, service identity, replica incarnation,
-  and terminal projection mutually consistent.
+- Keep the typed launch profile, its domain authorization, request binding,
+  service identity, replica incarnation, and terminal projection mutually
+  consistent.
 - Preserve current launch/down ordering, provider-work limits, retry behavior,
   and public Serve semantics.
-- Reuse the ordinary API request executor and existing internal launch path.
+- Reuse the API request executor and existing internal launch path.
 - Make ambiguity explicit and operator-visible instead of guessing success or
   absence.
+- Let one poisoned or ambiguous association quarantine only its exact replica,
+  reserved pool/card grant, and successor decision while unrelated probes,
+  routes, autoscaling, and sibling pools continue.
 
 ## Non-goals
 
 - A universal resource or physical-capacity state machine.
 - A dedicated resource-action authority worker, private HTTPS control plane,
-  cohort, policy rotation, or special execution lease.
+  execution-worker cohort, policy rotation, or special execution lease. The
+  deployment capability cohort is only a mixed-version admission proof.
 - Reimplementing SkyPilot launch/down through a native Kubernetes renderer.
 - Moving provider credentials or provider clients into a new component.
 - Replacing the existing API request queue or ordinary executor.
-- Changing pools, managed jobs, paid capacity, reserved fill, spot fallback,
-  cost rebalance, placement failover, or logical replica accounting.
+- Replacing pool, managed-job, paid-capacity, reserved-fill, cost-rebalance,
+  system-OOM, placement, or logical-replica domain policy. Those planners feed
+  the common binding but retain their own authorization and accounting.
+- A shared capacity scanner, observation cache, occupancy ledger, provider
+  renderer, action worker, or scheduler across domains.
 - Removing process-local fields that remain useful as caches before their
   durable replacements are proven in production.
 
@@ -175,25 +234,36 @@ cases, but it is not a durable proof that the old request was adopted, canceled,
 or terminal. The controller must not rely on that incidental behavior as its
 recovery contract.
 
+The 2026-08-15 incident also disproved a narrower inference in the first
+ordinary-binding design. An old executor can claim and execute a request
+without publishing the API008/010-era process and quiescence evidence that a
+new reducer expects. Cancellation can subsequently leave
+`execution_generation = 0`, no PID/entrypoint, and
+`execution_quiescence_required = false` even though provider effects already
+ran. Those fields describe the surviving database record, not historical
+effect absence. Exact provider readback, immutable result evidence, or a
+current-protocol pre-effect receipt is required before retry.
+
 ## Public contract
 
 There is no new CLI, SDK, configuration, or provider interface. Existing
 Serve behavior remains backward compatible.
 
-If the bounded fix is authorized, an ordinary non-pool replica launch will have
-the following internal contract:
+Every central-PostgreSQL non-pool replica launch has the following internal
+contract after generalized activation:
 
 1. A replica row has a stable record identity. The bounded implementation adds
-   a neutral ordinary-launch generation or association identity; it does not
+   one neutral launch generation and association identity; it does not
    silently reinterpret nullable Serve033 action columns.
-2. Before execution can escape the ordinary API request boundary, the row is
-   durably bound to one exact API request ID for that generation.
+2. Before execution can escape the API request boundary, the row is
+   durably bound to one exact API request ID, typed profile kind/version/digest,
+   and capability-cohort epoch for that generation.
 3. A restarted controller with the same row identity and generation adopts
    that request ID.
 4. A controller may create a successor only after the predecessor is exact
    terminal/quiescent and its durable effect phase proves neither provider nor
    service-job I/O began. Terminal/quiescent post-effect ambiguity blocks.
-5. Ordinary controller replacement transfers the association to the new
+5. Controller replacement transfers the association to the new
    controller by owner-epoch compare-and-swap and adopts the exact request.
    Cancellation targets that request only for committed supersession/teardown;
    losing an in-memory cache is never permission to cancel or replace it.
@@ -205,6 +275,13 @@ the following internal contract:
    A lost HTTP acknowledgement followed by an identical retry returns the
    already-bound request ID; reuse of that key with a different canonical
    launch digest fails closed.
+9. A profile-specific planner supplies immutable authorization references, and
+   both admission and the terminal pre-I/O fence revalidate them. A generic
+   binding never converts missing reserved-fill, paid-capacity, system-OOM, or
+   replacement authority into permission.
+10. Recovery classifies exact durable evidence. It never treats terminal
+    status, generation zero, missing process identity, or a false quiescence-
+    required bit as effect-absence proof for a legacy/mixed-version request.
 
 The API request remains the execution record. A second generic action DAG is
 not introduced merely to wrap it.
@@ -215,13 +292,16 @@ not introduced merely to wrap it.
 
 - `ReplicaManager` owns the desired replica transition and stable replica
   record identity.
-- A separate central PostgreSQL association record owns the neutral ordinary-
-  launch identity and exact request binding.
-- The existing API request queue and ordinary executor own request claim,
+- The existing central PostgreSQL Serve042 association record owns the neutral
+  non-pool launch identity, immutable typed profile, domain-authorization
+  references, capability-cohort epoch, and exact request binding. Serve047
+  extends this table in place; no parallel association or dual write exists.
+- The existing API request queue and executor own request claim,
   execution generation, cancellation, and terminal result.
 - Existing SkyPilot launch/down internals own provider selection and effects.
-- The Serve reducer validates the row/request association before projecting a
-  result.
+- Each domain planner owns its admission policy and authorization payload. The
+  Serve reducer validates that payload and the row/request association before
+  projecting a result.
 
 The exact built-in PostgreSQL request backend owns the admission transaction.
 It reaches the Serve association and replica tables through the same physical
@@ -245,10 +325,11 @@ unfenced stale replica snapshot and permission to start provider I/O.
 
 ### Commit-before-effect
 
-The bounded implementation adds one internal atomic bind-and-enqueue seam. A
-dedicated `/internal/serve/ordinary-launch` endpoint accepts one controller-
-generated stable submission UUID. It does not fall back to `/launch`, whose old
-implementation would ignore unknown binding context and execute unbound. The
+The generalized implementation has one internal atomic bind-and-enqueue seam.
+A dedicated versioned `/internal/serve/non-pool-launch` endpoint accepts one
+controller-generated stable submission UUID and one closed typed profile. It
+does not fall back to `/launch` or the ordinary-only endpoint: either would let
+an old server ignore unknown binding context and execute unbound. The
 controller reuses that UUID for every transport retry. The server
 deterministically derives the association and exact API request IDs from the
 submission UUID plus authenticated tenant scope, independent of the fresh ID
@@ -256,10 +337,13 @@ assigned to each HTTP attempt by `RequestIDMiddleware`, and returns the exact
 bound request ID in the response body.
 
 In one transaction the server locks the lifecycle fence, service row, exact
-replica row, and current association, constructs the complete ordinary-bound
-request with a distinct registered handler on the normal executor topology,
-and inserts the association, `api_requests` row, generic request-retention pin,
-and `api_request_queue` row. It also sets the replica row's exact association
+replica row, and current association; revalidates the profile planner's exact
+authorization; constructs the complete bound request with one distinct generic
+handler on the normal executor topology; and inserts the association,
+`api_requests` row, generic request-retention pin, and `api_request_queue` row.
+Reserved-fill row acceptance returns the association and request IDs in its
+`FillCommitResult`; it cannot first persist a row and later discover or create
+the binding. The transaction also sets the replica row's exact association
 pointer. Queue visibility occurs only at transaction commit,
 after every fence and binding is durable. There is no committed
 PENDING-without-queue activation state and no second worker or recovery sweep.
@@ -273,25 +357,63 @@ association records that digest, but does not store another copy of the task or
 provider payload. The seam does not call the public SDK recursively, create a
 new execution topology, or render provider-native objects.
 
-Central API revision 009 adds an `ordinary_launch_binding_capable` instance
-advertisement, request-to-association correlation, and generic retention-pin
-table. Serve revision 042 adds the neutral association table, replica pointer,
-monotonic service-controller owner epoch, per-service controller capability,
-and durable binding mode/epoch. Bound admission requires every recent API
-acceptor, ordinary executor, GC participant, and possible service-controller
-owner to advertise the exact built-in PostgreSQL protocol; old ready and non-
-ready-but-recent leases must pass the documented quiescence window. The
-dedicated endpoint makes an old API target fail with no effect. Queue candidate
-selection and the locked claim require the distinct handler to be in the local
-supported-handler set, so an old executor leaves the row queued instead of
-claiming it. The service owner CAS persists the subprocess capability beside
-its owner epoch rather than inferring it from an API supervisor lease.
+Central API revision 009 added an ordinary-only capability, hard-coded handler
+constraint, request-to-association correlation, and generic retention-pin
+table. It is not a safe generalized capability: an old executor can advertise
+or understand only that ordinary profile. Forward-only API revision 011 adds
+the generic handler, closed profile kind/version/digest, request capability-
+cohort epoch, and exact per-profile supported-set digest; it replaces neither
+historical 009 nor revision 010. Serve revision 042 already owns the neutral
+association table, replica pointer, monotonic service-controller owner epoch,
+and binding mode/epoch. Forward-only Serve revision 047 extends that existing
+table and service state in place with the generic profile, authorization,
+reconciliation, provider-evidence, and capability-cohort fields.
+
+Bound admission requires one exact immutable cohort digest and epoch across
+all API acceptors, request-backend writers, queue executors, request GC,
+possible service controllers, and every profile-specific admission/executor
+participant. Old ready leases and non-ready-but-recent leases must drain past
+the maximum stale/quiescence window. The service, association, and request all
+persist that cohort epoch. The dedicated endpoint makes an old API target fail
+with no effect. Database handler/profile constraints, queue candidate
+selection, and the locked claim require the generic handler and exact local
+profile version; an old ordinary handler cannot claim it and a stale executor
+leaves it queued. The service owner CAS persists the subprocess capability
+beside its owner epoch rather than inferring it from an API supervisor lease.
+
+The forward schema contract is:
+
+- API011 retains API009's physical association/correlation and retention-pin
+  columns. It adds generic binding protocol version, profile kind/version/
+  SHA-256, and capability-cohort epoch to `api_requests`, plus an instance/lease
+  capability protocol version and profile-set SHA-256. Its closed constraint
+  permits the historical ordinary handler only for historical protocol-v1
+  correlations and requires the new generic handler plus complete v2 fields for
+  every new generic correlation.
+- Serve047 retains the Serve042 association table and replica pointer. It adds
+  the same protocol/profile/cohort tuple, a typed authority kind/reference/
+  generation plus canonical authority digest, typed reconciliation and
+  provider-evidence fields, and service cohort epoch/digest.
+- Existing bound ordinary rows are backfilled only when exact immutable
+  association/request/replica identity agrees. Historical unbound rows are not
+  inserted into the association table. Every new field is closed by
+  completeness, value, and digest-length constraints; nullable transition
+  shapes are readable but have no generic effect authority.
+- API012/Serve048 add the controller-independent demand feed, ordered
+  zero-cost-before-paid admission, and provider-free route projections owned by
+  `skyserve-demand-capacity-convergence.md`.
+- API013/Serve049 are the blocked cleanup heads. They remove protocol-v1/new-
+  admission compatibility and transition columns/constraints only after G2's
+  gates; they preserve immutable tombstones, typed profiles, current cohort,
+  route history needed by live clients, and permanent reserved authorization.
 
 An active correlated bound request without its queue row is invariant
-corruption, not an activation state. Startup locks the correlated evidence. If
-execution generation is zero, no claim/lease exists, and effect phase is
-`NOT_STARTED`, it cancels/quiesces generation zero and records
-`PRE_EFFECT_TERMINAL`. A claimed `PENDING` or `WAITING` row between queue
+corruption, not an activation state. Startup locks and types the correlated
+evidence. Only when the request was admitted by the exact current protocol and
+cohort may execution generation zero, no claim/lease, and `NOT_STARTED` become
+`PRE_EFFECT_TERMINAL`. A legacy or mixed-version row with the same surviving
+field values is `LEGACY_EFFECT_AMBIGUOUS`; it is never retroactively given a
+receipt. A claimed `PENDING` or `WAITING` row between queue
 handoff and `RUNNING` publication remains active when its exact token, worker,
 generation, queue delivery, and live lease agree. Correlated bound rows are
 excluded from the generic queue lease reaper: only the association-aware
@@ -309,19 +431,25 @@ The transaction compares at least:
 
 - service name and service version;
 - replica ID and immutable replica record ID;
-- the new ordinary-launch association identity and server-selected generation;
+- the non-pool launch association identity and server-selected generation;
+- immutable profile kind, profile version, canonical profile digest, domain-
+  authorization references, and capability-cohort epoch;
 - a server-recomputed digest of the canonical prepared `LaunchBody`, excluding
   binding-only and mutable owner fields and never using a diagnostic raw-YAML
   or `repr` fallback;
 - initial controller owner and association-owner revision; and
 - expected absence of a conflicting nonterminal binding.
 
-### Durable association and per-service cutover
+### Durable association, typed reconciliation, and per-service cutover
 
 The association contains immutable association/submission UUIDs, service
 name/hash/workspace, lifecycle and binding epochs, service version, replica ID and
 `replica_record_id`, server-selected launch generation, cluster name, exact API
-request ID, and canonical digest/version. Uniqueness covers submission UUID,
+request ID, profile kind/version/digest, exact domain-authorization references,
+capability-cohort epoch, and canonical launch digest/version. The physical
+Serve042 table and replica pointer may retain their historical `ordinary`
+names for forward compatibility, but their only live meaning after Serve047 is
+the generalized non-pool contract. Uniqueness covers submission UUID,
 association UUID, request ID, and
 `(service_name, replica_record_id, launch_generation)`, with at most one
 unsettled association for a replica record. The replica row has a nullable
@@ -329,29 +457,75 @@ unsettled association for a replica record. The replica row has a nullable
 under its lock. No existing system-recovery, Serve033 action, or `ReplicaInfo`
 request/job field is reinterpreted.
 
+The profile envelope is closed and minimal. It stores typed references and a
+canonical digest, not a duplicate planner payload:
+
+| Profile | Immutable authorization references |
+|---|---|
+| `ORDINARY_PAID/v1` | Exact paid-capacity pool/claim identity and generation plus selected placement digest. |
+| `ORDINARY_ZERO_COST/v1` | Exact zero-cost placement identity and database-assigned admission sequence. |
+| `RESERVED_FILL/v1` | Gate, allocation, claim, and observation generations; exact pool/physical-UID/card; intent key; zero-cost admission sequence; committed service version; worker-projection digest; reclaim-policy identity and ticket reference. |
+| `UNKNOWN_CAPACITY_REPLACEMENT/v1` | Exact predecessor record/generation, replacement reason, observation identity/classification, and new-placement decision digest. |
+| `COST_REBALANCE/v1` | Exact predecessor record/generation, rebalance decision/target placement digest, and current paid/zero-cost claim reference. |
+| `SYSTEM_OOM_RECOVERY/v1` | Exact predecessor record/generation, recovery generation/lease/trigger identity, and prior bound request/result reference. |
+
+The authoritative domain fields remain in the locked service, replica,
+allocation, claim, projection, and recovery rows. Admission and pre-I/O resolve
+these references, recompute the profile digest, and fail closed if a referenced
+row is missing, stale, partial, or inconsistent.
+
 Mutable fields are current controller-owner incarnation/epoch,
-association-owner revision,
-effect phase, request terminal status/cause and quiesced generation, optional
-exact service-job ID, ambiguity code, projection state, and database-clock
-timestamps. Effect phases are `NOT_STARTED`, `PROVIDER_IO`, `SERVICE_JOB_IO`,
-and `SERVICE_JOB_RECORDED`; resolution states are `BOUND`,
-`CANCEL_REQUESTED`, `RESULT_RECORDED`, `PROJECTED`,
-`PRE_EFFECT_TERMINAL`, and `AMBIGUOUS`.
+association-owner revision, effect phase, request terminal status/cause and
+quiesced generation, optional exact service-job ID, typed reconciliation and
+provider-evidence outcomes, projection state, and database-clock timestamps.
+Effect phases are `NOT_STARTED`, `PROVIDER_IO`, `SERVICE_JOB_IO`, and
+`SERVICE_JOB_RECORDED`. Reconciliation outcomes are `ACTIVE_ADOPT`,
+`RESULT_RECORDED`, `PROJECTED`, `PRE_EFFECT_TERMINAL`,
+`POST_EFFECT_AMBIGUOUS`, and `LEGACY_EFFECT_AMBIGUOUS`. Provider evidence is
+independently closed as `NOT_QUERIED`, `PRESENT`, `ABSENT`, `UNKNOWN`, or
+`REPLACED`; timeout, partial enumeration, RBAC denial, malformed identity, or
+an unrecognized same-name resource is `UNKNOWN`, never `ABSENT`.
 Identity/digest fields never change, and unresolved history cannot be deleted.
 
-| Resolution state | Required evidence | Unsettled / pinned | Exit |
+| Reconciliation outcome | Required evidence | Unsettled / pinned | Exit |
 |---|---|---|---|
-| `BOUND` | Request active or terminal evidence not yet reduced; effect phase is authoritative | yes | result reduction, fenced cancel, or ambiguity |
-| `CANCEL_REQUESTED` | Current owner committed exact supersede/teardown intent | yes | exact terminal + quiescence reduction |
+| `ACTIVE_ADOPT` | Exact current-protocol request, claim/generation/lease, profile, cohort, and association agree | yes | adoption, result reduction, fenced cancel, or ambiguity |
+| cancel requested | Current owner committed exact supersede/teardown intent; cancellation is not absence evidence | yes | typed terminal/quiescence/provider reconciliation |
 | `RESULT_RECORDED` | Exact terminal/quiescence and service-job ID copied after `SERVICE_JOB_RECORDED` | yes | atomic replica projection |
-| `PRE_EFFECT_TERMINAL` | Exact terminal/quiescence copied while effect remained `NOT_STARTED`; replica reprojected pending unless teardown already interrupted it; pointer and retention pin cleared | no | non-cancelled demand may admit a successor generation with the same exact paid claim; cancellation releases the claim and cannot retry |
+| `PRE_EFFECT_TERMINAL` | Exact current-protocol cohort proves no claim/effect and terminal/quiescence is copied while effect remained `NOT_STARTED` | no | non-cancelled demand may admit a successor generation under freshly revalidated profile authority |
 | `PROJECTED` | Exact result/tombstone projected, pointer cleared, pin deleted | no | 60-day tombstone retention |
-| `AMBIGUOUS` | Effect/claim/result cannot prove a safe terminal disposition | yes | explicit operator reconciliation only |
+| `POST_EFFECT_AMBIGUOUS` | Current protocol crossed or may have crossed an effect boundary without an exact projectable result | yes | exact provider/result evidence and profile-specific operator reconciliation |
+| `LEGACY_EFFECT_AMBIGUOUS` | Legacy/mixed-version execution may have caused effects but lacks the current receipt contract | yes | exact provider/result evidence only; never synthesized quiescence |
 
-The partial unique constraint treats `BOUND`, `CANCEL_REQUESTED`,
-`RESULT_RECORDED`, and `AMBIGUOUS` as unsettled. A successor transaction
+The partial unique constraint treats active, cancel-requested,
+`RESULT_RECORDED`, `POST_EFFECT_AMBIGUOUS`, and
+`LEGACY_EFFECT_AMBIGUOUS` rows as unsettled. A successor transaction
 requires the predecessor to be `PRE_EFFECT_TERMINAL`, the replica pointer to be
-clear, the retention pin absent, and the service binding epoch unchanged.
+clear, the retention pin absent, the service binding and cohort epochs
+unchanged, and the profile planner's current authorization revalidated.
+
+Startup and ordinary reconciliation schedule one bounded task per association;
+they do not hold a global recovery lock, manager lock, or actuation lock across
+provider I/O, network waits, sleeps, or polling. One ambiguous row quarantines
+only that exact row and, for reserved fill, its exact pool/card/grant. Probers,
+route publication, the reconciliation coordinator, autoscaling, and sibling
+rows start immediately and continue. The legacy cluster-name scan is retained
+during transition only for already-durable unbound rows and may gather typed
+provider evidence; it never synthesizes a binding or authorizes a successor.
+
+Serve047 also adds one transition-only append-only legacy-reconciliation
+evidence table. It is not an association, request-admission path, queue, or
+source of launch authority. A row names the exact service, replica record,
+cluster name, request, Kubernetes context, and physical-cluster UID; preserves
+the observed request facts; records an explicit old-executor termination
+attestation and its digest; and then records a provider observation made after
+that attestation. Only the monotonic
+`LEGACY_EFFECT_AMBIGUOUS -> CLEANUP_AUTHORIZED -> PROJECTED` reduction is
+allowed. `CLEANUP_AUTHORIZED` requires exact provider `ABSENT` observed after
+the attested executor termination. It permits only exact UID-fenced cleanup of
+that legacy replica and never supplies a receipt, association, retry, or
+successor-launch proof. G2 removes the writer and active transition surface
+after the zero-legacy gate while retaining its audit tombstones.
 
 The service row has a non-null controller-incarnation UUID, monotonic
 `controller_owner_epoch`, capability bound to that exact incarnation,
@@ -402,15 +576,18 @@ intent owned by the current epoch/revision.
 
 ### Pre-I/O fence
 
-Immediately before provider I/O, the ordinary executor or internal handler
+Immediately before provider I/O, the generic non-pool executor handler
 must revalidate:
 
 - its live request claim and execution generation;
 - the locked claim still resolves the distinct locally supported bound handler;
+- its exact profile kind/version/digest and capability-cohort epoch;
 - the service and exact replica row still exist;
 - the replica pointer and association still name this record, generation, and
   request ID;
-- the submitted input digest matches the durable binding; and
+- the submitted input digest matches the durable binding;
+- the profile planner's exact paid, zero-cost, reserved-fill, replacement,
+  rebalance, or system-OOM authorization remains current; and
 - the association owner/revision matches the current durable service-controller
   owner/revision.
 
@@ -444,19 +621,23 @@ in one transaction on both ordinary and paid-capacity completion paths. The
 reducer relies on those canonical row locks rather than the exclusive provider
 advisory guard. This is safe because its only expiry writes either settle an
 exact `NOT_STARTED` generation whose expired lease can no longer enter the
-provider guard or mark an advanced phase `AMBIGUOUS`; projection additionally
+provider guard or mark an advanced phase `POST_EFFECT_AMBIGUOUS`; projection additionally
 requires the executor's exact-generation quiescence receipt, which is emitted
 only after its provider guard has exited. The same rows serialize controller
 owner transfer and effect-phase advance.
 
 Failure and retry policy use the database clock. Terminal plus quiescent does
-not prove effect absence. A successor generation is allowed only from
-`PRE_EFFECT_TERMINAL` with effect phase `NOT_STARTED`, proving neither provider
-nor service-job I/O began. Any terminal result after `PROVIDER_IO` without an
-exact projectable service-job outcome, any `SERVICE_JOB_IO` crash, unclear
-request/result, fence rejection, or cancellation race is `AMBIGUOUS` and blocks
-automatic resubmission. This bounded design does not claim cross-provider
-effect absence.
+not prove effect absence, and a false `execution_quiescence_required` value is
+not itself quiescence. A successor generation is allowed only from
+`PRE_EFFECT_TERMINAL` with effect phase `NOT_STARTED` and exact current-protocol
+cohort evidence proving neither provider nor service-job I/O began. Any
+terminal result after `PROVIDER_IO` without an exact projectable service-job
+outcome, any `SERVICE_JOB_IO` crash, unclear request/result, fence rejection,
+or cancellation race is `POST_EFFECT_AMBIGUOUS`. A legacy/mixed-version row
+without the current receipt is `LEGACY_EFFECT_AMBIGUOUS` even when its stored
+generation is zero. Both block automatic resubmission. Exact provider presence,
+absence, replacement-incarnation, or result evidence may settle a typed row;
+the design does not claim cross-provider absence from generic request fields.
 
 ### Cleanup
 
@@ -466,12 +647,14 @@ association through a non-authorizing exact record snapshot. It first commits
 owner-epoch/revision-fenced cancel intent for all targets in one complete pass,
 without an advisory guard, so one stuck provider cannot make cancellation of a
 peer unreachable. A second pass drives each canonical row-lock reducer to
-projection, safe pre-effect settlement, or durable ambiguity, then the generic
-barrier covers legacy/special requests. Only after those proofs may teardown
+projection, safe pre-effect settlement, or durable ambiguity, then the
+transition-only generic barrier covers pre-existing unbound requests. Only
+after those proofs may teardown
 take exclusive owner authority and delete or replace replica rows. Ordinary
 `remove_replica(s)` cannot race a bound pre-I/O check with a direct ORM delete.
 Association history is retained so a same-number successor record cannot
-inherit, cancel, or project predecessor work.
+inherit, cancel, or project predecessor work. Fresh non-pool requests never
+enter that legacy barrier after generalized activation.
 
 Any later change to persist retry deadlines must preserve current immediate
 restart redrive and be independently justified by observed retry storms or
@@ -606,7 +789,11 @@ proved rather than inferred.
 If there are no eligible launches and no correctness mandate, stop. The design
 remains a documented limitation and no runtime is added.
 
-### R2: bounded binding and adoption
+### R2: bounded ordinary binding and adoption (historical foundation)
+
+R2 describes the already-authored ordinary-only foundation. G1 below
+supersedes its profile exclusion and reuses its association, transaction,
+retention, handoff, and fencing mechanics in place.
 
 If R1 authorizes work:
 
@@ -635,28 +822,15 @@ If R1 authorizes work:
 - add crash tests at intent commit, request binding, claim, pre-I/O, result,
   and projection boundaries.
 
-System-OOM recovery, pools, reserved-fill launches, and other special launch
-profiles remain on their existing contracts and may not enter this ordinary
-association path. For a non-pool service in `bound` mode, retaining those
-contracts is not an unmarked fallback: every excluded request carries one
-closed, versioned discriminator through queue persistence and the provider
-boundary. The persistent-special form names the exact replica ID and canonical
-`replica_record_id`; the system-recovery form names the exact replica ID,
-launch generation, and server-bound request ID. Both admission checks reread
-the named PENDING/PROVISIONING replica in the same PostgreSQL authorization
-snapshot and require the corresponding persisted exclusion state. Unknown,
-partial, stale, mismatched, or ordinary unmarked claims fail closed. Pools
-retain their separate existing authority and do not use this discriminator.
-The dedicated bound endpoint rejects every caller-authored excluded-profile
-key. Admission and every provider, service-job, cancellation, and projection
-boundary decode the full versioned replica payload and require the exact narrow
-ordinary defaults: no reserved-fill metadata, zero-cost placement, unknown-
-capacity replacement, cost-rebalance predecessor, or system-recovery state.
-They also require the scalar and decoded replica ID, canonical record ID,
-cluster, status, and service version to agree, and require that version to
-remain the current quarantine-aware elected version. A special-profile marker
-or profile drift therefore removes bound effect authority rather than creating
-a second launch contract.
+The R2 exclusion of system-OOM, reserved fill, zero-cost placement, unknown-
+capacity replacement, and cost rebalance was a transition boundary, not a
+valid steady state. G1 converts each to a closed profile on the same
+association. Each profile names the exact replica ID, canonical
+`replica_record_id`, generation, service version, and planner-owned authority.
+Admission and every provider, service-job, cancellation, and projection
+boundary decode and revalidate the complete profile. Unknown, partial, stale,
+mismatched, or caller-authored profile claims fail closed. Pools retain their
+separate authority and do not use the non-pool association.
 
 The crash matrix includes timeout before transaction commit, response loss
 after atomic commit, identical and conflicting submission-key retries, old-
@@ -697,8 +871,8 @@ sharing the pool cannot consume that capacity early. Service teardown first
 publishes `SHUTTING_DOWN` under canonical lifecycle/service row locks and
 delivers exact cancellation to every target while a provider retry may still
 hold shared authority. It then reduces/projects under the old exact owner and
-runs the generic legacy/special quiescence barrier before taking exclusive
-authority and claiming a fresh restricted teardown incarnation. Dead-child
+runs the transition-only legacy-unbound quiescence barrier before taking
+exclusive authority and claiming a fresh restricted teardown incarnation. Dead-child
 respawn and ordinary HA recovery try that exclusive ownership nonblockingly, so
 they cannot occupy the only process that can observe a later teardown.
 `FAILED_CLEANUP` recovery uses the post-fence `SHUTTING_DOWN` status in that
@@ -754,7 +928,7 @@ no bulk migration and exposes no new public switch. The explicit R2 transition
 and fenced demotion surfaces remain available for controlled migration and
 rollback of existing services.
 
-### R4: rollout-gated legacy fallback removal
+### R4: ordinary-only fallback removal (superseded)
 
 Deploy R1 and R2 dark/read-only validation first, then R3 and one newly created
 eligible non-pool service. Remove the old resubmission inference only after the
@@ -764,11 +938,123 @@ removal change makes the bound endpoint mandatory for eligible ordinary
 launches, removes the branch in `_recover_legacy_replica_operations()` that
 resubmits without first resolving an exact association, removes the
 capability-controlled unbound submission fallback, and deletes
-transition-only compatibility probes. It retains the process map and legacy
-recovery for pools, system-OOM recovery, reserved-fill, and other excluded
-profiles; global deletion of those contracts is outside this design.
+transition-only compatibility probes. Its proposed retention of separate
+system-OOM, reserved-fill, and other non-pool launch paths is rejected by the
+2026-08-15 incident correction. R4 must not merge; G2 is its replacement.
+
+### G1: generalized non-pool transition feature
+
+G1 is one focused transition PR, stacked above the immediate incident hotfix
+and below a simultaneously authored blocked G2 cleanup PR. It:
+
+- adds forward-only API-request revision 011 and Serve revision 047; historical
+  API009/010 and Serve042--046 migrations are never edited or renumbered;
+- extends the existing Serve042 association in place with the closed profile,
+  authorization, cohort, reconciliation, and provider-evidence contract;
+- replaces the ordinary-only endpoint/handler for new admissions with one
+  generic non-pool handler whose exact version and supported-profile digest are
+  constrained in PostgreSQL and in queue claim;
+- atomically commits the replica row, association, request, queue row,
+  retention pin, and profile authority. Reserved-fill `FillCommitResult`
+  returns the exact association and request IDs for each accepted intent;
+- persists one immutable cohort digest/epoch across service, association, and
+  request, and promotes a service only after every API acceptor, request
+  backend, queue executor, GC participant, possible controller, and profile
+  participant is capable and every older/recent lease has drained;
+- schedules per-row typed reconciliation without holding manager/global locks
+  across provider reads, network waits, polling, or sleeps;
+- publishes complete provider-free route projections from the manager's
+  ordinary probe result so LB/API reads do not repeat provider work; and
+- retains legacy cluster-name discovery only for historical unbound rows. It
+  never backfills an association or receipt for those rows.
+
+Backfill is limited to already-bound ordinary associations whose immutable
+request and replica identity agree; they deterministically become
+`ORDINARY_PAID/v1` or `ORDINARY_ZERO_COST/v1`. G1 never synthesizes an
+association for a historical unbound request. Such a request is settled by the
+typed legacy reconciler and remains a conservative capacity debit while its
+effect disposition is unknown.
+
+### G2: blocked steady-state cleanup
+
+G2 is authored with G1 and the demand-convergence P2 change and remains
+draft/blocked until every gate below is recorded. It owns forward-only
+API-request revision 013 and Serve revision 049.
+Any earlier draft that assigned API011 to combined-role cleanup or Serve047 to
+reserved-fill final cleanup is renumbered to API013/Serve049; API012/Serve048
+belong to the intervening demand/route convergence. Migration numbers must be
+globally unique and already-published revisions are immutable.
+
+G2 removes every unbound non-pool admission and recovery branch, the ordinary-
+only handler/profile alias, cluster-name quiescence as active authority, global
+startup recovery lock/backoff, process-map authority, legacy promotion and
+demotion surfaces after the rollback window, and transition-only telemetry.
+Fresh central-PostgreSQL non-pool work is always bound. Historical unbound
+`READY` rows may remain readable for status/cleanup, but no active launch or
+automatic recovery path consumes them. Pools retain their separate lifecycle.
+The final topology has one non-pool handler, one association, one request queue,
+one executor topology, and the existing provider path.
 
 ## Deployment and rollback
+
+### Generalized G1/G2 rollout
+
+Ship API011 and Serve047 schemas plus tolerant readers before any generic
+writer or claim is enabled. Then converge every split role on one immutable
+image and exact capability-profile digest. The cohort inventory includes API
+acceptors, request-backend writers, queue executors, GC, possible service
+controllers, and each profile-specific admission/executor participant; role
+health alone is insufficient. Drain every old ready lease and every non-ready-
+but-recent lease through the maximum stale-writer and quiescence horizon before
+creating the next cohort epoch.
+
+Before the first per-service cutover:
+
+1. Reconcile the seven incident rows individually. Preserve the fact that the
+   old executor caused real provider effects. Record exact request result and
+   provider evidence and classify each row; never fabricate a receipt or edit
+   it into `PRE_EFFECT_TERMINAL`.
+2. Require zero unbound active requests and zero unbound
+   `PENDING`/`PROVISIONING` replica rows for that service. A historical
+   unbound row with uncertain effects is quarantined and blocks only its exact
+   successor/profile authority.
+3. Prove the exact service owner and all participants advertise the same
+   generic handler version, profile set/digest, receipt protocol, and cohort
+   epoch. Prove an old handler cannot claim the new queue row.
+4. Publish one complete manager-owned route projection for the new owner and
+   prove LB/API reads use PostgreSQL only. Startup launches the prober,
+   coordinator, and route publication immediately; row reconciliation runs in
+   bounded independent tasks.
+5. Advance the service binding epoch and capability-cohort epoch once under the
+   canonical locks. New non-pool admission is thereafter generic-only for that
+   service.
+
+Reserved-fill activation remains one way and fail closed. It may enter
+`SEQUENCED_ACTIVE` only after its typed profile participates in the same G1
+cohort and row acceptance returns exact binding IDs. After activation, rollback
+is limited to a capability-compatible artifact after bound work is drained;
+the database and authorization generation are never downgraded and legacy fill
+is never reopened. Before reserved activation, a G1 application rollback may
+disable new promotions, retain the forward schemas, drain/project all bound
+work, and use the fenced demotion only within the documented rollback window.
+Once G2 removes demotion and legacy admission, recovery is fix-forward.
+
+G2 cannot merge on elapsed time alone. It requires zero legacy-capable
+participants, zero active or unsettled old-handler requests, zero unbound
+non-pool rows requiring recovery, a controller restart and ordinary service
+update on the generic path, complete readiness/+10/+30 monitoring, at least one
+full 180-second Serve authority horizon plus the longer stale-writer/
+quiescence horizon, bounded manager-lock hold time, fresh route projection,
+broker conservation/no paid spill, and a successful rollback rehearsal before
+the point of no return. The cleanup PR then removes the rollback path and later
+defects are fixed forward.
+
+The generalized contract is a material design change. All prior adversarial
+rounds over an ordinary-only R2/R3 or a Serve047 reserved-fill cleanup are
+historical and the required consecutive review sequence restarts at zero on
+the exact G1/G2 heads.
+
+### Historical R0 deployment record
 
 R0 is a code cleanup over retained additive forward-only schemas. Before the
 compatibility upgrade, prove no request in any status uses any of the four
@@ -871,9 +1157,10 @@ for attribution; it does not trigger an automatic rollback to an artifact that
 already exhibited that signal. An unexplained warning or error also holds R0
 open, and requires rollback if investigation connects it to the new artifact.
 
-R2 ships with every service in durable `legacy` mode, so schema and capability
-writes are dark. Promotion changes one approved non-pool service to `bound`
-only after its controller capability, the full participant barrier, and the
+Historically, R2 was designed to ship with every service in durable `legacy`
+mode, so schema and capability writes are dark. Promotion changes one approved
+non-pool service to `bound` only after its controller capability, the full
+participant barrier, and the
 legacy-drain transaction pass. R3 retains that same transition as the safe
 bootstrap for a fresh eligible service: the row is inserted in `legacy`, its
 fresh capable incarnation is claimed, promotion commits, and the exact bound
@@ -893,18 +1180,15 @@ or tombstones, release pins early, change replica record IDs, or race a
 predecessor with a successor. R3 makes `bound` mandatory before the first child
 spawn for each newly created eligible non-pool service. After all existing
 eligible services are explicitly promoted or retired and rollout evidence
-passes, R4 removes the ordinary legacy fallback; excluded profiles retain their
-existing contracts through the closed discriminator rather than entering the
-ordinary association path.
+passes, the superseded R4 would have removed only the ordinary fallback.
 
-Eligibility is deliberately narrower than "not a pool": reserved-fill,
-zero-cost/reservation, system-OOM recovery, unknown-capacity replacement, and
-cost-rebalance launches stay on their existing contracts. Bound mode permits
-them only through the exact excluded-profile discriminator above; it never
-turns their exclusion into generic unmarked launch authority. A fresh paid
-launch that otherwise has the ordinary profile may use R2; if its request
-terminates before either effect boundary, the exact paid claim remains attached
-to the pending replica and is reused by the next durable generation.
+G1 replaces that ordinary-only rollout boundary. Eligibility is exactly every
+central-PostgreSQL non-pool launch, including reserved fill, zero-cost/
+reservation, system-OOM recovery, unknown-capacity replacement, and cost
+rebalance. These profiles enter one typed association without surrendering
+their planner-owned authority. A fresh paid launch whose exact current-protocol
+request terminates before either effect boundary may reuse its paid claim in a
+successor generation; a legacy/mixed-version terminal row may not.
 
 No canary that creates provider capacity is authorized by this design alone.
 Before such a canary, record the logical GPU slots, physical instance shape and
@@ -912,6 +1196,54 @@ count, region, duration, market/reservation class, and incremental cost, and
 obtain explicit management approval.
 
 ## Verification and monitoring
+
+### Generalized binding verification
+
+G1 fault injection covers crashes before and after atomic commit, queue claim,
+each provider-I/O boundary, Kubernetes Pod create/adopt, service-job submission,
+terminal result, replica projection, and route publication. Lost-ACK retries
+must return the exact request; a stable-key or profile-digest conflict must
+write nothing. Old/new API, controller, executor, GC, and profile-participant
+permutations prove an old handler cannot claim a generic request and a stale
+lease cannot satisfy the cohort gate.
+
+The incident regression is mandatory: an old mixed-version handler performs a
+real provider effect and later leaves generation zero, no process identity, and
+`execution_quiescence_required = false`. Recovery must classify
+`LEGACY_EFFECT_AMBIGUOUS`, rediscover the provider state, and never fabricate a
+receipt or create a successor. A separate modern-protocol test proves the
+narrow inverse: exact cohort admission, no claim, `NOT_STARTED`, and exact
+terminal/quiescence evidence classify `PRE_EFFECT_TERMINAL` and permit a
+fenced retry.
+
+Typed provider tests cover `PRESENT`, exact `ABSENT`, `UNKNOWN`, and
+`REPLACED` for a same-name/new-UID resource. Timeout, partial enumeration,
+malformed identity, and RBAC denial are `UNKNOWN`. Exact result and provider
+evidence must agree before projection; contradictory evidence remains
+quarantined.
+
+A scale test injects one poisoned association among hundreds of replicas and
+requires probes, provider-free route publication, LB sync, autoscaling, the
+reconciliation coordinator, and sibling reserved pools/cards to continue. No
+provider/network wait, sleep, or poll may occur under the manager/global
+recovery locks; lock-order instrumentation enforces the canonical database and
+in-process order. Reserved-fill tests prove broker conservation, exact
+`FillCommitResult` association/request IDs, no oversubscription or paid spill,
+and stale profile authority rejected at both admission and provider I/O.
+
+Route tests bind every record to exact `(replica_id, replica_record_id)` and
+generation identity. A predecessor URL/demand/result cannot affect a successor
+record; cold owner replacement remains fail closed until a complete fresh
+projection. Instrumented LB/API reads make zero provider, Kubernetes, cluster-
+state, or replica-list calls.
+
+G2 final-state tests are source-absence tests. They fail if any unbound
+non-pool admission/recovery, old handler/profile alias, global startup recovery
+lock/backoff, cluster-name authority, process-map authority, demotion surface,
+or transition-only telemetry remains callable. They retain readable historical
+tombstones and the separate pool lifecycle.
+
+### Historical R0 verification
 
 R0 completion requires both the compatibility and final-removal deployments:
 
@@ -1883,6 +2215,43 @@ approved canary:
 
 ## Open gates
 
+### Generalized non-pool binding gates (current)
+
+- [ ] Author and review G1 (API011/Serve047), demand convergence
+  (API012/Serve048), and the blocked stacked G2 cleanup (API013/Serve049)
+  together; link the PRs and state G2's exact merge gate.
+- [ ] Restack any draft API011 combined-role cleanup to API013 and any draft
+  Serve047 reserved-fill permanent cleanup to Serve049. Prove each schema
+  lineage has one forward-only head and no historical migration changed.
+- [ ] Reconcile all seven incident rows from exact request, provider, and
+  cluster-incarnation evidence. Preserve real old-executor effects; record no
+  fabricated quiescence receipt or synthetic association.
+- [ ] Converge every API acceptor, request backend, queue executor, GC
+  participant, possible controller, and profile participant on one immutable
+  generic handler/profile/capability digest; drain old and recent leases through
+  the complete stale/quiescence horizon.
+- [ ] Prove zero unbound active request and zero unbound
+  `PENDING`/`PROVISIONING` row before each per-service cutover. Quarantine a
+  legacy ambiguous row locally rather than taking a global recovery lock.
+- [ ] Pass the complete G1 crash/mixed-version matrix, including real legacy
+  effects with misleading generation-zero fields, modern pre-effect generation
+  zero, provider present/absent/unknown/replaced, and lost-ACK identity replay.
+- [ ] Pass reserved-fill conservation, no-paid-spill, exact binding receipt,
+  provider-free route projection, bounded manager-lock, and poisoned-row
+  progress tests.
+- [ ] Deploy G1 through readiness, +10, and +30, then observe at least one full
+  180-second Serve authority horizon and the longer stale-writer/quiescence
+  horizon. Complete one controller restart, one ordinary service update, and a
+  rollback rehearsal before G2 becomes eligible.
+- [ ] Run three new consecutive pragmatic adversarial reviews against the exact
+  frozen G1/G2 and reserved-fill heads. The 2026-08-15 material correction
+  resets prior ordinary-only and Serve047-cleanup review counts to zero.
+- [ ] Merge G2 only after zero legacy-capable participants, zero old-handler
+  active/unsettled requests, and zero unbound non-pool rows requiring recovery.
+  After G2, roll forward only.
+
+### Historical retirement and ordinary-only gates
+
 - [x] Complete and merge the compatibility R0 cleanup.
 - [x] Deploy and monitor the compatibility cleanup on `boltz-test`; the
   all-status zero private-handler gate passed at readiness, +10 minutes, and
@@ -1955,9 +2324,8 @@ approved canary:
   participant/drain-barrier failure produces no child or launch request.
 - [ ] Inventory every existing eligible `legacy` service and explicitly
   promote or retire it; R3 intentionally does not perform that migration.
-- [ ] Keep the stacked R4 legacy-fallback removal blocked until the promoted
-  R2/R3 artifact passes its exact canary and monitoring gates, rollback through
-  fenced demotion is proved, and no existing eligible legacy row remains.
+- [x] Retire the ordinary-only R4 cleanup without merge. G2 supersedes it and
+  removes every unbound non-pool path only after the current gates above.
 - [x] Record the final production rollout's exact zero-incremental-capacity
   bound; the worst-case API plus 16-LB surge fits either existing non-API node.
 - [ ] R2 only: obtain named capacity approval before any positive launch/down
@@ -1966,5 +2334,6 @@ approved canary:
 Until the bounded shared-snapshot deadline artifact passes its production
 monitor and this stacked canonical follow-up merges, the dedicated
 authority-stack retirement is not production-complete. The bounded
-request-binding follow-up remains independently incomplete until issue #1352
-satisfies the R1--R4 evidence above.
+request-binding follow-up remains independently incomplete until the
+generalized G1/G2 gates above close; satisfying the historical R1--R3 evidence
+alone cannot complete it.
