@@ -52,7 +52,7 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert preemptible_service_breakdown_version == 78
     non_pool_launch_binding_version = (
         server_constants.MIN_NON_POOL_LAUNCH_BINDING_API_VERSION)
-    assert non_pool_launch_binding_version == 79
+    assert non_pool_launch_binding_version == 80
     reserved_fill_status_version = (
         server_constants.
         MIN_SERVE_RESERVED_FILL_RECONCILIATION_STATUS_API_VERSION)

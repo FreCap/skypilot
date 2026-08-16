@@ -25,6 +25,7 @@ from sky.provision.gcp import constants as gcp_constants
 from sky.provision.kubernetes import fuse as kubernetes_fuse
 from sky.provision.kubernetes import host_network_probe
 from sky.provision.kubernetes import network_utils
+from sky.provision.kubernetes import pod_spec as kubernetes_pod_spec
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.utils import is_tpu_on_gke
 from sky.provision.kubernetes.utils import KubernetesHighPerformanceNetworkType
@@ -704,7 +705,7 @@ class Kubernetes(clouds.Cloud):
         return 0
 
     @staticmethod
-    def _calculate_provision_timeout(
+    def calculate_provision_timeout(
         num_nodes: int,
         volume_mounts: list['volume_lib.VolumeMount'] | None,
         enable_flex_start: bool,
@@ -807,10 +808,22 @@ class Kubernetes(clouds.Cloud):
         projection_version = (
             worker_placement_projection.get('projection_version')
             if worker_placement_projection is not None else None)
-        if projection_version is not None and projection_version != 2:
+        try:
+            (kubernetes_pod_spec.
+             validate_serve_worker_projection_protocol_version)(
+                 projection_version, allow_none=True)
+        except ValueError as error:
+            raise ValueError('Unsupported worker placement projection '
+                             f'version {projection_version!r}.') from error
+        has_strict_worker_admission = (
+            kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_strict_admission(
+                projection_version))
+        if projection_version is not None and not has_strict_worker_admission:
+            # Protocol v1 has no on-wire marker. An explicit version here is a
+            # malformed request rather than a supported v1 projection.
             raise ValueError('Unsupported worker placement projection '
                              f'version {projection_version!r}.')
-        is_v2_worker_projection = projection_version == 2
 
         def _get_image_id(resources: 'resources_lib.Resources') -> str:
             container_image = resources.extract_docker_image()
@@ -938,8 +951,8 @@ class Kubernetes(clouds.Cloud):
                 keys=('high_availability', 'storage_class_name'),
                 default_value=None))
 
-        if is_v2_worker_projection:
-            # V2 freezes the complete Kueue admission pair at version commit.
+        if has_strict_worker_admission:
+            # Strict projections freeze the complete Kueue admission pair.
             # Never consult mutable server or request configuration here.
             assert worker_placement_projection is not None
             kueue_admission = worker_placement_projection['kueue_admission']
@@ -986,8 +999,9 @@ class Kubernetes(clouds.Cloud):
         # Check DWS configuration for GKE.
         (enable_flex_start, enable_flex_start_queued_provisioning,
          max_run_duration_seconds) = gcp_utils.get_dws_config(
-             context, k8s_kueue_local_queue_name, None
-             if is_v2_worker_projection else resources.cluster_config_overrides)
+             context, k8s_kueue_local_queue_name,
+             None if has_strict_worker_admission else
+             resources.cluster_config_overrides)
         if enable_flex_start_queued_provisioning or enable_flex_start:
             # DWS is only supported in GKE, check the autoscaler type.
             autoscaler_type = skypilot_config.get_effective_region_config(
@@ -1002,29 +1016,37 @@ class Kubernetes(clouds.Cloud):
                     f'DWS is only supported in GKE, but the autoscaler type '
                     f'for context {context} is {autoscaler_type}')
 
-        # Timeout for resource provisioning. This timeout determines how long to
-        # wait for pod to be in pending status before giving up.
-        # Larger timeout may be required for autoscaling clusters, since
-        # autoscaler may take some time to provision new nodes.
-        # Note that this timeout includes time taken by the Kubernetes scheduler
-        # itself, which can be upto 2-3 seconds, and up to 10-15 seconds when
-        # scheduling 100s of pods.
-        # We use a linear scaling formula to determine the timeout based on the
-        # number of nodes.
-        is_using_kueue = k8s_kueue_local_queue_name is not None
-        timeout = self._calculate_provision_timeout(
-            num_nodes, volume_mounts, enable_flex_start or
-            enable_flex_start_queued_provisioning, is_using_kueue)
-
-        # Use _REPR, instead of directly using 'kubernetes' as the config key,
-        # because it could be SSH node pool as well.
+        # Timeout for resource provisioning. Protocol v3 freezes this value in
+        # the server-owned candidate at version commit. The terminal launch must
+        # not re-resolve ambient API-server or task configuration. Historical
+        # v1/v2 launches retain their exact launch-time behavior.
         cloud_config_str = self._REPR.lower()
-        timeout = skypilot_config.get_effective_region_config(
-            cloud=cloud_config_str,
-            region=context,
-            keys=('provision_timeout',),
-            default_value=timeout,
-            override_configs=resources.cluster_config_overrides)
+        has_projected_provision_timeout = (
+            kubernetes_pod_spec.
+            serve_worker_projection_protocol_has_provision_timeout(
+                projection_version))
+        if has_projected_provision_timeout:
+            assert worker_placement_projection is not None
+            timeout = (
+                kubernetes_pod_spec.validate_projected_worker_provision_timeout(
+                    worker_placement_projection['provision_timeout']))
+        else:
+            # This timeout determines how long to wait for a Pending Pod before
+            # giving up. It includes Kubernetes scheduler latency and scales
+            # linearly with node count up to the existing cap.
+            is_using_kueue = k8s_kueue_local_queue_name is not None
+            timeout = self.calculate_provision_timeout(
+                num_nodes, volume_mounts, enable_flex_start or
+                enable_flex_start_queued_provisioning, is_using_kueue)
+
+            # Use _REPR instead of directly using 'kubernetes' because this may
+            # be an SSH node pool. V1/v2 task overrides intentionally remain.
+            timeout = skypilot_config.get_effective_region_config(
+                cloud=cloud_config_str,
+                region=context,
+                keys=('provision_timeout',),
+                default_value=timeout,
+                override_configs=resources.cluster_config_overrides)
 
         if worker_placement_projection is None:
             namespace = kubernetes_utils.get_namespace(

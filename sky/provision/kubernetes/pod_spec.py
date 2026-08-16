@@ -9,6 +9,9 @@ to Kubernetes.
 from collections.abc import Mapping
 import copy
 import dataclasses
+from decimal import Decimal
+from decimal import InvalidOperation
+import posixpath
 from typing import Any, Literal
 
 from sky.provision import constants
@@ -18,9 +21,35 @@ from sky.utils import config_utils
 
 PodRole = Literal['head', 'worker']
 
+SERVE_WORKER_PROJECTION_PROTOCOL_VERSION = 3
+_SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({1, 2, 3})
+_STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS = frozenset({2, 3})
+SERVE_WORKER_SCRATCH_MOUNT_PATH = '/tmp'
+SERVE_WORKER_SCRATCH_VOLUME_NAME = 'skypilot-serve-worker-tmp'
+_SERVE_WORKER_SCRATCH_NONE_KEYS = frozenset({'kind'})
+_SERVE_WORKER_SCRATCH_MEMORY_KEYS = frozenset(
+    {'kind', 'mount_path', 'volume_name', 'size_limit_bytes'})
+_KUBERNETES_QUANTITY_MAX = 2**63 - 1
+_KUBERNETES_QUANTITY_EXPONENTS = {
+    'n': -3,
+    'u': -2,
+    'm': -1,
+    'K': 1,
+    'k': 1,
+    'M': 2,
+    'G': 3,
+    'T': 4,
+    'P': 5,
+    'E': 6,
+}
+
 
 class ProjectedAcceleratorContractError(ValueError):
     """A projected worker Pod has an ambiguous resource-request shape."""
+
+
+class ProjectedScratchContractError(ValueError):
+    """A projected worker Pod has an ambiguous scratch-volume shape."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,6 +61,111 @@ class ProjectedAcceleratorContract:
     ray_node_resource_contract_matches: bool
     unexpected_accelerator_resources: dict[str, object]
     dynamic_resource_claims: dict[str, object]
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectedScratchContract:
+    """Whole-Pod scratch ownership observed at one contract boundary."""
+
+    matches: bool
+    expected: dict[str, object]
+    actual: dict[str, object]
+
+
+def validate_serve_worker_projection_protocol_version(
+    value: object,
+    *,
+    allow_none: bool = False,
+) -> int | None:
+    """Validate one persisted Serve worker projection protocol marker."""
+    if value is None and allow_none:
+        return None
+    if (type(value) is not int or
+            value not in _SUPPORTED_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS):
+        raise ValueError('SkyServe worker projection protocol version must be '
+                         '1, 2, or 3.')
+    return value
+
+
+def serve_worker_projection_protocol_has_strict_admission(
+        value: object) -> bool:
+    """Whether a protocol owns scheduler and Kueue admission surfaces."""
+    version = validate_serve_worker_projection_protocol_version(value,
+                                                                allow_none=True)
+    return version in _STRICT_SERVE_WORKER_PROJECTION_PROTOCOL_VERSIONS
+
+
+def serve_worker_projection_protocol_has_scratch(value: object) -> bool:
+    """Whether a protocol carries the closed worker scratch contract."""
+    version = validate_serve_worker_projection_protocol_version(value,
+                                                                allow_none=True)
+    return version == SERVE_WORKER_PROJECTION_PROTOCOL_VERSION
+
+
+def serve_worker_projection_protocol_has_provision_timeout(
+        value: object) -> bool:
+    """Whether a protocol carries the terminal provisioning timeout."""
+    version = validate_serve_worker_projection_protocol_version(value,
+                                                                allow_none=True)
+    return version == SERVE_WORKER_PROJECTION_PROTOCOL_VERSION
+
+
+def validate_projected_worker_provision_timeout(value: object) -> int:
+    """Validate the closed v3 provisioning-wait contract."""
+    if type(value) is not int or value < -1:
+        raise ValueError('Projected worker provision_timeout must be -1 or a '
+                         'non-negative integer.')
+    return value
+
+
+def worker_scratch_mount_path_collides(value: object) -> bool:
+    """Whether an absolute mount path overlaps the server-owned /tmp tree."""
+    if not isinstance(value, str) or not value.startswith('/'):
+        return False
+    # Force one POSIX root before normalization so alternate spellings such as
+    # //tmp, /tmp/, and /var/../tmp cannot bypass collision detection.  A
+    # nested mount would hide part of the bounded memory-backed filesystem, so
+    # the complete /tmp subtree is one reserved identity.
+    normalized = posixpath.normpath('/' + value.lstrip('/'))
+    return (normalized == SERVE_WORKER_SCRATCH_MOUNT_PATH or
+            normalized.startswith(f'{SERVE_WORKER_SCRATCH_MOUNT_PATH}/'))
+
+
+def validate_projected_worker_scratch(value: object) -> dict[str, object]:
+    """Validate and copy the closed server-owned worker scratch contract."""
+    if not isinstance(value, dict):
+        raise ProjectedScratchContractError(
+            'Worker scratch contract must be a mapping.')
+    kind = value.get('kind')
+    if kind == 'none':
+        if set(value) != _SERVE_WORKER_SCRATCH_NONE_KEYS:
+            raise ProjectedScratchContractError(
+                'Worker scratch kind none cannot contain other fields.')
+        return {'kind': 'none'}
+    if kind != 'memory' or set(value) != _SERVE_WORKER_SCRATCH_MEMORY_KEYS:
+        raise ProjectedScratchContractError(
+            'Worker scratch contract must be exactly none or memory-backed '
+            '/tmp.')
+    if value['mount_path'] != SERVE_WORKER_SCRATCH_MOUNT_PATH:
+        raise ProjectedScratchContractError(
+            'Worker memory scratch mount_path must be exactly '
+            f'{SERVE_WORKER_SCRATCH_MOUNT_PATH!r}.')
+    if value['volume_name'] != SERVE_WORKER_SCRATCH_VOLUME_NAME:
+        raise ProjectedScratchContractError(
+            'Worker memory scratch volume_name must be exactly '
+            f'{SERVE_WORKER_SCRATCH_VOLUME_NAME!r}.')
+    size_limit_bytes = value['size_limit_bytes']
+    if (type(size_limit_bytes) is not int or size_limit_bytes < 1 or
+            size_limit_bytes > _KUBERNETES_QUANTITY_MAX):
+        raise ProjectedScratchContractError(
+            'Worker memory scratch size_limit_bytes must be a positive '
+            'Kubernetes quantity byte count.')
+    return {
+        'kind': 'memory',
+        'mount_path': SERVE_WORKER_SCRATCH_MOUNT_PATH,
+        'volume_name': SERVE_WORKER_SCRATCH_VOLUME_NAME,
+        'size_limit_bytes': size_limit_bytes,
+    }
 
 
 def _pod_api_field(owner: object, yaml_name: str, api_name: str) -> Any:
@@ -48,6 +182,335 @@ def _pod_api_field(owner: object, yaml_name: str, api_name: str) -> Any:
     # fields (for example ``containers`` -> ``_containers``). Read the stored
     # value directly so generic mocks cannot synthesize a truthy missing field.
     return state.get(f'_{api_name}')
+
+
+def _present_json_fields(value: object) -> set[str]:
+    """Return non-null JSON fields for mappings or Kubernetes API models."""
+    if isinstance(value, Mapping):
+        return {
+            str(key)
+            for key, field_value in value.items()
+            if field_value is not None
+        }
+    attribute_map = getattr(value, 'attribute_map', None)
+    if not isinstance(attribute_map, Mapping):
+        return set()
+    return {
+        str(json_field)
+        for attribute, json_field in attribute_map.items()
+        if _pod_api_field(value, str(json_field), str(attribute)) is not None
+    }
+
+
+def _parse_kubernetes_quantity(value: object) -> Decimal:
+    """Parse the SI forms used by Kubernetes Quantity without an SDK import."""
+    if isinstance(value, bool):
+        raise ValueError('Boolean is not a Kubernetes quantity.')
+    if isinstance(value, (int, float, Decimal)):
+        return Decimal(value)
+    quantity = str(value)
+    number = quantity
+    suffix = None
+    if len(quantity) >= 2 and quantity[-1] == 'i':
+        if quantity[-2] in _KUBERNETES_QUANTITY_EXPONENTS:
+            number = quantity[:-2]
+            suffix = quantity[-2:]
+    elif quantity and quantity[-1] in _KUBERNETES_QUANTITY_EXPONENTS:
+        number = quantity[:-1]
+        suffix = quantity[-1:]
+    try:
+        parsed = Decimal(number)
+    except InvalidOperation as error:
+        raise ValueError(f'Invalid Kubernetes quantity {value!r}.') from error
+    if suffix is None:
+        return parsed
+    if suffix == 'ki':
+        raise ValueError(f'Unknown Kubernetes quantity suffix in {value!r}.')
+    base = 1024 if suffix.endswith('i') else 1000
+    return parsed * (base**_KUBERNETES_QUANTITY_EXPONENTS[suffix[0]])
+
+
+def _observe_projected_worker_scratch(pod_spec: object) -> dict[str, object]:
+    """Extract every reserved scratch identity from one Pod spec shape."""
+    malformed = pod_spec is None
+    volumes = _pod_api_field(pod_spec, 'volumes', 'volumes')
+    if volumes is None:
+        volumes = []
+    reserved_volumes = []
+    if isinstance(volumes, (list, tuple)):
+        for volume in volumes:
+            name = _pod_api_field(volume, 'name', 'name')
+            if name != SERVE_WORKER_SCRATCH_VOLUME_NAME:
+                continue
+            empty_dir = _pod_api_field(volume, 'emptyDir', 'empty_dir')
+            size_limit = _pod_api_field(empty_dir, 'sizeLimit', 'size_limit')
+            reserved_volumes.append({
+                'name': name,
+                'medium': _pod_api_field(empty_dir, 'medium', 'medium'),
+                'size_limit': (None if size_limit is None else str(size_limit)),
+                'extra_fields':
+                    sorted(_present_json_fields(volume) - {'name', 'emptyDir'}),
+                'empty_dir_extra_fields': sorted(
+                    _present_json_fields(empty_dir) - {'medium', 'sizeLimit'}),
+            })
+    else:
+        malformed = True
+
+    reserved_mounts = []
+    reserved_devices = []
+    ray_node_container_count = 0
+    container_fields = (
+        ('containers', 'containers', 'containers'),
+        ('initContainers', 'init_containers', 'initContainers'),
+        ('ephemeralContainers', 'ephemeral_containers', 'ephemeralContainers'),
+    )
+    for yaml_field, api_field, scope in container_fields:
+        containers = _pod_api_field(pod_spec, yaml_field, api_field)
+        if containers is None:
+            if scope == 'containers':
+                malformed = True
+            containers = []
+        if not isinstance(containers, (list, tuple)):
+            malformed = True
+            continue
+        for container in containers:
+            container_name = _pod_api_field(container, 'name', 'name')
+            if scope == 'containers' and container_name == 'ray-node':
+                ray_node_container_count += 1
+            mounts = _pod_api_field(container, 'volumeMounts', 'volume_mounts')
+            if mounts is None:
+                mounts = []
+            if not isinstance(mounts, (list, tuple)):
+                malformed = True
+                continue
+            for mount in mounts:
+                name = _pod_api_field(mount, 'name', 'name')
+                mount_path = _pod_api_field(mount, 'mountPath', 'mount_path')
+                if (name != SERVE_WORKER_SCRATCH_VOLUME_NAME and
+                        not worker_scratch_mount_path_collides(mount_path)):
+                    continue
+                reserved_mounts.append({
+                    'scope': scope,
+                    'container_name': container_name,
+                    'name': name,
+                    'mount_path': mount_path,
+                    'read_only': _pod_api_field(mount, 'readOnly', 'read_only'),
+                    'sub_path': _pod_api_field(mount, 'subPath', 'sub_path'),
+                    'sub_path_expr': _pod_api_field(mount, 'subPathExpr',
+                                                    'sub_path_expr'),
+                    'mount_propagation': _pod_api_field(mount,
+                                                        'mountPropagation',
+                                                        'mount_propagation'),
+                    'recursive_read_only': _pod_api_field(
+                        mount, 'recursiveReadOnly', 'recursive_read_only'),
+                    'extra_fields': sorted(
+                        _present_json_fields(mount) - {
+                            'name', 'mountPath', 'readOnly', 'subPath',
+                            'subPathExpr', 'mountPropagation',
+                            'recursiveReadOnly'
+                        }),
+                })
+            devices = _pod_api_field(container, 'volumeDevices',
+                                     'volume_devices')
+            if devices is None:
+                devices = []
+            if not isinstance(devices, (list, tuple)):
+                malformed = True
+                continue
+            for device in devices:
+                if (_pod_api_field(device, 'name',
+                                   'name') == SERVE_WORKER_SCRATCH_VOLUME_NAME):
+                    reserved_devices.append({
+                        'scope': scope,
+                        'container_name': container_name,
+                        'name': SERVE_WORKER_SCRATCH_VOLUME_NAME,
+                        'device_path': _pod_api_field(device, 'devicePath',
+                                                      'device_path'),
+                    })
+    return {
+        'malformed': malformed,
+        'ray_node_container_count': ray_node_container_count,
+        'volumes': reserved_volumes,
+        'mounts': reserved_mounts,
+        'devices': reserved_devices,
+    }
+
+
+def _projected_worker_scratch_matches(actual: dict[str, object],
+                                      expected: dict[str, object]) -> bool:
+    if actual['malformed'] or actual['ray_node_container_count'] != 1:
+        return False
+    volumes = actual['volumes']
+    mounts = actual['mounts']
+    devices = actual['devices']
+    assert isinstance(volumes, list)
+    assert isinstance(mounts, list)
+    assert isinstance(devices, list)
+    if expected['kind'] == 'none':
+        return not volumes and not mounts and not devices
+    volume_matches = False
+    if len(volumes) == 1:
+        scratch_volume = volumes[0]
+        assert isinstance(scratch_volume, dict)
+        try:
+            parsed_size = _parse_kubernetes_quantity(
+                scratch_volume['size_limit'])
+        except (TypeError, ValueError):
+            parsed_size = None
+        volume_matches = (scratch_volume['name']
+                          == SERVE_WORKER_SCRATCH_VOLUME_NAME and
+                          scratch_volume['medium'] == 'Memory' and
+                          parsed_size == expected['size_limit_bytes'] and
+                          not scratch_volume['extra_fields'] and
+                          not scratch_volume['empty_dir_extra_fields'])
+    if len(mounts) != 1:
+        return False
+    scratch_mount = mounts[0]
+    assert isinstance(scratch_mount, dict)
+    mount_matches = (
+        scratch_mount['scope'] == 'containers' and
+        scratch_mount['container_name'] == 'ray-node' and
+        scratch_mount['name'] == SERVE_WORKER_SCRATCH_VOLUME_NAME and
+        scratch_mount['mount_path'] == SERVE_WORKER_SCRATCH_MOUNT_PATH and
+        scratch_mount['read_only'] in (None, False) and
+        scratch_mount['sub_path'] in (None, '') and
+        scratch_mount['sub_path_expr'] in (None, '') and
+        scratch_mount['mount_propagation'] in (None, '') and
+        scratch_mount['recursive_read_only'] in (None, 'Disabled') and
+        not scratch_mount['extra_fields'])
+    return volume_matches and mount_matches and not devices
+
+
+def enforce_projected_worker_scratch_contract(
+    pod_spec: object,
+    expected_scratch: object,
+    *,
+    rewrite: bool,
+) -> ProjectedScratchContract:
+    """Own the complete memory-backed ``/tmp`` surface for one worker Pod.
+
+    ``rewrite=True`` canonicalizes mutable YAML and refuses every pre-existing
+    collision with the reserved volume name or the normalized ``/tmp`` tree.
+    ``rewrite=False`` observes the same surfaces on an admitted Kubernetes API
+    object without mutation and returns an exact attestation result.
+    """
+    expected = validate_projected_worker_scratch(expected_scratch)
+    if rewrite:
+        if not isinstance(pod_spec, dict):
+            raise ProjectedScratchContractError(
+                'Projected SkyServe Kubernetes Pod spec must be a mapping.')
+        memory_backed = expected['kind'] == 'memory'
+        expected_volume = None if not memory_backed else {
+            'name': SERVE_WORKER_SCRATCH_VOLUME_NAME,
+            'emptyDir': {
+                'medium': 'Memory',
+                'sizeLimit': str(expected['size_limit_bytes']),
+            },
+        }
+        expected_mount = None if not memory_backed else {
+            'name': SERVE_WORKER_SCRATCH_VOLUME_NAME,
+            'mountPath': SERVE_WORKER_SCRATCH_MOUNT_PATH,
+        }
+        volumes = pod_spec.get('volumes')
+        if volumes is None:
+            volumes = []
+        if not isinstance(volumes, list) or any(
+                not isinstance(volume, dict) for volume in volumes):
+            raise ProjectedScratchContractError(
+                'Projected SkyServe Kubernetes Pod volumes must be a list of '
+                'mappings.')
+        owned_volumes = [
+            volume for volume in volumes
+            if volume.get('name') == SERVE_WORKER_SCRATCH_VOLUME_NAME
+        ]
+        if owned_volumes and (not memory_backed or len(owned_volumes) != 1 or
+                              owned_volumes[0] != expected_volume):
+            raise ProjectedScratchContractError(
+                'Projected SkyServe worker scratch volume identity collides '
+                'with an existing Pod volume.')
+
+        runtime_containers = []
+        for container_field in ('containers', 'initContainers',
+                                'ephemeralContainers'):
+            containers = pod_spec.get(container_field)
+            if containers is None:
+                containers = []
+            if not isinstance(containers, list) or any(
+                    not isinstance(container, dict)
+                    for container in containers):
+                raise ProjectedScratchContractError(
+                    f'Projected SkyServe Kubernetes {container_field} must '
+                    'be a list of mappings.')
+            for container in containers:
+                is_runtime = (container_field == 'containers' and
+                              container.get('name') == 'ray-node')
+                if is_runtime:
+                    runtime_containers.append(container)
+                mounts = container.get('volumeMounts')
+                if mounts is None:
+                    mounts = []
+                if not isinstance(mounts, list) or any(
+                        not isinstance(mount, dict) for mount in mounts):
+                    raise ProjectedScratchContractError(
+                        'Projected SkyServe Kubernetes volumeMounts must be a '
+                        'list of mappings.')
+                matching_mounts = []
+                for mount in mounts:
+                    owns_identity = (mount.get('name')
+                                     == SERVE_WORKER_SCRATCH_VOLUME_NAME or
+                                     worker_scratch_mount_path_collides(
+                                         mount.get('mountPath')))
+                    if owns_identity:
+                        matching_mounts.append(mount)
+                if matching_mounts and (not memory_backed or not is_runtime or
+                                        len(matching_mounts) != 1 or
+                                        matching_mounts[0] != expected_mount):
+                    raise ProjectedScratchContractError(
+                        'Projected SkyServe worker scratch mount identity '
+                        'collides with an existing container mount.')
+                devices = container.get('volumeDevices')
+                if devices is None:
+                    devices = []
+                if not isinstance(devices, list) or any(
+                        not isinstance(device, dict) for device in devices):
+                    raise ProjectedScratchContractError(
+                        'Projected SkyServe Kubernetes volumeDevices must be a '
+                        'list of mappings.')
+                if any(
+                        device.get('name') == SERVE_WORKER_SCRATCH_VOLUME_NAME
+                        for device in devices):
+                    raise ProjectedScratchContractError(
+                        'Projected SkyServe worker scratch volume identity '
+                        'collides with a container volumeDevice.')
+
+        if memory_backed:
+            if len(runtime_containers) != 1:
+                raise ProjectedScratchContractError(
+                    'Projected SkyServe Kubernetes Pods must contain exactly '
+                    'one ray-node container.')
+            volumes[:] = [
+                volume for volume in volumes
+                if volume.get('name') != SERVE_WORKER_SCRATCH_VOLUME_NAME
+            ]
+            assert expected_volume is not None
+            volumes.append(expected_volume)
+            pod_spec['volumes'] = volumes
+            runtime_mounts = runtime_containers[0].get('volumeMounts')
+            if runtime_mounts is None:
+                runtime_mounts = []
+            assert isinstance(runtime_mounts, list)
+            assert expected_mount is not None
+            runtime_mounts[:] = [
+                mount for mount in runtime_mounts if mount != expected_mount
+            ]
+            runtime_mounts.append(expected_mount)
+            runtime_containers[0]['volumeMounts'] = runtime_mounts
+    actual = _observe_projected_worker_scratch(pod_spec)
+    return ProjectedScratchContract(
+        matches=_projected_worker_scratch_matches(actual, expected),
+        expected=expected,
+        actual=actual,
+    )
 
 
 def _resource_mapping(owner: object, section: str, location: str,

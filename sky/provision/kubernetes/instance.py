@@ -1836,6 +1836,41 @@ def _attest_serve_worker_scheduler_and_binding(
         defer_cleanup=defer_cleanup)
 
 
+def _validate_serve_worker_scratch_contract(value: object) -> dict[str, object]:
+    """Validate the persisted provider-side protocol-v3 scratch contract."""
+    try:
+        return pod_spec_lib.validate_projected_worker_scratch(value)
+    except pod_spec_lib.ProjectedScratchContractError as error:
+        raise config_lib.KubernetesError(str(error)) from error
+
+
+def _attest_serve_worker_scratch(
+    pod: object,
+    namespace: str,
+    context: str | None,
+    expected_scratch: object,
+    *,
+    defer_cleanup: bool = False,
+) -> None:
+    """Reject an admitted worker whose exact v3 /tmp contract changed."""
+    if expected_scratch is _NO_SERVE_WORKER_IDENTITY_ATTESTATION:
+        return
+    expected = _validate_serve_worker_scratch_contract(expected_scratch)
+    pod_spec = (pod.get('spec') if isinstance(pod, Mapping) else getattr(
+        pod, 'spec', None))
+    contract = pod_spec_lib.enforce_projected_worker_scratch_contract(
+        pod_spec, expected, rewrite=False)
+    if contract.matches:
+        return
+    _reject_admitted_serve_worker_identity(pod,
+                                           namespace,
+                                           context,
+                                           'worker scratch contract',
+                                           contract.actual,
+                                           contract.expected,
+                                           defer_cleanup=defer_cleanup)
+
+
 def _attest_created_serve_worker_pod(
     pod: Any,
     namespace: str,
@@ -1856,6 +1891,7 @@ def _attest_created_serve_worker_pod(
     expected_accelerator_label_values: object,
     expected_accelerator_resource_key: object,
     expected_accelerator_count: object,
+    expected_scratch: object,
     expected_kueue_lifecycle: _RequiredKueuePodLifecycle = 'create_response',
 ) -> None:
     """Attest one admitted Pod before its create thread returns."""
@@ -1903,6 +1939,11 @@ def _attest_created_serve_worker_pod(
         expected_accelerator_label_values,
         expected_kueue_lifecycle,
         defer_cleanup=True)
+    _attest_serve_worker_scratch(pod,
+                                 namespace,
+                                 context,
+                                 expected_scratch,
+                                 defer_cleanup=True)
 
 
 def _attest_pod_with_provider_guard(
@@ -1994,13 +2035,16 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
         'kueue_workload_priority_class_name')
     serve_worker_projection_protocol_version = provider_config.get(
         'serve_worker_projection_protocol_version')
-    if serve_worker_projection_protocol_version is not None and (
-            type(serve_worker_projection_protocol_version) is not int or
-            serve_worker_projection_protocol_version not in (1, 2)):
+    try:
+        pod_spec_lib.validate_serve_worker_projection_protocol_version(
+            serve_worker_projection_protocol_version, allow_none=True)
+    except ValueError as error:
         raise config_lib.KubernetesError(
             'The rendered SkyServe worker projection protocol version must be '
-            '1, 2, or absent.')
-    strict_kueue_projection = (serve_worker_projection_protocol_version == 2)
+            '1, 2, 3, or absent.') from error
+    strict_kueue_projection = (
+        pod_spec_lib.serve_worker_projection_protocol_has_strict_admission(
+            serve_worker_projection_protocol_version))
     if (kueue_workload_priority_class_name is not None and
         (not isinstance(kueue_workload_priority_class_name, str) or
          not kueue_workload_priority_class_name)):
@@ -2034,6 +2078,23 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     serve_worker_expected_accelerator_count = provider_config.get(
         'serve_worker_expected_accelerator_count',
         _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    serve_worker_expected_scratch = provider_config.get(
+        'serve_worker_expected_scratch', _NO_SERVE_WORKER_IDENTITY_ATTESTATION)
+    if pod_spec_lib.serve_worker_projection_protocol_has_scratch(
+            serve_worker_projection_protocol_version):
+        if (serve_worker_expected_scratch
+                is _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+            raise config_lib.KubernetesError(
+                'Projection protocol v3 requires the complete worker scratch '
+                'attestation contract.')
+        serve_worker_expected_scratch = (
+            _validate_serve_worker_scratch_contract(
+                serve_worker_expected_scratch))
+    elif (serve_worker_expected_scratch
+          is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+        raise config_lib.KubernetesError(
+            'Only projection protocol v3 may carry a worker scratch '
+            'attestation contract.')
     priority_attestation_presence = tuple(
         value is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION
         for value in (serve_worker_expected_priority_class_name,
@@ -2065,8 +2126,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                                     is _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
                                     not all(accelerator_attestation_presence)):
         raise config_lib.KubernetesError(
-            'Projection protocol v2 requires the complete priority, service '
-            'account, scheduler, and accelerator attestation contract.')
+            'A strict projection protocol requires the complete priority, '
+            'service account, scheduler, and accelerator attestation contract.')
     kueue_cluster_queue_name: str | None = None
     if kueue_require_managed:
         if not kueue_local_queue_name:
@@ -2156,6 +2217,8 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             serve_worker_expected_scheduler_name
             is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
             serve_worker_expected_accelerator_label_key
+            is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION or
+            serve_worker_expected_scratch
             is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
 
         def attest_pod(
@@ -2192,6 +2255,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     serve_worker_expected_accelerator_resource_key),
                 expected_accelerator_count=(
                     serve_worker_expected_accelerator_count),
+                expected_scratch=serve_worker_expected_scratch,
                 expected_kueue_lifecycle=expected_kueue_lifecycle)
 
         def attest_created_pod(pod: Any) -> None:
@@ -2446,6 +2510,21 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
             namespace=namespace,
             deployment_name=deployment_name,
         )
+
+        if (serve_worker_expected_scratch
+                is not _NO_SERVE_WORKER_IDENTITY_ATTESTATION):
+            assert isinstance(serve_worker_expected_scratch, dict)
+            scratch_contract = (
+                pod_spec_lib.enforce_projected_worker_scratch_contract(
+                    pod_spec_copy['spec'],
+                    serve_worker_expected_scratch,
+                    rewrite=False))
+            if not scratch_contract.matches:
+                raise config_lib.KubernetesError(
+                    'The finalized SkyServe worker Pod changed the immutable '
+                    'scratch contract: '
+                    f'{scratch_contract.actual!r}; expected '
+                    f'{scratch_contract.expected!r}.')
 
         if kueue_require_managed:
             assert kueue_local_queue_name is not None
