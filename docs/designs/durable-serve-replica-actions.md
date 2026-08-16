@@ -86,13 +86,13 @@ permanently unbound.
 As of 2026-08-16, G1 is merged as PR #1498. It was present in the v1.1.1296
 revision-401 artifact, but a concurrent Terragrunt/Terraform apply created Helm
 revision 402 and regressed the runtime to v1.1.1287 while PostgreSQL correctly
-remained forward at
-API-request 011/Serve047. The current runtime is therefore not capable of the
-G1 legacy-reconciliation operation; no legacy evidence or service authority
-write may be attempted until one exact G1-capable cohort is restored. EKS
-audit records attribute revision 402 to Terraform's Helm provider; the
-checked-in platform runtime pin, not a direct Helm mutation, is the durable
-deployment authority. G1 adds
+remained forward at API-request 011/Serve047. Direct Helm revision 405 has
+since restored one exact G1/P2-capable v1.1.1302 cohort and advanced the
+forward heads to API-request 012/Serve050 without promoting a service. The
+earlier audit incorrectly treated a checked-in platform runtime pin as the
+deployment authority. The production contract is a reviewed direct Helm
+fix-forward from merged SkyPilot artifacts; it requires no `boltz-platform`
+pin or Terragrunt apply. G1 adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
 pre-admission retirement, failure-isolated startup recovery, and exact
@@ -1239,12 +1239,13 @@ Python compilation, and `git diff --check` pass. G1Sb is implemented on
 `feat/serve-executor-termination-evidence`: API013, the controller-generation-
 owned observer, immutable evidence writer, transition Helm surface and focused
 real-PostgreSQL/observer/Helm tests pass locally. G1Sc is the next stacked
-change. It is authored on `cleanup/serve-executor-retirement-transition` and
-removes the observer flag, the legacy grace-variable fallback, and the
-sleep-only chart projection. The final chart supplies exactly one execution-
-drain variable in both HA and compatibility topology, and only the dedicated
-HA controller owns the termination observer. G1Sc remains blocked from merge
-until the qualification gates below.
+change, authored as draft PR #1523 on
+`cleanup/serve-executor-retirement-transition`. G1Sb is draft PR #1522 and
+G1Sa is draft PR #1519. G1Sc removes the observer flag, legacy grace-variable
+fallback, and sleep-only chart projection. The final chart supplies exactly
+one execution-drain variable in both HA and compatibility topology, and only
+the dedicated HA controller owns the termination observer. G1Sc remains
+blocked from merge until the qualification gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -2548,9 +2549,10 @@ approved canary:
 
 - [x] Author, review, and merge G1 (API011/Serve047) and demand convergence
   (API012/Serve048--050).
-- [ ] Author G1Sb executor-termination evidence on API013 and restack the
-  blocked G2 cleanup onto API014/Serve051; link the PRs and state G1Sc/G2's
-  exact merge gates.
+- [ ] G1Sb executor-termination evidence is authored on API013 as draft PR
+  #1522 and G1Sc is authored as draft PR #1523 with its exact merge gate.
+  Restack the blocked G2 cleanup onto API014/Serve051 before completing this
+  combined gate.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs

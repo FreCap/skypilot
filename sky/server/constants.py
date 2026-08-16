@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 85  # Ordered SkyServe capacity admission
+API_VERSION = 87  # Durable executor-termination evidence
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -149,6 +149,11 @@ MIN_NON_POOL_LAUNCH_BINDING_API_VERSION = 80
 MIN_SERVE_DURABLE_DEMAND_API_VERSION = 82
 MIN_SERVE_ROUTE_PROJECTION_API_VERSION = 83
 MIN_SERVE_ORDERED_CAPACITY_ADMISSION_API_VERSION = 85
+# Minimum API version whose durable demand summary preserves the confirmed
+# in-flight lower bound and unknown-backend count when exact coverage is
+# incomplete.
+MIN_SERVE_PARTIAL_IN_FLIGHT_TELEMETRY_API_VERSION = 86
+MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION = 87
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
 # Minimum API version whose Serve version-history response exposes immutable

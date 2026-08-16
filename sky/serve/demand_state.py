@@ -667,6 +667,8 @@ def _empty_summary(state: str,
         'request_window_seconds': constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
         'requests_per_second': None,
         'in_flight_requests': None,
+        'confirmed_in_flight_requests': None,
+        'unknown_in_flight_replica_count': None,
         'request_queue_depth': None,
         'rejected_requests': None,
         'recent_rejected_requests': None,
@@ -788,8 +790,10 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     # occupancy is replica-global/max-selected by LbSessionLedger. The local
     # admission count overlaps HTTP dispatch and therefore remains a drain
     # proof, not another additive UI demand unit.
-    in_flight = (None if aggregate.unknown_urls else sum(
-        aggregate.in_flight.values()))
+    confirmed_in_flight = sum(aggregate.in_flight.values())
+    unknown_in_flight_replica_count = len(aggregate.unknown_urls)
+    in_flight = (None
+                 if unknown_in_flight_replica_count else confirmed_in_flight)
     reason = ('compatibility_incomplete' if not complete else
               'in_flight_incomplete' if aggregate.unknown_urls else 'complete')
     return {
@@ -802,6 +806,11 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         'request_window_seconds': window_seconds,
         'requests_per_second': recent_count / window_seconds,
         'in_flight_requests': in_flight,
+        # Keep the exact gauge nullable when any routed replica lacks a
+        # current occupancy proof, but retain the independently proven lower
+        # bound and its coverage gap for honest operator observability.
+        'confirmed_in_flight_requests': confirmed_in_flight,
+        'unknown_in_flight_replica_count': unknown_in_flight_replica_count,
         'request_queue_depth': queue_depth,
         'rejected_requests': rejected,
         'recent_rejected_requests': recent_rejected,

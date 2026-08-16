@@ -31,7 +31,11 @@ def test_status_contract_has_distinct_api_capability_version() -> None:
     assert server_constants.MIN_SERVE_ROUTE_PROJECTION_API_VERSION == 83
     assert (
         server_constants.MIN_SERVE_ORDERED_CAPACITY_ADMISSION_API_VERSION == 85)
-    assert server_constants.API_VERSION == 85
+    assert (server_constants.MIN_SERVE_PARTIAL_IN_FLIGHT_TELEMETRY_API_VERSION
+            == 86)
+    assert (server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION ==
+            87)
+    assert server_constants.API_VERSION == 87
 
 
 def _allocation(

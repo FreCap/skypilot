@@ -2096,6 +2096,105 @@ describe('useServiceReplicaData bounded loading', () => {
     ]);
   });
 
+  it('keeps one persisted replica refresh owner across slow polling intervals', async () => {
+    jest.useFakeTimers();
+    const visibilityDescriptor = Object.getOwnPropertyDescriptor(
+      window.document,
+      'visibilityState'
+    );
+    setDocumentVisibility('visible');
+    const pendingSummary = deferred();
+    const pendingPage = deferred();
+    getServiceReplicaSummaries.mockReturnValue(pendingSummary.promise);
+    getServiceReplicas.mockReturnValue(pendingPage.promise);
+
+    const { unmount } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+
+    try {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(getServiceReplicaSummaries).toHaveBeenCalledTimes(1);
+      expect(getServiceReplicas).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        jest.advanceTimersByTime(3 * 60 * 1000);
+        await Promise.resolve();
+      });
+
+      expect(getServiceReplicaSummaries).toHaveBeenCalledTimes(1);
+      expect(getServiceReplicas).toHaveBeenCalledTimes(1);
+    } finally {
+      unmount();
+      pendingSummary.resolve(directSummary());
+      pendingPage.resolve(
+        directPage('current_or_uncertain', {
+          total: 1,
+          replicas: [{ id: 1, status: 'READY' }],
+        })
+      );
+      jest.runOnlyPendingTimers();
+      jest.useRealTimers();
+      if (visibilityDescriptor) {
+        Object.defineProperty(
+          window.document,
+          'visibilityState',
+          visibilityDescriptor
+        );
+      } else {
+        delete window.document.visibilityState;
+      }
+    }
+  });
+
+  it('lets a manual replica refresh supersede automatic work and reuses its owner', async () => {
+    const initialSummary = deferred();
+    const initialPage = deferred();
+    const manualSummary = deferred();
+    const manualPage = deferred();
+    getServiceReplicaSummaries
+      .mockReturnValueOnce(initialSummary.promise)
+      .mockReturnValueOnce(manualSummary.promise);
+    getServiceReplicas
+      .mockReturnValueOnce(initialPage.promise)
+      .mockReturnValueOnce(manualPage.promise);
+
+    const { result, unmount } = renderHook(() =>
+      useServiceReplicaData({
+        serviceName: 'svc',
+        serviceHash: 'hash-a',
+        metadataReady: true,
+      })
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    let firstManual;
+    let secondManual;
+    act(() => {
+      firstManual = result.current.refreshReplicas();
+      secondManual = result.current.refreshReplicas();
+    });
+
+    expect(firstManual).toBe(secondManual);
+    expect(getServiceReplicaSummaries).toHaveBeenCalledTimes(2);
+    expect(getServiceReplicas).toHaveBeenCalledTimes(2);
+
+    unmount();
+    initialSummary.resolve(directSummary());
+    initialPage.resolve(directPage('current_or_uncertain'));
+    manualSummary.resolve(directSummary());
+    manualPage.resolve(directPage('current_or_uncertain'));
+    await Promise.allSettled([firstManual, initialSummary.promise]);
+  });
+
   it('keeps last-good rows when a direct refresh fails', async () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation();
     const { result } = renderHook(() =>
@@ -3636,6 +3735,41 @@ describe('ServiceDetailCard cost and request estimates', () => {
       )
     ).toBeTruthy();
     expect(screen.queryByText(/telemetry stale/)).toBeNull();
+  });
+
+  it('renders a proven lower bound when backend occupancy is incomplete', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 5,
+          replicasTotal: 5,
+          replicasFailed: 0,
+          activeVersions: [1],
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: 0,
+          recentRequestCount: 0,
+          requestWindowSeconds: 60,
+          inFlightRequests: null,
+          confirmedInFlightRequests: 0,
+          unknownInFlightReplicaCount: 5,
+          requestQueueDepth: 0,
+          rejectedRequests: 0,
+          requestStatsAgeSeconds: 2,
+          requestTelemetryState: 'fresh',
+          requestTelemetryReason: 'in_flight_incomplete',
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('0 confirmed processing')).toBeTruthy();
+    expect(
+      screen.getByText(
+        '0.00 req/s recent · 0 requests in 60s · 0 queued · 5 backends with unknown occupancy · 0 rejected · activity report 2s old'
+      )
+    ).toBeTruthy();
   });
 });
 
