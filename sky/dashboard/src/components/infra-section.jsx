@@ -2,7 +2,10 @@ import React from 'react';
 import { CircularProgress } from '@mui/material';
 import { AlertTriangleIcon } from 'lucide-react';
 
-import { GpuUtilizationBar } from '@/components/infra-context-details';
+import {
+  GpuUtilizationBar,
+  PriorityOrderLegend,
+} from '@/components/infra-context-details';
 import { NonCapitalizedTooltip } from '@/components/utils';
 import { PluginSlot } from '@/plugins/PluginSlot';
 import { UI_CONFIG } from '@/lib/config';
@@ -397,8 +400,11 @@ export function InfrastructureSection({
                           Requestable
                         </th>
                         <th className="p-3 text-left font-medium text-gray-600 w-1/2">
-                          <div className="flex items-center">
+                          <div>
                             <span>Utilization</span>
+                            {!isSSH && !isSlurm && (
+                              <PriorityOrderLegend className="mt-1 font-normal" />
+                            )}
                           </div>
                         </th>
                       </tr>

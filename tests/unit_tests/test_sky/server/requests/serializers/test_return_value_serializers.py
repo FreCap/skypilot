@@ -200,7 +200,7 @@ class TestSerializeKubernetesNodeInfo:
                 'boltz-l4-fleet': 6
             },
         })
-        mock_get_version.return_value = 78
+        mock_get_version.return_value = 79
         parsed = json.loads(
             return_value_serializers.serialize_kubernetes_node_info(data))
         assert parsed['node_info_dict']['node1'][
@@ -209,6 +209,41 @@ class TestSerializeKubernetesNodeInfo:
             'preemptible_service_breakdown'] == {
                 'boltz-l4-fleet': 6
             }
+
+    @mock.patch(
+        'sky.server.requests.serializers.return_value_serializers.versions.get_remote_api_version'
+    )
+    def test_operational_priority_breakdown_is_version_gated(
+            self, mock_get_version):
+        node = {
+            'name': 'node1',
+            'allocation_breakdown': {
+                'ma-lt (31)': 2,
+                'wa-eval (20)': 6,
+            },
+            'preemptible_service_priority_breakdown': {
+                'boltz-l4-fleet': {
+                    'wa-eval (20)': 4
+                }
+            },
+        }
+        data = {'node_info_dict': {'node1': dict(node)}}
+        mock_get_version.return_value = 80
+        parsed = json.loads(
+            return_value_serializers.serialize_kubernetes_node_info(data))
+        assert 'allocation_breakdown' not in parsed['node_info_dict']['node1']
+        assert 'preemptible_service_priority_breakdown' not in parsed[
+            'node_info_dict']['node1']
+
+        data = {'node_info_dict': {'node1': dict(node)}}
+        mock_get_version.return_value = 81
+        parsed = json.loads(
+            return_value_serializers.serialize_kubernetes_node_info(data))
+        assert parsed['node_info_dict']['node1'][
+            'allocation_breakdown'] == node['allocation_breakdown']
+        assert parsed['node_info_dict']['node1'][
+            'preemptible_service_priority_breakdown'] == node[
+                'preemptible_service_priority_breakdown']
 
     @mock.patch(
         'sky.server.requests.serializers.return_value_serializers.versions.get_remote_api_version'
