@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
 import {
   HISTORY_PRESETS,
@@ -23,6 +23,12 @@ export function ServeHistorySection({
     kind: 'preset',
     seconds: HISTORY_PRESETS[0].seconds,
   });
+  useEffect(() => {
+    setSelection({
+      kind: 'preset',
+      seconds: HISTORY_PRESETS[0].seconds,
+    });
+  }, [history?.serviceHash]);
   const effectiveSelection = useMemo(
     () => getEffectiveHistorySelection(history, selection),
     [history, selection]

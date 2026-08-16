@@ -212,6 +212,27 @@ describe('ServeHistorySection', () => {
     expect(screen.getByText('Latest ready')).toBeInTheDocument();
   });
 
+  it('resets the selected range when the service incarnation changes', () => {
+    const { rerender } = render(
+      <ServeHistorySection history={{ ...history, serviceHash: 'hash-a' }} />
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '12h' }));
+    expect(screen.getByRole('button', { name: '12h' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+
+    rerender(
+      <ServeHistorySection history={{ ...history, serviceHash: 'hash-b' }} />
+    );
+
+    expect(screen.getByRole('button', { name: '1h' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+  });
+
   it('renders explicit loading and unavailable placeholders', () => {
     const { rerender } = render(<ServeHistorySection history={null} loading />);
     expect(
