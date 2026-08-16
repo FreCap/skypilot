@@ -87,8 +87,9 @@ class TestProbeRoundBatching(unittest.TestCase):
         manager._cloud_instance_looks_alive = mock.Mock(return_value=True)
         manager._terminate_replica = mock.Mock()
         manager._resolve_probe_urls = mock.Mock(
-            side_effect=lambda infos, *, phase_admission:
+            side_effect=lambda infos, **_kwargs:
             {info.replica_id: info.url for info in infos})
+        manager._route_projection_publisher = None
         return manager
 
     def _run_probe_round(self, manager, infos, *, refreshed=None):
