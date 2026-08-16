@@ -11,6 +11,11 @@ and P2b2 recognizes its additive Serve050 head before either path can be
 promoted. Production remains on the legacy controller-coupled demand and route
 paths.
 
+The exact post-#1503 P2b2 review scope is 42 files with 4,298 insertions and
+241 deletions relative to `improvements`. GitHub stack #1517 retains #1504
+above that trunk and the blocked draft removals #1506/#1510 above #1504; base
+retargeting did not detach or merge either cleanup.
+
 Last updated: 2026-08-16
 
 Canonical owner: this file for request telemetry ingestion, paid-capacity
