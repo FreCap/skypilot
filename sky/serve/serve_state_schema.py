@@ -140,6 +140,23 @@ services_table = sqlalchemy.Table(
                       sqlalchemy.BigInteger,
                       nullable=False,
                       server_default='0'),
+    # Serve047 generic capability is separate from the ordinary-only bit. The
+    # complete tuple is bound to the current controller incarnation and is
+    # installed only by explicit per-service promotion.
+    sqlalchemy.Column('non_pool_launch_binding_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('non_pool_launch_controller_incarnation',
+                      sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('non_pool_launch_binding_protocol_version',
+                      sqlalchemy.Integer),
+    sqlalchemy.Column('non_pool_launch_capability_profile_set_digest',
+                      sqlalchemy.Text),
+    sqlalchemy.Column('non_pool_launch_capability_cohort_epoch',
+                      sqlalchemy.BigInteger),
+    sqlalchemy.Column('non_pool_launch_receipt_protocol_version',
+                      sqlalchemy.Integer),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that

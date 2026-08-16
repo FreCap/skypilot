@@ -1196,6 +1196,49 @@ def submit_prepared_ordinary_launch_request(
                                              str(binding.request_id))
 
 
+def submit_prepared_non_pool_launch_request(
+    prepared_request: PreparedLaunchRequest,
+    submission_uuid: str | uuid.UUID,
+    profile_kind: str,
+) -> server_common.RequestId[tuple[int | None,
+                                   Optional['backends.ResourceHandle']]]:
+    """Submit one frozen request through the generic durable binding seam."""
+    try:
+        parsed_submission_uuid = uuid.UUID(str(submission_uuid))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError('submission_uuid must be a UUID.') from error
+    canonical_submission_uuid = str(parsed_submission_uuid)
+    if (isinstance(submission_uuid, str) and
+            submission_uuid != canonical_submission_uuid):
+        raise ValueError('submission_uuid must be a canonical UUID string.')
+    if not isinstance(profile_kind, str) or not profile_kind:
+        raise ValueError('profile_kind must be non-empty text.')
+    response = server_common.make_authenticated_request(
+        'POST',
+        server_constants.NON_POOL_LAUNCH_BINDING_PATH,
+        json={
+            'submission_uuid': canonical_submission_uuid,
+            'profile_kind': profile_kind,
+            'launch': json.loads(prepared_request.submitted_bytes),
+        },
+        timeout=5)
+    server_common.handle_request_error(response)
+    try:
+        binding = responses.OrdinaryLaunchBindingResponse.model_validate(
+            response.json())
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            'Non-pool Serve launch binding returned a malformed response.') \
+            from error
+    if str(binding.submission_uuid) != canonical_submission_uuid:
+        raise RuntimeError(
+            'Non-pool Serve launch binding returned a different submission '
+            'UUID.')
+    return server_common.RequestId[tuple[int | None,
+                                         Optional['backends.ResourceHandle']]](
+                                             str(binding.request_id))
+
+
 @usage_lib.entrypoint
 @server_common.check_server_healthy_or_start
 @annotations.client_api

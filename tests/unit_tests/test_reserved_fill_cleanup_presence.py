@@ -131,6 +131,16 @@ def test_one_provider_read_serves_a_whole_drain_sweep(monkeypatch):
     assert calls['n'] == 1
 
 
+def test_exact_evidence_bypasses_an_older_cached_snapshot(monkeypatch):
+    calls = _patch_pods(monkeypatch,
+                        [_pod(annotation='other', label='other-1')])
+    assert reserved_capacity.probe_physical_replica_presence(
+        _fence(), _CLUSTER, now=100.0) is Presence.ABSENT
+    assert reserved_capacity.probe_physical_replica_presence(
+        _fence(), _CLUSTER, now=101.0, use_cache=False) is Presence.ABSENT
+    assert calls['n'] == 2
+
+
 def test_snapshot_expires_so_new_pods_are_observed(monkeypatch):
     calls = _patch_pods(monkeypatch,
                         [_pod(annotation='other', label='other-1')])

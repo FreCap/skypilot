@@ -285,10 +285,12 @@ source work to inspect the fleet safely.
 ### P1: generalized durable non-pool actions
 
 Implement API011/Serve047 from `durable-serve-replica-actions.md`: one generic
-handler, six typed profiles, atomic row/association/request/queue/pin commit,
+handler, six typed profiles, planner-intent commit followed by atomic
+association/request/queue/pin binding,
 pre-I/O revalidation, typed result/provider reconciliation, and per-association
-quarantine. Add the closed seven-row incident evidence manifest and reconcile
-those rows only from old-executor termination plus fresh exact provider
+quarantine. Add reusable append-only legacy reconciliation scopes and register
+the seven production rows as one exact reviewed scope. Reconcile those rows
+only from old-executor termination plus fresh exact provider
 evidence. No synthetic quiescence or association backfill is permitted.
 
 Expected size: large, approximately 3,000--5,000 source/test lines by extending
@@ -401,7 +403,7 @@ generation. The final cleanup removes their predecessor paths.
   reserved-fill activation.
 - [ ] Publish P1 and its blocked P3 removal as a reviewed stack.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
-- [ ] Reconcile the exact seven-row incident manifest without fabricated
+- [ ] Reconcile the exact seven-row production scope without fabricated
   quiescence or manual row deletion.
 - [ ] Publish P2 and update P3 for every transition-only demand/route path.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller

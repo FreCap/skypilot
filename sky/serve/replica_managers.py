@@ -1059,6 +1059,7 @@ def launch_cluster(
         None, ordinary_launch_handoff.TerminalStatus | None
     ], None] | None = None,
     ordinary_launch_submission_uuid: str | None = None,
+    non_pool_launch_profile_kind: str | None = None,
     inspect_bound_ordinary_launch: Callable[[], Any] | None = None,
     reduce_bound_ordinary_launch: Callable[[Any, BaseException | None], Any] |
     None = None,
@@ -1404,11 +1405,37 @@ def launch_cluster(
     if availability_max_retry is None:
         availability_max_retry = max_retry
 
+    if non_pool_launch_profile_kind is not None:
+        try:
+            generic_profile_kind = (
+                ordinary_launch_binding.NonPoolLaunchProfileKind(
+                    non_pool_launch_profile_kind))
+        except (TypeError, ValueError) as error:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Generic launch has an unsupported profile kind.') from error
+        if ordinary_launch_submission_uuid is None:
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Generic launch has no stable submission UUID.')
+    else:
+        generic_profile_kind = None
+
     if ordinary_launch_submission_uuid is not None:
-        if recovery_context_available or protocol_v2_fence is not None:
+        if (generic_profile_kind is None and
+            (recovery_context_available or protocol_v2_fence is not None)):
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Special recovery and reserved-fill launches cannot enter the '
                 'ordinary binding path.')
+        reserved_profile = (generic_profile_kind == ordinary_launch_binding.
+                            NonPoolLaunchProfileKind.RESERVED_FILL)
+        if reserved_profile != (protocol_v2_fence is not None):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'Reserved-fill profile and physical launch fence must be '
+                'present together.')
+        if (generic_profile_kind == ordinary_launch_binding.
+                NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY and
+                not recovery_context_available):
+            raise _BoundOrdinaryLaunchUnresolvedError(
+                'System-OOM profile lost its exact recovery context.')
         if (launch_fence is None or inspect_bound_ordinary_launch is None or
                 reduce_bound_ordinary_launch is None or
                 cancel_bound_ordinary_launch is None):
@@ -1446,8 +1473,17 @@ def launch_cluster(
             try:
                 with (skypilot_config.local_active_workspace_ctx(workspace)
                       if workspace is not None else contextlib.nullcontext()):
-                    request_id = (sdk.submit_prepared_ordinary_launch_request(
-                        prepared_request, ordinary_launch_submission_uuid))
+                    if generic_profile_kind is None:
+                        request_id = (
+                            sdk.submit_prepared_ordinary_launch_request(
+                                prepared_request,
+                                ordinary_launch_submission_uuid))
+                    else:
+                        request_id = (
+                            sdk.submit_prepared_non_pool_launch_request(
+                                prepared_request,
+                                ordinary_launch_submission_uuid,
+                                generic_profile_kind.value))
                 break
             except Exception as error:  # pylint: disable=broad-except
                 if not _bound_submission_may_have_committed(error):
@@ -3633,7 +3669,11 @@ class SkyPilotReplicaManager(ReplicaManager):
             and self._service_is_launch_authorized())
 
     def _bound_ordinary_launch_fence_context(
-            self, info: ReplicaInfo, service_version: int) -> dict[str, Any]:
+        self,
+        info: ReplicaInfo,
+        service_version: int,
+        base_launch_fence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Build the complete immutable admission fence for one replica."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or authority.capable is not True or
@@ -3641,7 +3681,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 != ordinary_launch_binding.BindingMode.BOUND):
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Bound ordinary launch has no promoted controller authority.')
-        fence = self._replica_launch_fence_context(service_version)
+        fence = (self._replica_launch_fence_context(service_version)
+                 if base_launch_fence is None else dict(base_launch_fence))
         if fence is None:
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Bound ordinary launch has no durable service-owner fence.')
@@ -3938,14 +3979,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         replica_id for replica_id, worker in
                         self._legacy_mutation_runtime_state(
                         ).launch_thread_pool.items()
-                        if (isinstance(worker, _ReplicaLaunchThread) and
-                            (worker.ordinary_legacy_launch or
-                             worker.bound_ordinary_launch))
+                        if isinstance(worker, _ReplicaLaunchThread)
                     ]
                     if eligible_workers:
                         raise _BoundOrdinaryLaunchUnresolvedError(
-                            'Ordinary-launch binding transition found local '
-                            'eligible workers that have not crossed the '
+                            'Launch-binding transition found local eligible '
+                            'workers '
+                            'that have not crossed the '
                             f'completion barrier: {sorted(eligible_workers)}.')
 
                     installed = False
@@ -4855,31 +4895,25 @@ class SkyPilotReplicaManager(ReplicaManager):
         #    (SERVICE_REGISTER_TIMEOUT_SECONDS) → _bail_on_boot_failure →
         #    os._exit(1) → daemon respawn → recovery restarted from scratch,
         #    forever: a controller crash-loop that froze the whole service.
-        #    With the thread, uvicorn binds within seconds while recovery
-        #    proceeds under the lock; probes/scaling naturally wait on the
-        #    lock exactly as they would during any long locked operation.
+        #    With the thread, uvicorn binds within seconds. Each recovery pass
+        #    proceeds under the lock, but a failed pass releases it before
+        #    backoff so probes/scaling are not frozen by one unresolved row.
         recovery_lock_acquired = threading.Event()
 
         def _recover_with_lock() -> None:
             try:
-                with self.lock:
-                    recovery_lock_acquired.set()
-                    # Retry a failed recovery pass instead of dying silently:
-                    # in the previous synchronous design a recovery exception
-                    # failed the controller boot and the HA daemon retried
-                    # via respawn; a thread that just died would instead
-                    # leave interrupted replicas un-redriven forever while
-                    # the controller kept serving. Re-running is idempotent:
-                    # _launch_replica/_terminate_replica skip replicas whose
-                    # threads are already enqueued. The lock is deliberately
-                    # held across the backoff — until recovery completes the
-                    # daemons must not act on half-redriven state (matching
-                    # the pre-existing recovery-holds-lock-first semantics).
-                    backoff_seconds = 30
-                    while True:
+                # Retry a failed recovery pass instead of dying silently. Each
+                # pass owns the manager lock, but the backoff deliberately
+                # does not: one malformed or ambiguous association must not
+                # freeze probes, routes, scaling, or healthy sibling actions
+                # while its exact recovery is retried. Re-entry is idempotent;
+                # already reconstructed workers remain in their pools.
+                backoff_seconds = 30
+                while not self._manager_daemon_should_stop():
+                    with self.lock:
+                        recovery_lock_acquired.set()
                         try:
                             self._recover_replica_operations()
-                            break
                         except Exception as e:  # pylint: disable=broad-except
                             logger.error(
                                 'Replica recovery pass failed; retrying in '
@@ -4888,7 +4922,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             with ux_utils.enable_traceback():
                                 logger.error(
                                     f'  Traceback: {traceback.format_exc()}')
-                            time.sleep(backoff_seconds)
+                        else:
+                            return
+                    if self._manager_daemon_stop.wait(backoff_seconds):
+                        return
             finally:
                 # Failsafe: never leave __init__ waiting if this thread dies
                 # before signaling (nothing before the `with` can normally
@@ -4935,8 +4972,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         """Re-drive interrupted replica operations from durable state.
 
         Runs in the dedicated recovery thread started by __init__, which
-        holds the manager lock for the whole pass (see __init__ for the
-        lock-ordering handshake with the daemon threads)."""
+        holds the manager lock for one pass but releases it between failed
+        retries (see __init__ for the lock-ordering handshake with daemon
+        threads)."""
         # This remains the current launch/down restart-recovery owner.  A
         # future bounded ordinary-launch association may replace only its
         # duplicate-request inference after independent qualification.
@@ -5042,9 +5080,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         # Kubernetes context that was retargeted while this controller was
         # down.  Tear every interrupted fill down before considering the
         # ordinary recovery wave; a fresh broker round can refill the slot.
-        interrupted_fill_replicas = [
+        binding_authority = self._ordinary_launch_binding_authority
+        generic_binding_active = bool(
+            not self._is_pool and binding_authority is not None and
+            binding_authority.generic_launches_required)
+        interrupted_fill_replicas = ([] if generic_binding_active else [
             info for info in to_up_replicas if info.reserved_fill is True
-        ]
+        ])
         interrupted_fill_replicas.sort(key=_provider_cleanup_phase_order)
         if interrupted_fill_replicas:
             # The old controller may have submitted sdk.launch before it died
@@ -5125,13 +5167,67 @@ class SkyPilotReplicaManager(ReplicaManager):
 
         bound_recovery_errors: list[tuple[int, Exception]] = []
         for replica_info in to_up_replicas:
+            generic_reduction = None
+            if generic_binding_active:
+                try:
+                    generic_reduction = (
+                        request_postgres.inspect_bound_ordinary_launch(
+                            self._service_name, replica_info.replica_id,
+                            replica_info.replica_record_id))
+                    if generic_reduction is None:
+                        # Generic promotion has a zero-pending barrier, so this
+                        # retained row was committed after cutover. Without an
+                        # association no API request became visible and no
+                        # provider effect could escape. Retire the planner
+                        # intent atomically instead of reconstructing it with a
+                        # partial set of profile fields; current planners will
+                        # make a fresh decision.
+                        authority = self._ordinary_launch_binding_authority
+                        assert authority is not None
+                        retirement = (
+                            ordinary_launch_binding.
+                            retire_pre_admission_non_pool_launch_intent(
+                                authority, replica_info.replica_id,
+                                replica_info.replica_record_id))
+                        if retirement.disposition in (
+                                ordinary_launch_binding.
+                                PreAdmissionRetirementDisposition.RETIRED,
+                                ordinary_launch_binding.
+                                PreAdmissionRetirementDisposition.ABSENT):
+                            profile = (None if retirement.profile_kind is None
+                                       else retirement.profile_kind.value)
+                            logger.info(
+                                'Retired pre-admission generic launch intent '
+                                'for replica %s after controller restart '
+                                '(profile=%s, disposition=%s).',
+                                replica_info.replica_id, profile,
+                                retirement.disposition.value)
+                            continue
+                        # Admission won the row-lock race. Re-read its exact
+                        # request/association snapshot and enter normal
+                        # adoption.
+                        generic_reduction = (
+                            request_postgres.inspect_bound_ordinary_launch(
+                                self._service_name, replica_info.replica_id,
+                                replica_info.replica_record_id))
+                        if generic_reduction is None:
+                            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                                'Generic admission became associated without '
+                                'an adoptable request snapshot.')
+                except Exception as e:  # pylint: disable=broad-except
+                    logger.error(
+                        'Failed to recover generic launch identity for replica '
+                        f'{replica_info.replica_id}: '
+                        f'{common_utils.format_exception(e)}')
+                    bound_recovery_errors.append((replica_info.replica_id, e))
+                    continue
             pending_version = self._pending_version
             if (pending_version is not None and
                     pending_version > replica_info.version):
                 authority = self._ordinary_launch_binding_authority
-                bound_reduction = None
-                if (authority is not None and authority.capable is True and
-                        authority.binding_mode
+                bound_reduction = generic_reduction
+                if (bound_reduction is None and authority is not None and
+                        authority.capable is True and authority.binding_mode
                         == ordinary_launch_binding.BindingMode.BOUND):
                     bound_reduction = (
                         request_postgres.inspect_bound_ordinary_launch(
@@ -5150,7 +5246,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             in_flight_drain_cap_seconds=0)
                 else:
                     logger.info(
-                        'Deferring pointerless recovery re-drive for replica '
+                        'Deferring legacy pointerless recovery re-drive for '
+                        'replica '
                         '%s at version %s because version %s is waiting to be '
                         'applied.', replica_info.replica_id,
                         replica_info.version, pending_version)
@@ -5161,15 +5258,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'the current manager version is %s.',
                     replica_info.replica_id, replica_info.version,
                     self.latest_version)
-                # _terminate_replica first settles any exact bound pointer;
-                # pointerless pre-admission rows proceed directly to cleanup.
+                # Generic pointerless pre-admission rows were retired above.
+                # For remaining legacy rows, _terminate_replica first settles
+                # any exact bound pointer and otherwise enters legacy cleanup.
                 self._terminate_replica(replica_info.replica_id,
                                         sync_down_logs=False,
                                         replica_drain_delay_seconds=0,
                                         is_scale_down=True,
                                         in_flight_drain_cap_seconds=0)
                 continue
-            if replica_info.system_recovery_quarantine is not None:
+            if (not generic_binding_active and
+                    replica_info.system_recovery_quarantine is not None):
                 logger.warning(
                     f'Replica {replica_info.replica_id} has quarantined '
                     'system-recovery state; scheduling legacy teardown.')
@@ -5178,8 +5277,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                         replica_drain_delay_seconds=0)
                 continue
             disposition = replica_info.system_recovery_disposition
-            if (disposition ==
-                    system_recovery_state.SystemRecoveryDisposition.CAPABLE):
+            if (not generic_binding_active and disposition
+                    == system_recovery_state.SystemRecoveryDisposition.CAPABLE):
                 # Exact job capture proves the original launch completed. A
                 # controller crash before the ordinary launch-status write
                 # must not submit another request for the same generation.
@@ -5187,7 +5286,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     common_utils.ProcessStatus.SUCCEEDED)
                 self._persist_replica(replica_info.replica_id, replica_info)
                 continue
-            if (disposition ==
+            if (not generic_binding_active and disposition ==
                     system_recovery_state.SystemRecoveryDisposition.CANDIDATE):
                 intent = replica_info.system_recovery_launch_intent
                 assert intent is not None
@@ -5272,8 +5371,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                 not self._is_pool and authority is not None and
                 authority.capable is True and authority.binding_mode
                 == ordinary_launch_binding.BindingMode.BOUND and
-                ordinary_launch_binding.replica_has_narrow_ordinary_profile(
-                    replica_info))
+                (authority.generic_launches_required or ordinary_launch_binding.
+                 replica_has_narrow_ordinary_profile(replica_info)))
             try:
                 prior_planned_capacity = replica_info.planned_capacity
                 if (isinstance(prior_planned_capacity, bool) or
@@ -5295,10 +5394,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if (authority is not None and authority.capable is True and
                         authority.binding_mode
                         == ordinary_launch_binding.BindingMode.BOUND):
-                    bound_reduction = (
-                        request_postgres.inspect_bound_ordinary_launch(
-                            self._service_name, replica_info.replica_id,
-                            replica_info.replica_record_id))
+                    bound_reduction = generic_reduction
+                    if bound_reduction is None:
+                        bound_reduction = (
+                            request_postgres.inspect_bound_ordinary_launch(
+                                self._service_name, replica_info.replica_id,
+                                replica_info.replica_record_id))
                     if bound_reduction is not None:
                         if (replica_info.replica_id
                                 in legacy_runtime.launch_thread_pool):
@@ -5656,7 +5757,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if bound_recovery_errors:
             failed_ids = [replica_id for replica_id, _ in bound_recovery_errors]
             raise RuntimeError(
-                'Exact bound ordinary-launch recovery remains incomplete for '
+                'Exact bound non-pool launch recovery remains incomplete for '
                 f'replicas {failed_ids!r}; retrying the recovery pass.') from (
                     bound_recovery_errors[0][1])
 
@@ -6708,14 +6809,28 @@ class SkyPilotReplicaManager(ReplicaManager):
             ordinary_binding_profile = (
                 self._is_ordinary_launch_binding_profile(
                     info, recovery_launch_kwargs))
+            authority = self._ordinary_launch_binding_authority
+            generic_profile_kind = (
+                None if self._is_pool else
+                ordinary_launch_binding.classify_non_pool_launch_profile(info))
+            generic_launches_required = bool(
+                authority is not None and authority.generic_launches_required)
+            if generic_launches_required and generic_profile_kind is None:
+                raise _BoundOrdinaryLaunchUnresolvedError(
+                    'Promoted generic service produced an incomplete non-pool '
+                    f'launch profile for replica {info.replica_id}.')
+            bound_non_pool_launch = bool(generic_launches_required and
+                                         generic_profile_kind is not None)
             bound_ordinary_launch = bool(
-                ordinary_binding_profile and
-                self._bound_ordinary_launch_is_eligible(info,
-                                                        recovery_launch_kwargs))
+                bound_non_pool_launch or
+                (ordinary_binding_profile and
+                 self._bound_ordinary_launch_is_eligible(
+                     info, recovery_launch_kwargs)))
             ordinary_legacy_launch = bool(ordinary_binding_profile and
                                           not bound_ordinary_launch)
             effective_launch_fence = launch_fence
-            if not ordinary_binding_profile and not self._is_pool:
+            if (not bound_non_pool_launch and not ordinary_binding_profile and
+                    not self._is_pool):
                 # Emit this while still in legacy mode too.  A queued special
                 # launch can then cross an immediately following promotion
                 # without being mistaken for an unbound ordinary request.
@@ -6727,7 +6842,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'exact_resources_override': location is not None,
                 'pre_launch_guard':
                     (self._ordinary_binding_profile_launch_is_authorized
-                     if ordinary_binding_profile else
+                     if bound_ordinary_launch or ordinary_binding_profile else
                      self._service_is_launch_authorized),
                 'cloud_launch_guard': cloud_launch_guard,
                 'supersession_guard': functools.partial(
@@ -6757,9 +6872,14 @@ class SkyPilotReplicaManager(ReplicaManager):
                 bound_cloud = next(iter(bound_task.resources)).cloud
                 effective_launch_fence = (
                     self._bound_ordinary_launch_fence_context(
-                        info, launch_version))
+                        info,
+                        launch_version,
+                        base_launch_fence=(launch_fence
+                                           if bound_non_pool_launch else None)))
                 inspect_bound, reduce_bound, cancel_bound = (
                     self._bound_ordinary_launch_callbacks(info, bound_cloud))
+                bound_profile_kind = (None if generic_profile_kind is None else
+                                      generic_profile_kind.value)
                 launch_thread_kwargs.update({
                     'launch_fence': effective_launch_fence,
                     'ordinary_launch_submission_uuid':
@@ -6767,6 +6887,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         stable_bound_ordinary_launch_submission_id(
                             self._service_name, info.replica_id,
                             info.replica_record_id),
+                    'non_pool_launch_profile_kind': bound_profile_kind,
                     'inspect_bound_ordinary_launch': inspect_bound,
                     'reduce_bound_ordinary_launch': reduce_bound,
                     'cancel_bound_ordinary_launch': cancel_bound,

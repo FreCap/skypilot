@@ -19,7 +19,7 @@ AUTHORITY_REVISION = '040'
 # relation/function contract.  The catalog proof below remains the trust root;
 # the Alembic head merely identifies a recognized descendant installation.
 RECOGNIZED_ADDITIVE_REVISIONS = frozenset(
-    ('040', '041', '042', '043', '044', '045', '046'))
+    ('040', '041', '042', '043', '044', '045', '046', '047'))
 AUTHORITY_FUNCTION = ('skyserve040_assert_placement_normalization_authority')
 AUTHORITY_GATE = 'placement_normalization_write_fence'
 RUNS_RELATION = 'placement_normalization_runs'

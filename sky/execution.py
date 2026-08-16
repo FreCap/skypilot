@@ -62,6 +62,8 @@ logger = sky_logging.init_logger(__name__)
 
 ordinary_launch_request = adaptors_common.LazyImport(
     'sky.server.requests.ordinary_launch')
+ordinary_launch_binding = adaptors_common.LazyImport(
+    'sky.serve.ordinary_launch_binding')
 
 # Keep the historical sky.execution callable identities while the launch-time
 # policy implementation lives in its own module.
@@ -486,11 +488,22 @@ def _execute(
         ordinary_launch_request._has_bound_context_fields(  # pylint: disable=protected-access
             _extra_launch_context))
     if has_bound_ordinary_launch_context:
-        if (not _is_launched_by_sky_serve_controller or
-                reserved_fill_launch_fence is not None):
+        if not _is_launched_by_sky_serve_controller:
             raise exceptions.RequestCancelled(
                 'Bound ordinary launch authority is restricted to a '
-                'non-reserved SkyServe request.')
+                'SkyServe request.')
+        is_non_pool = ordinary_launch_binding.BINDING_PROTOCOL_VERSION_KEY in (
+            _extra_launch_context)
+        non_pool_context = (
+            ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                _extra_launch_context) if is_non_pool else None)
+        reserved_profile = bool(
+            non_pool_context is not None and non_pool_context.profile.kind
+            == ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        if reserved_profile != (reserved_fill_launch_fence is not None):
+            raise exceptions.RequestCancelled(
+                'Bound reserved-fill profile and physical launch fence must '
+                'be present together.')
         # Bound requests deliberately replace mutable PID/IP routing metadata
         # with fail-closed sentinels.  Parse their complete immutable context
         # here, then let the request-claim/association fence authorize the

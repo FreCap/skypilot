@@ -105,7 +105,7 @@ _QUIESCENCE_BACKEND_GUARD_ENV_VAR = (
     'SKYPILOT_API_REQUIRE_EXECUTION_QUIESCENCE_BACKENDS')
 _IMAGE_ID_DIGEST_PATTERN = re.compile(r'(?:@|//)(sha256:[0-9a-fA-F]{64})$')
 _PROTOCOL_V2_SCHEMA_REVISIONS = frozenset({'035', '036', '037'})
-_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '010'
+_PROTOCOL_V2_API_REQUEST_SCHEMA_REVISION = '011'
 _MAX_SERVICE_ACCOUNT_TOKEN_BYTES = 64 * 1024
 # Keep this equal to the API request server-instance lease's stale horizon.
 # Recently draining/unready rows remain relevant: their controller children may

@@ -312,7 +312,9 @@ def _read_physical_replica_names(
 def probe_physical_replica_presence(
         fence: ProtocolV2CleanupFence,
         cluster_name: str,
-        now: float | None = None) -> PhysicalReplicaPresence:
+        now: float | None = None,
+        *,
+        use_cache: bool = True) -> PhysicalReplicaPresence:
     """Prove whether `cluster_name` still owns Pods on the fenced cluster.
 
     A cleanup whose durable record vanished is not evidence that provider
@@ -324,11 +326,12 @@ def probe_physical_replica_presence(
         now = time.monotonic()
     key = (fence.kubernetes_context, fence.physical_cluster_uid)
     snapshot: tuple[frozenset[str], frozenset[str], bool] | None = None
-    with _physical_presence_lock:
-        cached = _physical_presence_snapshots.get(key)
-        if (cached is not None and
-                now - cached[0] <= _PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS):
-            snapshot = (cached[1], cached[2], cached[3])
+    if use_cache:
+        with _physical_presence_lock:
+            cached = _physical_presence_snapshots.get(key)
+            if (cached is not None and
+                    now - cached[0] <= _PHYSICAL_PRESENCE_SNAPSHOT_TTL_SECONDS):
+                snapshot = (cached[1], cached[2], cached[3])
     if snapshot is None:
         try:
             snapshot = _read_physical_replica_names(fence)

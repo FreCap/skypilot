@@ -59,7 +59,9 @@ _LOGICAL_PLACEMENT_CONTRACT = placement_policy.resolve_fresh_contract(
 
 
 def _binding_authority(mode=ordinary_launch_binding.BindingMode.LEGACY,
-                       binding_epoch=1):
+                       binding_epoch=1,
+                       *,
+                       generic=False):
     return ordinary_launch_binding.ControllerBindingAuthority(
         service_name='svc',
         service_hash='hash',
@@ -72,7 +74,20 @@ def _binding_authority(mode=ordinary_launch_binding.BindingMode.LEGACY,
         controller_owner_epoch=7,
         capable=True,
         binding_mode=mode,
-        binding_epoch=binding_epoch)
+        binding_epoch=binding_epoch,
+        non_pool_capable=generic,
+        non_pool_binding_protocol_version=(
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION
+            if generic else None),
+        non_pool_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            if generic else None),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH
+            if generic else None),
+        non_pool_receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION
+            if generic else None))
 
 
 def _physical_service_spec_mock() -> mock.Mock:
@@ -304,6 +319,37 @@ class TestSkyPilotReplicaManagerInitOrdering:
                 break
             import time as time_mod
             time_mod.sleep(0.05)
+        assert mgr.lock.locked() is False
+
+    def test_failed_recovery_releases_manager_lock_during_backoff(self):
+        import threading as threading_mod
+
+        manager_ref = []
+        backoff_lock_states = []
+        backoff_observed = threading_mod.Event()
+        original_wait = threading_mod.Event.wait
+
+        def _failing_recovery(self_):
+            manager_ref.append(self_)
+            raise RuntimeError('one exact association is unavailable')
+
+        def _observe_wait(event, timeout=None):
+            if timeout == 30 and manager_ref:
+                backoff_lock_states.append(manager_ref[0].lock.locked())
+                backoff_observed.set()
+                # End the background recovery thread after observing its first
+                # backoff; no wall-clock sleep is needed in this unit test.
+                return True
+            return original_wait(event, timeout)
+
+        with mock.patch.object(threading_mod.Event,
+                               'wait',
+                               autospec=True,
+                               side_effect=_observe_wait):
+            mgr = self._build(_failing_recovery, [])
+            assert original_wait(backoff_observed, 5)
+
+        assert backoff_lock_states == [False]
         assert mgr.lock.locked() is False
 
     def test_all_daemon_threads_are_started(self):
@@ -3636,6 +3682,87 @@ class TestLaunchClusterRetry:
     """`launch_cluster` must fail fast ONLY on resource availability
     (capacity) failures when `availability_max_retry` caps them; other
     (transient) errors must keep the `max_retry` in-place attempts."""
+
+    def test_generic_bound_launch_uses_only_non_pool_admission(self, tmp_path):
+        task = mock.MagicMock()
+        resource = mock.MagicMock()
+        resource.cloud = clouds.AWS()
+        task.resources = {resource}
+        prepared = types.SimpleNamespace(body=types.SimpleNamespace(
+            model_dump_json=lambda: '{}'))
+        submission_uuid = '11111111-1111-4111-8111-111111111111'
+        fence = {
+            replica_managers.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc',
+            replica_managers.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY: 'hash',
+        }
+        request_ids = thread_utils.ThreadSafeDict()
+        with mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=task), \
+             mock.patch.object(replica_managers.sdk,
+                               'prepare_launch_request',
+                               return_value=prepared), \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'submit_prepared_non_pool_launch_request',
+                 return_value='request-id') as submit_generic, \
+             mock.patch.object(
+                 replica_managers.sdk,
+                 'submit_prepared_ordinary_launch_request') as submit_ordinary, \
+             mock.patch.object(replica_managers.sdk, 'launch') as launch, \
+             mock.patch.object(replica_managers,
+                               '_wait_for_bound_ordinary_launch') as wait:
+            replica_managers.launch_cluster(
+                replica_id=1,
+                yaml_content='dummy: yaml',
+                cluster_name='svc-1',
+                log_file=str(tmp_path / 'launch.log'),
+                replica_to_request_id=request_ids,
+                replica_to_launch_cancelled=thread_utils.ThreadSafeDict(),
+                launch_fence=fence,
+                ordinary_launch_submission_uuid=submission_uuid,
+                non_pool_launch_profile_kind=(
+                    ordinary_launch_binding.NonPoolLaunchProfileKind.
+                    ORDINARY_PAID.value),
+                inspect_bound_ordinary_launch=mock.Mock(),
+                reduce_bound_ordinary_launch=mock.Mock(),
+                cancel_bound_ordinary_launch=mock.Mock())
+
+        submit_generic.assert_called_once_with(
+            prepared, submission_uuid, ordinary_launch_binding.
+            NonPoolLaunchProfileKind.ORDINARY_PAID.value)
+        submit_ordinary.assert_not_called()
+        launch.assert_not_called()
+        assert request_ids[1] == 'request-id'
+        wait.assert_called_once()
+
+    def test_reserved_fill_profile_requires_exact_physical_fence(
+            self, tmp_path):
+        task = mock.MagicMock()
+        task.resources = {mock.MagicMock()}
+        with mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=task), \
+             pytest.raises(replica_managers._BoundOrdinaryLaunchUnresolvedError,
+                           match='present together'):
+            replica_managers.launch_cluster(
+                replica_id=1,
+                yaml_content='dummy: yaml',
+                cluster_name='svc-1',
+                log_file=str(tmp_path / 'launch.log'),
+                replica_to_request_id=thread_utils.ThreadSafeDict(),
+                replica_to_launch_cancelled=thread_utils.ThreadSafeDict(),
+                launch_fence={
+                    replica_managers.serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_NAME_KEY: 'svc'
+                },
+                ordinary_launch_submission_uuid=(
+                    '11111111-1111-4111-8111-111111111111'),
+                non_pool_launch_profile_kind=(
+                    ordinary_launch_binding.NonPoolLaunchProfileKind.
+                    RESERVED_FILL.value),
+                inspect_bound_ordinary_launch=mock.Mock(),
+                reduce_bound_ordinary_launch=mock.Mock(),
+                cancel_bound_ordinary_launch=mock.Mock())
 
     def _run_launch_cluster(self,
                             tmp_path,
@@ -14479,11 +14606,45 @@ class TestRecoveryRetryAndIsolation:
         assert kwargs['prior_replica_record_id'] == info.replica_record_id
         assert kwargs['prior_paid_capacity_pool_key'] == 'pool-a'
 
+    def test_generic_restart_retires_pointerless_pre_admission_intent(self):
+        """A planner row without an action is discarded, never retyped."""
+        mgr = _make_manager()
+        authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        mgr._ordinary_launch_binding_authority = authority
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PENDING)
+        info.resources_override = {'region': 'us-east-1'}
+        retirement = ordinary_launch_binding.PreAdmissionRetirement(
+            ordinary_launch_binding.PreAdmissionRetirementDisposition.RETIRED,
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_infos',
+                return_value=[info]), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'inspect_bound_ordinary_launch',
+                 return_value=None) as inspect, \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'retire_pre_admission_non_pool_launch_intent',
+                 return_value=retirement) as retire, \
+             mock.patch.object(mgr, '_launch_replica') as launch, \
+             mock.patch.object(mgr, '_terminate_replica') as terminate:
+            mgr._recover_replica_operations()
+
+        inspect.assert_called_once_with('svc', 1, info.replica_record_id)
+        retire.assert_called_once_with(authority, 1, info.replica_record_id)
+        launch.assert_not_called()
+        terminate.assert_not_called()
+
     def test_recovered_bound_adopter_freezes_replica_version_guard(self):
         """A recovered waiter remains fenced to its persisted version."""
         mgr = _make_manager()
         mgr._ordinary_launch_binding_authority = _binding_authority(
-            ordinary_launch_binding.BindingMode.BOUND)
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
         info = _fake_replica_info(
             1, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         info.version = 1
@@ -14531,7 +14692,7 @@ class TestRecoveryRetryAndIsolation:
         """A transient startup read cannot strand the only exact waiter."""
         mgr = _make_manager()
         mgr._ordinary_launch_binding_authority = _binding_authority(
-            ordinary_launch_binding.BindingMode.BOUND)
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
         info = _fake_replica_info(
             1, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
         info.resources_override = None

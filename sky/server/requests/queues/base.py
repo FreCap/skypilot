@@ -19,12 +19,12 @@ logger = sky_logging.init_logger(__name__)
 class ProviderMutationRequestKind(enum.Enum):
     """Closed queue classification for provider-mutating requests.
 
-    API009 currently has one provider-mutating request handler.  Future typed
-    provider handlers must be added to this enum and to the PostgreSQL
-    handler-to-kind map before the generic queue is allowed to see them.
+    Every provider-mutating request handler must be added to this enum and to
+    the PostgreSQL handler-to-kind map before the generic queue may see it.
     """
 
     BOUND_ORDINARY_LAUNCH = 'bound_ordinary_launch'
+    NON_POOL_LAUNCH = 'non_pool_launch'
 
 
 @dataclasses.dataclass(frozen=True)

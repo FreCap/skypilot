@@ -673,7 +673,7 @@ def test_serve_alembic_lineage_has_033_through_action_history_039() -> None:
     assert Path(revision_039.path).name == (
         '039_serve_resource_action_execution_history.py')
     assert revision_039.down_revision == '038'
-    assert migration_utils.SERVE_VERSION == '046'
+    assert migration_utils.SERVE_VERSION == '047'
     assert migration_utils.SERVE_NON_POSTGRES_VERSION == '037'
 
 

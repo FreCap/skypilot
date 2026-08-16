@@ -19,6 +19,7 @@ from sky.server import common as server_common
 from sky.server import constants as server_constants
 from sky.server import core_middleware
 from sky.server import server
+from sky.server.requests import non_pool_launch as non_pool_launch_request
 from sky.server.requests import ordinary_launch as ordinary_launch_request
 from sky.server.requests import payloads
 
@@ -120,6 +121,28 @@ def test_sdk_rejects_noncanonical_or_mismatched_submission_uuid(
     request.return_value = response
     with pytest.raises(RuntimeError, match='different submission UUID'):
         sdk.submit_prepared_ordinary_launch_request(prepared, _SUBMISSION_UUID)
+
+
+def test_sdk_submits_generic_profile_only_to_non_pool_endpoint(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    prepared = _prepared_launch()
+    request = mock.Mock(return_value=_binding_response())
+    monkeypatch.setattr(server_common, 'make_authenticated_request', request)
+
+    result = sdk.submit_prepared_non_pool_launch_request(
+        prepared, _SUBMISSION_UUID,
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID.value)
+
+    assert result == '33333333-3333-4333-8333-333333333333'
+    request.assert_called_once_with(
+        'POST',
+        server_constants.NON_POOL_LAUNCH_BINDING_PATH,
+        json={
+            'submission_uuid': str(_SUBMISSION_UUID),
+            'profile_kind': 'ORDINARY_PAID',
+            'launch': json.loads(prepared.submitted_bytes),
+        },
+        timeout=5)
 
 
 def test_deterministic_ids_are_retry_stable_and_scope_separated() -> None:
@@ -265,3 +288,104 @@ def test_endpoint_uses_derived_ids_distinct_handler_and_no_generic_retry(
         'launch_generation': 7,
         'created': False,
     }
+
+
+def test_non_pool_endpoint_recomputes_profile_and_uses_distinct_handler(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    launch_body = _launch_body(retry_until_up=True)
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID,
+        authorization_reference='paid-claim:svc:3',
+        authorization_generation=11,
+        authorization_payload={
+            'pool_key': 'paid-pool-a',
+            'claim_generation': 11,
+        })
+    submission = server._NonPoolServeLaunchSubmission(
+        submission_uuid=str(_SUBMISSION_UUID),
+        profile_kind=profile.kind,
+        launch=launch_body)
+    auth_user = models.User(id='tenant-a', name='Tenant A')
+    request = types.SimpleNamespace(state=types.SimpleNamespace(
+        request_id='transport-attempt-id', auth_user=auth_user))
+    association_id, request_id = server._derive_ordinary_launch_binding_ids(
+        _SUBMISSION_UUID, auth_user.id, 'workspace-a')
+    observed: dict[str, object] = {}
+
+    async def _build_request_async(**kwargs):
+        observed.update(kwargs)
+        return types.SimpleNamespace(request_id=kwargs['request_id'],
+                                     request_body=kwargs['request_body'],
+                                     log_path=mock.Mock())
+
+    def _bind_request(request_task, identity):
+        del request_task
+        assert str(identity.association_id) == association_id
+        assert identity.request_id == request_id
+        assert identity.profile == profile
+        return ordinary_launch_binding.BindingAdmission(
+            disposition=ordinary_launch_binding.AdmissionDisposition.
+            EXISTING_EXACT,
+            association_id=association_id,
+            request_id=request_id,
+            launch_generation=7,
+            owner_revision=2,
+            resolution=ordinary_launch_binding.Resolution.BOUND,
+            effect_phase=ordinary_launch_binding.EffectPhase.NOT_STARTED)
+
+    monkeypatch.setattr(server.serve_state,
+                        'get_service_config_recovery_identity',
+                        lambda _service_name: ('svc-hash', 'workspace-a'))
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'resolve_non_pool_launch_profile',
+                        lambda *_args: profile)
+    monkeypatch.setattr(server.executor, 'build_request_async',
+                        _build_request_async)
+    monkeypatch.setattr(server, '_bind_and_enqueue_non_pool_launch',
+                        _bind_request)
+
+    response = asyncio.run(server.non_pool_serve_launch(submission, request))
+
+    assert observed['request_id'] == request_id
+    assert observed['func'] is non_pool_launch_request.launch
+    assert observed['retryable'] is False
+    assert observed['should_enqueue'] is True
+    assert observed['request_body'].retry_until_up is True
+    assert observed['precondition'].request_id == request_id
+    assert observed['precondition'].association_id == association_id
+    assert response.model_dump(mode='json') == {
+        'submission_uuid': str(_SUBMISSION_UUID),
+        'association_id': association_id,
+        'request_id': request_id,
+        'launch_generation': 7,
+        'created': False,
+    }
+
+
+def test_non_pool_endpoint_rejects_profile_claimed_by_controller_when_planner_disagrees(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    launch_body = _launch_body()
+    submission = server._NonPoolServeLaunchSubmission(
+        submission_uuid=str(_SUBMISSION_UUID),
+        profile_kind=(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.ORDINARY_PAID),
+        launch=launch_body)
+    request = types.SimpleNamespace(state=types.SimpleNamespace(
+        request_id='transport-attempt-id', auth_user=None))
+    durable_profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.COST_REBALANCE,
+        authorization_reference='rebalance:svc:3',
+        authorization_generation=4,
+        authorization_payload={'source_replica_id': 2})
+    monkeypatch.setattr(server.serve_state,
+                        'get_service_config_recovery_identity',
+                        lambda _service_name: ('svc-hash', 'workspace-a'))
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'resolve_non_pool_launch_profile',
+                        lambda *_args: durable_profile)
+
+    with pytest.raises(fastapi.HTTPException) as raised:
+        asyncio.run(server.non_pool_serve_launch(submission, request))
+
+    assert raised.value.status_code == 409
+    assert 'does not match durable planner state' in raised.value.detail

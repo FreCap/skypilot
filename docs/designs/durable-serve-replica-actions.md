@@ -83,6 +83,13 @@ work remains useful transition machinery, but it is not the long-term boundary
 and must not be deployed as though excluded launch profiles can remain
 permanently unbound.
 
+As of 2026-08-16, the G1 implementation is authored but not deployed. It adds
+the generalized non-pool association/admission path, exact legacy-evidence
+ledger and bounded reconciler, pointerless pre-admission retirement, and
+failure-isolated startup recovery. Focused source tests and static analysis
+pass; PostgreSQL migration/reducer CI, stacked cleanup publication, rollout,
+and live evidence for the seven incident rows remain open gates.
+
 ## Decision record
 
 The original 2026-07-30 request was an evaluation of whether a unified
@@ -150,7 +157,8 @@ Profile planners retain all domain authority. In particular, reserved-fill
 broker generations, zero-cost admission sequencing, exact pool/card grants,
 worker-projection digests, and reclaim-policy tickets remain mandatory and
 fail closed. The generalized binding owns only the common effect envelope:
-exact request identity, atomic row/association/request/queue/pin commit,
+exact request identity, planner-owned intent commit followed by atomic
+association/request/queue/pin binding,
 execution generation and effect phase, owner transfer, adoption, cancellation,
 terminal result, quiescence, and typed reconciliation. Existing `sky.launch`
 and provider paths remain the only effect implementation.
@@ -282,6 +290,11 @@ contract after generalized activation:
 10. Recovery classifies exact durable evidence. It never treats terminal
     status, generation zero, missing process identity, or a false quiescence-
     required bit as effect-absence proof for a legacy/mixed-version request.
+11. Each profile has one adapter at the common binding boundary. The adapter
+    validates any profile-owned execution envelope before queue visibility,
+    revalidates it against the locked planner intent before provider I/O, and
+    projects profile-owned result fields in the reducer transaction. Merely
+    labeling an ordinary launch with a special profile is forbidden.
 
 The API request remains the execution record. A second generic action DAG is
 not introduced merely to wrap it.
@@ -325,7 +338,8 @@ unfenced stale replica snapshot and permission to start provider I/O.
 
 ### Commit-before-effect
 
-The generalized implementation has one internal atomic bind-and-enqueue seam.
+The generalized implementation has one internal atomic bind-and-enqueue seam
+after the existing planner-owned replica-intent commit.
 A dedicated versioned `/internal/serve/non-pool-launch` endpoint accepts one
 controller-generated stable submission UUID and one closed typed profile. It
 does not fall back to `/launch` or the ordinary-only endpoint: either would let
@@ -336,20 +350,54 @@ submission UUID plus authenticated tenant scope, independent of the fresh ID
 assigned to each HTTP attempt by `RequestIDMiddleware`, and returns the exact
 bound request ID in the response body.
 
-In one transaction the server locks the lifecycle fence, service row, exact
-replica row, and current association; revalidates the profile planner's exact
-authorization; constructs the complete bound request with one distinct generic
-handler on the normal executor topology; and inserts the association,
-`api_requests` row, generic request-retention pin, and `api_request_queue` row.
-Reserved-fill row acceptance returns the association and request IDs in its
-`FillCommitResult`; it cannot first persist a row and later discover or create
-the binding. The transaction also sets the replica row's exact association
-pointer. Queue visibility occurs only at transaction commit,
-after every fence and binding is durable. There is no committed
-PENDING-without-queue activation state and no second worker or recovery sweep.
-Timeout before commit leaves none of those rows. A lost response after commit
-is resolved by retrying the same submission UUID: exact identity and digest
-return the existing request; any mismatch fails closed.
+The planner first commits its replica intent and exact domain authority using
+its existing transaction: paid claim, zero-cost sequence, reserved allocation,
+replacement observation, rebalance decision, or recovery intent. That row is
+not effect authority. In a second transaction the server locks the lifecycle
+fence, service row, exact replica row, and current association; revalidates the
+profile planner's exact authorization; constructs the complete bound request
+with one distinct generic handler on the normal executor topology; and inserts
+the association, `api_requests` row, generic request-retention pin, and
+`api_request_queue` row. The transaction also sets the replica row's exact
+association pointer. Queue visibility occurs only at transaction commit, after
+every effect fence and binding is durable.
+
+That transaction also runs the selected profile adapter. Most profiles have no
+additional execution payload. `SYSTEM_OOM_RECOVERY/v1` is different: the
+adapter validates the complete unbound recovery envelope against the locked
+recovery intent, replaces its one-use nonce with the server-derived request
+ID, and stores that bound envelope only in the normal immutable `LaunchBody`.
+The association stores the canonical profile/authorization digests, not a
+second payload copy. At the pre-I/O boundary the adapter reconstructs the
+expected bound envelope from the still-locked recovery intent and exact
+request ID and requires exact field equality. Thus the generic path cannot
+silently execute a recovery candidate as an ordinary launch.
+
+This deliberate two-commit protocol keeps the request executor out of all six
+planner transactions without weakening commit-before-effect. A crash after the
+intent commit but before binding leaves a pointerless `PENDING` intent from
+which no request or provider effect could have escaped. Per-service promotion
+requires zero `PENDING`/`PROVISIONING` rows, so a pointerless pending row under
+an active generic capability is provably post-cutover rather than historical;
+startup locks the lifecycle, service, replica, and association history and
+atomically retires that pre-admission planner intent (including its paid claim,
+if any). The current demand, fill, rebalance, replacement, or recovery planner
+then makes a fresh decision. Startup must not reconstruct a retained profile
+from a subset of fields or run provider cleanup. If concurrent admission won
+the row lock first, startup instead finds and adopts the exact association. A
+crash after binding likewise finds the exact association and adopts that
+request. A lost response retries the same submission UUID: exact identity and
+digest return the existing request; any mismatch fails closed. There is no
+second executor, fallback launch, or provider-discovery inference.
+
+The same one-intent/one-action rule applies after an exact current-protocol
+`PRE_EFFECT_TERMINAL` result. The reducer clears the pointer and releases the
+request pin and paid claim; the controller atomically retires the now-proven
+effect-free planner row. The owning planner then creates a fresh record and
+fresh authorization decision. It does not reuse the old record, reconstruct a
+special profile from selected fields, or allocate association generation + 1.
+Transport retries before terminal settlement continue to reuse the original
+stable submission UUID and exact request.
 
 The canonical binding digest is computed server-side from the exact prepared
 `LaunchBody` bytes after removing binding-only and mutable owner fields. The
@@ -394,9 +442,10 @@ The forward schema contract is:
   the same protocol/profile/cohort tuple, a typed authority kind/reference/
   generation plus canonical authority digest, typed reconciliation and
   provider-evidence fields, and service cohort epoch/digest.
-- Existing bound ordinary rows are backfilled only when exact immutable
-  association/request/replica identity agrees. Historical unbound rows are not
-  inserted into the association table. Every new field is closed by
+- Existing protocol-v1 associations are never rewritten or given protocol-v2
+  receipts. They must settle, project, unpin, and drain before per-service v2
+  promotion. Historical unbound rows are not inserted into the association
+  table. Every new field is closed by
   completeness, value, and digest-length constraints; nullable transition
   shapes are readable but have no generic effect authority.
 - API012/Serve048 add the controller-independent demand feed, ordered
@@ -467,7 +516,7 @@ canonical digest, not a duplicate planner payload:
 | `RESERVED_FILL/v1` | Gate, allocation, claim, and observation generations; exact pool/physical-UID/card; intent key; zero-cost admission sequence; committed service version; worker-projection digest; reclaim-policy identity and ticket reference. |
 | `UNKNOWN_CAPACITY_REPLACEMENT/v1` | Exact predecessor record/generation, replacement reason, observation identity/classification, and new-placement decision digest. |
 | `COST_REBALANCE/v1` | Exact predecessor record/generation, rebalance decision/target placement digest, and current paid/zero-cost claim reference. |
-| `SYSTEM_OOM_RECOVERY/v1` | Exact predecessor record/generation, recovery generation/lease/trigger identity, and prior bound request/result reference. |
+| `SYSTEM_OOM_RECOVERY/v1` | Exact recovery-intent launch generation and nonce, authorization/runtime/task/image/envelope identities, selected placement/funding, and candidate disposition. Mutable recovery-row revision and request/result fields are excluded. |
 
 The authoritative domain fields remain in the locked service, replica,
 allocation, claim, projection, and recovery rows. Admission and pre-I/O resolve
@@ -492,17 +541,18 @@ Identity/digest fields never change, and unresolved history cannot be deleted.
 | `ACTIVE_ADOPT` | Exact current-protocol request, claim/generation/lease, profile, cohort, and association agree | yes | adoption, result reduction, fenced cancel, or ambiguity |
 | cancel requested | Current owner committed exact supersede/teardown intent; cancellation is not absence evidence | yes | typed terminal/quiescence/provider reconciliation |
 | `RESULT_RECORDED` | Exact terminal/quiescence and service-job ID copied after `SERVICE_JOB_RECORDED` | yes | atomic replica projection |
-| `PRE_EFFECT_TERMINAL` | Exact current-protocol cohort proves no claim/effect and terminal/quiescence is copied while effect remained `NOT_STARTED` | no | non-cancelled demand may admit a successor generation under freshly revalidated profile authority |
+| `PRE_EFFECT_TERMINAL` | Exact current-protocol cohort proves no claim/effect and terminal/quiescence is copied while effect remained `NOT_STARTED` | no | retire the effect-free planner row and let its owning planner create a fresh record/authorization |
 | `PROJECTED` | Exact result/tombstone projected, pointer cleared, pin deleted | no | 60-day tombstone retention |
 | `POST_EFFECT_AMBIGUOUS` | Current protocol crossed or may have crossed an effect boundary without an exact projectable result | yes | exact provider/result evidence and profile-specific operator reconciliation |
 | `LEGACY_EFFECT_AMBIGUOUS` | Legacy/mixed-version execution may have caused effects but lacks the current receipt contract | yes | exact provider/result evidence only; never synthesized quiescence |
 
 The partial unique constraint treats active, cancel-requested,
 `RESULT_RECORDED`, `POST_EFFECT_AMBIGUOUS`, and
-`LEGACY_EFFECT_AMBIGUOUS` rows as unsettled. A successor transaction
-requires the predecessor to be `PRE_EFFECT_TERMINAL`, the replica pointer to be
-clear, the retention pin absent, the service binding and cohort epochs
-unchanged, and the profile planner's current authorization revalidated.
+`LEGACY_EFFECT_AMBIGUOUS` rows as unsettled. A successor transaction uses a
+fresh replica-record identity after the effect-free predecessor planner row is
+retired. Association generation remains an immutable historical field; the
+generalized controller never uses same-record generation + 1 as a second retry
+path.
 
 Startup and ordinary reconciliation schedule one bounded task per association;
 they do not hold a global recovery lock, manager lock, or actuation lock across
@@ -512,6 +562,9 @@ route publication, the reconciliation coordinator, autoscaling, and sibling
 rows start immediately and continue. The legacy cluster-name scan is retained
 during transition only for already-durable unbound rows and may gather typed
 provider evidence; it never synthesizes a binding or authorizes a successor.
+Provider absence used for legacy cleanup always comes from a fresh physical-
+cluster read started after the reviewed executor-termination attestation; the
+normal teardown snapshot cache is explicitly bypassed for this evidence.
 
 Serve047 also adds one transition-only append-only legacy-reconciliation
 evidence table. It is not an association, request-admission path, queue, or
@@ -528,9 +581,12 @@ successor-launch proof. G2 removes the writer and active transition surface
 after the zero-legacy gate while retaining its audit tombstones.
 
 The service row has a non-null controller-incarnation UUID, monotonic
-`controller_owner_epoch`, capability bound to that exact incarnation,
-`ordinary_launch_binding_mode` (`legacy` or `bound`), and monotonic binding
-epoch. Every controller subprocess startup supplies a fresh incarnation UUID;
+`controller_owner_epoch`, ordinary capability, a complete generic protocol /
+profile-set / cohort / receipt capability tuple bound to that exact
+incarnation by a separately constrained capable-controller-incarnation UUID,
+`ordinary_launch_binding_mode` (`legacy` or `bound`), and a
+monotonic binding epoch. Every controller subprocess startup supplies a fresh
+incarnation UUID;
 the owner CAS changes it and increments the epoch even when PID/IP are reused.
 Serve042 migration rows and existing services default to `legacy`. Fresh R3
 services also insert as `legacy`; after claiming a fresh capable controller
@@ -626,11 +682,20 @@ requires the executor's exact-generation quiescence receipt, which is emitted
 only after its provider guard has exited. The same rows serialize controller
 owner transfer and effect-phase advance.
 
+The reducer invokes the same closed profile adapter before clearing the
+association pointer. For `SYSTEM_OOM_RECOVERY/v1`, an exact recorded service
+job atomically projects the association request ID and service-job ID into the
+existing recovery fields and advances their revision once; a pre-effect
+terminal result projects neither. Any profile/envelope/intent mismatch rolls
+back status, paid feedback, pointer clearing, pin release, and recovery-field
+projection together.
+
 Failure and retry policy use the database clock. Terminal plus quiescent does
 not prove effect absence, and a false `execution_quiescence_required` value is
-not itself quiescence. A successor generation is allowed only from
+not itself quiescence. Automatic re-planning is allowed only after
 `PRE_EFFECT_TERMINAL` with effect phase `NOT_STARTED` and exact current-protocol
-cohort evidence proving neither provider nor service-job I/O began. Any
+cohort evidence proving neither provider nor service-job I/O began, followed by
+atomic retirement of that effect-free planner row. Any
 terminal result after `PROVIDER_IO` without an exact projectable service-job
 outcome, any `SERVICE_JOB_IO` crash, unclear request/result, fence rejection,
 or cancellation race is `POST_EFFECT_AMBIGUOUS`. A legacy/mixed-version row
@@ -898,15 +963,17 @@ The row-lock reducer similarly never waits for that advisory guard: it cannot
 authorize cleanup from an unquiesced post-effect request, but it can durably
 expose ambiguity instead of deadlocking behind the opaque call.
 
-A live controller locally re-drives a pointerless unresolved admission with the
-same stable submission UUID instead of waiting for another restart. A persisted
-`SHUTTING_DOWN` race re-enters exact settlement and teardown with its saved
-scale-down, purge, and drain-cap fields. Restart adoption freezes the replica's
-persisted service version, retires superseded rows, and refuses a newly elected
-version at both admission and effect boundaries. Finally, the parent marks a
-started bound worker `RUNNING` only through a locked compare-and-update that
-requires the exact active association and still-`SCHEDULED` row; a faster child
-projection always wins.
+A live controller retries an unresolved transport admission with the same
+stable submission UUID while its worker still owns the retained intent. After a
+process restart, only an association is an adoptable action identity; a
+pointerless pre-admission intent is transactionally retired and replanned. A
+persisted `SHUTTING_DOWN` race re-enters exact settlement and teardown with its
+saved scale-down, purge, and drain-cap fields. Restart adoption freezes the
+replica's persisted service version, retires superseded rows, and refuses a
+newly elected version at both admission and effect boundaries. Finally, the
+parent marks a started bound worker `RUNNING` only through a locked compare-and-
+update that requires the exact active association and still-`SCHEDULED` row; a
+faster child projection always wins.
 
 ### R3: mandatory fresh-service adoption
 
@@ -954,9 +1021,9 @@ and below a simultaneously authored blocked G2 cleanup PR. It:
 - replaces the ordinary-only endpoint/handler for new admissions with one
   generic non-pool handler whose exact version and supported-profile digest are
   constrained in PostgreSQL and in queue claim;
-- atomically commits the replica row, association, request, queue row,
-  retention pin, and profile authority. Reserved-fill `FillCommitResult`
-  returns the exact association and request IDs for each accepted intent;
+- retains each domain planner's authoritative replica-intent transaction, then
+  atomically commits the association, request, queue row, retention pin, and
+  revalidated profile authority before provider I/O;
 - persists one immutable cohort digest/epoch across service, association, and
   request, and promotes a service only after every API acceptor, request
   backend, queue executor, GC participant, possible controller, and profile
@@ -968,12 +1035,11 @@ and below a simultaneously authored blocked G2 cleanup PR. It:
 - retains legacy cluster-name discovery only for historical unbound rows. It
   never backfills an association or receipt for those rows.
 
-Backfill is limited to already-bound ordinary associations whose immutable
-request and replica identity agree; they deterministically become
-`ORDINARY_PAID/v1` or `ORDINARY_ZERO_COST/v1`. G1 never synthesizes an
-association for a historical unbound request. Such a request is settled by the
-typed legacy reconciler and remains a conservative capacity debit while its
-effect disposition is unknown.
+Protocol-v1 associations are never rewritten as v2 and never receive a v2
+receipt. They drain before promotion. G1 never synthesizes an association for
+a historical unbound request. Such a request is settled by the typed legacy
+reconciler and remains a conservative capacity debit while its effect
+disposition is unknown.
 
 ### G2: blocked steady-state cleanup
 

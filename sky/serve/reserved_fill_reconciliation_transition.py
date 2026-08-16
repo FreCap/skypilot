@@ -26,8 +26,8 @@ from sky.skylet import constants as skylet_constants
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
-_REQUIRED_SERVE_SCHEMA = '046'
-_REQUIRED_API_REQUEST_SCHEMA = '010'
+_REQUIRED_SERVE_SCHEMA = '047'
+_REQUIRED_API_REQUEST_SCHEMA = '011'
 _REQUIRED_WRITER_ROLES = frozenset({'api', 'controller', 'executor'})
 _WRITER_ATTESTATION_MAX_AGE_SECONDS = 5.0
 _RECLAIM_ATTESTATION_MAX_AGE_SECONDS = 5.0

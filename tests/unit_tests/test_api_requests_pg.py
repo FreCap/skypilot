@@ -165,7 +165,7 @@ def bound_request_database(request_database, monkeypatch):
     # before its existing lifecycle/service/replica locks. Exercise the
     # current production schema boundary even while the reconciliation gate
     # remains in legacy mode.
-    alembic_command.upgrade(config, '046')
+    alembic_command.upgrade(config, '047')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
     with engine.begin() as connection:
         connection.execute(
@@ -326,6 +326,21 @@ def _gc_binding_authority(
         capable=True,
         binding_mode=ordinary_launch_binding.BindingMode.BOUND,
         binding_epoch=5)
+
+
+def _gc_legacy_identity(
+        request_id: str) -> (ordinary_launch_binding.LegacyLaunchIdentity):
+    return ordinary_launch_binding.LegacyLaunchIdentity(
+        service_name='gc-service',
+        service_hash='gc-service-hash',
+        service_lifecycle_epoch=4,
+        replica_id=3,
+        replica_record_id=_GC_REPLICA_RECORD_ID,
+        replica_version=2,
+        cluster_name='gc-service-3',
+        request_id=request_id,
+        provider_context='kubernetes-context-a',
+        provider_physical_resource_uid='cluster-uid-a')
 
 
 def _controller_request(
@@ -1214,6 +1229,55 @@ def test_bound_request_handler_correlation_and_pin_constraints(
                     request_postgres.REQUESTS.c.request_id == bound.request_id))
 
 
+def test_legacy_request_evidence_preserves_missing_quiescence_receipt(
+        bound_request_database):
+    engine, backend = bound_request_database
+    request_id = 'legacy-mixed-version-cancelled'
+    request = _legacy_serve_launch_request(request_id)
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == request_id))
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request_id).values(
+                    status=requests.RequestStatus.CANCELLED.value,
+                    terminal_cause=event_api_models.EventCause.EXPLICIT_CANCEL.
+                    value,
+                    finished_at=None,
+                    execution_quiescence_required=False,
+                    execution_quiesced_generation=None,
+                    execution_quiesced_at=None))
+
+    identity = _gc_legacy_identity(request_id)
+    ordinary_launch_binding.create_legacy_reconciliation_scope(
+        [identity],
+        reviewed_by='operator@example.com',
+        review_reason='Mixed-version executor termination review.')
+    terminated_at = datetime.datetime.now(datetime.timezone.utc)
+    evidence = request_postgres.read_legacy_launch_request_evidence(
+        identity,
+        executor_terminated_at=terminated_at,
+        executor_termination_evidence={
+            'pod_uid': 'old-api-pod-uid',
+            'termination': 'observed',
+        })
+
+    assert evidence.observed_request_status == 'CANCELLED'
+    assert evidence.observed_request_execution_generation == 0
+    assert not evidence.observed_request_queue_present
+    assert not evidence.observed_request_claim_present
+    assert evidence.observed_request_evidence[
+        'execution_quiescence_required'] is False
+    assert evidence.observed_request_evidence[
+        'execution_quiesced_generation'] is None
+    assert evidence.observed_request_evidence['finished_at'] is None
+    assert evidence.executor_terminated_at == terminated_at
+    assert evidence.provider_evidence is (
+        ordinary_launch_binding.ProviderEvidence.NOT_QUERIED)
+
+
 def test_generic_kill_requests_skips_correlated_bound_launch(request_database):
     engine, backend = request_database
     request_id = 'bound-generic-cancel-must-skip'
@@ -1489,7 +1553,7 @@ def test_generic_handoff_failure_is_durable_and_quiescent(
         event_api_models.EventCause.DISPATCHER_SUBMIT_FAILED.value)
     assert request_row['execution_quiesced_generation'] == 1
     assert request_row['execution_quiesced_at'] is not None
-    assert queue_row == {}
+    assert not queue_row
 
 
 def test_bound_effect_claim_requires_exact_request_queue_pin_and_owner(
@@ -1693,7 +1757,7 @@ def test_bound_reducer_blocks_on_protocol_before_authority_rows(
 def test_terminal_bound_pidless_claim_settles_immediately_before_provider_io(
         bound_request_database):
     engine, backend = bound_request_database
-    identity, context, _, item = _claim_gc_bound_request(engine, backend)
+    _, context, _, item = _claim_gc_bound_request(engine, backend)
     facts = request_postgres.request_bound_ordinary_launch_cancel(
         context, _gc_binding_authority(), 'replica-teardown')
     assert facts.status is requests.RequestStatus.CANCELLED
@@ -1986,7 +2050,7 @@ def test_retention_pin_primary_key_kind_check_and_request_fk(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '010'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '011'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -2002,6 +2066,11 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     assert {'resource_action_id',
             'resource_action_attempt'}.issubset(request_columns)
     assert 'ordinary_launch_association_id' in request_columns
+    assert {
+        'binding_protocol_version', 'profile_kind', 'profile_version',
+        'profile_digest', 'capability_cohort_epoch',
+        'capability_profile_set_digest', 'receipt_protocol_version'
+    }.issubset(request_columns)
     assert 'execution_process_start_time_ticks' in request_columns
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
@@ -2012,6 +2081,13 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
         for column in inspector.get_columns('api_server_instances')
     }
     assert 'ordinary_launch_binding_capable' in instance_columns
+    assert {
+        'non_pool_launch_binding_capable',
+        'non_pool_launch_binding_protocol_version',
+        'non_pool_launch_capability_profile_set_digest',
+        'non_pool_launch_capability_cohort_epoch',
+        'non_pool_launch_receipt_protocol_version'
+    }.issubset(instance_columns)
     binding_index = {
         index['name']: index for index in inspector.get_indexes('api_requests')
     }['uq_api_requests_ordinary_launch_association']
@@ -2351,22 +2427,22 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api010_downgrade_guard_retains_head(request_database):
+def test_api011_downgrade_guard_retains_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
-    with pytest.raises(RuntimeError, match='010 is additive'):
+    with pytest.raises(RuntimeError, match='011 is additive'):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '010'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '011'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
     assert 'api_request_retention_pins' in inspector.get_table_names()
 
 
-def test_api010_downgrade_guard_retains_binding_evidence(request_database):
+def test_api011_downgrade_guard_retains_binding_evidence(request_database):
     engine, _ = request_database
     columns_before = {
         column['name']
@@ -2379,14 +2455,17 @@ def test_api010_downgrade_guard_retains_binding_evidence(request_database):
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
 
-    with pytest.raises(RuntimeError, match='010 is additive'):
+    with pytest.raises(RuntimeError, match='011 is additive'):
         alembic_command.downgrade(config, '008')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '010'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '011'
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
         'execution_quiesced_at', 'ordinary_launch_association_id',
+        'binding_protocol_version', 'profile_kind', 'profile_version',
+        'profile_digest', 'capability_cohort_epoch',
+        'capability_profile_set_digest', 'receipt_protocol_version',
         'managed_job_id', 'managed_job_controller_instance_id',
         'managed_job_controller_generation', 'managed_job_controller_slot_id',
         'managed_job_controller_slot_attempt'
@@ -2397,7 +2476,12 @@ def test_api010_downgrade_guard_retains_binding_evidence(request_database):
     }
     assert {
         'request_storage_backend', 'request_queue_backend',
-        'execution_quiescence_capable', 'ordinary_launch_binding_capable'
+        'execution_quiescence_capable', 'ordinary_launch_binding_capable',
+        'non_pool_launch_binding_capable',
+        'non_pool_launch_binding_protocol_version',
+        'non_pool_launch_capability_profile_set_digest',
+        'non_pool_launch_capability_cohort_epoch',
+        'non_pool_launch_receipt_protocol_version'
     } <= instance_columns_before
     assert instance_columns_before == {
         column['name'] for column in sqlalchemy.inspect(engine).get_columns(
@@ -3273,15 +3357,16 @@ def test_legacy_daemon_retirement_covers_all_states_and_only_allowlist(
         assert backend.get_request(ordinary_suffix_id) is not None
         with engine.connect() as connection:
             assert connection.execute(
-                sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                    request_postgres.QUEUE).where(
-                        request_postgres.QUEUE.c.request_id.in_(
-                            daemon_ids))).scalar_one() == 0
+                sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                                 ).select_from(request_postgres.QUEUE).where(
+                                     request_postgres.QUEUE.c.request_id.in_(
+                                         daemon_ids))).scalar_one() == 0
             assert connection.execute(
-                sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                    request_postgres.REQUEST_RETENTION_PINS).where(
-                        request_postgres.REQUEST_RETENTION_PINS.c.request_id.
-                        in_(daemon_ids))).scalar_one() == 0
+                sqlalchemy.select(
+                    sqlalchemy.func.count()  # pylint: disable=not-callable
+                ).select_from(request_postgres.REQUEST_RETENTION_PINS).where(
+                    request_postgres.REQUEST_RETENTION_PINS.c.request_id.in_(
+                        daemon_ids))).scalar_one() == 0
     finally:
         leader.release()
 
@@ -4822,7 +4907,7 @@ def test_claimed_pidless_cancel_records_exact_quiescence(
     assert request_row['execution_quiesced_generation'] == (
         item.execution_generation)
     assert request_row['execution_quiesced_at'] is not None
-    assert queue_row == {}
+    assert not queue_row
 
 
 def test_unclaimed_insert_opts_into_quiescence_only_when_claimed(
@@ -5320,7 +5405,7 @@ def test_parent_transport_exception_atomically_fails_and_quiesces(
     assert request_row['execution_quiesced_generation'] == (
         item.execution_generation)
     assert request_row['execution_quiesced_at'] is not None
-    assert queue_row == {}
+    assert not queue_row
     restored = backend.get_request(request_id)
     assert restored.get_error()['type'] == 'RuntimeError'
 
@@ -5351,7 +5436,7 @@ def test_parent_normal_completion_preserves_child_terminal_result(
     assert request_row['execution_quiesced_generation'] == (
         item.execution_generation)
     assert request_row['execution_quiesced_at'] is not None
-    assert queue_row == {}
+    assert not queue_row
 
 
 def test_new_claim_resets_prior_generation_quiescence(request_database):
@@ -5765,10 +5850,10 @@ def test_retry_handoff_does_not_resurrect_cancellation(request_database):
                 request_postgres.REQUESTS.c.request_id ==
                 request_id)).scalar_one()
         delivery_count = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                request_postgres.QUEUE).where(
-                    request_postgres.QUEUE.c.request_id ==
-                    request_id)).scalar_one()
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.QUEUE).where(
+                                 request_postgres.QUEUE.c.request_id ==
+                                 request_id)).scalar_one()
     assert status == requests.RequestStatus.CANCELLED.value
     assert delivery_count == 0
 
@@ -6303,4 +6388,4 @@ def test_shutdown_retry_waits_for_exact_quiescence_receipt(
     assert request_row['should_retry']
     assert request_row['execution_quiesced_generation'] == (
         item.execution_generation)
-    assert queue_row == {}
+    assert not queue_row
