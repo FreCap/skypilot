@@ -461,6 +461,12 @@ contract. During transition the LB sends both old controller sync data and the
 new durable report. The durable feed is authoritative for display only when
 fresh; it has no scaling or launch authority in P2a.
 
+The status projection keeps the durable request-report age and the
+controller's ready-capacity observation age as separate fields and freshness
+clocks. Overlaying a fresh or unavailable durable request report therefore
+cannot revive stale logical ready capacity or invalidate a fresh controller
+capacity observation.
+
 Current reviewed size: 2,814 additions and 85 deletions across 38 files,
 mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
@@ -477,10 +483,12 @@ integration gates: current-head forward-only tests derive the Serve revision
 instead of pinning the predecessor; all five load-balancer background loops,
 including demand publication, are owned and cancelled; the dashboard demand
 GET is viewer-readable while the internal reporter POST is explicitly denied;
-and controller-capacity tests stub durable demand so one authority cannot
-silently contaminate the other's fixture. The four exact regressions and the
-real-PostgreSQL case pass locally; the corrected exact-head CI and live rollout
-evidence remain open.
+and controller-ready and durable-request observations retain independent
+freshness clocks. The last gate exposed and fixed a product bug, rather than
+only fixture contamination: fresh demand can no longer revive stale logical
+capacity, and unavailable demand can no longer erase fresh logical capacity.
+The exact regressions and the real-PostgreSQL case pass locally; corrected
+exact-head CI and live rollout evidence remain open.
 
 ### P2b1: provider-free route projection
 
