@@ -121,15 +121,28 @@ claim revalidated immediately before provider I/O. These changes remain dark
 and unpromoted. The final dashboard placement explanation and P3 removal of
 the legacy demand/route paths are not yet implemented.
 
-The 2026-08-16 production read-only audit found Serve revision 046 on release
-v1.1.1291, no remaining replica rows 52032--52038, and no generalized
-non-pool association/action rows for `boltz-l4-fleet`. Absence of those replica
-rows is not by itself quiescence evidence, so the historical-scope evidence
-gate remains open. The same audit reproduced the live economic defect: one
+The latest 2026-08-16 production read-only audit found Helm revision 400 on
+v1.1.1295, commit `2ccb6358a930373069393d5cba4db131feb99c71`, API 81,
+API-request revision 011, and Serve revision 047. The API deployment and both
+`boltz-l4-fleet` load balancers use immutable digest
+`sha256:c67538db1d83088d542583e44b75013b0082fd13162a62409df787337f10baaf`.
+The service remains `resource_action_mode=legacy` and non-pool capability is
+false. It has no generalized non-pool association, associated request, legacy
+scope/reconciliation, or resource-action shadow row, and replica IDs
+52032--52038 remain absent. Absence of those replica rows is not by itself
+quiescence evidence, so the historical-scope evidence gate remains open.
+
+The same audit reproduced the live economic defect before revision 400: one
 fresh interval had target 65, 28 ready zero-cost slots, 201 observed free
 reserved slots, and 11 paid L4 cold-launch authorizations. Broker grants were
 fresh and large enough (48 A100, 40 A100-80GB, and 144 H200), proving that the
-blocker was controller ordering/accounting rather than reserved scarcity.
+blocker was controller ordering/accounting rather than reserved scarcity. A
+later revision-400 sample with zero arrivals had 35 ready slots, 8 provisioning
+rows, 7 Spot rows shutting down, target 5/raw target 1, no paid cold-launch
+authority, 196 reserved-fill target slots, and 172 observed free reserved
+slots. The lack of paid authority in that later sample does not invalidate the
+earlier race; it confirms that the defect is reconcile-order dependent rather
+than permanent Spot scarcity.
 
 ## Public contract
 
@@ -686,9 +699,10 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
 
 ## Open gates
 
-- [x] Verify the equivalent later v1.1.1291 production compatibility baseline
-  without generalized-action, demand-authority, or placement promotion
-  (2026-08-16: single-`all` `Recreate`, Serve046/API010, `LEGACY_ACTIVE`).
+- [x] Verify the later v1.1.1295 production compatibility baseline without
+  generalized-action, demand-authority, or placement promotion (2026-08-16:
+  Helm revision 400, single-`all` `Recreate`, Serve047/API011, API 81, service
+  resource-action mode legacy, non-pool capability false).
 - [x] Merge P1 as PR #1498 and publish P2a as PR #1499, P2b as PRs #1503/#1504,
   and the blocked P3 removals as draft PRs #1506/#1510.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
