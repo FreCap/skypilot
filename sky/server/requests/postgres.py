@@ -324,6 +324,8 @@ class BoundOrdinaryLaunchProjectionInput:
     pre_effect_terminal: bool
     cancel_reason: str | None
     paid_capacity_pool_key: str | None
+    provider_evidence: 'ordinary_launch_binding_lib.ProviderEvidence | None' = (
+        None)
 
 
 class BoundOrdinaryLaunchReplicaProjector(typing.Protocol):
@@ -3430,17 +3432,18 @@ def record_bound_non_pool_provider_evidence(
 ) -> bool:
     """Atomically require exact request quiescence and record provider data."""
 
-    def _request_is_quiescent(
+    def _request_terminal_evidence(
         connection: sqlalchemy.engine.Connection,
         locked_context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
-    ) -> bool:
+    ) -> ordinary_launch_binding_lib.TerminalEvidence | None:
         facts, _, queue_row, _ = _lock_bound_request_evidence(
             connection, locked_context)
-        return bool(
+        ready = bool(
             facts.exists and
             facts.status in requests_lib.RequestStatus.finished_status() and
             facts.quiescent and queue_row is None and
-            facts.retention_pin_active)
+            facts.retention_pin_active and facts.terminal_cause is not None)
+        return _terminal_evidence(facts) if ready else None
 
     engine = initialize_and_get_db()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
@@ -3449,7 +3452,80 @@ def record_bound_non_pool_provider_evidence(
     with engine.begin() as connection:
         return ordinary_launch_binding.record_non_pool_provider_evidence(
             connection, context, authority, evidence, payload,
-            _request_is_quiescent)
+            _request_terminal_evidence)
+
+
+def project_bound_non_pool_provider_absence(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> bool:
+    """Atomically project one exact quiescent reserved-fill absence."""
+    if not callable(project_replica_result):
+        raise TypeError('project_replica_result must be callable.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic provider reconciliation requires PostgreSQL.')
+    with engine.begin() as connection:
+        # The ReplicaInfo projector can touch the zero-cost materialization
+        # sequencer. Preserve its global lock order even though exact absence
+        # must never stamp a successful materialization.
+        serve_state.lock_zero_cost_protocol_for_bound_launch_projection(
+            connection)
+        association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+            connection, context)
+        if not _controller_authority_matches_reduction(association, authority):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence writer no longer owns this association.')
+        facts, _, queue_row, _ = _lock_bound_request_evidence(
+            connection, context)
+        if (not facts.exists or facts.status
+                not in requests_lib.RequestStatus.finished_status() or
+                facts.terminal_cause is None or not facts.quiescent or
+                queue_row is not None or not facts.retention_pin_active):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence projection requires exact terminal request '
+                'quiescence and its active retention pin.')
+        terminal_evidence = _terminal_evidence(facts)
+        checked_association, locked_replica_info = (
+            ordinary_launch_binding.
+            provider_absence_projection_authority_in_connection(
+                connection, context, terminal_evidence))
+        if not _paid_capacity_claim_is_exact(connection, checked_association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence projection found unexpected paid capacity.')
+        projection = BoundOrdinaryLaunchProjectionInput(
+            context=context,
+            request=facts,
+            locked_replica_info=locked_replica_info,
+            status=facts.status,
+            cause=facts.terminal_cause,
+            service_job_id=None,
+            pre_effect_terminal=False,
+            cancel_reason=checked_association.get('cancel_reason'),
+            paid_capacity_pool_key=None,
+            provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT)
+        if project_replica_result(connection, projection) is not True:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence replica projection lost its exact row.')
+        if not _paid_capacity_claim_is_exact(connection, checked_association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence projection changed paid-capacity identity.')
+        ordinary_launch_binding.project_provider_absence_in_connection(
+            connection, context, terminal_evidence)
+        if not delete_request_retention_pin_in_transaction(
+                connection, context.request_id,
+                ORDINARY_LAUNCH_RETENTION_PIN_KIND, context.association_id):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence could not release its exact request pin.')
+        if not (ordinary_launch_binding.
+                release_projected_paid_capacity_claim_in_connection(
+                    connection, context)):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider absence could not close paid-capacity authority.')
+    return True
 
 
 def bound_non_pool_provider_reconciliation_ready(

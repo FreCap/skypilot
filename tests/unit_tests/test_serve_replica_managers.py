@@ -130,11 +130,14 @@ def test_non_pool_provider_reconciliation_is_scheduled_without_inline_io():
                            return_value=worker) as thread_constructor:
         manager._schedule_non_pool_provider_reconciliation(info, context)
 
-    thread_constructor.assert_called_once_with(
-        target=replica_managers.non_pool_launch_reconciliation.reconcile,
-        name='replica-3-provider-reconciliation',
-        daemon=True,
-        args=(context, info, authority))
+    thread_constructor.assert_called_once()
+    worker_args = thread_constructor.call_args.kwargs
+    assert worker_args['target'] is (
+        replica_managers.non_pool_launch_reconciliation.reconcile)
+    assert worker_args['name'] == 'replica-3-provider-reconciliation'
+    assert worker_args['daemon'] is True
+    assert worker_args['args'][:3] == (context, info, authority)
+    assert callable(worker_args['args'][3])
     worker.start.assert_called_once_with()
 
 
@@ -1477,6 +1480,57 @@ class TestBoundOrdinaryLaunchManagerIntegration:
         assert info.service_job_id == 41
         assert info.system_recovery_revision == 2
         update.assert_called_once()
+
+    def test_reserved_fill_absence_projects_failed_without_materialization(
+            self):
+        manager = _make_manager()
+        manager._ordinary_launch_binding_authority = _binding_authority(
+            ordinary_launch_binding.BindingMode.BOUND, generic=True)
+        info = _fake_replica_info(
+            1, replica_managers.serve_state.ReplicaStatus.PROVISIONING)
+        info.reserved_fill = True
+        info.is_zero_cost = True
+        profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+            authorization_reference='reserved-fill:' + 'a' * 64,
+            authorization_generation=1,
+            authorization_payload={'physical_cluster_uid': 'uid-a'})
+        context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+            association_id=uuid.uuid4(),
+            request_id='request-id',
+            service_name='svc',
+            replica_id=1,
+            replica_record_id=uuid.UUID(info.replica_record_id),
+            launch_generation=1,
+            input_digest='a' * 64,
+            profile=profile,
+            capability_cohort_epoch=1,
+            capability_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            receipt_protocol_version=1)
+        projection = types.SimpleNamespace(
+            locked_replica_info=info,
+            request=types.SimpleNamespace(error=None),
+            status=types.SimpleNamespace(value='SUCCEEDED'),
+            service_job_id=None,
+            pre_effect_terminal=False,
+            paid_capacity_pool_key=None,
+            provider_evidence=(ordinary_launch_binding.ProviderEvidence.ABSENT),
+            context=context)
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'update_replica_for_bound_ordinary_launch_in_transaction',
+                return_value=True) as update:
+            assert manager._project_bound_ordinary_launch(
+                None, mock.sentinel.connection, projection)
+
+        assert (info.status_property.sky_launch_status ==
+                common_utils.ProcessStatus.FAILED)
+        assert update.call_args.kwargs['provider_launch_succeeded'] is False
+        assert update.call_args.kwargs['paid_capacity_pool_key'] is None
+        assert update.call_args.kwargs['paid_capacity_outcome'] is None
 
     def test_generic_pre_effect_result_retires_intent_for_fresh_planning(self):
         manager = _make_manager()

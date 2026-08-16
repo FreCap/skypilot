@@ -86,6 +86,33 @@ def _gc_replica_state() -> dict[str, object]:
     return info.to_storage_dict()
 
 
+def _gc_reserved_fill_info() -> replica_managers.ReplicaInfo:
+    info = replica_managers.ReplicaInfo.from_storage_dict(_gc_replica_state())
+    info.reserved_fill = True
+    info.is_zero_cost = True
+    info.zero_cost_admission_sequence = 1
+    values = {
+        'reserved_fill_pool_key': 'kubernetes/context-a/l4/physical-uid-a/v2',
+        'reserved_fill_service_generation': 7,
+        'reserved_fill_physical_cluster_uid': 'physical-uid-a',
+        'reserved_fill_kubernetes_context': 'context-a',
+        'reserved_fill_allocation_generation': 8,
+        'reserved_fill_allocation_input_sha256': 'a' * 64,
+        'reserved_fill_allocation_claim_generation': 7,
+        'reserved_fill_reconciliation_gate_generation': 9,
+        'reserved_fill_reclaim_fleet_bundle_sha256': 'b' * 64,
+        'reserved_fill_reclaim_policy_revision': 'policy-v1',
+        'reserved_fill_reclaim_provider_inventory_sha256': 'c' * 64,
+        'reserved_fill_worker_projection_sha256': 'd' * 64,
+        'reserved_fill_observation_generation': 10,
+        'reserved_fill_observation_sequence': 0,
+        'reserved_fill_intent_idempotency_key': 'e' * 64,
+    }
+    for field, value in values.items():
+        setattr(info, field, value)
+    return info
+
+
 @pytest.fixture(scope='module')
 def postgres_engine():
     container = None
@@ -1358,10 +1385,10 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
                 request_postgres.REQUESTS.c.request_id ==
                 identity.request_id)).mappings().one()
         queue_count = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.count()).select_from(
-                request_postgres.QUEUE).where(
-                    request_postgres.QUEUE.c.request_id ==
-                    identity.request_id)).scalar_one()
+            sqlalchemy.select(sqlalchemy.func.count()  # pylint: disable=not-callable
+                             ).select_from(request_postgres.QUEUE).where(
+                                 request_postgres.QUEUE.c.request_id ==
+                                 identity.request_id)).scalar_one()
         pin = connection.execute(
             sqlalchemy.select(request_postgres.REQUEST_RETENTION_PINS).where(
                 request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
@@ -1439,6 +1466,182 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
     assert request_postgres.record_bound_non_pool_provider_evidence(
         context, authority, ordinary_launch_binding.ProviderEvidence.ABSENT,
         {'result': 'ABSENT'})
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='launch profile or phase'):
+        request_postgres.project_bound_non_pool_provider_absence(
+            context,
+            authority,
+            project_replica_result=lambda *_args: pytest.fail(
+                'paid profiles must fail before replica projection'))
+
+
+def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
+        bound_request_database, monkeypatch) -> None:
+    engine, _ = bound_request_database
+    info = _gc_reserved_fill_info()
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    status='READY'))
+        ordinary_launch_binding.promote_non_pool_launch_service_in_connection(
+            connection,
+            service_name='gc-service',
+            controller_incarnation=_GC_CONTROLLER_ID,
+            controller_owner_epoch=6,
+            expected_binding_epoch=5,
+            participant_barrier_passed=lambda _connection: True,
+            legacy_requests_drained=lambda _connection: True)
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service',
+                serve_state_schema.replicas_table.c.replica_id == 3).values(
+                    status='PROVISIONING',
+                    paid_capacity_pool_key=None,
+                    replica_state=info.to_storage_dict()))
+
+    profile = ordinary_launch_binding.NonPoolLaunchProfile.create(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference='reserved-fill:' + 'e' * 64,
+        authorization_generation=8,
+        authorization_payload={'physical_cluster_uid': 'physical-uid-a'})
+    monkeypatch.setattr(ordinary_launch_binding,
+                        'resolve_non_pool_launch_profile_in_connection',
+                        lambda *_args, **_kwargs: profile)
+    identity = _gc_non_pool_binding_identity(profile)
+    request = _bound_non_pool_request(identity.request_id)
+    monkeypatch.setattr(request_postgres,
+                        '_resolved_request_backend_capability', lambda:
+                        ('postgres-storage', 'postgres-queue', True))
+    monkeypatch.setattr(request_postgres,
+                        'non_pool_launch_binding_fleet_capable',
+                        lambda **_kwargs: True)
+    admission = request_postgres.bind_and_enqueue_non_pool_launch(
+        request, identity)
+    context = ordinary_launch_binding.BoundNonPoolLaunchContext(
+        association_id=identity.association_id,
+        request_id=identity.request_id,
+        service_name=identity.service_name,
+        replica_id=identity.replica_id,
+        replica_record_id=identity.replica_record_id,
+        launch_generation=admission.launch_generation,
+        input_digest=identity.input_digest,
+        profile=profile,
+        capability_cohort_epoch=identity.capability_cohort_epoch,
+        capability_profile_set_digest=identity.capability_profile_set_digest,
+        receipt_protocol_version=identity.receipt_protocol_version)
+    authority = dataclasses.replace(
+        _gc_binding_authority(),
+        binding_epoch=6,
+        non_pool_capable=True,
+        non_pool_binding_protocol_version=(
+            ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+        non_pool_profile_set_digest=(
+            ordinary_launch_binding.supported_non_pool_profile_set_digest()),
+        non_pool_capability_cohort_epoch=(
+            ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+        non_pool_receipt_protocol_version=(
+            ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == identity.association_id).values(
+                      effect_phase=ordinary_launch_binding.EffectPhase.
+                      PROVIDER_IO.value,
+                      effect_phase_changed_at=sqlalchemy.func.clock_timestamp(),
+                      owner_revision=2,
+                      updated_at=sqlalchemy.func.clock_timestamp()))
+        assert ordinary_launch_binding.mark_ambiguous_in_connection(
+            connection, context, 'provider-result-uncertain')
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == identity.request_id))
+        now = sqlalchemy.func.clock_timestamp()
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                identity.request_id).values(
+                    status=requests.RequestStatus.CANCELLED.value,
+                    terminal_cause=event_api_models.EventCause.
+                    EXECUTION_LEASE_EXPIRED.value,
+                    execution_quiescence_required=True,
+                    execution_quiesced_generation=0,
+                    execution_quiesced_at=now,
+                    finished_at=now,
+                    updated_at=now))
+    provider_payload = {
+        'association_id': str(identity.association_id),
+        'cluster_name': 'gc-service-3',
+        'kubernetes_context': 'context-a',
+        'physical_cluster_uid': 'physical-uid-a',
+        'probe_contract': 'kubernetes-physical-replica-presence-v1',
+        'profile_kind': ordinary_launch_binding.NonPoolLaunchProfileKind.
+                        RESERVED_FILL.value,
+        'replica_record_id': str(_GC_REPLICA_RECORD_ID),
+        'result': 'ABSENT',
+    }
+    assert request_postgres.record_bound_non_pool_provider_evidence(
+        context, authority, ordinary_launch_binding.ProviderEvidence.ABSENT,
+        provider_payload)
+
+    with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                       match='replica projection'):
+        request_postgres.project_bound_non_pool_provider_absence(
+            context, authority, project_replica_result=lambda *_args: False)
+
+    def _project_replica(connection, projection):
+        assert projection.provider_evidence == (
+            ordinary_launch_binding.ProviderEvidence.ABSENT)
+        projected_info = projection.locked_replica_info
+        projected_info.status_property.sky_launch_status = (
+            common_utils.ProcessStatus.FAILED)
+        return serve_state.update_replica_for_bound_ordinary_launch_in_transaction(
+            connection,
+            'gc-service',
+            'gc-service-hash',
+            3,
+            str(_GC_REPLICA_RECORD_ID),
+            identity.association_id,
+            projected_info,
+            provider_launch_succeeded=False,
+            paid_capacity_pool_key=None,
+            paid_capacity_outcome=None)
+
+    assert request_postgres.project_bound_non_pool_provider_absence(
+        context, authority, project_replica_result=_project_replica)
+    with engine.connect() as connection:
+        association = connection.execute(
+            sqlalchemy.select(
+                ordinary_launch_binding.ordinary_launch_associations_table).
+            where(ordinary_launch_binding.ordinary_launch_associations_table.c.
+                  association_id == identity.association_id)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name ==
+                'gc-service', serve_state_schema.replicas_table.c.replica_id ==
+                3)).mappings().one()
+        pin_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()  # pylint: disable=not-callable
+            ).select_from(request_postgres.REQUEST_RETENTION_PINS).where(
+                request_postgres.REQUEST_RETENTION_PINS.c.request_id ==
+                identity.request_id)).scalar_one()
+    assert association['resolution'] == (
+        ordinary_launch_binding.Resolution.PROJECTED.value)
+    assert association['reconciliation_outcome'] == (
+        ordinary_launch_binding.ReconciliationOutcome.PROJECTED.value)
+    assert association['ambiguity_code'] is None
+    assert association[
+        'terminal_status'] == requests.RequestStatus.CANCELLED.value
+    assert association['pin_released_at'] is not None
+    assert replica['ordinary_launch_association_id'] is None
+    assert replica['status'] == 'FAILED_CLEANUP'
+    assert pin_count == 0
 
 
 def test_legacy_request_evidence_preserves_missing_quiescence_receipt(

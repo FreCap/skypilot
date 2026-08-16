@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-15
+Last updated: 2026-08-16
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -86,12 +86,19 @@ permanently unbound.
 As of 2026-08-16, the G1 implementation is authored but not deployed. It adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
-pre-admission retirement, and failure-isolated startup recovery. Local evidence
-currently includes 58 focused source contracts, all 53 real-PostgreSQL
-Serve047 migration/binding/reducer tests, the real-PostgreSQL atomic API011
-admission/quiescence test, `git diff --check`, and Python compilation. CI,
-provider-absence projection, stacked cleanup publication, rollout, and live
-evidence for the seven incident rows remain open gates.
+pre-admission retirement, failure-isolated startup recovery, and exact
+reserved-fill provider-absence projection. The absence path requires a fresh
+physical-UID read after exact request quiescence, revalidates the same request,
+profile, provider payload/digest, service owner, and replica record under row
+locks, then atomically projects the failed replica, clears its association
+pointer, settles the association, releases its request pin, and verifies that
+no paid-capacity claim exists. Local evidence currently includes the focused
+source contracts, all 53 real-PostgreSQL Serve047 migration/binding/reducer
+tests, real-PostgreSQL API011 atomic admission/quiescence and rollback/projection
+tests, `git diff --check`, Python compilation, repository-wide mypy over 937
+source files, changed-file pylint, and dashboard lint/format. CI, stacked
+cleanup publication, rollout, and live evidence for the seven incident rows
+remain open gates.
 
 ## Decision record
 
@@ -1077,6 +1084,12 @@ and below a simultaneously authored blocked G2 cleanup PR. It:
   participant is capable and every older/recent lease has drained;
 - schedules per-row typed reconciliation without holding manager/global locks
   across provider reads, network waits, polling, or sleeps;
+- settles only an exact `RESERVED_FILL` `ABSENT` observation, recorded after
+  terminal executor quiescence against the immutable Kubernetes context and
+  physical cluster UID. The current owner atomically marks the replica for
+  failed cleanup, clears the pointer, settles the association, releases the
+  exact request pin, and proves the action has no paid-capacity claim. Every
+  other profile or provider classification remains quarantined;
 - retains legacy cluster-name discovery only for historical unbound rows. It
   never backfills an association or receipt for those rows.
 
@@ -1331,7 +1344,11 @@ Typed provider tests cover `PRESENT`, exact `ABSENT`, `UNKNOWN`, and
 `REPLACED` for a same-name/new-UID resource. Timeout, partial enumeration,
 malformed identity, and RBAC denial are `UNKNOWN`. Exact result and provider
 evidence must agree before projection; contradictory evidence remains
-quarantined.
+quarantined. The exact `ABSENT` integration test forces the ReplicaInfo
+projector to fail once and proves the replica state, association transition,
+and request-pin deletion all roll back; its successful retry proves
+`AMBIGUOUS` to `PROJECTED`, failed-cleanup status, pointer clearing, immutable
+terminal/provider evidence, and pin release commit together.
 
 A scale test injects one poisoned association among hundreds of replicas and
 requires probes, provider-free route publication, LB sync, autoscaling, the

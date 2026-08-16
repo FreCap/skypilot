@@ -79,8 +79,12 @@ _REPLICA_AUTHORIZATION_GUARD_FUNCTION = (
 _REPLICA_AUTHORIZATION_GUARD_TRIGGER = (
     'skyserve047_replica_non_pool_authorization_guard')
 _ORDINARY_SERVICE_GUARD_FUNCTION = 'skyserve042_guard_service_binding'
+_ORDINARY_ASSOCIATION_GUARD_FUNCTION = (
+    'skyserve042_guard_ordinary_association')
+_ORDINARY_REPLICA_GUARD_FUNCTION = 'skyserve042_guard_replica_binding'
 _UNSETTLED_ASSOCIATIONS = (
     "'BOUND', 'CANCEL_REQUESTED', 'RESULT_RECORDED', 'AMBIGUOUS'")
+_SETTLED_ASSOCIATIONS = "'PROJECTED', 'PRE_EFFECT_TERMINAL'"
 
 
 def _sql_values(values: tuple[str, ...]) -> str:
@@ -293,6 +297,29 @@ def _create_profile_constraints(bind: sa.engine.Connection) -> None:
             "jsonb_typeof(non_pool_launch_authorization) = 'object'")
 
 
+def _extend_provider_absence_projection_constraints(
+        bind: sa.engine.Connection) -> None:
+    """Permit only exact v2 reserved-fill absence without a service job."""
+    op.drop_constraint('serve_ordinary_binding_result_effect',
+                       _ASSOCIATIONS,
+                       type_='check')
+    op.create_check_constraint(
+        'serve_ordinary_binding_result_effect', _ASSOCIATIONS,
+        "resolution <> 'RESULT_RECORDED' OR "
+        "effect_phase = 'SERVICE_JOB_RECORDED'")
+    if ('serve047_provider_absence_projection_ck'
+            not in _constraint_names(bind, _ASSOCIATIONS)):
+        op.create_check_constraint(
+            'serve047_provider_absence_projection_ck', _ASSOCIATIONS,
+            "resolution <> 'PROJECTED' OR "
+            "effect_phase = 'SERVICE_JOB_RECORDED' OR "
+            "(binding_protocol_version = 2 AND "
+            "profile_kind = 'RESERVED_FILL' AND "
+            "reconciliation_outcome = 'PROJECTED' AND "
+            "provider_evidence = 'ABSENT' AND "
+            "provider_evidence_observed_at >= execution_quiesced_at)")
+
+
 def _create_legacy_tables(bind: sa.engine.Connection) -> None:
     if not sa.inspect(bind).has_table(_LEGACY_SCOPES):
         op.create_table(
@@ -477,6 +504,266 @@ def _create_legacy_tables(bind: sa.engine.Connection) -> None:
                         _LEGACY_RECONCILIATIONS, ['resolution', 'created_at'])
 
 
+def _install_provider_absence_projection_guards() -> None:
+    """Extend Serve042 transitions for one exact reserved-fill outcome."""
+    op.execute(f"""
+        CREATE OR REPLACE FUNCTION {_ORDINARY_ASSOCIATION_GUARD_FUNCTION}()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        DECLARE
+            service_owner RECORD;
+            old_effect_rank integer;
+            new_effect_rank integer;
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                IF OLD.resolution IN ({_UNSETTLED_ASSOCIATIONS}) THEN
+                    RAISE EXCEPTION
+                        'unresolved ordinary-launch association cannot be deleted';
+                END IF;
+                IF OLD.pin_released_at IS NULL OR
+                   OLD.tombstone_not_before IS NULL OR
+                   OLD.tombstone_not_before > clock_timestamp() OR EXISTS (
+                       SELECT 1 FROM {_REPLICAS} AS replica
+                       WHERE replica.ordinary_launch_association_id =
+                             OLD.association_id
+                   ) THEN
+                    RAISE EXCEPTION
+                        'ordinary-launch tombstone retention is not satisfied';
+                END IF;
+                RETURN OLD;
+            END IF;
+
+            SELECT service.* INTO service_owner
+            FROM {_SERVICES} AS service
+            WHERE service.name = NEW.service_name;
+            IF NOT FOUND OR service_owner.hash IS DISTINCT FROM NEW.service_hash
+               OR service_owner.workspace IS DISTINCT FROM
+                    NEW.service_workspace
+               OR service_owner.lifecycle_epoch IS DISTINCT FROM
+                    NEW.service_lifecycle_epoch
+               OR service_owner.ordinary_launch_binding_mode <> 'bound'
+               OR service_owner.ordinary_launch_binding_epoch IS DISTINCT FROM
+                    NEW.service_binding_epoch
+               OR NOT service_owner.ordinary_launch_binding_capable
+               OR service_owner.controller_incarnation IS DISTINCT FROM
+                    NEW.owner_controller_incarnation
+               OR service_owner.controller_owner_epoch IS DISTINCT FROM
+                    NEW.owner_controller_epoch THEN
+                RAISE EXCEPTION
+                    'ordinary-launch association does not match current service authority';
+            END IF;
+
+            IF TG_OP = 'INSERT' THEN
+                IF NEW.owner_revision <> 1 OR NEW.effect_phase <> 'NOT_STARTED'
+                   OR NEW.resolution <> 'BOUND' THEN
+                    RAISE EXCEPTION
+                        'ordinary-launch association has invalid initial state';
+                END IF;
+                RETURN NEW;
+            END IF;
+
+            IF NEW.association_id IS DISTINCT FROM OLD.association_id
+               OR NEW.submission_id IS DISTINCT FROM OLD.submission_id
+               OR NEW.tenant_scope IS DISTINCT FROM OLD.tenant_scope
+               OR NEW.service_name IS DISTINCT FROM OLD.service_name
+               OR NEW.service_hash IS DISTINCT FROM OLD.service_hash
+               OR NEW.service_workspace IS DISTINCT FROM OLD.service_workspace
+               OR NEW.service_lifecycle_epoch IS DISTINCT FROM
+                    OLD.service_lifecycle_epoch
+               OR NEW.service_binding_epoch IS DISTINCT FROM
+                    OLD.service_binding_epoch
+               OR NEW.service_version IS DISTINCT FROM OLD.service_version
+               OR NEW.replica_id IS DISTINCT FROM OLD.replica_id
+               OR NEW.replica_record_id IS DISTINCT FROM OLD.replica_record_id
+               OR NEW.paid_capacity_pool_key IS DISTINCT FROM
+                    OLD.paid_capacity_pool_key
+               OR NEW.launch_generation IS DISTINCT FROM OLD.launch_generation
+               OR NEW.cluster_name IS DISTINCT FROM OLD.cluster_name
+               OR NEW.request_id IS DISTINCT FROM OLD.request_id
+               OR NEW.input_digest IS DISTINCT FROM OLD.input_digest
+               OR NEW.digest_version IS DISTINCT FROM OLD.digest_version
+               OR NEW.created_at IS DISTINCT FROM OLD.created_at THEN
+                RAISE EXCEPTION
+                    'ordinary-launch association identity is immutable';
+            END IF;
+            IF NEW.owner_revision < OLD.owner_revision OR
+                    NEW.owner_revision > OLD.owner_revision + 1 THEN
+                RAISE EXCEPTION
+                    'ordinary-launch owner revision is not monotonic';
+            END IF;
+            IF NEW IS DISTINCT FROM OLD AND
+                    NEW.owner_revision = OLD.owner_revision THEN
+                RAISE EXCEPTION
+                    'ordinary-launch mutation requires owner revision advance';
+            END IF;
+            IF (NEW.owner_controller_incarnation IS DISTINCT FROM
+                    OLD.owner_controller_incarnation OR
+                NEW.owner_controller_epoch IS DISTINCT FROM
+                    OLD.owner_controller_epoch) AND
+                    NEW.owner_revision <> OLD.owner_revision + 1 THEN
+                RAISE EXCEPTION
+                    'ordinary-launch owner transfer requires revision advance';
+            END IF;
+
+            old_effect_rank := CASE OLD.effect_phase
+                WHEN 'NOT_STARTED' THEN 0 WHEN 'PROVIDER_IO' THEN 1
+                WHEN 'SERVICE_JOB_IO' THEN 2
+                WHEN 'SERVICE_JOB_RECORDED' THEN 3 END;
+            new_effect_rank := CASE NEW.effect_phase
+                WHEN 'NOT_STARTED' THEN 0 WHEN 'PROVIDER_IO' THEN 1
+                WHEN 'SERVICE_JOB_IO' THEN 2
+                WHEN 'SERVICE_JOB_RECORDED' THEN 3 END;
+            IF new_effect_rank < old_effect_rank OR
+                    new_effect_rank > old_effect_rank + 1 THEN
+                RAISE EXCEPTION
+                    'ordinary-launch effect phase transition is illegal';
+            END IF;
+            IF NEW.effect_phase IS DISTINCT FROM OLD.effect_phase AND
+                    NEW.effect_phase_changed_at IS NOT DISTINCT FROM
+                        OLD.effect_phase_changed_at THEN
+                RAISE EXCEPTION
+                    'effect phase transition requires a database timestamp';
+            END IF;
+            IF OLD.service_job_id IS NOT NULL AND
+                    NEW.service_job_id IS DISTINCT FROM OLD.service_job_id THEN
+                RAISE EXCEPTION 'ordinary-launch service-job ID is immutable';
+            END IF;
+            IF OLD.cancel_reason IS NOT NULL AND
+                    (NEW.cancel_reason IS DISTINCT FROM OLD.cancel_reason OR
+                     NEW.cancel_requested_at IS DISTINCT FROM
+                        OLD.cancel_requested_at) THEN
+                RAISE EXCEPTION
+                    'ordinary-launch cancellation intent is immutable';
+            END IF;
+            IF OLD.cancel_reason IS NULL AND NEW.cancel_reason IS NOT NULL AND
+                    NOT (OLD.resolution = 'BOUND' AND
+                         NEW.resolution = 'CANCEL_REQUESTED') THEN
+                RAISE EXCEPTION
+                    'ordinary-launch cancellation requires exact transition';
+            END IF;
+            IF OLD.terminal_status IS NOT NULL AND
+                    (NEW.terminal_status IS DISTINCT FROM OLD.terminal_status OR
+                     NEW.terminal_cause IS DISTINCT FROM OLD.terminal_cause OR
+                     NEW.terminal_execution_generation IS DISTINCT FROM
+                        OLD.terminal_execution_generation OR
+                     NEW.execution_quiescence_required IS DISTINCT FROM
+                        OLD.execution_quiescence_required OR
+                     NEW.execution_quiesced_generation IS DISTINCT FROM
+                        OLD.execution_quiesced_generation OR
+                     NEW.execution_quiesced_at IS DISTINCT FROM
+                        OLD.execution_quiesced_at) THEN
+                RAISE EXCEPTION
+                    'ordinary-launch terminal evidence is immutable';
+            END IF;
+            IF OLD.pin_released_at IS NOT NULL AND
+                    NEW.pin_released_at IS DISTINCT FROM OLD.pin_released_at THEN
+                RAISE EXCEPTION
+                    'ordinary-launch pin-release evidence is immutable';
+            END IF;
+            IF OLD.tombstone_not_before IS NOT NULL AND
+                    NEW.tombstone_not_before IS DISTINCT FROM
+                        OLD.tombstone_not_before THEN
+                RAISE EXCEPTION
+                    'ordinary-launch tombstone deadline is immutable';
+            END IF;
+
+            IF NEW.resolution IS DISTINCT FROM OLD.resolution AND NOT (
+                (OLD.resolution = 'BOUND' AND NEW.resolution IN
+                    ('CANCEL_REQUESTED', 'RESULT_RECORDED',
+                     'PRE_EFFECT_TERMINAL', 'AMBIGUOUS')) OR
+                (OLD.resolution = 'CANCEL_REQUESTED' AND NEW.resolution IN
+                    ('RESULT_RECORDED', 'PRE_EFFECT_TERMINAL', 'AMBIGUOUS')) OR
+                (OLD.resolution = 'RESULT_RECORDED' AND NEW.resolution IN
+                    ('PROJECTED', 'AMBIGUOUS')) OR
+                (OLD.resolution = 'AMBIGUOUS' AND
+                 NEW.resolution = 'PROJECTED' AND
+                 OLD.binding_protocol_version = 2 AND
+                 OLD.profile_kind = 'RESERVED_FILL' AND
+                 OLD.reconciliation_outcome = 'POST_EFFECT_AMBIGUOUS' AND
+                 OLD.provider_evidence = 'ABSENT' AND
+                 NEW.reconciliation_outcome = 'PROJECTED' AND
+                 NEW.ambiguity_code IS NULL AND
+                 NEW.terminal_status IS NOT NULL AND
+                 NEW.execution_quiesced_at IS NOT NULL AND
+                 NEW.provider_evidence_observed_at >=
+                    NEW.execution_quiesced_at AND
+                 NEW.effect_phase IN ('PROVIDER_IO', 'SERVICE_JOB_IO'))
+            ) THEN
+                RAISE EXCEPTION
+                    'ordinary-launch resolution transition is illegal';
+            END IF;
+            IF NEW.resolution IN ({_SETTLED_ASSOCIATIONS}) AND
+                    OLD.resolution NOT IN ({_SETTLED_ASSOCIATIONS}) AND
+                    NEW.tombstone_not_before <
+                        transaction_timestamp() + INTERVAL '60 days' THEN
+                RAISE EXCEPTION
+                    'ordinary-launch tombstone retention is shorter than 60 days';
+            END IF;
+            RETURN NEW;
+        END;
+        $function$
+    """)
+    op.execute(f"""
+        CREATE OR REPLACE FUNCTION {_ORDINARY_REPLICA_GUARD_FUNCTION}()
+        RETURNS trigger LANGUAGE plpgsql AS $function$
+        DECLARE association RECORD;
+        BEGIN
+            IF TG_OP = 'DELETE' THEN
+                IF OLD.ordinary_launch_association_id IS NOT NULL THEN
+                    RAISE EXCEPTION
+                        'bound ordinary-launch replica cannot be deleted';
+                END IF;
+                RETURN OLD;
+            END IF;
+            IF TG_OP = 'UPDATE' AND
+               OLD.ordinary_launch_association_id IS NOT NULL AND
+               NEW.ordinary_launch_association_id IS NOT NULL AND
+               OLD.ordinary_launch_association_id IS DISTINCT FROM
+                    NEW.ordinary_launch_association_id THEN
+                RAISE EXCEPTION
+                    'ordinary-launch replica pointer cannot be swapped';
+            END IF;
+            IF NEW.ordinary_launch_association_id IS NOT NULL THEN
+                SELECT bound.* INTO association FROM {_ASSOCIATIONS} AS bound
+                WHERE bound.association_id =
+                      NEW.ordinary_launch_association_id;
+                IF NOT FOUND OR association.service_name <> NEW.service_name
+                   OR association.replica_id <> NEW.replica_id
+                   OR association.replica_record_id::text IS DISTINCT FROM
+                        (NEW.replica_state ->> 'replica_record_id')
+                   OR association.resolution NOT IN (
+                        {_UNSETTLED_ASSOCIATIONS}) THEN
+                    RAISE EXCEPTION
+                        'ordinary-launch replica pointer is not exact';
+                END IF;
+            END IF;
+            IF TG_OP = 'UPDATE' AND
+               OLD.ordinary_launch_association_id IS NOT NULL AND
+               NEW.ordinary_launch_association_id IS NULL THEN
+                SELECT bound.* INTO association FROM {_ASSOCIATIONS} AS bound
+                WHERE bound.association_id =
+                      OLD.ordinary_launch_association_id;
+                IF NOT FOUND OR NOT (
+                    association.resolution = 'RESULT_RECORDED' OR
+                    (association.effect_phase = 'NOT_STARTED' AND
+                     association.terminal_status IS NOT NULL) OR
+                    (association.resolution = 'AMBIGUOUS' AND
+                     association.binding_protocol_version = 2 AND
+                     association.profile_kind = 'RESERVED_FILL' AND
+                     association.reconciliation_outcome =
+                        'POST_EFFECT_AMBIGUOUS' AND
+                     association.provider_evidence = 'ABSENT' AND
+                     association.provider_evidence_observed_at IS NOT NULL)
+                ) THEN
+                    RAISE EXCEPTION
+                        'ordinary-launch pointer clear lacks terminal evidence';
+                END IF;
+            END IF;
+            RETURN NEW;
+        END;
+        $function$
+    """)
+
+
 def _install_guards() -> None:
     immutable_profile_columns = (
         'binding_protocol_version',
@@ -501,6 +788,17 @@ def _install_guards() -> None:
             IF {immutable_checks} THEN
                 RAISE EXCEPTION
                     'non-pool launch profile identity is immutable';
+            END IF;
+            IF OLD.provider_evidence IN ('ABSENT', 'REPLACED') AND (
+               NEW.provider_evidence IS DISTINCT FROM OLD.provider_evidence OR
+               NEW.provider_evidence_observed_at IS DISTINCT FROM
+                    OLD.provider_evidence_observed_at OR
+               NEW.provider_evidence_payload IS DISTINCT FROM
+                    OLD.provider_evidence_payload OR
+               NEW.provider_evidence_digest IS DISTINCT FROM
+                    OLD.provider_evidence_digest) THEN
+                RAISE EXCEPTION
+                    'terminal non-pool provider evidence is immutable';
             END IF;
             RETURN NEW;
         END;
@@ -812,8 +1110,10 @@ def upgrade() -> None:
         return
     _add_profile_columns(bind)
     _create_profile_constraints(bind)
+    _extend_provider_absence_projection_constraints(bind)
     _create_legacy_tables(bind)
     _install_guards()
+    _install_provider_absence_projection_guards()
 
 
 def downgrade() -> None:

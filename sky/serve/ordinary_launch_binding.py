@@ -666,9 +666,16 @@ ordinary_launch_associations_table = sqlalchemy.Table(
         '(service_job_id IS NOT NULL)',
         name='serve_ordinary_binding_service_job'),
     sqlalchemy.CheckConstraint(
-        "resolution NOT IN ('RESULT_RECORDED', 'PROJECTED') OR "
+        "resolution <> 'RESULT_RECORDED' OR "
         "effect_phase = 'SERVICE_JOB_RECORDED'",
         name='serve_ordinary_binding_result_effect'),
+    sqlalchemy.CheckConstraint(
+        "resolution <> 'PROJECTED' OR effect_phase = 'SERVICE_JOB_RECORDED' "
+        "OR (binding_protocol_version = 2 AND profile_kind = 'RESERVED_FILL' "
+        "AND reconciliation_outcome = 'PROJECTED' AND "
+        "provider_evidence = 'ABSENT' AND "
+        "provider_evidence_observed_at >= execution_quiesced_at)",
+        name='serve047_provider_absence_projection_ck'),
     sqlalchemy.CheckConstraint(
         "resolution NOT IN ('RESULT_RECORDED', 'PROJECTED', "
         "'PRE_EFFECT_TERMINAL') OR "
@@ -2024,7 +2031,7 @@ def build_replacement_planner_authorization(
             return []
         if not isinstance(values, Mapping):
             raise ValueError('Accelerator state must be a mapping.')
-        normalized = []
+        normalized: list[list[Any]] = []
         for raw_card, raw_value in values.items():
             card = _nonempty(raw_card, 'accelerator')
             value = (_positive_int(raw_value, 'accelerator value') if positive
@@ -2626,8 +2633,8 @@ def validate_non_pool_submission_execution_context_in_connection(
         intent,
         service_name=identity.service_name,
         service_version=identity.service_version,
-        controller_pid=identity.controller_pid,
-        controller_ip=identity.controller_ip)
+        controller_pid=service['controller_pid'],
+        controller_ip=service['controller_ip'])
     try:
         submitted = system_oom_recovery.extract_unbound_launch_context(
             dict(launch_context))
@@ -5112,7 +5119,8 @@ def record_non_pool_provider_evidence(
     evidence: ProviderEvidence,
     payload: Mapping[str, Any],
     request_quiescence_validator: Callable[
-        [sqlalchemy.engine.Connection, BoundNonPoolLaunchContext], bool],
+        [sqlalchemy.engine.Connection, BoundNonPoolLaunchContext],
+        TerminalEvidence | None],
 ) -> bool:
     """Record one fresh typed provider read for an ambiguous v2 action.
 
@@ -5164,19 +5172,28 @@ def record_non_pool_provider_evidence(
     # The provider read happened before this transaction. Requiring the exact
     # request generation to be terminal and quiescent now proves no admitted
     # executor can create a resource after an ABSENT observation is recorded.
-    if not request_quiescence_validator(connection, context):
+    terminal_evidence = request_quiescence_validator(connection, context)
+    if terminal_evidence is None:
         raise OrdinaryLaunchBindingConflict(
             'Provider evidence requires exact request quiescence.')
+    terminal_values = _terminal_values(terminal_evidence)
+    if (association['terminal_status'] is not None and
+            any(association[key] != value
+                for key, value in terminal_values.items())):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider evidence conflicts with copied terminal evidence.')
 
     previous = ProviderEvidence(str(association['provider_evidence']))
     # Do not let a failed later read erase a stronger observation. Exact
     # absence and a retargeted physical identity are terminal evidence
     # classifications for this association; contradictions remain quarantined
     # for operator review rather than rewriting history.
-    if (previous in (ProviderEvidence.ABSENT, ProviderEvidence.REPLACED) and
-            evidence != previous):
-        raise OrdinaryLaunchBindingConflict(
-            'Provider evidence contradicts a terminal classification.')
+    if previous in (ProviderEvidence.ABSENT, ProviderEvidence.REPLACED):
+        existing_digest = association['provider_evidence_digest']
+        if evidence != previous or existing_digest != evidence_digest:
+            raise OrdinaryLaunchBindingConflict(
+                'Provider evidence contradicts a terminal classification.')
+        return False
     if (previous == ProviderEvidence.PRESENT and
             evidence == ProviderEvidence.UNKNOWN):
         return False
@@ -5188,6 +5205,10 @@ def record_non_pool_provider_evidence(
         'owner_revision': int(association['owner_revision']) + 1,
         'updated_at': sqlalchemy.func.clock_timestamp(),
     }
+    # Only the request layer can produce this callback. Copy its locked exact
+    # receipt before any provider classification becomes projectable, so a
+    # later Serve-only caller can compare evidence but never fabricate it.
+    values.update(terminal_values)
     changed = connection.execute(
         sqlalchemy.update(ordinary_launch_associations_table).where(
             ordinary_launch_associations_table.c.association_id ==
@@ -5197,6 +5218,120 @@ def record_non_pool_provider_evidence(
     if changed.rowcount != 1:
         raise OrdinaryLaunchBindingConflict(
             'Provider evidence update lost its association CAS.')
+    return True
+
+
+def provider_absence_projection_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    context: BoundNonPoolLaunchContext,
+    terminal_evidence: TerminalEvidence,
+) -> tuple[dict[str, Any], Any]:
+    """Validate one exact reserved-fill absence settlement authority.
+
+    The request layer calls this after locking the exact terminal request and
+    before invoking its ReplicaInfo projector.  Only reserved-fill owns a
+    durable Kubernetes physical identity, so no other profile can turn a
+    missing provider record into capacity absence.
+    """
+    if not isinstance(context, BoundNonPoolLaunchContext):
+        raise TypeError('context must be a BoundNonPoolLaunchContext.')
+    values = _terminal_values(terminal_evidence)
+    lifecycle, service, replica, association = _lock_effect_rows(
+        connection, context, require_paid_claim=False)
+    _validate_effect_rows(lifecycle,
+                          service,
+                          replica,
+                          association,
+                          context,
+                          allowed_resolutions=frozenset({Resolution.AMBIGUOUS}))
+    if (context.profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value or
+            association['provider_evidence'] != ProviderEvidence.ABSENT.value or
+            association['effect_phase']
+            not in (EffectPhase.PROVIDER_IO.value,
+                    EffectPhase.SERVICE_JOB_IO.value) or
+            association['paid_capacity_pool_key'] is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence cannot settle this launch profile or phase.')
+    existing_terminal = association['terminal_status']
+    if existing_terminal is None or any(
+            association[key] != value for key, value in values.items()):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence lacks the exact copied terminal evidence.')
+
+    observed_at = association['provider_evidence_observed_at']
+    if (observed_at is None or terminal_evidence.quiesced_at is None or
+            observed_at < terminal_evidence.quiesced_at):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence predates exact executor quiescence.')
+    payload = association['provider_evidence_payload']
+    info = _locked_replica_info(replica)
+    expected_payload = {
+        'association_id': str(context.association_id),
+        'cluster_name': info.cluster_name,
+        'kubernetes_context': info.reserved_fill_kubernetes_context,
+        'physical_cluster_uid': info.reserved_fill_physical_cluster_uid,
+        'probe_contract': 'kubernetes-physical-replica-presence-v1',
+        'profile_kind': NonPoolLaunchProfileKind.RESERVED_FILL.value,
+        'replica_record_id': str(context.replica_record_id),
+        'result': 'ABSENT',
+    }
+    if payload != expected_payload:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence does not name the exact physical replica.')
+    expected_digest = _canonical_sha256({
+        'association_id': str(context.association_id),
+        'evidence': ProviderEvidence.ABSENT.value,
+        'payload': expected_payload,
+        'profile_digest': context.profile.digest,
+    })
+    if association['provider_evidence_digest'] != expected_digest:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence evidence digest is not canonical.')
+    return dict(association), info
+
+
+def project_provider_absence_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    context: BoundNonPoolLaunchContext,
+    terminal_evidence: TerminalEvidence,
+) -> bool:
+    """Settle an exact reserved-fill phantom after provider absence proof."""
+    association, _ = provider_absence_projection_authority_in_connection(
+        connection, context, terminal_evidence)
+    cleared = connection.execute(
+        sqlalchemy.update(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name ==
+            context.service_name, serve_state_schema.replicas_table.c.replica_id
+            == context.replica_id,
+            serve_state_schema.replicas_table.c.ordinary_launch_association_id
+            == context.association_id).values(
+                ordinary_launch_association_id=None))
+    if cleared.rowcount != 1:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence could not clear the exact replica pointer.')
+    now = sqlalchemy.func.clock_timestamp()
+    values = {
+        'resolution': Resolution.PROJECTED.value,
+        'reconciliation_outcome': ReconciliationOutcome.PROJECTED.value,
+        'ambiguity_code': None,
+        'projected_at': now,
+        'pin_released_at': now,
+        'tombstone_not_before':
+            sqlalchemy.text("transaction_timestamp() + INTERVAL '60 days'"),
+        'owner_revision': int(association['owner_revision']) + 1,
+        'updated_at': now,
+    }
+    updated = connection.execute(
+        sqlalchemy.update(ordinary_launch_associations_table).where(
+            ordinary_launch_associations_table.c.association_id ==
+            context.association_id,
+            ordinary_launch_associations_table.c.owner_revision ==
+            association['owner_revision']).values(**values))
+    if updated.rowcount != 1:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence projection lost its association CAS.')
     return True
 
 

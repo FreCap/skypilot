@@ -4041,16 +4041,16 @@ def _upsert_replica_rows_in_session(
     insert_func = _upsert_insert_func(engine)
     for start in range(0, len(replica_infos), chunk_size):
         chunk = replica_infos[start:start + chunk_size]
-        row_values = [
+        insert_rows = [
             _initial_replica_row_values(engine, service_name, replica_id,
                                         replica_info)
             for replica_id, replica_info in chunk
         ]
         if any('non_pool_launch_authorization' in values
-               for values in row_values):
-            for values in row_values:
+               for values in insert_rows):
+            for values in insert_rows:
                 values.setdefault('non_pool_launch_authorization', None)
-        insert_stmt = insert_func(replicas_table).values(row_values)
+        insert_stmt = insert_func(replicas_table).values(insert_rows)
         session.execute(insert_stmt)
     return replica_infos
 

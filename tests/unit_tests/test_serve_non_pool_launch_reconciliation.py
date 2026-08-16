@@ -129,3 +129,37 @@ def test_profile_without_durable_provider_uid_remains_unknown(
 
     assert observed.evidence == ordinary_launch_binding.ProviderEvidence.UNKNOWN
     assert observed.payload['reason'] == 'profile-has-no-durable-provider-uid'
+
+
+@pytest.mark.parametrize('evidence',
+                         (ordinary_launch_binding.ProviderEvidence.ABSENT,
+                          ordinary_launch_binding.ProviderEvidence.PRESENT))
+def test_reconcile_projects_only_exact_absence(
+        monkeypatch: pytest.MonkeyPatch,
+        evidence: ordinary_launch_binding.ProviderEvidence) -> None:
+    context = _context(
+        ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    authority = object()
+    replica = _reserved_replica()
+    observation = reconciliation.ProviderObservation(evidence, {
+        'result': evidence.value,
+    })
+    calls = []
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'bound_non_pool_provider_reconciliation_ready',
+                        lambda *_args: True)
+    monkeypatch.setattr(reconciliation, 'observe_provider',
+                        lambda *_args: observation)
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'record_bound_non_pool_provider_evidence',
+                        lambda *_args: calls.append('record'))
+    monkeypatch.setattr(reconciliation.request_postgres,
+                        'project_bound_non_pool_provider_absence',
+                        lambda *_args, **_kwargs: calls.append('project'))
+    projector = lambda *_args: True
+
+    assert reconciliation.reconcile(context, replica, authority,
+                                    projector) == observation
+    assert calls == (['record', 'project'] if evidence
+                     == ordinary_launch_binding.ProviderEvidence.ABSENT else
+                     ['record'])

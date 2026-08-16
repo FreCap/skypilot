@@ -1203,6 +1203,11 @@ class ReplicaInfo:
         # Exact provider capacity pool whose unresolved-launch allowance this
         # row consumes. None for zero-cost, recovery-only, and pre-v12 rows.
         self.paid_capacity_pool_key: str | None = None
+        # Initial-insert-only planner authority is stored in its own
+        # PostgreSQL column, not in the versioned ReplicaInfo JSON. This
+        # process-local field carries it only across planner construction and
+        # the atomic row insert.
+        self.non_pool_launch_authorization: dict[str, Any] | None = None
         self.system_recovery_launch_intent: (
             system_recovery_state.SystemRecoveryLaunchIntent | None) = None
         self.system_recovery_disposition = (

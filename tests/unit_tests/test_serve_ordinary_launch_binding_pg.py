@@ -499,6 +499,14 @@ def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
         assert binding.mark_ambiguous_in_connection(
             connection, context, 'provider-result-uncertain')
 
+    terminal = binding.TerminalEvidence(status=binding.TerminalStatus.CANCELLED,
+                                        cause='execution_lease_expired',
+                                        execution_generation=0,
+                                        quiescence_required=True,
+                                        quiesced_generation=0,
+                                        quiesced_at=datetime.datetime.now(
+                                            datetime.timezone.utc))
+
     def _record(evidence, result, *, quiescent=True):
         with binding_database.begin() as connection:
             return binding.record_non_pool_provider_evidence(
@@ -507,7 +515,8 @@ def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
                     'cluster_name': 'svc-3',
                     'probe_contract': 'test-provider-v1',
                     'result': result,
-                }, lambda _connection, _context: quiescent)
+                }, lambda _connection, _context: terminal
+                if quiescent else None)
 
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                        match='exact request quiescence'):
@@ -516,6 +525,7 @@ def test_serve047_provider_evidence_is_owner_fenced_and_monotonic(
     # A later unreadable provider must not erase stronger presence evidence.
     assert not _record(binding.ProviderEvidence.UNKNOWN, 'UNKNOWN')
     assert _record(binding.ProviderEvidence.ABSENT, 'ABSENT')
+    assert not _record(binding.ProviderEvidence.ABSENT, 'ABSENT')
     with pytest.raises(binding.OrdinaryLaunchBindingConflict,
                        match='terminal classification'):
         _record(binding.ProviderEvidence.PRESENT, 'PRESENT')

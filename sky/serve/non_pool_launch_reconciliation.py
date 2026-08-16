@@ -9,6 +9,7 @@ never promoted into provider absence.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import dataclasses
 from typing import Any
 
@@ -109,8 +110,9 @@ def reconcile(
     context: ordinary_launch_binding.BoundNonPoolLaunchContext,
     replica_info: Any,
     authority: ordinary_launch_binding.ControllerBindingAuthority,
+    project_replica_result: Callable[..., bool],
 ) -> ProviderObservation:
-    """Observe outside locks, then owner-fence one durable evidence update."""
+    """Observe outside locks, then durably record and reduce exact absence."""
     if not request_postgres.bound_non_pool_provider_reconciliation_ready(
             context, authority):
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
@@ -119,4 +121,7 @@ def reconcile(
     observation = observe_provider(context, replica_info)
     request_postgres.record_bound_non_pool_provider_evidence(
         context, authority, observation.evidence, observation.payload)
+    if observation.evidence == ordinary_launch_binding.ProviderEvidence.ABSENT:
+        request_postgres.project_bound_non_pool_provider_absence(
+            context, authority, project_replica_result=project_replica_result)
     return observation

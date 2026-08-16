@@ -3752,6 +3752,20 @@ class SkyPilotReplicaManager(ReplicaManager):
         request_error = projection.request.error
         reason = self._bound_launch_capacity_reason(launch_cloud, request_error)
         status = projection.status.value
+        provider_absent = (getattr(
+            projection, 'provider_evidence',
+            None) == ordinary_launch_binding.ProviderEvidence.ABSENT)
+        if provider_absent:
+            absence_context = projection.context
+            if (not isinstance(
+                    absence_context,
+                    ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                    absence_context.profile.kind != ordinary_launch_binding.
+                    NonPoolLaunchProfileKind.RESERVED_FILL or
+                    projection.pre_effect_terminal or
+                    projection.service_job_id is not None or
+                    projection.paid_capacity_pool_key is not None):
+                return False
         paid_outcome: paid_capacity.LaunchOutcome | None
         if projection.pre_effect_terminal:
             # No provider or service-job effect occurred.  Leave this exact
@@ -3770,6 +3784,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             # The reducer, which can see the association's cancel reason,
             # decides whether the exact claim is retained for the successor.
             paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
+        elif provider_absent:
+            # The request result describes the handler; this independent exact
+            # provider read describes usable capacity.  Once the immutable
+            # physical resource is absent, never publish the replica as ready
+            # or stamp a zero-cost materialization even if the handler had
+            # reported success before disappearing.
+            if (info.status_property.sky_launch_status
+                    != common_utils.ProcessStatus.INTERRUPTED):
+                info.status_property.sky_launch_status = (
+                    common_utils.ProcessStatus.FAILED)
+            paid_outcome = None
         elif status == 'SUCCEEDED':
             # Teardown writes INTERRUPTED before exact cancellation.  A request
             # may race that cancel and finish successfully, but its result must
@@ -3798,18 +3823,18 @@ class SkyPilotReplicaManager(ReplicaManager):
                 info.status_property.failed_spot_availability = True
             else:
                 paid_outcome = paid_capacity.LaunchOutcome.OTHER_FAILURE
-        context = projection.context
-        if (isinstance(context,
+        binding_context = projection.context
+        if (isinstance(binding_context,
                        ordinary_launch_binding.BoundNonPoolLaunchContext) and
-                context.profile.kind == ordinary_launch_binding.
+                binding_context.profile.kind == ordinary_launch_binding.
                 NonPoolLaunchProfileKind.SYSTEM_OOM_RECOVERY):
             intent = info.system_recovery_launch_intent
             if (intent is None or info.system_recovery_quarantine is not None or
                     info.system_recovery_disposition
                     != system_recovery_state.SystemRecoveryDisposition.CANDIDATE
-                    or context.profile.authorization_reference
+                    or binding_context.profile.authorization_reference
                     != f'system-oom:{intent.launch_nonce}' or
-                    context.profile.authorization_generation
+                    binding_context.profile.authorization_generation
                     != intent.launch_generation):
                 return False
             if not projection.pre_effect_terminal:
@@ -3818,13 +3843,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         job_id < 1):
                     return False
                 existing = (info.launch_request_id, info.service_job_id)
-                expected = (context.request_id, job_id)
+                expected = (binding_context.request_id, job_id)
                 if existing == (None, None):
                     revision = info.system_recovery_revision
                     if (isinstance(revision, bool) or
                             not isinstance(revision, int) or revision < 1):
                         return False
-                    info.launch_request_id = context.request_id
+                    info.launch_request_id = binding_context.request_id
                     info.service_job_id = job_id
                     info.system_recovery_revision = revision + 1
                 elif existing != expected:
@@ -3843,6 +3868,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             projection.context.association_id,
             info,
             provider_launch_succeeded=(not projection.pre_effect_terminal and
+                                       not provider_absent and
                                        status == 'SUCCEEDED'),
             paid_capacity_pool_key=projection.paid_capacity_pool_key,
             paid_capacity_outcome=paid_outcome)
@@ -3901,10 +3927,10 @@ class SkyPilotReplicaManager(ReplicaManager):
     def _schedule_non_pool_provider_reconciliation(
         self,
         info: ReplicaInfo,
-        context: Any,
+        binding_context: Any,
     ) -> None:
         """Schedule one bounded provider read without blocking this manager."""
-        if not isinstance(context,
+        if not isinstance(binding_context,
                           ordinary_launch_binding.BoundNonPoolLaunchContext):
             return
         authority = self._ordinary_launch_binding_authority
@@ -3935,7 +3961,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 logger.warning(
                     'Provider reconciliation for replica %s failed; retrying '
                     'in %.1f seconds: %s', replica_id, delay,
-                    common_utils.format_exception(existing.exception))
+                    existing.format_exc or repr(existing.exception))
                 return
         if time.monotonic() < self._non_pool_reconciliation_retry_at.get(
                 replica_id, 0):
@@ -3950,7 +3976,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             target=non_pool_launch_reconciliation.reconcile,
             name=f'replica-{replica_id}-provider-reconciliation',
             daemon=True,
-            args=(context, info, authority))
+            args=(binding_context, info, authority,
+                  functools.partial(self._project_bound_ordinary_launch, None)))
         self._non_pool_reconciliation_threads[replica_id] = worker
         worker.start()
 
