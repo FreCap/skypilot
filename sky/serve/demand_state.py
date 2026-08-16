@@ -143,16 +143,24 @@ def _priority_map(value: Any, field: str) -> dict[str, int]:
     return parsed
 
 
-def _validate_compatibility_profiles(value: Any, field: str, *,
-                                     require_timestamp: bool) -> set[str]:
+def _validate_compatibility_profiles(
+        value: Any, field: str, *, require_timestamp: bool
+) -> tuple[set[str], dict[str, int], dict[str, int]]:
     if not isinstance(value,
                       list) or len(value) > constants.LB_REQUEST_TIMESTAMP_CAP:
         raise DemandReportError(f'{field} must be a bounded list.')
     accelerators: set[str] = set()
+    counts_by_priority: dict[str, int] = {}
+    recent_counts_by_priority: dict[str, int] = {}
     for profile in value:
         parsed = lb_ha.CompatibilityDemand.from_dict(
             profile, require_timestamp=require_timestamp)
         if parsed is None:
+            raise DemandReportError(f'{field} contains an invalid profile.')
+        if not 0 <= parsed.priority <= 100 or parsed.count > _MAX_COUNTER:
+            raise DemandReportError(f'{field} contains an invalid profile.')
+        if (parsed.recent_count is not None and
+                parsed.recent_count > _MAX_COUNTER):
             raise DemandReportError(f'{field} contains an invalid profile.')
         if (len(parsed.compatible_accelerators)
                 > constants.LB_REQUEST_ACCELERATORS_MAX_ITEMS or
@@ -161,7 +169,14 @@ def _validate_compatibility_profiles(value: Any, field: str, *,
             raise DemandReportError(
                 f'{field} contains an invalid accelerator set.')
         accelerators.update(parsed.compatible_accelerators)
-    return accelerators
+        priority = str(parsed.priority)
+        counts_by_priority[priority] = (counts_by_priority.get(priority, 0) +
+                                        parsed.count)
+        if parsed.recent_count:
+            recent_counts_by_priority[priority] = (
+                recent_counts_by_priority.get(priority, 0) +
+                parsed.recent_count)
+    return accelerators, counts_by_priority, recent_counts_by_priority
 
 
 def _validate_demand_window(
@@ -210,11 +225,11 @@ def _validate_demand_window(
         request_count = _nonnegative_int(bucket.get('request_count'),
                                          'demand_window request_count')
         profiles = bucket.get('compatibility_profiles')
-        compatibility_accelerators.update(
-            _validate_compatibility_profiles(
-                profiles,
-                'demand_window compatibility_profiles',
-                require_timestamp=False))
+        profile_accelerators, _, _ = _validate_compatibility_profiles(
+            profiles,
+            'demand_window compatibility_profiles',
+            require_timestamp=False)
+        compatibility_accelerators.update(profile_accelerators)
         assert isinstance(profiles, list)
         profile_count = 0
         for profile in profiles:
@@ -332,14 +347,16 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
     recent_rejected_by_priority = _priority_map(
         raw.get('rejected_in_recent_window_by_priority'),
         'rejected_in_recent_window_by_priority')
-    queued_accelerators = _validate_compatibility_profiles(
-        raw.get('queued_requests_by_compatibility'),
-        'queued_requests_by_compatibility',
-        require_timestamp=False)
-    rejected_accelerators = _validate_compatibility_profiles(
-        raw.get('rejected_requests_by_compatibility'),
-        'rejected_requests_by_compatibility',
-        require_timestamp=False)
+    (queued_accelerators, queued_profiles_by_priority,
+     _) = _validate_compatibility_profiles(
+         raw.get('queued_requests_by_compatibility'),
+         'queued_requests_by_compatibility',
+         require_timestamp=False)
+    (rejected_accelerators, rejected_profiles_by_priority,
+     recent_rejected_profiles_by_priority) = _validate_compatibility_profiles(
+         raw.get('rejected_requests_by_compatibility'),
+         'rejected_requests_by_compatibility',
+         require_timestamp=False)
     queued_profiles = raw['queued_requests_by_compatibility']
     rejected_profiles = raw['rejected_requests_by_compatibility']
     queued_profile_count = sum(
@@ -354,6 +371,22 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
             > counts['rejected_in_recent_window']):
         raise DemandReportError(
             'Compatibility profile counts exceed their aggregate gauges.')
+    complete_priority_totals = (
+        queued_profile_count == counts['queue_depth'] and
+        sum(queue_by_priority.values()) == counts['queue_depth'] and
+        rejected_profile_count == counts['rejected_in_window'] and
+        sum(rejected_by_priority.values()) == counts['rejected_in_window'] and
+        recent_rejected_profile_count == counts['rejected_in_recent_window'] and
+        sum(recent_rejected_by_priority.values())
+        == counts['rejected_in_recent_window'])
+    if complete_priority_totals and (
+            queued_profiles_by_priority != queue_by_priority or
+            rejected_profiles_by_priority != rejected_by_priority or
+            recent_rejected_profiles_by_priority
+            != recent_rejected_by_priority):
+        raise DemandReportError(
+            'Compatibility profile priorities conflict with aggregate '
+            'priority gauges.')
     unknown_accelerators = (
         demand_accelerators | queued_accelerators |
         rejected_accelerators) - set(configured_accelerators)
@@ -370,10 +403,7 @@ def _validate_report(raw: Any) -> tuple[dict[str, Any], str, bool]:
         queued_profile_count == counts['queue_depth'] and
         rejected_profile_count == counts['rejected_in_window'] and
         recent_rejected_profile_count == counts['rejected_in_recent_window'] and
-        sum(queue_by_priority.values()) == counts['queue_depth'] and
-        sum(rejected_by_priority.values()) == counts['rejected_in_window'] and
-        sum(recent_rejected_by_priority.values())
-        == counts['rejected_in_recent_window'] and not offered_saturated)
+        complete_priority_totals and not offered_saturated)
 
     request_history = raw.get('request_history')
     if request_history is not None:
@@ -606,6 +636,7 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
     recent_rejected = 0
     newest_received_at = min(row['received_at'] for row in rows)
     complete = True
+    active_report_present = False
     now_epoch = now.timestamp()
     for row in rows:
         payload = row['payload']
@@ -614,6 +645,8 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         session = str(row['reporter_session_id'])
         slot = lb_ha.parse_slot(row['lb_slot']) or lb_ha.LbSlot.A
         role = lb_ha.LbRole(payload.get('applied_role'))
+        active_report_present = (active_report_present or
+                                 role is lb_ha.LbRole.ACTIVE)
         received_epoch = row['received_at'].timestamp()
         elapsed_since_receipt = max(0.0, now_epoch - received_epoch)
         ledger_payload = dict(payload)
@@ -648,6 +681,10 @@ def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
         recent_rejected += int(payload.get('rejected_in_recent_window', 0))
         newest_received_at = max(newest_received_at, row['received_at'])
         complete = complete and bool(row['complete'])
+    if not active_report_present:
+        return _empty_summary('stale',
+                              'active_report_missing',
+                              generation=generation)
     aggregate = ledger.aggregate(sessions, now=now_epoch)
     if not aggregate.complete:
         return _empty_summary('stale',

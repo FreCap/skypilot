@@ -149,6 +149,30 @@ def test_validate_report_rejects_profile_outside_configured_catalog():
         demand_state._validate_report(report)
 
 
+def test_validate_report_rejects_invalid_profile_priority():
+    report = copy.deepcopy(_report())
+    report['demand_window']['buckets'][0]['compatibility_profiles'][0][
+        'priority'] = 101
+
+    with pytest.raises(demand_state.DemandReportError, match='invalid profile'):
+        demand_state._validate_report(report)
+
+
+def test_validate_report_rejects_conflicting_complete_priority_maps():
+    report = copy.deepcopy(_report())
+    report['queue_depth'] = 1
+    report['queue_depth_by_priority'] = {'50': 1}
+    report['queued_requests_by_compatibility'] = [{
+        'priority': 40,
+        'compatible_accelerators': ['L4'],
+        'count': 1,
+    }]
+
+    with pytest.raises(demand_state.DemandReportError,
+                       match='priorities conflict'):
+        demand_state._validate_report(report)
+
+
 def test_validate_report_rejects_future_demand_bucket():
     report = copy.deepcopy(_report())
     report['demand_window']['buckets'][0]['bucket_start'] = 125

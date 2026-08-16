@@ -1,7 +1,8 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 is implemented in draft PR #1498; P2a is implemented in draft PR
-#1499; production remains on the legacy controller-coupled demand path
+Status: P1 is implemented in draft PR #1498; the rebased and locally reviewed
+P2a implementation is in draft PR #1499; production remains on the legacy
+controller-coupled demand path
 
 Last updated: 2026-08-16
 
@@ -128,7 +129,8 @@ Each load-balancer process sends a cumulative, idempotent report to the stable
 central API endpoint. Version 1 contains:
 
 - service name and exact service-incarnation hash;
-- load-balancer slot, Pod UID, LB session ID, and request-history session ID;
+- load-balancer slot, Pod UID as the durable LB session ID, and a
+  process-lifetime request-history/reporter session ID;
 - report protocol version and monotonically increasing reporter sequence;
 - reporter observation time for diagnostics; PostgreSQL computes `received_at`
   and `valid_until` from its own clock;
@@ -154,6 +156,9 @@ Reporter wall-clock skew is bounded to 30 seconds. Live bucket ages are
 rebased onto PostgreSQL receipt time before aggregation, so even tolerated
 clock skew cannot extend the rolling demand window. Historical event buckets
 retain wall-clock timestamps for charts but never authorize capacity in P2a.
+Compatibility priorities are bounded to the public 0--100 range. A report with
+complete compatibility totals but contradictory per-priority profiles and
+gauges is rejected rather than becoming future placement authority.
 
 Minute history remains additive across distinct reporter sessions and
 greatest-value idempotent within one reporter minute. Live gauges remain one
@@ -166,7 +171,9 @@ never converted to a zero observation.
 
 Every consumer exposes one of three states:
 
-- `fresh`: at least one valid reporter; a separate
+- `fresh`: at least one valid reporter whose applied HA role is `ACTIVE`; a
+  fresh standby cannot conceal an expired or partitioned traffic owner. A
+  separate
   `compatibility_complete` bit determines whether exact-card demand may become
   scaling or launch authority. A current report with occupancy-unknown routes
   keeps arrival/queue telemetry fresh but exposes the processing count as
@@ -348,6 +355,13 @@ files, mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
 bounded report validation, and PostgreSQL migration matrix account for the
 increase over the 1,000--1,800 estimate.
+
+Local review evidence on 2026-08-16 includes all 9 real-PostgreSQL Serve048
+tests, 13 validation tests, 121 focused dashboard tests, repository-wide mypy
+over 940 source files, changed-file pylint at 10/10, dashboard ESLint and
+Prettier, and the exact HA cases where replica-global async occupancy must not
+be double-counted and a fresh standby must not turn an expired active report
+into a false zero. CI and live rollout evidence remain open.
 
 ### P2b: one demand authority, routes, and ordered capacity admission
 

@@ -158,7 +158,7 @@ def test_serve039_lineage_metadata_and_dialect_target(monkeypatch) -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
     revision = scripts.get_revision('039')
-    assert scripts.get_heads() == ['046']
+    assert scripts.get_heads() == ['048']
     assert Path(revision.path).name == (
         '039_serve_resource_action_execution_history.py')
     assert revision.down_revision == '038'

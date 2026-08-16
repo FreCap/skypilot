@@ -159,8 +159,10 @@ def test_report_sequence_idempotency_freshness_and_summary(demand_database):
         connection.execute(
             sqlalchemy.update(
                 demand_state_schema.serve_lb_demand_reports_table).values(
+                    received_at=sqlalchemy.func.clock_timestamp() -
+                    sqlalchemy.text("INTERVAL '20 seconds'"),
                     valid_until=sqlalchemy.func.clock_timestamp() -
-                    sqlalchemy.text("INTERVAL '1 second'")))
+                    sqlalchemy.text("INTERVAL '5 seconds'")))
     stale = demand_state.get_request_summary('svc', 'svc-hash')
     assert stale['request_telemetry_state'] == 'stale'
     assert stale['recent_request_count'] is None
@@ -209,6 +211,73 @@ def test_unknown_occupancy_never_displays_processing_zero(demand_database):
     assert summary['request_telemetry_reason'] == 'in_flight_incomplete'
     assert summary['in_flight_requests'] is None
     assert summary['recent_request_count'] == 1
+
+
+def test_ha_handoff_adds_disjoint_work_without_double_counting_occupancy(
+        demand_database):
+    assert demand_database is not None
+    now = time.time()
+    draining = _report(now)
+    draining['applied_role'] = 'DRAINING'
+    active = _report(now)
+    active.update(
+        reporter_session_id='process-b',
+        lb_session_id='pod-b',
+        lb_slot='b',
+        local_in_flight=5,
+        http_in_flight={'http://replica': 4},
+        queue_depth=1,
+        queued_requests_by_compatibility=[{
+            'priority': 50,
+            'compatible_accelerators': ['L4'],
+            'count': 1,
+        }],
+        queue_depth_by_priority={'50': 1},
+    )
+
+    demand_state.ingest_report('svc', 'svc-hash', draining)
+    demand_state.ingest_report('svc', 'svc-hash', active)
+    summary = demand_state.get_request_summary('svc', 'svc-hash')
+
+    assert summary['request_telemetry_state'] == 'fresh'
+    assert summary['request_reporter_count'] == 2
+    assert summary['recent_request_count'] == 2
+    # HTTP work belongs to each LB (1 + 4), while async occupancy is the same
+    # replica-global observation and is selected once (2).
+    assert summary['in_flight_requests'] == 7
+    assert summary['request_queue_depth'] == 1
+
+
+def test_fresh_standby_never_hides_an_expired_active_report(demand_database):
+    now = time.time()
+    active = _report(now)
+    standby = _report(now)
+    standby.update(
+        reporter_session_id='process-b',
+        lb_session_id='pod-b',
+        lb_slot='b',
+        applied_role='STANDBY',
+        local_in_flight=0,
+        http_in_flight={},
+    )
+    demand_state.ingest_report('svc', 'svc-hash', active)
+    demand_state.ingest_report('svc', 'svc-hash', standby)
+    with demand_database.begin() as connection:
+        reports = demand_state_schema.serve_lb_demand_reports_table
+        connection.execute(
+            sqlalchemy.update(reports).where(
+                reports.c.reporter_session_id == 'process-a').values(
+                    received_at=sqlalchemy.func.clock_timestamp() -
+                    sqlalchemy.text("INTERVAL '20 seconds'"),
+                    valid_until=sqlalchemy.func.clock_timestamp() -
+                    sqlalchemy.text("INTERVAL '5 seconds'")))
+
+    summary = demand_state.get_request_summary('svc', 'svc-hash')
+
+    assert summary['request_telemetry_state'] == 'stale'
+    assert summary['request_telemetry_reason'] == 'active_report_missing'
+    assert summary['in_flight_requests'] is None
+    assert summary['recent_request_count'] is None
 
 
 def test_reporter_identity_and_count_are_bounded(demand_database, monkeypatch):
