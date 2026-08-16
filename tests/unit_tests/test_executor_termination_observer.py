@@ -51,16 +51,12 @@ def test_observation_requires_deleting_pod_and_current_terminated_state():
         kubernetes_cluster_uid=cluster_uid) is None
 
 
-def test_start_is_dark_and_requires_owner_to_equal_pod_uid(monkeypatch):
+def test_start_requires_owner_to_equal_pod_uid():
     owner = (str(uuid.uuid4()), 2)
     pod_identity = request_postgres.ServerPodIdentity(name='controller',
                                                       namespace='skypilot',
                                                       uid=str(uuid.uuid4()),
                                                       ip='10.0.0.1')
-    monkeypatch.delenv(observer.OBSERVER_ENABLED_ENV_VAR, raising=False)
-    assert observer.start(owner, pod_identity) is None
-
-    monkeypatch.setenv(observer.OBSERVER_ENABLED_ENV_VAR, 'true')
     try:
         observer.start(owner, pod_identity)
     except RuntimeError as error:

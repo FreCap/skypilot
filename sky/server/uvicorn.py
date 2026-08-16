@@ -43,9 +43,7 @@ _WAIT_REQUESTS_INTERVAL_SECONDS = 5
 # Timeout for waiting for on-going requests to finish.
 try:
     _WAIT_REQUESTS_TIMEOUT_SECONDS = int(
-        os.environ.get(
-            constants.EXECUTION_DRAIN_SECONDS_ENV_VAR,
-            os.environ.get(constants.GRACE_PERIOD_SECONDS_ENV_VAR, '60')))
+        os.environ.get(constants.EXECUTION_DRAIN_SECONDS_ENV_VAR, '60'))
 except ValueError:
     _WAIT_REQUESTS_TIMEOUT_SECONDS = 60
 

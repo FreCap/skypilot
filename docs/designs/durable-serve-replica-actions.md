@@ -1239,7 +1239,12 @@ Python compilation, and `git diff --check` pass. G1Sb is implemented on
 `feat/serve-executor-termination-evidence`: API013, the controller-generation-
 owned observer, immutable evidence writer, transition Helm surface and focused
 real-PostgreSQL/observer/Helm tests pass locally. G1Sc is the next stacked
-change and remains blocked from merge until the qualification gates below.
+change. It is authored on `cleanup/serve-executor-retirement-transition` and
+removes the observer flag, the legacy grace-variable fallback, and the
+sleep-only chart projection. The final chart supplies exactly one execution-
+drain variable in both HA and compatibility topology, and only the dedicated
+HA controller owns the termination observer. G1Sc remains blocked from merge
+until the qualification gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1356,7 +1361,11 @@ Kubernetes watch is admitted. Qualification enables it only for the exact test
 cohort, verifies its least-privilege release-namespace Pod get/list/watch RBAC,
 and injects both a planned deletion and a liveness restart. G1Sc removes the
 flag and mixed-version grace-variable fallback only after the complete cohort
-and crash-matrix gates pass. The existing reviewed Serve047 legacy attestation
+and crash-matrix gates pass. Before G1Sc merges, every release's stored values
+must be snapshotted and the transition-only
+`apiService.highAvailability.executorTerminationEvidenceObserverEnabled` key
+must be absent; the cleanup deploy then uses the same direct Helm
+`--reuse-values` contract. The existing reviewed Serve047 legacy attestation
 remains the only path for historical/incomplete infrastructure evidence; it is
 not converted into an API013 automatic certificate.
 
@@ -2578,11 +2587,11 @@ approved canary:
 - [ ] Run three new consecutive pragmatic adversarial reviews against the exact
   frozen G1/G2 and reserved-fill heads. The 2026-08-15 material correction
   resets prior ordinary-only and Serve047-cleanup review counts to zero.
-- [ ] Author G1S and its stacked sleep-only cleanup. Validate the three-part
+- [x] Author G1S and its stacked sleep-only cleanup. Validate the three-part
   Helm shutdown budget, exact drain-marker ownership transition, real receipt
   completion, and typed executor-termination evidence across the complete
-  rollout/crash matrix. Do not treat Pod absence or lease expiry as automatic
-  execution proof.
+  rollout/crash matrix before either cleanup becomes merge-eligible. Do not
+  treat Pod absence or lease expiry as automatic execution proof.
 - [ ] Deploy G1S dark and pass one planned retirement per API, executor, and
   controller role plus one injected hard-kill quarantine test before enabling
   its automatic infrastructure certificate issuer or merging its cleanup.

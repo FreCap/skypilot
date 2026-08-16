@@ -41,11 +41,6 @@ apiService:
     # process exit before Kubernetes sends SIGKILL.
     # @schema type: [integer]; minimum: 1
     finalCommitSeconds: 10
-    # Transition-only observer for exact current-container termination
-    # evidence. Enable only for a qualified HA cohort; API013 evidence remains
-    # diagnostic until the later quiescence consumer is deployed.
-    # @schema type: [boolean]
-    executorTerminationEvidenceObserverEnabled: false
   preDeployHook: |-
     # Run commands before deploying the API server, e.g. installing an admin policy.
     # Refer to https://docs.skypilot.co/en/latest/cloud-setup/policy.html for more details about admin policy.

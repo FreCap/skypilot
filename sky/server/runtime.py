@@ -334,7 +334,7 @@ def _controller_cutover_quiescence_seconds() -> float:
 def _start_surface_interrupted_cluster_launches() -> None:
     try:
         scan_delay = float(
-            os.environ.get(constants.GRACE_PERIOD_SECONDS_ENV_VAR, '60'))
+            os.environ.get(constants.EXECUTION_DRAIN_SECONDS_ENV_VAR, '60'))
     except ValueError:
         scan_delay = 60
     threading.Thread(target=requests_lib.surface_interrupted_cluster_launches,
@@ -722,9 +722,12 @@ async def _supervise_runtime_daemon(daemon_id: str, clean_env: dict[str, str],
 
 
 async def _register_runtime_daemons_async(
-        background: _BackgroundLoop, max_db_connections: int,
+        background: _BackgroundLoop,
+        max_db_connections: int,
         controller_owner: tuple[str, int],
-        pod_identity: request_postgres.ServerPodIdentity) -> tuple[str, ...]:
+        pod_identity: request_postgres.ServerPodIdentity,
+        *,
+        observe_executor_termination: bool = False) -> tuple[str, ...]:
     """Select and register runtime daemons once for this leadership term."""
     clean_env = clean_env_module.get_clean_server_env()
     if clean_env is None:
@@ -737,9 +740,9 @@ async def _register_runtime_daemons_async(
         raise RuntimeError(
             'Runtime daemon startup requires controller capability authority.')
     selected: list[str] = []
-    termination_observer = executor_termination_observer.start(
-        controller_owner, pod_identity)
-    if termination_observer is not None:
+    if observe_executor_termination:
+        termination_observer = executor_termination_observer.start(
+            controller_owner, pod_identity)
 
         async def stop_termination_observer() -> None:
             await asyncio.to_thread(termination_observer.stop)
@@ -1304,9 +1307,11 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         background = _start_background_loop('controller')
         background.run(
             _register_runtime_daemons_async(
-                background, state.config.num_db_connections_per_worker,
+                background,
+                state.config.num_db_connections_per_worker,
                 (lease.instance_id, generation),
-                state.instance_lease.pod_identity))
+                state.instance_lease.pod_identity,
+                observe_executor_termination=True))
 
         _start_surface_interrupted_cluster_launches()
 

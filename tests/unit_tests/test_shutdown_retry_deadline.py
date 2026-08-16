@@ -24,10 +24,10 @@ import unittest.mock as mock
 from sky.server import uvicorn as uvicorn_module
 
 
-def test_execution_drain_budget_precedes_legacy_full_grace():
+def test_execution_drain_budget_ignores_retired_legacy_grace_variable():
     env = dict(os.environ)
     env['SKYPILOT_EXECUTION_DRAIN_SECONDS'] = '30'
-    env['SKYPILOT_GRACE_PERIOD_SECONDS'] = '60'
+    env['SKYPILOT_GRACE_PERIOD_SECONDS'] = 'not-an-integer'
     result = subprocess.run([
         sys.executable, '-c', 'from sky.server import uvicorn; '
         'print(uvicorn._WAIT_REQUESTS_TIMEOUT_SECONDS)'
