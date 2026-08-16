@@ -10,23 +10,27 @@ import { NonCapitalizedTooltip } from '@/components/utils';
 
 const PRIORITY_TIERS = [
   {
-    code: 'MA',
+    code: 'HA',
     rank: 1,
+    meaning: 'Highly available',
     className: 'bg-red-100 text-red-800 border-red-200',
   },
   {
-    code: 'HA',
+    code: 'MA',
     rank: 2,
+    meaning: 'Mostly available',
     className: 'bg-orange-100 text-orange-800 border-orange-200',
   },
   {
     code: 'WA',
     rank: 3,
+    meaning: 'Weakly available',
     className: 'bg-blue-100 text-blue-800 border-blue-200',
   },
   {
     code: 'BE',
     rank: 4,
+    meaning: 'Best effort',
     className: 'bg-slate-100 text-slate-700 border-slate-200',
   },
 ];
@@ -36,10 +40,10 @@ const PRIORITY_BY_CODE = Object.fromEntries(
 );
 
 const PRIORITY_POLICY_LINES = [
-  'PREEMPTION ORDER',
-  '1 MA → 2 HA → 3 WA → 4 BE',
-  'A tier can preempt tiers to its right when scheduling requires it.',
-  'Within one tier, the higher raw Kubernetes priority value preempts the lower value.',
+  'PROTECTION ORDER (HIGH → LOW)',
+  '1 HA → 2 MA → 3 WA → 4 BE',
+  'Higher raw priority is protected over lower raw priority.',
+  'Eviction still requires permission from the incoming Pod PriorityClass and the Kueue queue policy.',
 ];
 
 const withPriorityPolicy = (lines) =>
@@ -47,33 +51,41 @@ const withPriorityPolicy = (lines) =>
 
 const getPriorityTier = (label) => {
   const code = label?.match(/^(ma|ha|wa|be)(?:-|\s|\()/i)?.[1];
-  return code ? PRIORITY_BY_CODE[code.toUpperCase()] : null;
+  if (code) return PRIORITY_BY_CODE[code.toUpperCase()];
+  // Production SkyServe fill uses a deployment-specific low class instead of
+  // the standard be-{ls,lt} names, but its declared operational tier is BE.
+  if (/inference-low/i.test(label || '')) return PRIORITY_BY_CODE.BE;
+  return null;
+};
+
+const getRawPriority = (label) => {
+  const classValue = label?.match(/\((-?\d+)\)/)?.[1];
+  if (classValue != null) return Number(classValue);
+  const defaultValue = label?.match(/^priority\s+(-?\d+)/i)?.[1];
+  return defaultValue == null ? null : Number(defaultValue);
+};
+
+const getWorkloadKind = (label) => label?.split(' · ')[1] || null;
+
+const getClassName = (label) => {
+  const className = label?.match(/^(.*?)\s+\(-?\d+\)/)?.[1];
+  return className || null;
+};
+
+const getLatencyMode = (label) => {
+  const className = getClassName(label);
+  if (/-ls$/i.test(className || '')) return 'latency sensitive';
+  if (/-lt$/i.test(className || '')) return 'latency tolerant';
+  return null;
 };
 
 const formatGpuCount = (qty) => `${qty} GPU${qty === 1 ? '' : 's'}`;
 
-const formatTierList = (tiers) =>
-  tiers.map((tier) => `${tier.rank} ${tier.code}`).join(', ');
-
-const formatPreemptionAction = (tier) => {
-  if (!tier) {
-    return 'unmapped tier; compare the raw Kubernetes value (higher preempts lower)';
-  }
-  const higher = PRIORITY_TIERS.filter(
-    (candidate) => candidate.rank < tier.rank
-  );
-  const lower = PRIORITY_TIERS.filter(
-    (candidate) => candidate.rank > tier.rank
-  );
-  const higherRanks = higher.length > 0 ? `${formatTierList(higher)} or ` : '';
-  const lowerRanks = lower.length > 0 ? `${formatTierList(lower)} and ` : '';
-  const preemptedBy = `preempted by ${higherRanks}higher raw ${tier.code} value`;
-  const preempts = `preempts ${lowerRanks}lower raw ${tier.code} value`;
-  return `${preemptedBy}; ${preempts}`;
-};
-
 const sortPriorityEntries = (breakdown) =>
   Object.entries(breakdown || {}).sort(([labelA, qtyA], [labelB, qtyB]) => {
+    const rawA = getRawPriority(labelA);
+    const rawB = getRawPriority(labelB);
+    if (rawA != null && rawB != null && rawA !== rawB) return rawB - rawA;
     const tierA = getPriorityTier(labelA);
     const tierB = getPriorityTier(labelB);
     if (tierA && tierB && tierA.rank !== tierB.rank) {
@@ -87,11 +99,40 @@ const sortPriorityEntries = (breakdown) =>
 const formatPriorityBreakdown = (breakdown, indent = '') =>
   sortPriorityEntries(breakdown).map(([label, qty]) => {
     const tier = getPriorityTier(label);
-    const rank = tier ? `${tier.rank} ${tier.code}` : '? unmapped';
-    return (
-      `${indent}${rank} · ${formatGpuCount(qty)} · ${label} · ` +
-      formatPreemptionAction(tier)
-    );
+    const rawPriority = getRawPriority(label);
+    const workloadKind = getWorkloadKind(label);
+    const className = getClassName(label);
+    const latencyMode = getLatencyMode(label);
+    if (!tier) {
+      return [
+        `${indent}UNTAGGED · ${formatGpuCount(qty)}${workloadKind ? ` · ${workloadKind}` : ''}`,
+        `${indent}  actual: ${className || 'no PriorityClass'} · raw priority ${rawPriority ?? 'unknown'}`,
+        `${indent}  operational tier: not assigned; compare the raw value`,
+      ].join('\n');
+    }
+    const detail = [
+      tier.meaning,
+      latencyMode,
+      className || 'default PriorityClass',
+      `raw priority ${rawPriority ?? 'unknown'}`,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    const higher = PRIORITY_TIERS.filter(
+      (candidate) => candidate.rank < tier.rank
+    )
+      .map((candidate) => `${candidate.rank} ${candidate.code}`)
+      .join(', ');
+    const lower = PRIORITY_TIERS.filter(
+      (candidate) => candidate.rank > tier.rank
+    )
+      .map((candidate) => `${candidate.rank} ${candidate.code}`)
+      .join(', ');
+    return [
+      `${indent}${tier.rank} ${tier.code} · ${formatGpuCount(qty)}${workloadKind ? ` · ${workloadKind}` : ''}`,
+      `${indent}  ${detail}`,
+      `${indent}  protected over: ${lower || 'no lower named tier'}; yields to: ${higher || 'no higher named tier'}`,
+    ].join('\n');
   });
 
 const subtractBreakdown = (total, subset) => {
@@ -131,7 +172,7 @@ const compactTierLabel = (breakdown) => {
   if (tiers.length > 1 || (tiers.length > 0 && hasUnmapped)) {
     return 'mixed tiers';
   }
-  return hasUnmapped ? 'unmapped' : null;
+  return hasUnmapped ? 'untagged' : null;
 };
 
 const buildSegmentLabel = (qty, noun, breakdown) => {
@@ -139,12 +180,12 @@ const buildSegmentLabel = (qty, noun, breakdown) => {
   return tier ? `${tier} · ${qty} ${noun}` : `${qty} ${noun}`;
 };
 
-// Operational tooltip for reclaimable non-SkyServe allocations.
+// Operational tooltip for lower-priority non-SkyServe allocations.
 const buildPreemptibleTitle = (preemptible, breakdown) => {
   const entries = formatPriorityBreakdown(breakdown);
   return withPriorityPolicy([
-    'RUNNING NOW',
-    `${formatGpuCount(preemptible)} · non-SkyServe workloads · reclaimable`,
+    'LOWER PRIORITY NOW',
+    `${formatGpuCount(preemptible)} · non-SkyServe workloads · may yield to higher-priority work`,
     ...entries,
   ]);
 };
@@ -167,8 +208,8 @@ const buildServicePreemptibleTitle = (
     }
   }
   return withPriorityPolicy([
-    'RUNNING NOW',
-    `${formatGpuCount(preemptible)} · SkyServe · reclaimable`,
+    'LOWER PRIORITY NOW',
+    `${formatGpuCount(preemptible)} · SkyServe · may yield to higher-priority work`,
     ...serviceLines,
   ]);
 };
@@ -176,8 +217,8 @@ const buildServicePreemptibleTitle = (
 const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
   const entries = formatPriorityBreakdown(breakdown);
   return withPriorityPolicy([
-    'RUNNING NOW',
-    `${formatGpuCount(preemptible)} · reclaimable · workload identity unavailable`,
+    'LOWER PRIORITY NOW',
+    `${formatGpuCount(preemptible)} · workload identity unavailable · may yield to higher-priority work`,
     ...entries,
   ]);
 };
@@ -185,8 +226,8 @@ const buildUnknownPreemptibleTitle = (preemptible, breakdown) => {
 const buildUsedTitle = (used, breakdown) => {
   const entries = formatPriorityBreakdown(breakdown);
   return withPriorityPolicy([
-    'RUNNING NOW',
-    `${formatGpuCount(used)} · highest active tier · not currently reclaimable`,
+    'TOP PRIORITY NOW',
+    `${formatGpuCount(used)} · highest raw priority currently running`,
     ...entries,
   ]);
 };
@@ -201,17 +242,17 @@ const PriorityBadge = ({ tier }) => (
 
 export const PriorityOrderLegend = ({ className = '' }) => (
   <div
-    aria-label="Preemption order: 1 MA, 2 HA, 3 WA, 4 BE. Tiers on the left can preempt tiers to their right. Within a tier, a higher raw Kubernetes priority value preempts a lower value."
+    aria-label="Protection order from high to low: 1 HA, 2 MA, 3 WA, 4 BE. Higher raw priority is protected over lower raw priority. Actual eviction depends on Pod PriorityClass and Kueue queue policy."
     className={`flex flex-wrap items-center gap-1.5 text-[11px] text-gray-600 ${className}`.trim()}
   >
-    <span className="font-medium text-gray-700">Preemption:</span>
+    <span className="font-medium text-gray-700">Priority:</span>
     {PRIORITY_TIERS.map((tier, index) => (
       <React.Fragment key={tier.code}>
         {index > 0 && <span aria-hidden="true">→</span>}
         <PriorityBadge tier={tier} />
       </React.Fragment>
     ))}
-    <span>left preempts right; higher raw value wins within a tier</span>
+    <span>high → low; eviction is policy-gated</span>
   </div>
 );
 
@@ -522,7 +563,7 @@ export function ContextDetails({
                 <h4 className="text-base font-semibold">GPU capacity</h4>
                 <p className="mt-1 text-xs text-gray-600">
                   {!isSSHContext && !isSlurm
-                    ? 'Free is immediate headroom. Reclaimable GPUs are allocated, not idle, and may be preempted by higher-priority work. Hover or focus a segment for workload and priority details.'
+                    ? 'Free is immediate headroom. Lower-priority GPUs are allocated, not idle; whether they can be evicted depends on Pod and Kueue policy. Hover or focus a segment for the running workload and actual priority.'
                     : 'Free is unallocated in this snapshot. Hover or focus a segment for utilization details.'}
                 </p>
                 {!isSSHContext && !isSlurm && (

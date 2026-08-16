@@ -119,11 +119,12 @@ export function hasAccelerator(accelerators) {
 /**
  * Empty scheduling accounting for a fresh per-GPU-type aggregate.
  *
- * "Preemptible" accelerators are those held by pods below the cluster's top
- * scheduling priority tier, i.e. reclaimable by a higher-priority workload.
+ * "Preemptible" is the compatibility field name for accelerators held by pods
+ * below the cluster's top observed raw scheduling priority. It does not, by
+ * itself, assert that Pod PriorityClass and Kueue policy permit eviction.
  * The Infra page aggregates GPU rows at three levels (per node into a context,
  * per context into a workspace view, and per GPU type across contexts); every
- * one of them must carry every active tier, the reclaimable total, and the
+ * one of them must carry every active tier, the lower-priority total, and the
  * SkyServe subset (including its service/tier matrix), or the split silently
  * collapses back into a single "used" block.
  */
