@@ -85,6 +85,14 @@
                         "enabled": {
                             "type": "boolean"
                         },
+                        "executionDrainSeconds": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
+                        "finalCommitSeconds": {
+                            "type": "integer",
+                            "minimum": 1
+                        },
                         "readinessDrainSeconds": {
                             "type": "integer",
                             "minimum": 1

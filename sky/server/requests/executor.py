@@ -409,6 +409,12 @@ class RequestWorker:
         fut: process.InvocationFuture | None = None
         reservation: process.IdleWorkerReservation | None = None
         try:
+            if request_storage.role_is_draining():
+                # The marker is written before Kubernetes' readiness sleep.
+                # Fence the dispatcher immediately instead of waiting for the
+                # later SIGTERM to reach the runtime supervisor.
+                self.request_shutdown()
+                return
             # Capacity is reserved before *every* dequeue.  A durable claim or
             # legacy queue pop must never sit in a dispatcher-local backlog
             # waiting for a process boundary to become available.
@@ -432,6 +438,13 @@ class RequestWorker:
                 return
             request_element = queue_base.normalize_queue_item(queued)
             request_id = request_element.request_id
+            if request_storage.role_is_draining():
+                # The claim is still pre-effect. Return its exact generation
+                # through the backend's normal atomic handoff rather than
+                # abandoning it for lease expiry.
+                self.request_shutdown()
+                queue.put(request_element)
+                return
             ignore_return_value = request_element.ignore_return_value
             request = api_requests.get_request(request_id,
                                                fields=['status', 'created_at'])
@@ -511,6 +524,11 @@ class RequestWorker:
             if not self._start_task_monitor(fut, request_element):
                 return
 
+            if request_storage.role_is_draining():
+                self.request_shutdown()
+                fut.request_cancel()
+                return
+
             guardian = fut.guardian_identity
             observed_start_ticks: int | None = None
             try:
@@ -565,6 +583,13 @@ class RequestWorker:
             if not admitted:
                 logger.warning(f'Request {request_id} is already finished or '
                                'cancelled; cancelling before effect admission')
+                fut.request_cancel()
+                return
+            if request_storage.role_is_draining():
+                # Admission and the marker can race. The guarded invocation
+                # has not crossed its effect gate yet, so retain its monitor
+                # and converge a real cancelled/quiescent result.
+                self.request_shutdown()
                 fut.request_cancel()
                 return
             fut.admit()

@@ -3000,6 +3000,17 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert not row['ready']
     assert row['draining_at'] is not None
     assert row['health_detail'] == {'phase': 'draining'}
+    drain_started_at = row['draining_at']
+    prior_heartbeat_at = row['heartbeat_at']
+    time.sleep(0.01)
+    lease.begin_draining()
+    with engine.connect() as connection:
+        continuing_drain = connection.execute(
+            sqlalchemy.select(request_postgres.SERVER_INSTANCES).where(
+                request_postgres.SERVER_INSTANCES.c.instance_id == uuid.UUID(
+                    instance_id))).mappings().one()
+    assert continuing_drain['draining_at'] == drain_started_at
+    assert continuing_drain['heartbeat_at'] > prior_heartbeat_at
     lease.stop()
     assert not lease.is_locally_ready()
     with engine.connect() as connection:

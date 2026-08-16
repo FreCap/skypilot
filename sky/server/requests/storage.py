@@ -38,6 +38,32 @@ class ExecutionClaim:
 
 
 ManagedJobControllerSlotIdentity = tuple[str, int, int, str]
+ROLE_DRAIN_MARKER_PATH = '/var/run/skypilot/draining'
+
+
+def role_is_draining() -> bool:
+    """Return whether Kubernetes has started this role's drain interval."""
+    return os.path.exists(ROLE_DRAIN_MARKER_PATH)
+
+
+def clear_stale_role_drain_marker(process_started_at: float) -> bool:
+    """Remove only a marker that predates the current container process."""
+    try:
+        marker_stat = os.stat(ROLE_DRAIN_MARKER_PATH)
+    except FileNotFoundError:
+        return False
+    if marker_stat.st_mtime >= process_started_at:
+        return False
+    try:
+        current_stat = os.stat(ROLE_DRAIN_MARKER_PATH)
+        if ((current_stat.st_dev, current_stat.st_ino, current_stat.st_mtime_ns)
+                != (marker_stat.st_dev, marker_stat.st_ino,
+                    marker_stat.st_mtime_ns)):
+            return False
+        os.unlink(ROLE_DRAIN_MARKER_PATH)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 class ManagedJobRequestQuiescenceError(RuntimeError):

@@ -19,6 +19,7 @@ import time
 from typing import Any
 import uuid
 
+import psutil
 import uvloop
 
 from sky import check as sky_check
@@ -77,6 +78,8 @@ _RUNTIME_DAEMON_TERM_TIMEOUT_SECONDS = 10
 _RUNTIME_DAEMON_GROUP_POLL_SECONDS = 0.05
 _BACKGROUND_SHUTDOWN_TIMEOUT_SECONDS = 30
 _OWNERSHIP_SHUTDOWN_RETRY_SECONDS = 1
+_DRAIN_MARKER_POLL_SECONDS = 0.1
+_DRAIN_PUBLICATION_WAIT_SECONDS = 1
 _MANAGED_JOB_RUNTIME_OWNER_PID_ENV_VAR = (
     'SKYPILOT_MANAGED_JOB_RUNTIME_OWNER_PID')
 _MANAGED_JOB_RUNTIME_OWNER_START_TICKS_ENV_VAR = (
@@ -85,6 +88,68 @@ _MANAGED_JOB_RUNTIME_OWNER_START_TICKS_ENV_VAR = (
 
 class RuntimeOwnershipShutdownError(RuntimeError):
     """Owned execution effects did not quiesce before role handoff."""
+
+
+class _RoleDrainMarkerMonitor:
+    """Turn the Kubernetes drain marker into an immediate runtime event."""
+
+    def __init__(
+        self,
+        lease: request_postgres.ServerInstanceLease,
+        request_shutdown: Callable[[], bool | None],
+        *,
+        marker_path: str = request_storage.ROLE_DRAIN_MARKER_PATH,
+        poll_seconds: float = _DRAIN_MARKER_POLL_SECONDS,
+        publication_wait_seconds: float = _DRAIN_PUBLICATION_WAIT_SECONDS,
+    ) -> None:
+        self._lease = lease
+        self._request_shutdown = request_shutdown
+        self._marker_path = marker_path
+        self._poll_seconds = poll_seconds
+        self._publication_wait_seconds = publication_wait_seconds
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run,
+                                        name='server-role-drain-marker',
+                                        daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._poll_seconds):
+            if not os.path.exists(self._marker_path):
+                continue
+
+            def publish_drain() -> None:
+                try:
+                    self._lease.begin_draining()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        'Failed to publish early role drain state.')
+
+            publisher = threading.Thread(target=publish_drain,
+                                         name='server-role-drain-publisher',
+                                         daemon=True)
+            publisher.start()
+            publisher.join(timeout=self._publication_wait_seconds)
+            if publisher.is_alive():
+                # The marker already fences readiness and every dispatcher.
+                # Never let a hung database publication consume the real Pod
+                # execution budget before signal-driven child convergence.
+                logger.warning('Early role drain publication exceeded its '
+                               'bounded wait; proceeding with shutdown.')
+            while not self._stop_event.is_set():
+                if self._request_shutdown() is not False:
+                    return
+                # The role-specific signal handler may not be installed yet
+                # during startup. Keep the marker fence active and retry;
+                # never deliver SIGTERM to Python's default handler.
+                self._stop_event.wait(self._poll_seconds)
+            return
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=max(1, self._poll_seconds * 2))
 
 
 def _open_capability_transport(capability: str) -> int:
@@ -166,6 +231,14 @@ def _clear_controller_origin_capability(capability: str | None) -> None:
 def _request_runtime_shutdown() -> None:
     """Wake the role's ordinary signal-driven graceful shutdown path."""
     os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _request_runtime_shutdown_when_ready() -> bool:
+    """Request shutdown only after the role owns SIGTERM handling."""
+    if signal.getsignal(signal.SIGTERM) in (signal.SIG_DFL, signal.SIG_IGN):
+        return False
+    _request_runtime_shutdown()
+    return True
 
 
 async def _monitor_compat_controller_leadership(
@@ -940,6 +1013,36 @@ def _request_worker_shutdown(workers: list[executor.RequestWorker],
             num_threads=len(workers))
 
 
+def _fence_execution_admission(
+    workers: list[executor.RequestWorker],
+    *,
+    managed_job_refresh: Any | None = None,
+    managed_job_slots: Any | None = None,
+) -> bool:
+    """Best-effort local admission fence before fallible drain publication."""
+    boundaries: list[tuple[str, Callable[[], None]]] = [
+        ('request-worker claim stop', worker.request_shutdown)
+        for worker in workers
+    ]
+    if managed_job_refresh is not None:
+        boundaries.append(('managed-job refresh effect fence',
+                           managed_job_refresh.request_shutdown))
+    if managed_job_slots is not None:
+        boundaries.append(('managed-job slot claim fence',
+                           managed_job_slots.request_shutdown))
+    fenced = True
+    for label, boundary in boundaries:
+        try:
+            boundary()
+        except Exception:  # pylint: disable=broad-except
+            # The authoritative convergence path below retries every fence and
+            # retains ownership until it succeeds.  Do not let one local fence
+            # prevent the remaining independent boundaries from closing.
+            logger.exception(f'Early runtime shutdown step failed ({label}).')
+            fenced = False
+    return fenced
+
+
 def _stop_queue_server(queue_server: multiprocessing.Process | None) -> None:
     if queue_server is None:
         return
@@ -960,6 +1063,7 @@ def _shutdown_execution_ownership(
     before_worker_join: Callable[[], None] | None = None,
     managed_job_refresh: Any | None = None,
     managed_job_slots: Any | None = None,
+    admission_fenced: bool = False,
 ) -> None:
     """Quiesce effects while retaining the sole local PID-death proof owner."""
     failures: list[tuple[str, BaseException]] = []
@@ -974,14 +1078,15 @@ def _shutdown_execution_ownership(
     # First close every finite-request claim loop.  Runtime daemon supervisors
     # and maintenance ownership then stop completely, so broad child fencing
     # cannot race a daemon supervisor that restarts what it observes dying.
-    for worker in workers:
-        attempt('request-worker claim stop', worker.request_shutdown)
-    if managed_job_refresh is not None:
-        attempt('managed-job refresh effect fence',
-                managed_job_refresh.request_shutdown)
-    if managed_job_slots is not None:
-        attempt('managed-job slot claim fence',
-                managed_job_slots.request_shutdown)
+    if not admission_fenced:
+        for worker in workers:
+            attempt('request-worker claim stop', worker.request_shutdown)
+        if managed_job_refresh is not None:
+            attempt('managed-job refresh effect fence',
+                    managed_job_refresh.request_shutdown)
+        if managed_job_slots is not None:
+            attempt('managed-job slot claim fence',
+                    managed_job_slots.request_shutdown)
     if background is not None:
         attempt('daemon and maintenance join', background.stop)
     if managed_job_refresh is not None:
@@ -1244,6 +1349,11 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         try:
             if became_leader:
                 assert generation is not None
+                admission_fenced = _fence_execution_admission(
+                    workers,
+                    managed_job_refresh=managed_job_refresh,
+                    managed_job_slots=managed_job_slots,
+                )
                 if not leadership_lost and not cutover_regressed:
                     try:
                         state.instance_lease.set_ready(
@@ -1264,6 +1374,7 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
                         before_worker_join=None,
                         managed_job_refresh=managed_job_refresh,
                         managed_job_slots=managed_job_slots,
+                        admission_fenced=admission_fenced,
                     )
                     try:
                         lease.release()
@@ -1479,6 +1590,11 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
         logger.info(f'Shutting down SkyPilot {state.role} role...')
         try:
             if state.role != 'controller':
+                admission_fenced = _fence_execution_admission(
+                    workers,
+                    managed_job_refresh=managed_job_refresh,
+                    managed_job_slots=managed_job_slots,
+                )
                 if health_server is not None:
                     try:
                         assert state.instance_lease is not None
@@ -1494,6 +1610,7 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     before_worker_join=None,
                     managed_job_refresh=managed_job_refresh,
                     managed_job_slots=managed_job_slots,
+                    admission_fenced=admission_fenced,
                 )
                 if state.role == 'all':
                     if compatibility_controller_lease is not None:
@@ -1577,5 +1694,20 @@ def main() -> None:
     from sky.server import uvicorn as skyuvicorn
     skyuvicorn.add_timestamp_prefix_for_server_logs()
 
+    if _uses_postgres_requests():
+        process_started_at = psutil.Process(os.getpid()).create_time()
+        if request_storage.clear_stale_role_drain_marker(process_started_at):
+            logger.info('Removed a drain marker retained from an earlier '
+                        'container process.')
+
     state = initialize_common_runtime(args.role, args.deploy)
-    run_role(state, args)
+    drain_monitor = None
+    if state.instance_lease is not None:
+        drain_monitor = _RoleDrainMarkerMonitor(
+            state.instance_lease, _request_runtime_shutdown_when_ready)
+        drain_monitor.start()
+    try:
+        run_role(state, args)
+    finally:
+        if drain_monitor is not None:
+            drain_monitor.stop()

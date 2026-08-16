@@ -388,6 +388,16 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_GRACE_PERIOD_SECONDS
+            value: "30"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_EXECUTION_DRAIN_SECONDS
+            value: "30"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_API_SERVER_INSTANCE_ID
             valueFrom:
               fieldRef:
@@ -538,7 +548,7 @@ tests:
       - failedTemplate:
           errorMessage: "apiService.highAvailability.readinessDrainSeconds must be at least the API readiness failure-detection window (16 seconds)"
 
-  - it: should reserve enough termination time after the HA drain
+  - it: should reserve all three HA termination budgets
     set:
       apiService.highAvailability.enabled: true
       apiService.highAvailability.readinessDrainSeconds: 51
@@ -550,7 +560,21 @@ tests:
       storage.accessMode: ReadWriteMany
     asserts:
       - failedTemplate:
-          errorMessage: "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+10 (61 seconds) in HA mode"
+          errorMessage: "apiService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+executionDrainSeconds+finalCommitSeconds (91 seconds) in HA mode"
+
+  - it: should reject an executor grace shorter than all three HA budgets
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      requestStore.backend: postgres
+      apiService.dbConnectionSecretName: external-db
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      executorService.terminationGracePeriodSeconds: 59
+    asserts:
+      - failedTemplate:
+          errorMessage: "executorService.terminationGracePeriodSeconds must be at least readinessDrainSeconds+executionDrainSeconds+finalCommitSeconds (60 seconds) in HA mode"
 
   - it: should reject HA without the PostgreSQL request store
     set:

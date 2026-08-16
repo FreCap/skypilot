@@ -7,6 +7,7 @@ import pathlib
 import socket
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest import mock
@@ -268,6 +269,178 @@ def test_role_drain_marker_fails_readiness_before_shutdown(
     assert values['health_detail'] == {'phase': 'draining'}
 
 
+def test_role_drain_monitor_publishes_before_requesting_shutdown(tmp_path):
+    drain_marker = tmp_path / 'draining'
+    lease = mock.Mock()
+
+    def assert_drain_was_published() -> bool:
+        lease.begin_draining.assert_called_once_with()
+        return True
+
+    shutdown_requested = mock.Mock(side_effect=assert_drain_was_published)
+    monitor = runtime._RoleDrainMarkerMonitor(  # pylint: disable=protected-access
+        lease,
+        shutdown_requested,
+        marker_path=str(drain_marker),
+        poll_seconds=0.001)
+    monitor.start()
+    try:
+        drain_marker.touch()
+        deadline = time.monotonic() + 2
+        while not shutdown_requested.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+    finally:
+        monitor.stop()
+
+    shutdown_requested.assert_called_once_with()
+
+
+def test_role_drain_monitor_still_shuts_down_when_publication_fails(tmp_path):
+    drain_marker = tmp_path / 'draining'
+    lease = mock.Mock()
+    lease.begin_draining.side_effect = RuntimeError('database unavailable')
+    shutdown_requested = mock.Mock()
+    monitor = runtime._RoleDrainMarkerMonitor(  # pylint: disable=protected-access
+        lease,
+        shutdown_requested,
+        marker_path=str(drain_marker),
+        poll_seconds=0.001)
+    monitor.start()
+    try:
+        drain_marker.touch()
+        deadline = time.monotonic() + 2
+        while not shutdown_requested.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+    finally:
+        monitor.stop()
+
+    lease.begin_draining.assert_called_once_with()
+    shutdown_requested.assert_called_once_with()
+
+
+def test_role_drain_monitor_bounds_hung_publication(tmp_path):
+    drain_marker = tmp_path / 'draining'
+    publication_release = threading.Event()
+    lease = mock.Mock()
+    lease.begin_draining.side_effect = publication_release.wait
+    shutdown_requested = mock.Mock()
+    monitor = runtime._RoleDrainMarkerMonitor(  # pylint: disable=protected-access
+        lease,
+        shutdown_requested,
+        marker_path=str(drain_marker),
+        poll_seconds=0.001,
+        publication_wait_seconds=0.01)
+    monitor.start()
+    try:
+        drain_marker.touch()
+        deadline = time.monotonic() + 2
+        while not shutdown_requested.called and time.monotonic() < deadline:
+            time.sleep(0.001)
+    finally:
+        monitor.stop()
+        publication_release.set()
+
+    shutdown_requested.assert_called_once_with()
+
+
+def test_role_drain_monitor_waits_for_role_signal_handler(tmp_path):
+    drain_marker = tmp_path / 'draining'
+    lease = mock.Mock()
+    shutdown_requested = mock.Mock(side_effect=[False, True])
+    monitor = runtime._RoleDrainMarkerMonitor(  # pylint: disable=protected-access
+        lease,
+        shutdown_requested,
+        marker_path=str(drain_marker),
+        poll_seconds=0.001)
+    monitor.start()
+    try:
+        drain_marker.touch()
+        deadline = time.monotonic() + 2
+        while shutdown_requested.call_count < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+    finally:
+        monitor.stop()
+
+    lease.begin_draining.assert_called_once_with()
+    assert shutdown_requested.call_count == 2
+
+
+def test_runtime_shutdown_waits_until_sigterm_handler_is_installed(monkeypatch):
+    terminate = mock.Mock()
+    monkeypatch.setattr(runtime.signal, 'getsignal',
+                        lambda signum: runtime.signal.SIG_DFL)
+    monkeypatch.setattr(runtime.os, 'kill', terminate)
+
+    assert not runtime._request_runtime_shutdown_when_ready(  # pylint: disable=protected-access
+    )
+    terminate.assert_not_called()
+
+
+def test_stale_drain_marker_is_cleared_without_erasing_current_drain(
+        monkeypatch, tmp_path):
+    drain_marker = tmp_path / 'draining'
+    monkeypatch.setattr(runtime.request_storage, 'ROLE_DRAIN_MARKER_PATH',
+                        str(drain_marker))
+    drain_marker.touch()
+    marker_time = drain_marker.stat().st_mtime
+
+    assert runtime.request_storage.clear_stale_role_drain_marker(marker_time +
+                                                                 1)
+    assert not drain_marker.exists()
+
+    drain_marker.touch()
+    marker_time = drain_marker.stat().st_mtime
+    assert not runtime.request_storage.clear_stale_role_drain_marker(
+        marker_time - 1)
+    assert drain_marker.exists()
+
+
+def test_stale_drain_marker_cleanup_revalidates_before_unlink(
+        monkeypatch, tmp_path):
+    drain_marker = tmp_path / 'draining'
+    monkeypatch.setattr(runtime.request_storage, 'ROLE_DRAIN_MARKER_PATH',
+                        str(drain_marker))
+    drain_marker.touch()
+    original_stat = os.stat
+    stale_stat = original_stat(drain_marker)
+    calls = 0
+
+    def stat_with_concurrent_prestop(path):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            os.utime(drain_marker,
+                     ns=(stale_stat.st_atime_ns,
+                         stale_stat.st_mtime_ns + 1_000_000_000))
+        return original_stat(path)
+
+    monkeypatch.setattr(runtime.request_storage.os, 'stat',
+                        stat_with_concurrent_prestop)
+
+    assert not runtime.request_storage.clear_stale_role_drain_marker(
+        stale_stat.st_mtime + 1)
+    assert original_stat(drain_marker)
+
+
+def test_early_execution_fence_attempts_every_boundary_and_reports_failure():
+    failed_worker = mock.Mock()
+    failed_worker.request_shutdown.side_effect = RuntimeError('fence failed')
+    healthy_worker = mock.Mock()
+    managed_refresh = mock.Mock()
+    managed_slots = mock.Mock()
+
+    fenced = runtime._fence_execution_admission(  # pylint: disable=protected-access
+        [failed_worker, healthy_worker],
+        managed_job_refresh=managed_refresh,
+        managed_job_slots=managed_slots)
+
+    assert not fenced
+    failed_worker.request_shutdown.assert_called_once_with()
+    healthy_worker.request_shutdown.assert_called_once_with()
+    managed_refresh.request_shutdown.assert_called_once_with()
+    managed_slots.request_shutdown.assert_called_once_with()
+
+
 def test_api_role_starts_only_public_server(monkeypatch):
     background = _BackgroundLoop()
     lease = mock.Mock()
@@ -290,11 +463,14 @@ def test_api_role_starts_only_public_server(monkeypatch):
 
 
 def test_executor_role_starts_workers_without_public_server(monkeypatch):
+    lifecycle = mock.Mock()
     background = _BackgroundLoop()
     lease = mock.Mock()
     config = mock.Mock()
     queue_server = mock.Mock()
     worker = mock.Mock()
+    lifecycle.attach_mock(worker.request_shutdown, 'fence_claims')
+    lifecycle.attach_mock(lease.set_ready, 'set_ready')
     state = runtime.RuntimeState('executor', config, lease, False)
     run_uvicorn = mock.Mock()
     health_server = mock.Mock()
@@ -330,6 +506,9 @@ def test_executor_role_starts_workers_without_public_server(monkeypatch):
                   }),
         mock.call(False, health_detail={'phase': 'draining'}),
     ]
+    draining = mock.call.set_ready(False, health_detail={'phase': 'draining'})
+    assert lifecycle.mock_calls.index(
+        mock.call.fence_claims()) < lifecycle.mock_calls.index(draining)
     health_server.start.assert_called_once_with()
     health_server.stop.assert_called_once_with()
     lease.stop.assert_called_once_with()
@@ -726,6 +905,7 @@ def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
     queue_server = mock.Mock()
     lifecycle = mock.Mock()
     lifecycle.attach_mock(instance_lease.set_ready, 'set_ready')
+    lifecycle.attach_mock(worker.request_shutdown, 'fence_claims')
     background.stop = mock.Mock(
         side_effect=lambda: setattr(background, 'stopped', True))
     lifecycle.attach_mock(background.stop, 'background_stop')
@@ -778,6 +958,8 @@ def test_controller_role_becomes_unready_before_graceful_release(monkeypatch):
                                        'controller_generation': 8,
                                    })
     assert draining in lifecycle.mock_calls
+    assert lifecycle.mock_calls.index(
+        mock.call.fence_claims()) < lifecycle.mock_calls.index(draining)
     assert lifecycle.mock_calls.index(draining) < lifecycle.mock_calls.index(
         mock.call.release())
     assert lifecycle.mock_calls.index(
