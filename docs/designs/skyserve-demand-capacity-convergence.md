@@ -467,7 +467,7 @@ clocks. Overlaying a fresh or unavailable durable request report therefore
 cannot revive stale logical ready capacity or invalidate a fresh controller
 capacity observation.
 
-Current reviewed size: 2,814 additions and 85 deletions across 38 files,
+Current reviewed size: 2,851 additions and 90 deletions across 38 files,
 mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
 bounded report validation, and PostgreSQL migration matrix account for the
@@ -591,7 +591,7 @@ controller-sync endpoint may still accept routing/drain reports during the
 transition, but it cannot call `collect_request_information`; only the durable
 reader may advance autoscaler demand state.
 
-Reviewed P2b2 size: 40 files, 3,973 additions and 194 deletions.
+Reviewed P2b2 size: 40 files, 4,021 additions and 197 deletions.
 This is large and above the original 1,200--2,000-line estimate because it
 includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
 races, controller ordering tests, strict route/content/LB-generation
