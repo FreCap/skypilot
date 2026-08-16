@@ -538,6 +538,15 @@ export function normalizeService(record) {
   const normalizedRequestRate = Number.isFinite(requestRate)
     ? requestRate
     : null;
+  const rawObservedReadyReplicas = record.observed_ready_replicas;
+  const observedReadyReplicas =
+    Number.isInteger(rawObservedReadyReplicas) && rawObservedReadyReplicas >= 0
+      ? rawObservedReadyReplicas
+      : null;
+  const observedReadyReplicasFresh =
+    typeof record.observed_ready_replicas_fresh === 'boolean'
+      ? record.observed_ready_replicas_fresh
+      : null;
   const costPerThousandRequests =
     pricedReplicas.length > 0 && normalizedRequestRate > 0
       ? // Lower bound when replicas with unknown prices are excluded: known
@@ -671,6 +680,8 @@ export function normalizeService(record) {
     requestQueueDepth: record.request_queue_depth ?? null,
     rejectedRequests: record.rejected_requests ?? null,
     requestStatsAgeSeconds: record.request_stats_age_seconds ?? null,
+    observedReadyReplicas,
+    observedReadyReplicasFresh,
     costPerThousandRequests,
     replicaHistory: normalizeReplicaHistory(record.replica_status_history),
     replicas,

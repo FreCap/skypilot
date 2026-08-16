@@ -3055,6 +3055,7 @@ class TestServiceStatusEndpointSnapshot:
         response.json.return_value = {
             'target_num_replicas': 1,
             'ready_replicas': 7,
+            'report_age_seconds': 4.0,
         }
         with mock.patch(
                 'sky.serve.serve_utils.serve_state.get_service_from_name',
@@ -3084,6 +3085,50 @@ class TestServiceStatusEndpointSnapshot:
         assert status is not None
         for key, value in expected.items():
             assert status[key] == value
+        assert status['observed_ready_replicas_fresh'] is True
+
+    def test_stale_observed_logical_capacity_does_not_replace_replica_state(
+            self):
+        service_record = {
+            'name': 'svc-a',
+            'pool': False,
+            'hash': 'incarnation-a',
+            'logical_replica_semantics': True,
+        }
+        response = mock.Mock()
+        response.json.return_value = {
+            'target_num_replicas': 0,
+            'ready_replicas': 262,
+            'report_age_seconds': 700.0,
+        }
+        with mock.patch(
+                'sky.serve.serve_utils.serve_state.get_service_from_name',
+                return_value=service_record), \
+             mock.patch('sky.serve.serve_utils.serve_state.'
+                        'get_replica_status_and_capacity_counts',
+                        return_value=({
+                            'READY': 62,
+                            'PROVISIONING': 2,
+                        }, {
+                            'READY': 62,
+                            'PROVISIONING': 2,
+                        })), \
+             mock.patch('sky.serve.serve_utils.'
+                        '_get_to_controller_with_retry',
+                        return_value=response):
+            status = serve_utils._get_service_status(
+                'svc-a',
+                pool=False,
+                with_replica_info=False,
+                with_replica_counts=True,
+                with_yaml=False,
+                with_target_num_replicas=True)
+
+        assert status is not None
+        assert status['ready_replicas'] == 62
+        assert status['total_replicas'] == 64
+        assert status['observed_ready_replicas'] == 262
+        assert status['observed_ready_replicas_fresh'] is False
 
     def test_service_status_propagates_reserved_fill_reconciliation(self):
         service_record = {

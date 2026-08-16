@@ -3245,7 +3245,7 @@ describe('ServiceDetailCard cost and request estimates', () => {
     );
 
     expect(
-      screen.getByText('Logical capacity (ready/non-failed)')
+      screen.getByText('Fleet-wide logical slots (ready/non-failed)')
     ).toBeTruthy();
     expect(
       screen.getByText(/1\/2 physical backends \(ready\/non-failed\)/)
@@ -3253,6 +3253,100 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(screen.getByText(/1 past attempt retained/)).toBeTruthy();
     expect(screen.queryByText(/failed or cleanup-uncertain/)).toBeNull();
     expect(screen.queryByText('Replicas (ready/non-failed)')).toBeNull();
+    expect(
+      screen.getByText(/not a GPU count for the current cluster/)
+    ).toBeTruthy();
+  });
+
+  it('separates a stale load-balancer observation from current replica state', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'boltz-l4-fleet',
+          status: 'READY',
+          uptime: null,
+          replicaUnit: 'logical',
+          replicasReady: 62,
+          replicasTotal: 64,
+          replicasFailed: 3911,
+          physicalReplicasReady: 62,
+          physicalReplicasTotal: 64,
+          physicalReplicasFailed: 3911,
+          observedReadyReplicas: 262,
+          observedReadyReplicasFresh: false,
+          requestStatsAgeSeconds: 700,
+          replicaStatusCounts: { READY: 62, PROVISIONING: 2, UNKNOWN: 3828 },
+          targetReplicas: 0,
+          endpoint: null,
+          policy: 'autoscaling',
+          loadBalancingPolicy: 'instance_aware_least_load',
+          requestedResources: 'H200:1',
+          activeVersions: [58],
+          estimatedHourlyCost: null,
+          spotHourlyCost: 0,
+          onDemandHourlyCost: 0,
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: null,
+          recentRequestCount: null,
+          requestWindowSeconds: null,
+          inFlightRequests: null,
+          requestQueueDepth: null,
+          rejectedRequests: null,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('62/64')).toBeTruthy();
+    expect(
+      screen.getByText(/last load-balancer observation \(262 logical slots\)/)
+    ).toBeTruthy();
+    expect(screen.getAllByText(/700s old/)).toHaveLength(2);
+  });
+
+  it('warns when controller-recorded logical slots are not routing-ready', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'boltz-l4-fleet',
+          status: 'REPLICA_INIT',
+          uptime: null,
+          replicaUnit: 'logical',
+          replicasReady: 279,
+          replicasTotal: 288,
+          replicasFailed: 0,
+          physicalReplicasReady: 279,
+          physicalReplicasTotal: 288,
+          physicalReplicasFailed: 0,
+          replicaStatusCounts: { READY: 279, PROVISIONING: 9 },
+          targetReplicas: 0,
+          endpoint: null,
+          policy: 'autoscaling',
+          loadBalancingPolicy: 'instance_aware_least_load',
+          requestedResources: 'H200:1',
+          activeVersions: [58],
+          estimatedHourlyCost: null,
+          spotHourlyCost: 0,
+          onDemandHourlyCost: 0,
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: null,
+          recentRequestCount: null,
+          requestWindowSeconds: null,
+          inFlightRequests: null,
+          requestQueueDepth: null,
+          rejectedRequests: null,
+          requestStatsAgeSeconds: null,
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('Routing unverified')).toBeTruthy();
+    expect(
+      screen.getByText(
+        /These are controller-recorded slots, not confirmed live GPU endpoints/
+      )
+    ).toBeTruthy();
   });
 
   it('does not show a request total when durable history is unavailable', () => {

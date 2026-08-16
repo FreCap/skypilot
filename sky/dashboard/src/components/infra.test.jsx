@@ -318,6 +318,8 @@ describe('ContextDetails', () => {
               'drill (-500)': 2,
               'inference-low (-1000)': 4,
             },
+            gpu_preemptible_services: 0,
+            gpu_preemptible_service_breakdown: {},
           },
         ]}
         nodesInContext={[node]}
@@ -329,9 +331,11 @@ describe('ContextDetails', () => {
     expect(screen.getByTitle('2 free')).toBeInTheDocument();
     // Classes are listed largest-first under the summary line. Asserted on the
     // raw attribute because title queries collapse the newlines away.
-    expect(screen.getByTitle(/6 other preemptible/)).toHaveAttribute(
+    expect(
+      screen.getByTitle(/6 preemptible attributed to non-SkyServe pods/)
+    ).toHaveAttribute(
       'title',
-      '6 other preemptible (reclaimable by higher-priority workloads)\n' +
+      '6 preemptible attributed to non-SkyServe pods (reclaimable by higher-priority workloads)\n' +
         'inference-low (-1000): 4\n' +
         'drill (-500): 2'
     );
@@ -364,15 +368,54 @@ describe('ContextDetails', () => {
 
     expect(screen.getByTitle('8 used')).toBeInTheDocument();
     expect(screen.getByTitle('2 free')).toBeInTheDocument();
-    expect(screen.getByTitle(/4 SkyServe preemptible/)).toHaveAttribute(
+    expect(
+      screen.getByTitle(/4 preemptible attributed to SkyServe pods/)
+    ).toHaveAttribute(
       'title',
-      '4 SkyServe preemptible (reclaimable by higher-priority workloads)\n' +
+      '4 preemptible attributed to SkyServe pods (reclaimable by higher-priority workloads)\n' +
         'boltz-l4-fleet: 4'
     );
-    expect(screen.getByTitle(/2 other preemptible/)).toHaveAttribute(
+    expect(
+      screen.getByTitle(/2 preemptible attributed to non-SkyServe pods/)
+    ).toHaveAttribute(
       'title',
-      '2 other preemptible (reclaimable by higher-priority workloads)'
+      '2 preemptible attributed to non-SkyServe pods (reclaimable by higher-priority workloads)'
     );
+  });
+
+  it('does not turn missing workload identity into zero SkyServe pods', () => {
+    render(
+      <ContextDetails
+        contextName="prod"
+        gpusInContext={[
+          {
+            gpu_name: 'H200',
+            gpu_requestable_qty_per_node: 8,
+            gpu_total: 512,
+            gpu_free: 79,
+            gpu_not_ready: 0,
+            gpu_preemptible: 432,
+            gpu_preemptible_breakdown: {
+              'ma-lt (31)': 176,
+              'priority 0': 256,
+            },
+            gpu_preemptible_services: null,
+            gpu_preemptible_service_breakdown: null,
+          },
+        ]}
+        nodesInContext={[node]}
+      />
+    );
+
+    expect(
+      screen.getByTitle(/432 preemptible; SkyServe pod attribution unavailable/)
+    ).toHaveAttribute(
+      'title',
+      '432 preemptible; SkyServe pod attribution unavailable (pods lack durable SkyPilot workload identity)\n' +
+        'priority 0: 256\n' +
+        'ma-lt (31): 176'
+    );
+    expect(screen.queryByTitle(/0 SkyServe/)).not.toBeInTheDocument();
   });
 
   it('renders a single used block when nothing is preemptible', async () => {
