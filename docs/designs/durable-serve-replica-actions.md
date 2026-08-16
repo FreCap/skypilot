@@ -225,9 +225,22 @@ In the HA chart, Kubernetes starts the Pod termination-grace countdown before
 running `preStop`, while `preStop` spends `readinessDrainSeconds` only touching
 the readiness marker and sleeping. The application still receives
 `SKYPILOT_GRACE_PERIOD_SECONDS` equal to the complete Pod grace period. It can
-therefore budget work past the real SIGKILL deadline. This timing defect is not
-claimed as the proven cause of replica 52689, but it can produce the same class
-of missing execution receipt during any rollout.
+therefore budget work past the real SIGKILL deadline.
+
+EKS audit and PostgreSQL evidence prove that this timing defect caused replica
+52689's missing receipt. Request `e8522a85-33da-4c7c-b5bb-f9dfce503d68` was
+created at 13:51:14.086 UTC. The ReplicaSet controller deleted exact Pod
+`skypilot-api-server-57d7dd9584-mqglt`, UID
+`c74d8735-f5f9-4e9a-8bd1-19e69f8b68ea`, at 13:51:15.759 UTC (audit ID
+`877cb2bc-db4b-405d-b9ff-23121728c40b`). The rendered Pod had a 60-second
+termination grace and a 20-second readiness `preStop`, while the application
+was incorrectly given the full 60 seconds. Kubernetes recorded the API
+container terminated with exit 137 at 13:52:16 UTC (audit ID
+`50a76fdf-882f-4941-9667-e9c83f8ff8ec`), and the kubelet finalized the exact
+Pod with grace zero at 13:52:16.990 UTC. Only afterward did the request lease
+expire at 13:52:36.525 UTC and the request become `CANCELLED` at 13:53:01.138
+UTC without an execution-quiescence receipt. This is a rollout retirement
+failure, not provider scarcity.
 
 The steady-state correction makes retirement an application-visible protocol,
 not an incidental signal sequence:
