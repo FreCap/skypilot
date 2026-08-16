@@ -1239,7 +1239,11 @@ Python compilation, and `git diff --check` pass. G1Sb is implemented on
 `feat/serve-executor-termination-evidence`: API013, the controller-generation-
 owned observer, immutable evidence writer, transition Helm surface and focused
 real-PostgreSQL/observer/Helm tests pass locally. G1Sc is the next stacked
-change and remains blocked from merge until the qualification gates below.
+change, authored as draft PR #1523 on
+`cleanup/serve-executor-retirement-transition`. G1Sb is draft PR #1522 and
+G1Sa is draft PR #1519. G1Sc removes the observer flag, legacy grace-variable
+fallback, and sleep-only chart projection; it remains blocked from merge until
+the qualification gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -2539,9 +2543,10 @@ approved canary:
 
 - [x] Author, review, and merge G1 (API011/Serve047) and demand convergence
   (API012/Serve048--050).
-- [ ] Author G1Sb executor-termination evidence on API013 and restack the
-  blocked G2 cleanup onto API014/Serve051; link the PRs and state G1Sc/G2's
-  exact merge gates.
+- [ ] G1Sb executor-termination evidence is authored on API013 as draft PR
+  #1522 and G1Sc is authored as draft PR #1523 with its exact merge gate.
+  Restack the blocked G2 cleanup onto API014/Serve051 before completing this
+  combined gate.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
