@@ -158,10 +158,16 @@ three provisioning rows require typed reconciliation:
 - replica 52688 has a present A100-80GB provider cluster and a succeeded,
   exactly quiesced launch request;
 - replica 52689 has a present A100 provider cluster and a cancelled request
-  whose execution lease expired without an execution-quiescence receipt. Its
-  old exact API Pod UID is absent, but that is executor-termination evidence,
-  not a fabricated request receipt. This one row currently causes the legacy
-  recovery pass to time out every 30 seconds; and
+  whose execution lease expired without an execution-quiescence receipt. The
+  exact launch began at 13:51:14.086 UTC, its ReplicaSet deleted owner Pod UID
+  `c74d8735-f5f9-4e9a-8bd1-19e69f8b68ea` at 13:51:15.759 UTC, and Kubernetes
+  recorded the API container killed with exit 137 at the 60-second Pod grace
+  deadline at 13:52:16 UTC. The lease expired only afterward. This proves a
+  rollout retirement failure, including the chart's overlapping 20-second
+  readiness sleep and full-grace application budget, caused the missing
+  receipt. The exact failed-container audit record is executor-termination
+  evidence, not a fabricated request receipt. This one row currently causes
+  the legacy recovery pass to time out every 30 seconds; and
 - replica 52690 has an `INIT` H200 provider record and an exactly quiesced
   failed request. Its PHX Kubernetes admission failed because the Pod omitted
   the server-owned `kueue.x-k8s.io/queue-name` label. This is a separate
