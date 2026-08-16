@@ -22,6 +22,7 @@ from sky import global_user_state
 from sky.resources import Resources
 from sky.serve import constants
 from sky.serve import controller_transport
+from sky.serve import demand_state
 from sky.serve import maintenance
 from sky.serve import ordinary_launch_binding
 from sky.serve import reserved_capacity
@@ -3076,10 +3077,8 @@ class TestServiceStatusEndpointSnapshot:
                         return_value=response), \
              mock.patch('sky.serve.serve_utils.demand_state.'
                         'get_request_summary',
-                        return_value={
-                            'request_telemetry_state': 'unavailable',
-                            'request_telemetry_reason': 'no_report_received',
-                        }):
+                        return_value=demand_state.unavailable_request_summary(
+                            'test_controller_capacity')):
             status = serve_utils._get_service_status(
                 'svc-a',
                 pool=False,
@@ -3092,6 +3091,8 @@ class TestServiceStatusEndpointSnapshot:
         for key, value in expected.items():
             assert status[key] == value
         assert status['observed_ready_replicas_fresh'] is True
+        assert status['observed_ready_replicas_age_seconds'] == 4.0
+        assert status['request_stats_age_seconds'] is None
 
     def test_stale_observed_logical_capacity_does_not_replace_replica_state(
             self):
@@ -3121,7 +3122,18 @@ class TestServiceStatusEndpointSnapshot:
                         })), \
              mock.patch('sky.serve.serve_utils.'
                         '_get_to_controller_with_retry',
-                        return_value=response):
+                        return_value=response), \
+             mock.patch('sky.serve.serve_utils.demand_state.'
+                        'get_request_summary',
+                        return_value={
+                            **demand_state.unavailable_request_summary(
+                                'test_controller_capacity'),
+                            'request_telemetry_state': 'fresh',
+                            'request_telemetry_reason': 'complete',
+                            'request_telemetry_compatibility_complete': True,
+                            'request_reporter_count': 1,
+                            'request_stats_age_seconds': 1.0,
+                        }):
             status = serve_utils._get_service_status(
                 'svc-a',
                 pool=False,
@@ -3135,6 +3147,8 @@ class TestServiceStatusEndpointSnapshot:
         assert status['total_replicas'] == 64
         assert status['observed_ready_replicas'] == 262
         assert status['observed_ready_replicas_fresh'] is False
+        assert status['observed_ready_replicas_age_seconds'] == 700.0
+        assert status['request_stats_age_seconds'] == 1.0
 
     def test_service_status_propagates_reserved_fill_reconciliation(self):
         service_record = {
@@ -3161,7 +3175,11 @@ class TestServiceStatusEndpointSnapshot:
                 return_value=service_record), \
              mock.patch('sky.serve.serve_utils.'
                         '_get_to_controller_with_retry',
-                        return_value=response):
+                        return_value=response), \
+             mock.patch('sky.serve.serve_utils.demand_state.'
+                        'get_request_summary',
+                        return_value=demand_state.unavailable_request_summary(
+                            'test_controller_capacity')):
             status = serve_utils._get_service_status(
                 'svc-a',
                 pool=False,

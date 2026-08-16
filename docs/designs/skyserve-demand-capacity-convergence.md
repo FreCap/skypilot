@@ -360,6 +360,12 @@ contract. During transition the LB sends both old controller sync data and the
 new durable report. The durable feed is authoritative for display only when
 fresh; it has no scaling or launch authority in P2a.
 
+The status projection keeps the durable request-report age and the
+controller's ready-capacity observation age as separate fields and freshness
+clocks. Overlaying a fresh or unavailable durable request report therefore
+cannot revive stale logical ready capacity or invalidate a fresh controller
+capacity observation.
+
 Current reviewed size: approximately 2,650 source/test/UI lines across 33
 files, mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
