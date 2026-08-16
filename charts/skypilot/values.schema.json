@@ -89,6 +89,9 @@
                             "type": "integer",
                             "minimum": 1
                         },
+                        "executorTerminationEvidenceObserverEnabled": {
+                            "type": "boolean"
+                        },
                         "finalCommitSeconds": {
                             "type": "integer",
                             "minimum": 1

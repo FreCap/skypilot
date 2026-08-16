@@ -93,16 +93,24 @@ async def test_runtime_daemon_inventory_and_skip_evaluated_once(monkeypatch):
     monkeypatch.setattr(runtime, '_executor_process_start_time_ticks',
                         lambda pid: 123)
     monkeypatch.setattr(runtime, '_singleton_task', singleton)
+    start_observer = mock.Mock(return_value=None)
+    monkeypatch.setattr(runtime.executor_termination_observer, 'start',
+                        start_observer)
+    pod_identity = request_postgres.ServerPodIdentity(name='controller',
+                                                      namespace='skypilot',
+                                                      uid=_CONTROLLER_OWNER[0],
+                                                      ip='10.0.0.1')
     capability = controller_capability.generate()
     controller_capability.install_process_local(capability)
 
     try:
         selected = await runtime._register_runtime_daemons_async(
-            background, 4, _CONTROLLER_OWNER)
+            background, 4, _CONTROLLER_OWNER, pod_identity)
     finally:
         controller_capability.clear_process_local()
 
     assert selected == ('first-daemon',)
+    start_observer.assert_called_once_with(_CONTROLLER_OWNER, pod_identity)
     first.should_skip.assert_called_once_with()
     second.should_skip.assert_called_once_with()
     singleton.assert_called_once_with('internal-daemon:first-daemon', mock.ANY)

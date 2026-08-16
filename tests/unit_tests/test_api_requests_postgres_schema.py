@@ -53,9 +53,9 @@ def test_postgres_record_schema_topology() -> None:
              'claim_generation', 'updated_at'),
         'api_request_store_metadata': ('key', 'value', 'updated_at'),
         'api_server_instances':
-            ('instance_id', 'role', 'pod_name', 'pod_uid', 'pod_ip', 'version',
-             'started_at', 'heartbeat_at', 'draining_at', 'ready',
-             'health_detail', 'supported_handlers',
+            ('instance_id', 'role', 'pod_name', 'pod_uid', 'pod_namespace',
+             'pod_ip', 'version', 'started_at', 'heartbeat_at', 'draining_at',
+             'ready', 'health_detail', 'supported_handlers',
              'supported_payload_versions', 'request_storage_backend',
              'request_queue_backend', 'execution_quiescence_capable',
              'ordinary_launch_binding_capable',
@@ -66,7 +66,18 @@ def test_postgres_record_schema_topology() -> None:
              'non_pool_launch_receipt_protocol_version',
              'ordered_capacity_admission_capable',
              'ordered_capacity_admission_protocol_version',
-             'ordered_capacity_admission_cohort_epoch'),
+             'ordered_capacity_admission_cohort_epoch',
+             'executor_termination_evidence_capable',
+             'executor_termination_evidence_protocol_version'),
+        'api_request_executor_termination_evidence':
+            ('evidence_id', 'request_id', 'execution_generation', 'claim_token',
+             'worker_instance_id', 'worker_role', 'kubernetes_cluster_uid',
+             'pod_namespace', 'pod_name', 'pod_uid', 'container_name',
+             'pod_resource_version', 'pod_deletion_timestamp',
+             'container_finished_at', 'container_exit_code', 'container_reason',
+             'source', 'evidence_payload', 'evidence_digest',
+             'observer_instance_id', 'observer_controller_generation',
+             'observed_at', 'created_at'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
              'generation_lock_key', 'origin_capability_sha256', 'acquired_at',
@@ -102,6 +113,8 @@ def test_postgres_schema_objects_keep_historical_facade_identity() -> None:
     assert postgres.QUEUE is postgres_schema.QUEUE
     assert postgres.STORE_METADATA is postgres_schema.STORE_METADATA
     assert postgres.SERVER_INSTANCES is postgres_schema.SERVER_INSTANCES
+    assert (postgres.EXECUTOR_TERMINATION_EVIDENCE
+            is postgres_schema.EXECUTOR_TERMINATION_EVIDENCE)
     assert (postgres.CONTROLLER_LEADERSHIP
             is postgres_schema.CONTROLLER_LEADERSHIP)
     assert (postgres.CONTROLLER_ACTION_RESERVATIONS

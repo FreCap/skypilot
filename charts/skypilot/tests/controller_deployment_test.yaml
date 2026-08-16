@@ -135,6 +135,11 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
+            name: SKYPILOT_API_EXECUTOR_TERMINATION_EVIDENCE_OBSERVER_ENABLED
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
             name: SKYPILOT_API_SERVER_INSTANCE_ID
             valueFrom:
               fieldRef:
@@ -189,6 +194,25 @@ tests:
           content:
             name: metrics
             containerPort: 9090
+
+  - it: should enable termination evidence only for the explicit HA cohort
+    set:
+      apiService.highAvailability.enabled: true
+      apiService.highAvailability.executorTerminationEvidenceObserverEnabled: true
+      apiService.replicas: 2
+      apiService.upgradeStrategy: RollingUpdate
+      apiService.dbConnectionSecretName: external-db
+      requestStore.backend: postgres
+      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
+      storage.enabled: true
+      storage.accessMode: ReadWriteMany
+      controllerService.replicas: 2
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_API_EXECUTOR_TERMINATION_EVIDENCE_OBSERVER_ENABLED
+            value: "true"
 
   - it: should expose controller multiprocess metrics from leaders and standbys
     set:

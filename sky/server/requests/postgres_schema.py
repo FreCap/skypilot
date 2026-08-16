@@ -303,6 +303,7 @@ SERVER_INSTANCES = sqlalchemy.Table(
     sqlalchemy.Column('role', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('pod_name', sqlalchemy.Text),
     sqlalchemy.Column('pod_uid', sqlalchemy.Text),
+    sqlalchemy.Column('pod_namespace', sqlalchemy.Text),
     sqlalchemy.Column('pod_ip', sqlalchemy.Text),
     sqlalchemy.Column('version', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('started_at',
@@ -362,6 +363,12 @@ SERVER_INSTANCES = sqlalchemy.Table(
                       sqlalchemy.Integer),
     sqlalchemy.Column('ordered_capacity_admission_cohort_epoch',
                       sqlalchemy.BigInteger),
+    sqlalchemy.Column('executor_termination_evidence_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('executor_termination_evidence_protocol_version',
+                      sqlalchemy.Integer),
     sqlalchemy.CheckConstraint(
         '((NOT non_pool_launch_binding_capable AND '
         'num_nonnulls(non_pool_launch_binding_protocol_version, '
@@ -394,7 +401,100 @@ SERVER_INSTANCES = sqlalchemy.Table(
         'ordered_capacity_admission_protocol_version = 1 AND '
         'ordered_capacity_admission_cohort_epoch = 1))',
         name='ck_api_server_instances_ordered_capacity_complete'),
+    sqlalchemy.CheckConstraint(
+        '((NOT executor_termination_evidence_capable AND '
+        'executor_termination_evidence_protocol_version IS NULL) OR '
+        '(executor_termination_evidence_capable AND '
+        'executor_termination_evidence_protocol_version = 1))',
+        name='ck_api_server_instances_executor_termination_evidence'),
 )
+EXECUTOR_TERMINATION_EVIDENCE = sqlalchemy.Table(
+    'api_request_executor_termination_evidence',
+    metadata,
+    sqlalchemy.Column('evidence_id',
+                      postgresql.UUID(as_uuid=True),
+                      primary_key=True),
+    sqlalchemy.Column('request_id', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('execution_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('claim_token',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('worker_instance_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('worker_role', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('kubernetes_cluster_uid', sqlalchemy.Text,
+                      nullable=False),
+    sqlalchemy.Column('pod_namespace', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pod_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pod_uid', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('container_name', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pod_resource_version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pod_deletion_timestamp',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('container_finished_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False),
+    sqlalchemy.Column('container_exit_code', sqlalchemy.Integer,
+                      nullable=False),
+    sqlalchemy.Column('container_reason', sqlalchemy.Text),
+    sqlalchemy.Column('source', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('evidence_payload',
+                      postgresql.JSONB(none_as_null=True),
+                      nullable=False),
+    sqlalchemy.Column('evidence_digest', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('observer_instance_id',
+                      postgresql.UUID(as_uuid=True),
+                      nullable=False),
+    sqlalchemy.Column('observer_controller_generation',
+                      sqlalchemy.BigInteger,
+                      nullable=False),
+    sqlalchemy.Column('observed_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.Column('created_at',
+                      sqlalchemy.DateTime(timezone=True),
+                      nullable=False,
+                      server_default=sqlalchemy.func.clock_timestamp()),
+    sqlalchemy.CheckConstraint(
+        'execution_generation > 0 AND '
+        'observer_controller_generation > 0 AND '
+        'container_exit_code >= 0',
+        name='ck_api013_executor_termination_numeric'),
+    sqlalchemy.CheckConstraint(
+        'length(request_id) > 0 AND length(worker_role) > 0 AND '
+        'length(kubernetes_cluster_uid) > 0 AND length(pod_namespace) > 0 AND '
+        'length(pod_name) > 0 AND length(pod_uid) > 0 AND '
+        'length(container_name) > 0 AND length(pod_resource_version) > 0',
+        name='ck_api013_executor_termination_text'),
+    sqlalchemy.CheckConstraint(
+        "pod_uid = worker_instance_id::text AND worker_role IN "
+        "('all', 'executor', 'controller')",
+        name='ck_api013_executor_termination_worker'),
+    sqlalchemy.CheckConstraint(
+        'container_finished_at >= pod_deletion_timestamp AND '
+        'observed_at >= container_finished_at',
+        name='ck_api013_executor_termination_time'),
+    sqlalchemy.CheckConstraint(
+        "jsonb_typeof(evidence_payload) = 'object' AND "
+        "evidence_digest ~ '^[0-9a-f]{64}$'",
+        name='ck_api013_executor_termination_payload'),
+    sqlalchemy.CheckConstraint("source = 'KUBERNETES_POD_TERMINATED_V1'",
+                               name='ck_api013_executor_termination_source'),
+)
+sqlalchemy.Index('uq_api013_executor_termination_execution',
+                 EXECUTOR_TERMINATION_EVIDENCE.c.request_id,
+                 EXECUTOR_TERMINATION_EVIDENCE.c.execution_generation,
+                 EXECUTOR_TERMINATION_EVIDENCE.c.claim_token,
+                 EXECUTOR_TERMINATION_EVIDENCE.c.worker_instance_id,
+                 unique=True)
+sqlalchemy.Index('ix_api013_executor_termination_worker',
+                 EXECUTOR_TERMINATION_EVIDENCE.c.worker_instance_id,
+                 EXECUTOR_TERMINATION_EVIDENCE.c.container_finished_at)
 CONTROLLER_LEADERSHIP = sqlalchemy.Table(
     'api_controller_leadership',
     metadata,

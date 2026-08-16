@@ -1235,7 +1235,11 @@ merge-eligible until G1Sb and G1Sc are authored and linked. Its focused Python
 runtime, executor, shutdown-deadline, and wire-contract suites pass; all 160
 focused API/controller/executor Helm tests pass; the generated values schema is
 exact; and repository-wide mypy, changed-file pylint, dashboard lint/format,
-Python compilation, and `git diff --check` pass. G1Sb and G1Sc remain planned.
+Python compilation, and `git diff --check` pass. G1Sb is implemented on
+`feat/serve-executor-termination-evidence`: API013, the controller-generation-
+owned observer, immutable evidence writer, transition Helm surface and focused
+real-PostgreSQL/observer/Helm tests pass locally. G1Sc is the next stacked
+change and remains blocked from merge until the qualification gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1314,6 +1318,57 @@ the additive evidence schema remains unread-but-tolerated; it must not restore
 the sleep-only chart hook after the first service relies on early retirement.
 The stacked cleanup merges only after all old chart/runtime cohorts age beyond
 the stale-writer and quiescence horizons.
+
+#### G1Sb certificate contract
+
+API013 adds one append-only
+`api_request_executor_termination_evidence` relation. One row names the exact
+request ID, execution generation, claim token, worker-instance UUID, Kubernetes
+cluster UID, namespace, Pod name/UID, role container, Pod resource version,
+deletion timestamp, container termination outcome and finish timestamp,
+observer identity and controller generation, closed evidence source, canonical
+payload, and digest. The
+unique execution tuple is immutable and an exact replay is idempotent; a
+different payload for that tuple fails closed. PostgreSQL rejects every
+`UPDATE`, `DELETE`, and `TRUNCATE`; a later valid Pod resource version cannot
+replace the first certificate and does not interrupt observation of unrelated
+Pods. This relation is evidence only: its writer never changes request status,
+queue state, claim identity,
+`execution_quiescence_required`, `execution_quiesced_generation`, or an
+association resolution.
+
+Automatic source `KUBERNETES_POD_TERMINATED_V1` is deliberately narrower than
+Pod disappearance. A singleton controller observer must read the immutable
+`kube-system` Namespace UID for the current in-cluster API, then observe a Pod
+object whose UID equals the request's worker-instance and registered lease UID,
+whose namespace and name equal that lease, whose deletion timestamp is set,
+and whose role container is in a current `terminated` state with a finish time
+at or after deletion began. The observer records the Pod resource version and
+container exit details in the canonical payload. A `last_state.terminated`
+entry is never automatic authority: the same Pod UID can execute again after a
+liveness restart. `NotFound`, an expired lease, a replacement Pod, a missing
+process-map entry, a watch reconnect, or a Pod with a running/waiting target
+container records no certificate.
+
+The observer is dark behind one transition-only HA value in G1Sb. While dark,
+API013 readers and writers are deployed and mixed-version tolerant but no
+Kubernetes watch is admitted. Qualification enables it only for the exact test
+cohort, verifies its least-privilege release-namespace Pod get/list/watch RBAC,
+and injects both a planned deletion and a liveness restart. G1Sc removes the
+flag and mixed-version grace-variable fallback only after the complete cohort
+and crash-matrix gates pass. The existing reviewed Serve047 legacy attestation
+remains the only path for historical/incomplete infrastructure evidence; it is
+not converted into an API013 automatic certificate.
+
+API013 certificates are not cleanup authority by themselves. G2/API014 and
+Serve051 may consume one only as proof that the named executor can no longer
+create effects after `container_finished_at`. A request that crossed or may
+have crossed the effect boundary remains post-effect ambiguous. Any provider
+absence observation must begin after that timestamp, copy the exact certificate
+identity/digest into the locked association, and revalidate the request,
+certificate, provider physical UID, service owner, and replica under the
+canonical lock order before projection. Until that consumer exists, a
+certificate is diagnostic durable history and cannot unblock a successor.
 
 ### Historical R0 deployment record
 
