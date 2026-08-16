@@ -1,5 +1,9 @@
 """Retry and transport-failure policy for the SkyServe load balancer."""
 
+from collections.abc import Callable
+import types
+from typing import Any
+
 import httpx
 
 # HTTP semantics define these methods as idempotent: replay after an ambiguous
@@ -64,3 +68,41 @@ def _can_retry_proxy_failure(method: str, exc: Exception) -> bool:
     if method.upper() in _IDEMPOTENT_METHODS:
         return True
     return _is_definitely_not_dispatched(exc)
+
+
+_FACADE_GLOBAL_FUNCTION_NAMES = (
+    '_is_dead_connection_error',
+    '_is_definitely_not_dispatched',
+    '_can_retry_proxy_failure',
+)
+
+
+def _bind_facade_globals(
+    facade_globals: dict[str, Any]
+) -> tuple[Callable[[Exception], bool], Callable[[Exception], bool], Callable[
+    [str, Exception], bool]]:
+    """Bind extracted policy functions to their historical facade globals."""
+    facade_globals['_IDEMPOTENT_METHODS'] = _IDEMPOTENT_METHODS
+    for function_name in _FACADE_GLOBAL_FUNCTION_NAMES:
+        function = globals()[function_name]
+        rebound_function = types.FunctionType(
+            function.__code__,
+            facade_globals,
+            function.__name__,
+            function.__defaults__,
+            function.__closure__,
+        )
+        rebound_function.__kwdefaults__ = (None
+                                           if function.__kwdefaults__ is None
+                                           else function.__kwdefaults__.copy())
+        rebound_function.__annotations__ = function.__annotations__.copy()
+        rebound_function.__module__ = facade_globals['__name__']
+        rebound_function.__qualname__ = function.__qualname__
+        rebound_function.__dict__.update(function.__dict__)
+        type_params = getattr(function, '__type_params__', None)
+        if type_params is not None:
+            setattr(rebound_function, '__type_params__', type_params)
+        globals()[function_name] = rebound_function
+        facade_globals[function_name] = rebound_function
+    return (_is_dead_connection_error, _is_definitely_not_dispatched,
+            _can_retry_proxy_failure)

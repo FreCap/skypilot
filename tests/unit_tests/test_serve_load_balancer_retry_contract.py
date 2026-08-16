@@ -10,6 +10,7 @@ import pickle
 import subprocess
 import sys
 import textwrap
+from unittest import mock
 
 import httpx
 import pytest
@@ -93,6 +94,38 @@ def test_retry_policy_exception_contract() -> None:
     pre_dispatch = load_balancer._PreDispatchError('client unavailable')
     assert isinstance(pre_dispatch, RuntimeError)
     assert str(pre_dispatch) == 'client unavailable'
+
+
+def test_retry_policy_keeps_facade_dependency_patch_surface() -> None:
+    for name in ('_is_dead_connection_error', '_is_definitely_not_dispatched',
+                 '_can_retry_proxy_failure'):
+        assert getattr(load_balancer, name).__globals__ is vars(load_balancer)
+
+    class ReplacementPreDispatchError(RuntimeError):
+        pass
+
+    error = ReplacementPreDispatchError('replacement')
+    with mock.patch.object(load_balancer, '_PreDispatchError',
+                           ReplacementPreDispatchError):
+        assert load_balancer._is_definitely_not_dispatched(error)
+        assert load_balancer._can_retry_proxy_failure('POST', error)
+
+    class ReplacementRetriableStatusError(Exception):
+        pass
+
+    with mock.patch.object(load_balancer, '_RetriableStatusError',
+                           ReplacementRetriableStatusError):
+        assert load_balancer._can_retry_proxy_failure(
+            'POST', ReplacementRetriableStatusError('replacement'))
+
+    with mock.patch.object(load_balancer, '_IDEMPOTENT_METHODS',
+                           frozenset({'POST'})):
+        assert load_balancer._can_retry_proxy_failure('POST', RuntimeError())
+
+    with mock.patch.object(load_balancer,
+                           '_is_definitely_not_dispatched',
+                           return_value=True):
+        assert load_balancer._can_retry_proxy_failure('POST', RuntimeError())
 
 
 @pytest.mark.parametrize('first_module',
