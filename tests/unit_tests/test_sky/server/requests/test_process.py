@@ -779,8 +779,18 @@ def test_both_owners_hard_dead_with_active_effects_reports_ambiguous(tmp_path):
         assert not executor.has_idle_workers()
         with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
             executor.submit(dummy_task)
-        with pytest.raises(process.AmbiguousBoundaryError, match='poisoned'):
+        # ``future.result()`` publishes the ambiguity before the monitor
+        # thread's final callback/exit.  A zero-timeout shutdown racing that
+        # tail may correctly report the still-live receipt monitor first.
+        with pytest.raises((process.AmbiguousBoundaryError,
+                            process.BoundaryShutdownPendingError)) as error:
             executor.shutdown(timeout=0)
+        if isinstance(error.value, process.BoundaryShutdownPendingError):
+            with pytest.raises(process.AmbiguousBoundaryError,
+                               match='poisoned'):
+                executor.shutdown(timeout=20)
+        else:
+            assert 'poisoned' in str(error.value)
         assert poison_errors
     finally:
         if _identity_exists(handler):
