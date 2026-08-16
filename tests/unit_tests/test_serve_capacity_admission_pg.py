@@ -1,6 +1,7 @@
 """PostgreSQL contracts for ordered SkyServe capacity admission."""
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
+import dataclasses
 import time
 import uuid
 
@@ -210,7 +211,6 @@ def capacity_database(empty_postgres, monkeypatch):
 
 
 def _plan(
-    engine,
     demand_target: int,
     *,
     normalized_demand: dict | None = None
@@ -230,10 +230,13 @@ def _plan(
         route_source_epoch=snapshot.route_source_epoch,
         normalized_demand=(snapshot.normalized_demand
                            if normalized_demand is None else normalized_demand),
-        demand_target_by_accelerator={'l4': demand_target})
+        capacity_target_by_accelerator={'l4': demand_target})
 
 
-def _replica_values(replica_id: int, *, zero_cost: bool) -> dict:
+def _replica_values(replica_id: int,
+                    *,
+                    zero_cost: bool,
+                    accelerator: str = 'L4') -> dict:
     return {
         'service_name': 'svc',
         'replica_id': replica_id,
@@ -249,7 +252,7 @@ def _replica_values(replica_id: int, *, zero_cost: bool) -> dict:
             'is_zero_cost': zero_cost,
             'location': {
                 'accelerators': {
-                    'L4': 1,
+                    accelerator: 1,
                 },
             },
             'resources_override': None,
@@ -322,14 +325,14 @@ def test_serve050_schema_and_promotion_are_explicit(capacity_database):
 def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(engine, 2))
+    first = repository.publish(_plan(2))
     first_claim = _insert_claim(engine, first, 10)
 
     demand_state.ingest_report(
         'svc', 'svc-hash', _demand_report(time.time(),
                                           route_receipt,
                                           sequence=2))
-    duplicate = repository.publish(_plan(engine, 2))
+    duplicate = repository.publish(_plan(2))
 
     assert duplicate.generation == first.generation
     assert duplicate.demand_feed_generation > first.demand_feed_generation
@@ -364,7 +367,7 @@ def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
 def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
     engine, _, _ = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    authority = repository.publish(_plan(engine, 2))
+    authority = repository.publish(_plan(2))
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.insert(serve_state_schema.replicas_table).values(
@@ -385,18 +388,44 @@ def test_zero_cost_commit_after_plan_revokes_paid_claim(capacity_database):
                 prospective=True)
 
 
+def test_cross_card_reserved_capacity_satisfies_supply_aware_target(
+        capacity_database):
+    engine, _, _ = capacity_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **_replica_values(22, zero_cost=True, accelerator='A100')))
+    plan = _plan(2)
+    plan = dataclasses.replace(plan,
+                               normalized_demand={
+                                   **plan.normalized_demand,
+                                   'demand_target_by_accelerator': {
+                                       'L4': 2,
+                                   },
+                               },
+                               capacity_target_by_accelerator={
+                                   'L4': 0,
+                                   'A100': 2,
+                               })
+
+    authority = capacity_admission.CapacityAdmissionRepository(engine).publish(
+        plan)
+
+    assert authority.remaining() == {'a100': 1}
+
+
 def test_zero_target_mints_revoking_semantic_generation(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(engine, 1))
+    first = repository.publish(_plan(1))
     claim = _insert_claim(engine, first, 30)
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
-    revoked = repository.publish(_plan(engine, 0))
+    revoked = repository.publish(_plan(0))
 
     assert revoked.generation == first.generation + 1
-    assert revoked.remaining() == {}
+    assert not revoked.remaining()
     with engine.begin() as connection:
         service = connection.execute(
             sqlalchemy.select(serve_state_schema.services_table).where(
@@ -413,11 +442,11 @@ def test_zero_target_mints_revoking_semantic_generation(capacity_database):
 def test_superseded_unclaimed_plan_is_collected(capacity_database):
     engine, _, route_receipt = capacity_database
     repository = capacity_admission.CapacityAdmissionRepository(engine)
-    first = repository.publish(_plan(engine, 1))
+    first = repository.publish(_plan(1))
     demand_state.ingest_report(
         'svc', 'svc-hash',
         _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
-    second = repository.publish(_plan(engine, 0))
+    second = repository.publish(_plan(0))
 
     assert second.generation == first.generation + 1
     with engine.connect() as connection:
@@ -430,7 +459,7 @@ def test_superseded_unclaimed_plan_is_collected(capacity_database):
 
 def test_corrupt_route_snapshot_blocks_demand_and_plan(capacity_database):
     engine, _, route_receipt = capacity_database
-    plan = _plan(engine, 1)
+    plan = _plan(1)
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.update(
@@ -449,7 +478,7 @@ def test_corrupt_route_snapshot_blocks_demand_and_plan(capacity_database):
 
 def test_ha_generation_change_revokes_stale_demand_and_plan(capacity_database):
     engine, _, route_receipt = capacity_database
-    plan = _plan(engine, 1)
+    plan = _plan(1)
     with engine.begin() as connection:
         connection.execute(
             sqlalchemy.update(serve_state_schema.services_table).where(
@@ -504,5 +533,4 @@ def test_exact_card_plan_rejects_unclassified_committed_replica(
 
     with pytest.raises(capacity_admission.CapacityAdmissionConflict,
                        match='exact-card accounting'):
-        capacity_admission.CapacityAdmissionRepository(engine).publish(
-            _plan(engine, 1))
+        capacity_admission.CapacityAdmissionRepository(engine).publish(_plan(1))

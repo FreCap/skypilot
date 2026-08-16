@@ -3,7 +3,9 @@
 Status: P1 is implemented in draft PR #1498; the rebased and locally reviewed
 P2a implementation is in draft PR #1499; P2b1 route projection is implemented
 and locally reviewed in draft PR #1503; P2b2 ordered capacity admission is
-implemented and locally adversarially reviewed in draft PR #1504;
+implemented, locally adversarially reviewed, and ready for CI/review in PR
+#1504, including a post-review correction that separates cheapest-compatible
+demand attribution from supply-aware exact-card capacity accounting;
 production remains on the legacy controller-coupled demand and route paths
 
 Last updated: 2026-08-16
@@ -119,6 +121,16 @@ claim revalidated immediately before provider I/O. These changes remain dark
 and unpromoted. The final dashboard placement explanation and P3 removal of
 the legacy demand/route paths are not yet implemented.
 
+The 2026-08-16 production read-only audit found Serve revision 046 on release
+v1.1.1291, no remaining replica rows 52032--52038, and no generalized
+non-pool association/action rows for `boltz-l4-fleet`. Absence of those replica
+rows is not by itself quiescence evidence, so the historical-scope evidence
+gate remains open. The same audit reproduced the live economic defect: one
+fresh interval had target 65, 28 ready zero-cost slots, 201 observed free
+reserved slots, and 11 paid L4 cold-launch authorizations. Broker grants were
+fresh and large enough (48 A100, 40 A100-80GB, and 144 H200), proving that the
+blocker was controller ordering/accounting rather than reserved scarcity.
+
 ## Public contract
 
 ### Demand report
@@ -203,6 +215,8 @@ For each demand compatibility class, one immutable planner snapshot contains:
 
 - demand-feed generation and fresh reporter receipt watermark;
 - route-projection generation/digest/source epoch;
+- the complete supply-aware exact-card capacity target selected after
+  compatibility allocation, including zero entries for every configured card;
 - nonterminal compatible zero-cost and paid committed capacity, derived from
   locked replica rows rather than supplied by the controller; and
 - service incarnation, lifecycle, version, and demand-source epoch.
@@ -222,6 +236,7 @@ Every promoted reconcile follows one ordered path:
 ```text
 fresh protocol-v2 demand + exact fresh route
   -> autoscaler target
+  -> supply-aware exact-card capacity target
   -> attempt ordinary/reserved zero-cost-only admission
   -> if any zero-cost row commits: stop and replan
   -> PostgreSQL locks service, reports, route, and all replica rows
@@ -235,6 +250,17 @@ selection hard-disabled. `Accepted` means a durable replica row was committed,
 not that an in-memory choice was attempted. Deferred or rejected fill is not
 counted. Any accepted row ends the reconcile so paid residual is never inferred
 from its pre-commit snapshot.
+
+The public `demand_target_by_accelerator` remains an explanation of where
+flexible work would cold-start at current paid preference; it is not a durable
+capacity accounting class. For example, 65 headerless compatible requests may
+be displayed as L4 demand while already-materialized zero-cost A100 and H200
+slots satisfy that work. Paid residual is therefore computed against the
+autoscaler's supply-aware `capacity_target_by_accelerator`, never by
+subtracting exact-card inventory from the cheapest-compatible demand map.
+Using the display map would either over-authorize L4 Spot or fail every mixed-
+card plan closed. A missing, partial, or sum-inconsistent supply-aware target
+suppresses paid admission.
 
 Plan publication and claim admission share the service-row mutex and lock the
 fresh demand receipts, route head/snapshot, complete current-version replica
@@ -478,7 +504,8 @@ and one freshness-bearing `serve_capacity_plan_heads` row per service. A plan
 binds the service incarnation/lifecycle/version, demand-source epoch, complete
 fresh reporter receipt watermark, exact route generation/digest/epoch,
 normalized demand, demand target, PostgreSQL-derived zero-cost and paid
-baseline capacity, and paid residual by accelerator. The semantic payload is
+baseline capacity, the distinct supply-aware exact-card capacity target, and
+paid residual by accelerator. The semantic payload is
 content-addressed. The head carries the latest demand generation and
 receipt-watermark digest; an identical reconcile reconstructs its baseline by
 subtracting same-plan claims from locked paid inventory and refreshes those
@@ -518,11 +545,24 @@ controller-sync endpoint may still accept routing/drain reports during the
 transition, but it cannot call `collect_request_information`; only the durable
 reader may advance autoscaler demand state.
 
-Reviewed P2b2 size: 31 files, 3,694 additions and 161 deletions.
+Reviewed P2b2 size: 32 files, 3,950 additions and 175 deletions.
 This is large and above the original 1,200--2,000-line estimate because it
 includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
 races, controller ordering tests, strict route/content/LB-generation
 validation, bounded plan retention, and mixed-fleet capability tests.
+The 2026-08-16 post-review correction adds a cross-card PostgreSQL regression:
+L4-attributed compatible demand with an A100 actuation target debits the A100
+zero-cost row and authorizes only the remaining A100 residual. It also makes a
+sequenced reserved-fill commit return explicit progress to the ordered
+controller: any accepted row ends the promoted reconcile and forces a fresh
+plan, just like an ordinary zero-cost commit.
+
+Local P2b2 correction evidence on 2026-08-16 includes the complete Serve
+controller, concurrency/QPS autoscaler, compatibility-contract,
+decision-contract, and pure admission suites, plus all ten admission tests on
+a real local PostgreSQL 14 server. Formatting, mypy over 947 source files,
+pylint, and dashboard lint all pass. Remote CI, injected provider failure, and
+production promotion evidence remain open.
 
 ### P3: blocked steady-state cleanup
 
@@ -582,7 +622,7 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. live v1.1.1284 compatibility rollout with unchanged capacity and
+1. live v1.1.1291 compatibility baseline with unchanged capacity and
    `LEGACY_ACTIVE`;
 2. settlement of replica IDs 52032--52038 from exact evidence and independent
    retirement of the two shutting-down Spot rows;
@@ -622,8 +662,9 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
 
 ## Open gates
 
-- [ ] Deploy and verify v1.1.1284 in production without normalization or
-  reserved-fill activation.
+- [x] Supersede the planned v1.1.1284 compatibility step with the live
+  v1.1.1291 production cohort; verify PostgreSQL Serve revision 046 and retain
+  legacy demand/route/action modes without activating this stack.
 - [x] Publish the P1 draft as PR #1498.
 - [ ] Publish the blocked P3 removal after P2b supplies the final replacement
   path and keep it stacked until the removal gates pass.

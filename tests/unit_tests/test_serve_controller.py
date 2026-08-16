@@ -3798,12 +3798,42 @@ class TestAutoscalerRuntimeSnapshot:
         scaler.get_final_target_num_replicas.return_value = target
         scaler.unrecoverable_rollout_failure = None
         scaler.current_launch_priority.return_value = 50
+        scaler.configured_accelerator_shapes = {'L4': 1}
+        scaler.capacity_target_by_accelerator = {'L4': target}
+        scaler.capacity_target_complete = True
         scaler.info.return_value = {
             'demand_target_by_accelerator': {
                 'L4': target
             }
         }
         return scaler
+
+    def test_ordered_target_uses_supply_aware_cross_card_allocation(self):
+        scaler = self._durable_autoscaler(65)
+        scaler.configured_accelerator_shapes = {
+            'L4': 1,
+            'A100': 1,
+            'H200': 1,
+        }
+        scaler.capacity_target_by_accelerator = {
+            'A100': 20,
+            'H200': 45,
+        }
+        scaler.info.return_value = {'demand_target_by_accelerator': {'L4': 65,}}
+
+        assert controller.SkyServeController._ordered_capacity_target(  # pylint: disable=protected-access
+            scaler) == {
+                'l4': 0,
+                'a100': 20,
+                'h200': 45,
+            }
+
+    def test_ordered_target_rejects_incomplete_exact_card_state(self):
+        scaler = self._durable_autoscaler(1)
+        scaler.capacity_target_complete = False
+
+        assert controller.SkyServeController._ordered_capacity_target(  # pylint: disable=protected-access
+            scaler) is None
 
     def test_promoted_durable_demand_unavailable_suppresses_all_actuation(self):
         ctrl = _make_controller()
@@ -3896,6 +3926,56 @@ class TestAutoscalerRuntimeSnapshot:
             launch_priority=50,
             paid_launch_allowed=False)
         publish.assert_not_called()
+        notify.assert_called_once_with()
+
+    def test_promoted_reserved_fill_commit_forces_replan_before_paid_plan(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._durable_autoscaler()
+        scaler.reserved_capacity_fill = True
+        scaler.sequenced_reserved_fill_planning.return_value = (
+            contextlib.nullcontext())
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        allocation = object()
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               return_value=self._durable_snapshot()), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions',
+                 return_value=[]), \
+             mock.patch.object(ctrl,
+                               '_read_sequenced_reserved_fill_allocation',
+                               return_value=(True, allocation)), \
+             mock.patch.object(ctrl,
+                               '_accept_sequenced_reserved_fill',
+                               return_value=True) as accept, \
+             mock.patch.object(ctrl,
+                               '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority') as publish, \
+             mock.patch.object(ctrl, '_notify_scale_reconcile') as notify:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        accept.assert_called_once_with(allocation, scaler, 1, 0, [], [])
+        publish.assert_not_called()
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
         notify.assert_called_once_with()
 
     def test_promoted_paid_launch_uses_post_zero_cost_plan_authority(self):

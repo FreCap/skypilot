@@ -5371,13 +5371,13 @@ class SkyServeController:
         reconcile_generation: int,
         replica_infos: list[replica_managers.ReplicaInfo],
         scaling_options: list[autoscalers.AutoscalerDecision],
-    ) -> None:
+    ) -> bool:
         """Plan from durable authority and spend only the manager receipt."""
         if allocation is None or not allocation.pool_snapshots:
-            return
+            return False
         service_hash = self._service_hash
         if not isinstance(service_hash, str) or not service_hash:
-            return
+            return False
         capacity_unit = (reserved_fill_planner.FillCapacityUnit.LOGICAL
                          if decision_autoscaler.replica_unit == 'logical' else
                          reserved_fill_planner.FillCapacityUnit.PHYSICAL)
@@ -5402,39 +5402,66 @@ class SkyServeController:
             rotation_anchor=(
                 decision_autoscaler.reserved_fill_rotation_anchor()))
         if not plan.intents:
-            return
+            return False
         receipt = self._replica_manager.accept_reserved_fill(plan)
         receipt.validate_for_plan(plan)
         anchor = receipt.accepted_rotation_anchor(plan)
         if anchor is not None:
             decision_autoscaler.commit_reserved_fill_rotation_anchor(anchor)
-        if receipt.deferred and (receipt.accepted or any(
+        accepted = bool(receipt.accepted)
+        if receipt.deferred and not accepted and any(
                 deferred.reason is (reserved_fill_planner.DeferredFillReason.
                                     ADMISSION_SEQUENCE_CHANGED)
-                for deferred in receipt.deferred)):
-            # A prefix made durable progress. Coalesce one immediate pass for
-            # the eligible tail. A changed ordinary-admission high-water also
-            # needs an immediate durable reread/replan; an all-deferred
-            # provider-busy result relies on the bounded recovery wakeup.
+                for deferred in receipt.deferred):
+            # A changed ordinary-admission high-water needs an immediate
+            # durable reread/replan. An all-deferred provider-busy result
+            # relies on the bounded recovery wakeup. Accepted rows are
+            # returned to the caller, which owns the ordered replan boundary.
             self._notify_scale_reconcile()
+        return accepted
 
     @staticmethod
-    def _ordered_demand_target(
-        decision_autoscaler: autoscalers.Autoscaler,) -> dict[str, int]:
-        """Return one exact-card map or one aggregate accounting class."""
+    def _ordered_capacity_target(
+        decision_autoscaler: autoscalers.Autoscaler,) -> dict[str, int] | None:
+        """Return the supply-aware target used for paid residual accounting.
+
+        The public demand target deliberately assigns flexible work to the
+        cheapest compatible cold card.  It is explanatory placement demand,
+        not an accounting class: compatible materialized A100/H200 capacity
+        can satisfy work whose cold attribution is L4.  Shape-aware
+        autoscalers therefore publish the complete actuation target selected
+        after compatible existing supply is considered.  Missing or partial
+        exact-card state fails closed instead of becoming paid authority.
+        """
         final_target = max(
             0, int(decision_autoscaler.get_final_target_num_replicas()))
-        raw_target = decision_autoscaler.info().get(
-            'demand_target_by_accelerator')
-        if isinstance(raw_target, dict):
-            exact_target = {
-                str(card).casefold(): int(count)
-                for card, count in raw_target.items()
-                if isinstance(card, str) and card and isinstance(count, int) and
-                not isinstance(count, bool) and count >= 0
+        configured = decision_autoscaler.configured_accelerator_shapes
+        if configured:
+            if getattr(decision_autoscaler, 'capacity_target_complete',
+                       False) is not True:
+                return None
+            raw_target = getattr(decision_autoscaler,
+                                 'capacity_target_by_accelerator', {})
+            if not isinstance(raw_target, dict):
+                return None
+            canonical_configured = {
+                str(card).casefold(): str(card)
+                for card in configured
+                if isinstance(card, str) and card
             }
-            if exact_target and sum(exact_target.values()) == final_target:
-                return exact_target
+            if len(canonical_configured) != len(configured):
+                return None
+            exact_target = {card: 0 for card in canonical_configured}
+            for raw_card, count in raw_target.items():
+                if (not isinstance(raw_card, str) or
+                        raw_card.casefold() not in canonical_configured or
+                        not isinstance(count, int) or isinstance(count, bool) or
+                        count < 0):
+                    return None
+                exact_target[raw_card.casefold()] = count
+            if sum(exact_target.values()) != final_target:
+                return None
+            return exact_target
         return {capacity_admission.AGGREGATE_ACCELERATOR: final_target}
 
     def _publish_ordered_paid_authority(
@@ -5449,11 +5476,18 @@ class SkyServeController:
                 snapshot.service_hash != self._service_hash or
                 snapshot.demand_source_epoch <= 0):
             return None
-        demand_target = self._ordered_demand_target(decision_autoscaler)
+        capacity_target = self._ordered_capacity_target(decision_autoscaler)
+        if capacity_target is None:
+            logger.warning('Suppressing paid launch because the autoscaler '
+                           'has no complete supply-aware capacity target.')
+            return None
         normalized_demand = dict(snapshot.normalized_demand)
-        normalized_demand.update(autoscaler_target=(
-            decision_autoscaler.get_final_target_num_replicas()),
-                                 replica_unit=decision_autoscaler.replica_unit)
+        normalized_demand.update(
+            autoscaler_target=(
+                decision_autoscaler.get_final_target_num_replicas()),
+            replica_unit=decision_autoscaler.replica_unit,
+            demand_target_by_accelerator=(
+                decision_autoscaler.info().get('demand_target_by_accelerator')))
         plan = capacity_admission.CapacityPlanInput(
             service_name=self._service_name,
             service_hash=snapshot.service_hash,
@@ -5466,7 +5500,7 @@ class SkyServeController:
             route_sha256=snapshot.route_sha256,
             route_source_epoch=snapshot.route_source_epoch,
             normalized_demand=normalized_demand,
-            demand_target_by_accelerator=demand_target)
+            capacity_target_by_accelerator=capacity_target)
         try:
             return capacity_admission.CapacityAdmissionRepository().publish(
                 plan)
@@ -5613,12 +5647,18 @@ class SkyServeController:
                             actuation_generation, decision_autoscaler,
                             decision_version):
                         return
-                    self._accept_sequenced_reserved_fill(
+                    reserved_fill_progress = self._accept_sequenced_reserved_fill(
                         allocation, decision_autoscaler, decision_version,
                         reconcile_generation, replica_infos, scaling_options)
                     if not self._scale_actuation_is_current(
                             actuation_generation, decision_autoscaler,
                             decision_version):
+                        return
+                    if durable_demand_promoted and reserved_fill_progress:
+                        # The plan input was computed before these zero-cost
+                        # rows committed. Replan from their exact-card
+                        # attribution before publishing any paid residual.
+                        self._notify_scale_reconcile()
                         return
                 ordered_paid_authority = None
                 if durable_demand_promoted:

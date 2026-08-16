@@ -159,7 +159,7 @@ class CapacityPlanInput:
     route_sha256: str
     route_source_epoch: int
     normalized_demand: Mapping[str, Any]
-    demand_target_by_accelerator: Mapping[str, int]
+    capacity_target_by_accelerator: Mapping[str, int]
 
     def payload(
         self,
@@ -181,8 +181,8 @@ class CapacityPlanInput:
             raise ValueError('route_sha256 must be lowercase SHA-256.')
         if not isinstance(self.normalized_demand, Mapping):
             raise ValueError('normalized_demand must be a mapping.')
-        demand = _canonical_counts(self.demand_target_by_accelerator,
-                                   'demand_target_by_accelerator')
+        capacity_target = _canonical_counts(self.capacity_target_by_accelerator,
+                                            'capacity_target_by_accelerator')
         existing_zero_cost = _canonical_counts(
             existing_zero_cost_capacity_by_accelerator,
             'existing_zero_cost_capacity_by_accelerator')
@@ -191,15 +191,15 @@ class CapacityPlanInput:
             'existing_paid_capacity_by_accelerator')
         paid = _canonical_counts(paid_residual_by_accelerator,
                                  'paid_residual_by_accelerator')
-        cards = (set(demand) | set(existing_zero_cost) | set(existing_paid) |
-                 set(paid))
+        cards = (set(capacity_target) | set(existing_zero_cost) |
+                 set(existing_paid) | set(paid))
         if AGGREGATE_ACCELERATOR in cards and len(cards) != 1:
             raise ValueError('A capacity plan cannot mix aggregate and '
                              'exact-card accounting.')
         expected_paid = {
             card: max(
                 0,
-                demand.get(card, 0) - existing_zero_cost.get(card, 0) -
+                capacity_target.get(card, 0) - existing_zero_cost.get(card, 0) -
                 existing_paid.get(card, 0)) for card in cards
         }
         expected_paid = {
@@ -208,7 +208,7 @@ class CapacityPlanInput:
         paid = {card: count for card, count in paid.items() if count > 0}
         if paid != expected_paid:
             raise ValueError('Paid residual is not the exact post-zero-cost '
-                             'demand deficit.')
+                             'capacity deficit.')
         _canonical_watermark(self.receipt_watermark)
         normalized_demand = json.loads(
             _canonical_json(dict(self.normalized_demand)).decode('utf-8'))
@@ -227,7 +227,7 @@ class CapacityPlanInput:
                 'route_source_epoch': self.route_source_epoch,
             },
             'normalized_demand': normalized_demand,
-            'demand_target_by_accelerator': demand,
+            'capacity_target_by_accelerator': capacity_target,
             'existing_zero_cost_capacity_by_accelerator': existing_zero_cost,
             'existing_paid_capacity_by_accelerator': existing_paid,
             'paid_residual_by_accelerator': paid,
@@ -560,11 +560,12 @@ class CapacityAdmissionRepository:
         ttl_seconds: int = constants.CAPACITY_PLAN_TTL_SECONDS
     ) -> PaidLaunchAuthority:
         """Publish or refresh one post-zero-cost semantic plan."""
-        demand_target = _canonical_counts(plan.demand_target_by_accelerator,
-                                          'demand_target_by_accelerator')
-        accounting_cards = set(demand_target)
+        capacity_target = _canonical_counts(plan.capacity_target_by_accelerator,
+                                            'capacity_target_by_accelerator')
+        accounting_cards = set(capacity_target)
         if not accounting_cards:
-            raise ValueError('demand_target_by_accelerator must not be empty.')
+            raise ValueError(
+                'capacity_target_by_accelerator must not be empty.')
         watermark_sha256 = _sha256(_canonical_watermark(plan.receipt_watermark))
         if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
             raise ValueError('ttl_seconds must be positive.')
@@ -613,7 +614,7 @@ class CapacityAdmissionRepository:
                     existing_zero_cost_capacity_by_accelerator=full_zero_cost,
                     existing_paid_capacity_by_accelerator=prior_paid_baseline,
                     paid_residual_by_accelerator=_paid_residual(
-                        demand_target, full_zero_cost, prior_paid_baseline))
+                        capacity_target, full_zero_cost, prior_paid_baseline))
                 duplicate_digest = _sha256(duplicate_payload)
             duplicate = bool(previous is not None and
                              duplicate_digest == previous['content_sha256'])
@@ -627,7 +628,7 @@ class CapacityAdmissionRepository:
                     existing_zero_cost_capacity_by_accelerator=full_zero_cost,
                     existing_paid_capacity_by_accelerator=full_paid,
                     paid_residual_by_accelerator=_paid_residual(
-                        demand_target, full_zero_cost, full_paid))
+                        capacity_target, full_zero_cost, full_paid))
                 digest = _sha256(payload)
                 maximum = connection.execute(
                     sqlalchemy.select(sqlalchemy.func.max(
@@ -836,9 +837,9 @@ def validate_paid_claim_in_connection(
         raise CapacityAdmissionConflict(
             'Capacity plan digest no longer matches its payload.')
     try:
-        demand_target = _canonical_counts(
-            payload.get('demand_target_by_accelerator', {}),
-            'demand_target_by_accelerator')
+        capacity_target = _canonical_counts(
+            payload.get('capacity_target_by_accelerator', {}),
+            'capacity_target_by_accelerator')
         baseline_zero = _canonical_counts(
             payload.get('existing_zero_cost_capacity_by_accelerator', {}),
             'existing_zero_cost_capacity_by_accelerator')
@@ -851,7 +852,7 @@ def validate_paid_claim_in_connection(
     except ValueError as error:
         raise CapacityAdmissionConflict(
             'Capacity plan accounting is malformed.') from error
-    accounting_cards = set(demand_target)
+    accounting_cards = set(capacity_target)
     if (not accounting_cards or set(baseline_zero) != accounting_cards or
             set(baseline_paid) != accounting_cards or
             set(paid) - accounting_cards):

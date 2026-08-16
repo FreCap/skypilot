@@ -410,6 +410,14 @@ class Autoscaler:
             spec.min_replicas, sum(self.min_replicas_by_accelerator.values()))
         self.target_num_replicas_by_accelerator: dict[str, int] = dict(
             self.min_replicas_by_accelerator)
+        # Supply-aware exact-card target selected by the latest complete
+        # actuation pass.  This is deliberately distinct from
+        # target_num_replicas_by_accelerator, which attributes flexible demand
+        # to the cheapest compatible cold card for explanation.  Ordered paid
+        # admission must debit the target that already reused compatible
+        # materialized supply, not that explanatory demand attribution.
+        self.capacity_target_by_accelerator: dict[str, int] = {}
+        self.capacity_target_complete: bool = False
         # Independent explanatory floor for running or occupancy-unknown work
         # on its already-materialized exact card. It is not additive with the
         # cheapest-compatible demand attribution above and need not be its
@@ -2808,6 +2816,11 @@ class Autoscaler:
                 self.target_num_replicas_by_accelerator),
             'demand_target_by_accelerator': dict(
                 self.target_num_replicas_by_accelerator),
+            'capacity_target_by_accelerator': dict(
+                getattr(self, 'capacity_target_by_accelerator', {})),
+            'capacity_target_complete': getattr(self,
+                                                'capacity_target_complete',
+                                                False),
             'warm_retention_target_by_accelerator': dict(
                 self.warm_retention_target_by_accelerator),
             'cold_launch_authority_by_accelerator': dict(
@@ -4528,6 +4541,8 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
         target_by_card, use_card_targets = (
             self._actuation_target_by_accelerator(replica_infos))
+        self.capacity_target_by_accelerator = dict(target_by_card)
+        self.capacity_target_complete = use_card_targets
         if use_card_targets:
             replicas_by_card: dict[str, list[replica_managers.ReplicaInfo]] = {}
             ready_by_card: dict[str, int] = {}
@@ -8095,6 +8110,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
             target = self.get_final_target_num_replicas()
             target_by_card, use_card_targets = (
                 self._actuation_target_by_accelerator(replica_infos))
+            self.capacity_target_by_accelerator = dict(target_by_card)
+            self.capacity_target_complete = use_card_targets
             target_by_card_state = (tuple(target_by_card.items())
                                     if use_card_targets else ())
             shape_state = (tuple(self.configured_accelerator_shapes.items())
@@ -8632,6 +8649,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         self.cold_launch_authority_by_accelerator = {}
         target_by_card, use_card_targets = (
             self._actuation_target_by_accelerator(replica_infos))
+        self.capacity_target_by_accelerator = dict(target_by_card)
+        self.capacity_target_complete = use_card_targets
         if self.configured_accelerator_shapes and not use_card_targets:
             logger.info('Logical concurrency exact-card target is incomplete; '
                         'suppressing card-blind scaling decisions.')
@@ -8890,6 +8909,8 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
         if not self.has_recomputed_with_fresh_data():
             info['target_num_replicas_by_accelerator'] = {}
             info['demand_target_by_accelerator'] = {}
+            info['capacity_target_by_accelerator'] = {}
+            info['capacity_target_complete'] = False
             info['warm_retention_target_by_accelerator'] = {}
             info['cold_launch_authority_by_accelerator'] = {}
         in_flight_total = (sum(self._in_flight_by_replica_id.values()) if

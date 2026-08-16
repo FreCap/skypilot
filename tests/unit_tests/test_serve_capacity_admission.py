@@ -24,7 +24,7 @@ def _input(**overrides) -> capacity_admission.CapacityPlanInput:
         'normalized_demand': {
             'recent_request_count': 5,
         },
-        'demand_target_by_accelerator': {
+        'capacity_target_by_accelerator': {
             'L4': 5,
         },
     }
@@ -54,9 +54,38 @@ def test_capacity_plan_requires_exact_post_zero_cost_residual():
                          paid_residual_by_accelerator={'L4': 3})
 
 
+def test_capacity_plan_uses_supply_aware_target_not_cold_demand_card():
+    payload = _input(capacity_target_by_accelerator={
+        'L4': 0,
+        'A100': 5,
+    },
+                     normalized_demand={
+                         'demand_target_by_accelerator': {
+                             'L4': 5,
+                         }
+                     }).payload(existing_zero_cost_capacity_by_accelerator={
+                         'L4': 0,
+                         'A100': 4,
+                     },
+                                existing_paid_capacity_by_accelerator={
+                                    'L4': 0,
+                                    'A100': 0,
+                                },
+                                paid_residual_by_accelerator={'A100': 1})
+
+    assert payload['normalized_demand']['demand_target_by_accelerator'] == {
+        'L4': 5,
+    }
+    assert payload['capacity_target_by_accelerator'] == {
+        'a100': 5,
+        'l4': 0,
+    }
+    assert payload['paid_residual_by_accelerator'] == {'a100': 1}
+
+
 def test_capacity_plan_rejects_mixed_aggregate_and_exact_cards():
     with pytest.raises(ValueError, match='cannot mix aggregate'):
-        _input(demand_target_by_accelerator={
+        _input(capacity_target_by_accelerator={
             '*': 5,
             'L4': 1,
         }).payload(existing_zero_cost_capacity_by_accelerator={
