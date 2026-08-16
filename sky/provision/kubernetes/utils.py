@@ -2959,17 +2959,43 @@ class PriorityTier(NamedTuple):
     """A scheduling priority tier that accelerators can be attributed to.
 
     Two priority classes may share the same value, so the class name is part
-    of the identity to keep them distinguishable in the breakdown.
+    of the identity to keep them distinguishable in the breakdown. Workload
+    kind keeps operationally different allocations visible within one class.
     """
     priority: int
     class_name: str | None
+    workload_kind: str | None = None
 
     @property
     def label(self) -> str:
         """Display label, e.g. 'inference-low (-1000)' or 'priority 0'."""
         if self.class_name is None:
-            return f'priority {self.priority}'
-        return f'{self.class_name} ({self.priority})'
+            label = f'priority {self.priority}'
+        else:
+            label = f'{self.class_name} ({self.priority})'
+        if self.workload_kind is not None:
+            label = f'{label} · {self.workload_kind}'
+        return label
+
+
+def _gpu_workload_kind(pod: V1Pod) -> str | None:
+    """Returns a compact operational category for an allocated GPU pod."""
+    labels = pod.metadata.labels
+    job_type = labels.get('job-type')
+    if job_type == 'pytorch':
+        return 'PyTorch training'
+    if job_type == 'interactive':
+        return 'dev pod'
+    if labels.get(provision_constants.TAG_SKYPILOT_CLUSTER_NAME):
+        return 'SkyPilot cluster'
+    if job_type:
+        return job_type
+    return None
+
+
+def _is_proven_non_skyserve_workload(pod: V1Pod) -> bool:
+    """Whether pod metadata proves this is not a SkyServe replica."""
+    return pod.metadata.labels.get('job-type') is not None
 
 
 class SkyServeAllocation(NamedTuple):
@@ -3023,8 +3049,8 @@ def get_allocated_resources_by_node(
         allocated_qty_by_node_by_priority: dict[str, dict[
             PriorityTier, int]] = collections.defaultdict(
                 lambda: collections.defaultdict(int))
-        observed_gpu_allocations: list[tuple[str, PriorityTier, int,
-                                             str | None]] = []
+        observed_gpu_allocations: list[tuple[str, PriorityTier, int, str | None,
+                                             bool]] = []
         for item_dict in ijson.items(response,
                                      'items.item',
                                      buf_size=IJSON_BUFFER_SIZE):
@@ -3060,13 +3086,19 @@ def get_allocated_resources_by_node(
             if pod_allocated_qty > 0:
                 allocated_qty_by_node[pod.spec.node_name] += pod_allocated_qty
                 tier = PriorityTier(pod.spec.priority,
-                                    pod.spec.priority_class_name)
+                                    pod.spec.priority_class_name,
+                                    _gpu_workload_kind(pod))
                 allocated_qty_by_node_by_priority[
                     pod.spec.node_name][tier] += pod_allocated_qty
-                cluster_name = pod.metadata.annotations.get(
+                cluster_name = pod.metadata.labels.get(
                     provision_constants.TAG_SKYPILOT_CLUSTER_NAME)
-                observed_gpu_allocations.append(
-                    (pod.spec.node_name, tier, pod_allocated_qty, cluster_name))
+                observed_gpu_allocations.append((
+                    pod.spec.node_name,
+                    tier,
+                    pod_allocated_qty,
+                    cluster_name,
+                    _is_proven_non_skyserve_workload(pod),
+                ))
             if pod_allocated_cpu > 0 or pod_allocated_memory_gb > 0:
                 current_cpu, current_memory = allocated_cpu_memory_by_node[
                     pod.spec.node_name]
@@ -3074,35 +3106,38 @@ def get_allocated_resources_by_node(
                     current_cpu + pod_allocated_cpu,
                     current_memory + pod_allocated_memory_gb)
         top_priority = max(
-            (tier.priority for _, tier, _, _ in observed_gpu_allocations),
+            (tier.priority for _, tier, _, _, _ in observed_gpu_allocations),
             default=None)
         preemptible_allocations = [
             allocation for allocation in observed_gpu_allocations if
             top_priority is not None and allocation[1].priority < top_priority
         ]
         cluster_names = sorted({
-            cluster_name for _, _, _, cluster_name in observed_gpu_allocations
+            cluster_name
+            for _, _, _, cluster_name, _ in observed_gpu_allocations
             if cluster_name
         })
         preemptible_cluster_names = {
-            cluster_name for _, _, _, cluster_name in preemptible_allocations
+            cluster_name for _, _, _, cluster_name, _ in preemptible_allocations
             if cluster_name
         }
         allocated_qty_by_node_by_skyserve_service: dict[str,
                                                         dict[SkyServeAllocation,
                                                              int]] | None
         # SkyServe attribution is useful only when it is complete.  A pod
-        # without a SkyPilot cluster annotation, or an annotated cluster that
-        # is absent from durable state, cannot be proven to be either a
-        # service or a non-service workload.  Fail closed instead of turning
-        # that missing identity into a falsely precise zero.
-        if any(not cluster_name
-               for _, _, _, cluster_name in preemptible_allocations):
+        # without a SkyPilot cluster label or an explicit non-service workload
+        # label, or a labeled cluster that is absent from durable state, cannot
+        # be proven to be either a service or a non-service workload. Fail
+        # closed instead of turning that missing identity into a falsely
+        # precise zero.
+        if any(not cluster_name and not proven_non_service for _, _, _,
+               cluster_name, proven_non_service in preemptible_allocations):
             allocated_qty_by_node_by_skyserve_service = None
         else:
             try:
-                workload_fields = (global_user_state.
-                                   get_cluster_workload_fields(cluster_names))
+                workload_fields = (
+                    global_user_state.get_cluster_workload_fields(cluster_names)
+                    if cluster_names else {})
             except Exception as e:  # pylint: disable=broad-except
                 logger.debug(
                     'Failed to read workload attribution for Kubernetes GPU '
@@ -3116,7 +3151,7 @@ def get_allocated_resources_by_node(
                     service_allocations: dict[str, dict[
                         SkyServeAllocation, int]] = collections.defaultdict(
                             lambda: collections.defaultdict(int))
-                    for node_name, tier, quantity, cluster_name in (
+                    for node_name, tier, quantity, cluster_name, _ in (
                             observed_gpu_allocations):
                         if not cluster_name:
                             continue
