@@ -375,7 +375,8 @@ def test_constructor_owns_complete_explicit_interface():
     replica = _replica()
 
     assert set(vars(replica)) == {
-        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS
+        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS,
+        *replica_info._REPLICA_INFO_TRANSIENT_FIELDS
     }
     assert set(vars(replica.status_property)) == set(_status_field_names())
 
@@ -971,7 +972,8 @@ def test_live_legacy_json_shapes_materialize_canonical_v18(
 
     assert restored._version == 18
     assert set(vars(restored)) == {
-        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS
+        '_version', *replica_info._REPLICA_INFO_OWNED_FIELDS,
+        *replica_info._REPLICA_INFO_TRANSIENT_FIELDS
     }
     assert set(vars(restored.status_property)) == set(_status_field_names())
     assert rewritten['replica_info_version'] == 18
