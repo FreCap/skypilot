@@ -99,17 +99,23 @@ version_specs_table = serve_state_schema.version_specs_table
 _SERVE038_SERVICE_COLUMN_NAMES = frozenset(
     column.name
     for column in resource_action_m4_state_schema.service_candidate_columns())
-_SERVE042_SERVICE_COLUMN_NAMES = frozenset({
+_POST_SERVE037_SERVICE_COLUMN_NAMES = frozenset({
     'controller_incarnation',
     'controller_owner_epoch',
     'ordinary_launch_binding_capable',
     'ordinary_launch_binding_mode',
     'ordinary_launch_binding_epoch',
+    'non_pool_launch_binding_capable',
+    'non_pool_launch_controller_incarnation',
+    'non_pool_launch_binding_protocol_version',
+    'non_pool_launch_capability_profile_set_digest',
+    'non_pool_launch_capability_cohort_epoch',
+    'non_pool_launch_receipt_protocol_version',
 })
 _SERVE037_SERVICE_COLUMNS = tuple(
     column for column in services_table.c
     if column.name not in (_SERVE038_SERVICE_COLUMN_NAMES |
-                           _SERVE042_SERVICE_COLUMN_NAMES))
+                           _POST_SERVE037_SERVICE_COLUMN_NAMES))
 placement_normalization_runs_table = (
     serve_state_schema.placement_normalization_runs_table)
 placement_normalization_rows_table = (

@@ -28,13 +28,19 @@ _SERVE038_BOOTSTRAP_FACTORIES = {
         resource_action_m4_state_schema.version_spec_identity_columns,
     'replicas': resource_action_m4_state_schema.replica_spec_identity_columns,
 }
-_SERVE042_POSTGRES_ONLY_COLUMNS = {
+_POST_REVISION_001_COLUMNS = {
     'services': frozenset({
         'controller_incarnation',
         'controller_owner_epoch',
         'ordinary_launch_binding_capable',
         'ordinary_launch_binding_mode',
         'ordinary_launch_binding_epoch',
+        'non_pool_launch_binding_capable',
+        'non_pool_launch_controller_incarnation',
+        'non_pool_launch_binding_protocol_version',
+        'non_pool_launch_capability_profile_set_digest',
+        'non_pool_launch_capability_cohort_epoch',
+        'non_pool_launch_receipt_protocol_version',
     }),
     'replicas': frozenset({'ordinary_launch_association_id'}),
 }
@@ -57,11 +63,10 @@ def _initial_metadata(bind: sa.engine.Connection) -> sa.MetaData:
                     # without leaking 038 into a fresh non-PostgreSQL
                     # historical schema.
                     table._columns.remove(column)
-    # Serve042 owns these columns.  Strip them from the revision-001 catalog
-    # on every dialect so a fresh PostgreSQL upgrade receives the exact
-    # server defaults and constraints from the forward-only migration, while
-    # SQLite remains at its supported Serve037 ceiling.
-    for table_name, column_names in _SERVE042_POSTGRES_ONLY_COLUMNS.items():
+    # Later forward-only migrations own these columns. Strip them from the
+    # revision-001 catalog on every dialect so a fresh PostgreSQL upgrade gets
+    # exact migration defaults/constraints and SQLite stays at Serve037.
+    for table_name, column_names in _POST_REVISION_001_COLUMNS.items():
         table = metadata.tables[table_name]
         for column_name in column_names:
             column = table.c.get(column_name)

@@ -897,6 +897,8 @@ def test_api011_serve047_lineage_and_sqlite_stays_at_serve037(
     }
     assert 'controller_incarnation' not in service_columns
     assert 'ordinary_launch_binding_mode' not in service_columns
+    assert 'non_pool_launch_binding_capable' not in service_columns
+    assert 'non_pool_launch_controller_incarnation' not in service_columns
     assert 'ordinary_launch_association_id' not in replica_columns
     assert not inspector.has_table(
         binding.ordinary_launch_associations_table.name)
