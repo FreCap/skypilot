@@ -2,8 +2,8 @@
 
 Status: P1 is implemented in draft PR #1498; the rebased and locally reviewed
 P2a implementation is in draft PR #1499; P2b1 route projection is implemented
-and locally reviewed on its stacked branch but not yet published; production
-remains on the legacy controller-coupled demand and route paths
+and locally reviewed in draft PR #1503; production remains on the legacy
+controller-coupled demand and route paths
 
 Last updated: 2026-08-16
 
@@ -551,8 +551,8 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
 - [ ] Reconcile the exact seven-row production scope without fabricated
   quiescence or manual row deletion.
 - [x] Publish the P2a durable-demand/UI draft as PR #1499.
-- [ ] Publish P2b1/P2b2 and update P3 for every transition-only demand/route
-  path.
+- [x] Publish the P2b1 provider-free route draft as PR #1503.
+- [ ] Publish P2b2 and update P3 for every transition-only demand/route path.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set
