@@ -41,7 +41,7 @@ def _install_demotion_preconditions(monkeypatch,
         mock.Mock(
             side_effect=lambda _engine, section: {
                 broker.migration_utils.SERVE_DB_NAME: serve_revision,
-                broker.migration_utils.API_REQUESTS_DB_NAME: '010',
+                broker.migration_utils.API_REQUESTS_DB_NAME: '011',
             }[section]))
     monkeypatch.setattr(serve_state, 'get_reserved_fill_protocol_state',
                         mock.Mock(return_value={'protocol_version': 2}))
@@ -117,7 +117,7 @@ def test_demotion_rejects_schema_outside_compatible_set(monkeypatch):
     setter.assert_not_called()
 
 
-def test_demotion_rejects_api_request_schema_other_than_exact_010(monkeypatch):
+def test_demotion_rejects_api_request_schema_other_than_exact_011(monkeypatch):
     lock = _TrackedLock()
     monkeypatch.setattr(broker.locks, 'get_lock', lambda *_args: lock)
     monkeypatch.setattr(serve_state, 'get_database_engine',
@@ -133,7 +133,7 @@ def test_demotion_rejects_api_request_schema_other_than_exact_010(monkeypatch):
     monkeypatch.setattr(broker, '_read_stable_writer_rollout', attester)
 
     with pytest.raises(broker.ProtocolV1DemotionError,
-                       match='exact API-request schema revision 010'):
+                       match='exact API-request schema revision 011'):
         broker.demote_protocol_v1()
     attester.assert_not_called()
 

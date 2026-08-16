@@ -413,7 +413,9 @@ def test_queue_demand_capability_negotiates_and_downgrades():
     assert lb._queued_compatibility_demand_supported is False
 
 
-def test_projected_route_fence_advances_only_after_full_route_apply():
+def test_projected_route_fence_advances_only_after_full_route_apply(
+        monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
     lb = _make_lb()
     digest = 'b' * 64
     _run_one_sync(

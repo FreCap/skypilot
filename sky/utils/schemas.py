@@ -1275,6 +1275,33 @@ _SERVE_WORKER_CACHE_SCHEMA = {
     }],
 }
 
+_SERVE_WORKER_SCRATCH_SCHEMA = {
+    'oneOf': [{
+        'type': 'object',
+        'required': ['kind'],
+        'additionalProperties': False,
+        'properties': {
+            'kind': {
+                'const': 'none',
+            },
+        },
+    }, {
+        'type': 'object',
+        'required': ['kind', 'size_limit_bytes'],
+        'additionalProperties': False,
+        'properties': {
+            'kind': {
+                'const': 'memory',
+            },
+            'size_limit_bytes': {
+                'type': 'integer',
+                'minimum': 1,
+                'maximum': 9223372036854775807,
+            },
+        },
+    }],
+}
+
 _SERVE_CONTROLLER_WORK_CACHE_SCHEMA = {
     'oneOf': [{
         'type': 'object',
@@ -1474,6 +1501,7 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
     'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
     'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
+    'serve_worker_scratch': _SERVE_WORKER_SCRATCH_SCHEMA,
     'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
     'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
@@ -2911,6 +2939,7 @@ def get_config_schema():
                         'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
                         'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
+                        'serve_worker_scratch': _SERVE_WORKER_SCRATCH_SCHEMA,
                         'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
                         'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
@@ -2996,6 +3025,7 @@ def get_config_schema():
                                     'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
                                     'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
+                                    'serve_worker_scratch': _SERVE_WORKER_SCRATCH_SCHEMA,
                                     'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
                                     'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,

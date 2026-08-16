@@ -1,6 +1,7 @@
 """Tests for Kubernetes provision."""
 
 import contextlib
+import copy
 import datetime
 import json
 import multiprocessing
@@ -81,6 +82,97 @@ def _make_provision_config(count):
         resume_stopped_nodes=False,
         ports_to_open_on_launch=None,
     )
+
+
+@pytest.mark.parametrize(('protocol_version', 'scratch', 'message'), [
+    (3, None, 'v3 requires the complete worker scratch'),
+    (2, {
+        'kind': 'none'
+    }, 'Only projection protocol v3'),
+    (3, {
+        'kind': 'memory',
+        'size_limit_bytes': 1024,
+    }, 'must be exactly none or memory-backed /tmp'),
+])
+def test_create_pods_rejects_invalid_worker_scratch_provider_contract(
+        monkeypatch, protocol_version, scratch, message):
+    monkeypatch.setattr(kubernetes_utils, 'get_namespace_from_config',
+                        lambda *_args, **_kwargs: 'ns')
+    monkeypatch.setattr(kubernetes_utils, 'get_context_from_config',
+                        lambda *_args, **_kwargs: 'ctx')
+    config = _make_provision_config(count=1)
+    config.provider_config[
+        'serve_worker_projection_protocol_version'] = protocol_version
+    if scratch is not None:
+        config.provider_config['serve_worker_expected_scratch'] = scratch
+
+    with pytest.raises(config_lib.KubernetesError, match=message):
+        instance._create_pods('us', 'cluster', 'cluster', config)
+
+
+def test_create_pods_rejects_finalizer_scratch_drift_before_api_create(
+        monkeypatch):
+    cluster_on_cloud = 'scratch-finalizer-drift'
+    _patch_create_pods_k8s_boundary(monkeypatch, {}, None)
+    monkeypatch.setattr(kubernetes_utils, 'get_allowed_nodes_config',
+                        lambda _context: None)
+    monkeypatch.setattr(kubernetes_utils, 'inject_allowed_nodes_affinity',
+                        lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                        lambda fn, items, *_args: [fn(i) for i in items])
+    create_pod = mock.Mock()
+    monkeypatch.setattr(instance, '_create_namespaced_pod_with_retries',
+                        create_pod)
+
+    def mutate_scratch_after_finalization(pod_spec, **kwargs):
+        finalized = copy.deepcopy(pod_spec)
+        finalized['metadata']['name'] = kwargs['pod_name']
+        finalized['spec']['volumes'][0]['emptyDir']['sizeLimit'] = '1Gi'
+        return finalized
+
+    monkeypatch.setattr(instance.pod_spec_lib, 'finalize_pod_spec',
+                        mutate_scratch_after_finalization)
+    config = _make_provision_config(count=1)
+    config.node_config['spec'] = {
+        'containers': [{
+            'name': 'ray-node',
+            'volumeMounts': [{
+                'name': 'skypilot-serve-worker-tmp',
+                'mountPath': '/tmp',
+            }],
+        }],
+        'volumes': [{
+            'name': 'skypilot-serve-worker-tmp',
+            'emptyDir': {
+                'medium': 'Memory',
+                'sizeLimit': str(20 * 1024**3),
+            },
+        }],
+    }
+    config.provider_config.update({
+        'serve_worker_projection_protocol_version': 3,
+        'serve_worker_expected_priority_class_name': None,
+        'serve_worker_expected_priority_value': None,
+        'serve_worker_expected_preemption_policy': None,
+        'serve_worker_expected_service_account_name': 'inference-worker',
+        'serve_worker_expected_scheduler_name': 'default-scheduler',
+        'serve_worker_expected_accelerator_label_key': 'nvidia.com/gpu.product',
+        'serve_worker_expected_accelerator_label_values': ['NVIDIA-H200'],
+        'serve_worker_expected_accelerator_resource_key': 'nvidia.com/gpu',
+        'serve_worker_expected_accelerator_count': 1,
+        'serve_worker_expected_scratch': {
+            'kind': 'memory',
+            'mount_path': '/tmp',
+            'volume_name': 'skypilot-serve-worker-tmp',
+            'size_limit_bytes': 20 * 1024**3,
+        },
+    })
+
+    with pytest.raises(config_lib.KubernetesError,
+                       match='finalized SkyServe worker Pod changed'):
+        instance._create_pods('us', cluster_on_cloud, cluster_on_cloud, config)
+
+    create_pod.assert_not_called()
 
 
 def _fake_pod(name):

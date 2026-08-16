@@ -1198,6 +1198,7 @@ def test_replica_updates_and_insert_conflicts_preserve_action_owned_columns(
             'resource_action_spec_identity_sha256': None,
             'ordinary_launch_association_id': uuid.UUID(int=replica_id * 100 + 7
                                                        ),
+            'non_pool_launch_authorization': None,
         }
         expected_by_replica[replica_id] = action_values
         with orm.Session(_mock_serve_db) as session:

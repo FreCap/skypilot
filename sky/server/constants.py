@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 81  # Provider-free durable SkyServe route projection
+API_VERSION = 82  # Provider-free durable SkyServe route projection
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -145,14 +145,15 @@ MIN_OWNER_SCOPED_REQUEST_ACCESS_API_VERSION = 73
 # Minimum API version with the private atomic ordinary-launch binding endpoint.
 MIN_ORDINARY_LAUNCH_BINDING_API_VERSION = 74
 ORDINARY_LAUNCH_BINDING_PATH = '/internal/serve/ordinary-launch'
-MIN_NON_POOL_LAUNCH_BINDING_API_VERSION = 79
-MIN_SERVE_DURABLE_DEMAND_API_VERSION = 80
-MIN_SERVE_ROUTE_PROJECTION_API_VERSION = 81
+MIN_NON_POOL_LAUNCH_BINDING_API_VERSION = 80
+MIN_SERVE_DURABLE_DEMAND_API_VERSION = 81
+MIN_SERVE_ROUTE_PROJECTION_API_VERSION = 82
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
 # Minimum API version whose Serve version-history response exposes immutable
 # cross-context placement with Kubernetes/Kueue admission. Consumers must also
-# require placement_projection_protocol_version == 2.
+# require the exact advertised placement_projection_protocol_version; API 79
+# advances new writes to protocol 3 with typed worker scratch.
 MIN_SERVE_PLACEMENT_PROJECTION_API_VERSION = 77
 
 # Kubernetes node info includes the SkyServe-attributed subset of preemptible

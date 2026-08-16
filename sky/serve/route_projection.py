@@ -312,14 +312,14 @@ def build_route_view(
     replica_info: dict[str, dict[str, str]] = {}
     advertised_sources: dict[str, list[Any]] = {}
     for info in ready_infos:
-        material = resolved_routes.get(info.replica_id)
-        if material is None:
+        ready_material = resolved_routes.get(info.replica_id)
+        if ready_material is None:
             continue
-        url = _normalize_url(material.url)
+        url = _normalize_url(ready_material.url)
         if url not in collision_urls:
-            identity = current_identities.get(url)
-            if (identity is None or
-                    identity['replica_record_id'] != info.replica_record_id):
+            ready_identity = current_identities.get(url)
+            if (ready_identity is None or ready_identity['replica_record_id']
+                    != info.replica_record_id):
                 continue
         advertised_sources.setdefault(url, []).append(info)
 
@@ -336,7 +336,7 @@ def build_route_view(
             current_identities.pop(url, None)
             continue
         info = sources[0]
-        material = resolved_routes[info.replica_id]
+        advertised_material = resolved_routes[info.replica_id]
         marker = marker_for_route(info,
                                   url) if _is_recovery_capable(info) else None
         if _is_recovery_capable(info) and marker is None:
@@ -346,8 +346,8 @@ def build_route_view(
             }
             continue
         wire_info = {
-            'gpu_type': material.gpu_type,
-            'gpu_count': str(material.gpu_count),
+            'gpu_type': advertised_material.gpu_type,
+            'gpu_count': str(advertised_material.gpu_count),
         }
         if marker is not None:
             wire_info.update({
@@ -365,9 +365,9 @@ def build_route_view(
             wire_info['async_occupancy'] = ('true'
                                             if async_occupancy else 'false')
         replica_info[url] = wire_info
-        identity = current_identities.get(url)
-        if identity is not None:
-            identity['advertised'] = True
+        advertised_identity = current_identities.get(url)
+        if advertised_identity is not None:
+            advertised_identity['advertised'] = True
 
     response = {
         'replica_info': replica_info,
@@ -684,6 +684,7 @@ class RouteProjectionRepository:
                     _snapshot_owner_matches(previous_row, owner) and
                     previous_row['content_sha256'] == digest)
                 if duplicate:
+                    assert previous_row is not None
                     generation = int(previous_row['generation'])
                 else:
                     maximum = session.execute(
