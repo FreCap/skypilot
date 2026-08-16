@@ -91,7 +91,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
     assert workload_breakdown_version == 84
     assert route_projection_version < workload_breakdown_version
     assert workload_breakdown_version < ordered_capacity_version
-    assert server_constants.API_VERSION == ordered_capacity_version
+    partial_in_flight_version = (
+        server_constants.MIN_SERVE_PARTIAL_IN_FLIGHT_TELEMETRY_API_VERSION)
+    assert partial_in_flight_version == 86
+    assert ordered_capacity_version < partial_in_flight_version
+    assert server_constants.API_VERSION == partial_in_flight_version
 
 
 def test_current_demand_reads_database_without_controller():

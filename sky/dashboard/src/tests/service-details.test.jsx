@@ -3736,6 +3736,41 @@ describe('ServiceDetailCard cost and request estimates', () => {
     ).toBeTruthy();
     expect(screen.queryByText(/telemetry stale/)).toBeNull();
   });
+
+  it('renders a proven lower bound when backend occupancy is incomplete', () => {
+    render(
+      <ServiceDetailCard
+        serviceData={{
+          name: 'svc',
+          status: 'READY',
+          replicasReady: 5,
+          replicasTotal: 5,
+          replicasFailed: 0,
+          activeVersions: [1],
+          hourlyCostExcludedReplicaCount: 0,
+          requestRate: 0,
+          recentRequestCount: 0,
+          requestWindowSeconds: 60,
+          inFlightRequests: null,
+          confirmedInFlightRequests: 0,
+          unknownInFlightReplicaCount: 5,
+          requestQueueDepth: 0,
+          rejectedRequests: 0,
+          requestStatsAgeSeconds: 2,
+          requestTelemetryState: 'fresh',
+          requestTelemetryReason: 'in_flight_incomplete',
+          costPerThousandRequests: null,
+        }}
+      />
+    );
+
+    expect(screen.getByText('0 confirmed processing')).toBeTruthy();
+    expect(
+      screen.getByText(
+        '0.00 req/s recent · 0 requests in 60s · 0 queued · 5 backends with unknown occupancy · 0 rejected · activity report 2s old'
+      )
+    ).toBeTruthy();
+  });
 });
 
 describe('service replica placement breakdown', () => {
