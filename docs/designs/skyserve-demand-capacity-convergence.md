@@ -1,7 +1,7 @@
 # SkyServe demand, capacity, and telemetry convergence
 
-Status: P1 is implemented in draft PR #1498; P2a is in implementation;
-production remains on the legacy controller-coupled demand path
+Status: P1 is implemented in draft PR #1498; P2a is implemented in draft PR
+#1499; production remains on the legacy controller-coupled demand path
 
 Last updated: 2026-08-16
 
@@ -99,7 +99,7 @@ The implementation must reuse these checked-in mechanisms:
 - the generic non-pool binding and per-association reconciliation specified by
   `durable-serve-replica-actions.md`.
 
-The P2a implementation branch now contains, but has not deployed or promoted:
+The P2a draft PR #1499 now contains, but has not deployed or promoted:
 
 - a PostgreSQL-clock-fenced latest-report table and stable authenticated
   ingestion endpoint;
@@ -461,7 +461,8 @@ generation. The final cleanup removes their predecessor paths.
 - [ ] Pass the complete P1 crash/mixed-version/provider-evidence matrix.
 - [ ] Reconcile the exact seven-row production scope without fabricated
   quiescence or manual row deletion.
-- [ ] Publish P2 and update P3 for every transition-only demand/route path.
+- [x] Publish the P2a durable-demand/UI draft as PR #1499.
+- [ ] Publish P2b and update P3 for every transition-only demand/route path.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route, controller
   stall isolation, and dashboard tests.
 - [ ] Promote the service on one immutable capable cohort and set
