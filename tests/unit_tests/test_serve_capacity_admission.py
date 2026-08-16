@@ -1,8 +1,12 @@
 """Pure contract tests for ordered SkyServe capacity admission."""
 
 import pytest
+import sqlalchemy
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import sqlite
 
 from sky.serve import capacity_admission
+from sky.serve import serve_state_schema
 
 
 def _input(**overrides) -> capacity_admission.CapacityPlanInput:
@@ -30,6 +34,20 @@ def _input(**overrides) -> capacity_admission.CapacityPlanInput:
     }
     values.update(overrides)
     return capacity_admission.CapacityPlanInput(**values)
+
+
+def test_paid_claim_constraints_are_postgresql_only():
+    table = serve_state_schema.paid_capacity_claims_table
+    sqlite_ddl = str(
+        sqlalchemy.schema.CreateTable(table).compile(dialect=sqlite.dialect()))
+    postgres_ddl = str(
+        sqlalchemy.schema.CreateTable(table).compile(
+            dialect=postgresql.dialect()))
+
+    for constraint_name in ('serve050_paid_claim_plan_complete_ck',
+                            'serve050_paid_claim_plan_values_ck'):
+        assert constraint_name not in sqlite_ddl
+        assert constraint_name in postgres_ddl
 
 
 def test_capacity_plan_requires_exact_post_zero_cost_residual():

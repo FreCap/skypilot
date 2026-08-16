@@ -576,6 +576,12 @@ referenced by a planner-bound claim; the claim foreign key retains every
 generation that can still authorize or explain unsettled work without allowing
 the table to grow with every semantic reconcile.
 
+Serve050's authoritative constraints remain PostgreSQL-only, while the shared
+controller metadata omits their PostgreSQL-specific expressions when a local
+controller creates its still-supported SQLite database. The migration and
+runtime authority stay on PostgreSQL; this prevents the central database
+contract from accidentally breaking the separate local-controller backend.
+
 API012 advertises one exact ordered-admission protocol capability on every
 live `all|api|executor|controller` participant. Per-service promotion locks the
 service, proves that fleet capability, a fresh complete durable demand report,

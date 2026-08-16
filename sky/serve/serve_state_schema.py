@@ -966,11 +966,16 @@ paid_capacity_claims_table = sqlalchemy.Table(
     sqlalchemy.Column('demand_source_epoch', sqlalchemy.BigInteger),
     sqlalchemy.Column('capacity_plan_accelerator', sqlalchemy.Text),
     sqlalchemy.Column('capacity_plan_units', sqlalchemy.Integer),
+    # These constraints intentionally match the PostgreSQL-only Serve050
+    # migration. Keep them out of local controller SQLite DDL: num_nonnulls
+    # and the regex operator are PostgreSQL expressions, while local Serve
+    # state still officially supports SQLite.
     sqlalchemy.CheckConstraint(
         'num_nonnulls(capacity_plan_generation, capacity_plan_sha256, '
         'demand_feed_generation, demand_source_epoch, '
         'capacity_plan_accelerator, capacity_plan_units) IN (0, 6)',
-        name='serve050_paid_claim_plan_complete_ck'),
+        name='serve050_paid_claim_plan_complete_ck').ddl_if(dialect='postgresql'
+                                                           ),
     sqlalchemy.CheckConstraint(
         '(capacity_plan_generation IS NULL OR '
         '(capacity_plan_generation > 0 AND demand_feed_generation > 0 AND '
@@ -978,7 +983,7 @@ paid_capacity_claims_table = sqlalchemy.Table(
         "capacity_plan_sha256 ~ '^[0-9a-f]{64}$' AND "
         'length(capacity_plan_accelerator) > 0 AND '
         'capacity_plan_units > 0))',
-        name='serve050_paid_claim_plan_values_ck'),
+        name='serve050_paid_claim_plan_values_ck').ddl_if(dialect='postgresql'),
 )
 sqlalchemy.Index('paid_capacity_claims_pool_idx',
                  paid_capacity_claims_table.c.pool_key)
