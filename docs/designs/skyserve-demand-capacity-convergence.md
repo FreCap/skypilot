@@ -121,11 +121,11 @@ claim revalidated immediately before provider I/O. These changes remain dark
 and unpromoted. The final dashboard placement explanation and P3 removal of
 the legacy demand/route paths are not yet implemented.
 
-The latest 2026-08-16 production read-only audit found Helm revision 400 on
-v1.1.1295, commit `2ccb6358a930373069393d5cba4db131feb99c71`, API 81,
+The latest 2026-08-16 production read-only audit found Helm revision 401 on
+v1.1.1296, commit `036c7a2627b34050e00b335b41c8cd7e329cdc2a`, API 81,
 API-request revision 011, and Serve revision 047. The API deployment and both
 `boltz-l4-fleet` load balancers use immutable digest
-`sha256:c67538db1d83088d542583e44b75013b0082fd13162a62409df787337f10baaf`.
+`sha256:cb383b53e4723903d62c4115e961c3869b51b5a91e3e7bddec1460703ec54756`.
 The service remains `resource_action_mode=legacy` and non-pool capability is
 false. It has no generalized non-pool association, associated request, legacy
 scope/reconciliation, or resource-action shadow row, and replica IDs
@@ -713,9 +713,9 @@ rows instead of converting ambiguity into a fleet-wide publication barrier.
 
 ## Open gates
 
-- [x] Verify the later v1.1.1295 production compatibility baseline without
+- [x] Verify the later v1.1.1296 production compatibility baseline without
   generalized-action, demand-authority, or placement promotion (2026-08-16:
-  Helm revision 400, single-`all` `Recreate`, Serve047/API011, API 81, service
+  Helm revision 401, single-`all` `Recreate`, Serve047/API011, API 81, service
   resource-action mode legacy, non-pool capability false).
 - [x] Merge P1 as PR #1498 and publish P2a as PR #1499, P2b as PRs #1503/#1504,
   and the blocked P3 removals as draft PRs #1506/#1510.
