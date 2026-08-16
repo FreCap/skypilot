@@ -448,7 +448,7 @@ contract. During transition the LB sends both old controller sync data and the
 new durable report. The durable feed is authoritative for display only when
 fresh; it has no scaling or launch authority in P2a.
 
-Current reviewed size: 2,795 additions and 82 deletions across 34 files,
+Current reviewed size: 2,814 additions and 85 deletions across 38 files,
 mostly reusing existing aggregators, history tables, proxy
 authentication, and components. The additional direct-read hook, strict
 bounded report validation, and PostgreSQL migration matrix account for the
@@ -564,7 +564,7 @@ controller-sync endpoint may still accept routing/drain reports during the
 transition, but it cannot call `collect_request_information`; only the durable
 reader may advance autoscaler demand state.
 
-Reviewed P2b2 size: 40 files, 3,958 additions and 189 deletions.
+Reviewed P2b2 size: 40 files, 3,973 additions and 194 deletions.
 This is large and above the original 1,200--2,000-line estimate because it
 includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
 races, controller ordering tests, strict route/content/LB-generation
