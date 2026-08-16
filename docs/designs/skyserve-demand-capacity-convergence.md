@@ -159,6 +159,16 @@ EKS audit attributes that Helm 3.16.4 update to operator identity
 remains deployment drift. The final P2 rollout still goes through the reviewed
 pin and exact saved Terragrunt plan.
 
+While P2b2 exact-head CI was running, another independent direct Helm update
+created revision 404 with v1.1.1301, exact commit
+`b8c017dd6451e4373040d185634ffed5f7c2bf55`, API 84, and image digest
+`sha256:14f7c252bef9c5a1c3c9ec5a22df253a6e66102e9ca09091c93a04cb5a3adeb3`.
+The rollout completed with no restart and advanced the forward PostgreSQL
+heads to Serve049/API-request 011. Its active requests after readiness were
+read-only status, inventory, and managed-jobs queue reads; it created no
+launch/down provider mutation. It is also absent from the platform pin and
+does not replace the reviewed exact-head deployment path.
+
 The service remains `resource_action_mode=legacy`,
 `ordinary_launch_binding_mode=legacy`, and non-pool capability false. It has no
 generalized non-pool association, associated request, legacy
@@ -670,7 +680,8 @@ controller-sync endpoint may still accept routing/drain reports during the
 transition, but it cannot call `collect_request_information`; only the durable
 reader may advance autoscaler demand state.
 
-Reviewed P2b2 size: 40 files, 4,021 additions and 197 deletions.
+Reviewed P2b2 size after the API84 base collision was resolved: 46 files,
+4,316 additions and 246 deletions.
 This is large and above the original 1,200--2,000-line estimate because it
 includes sequential API/Serve migrations, real-PostgreSQL inventory/claim
 races, controller ordering tests, strict route/content/LB-generation
@@ -758,9 +769,9 @@ Automated tests must cover:
 
 Manual production verification records:
 
-1. the live deployment tuple at rollout time, including revision 403's
-   unpinned v1.1.1299 drift, unchanged single-`all` topology, and the forward
-   Serve048/API-request-012 database heads;
+1. the live deployment tuple at rollout time, including revision 404's
+   unpinned v1.1.1301 drift, unchanged single-`all` topology, and the forward
+   Serve049/API-request-011 database heads;
 2. the completed pre-migration inventory of retained legacy rows and unsettled
    requests; reconcile only rows that actually remain. Record the historical
    absence of IDs 52032--52038 without treating it as quiescence, recreating
