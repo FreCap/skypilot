@@ -46,11 +46,11 @@ _SERVE037_PLACEMENT_TABLES = (
 )
 
 # The common runtime metadata is the steady-state schema, while a sequential
-# upgrade reaches revision 038 before Serve042, Serve047, and Serve049 install
-# their PostgreSQL-only launch-binding and route-projection contract. Project
-# those future-owned fields and checks out unconditionally: revision 038 must
-# reject even a complete early lookalike, leaving each later migration as its
-# sole DDL owner.
+# upgrade reaches revision 038 before Serve042, Serve047, Serve049, and
+# Serve050 install their PostgreSQL-only launch-binding, route-projection, and
+# demand-authority contracts. Project those future-owned fields and checks out
+# unconditionally: revision 038 must reject even a complete early lookalike,
+# leaving each later migration as its sole DDL owner.
 _POST_SERVE038_FUTURE_COLUMNS = {
     _SERVICES: frozenset({
         'controller_incarnation',
@@ -69,6 +69,11 @@ _POST_SERVE038_FUTURE_COLUMNS = {
         'route_projection_capable',
         'route_projection_controller_incarnation',
         'route_projection_protocol_version',
+        'demand_source_mode',
+        'demand_source_epoch',
+        'demand_authority_capable',
+        'demand_authority_controller_incarnation',
+        'demand_authority_protocol_version',
     }),
     _REPLICAS: frozenset({'ordinary_launch_association_id'}),
 }
@@ -79,6 +84,10 @@ _POST_SERVE038_FUTURE_CHECKS = {
         'serve049_route_source_epoch_ck',
         'serve049_route_capability_shape_ck',
         'serve049_route_projected_capability_ck',
+        'serve050_demand_source_mode_ck',
+        'serve050_demand_source_epoch_ck',
+        'serve050_demand_capability_shape_ck',
+        'serve050_durable_demand_capability_ck',
     }),
 }
 

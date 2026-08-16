@@ -174,6 +174,23 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('route_projection_controller_incarnation',
                       sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('route_projection_protocol_version', sqlalchemy.Integer),
+    # Serve050 promotes the durable report to the sole autoscaling source only
+    # under an exact controller incarnation and monotonic source epoch.
+    sqlalchemy.Column('demand_source_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='LEGACY_CONTROLLER'),
+    sqlalchemy.Column('demand_source_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('demand_authority_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('demand_authority_controller_incarnation',
+                      sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('demand_authority_protocol_version', sqlalchemy.Integer),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that
@@ -269,6 +286,23 @@ services_table = sqlalchemy.Table(
         "route_source_mode <> 'DURABLE_PROJECTED' OR "
         '(route_source_epoch > 0 AND route_projection_capable)',
         name='serve049_route_projected_capability_ck'),
+    sqlalchemy.CheckConstraint(
+        "demand_source_mode IN ('LEGACY_CONTROLLER', 'DURABLE_FEED')",
+        name='serve050_demand_source_mode_ck'),
+    sqlalchemy.CheckConstraint('demand_source_epoch >= 0',
+                               name='serve050_demand_source_epoch_ck'),
+    sqlalchemy.CheckConstraint(
+        '((NOT demand_authority_capable AND '
+        'demand_authority_controller_incarnation IS NULL AND '
+        'demand_authority_protocol_version IS NULL) OR '
+        '(demand_authority_capable AND '
+        'demand_authority_controller_incarnation IS NOT NULL AND '
+        'demand_authority_protocol_version = 1))',
+        name='serve050_demand_capability_shape_ck'),
+    sqlalchemy.CheckConstraint(
+        "demand_source_mode <> 'DURABLE_FEED' OR "
+        '(demand_source_epoch > 0 AND demand_authority_capable)',
+        name='serve050_durable_demand_capability_ck'),
 )
 
 replicas_table = sqlalchemy.Table(
@@ -926,6 +960,30 @@ paid_capacity_claims_table = sqlalchemy.Table(
                       nullable=False),
     sqlalchemy.Column('priority', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('claimed_at', sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column('capacity_plan_generation', sqlalchemy.BigInteger),
+    sqlalchemy.Column('capacity_plan_sha256', sqlalchemy.Text),
+    sqlalchemy.Column('demand_feed_generation', sqlalchemy.BigInteger),
+    sqlalchemy.Column('demand_source_epoch', sqlalchemy.BigInteger),
+    sqlalchemy.Column('capacity_plan_accelerator', sqlalchemy.Text),
+    sqlalchemy.Column('capacity_plan_units', sqlalchemy.Integer),
+    # These constraints intentionally match the PostgreSQL-only Serve050
+    # migration. Keep them out of local controller SQLite DDL: num_nonnulls
+    # and the regex operator are PostgreSQL expressions, while local Serve
+    # state still officially supports SQLite.
+    sqlalchemy.CheckConstraint(
+        'num_nonnulls(capacity_plan_generation, capacity_plan_sha256, '
+        'demand_feed_generation, demand_source_epoch, '
+        'capacity_plan_accelerator, capacity_plan_units) IN (0, 6)',
+        name='serve050_paid_claim_plan_complete_ck').ddl_if(dialect='postgresql'
+                                                           ),
+    sqlalchemy.CheckConstraint(
+        '(capacity_plan_generation IS NULL OR '
+        '(capacity_plan_generation > 0 AND demand_feed_generation > 0 AND '
+        'demand_source_epoch > 0 AND '
+        "capacity_plan_sha256 ~ '^[0-9a-f]{64}$' AND "
+        'length(capacity_plan_accelerator) > 0 AND '
+        'capacity_plan_units > 0))',
+        name='serve050_paid_claim_plan_values_ck').ddl_if(dialect='postgresql'),
 )
 sqlalchemy.Index('paid_capacity_claims_pool_idx',
                  paid_capacity_claims_table.c.pool_key)

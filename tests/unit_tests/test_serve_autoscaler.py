@@ -386,6 +386,8 @@ class TestAutoscalerInfo(unittest.TestCase):
         self.assertEqual(info['recent_request_count'], 3)
         self.assertEqual(info['request_window_seconds'], 60)
         self.assertEqual(info['requests_per_second'], 0.05)
+        self.assertEqual(info['capacity_target_by_accelerator'], {})
+        self.assertFalse(info['capacity_target_complete'])
 
 
 class TestQueueLengthAutoscalerIdleReplicas(unittest.TestCase):

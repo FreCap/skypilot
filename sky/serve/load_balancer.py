@@ -4207,12 +4207,17 @@ class SkyServeLoadBalancer:
                 for url, sampled_at in self._occupancy_sample_time.items()
                 if url in sampled_set
             }
+            total_slots = {
+                url: int(slots)
+                for url, slots in self._replica_total_slots.items()
+                if url in sampled_set
+            }
         # Fail closed if a live observation has generation evidence but no
         # per-url sample timestamp. The controller rejects unequal key sets.
         reported_urls = (set(async_occupancy) | set(sample_generations) |
-                         set(sample_ages))
+                         set(sample_ages) | set(total_slots))
         common_urls = (set(async_occupancy) & set(sample_generations) &
-                       set(sample_ages))
+                       set(sample_ages) & set(total_slots))
         unknown_urls = sorted(set(unknown_urls) | (reported_urls - common_urls))
         async_occupancy = {url: async_occupancy[url] for url in common_urls}
         sample_generations = {
@@ -4239,6 +4244,12 @@ class SkyServeLoadBalancer:
             'async_occupancy': async_occupancy,
             'occupancy_sample_generation': sample_generations,
             'occupancy_sample_age_seconds': sample_ages,
+            'occupancy_sampled_urls': sorted(common_urls),
+            'total_slots_by_url': {
+                url: total_slots[url]
+                for url in common_urls
+                if url in total_slots
+            },
             'routing_urls': routing_urls,
             'unknown_in_flight_urls': unknown_urls,
             'draining_urls': list(self._draining_clients),

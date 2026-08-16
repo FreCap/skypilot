@@ -352,6 +352,16 @@ SERVER_INSTANCES = sqlalchemy.Table(
                       sqlalchemy.BigInteger),
     sqlalchemy.Column('non_pool_launch_receipt_protocol_version',
                       sqlalchemy.Integer),
+    # API012 proves that every live request participant understands the
+    # durable-demand planner tuple carried by paid SkyServe launches.
+    sqlalchemy.Column('ordered_capacity_admission_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('ordered_capacity_admission_protocol_version',
+                      sqlalchemy.Integer),
+    sqlalchemy.Column('ordered_capacity_admission_cohort_epoch',
+                      sqlalchemy.BigInteger),
     sqlalchemy.CheckConstraint(
         '((NOT non_pool_launch_binding_capable AND '
         'num_nonnulls(non_pool_launch_binding_protocol_version, '
@@ -374,6 +384,16 @@ SERVER_INSTANCES = sqlalchemy.Table(
         '(non_pool_launch_receipt_protocol_version IS NULL OR '
         'non_pool_launch_receipt_protocol_version = 1)',
         name='ck_api_server_instances_non_pool_launch_capability_values'),
+    sqlalchemy.CheckConstraint(
+        '((NOT ordered_capacity_admission_capable AND '
+        'ordered_capacity_admission_protocol_version IS NULL AND '
+        'ordered_capacity_admission_cohort_epoch IS NULL) OR '
+        '(ordered_capacity_admission_capable AND '
+        'ordered_capacity_admission_protocol_version IS NOT NULL AND '
+        'ordered_capacity_admission_cohort_epoch IS NOT NULL AND '
+        'ordered_capacity_admission_protocol_version = 1 AND '
+        'ordered_capacity_admission_cohort_epoch = 1))',
+        name='ck_api_server_instances_ordered_capacity_complete'),
 )
 CONTROLLER_LEADERSHIP = sqlalchemy.Table(
     'api_controller_leadership',

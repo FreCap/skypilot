@@ -221,14 +221,14 @@ def _drop_database(pg_server, dbname: str) -> None:
 
 @pytest.fixture(scope='session')
 def _pg_mechanics_template(pg_server):
-    """One migrated template cloned for isolated round-mechanics tests."""
+    """One current-head template cloned for isolated mechanics tests."""
     database_name = f'broker_template_{uuid.uuid4().hex[:10]}'
     url = _create_database(pg_server, database_name)
     engine = create_engine(url)
     try:
         migration_utils.safe_alembic_upgrade(engine,
                                              migration_utils.SERVE_DB_NAME,
-                                             '045')
+                                             migration_utils.SERVE_VERSION)
     finally:
         engine.dispose()
     try:

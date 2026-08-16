@@ -27,7 +27,7 @@ from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
-    name='serve_ordinary_launch_binding_schema_049_pg')
+    name='serve_ordinary_launch_binding_schema_050_pg')
 
 _SUBMISSION_ID = uuid.UUID('11111111-1111-4111-8111-111111111111')
 _RECORD_ID = uuid.UUID('22222222-2222-4222-8222-222222222222')
@@ -83,7 +83,7 @@ def _stored_replica_state(
 def binding_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(serve_config, '049')
+    alembic_command.upgrade(serve_config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
 

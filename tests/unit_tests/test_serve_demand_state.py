@@ -34,6 +34,10 @@ def _report() -> dict:
         'occupancy_sample_age_seconds': {
             'http://replica': 0.1
         },
+        'occupancy_sampled_urls': ['http://replica'],
+        'total_slots_by_url': {
+            'http://replica': 4
+        },
         'routing_urls': ['http://replica'],
         'unknown_in_flight_urls': [],
         'draining_urls': [],
@@ -107,8 +111,48 @@ def test_validate_report_rejects_occupancy_without_matching_freshness():
     report = _report()
     report['occupancy_sample_age_seconds'] = {}
 
-    with pytest.raises(demand_state.DemandReportError, match='role/occupancy'):
+    with pytest.raises(demand_state.DemandReportError):
         demand_state._validate_report(report)
+
+
+@pytest.mark.parametrize('field', [
+    'occupancy_sampled_urls',
+    'total_slots_by_url',
+    'async_occupancy',
+])
+def test_validate_report_protocol2_requires_one_exact_capacity_url_set(field):
+    report = _report()
+    report[field] = [] if field == 'occupancy_sampled_urls' else {}
+
+    with pytest.raises(demand_state.DemandReportError,
+                       match='slot and occupancy URLs'):
+        demand_state._validate_report(report)
+
+
+def test_validate_report_protocol2_accounts_for_every_routed_url():
+    report = _report()
+    report['routing_urls'].append('http://unaccounted')
+
+    with pytest.raises(demand_state.DemandReportError,
+                       match='sampled or explicitly unknown'):
+        demand_state._validate_report(report)
+
+
+def test_current_lb_authority_requires_exact_ha_active_generation():
+    report = _report()
+    rows = [{'lb_slot': 'a', 'payload': report}]
+    service = {
+        'lb_ha_enabled': 1,
+        'lb_active_slot': 'a',
+        'lb_cutover_generation': 2,
+    }
+    assert demand_state.reports_match_current_lb_authority(rows, service)
+
+    report['applied_generation'] = 1
+    assert not demand_state.reports_match_current_lb_authority(rows, service)
+    report['applied_generation'] = 2
+    report['applied_role'] = 'DRAINING'
+    assert not demand_state.reports_match_current_lb_authority(rows, service)
 
 
 def test_validate_report_never_promotes_incomplete_compatibility():

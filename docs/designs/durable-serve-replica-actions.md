@@ -83,7 +83,16 @@ work remains useful transition machinery, but it is not the long-term boundary
 and must not be deployed as though excluded launch profiles can remain
 permanently unbound.
 
-As of 2026-08-16, the G1 implementation is authored but not deployed. It adds
+As of 2026-08-16, G1 is merged as PR #1498. It was present in the v1.1.1296
+revision-401 artifact, but a concurrent Terragrunt/Terraform apply created Helm
+revision 402 and regressed the runtime to v1.1.1287 while PostgreSQL correctly
+remained forward at
+API-request 011/Serve047. The current runtime is therefore not capable of the
+G1 legacy-reconciliation operation; no legacy evidence or service authority
+write may be attempted until one exact G1-capable cohort is restored. EKS
+audit records attribute revision 402 to Terraform's Helm provider; the
+checked-in platform runtime pin, not a direct Helm mutation, is the durable
+deployment authority. G1 adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
 pre-admission retirement, failure-isolated startup recovery, and exact
@@ -96,9 +105,35 @@ no paid-capacity claim exists. Local evidence currently includes the focused
 source contracts, all 53 real-PostgreSQL Serve047 migration/binding/reducer
 tests, real-PostgreSQL API011 atomic admission/quiescence and rollback/projection
 tests, `git diff --check`, Python compilation, repository-wide mypy over 937
-source files, changed-file pylint, and dashboard lint/format. CI, stacked
-cleanup publication, rollout, and live evidence for the seven incident rows
-remain open gates.
+source files, changed-file pylint, and dashboard lint/format. CI and merge are
+complete; additive rollout, exact retained-row reconciliation, and stacked
+cleanup gates remain open.
+
+The fresh pre-migration inventory supersedes the historical seven-row recovery
+scope. Replica IDs 52032--52038 are absent and must not be recreated or treated
+as quiescent. The service initially had 64 nonterminal current-version rows: 46
+`READY`, 15 recent zero-cost `PENDING` intents, and three zero-cost
+`PROVISIONING` rows. Replica 52689 was the global legacy-recovery blocker: its
+A100 provider cluster was present, its request was cancelled after lease
+expiry, and it lacked exact execution quiescence. G1 sealed only that retained
+identity, recorded `LEGACY_EFFECT_AMBIGUOUS`, observed the provider effect as
+`PRESENT`, performed exact fenced teardown, and projected only after a new
+physical-UID-fenced `ABSENT` observation. The row and cluster are absent; the
+request remains cancelled without a synthetic receipt, and no paid claim
+exists.
+
+The recovery loop then cleared the prior intents from nonterminal `PENDING`
+state and admitted replicas 52688 and 52690 to ordinary typed cleanup. The live
+Serve048 runtime exposed a separate migration-lineage omission: revision-040
+authority recognized heads only through Serve047, so placement acknowledgement
+and the remaining cleanup fail closed. P2b1/P2b2 recognize the reviewed
+additive Serve048--050 heads.
+Replica 52688 still has a present provider cluster and a succeeded/quiesced
+request. Replica 52690 has a failed, quiesced request and a PHX Kubernetes
+admission failure caused by a missing server-owned Kueue queue label. Those
+rows remain ordinary typed-recovery work after the lineage fix; the label
+defect is owned by workspace/provider admission configuration, not this action
+protocol.
 
 ## Decision record
 
@@ -190,6 +225,63 @@ The incident correction is evidence preserving:
 The immediate cancel-then-rediscover correction is a bounded mitigation. It
 must preserve the may-have-effect classification and cannot become a second
 long-term recovery path.
+
+### 2026-08-16 executor-retirement correction
+
+The retained-row investigation exposed a second, independent lifecycle risk.
+In the HA chart, Kubernetes starts the Pod termination-grace countdown before
+running `preStop`, while `preStop` spends `readinessDrainSeconds` only touching
+the readiness marker and sleeping. The application still receives
+`SKYPILOT_GRACE_PERIOD_SECONDS` equal to the complete Pod grace period. It can
+therefore budget work past the real SIGKILL deadline.
+
+EKS audit and PostgreSQL evidence prove that this timing defect caused replica
+52689's missing receipt. Request `e8522a85-33da-4c7c-b5bb-f9dfce503d68` was
+created at 13:51:14.086 UTC. The ReplicaSet controller deleted exact Pod
+`skypilot-api-server-57d7dd9584-mqglt`, UID
+`c74d8735-f5f9-4e9a-8bd1-19e69f8b68ea`, at 13:51:15.759 UTC (audit ID
+`877cb2bc-db4b-405d-b9ff-23121728c40b`). The rendered Pod had a 60-second
+termination grace and a 20-second readiness `preStop`, while the application
+was incorrectly given the full 60 seconds. Kubernetes recorded the API
+container terminated with exit 137 at 13:52:16 UTC (audit ID
+`50a76fdf-882f-4941-9667-e9c83f8ff8ec`), and the kubelet finalized the exact
+Pod with grace zero at 13:52:16.990 UTC. Only afterward did the request lease
+expire at 13:52:36.525 UTC and the request become `CANCELLED` at 13:53:01.138
+UTC without an execution-quiescence receipt. This is a rollout retirement
+failure, not provider scarcity.
+
+The steady-state correction makes retirement an application-visible protocol,
+not an incidental signal sequence:
+
+1. the existing pod-local drain marker is the single early retirement input;
+   each API, executor, and controller runtime watches it, durably marks its
+   exact instance lease draining, stops new claims, and starts child/receipt
+   convergence before the readiness-propagation sleep;
+2. Helm exposes and validates disjoint readiness-propagation, execution-drain,
+   and final-commit margins. The application receives only its real remaining
+   budget, and chart rendering fails unless their sum fits inside
+   `terminationGracePeriodSeconds`;
+3. a graceful owner exits only after every exact claim and invocation warden it
+   owns has either published its real terminal/quiescence receipt or remains
+   durably classified as effect-ambiguous. A timeout never fabricates
+   quiescence;
+4. abnormal death uses a separate typed `EXECUTOR_TERMINATED` certificate. It
+   is not a request receipt and only proves that the named execution sandbox
+   can no longer perform effects. Automatic issuance requires authoritative
+   infrastructure evidence for the exact Kubernetes context, namespace, Pod
+   UID, and container termination outcome. Lease expiry, Pod `NotFound`, a
+   replacement Pod, or a missing process-map entry alone remain insufficient;
+   those cases require reviewed attestation and stay fail closed; and
+5. after executor termination, any request that may have crossed the effect
+   boundary remains `LEGACY_EFFECT_AMBIGUOUS` or its current-protocol typed
+   equivalent. Cleanup still requires a fresh physical-UID provider read that
+   starts after the certificate and is revalidated under the canonical row
+   locks. No successor is authorized from executor death alone.
+
+This extends the existing request-worker/guardian and association protocol. It
+does not add a second queue, executor topology, provider renderer, or recovery
+authority. Per-action isolation in G2 ensures an ambiguous action cannot block
+unrelated cards or services.
 
 ## Goals
 
@@ -1119,6 +1211,24 @@ automatic recovery path consumes them. Pools retain their separate lifecycle.
 The final topology has one non-pool handler, one association, one request queue,
 one executor topology, and the existing provider path.
 
+### G1S: additive executor-retirement hardening
+
+G1S is an additive PR above the deployed G1/P2 baseline and below the G2
+cleanup. It makes the existing drain marker active in API, executor, and
+controller runtimes; records drain-start and completion against the exact
+`api_server_instances` identity; splits and validates the Helm shutdown
+budgets; and adds the typed executor-termination evidence source without
+changing request terminal or quiescence fields. It retains the reviewed manual
+attestation path for historical or incomplete infrastructure evidence. A
+simultaneously authored stacked cleanup removes the old sleep-only hook and
+full-grace application environment once mixed chart versions have drained.
+
+The crash matrix includes drain-marker-before-SIGTERM, SIGTERM during provider
+I/O, SIGKILL before receipt commit, node loss, force deletion, database outage,
+old/new chart overlap, and launch during a rolling update. Every case asserts
+that no second effect starts without the canonical binding and that unknown
+termination evidence remains quarantined rather than synthesized.
+
 ## Deployment and rollback
 
 ### Generalized G1/G2 rollout
@@ -1177,6 +1287,16 @@ The generalized contract is a material design change. All prior adversarial
 rounds over an ordinary-only R2/R3 or a Serve047 reserved-fill cleanup are
 historical and the required consecutive review sequence restarts at zero on
 the exact G1/G2 heads.
+
+G1S rolls out dark with the existing binding modes unchanged. Qualification
+must observe one planned retirement for each runtime role, prove drain-start
+precedes readiness sleep and SIGTERM, prove every owned claim settles or is
+explicitly quarantined before exit, and inject one hard-kill case that leaves
+an ambiguous action isolated. Rollback may restore the prior binary only while
+the additive evidence schema remains unread-but-tolerated; it must not restore
+the sleep-only chart hook after the first service relies on early retirement.
+The stacked cleanup merges only after all old chart/runtime cohorts age beyond
+the stale-writer and quiescence horizons.
 
 ### Historical R0 deployment record
 
@@ -2345,15 +2465,21 @@ approved canary:
 
 ### Generalized non-pool binding gates (current)
 
-- [ ] Author and review G1 (API011/Serve047), demand convergence
-  (API012/Serve048), and the blocked stacked G2 cleanup (API013/Serve049)
+- [x] Author, review, and merge G1 (API011/Serve047); author demand convergence
+  (API012/Serve048) and the blocked stacked G2 cleanup (API013/Serve049)
   together; link the PRs and state G2's exact merge gate.
 - [ ] Restack any draft API011 combined-role cleanup to API013 and any draft
   Serve047 reserved-fill permanent cleanup to Serve049. Prove each schema
   lineage has one forward-only head and no historical migration changed.
-- [ ] Reconcile all seven incident rows from exact request, provider, and
-  cluster-incarnation evidence. Preserve real old-executor effects; record no
-  fabricated quiescence receipt or synthetic association.
+- [x] Inventory the historical seven incident rows and prove that IDs
+  52032--52038 are absent. Do not recreate them or misstate absence as
+  quiescence.
+- [x] Reconcile replica 52689 from exact request, executor-termination,
+  provider, and cluster-incarnation evidence through the G1 legacy ledger.
+  Preserve the real old-executor effect and original cancelled request; record
+  no fabricated quiescence receipt or synthetic association.
+- [ ] Deploy the reviewed Serve049/050 authority lineage and verify ordinary
+  typed cleanup converges replicas 52688 and 52690 without manual deletion.
 - [ ] Converge every API acceptor, request backend, queue executor, GC
   participant, possible controller, and profile participant on one immutable
   generic handler/profile/capability digest; drain old and recent leases through
@@ -2379,6 +2505,14 @@ approved canary:
 - [ ] Run three new consecutive pragmatic adversarial reviews against the exact
   frozen G1/G2 and reserved-fill heads. The 2026-08-15 material correction
   resets prior ordinary-only and Serve047-cleanup review counts to zero.
+- [ ] Author G1S and its stacked sleep-only cleanup. Validate the three-part
+  Helm shutdown budget, exact drain-marker ownership transition, real receipt
+  completion, and typed executor-termination evidence across the complete
+  rollout/crash matrix. Do not treat Pod absence or lease expiry as automatic
+  execution proof.
+- [ ] Deploy G1S dark and pass one planned retirement per API, executor, and
+  controller role plus one injected hard-kill quarantine test before enabling
+  its automatic infrastructure certificate issuer or merging its cleanup.
 - [ ] Merge G2 only after zero legacy-capable participants, zero old-handler
   active/unsettled requests, and zero unbound non-pool rows requiring recovery.
   After G2, roll forward only.
