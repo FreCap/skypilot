@@ -1056,7 +1056,9 @@ def test_api011_serve047_lineage_and_sqlite_stays_at_serve037(
     assert (server_constants.
             MIN_KUBERNETES_PREEMPTIBLE_SERVICE_BREAKDOWN_API_VERSION == 78)
     assert server_constants.MIN_NON_POOL_LAUNCH_BINDING_API_VERSION == 80
-    assert server_constants.API_VERSION == 80
+    assert (server_constants.
+            MIN_KUBERNETES_OPERATIONAL_PRIORITY_BREAKDOWN_API_VERSION == 81)
+    assert server_constants.API_VERSION == 81
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)
