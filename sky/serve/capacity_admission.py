@@ -6,13 +6,15 @@ capacity ledger one immutable authority tuple to bind into each claim.
 """
 from __future__ import annotations
 
+from collections.abc import Callable
+from collections.abc import Mapping
 import dataclasses
 import datetime
 import enum
 import hashlib
 import json
 import re
-from typing import Any, Callable, Mapping
+from typing import Any
 import uuid
 
 import sqlalchemy

@@ -8,13 +8,14 @@ controller is wedged or restarting.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import dataclasses
 import datetime
 import hashlib
 import json
 import math
 import re
-from typing import Any, Mapping
+from typing import Any
 
 import sqlalchemy
 from sqlalchemy.dialects import postgresql
