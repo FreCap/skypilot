@@ -1326,6 +1326,12 @@ def test_paid_claim_path_rejects_zero_cost_authority_without_side_effects(
 
 def test_paid_claim_failure_does_not_publish_pool_key(observation_engine,
                                                       monkeypatch) -> None:
+    # This test crosses the current paid-admission runtime boundary.  Keep the
+    # shared observation fixture at its canonical Serve046 characterization
+    # point, but advance this isolated database through the additive tail.
+    config = migration_utils.get_alembic_config(observation_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state._db_manager, '_engine', observation_engine)
     with observation_engine.begin() as connection:
         connection.execute(

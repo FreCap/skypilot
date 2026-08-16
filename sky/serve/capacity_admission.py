@@ -708,7 +708,6 @@ def validate_paid_claim_in_connection(
     require_planner: bool = True,
 ) -> None:
     """Revalidate one planner-bound claim before provider I/O."""
-    _require_postgres(connection)
     fields = ('capacity_plan_generation', 'capacity_plan_sha256',
               'demand_feed_generation', 'demand_source_epoch',
               'capacity_plan_accelerator', 'capacity_plan_units')
@@ -718,6 +717,11 @@ def validate_paid_claim_in_connection(
             raise CapacityAdmissionConflict(
                 'Durable-demand service retained an unbound paid claim.')
         return
+    # Legacy controller-sourced admission remains supported by the local
+    # controller SQLite catalog, whose migration head intentionally predates
+    # Serve050.  Only a complete planner tuple crosses the PostgreSQL-only
+    # ordered-admission boundary.
+    _require_postgres(connection)
     try:
         generation = _positive_int(claim['capacity_plan_generation'],
                                    'capacity_plan_generation')
