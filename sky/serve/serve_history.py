@@ -1135,6 +1135,14 @@ def record_request_activity(
     return len(rows)
 
 
+def validate_request_activity_history(
+    request_history: dict[str, Any],
+    timestamp: float | None = None,
+) -> None:
+    """Validate an arrival-history envelope without reading or writing."""
+    _request_history_rows('', '', '', request_history, _utc_datetime(timestamp))
+
+
 def _greatest_nullable(left: Any, right: Any) -> Any:
     """Return a SQL expression that preserves null only when both are null."""
     return sqlalchemy.case((left.is_(None), right), (right.is_(None), left),
@@ -1581,6 +1589,15 @@ def record_prediction_times(
                                   where=excluded.prediction_count
                                   >= table.c.prediction_count))
     return len(rows)
+
+
+def validate_prediction_time_history(
+    prediction_time_history: dict[str, Any],
+    timestamp: float | None = None,
+) -> None:
+    """Validate a prediction histogram without reading or writing state."""
+    _prediction_time_history_rows('', '', '', prediction_time_history,
+                                  _utc_datetime(timestamp))
 
 
 def _nonnegative_int(value: Any,

@@ -477,6 +477,26 @@ LB_DEMAND_HANDOFF_SECONDS = 60
 # routes on one shared contract. A route added to only one layer makes the
 # control channel fail at runtime even when each layer's unit tests pass.
 LB_CONTROLLER_SYNC_PATH = '/controller/load_balancer_sync'
+# Controller-independent, PostgreSQL-backed demand reporting.  Unlike the
+# routes above, this path terminates at the stable API server and must never be
+# proxied to the per-service controller process.
+LB_DEMAND_REPORT_PATH = '/demand'
+LB_DEMAND_REPORT_PROTOCOL_VERSION = 1
+LB_DEMAND_REPORT_INTERVAL_SECONDS = 5
+LB_DEMAND_REPORT_TIMEOUT_SECONDS = 10
+LB_DEMAND_REPORT_MAX_CLOCK_SKEW_SECONDS = 30
+# A report is usable for a little over two missed intervals.  Expiry is minted
+# from the PostgreSQL clock on receipt; reporter wall clocks are diagnostic
+# only and cannot extend launch authority.
+LB_DEMAND_REPORT_TTL_SECONDS = 15
+LB_DEMAND_REPORT_RETENTION_SECONDS = 60 * 60
+LB_DEMAND_REPORT_MAX_REPORTERS = 32
+LB_DEMAND_REPORT_MAX_BYTES = 512 * 1024
+LB_DEMAND_WINDOW_BUCKET_SECONDS = 5
+# Once the direct feed is fresh, controller status enrichment is optional for
+# request visibility.  Keep that enrichment bounded so a wedged controller
+# cannot make the durable request card disappear behind the client timeout.
+DURABLE_DEMAND_CONTROLLER_STATUS_TIMEOUT_SECONDS = (1.0, 2.0)
 LB_CONTROLLER_ROLE_PATH = '/controller/load_balancer_role'
 LB_CONTROLLER_HISTORY_SYNC_PATH = (
     '/controller/load_balancer_request_history_sync')

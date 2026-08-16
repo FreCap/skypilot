@@ -1,5 +1,6 @@
 """Characterization tests for Serve request accounting."""
 import pickle
+import types
 from unittest import mock
 
 from sky.serve import constants
@@ -129,3 +130,33 @@ def test_request_history_prunes_only_on_minute_boundary(monkeypatch):
     now[0] += constants.LB_REQUEST_HISTORY_BUCKET_SECONDS
     aggregator.add(None)
     assert prune.call_count == 2
+
+
+def test_durable_window_survives_controller_drain_and_expires(monkeypatch):
+    now = [120.0]
+    monkeypatch.setattr(serve_utils.time, 'time', lambda: now[0])
+    aggregator = serve_utils.RequestTimestamp()
+    request = types.SimpleNamespace(_skyserve_compatible_accelerators=['L4'],
+                                    _skyserve_request_priority=50)
+
+    aggregator.add(request)
+    assert aggregator.drain()['timestamps'] == [120.0]
+    snapshot = aggregator.demand_window_snapshot()
+    assert snapshot == {
+        'bucket_seconds': constants.LB_DEMAND_WINDOW_BUCKET_SECONDS,
+        'window_seconds': constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
+        'buckets': [{
+            'bucket_start': 120,
+            'request_count': 1,
+            'compatibility_profiles': [{
+                'priority': 50,
+                'compatible_accelerators': ['L4'],
+                'count': 1,
+            }],
+        }],
+        'compatibility_complete': True,
+        'saturated': False,
+    }
+
+    now[0] += constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS + 1
+    assert aggregator.demand_window_snapshot()['buckets'] == []

@@ -220,7 +220,7 @@ def test_serve038_lineage_and_dialect_target() -> None:
     assert Path(
         revision.path).name == ('038_serve_resource_action_authority.py')
     assert revision.down_revision == '037'
-    assert migration_utils.SERVE_VERSION == '047'
+    assert migration_utils.SERVE_VERSION == '048'
     assert migration_utils.serve_target_version(engine) == '037'
 
 

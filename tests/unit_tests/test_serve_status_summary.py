@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from sky.serve import constants
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.server.requests import payloads
@@ -70,6 +71,13 @@ def patched_state(monkeypatch):
     autoscaler_resp.json.return_value = {'target_num_replicas': 4}
     monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
                         lambda *a, **k: autoscaler_resp)
+    monkeypatch.setattr(
+        serve_utils.demand_state, 'get_request_summary', lambda *a, **k: {
+            'request_telemetry_state': 'unavailable',
+            'request_telemetry_reason': 'no_report_received',
+            'request_telemetry_generation': None,
+            'request_reporter_count': 0,
+        })
     return replicas
 
 
@@ -237,6 +245,47 @@ class TestGetServiceStatusSummary:
         assert record['quarantined_version'] == 5
         assert record['quarantined_at'] == 1000.0
         assert record['quarantine_reason'] == 'invalid ingress port'
+
+    def test_fresh_durable_demand_overrides_controller_snapshot(
+            self, patched_state, monkeypatch):
+        autoscaler_resp = mock.MagicMock()
+        autoscaler_resp.json.return_value = {
+            'target_num_replicas': 4,
+            'recent_request_count': 99,
+            'in_flight_total': 20,
+        }
+        autoscaler = mock.Mock(return_value=autoscaler_resp)
+        monkeypatch.setattr(serve_utils, '_get_to_controller_with_retry',
+                            autoscaler)
+        monkeypatch.setattr(
+            serve_utils.demand_state, 'get_request_summary', lambda *a, **k: {
+                'request_telemetry_state': 'fresh',
+                'request_telemetry_reason': 'complete',
+                'request_telemetry_generation': 7,
+                'request_reporter_count': 2,
+                'recent_request_count': 3,
+                'request_window_seconds': 60,
+                'requests_per_second': 0.05,
+                'in_flight_requests': 2,
+                'request_queue_depth': 1,
+                'rejected_requests': 0,
+                'recent_rejected_requests': 0,
+                'request_stats_age_seconds': 1.0,
+            })
+
+        record = serve_utils._get_service_status(  # pylint: disable=protected-access
+            'svc',
+            pool=False,
+            with_replica_info=False,
+            with_target_num_replicas=True)
+
+        assert record is not None
+        assert record['target_num_replicas'] == 4
+        assert record['recent_request_count'] == 3
+        assert record['in_flight_requests'] == 2
+        assert record['request_telemetry_state'] == 'fresh'
+        assert autoscaler.call_args.kwargs['timeout'] == (
+            constants.DURABLE_DEMAND_CONTROLLER_STATUS_TIMEOUT_SECONDS)
 
     def test_default_call_has_no_counts(self, patched_state, monkeypatch):
         # Internal callers that only want the service row

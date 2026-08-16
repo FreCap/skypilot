@@ -6,6 +6,7 @@ import enum
 import fastapi
 
 from sky import sky_logging
+from sky.serve import demand_state
 from sky.serve import kubernetes_identity
 from sky.serve import serve_dashboard
 from sky.serve import serve_history
@@ -224,6 +225,42 @@ async def status_history(
             status_code=409,
             detail='Service incarnation changed. Refresh and retry.')
     return history
+
+
+@router.get('/{service_name}/demand')
+async def current_demand(
+        service_name: str,
+        expected_service_hash: str = fastapi.Query(min_length=1),
+) -> dict:
+    """Read current request telemetry without contacting the controller."""
+    if not await asyncio.to_thread(serve_utils.is_consolidation_mode):
+        summary = demand_state.unavailable_request_summary('non_consolidated')
+        return {
+            'service_name': service_name,
+            'service_hash': expected_service_hash,
+            **summary,
+        }
+    service = await asyncio.to_thread(serve_state.get_service_status_snapshot,
+                                      service_name)
+    if service is None or service.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    if service.get('hash') != expected_service_hash:
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    summary = await asyncio.to_thread(demand_state.get_request_summary,
+                                      service_name, expected_service_hash)
+    if summary.get(
+            'request_telemetry_reason') == 'service_incarnation_mismatch':
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    return {
+        'service_name': service_name,
+        'service_hash': expected_service_hash,
+        **summary,
+    }
 
 
 @router.get('/replica-summaries')

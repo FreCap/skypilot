@@ -159,6 +159,42 @@ def test_proxy_forwards_raw_body_once_and_preserves_response(monkeypatch):
         constants.LB_CONTROLLER_PROXY_TIMEOUT_SECONDS)
 
 
+def test_demand_report_terminates_at_api_server(monkeypatch):
+    receipt = controller_proxy.demand_state.DemandReportReceipt(
+        generation=7,
+        duplicate=False,
+        request_history_accepted=True,
+        request_classification_history_accepted=True,
+        prediction_time_history_accepted=False)
+    ingest = mock.Mock(return_value=receipt)
+    monkeypatch.setattr(controller_proxy.demand_state, 'ingest_report', ingest)
+    path = '/api/internal/serve/svc/demand'
+
+    response = asyncio.run(
+        controller_proxy.record_load_balancer_demand(
+            'svc', _request(path, body=b'{"sequence": 1}')))
+
+    assert response.status_code == 200
+    assert controller_proxy.is_controller_sync_path(path)
+    ingest.assert_called_once_with('svc', 'service-incarnation-a',
+                                   {'sequence': 1})
+    assert b'"generation":7' in response.body
+
+
+def test_demand_report_rejects_oversize_body_before_ingestion(monkeypatch):
+    ingest = mock.Mock()
+    monkeypatch.setattr(controller_proxy.demand_state, 'ingest_report', ingest)
+
+    response = asyncio.run(
+        controller_proxy.record_load_balancer_demand(
+            'svc',
+            _request('/api/internal/serve/svc/demand',
+                     body=b'x' * (constants.LB_DEMAND_REPORT_MAX_BYTES + 1))))
+
+    assert response.status_code == 413
+    ingest.assert_not_called()
+
+
 def test_proxy_forwards_history_only_sync_to_distinct_controller_path(
         monkeypatch):
     owner = _owner()
@@ -416,11 +452,13 @@ def test_proxy_connection_failure_is_503_without_retry(monkeypatch):
     ('/api/internal/serve/svc/controller/system_recovery_route_lease', True),
     ('/api/internal/serve/svc/controller/'
      'load_balancer_request_history_sync', True),
+    ('/api/internal/serve/svc/demand', True),
     ('/api/internal/serve//controller/load_balancer_sync', False),
     ('/api/internal/serve//controller/'
      'load_balancer_request_history_sync', False),
     ('/api/internal/serve//controller/load_balancer_role', False),
     ('/api/internal/serve//controller/system_recovery_route_lease', False),
+    ('/api/internal/serve//demand', False),
     ('/api/internal/serve/a/b/controller/load_balancer_sync', False),
     ('/api/internal/serve/svc/controller/load_balancer_sync/more', False),
     ('/api/internal/serve/svc/controller/update_service', False),
@@ -440,6 +478,42 @@ def test_internal_route_is_hidden_from_openapi():
             not in app.openapi()['paths'])
     assert (controller_proxy.CONTROLLER_HISTORY_SYNC_ROUTE_PATH
             not in app.openapi()['paths'])
+    assert controller_proxy.DEMAND_REPORT_ROUTE_PATH not in app.openapi(
+    )['paths']
+
+
+def test_api_server_demand_route_uses_sync_auth(monkeypatch):
+    monkeypatch.setattr(server.serve_utils,
+                        'get_lb_sync_auth_tokens',
+                        lambda required=False: ('sync-token',))
+    receipt = controller_proxy.demand_state.DemandReportReceipt(
+        generation=7,
+        duplicate=False,
+        request_history_accepted=True,
+        request_classification_history_accepted=True,
+        prediction_time_history_accepted=True)
+    ingest = mock.Mock(return_value=receipt)
+    monkeypatch.setattr(controller_proxy.demand_state, 'ingest_report', ingest)
+    path = '/api/internal/serve/svc/demand'
+    client = testclient.TestClient(server.app)
+
+    rejected = client.post(path,
+                           headers={'Authorization': 'Bearer wrong'},
+                           json={'sequence': 1})
+    assert rejected.status_code == 401
+    ingest.assert_not_called()
+
+    response = client.post(
+        path,
+        headers={
+            'Authorization': 'Bearer sync-token',
+            constants.SERVICE_HASH_HEADER: 'service-incarnation-a',
+        },
+        json={'sequence': 1})
+    assert response.status_code == 200
+    assert response.json()['generation'] == 7
+    ingest.assert_called_once_with('svc', 'service-incarnation-a',
+                                   {'sequence': 1})
 
 
 def test_api_server_route_authenticates_and_proxies(monkeypatch):

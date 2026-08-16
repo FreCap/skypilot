@@ -85,7 +85,7 @@ def test_serve041_lineage_and_sqlite_ceiling() -> None:
 
     assert scripts.get_heads() == ['046']
     assert revision.down_revision == '040'
-    assert migration_utils.SERVE_VERSION == '047'
+    assert migration_utils.SERVE_VERSION == '048'
     assert migration_utils.serve_target_version(sqlite) == '037'
 
 
