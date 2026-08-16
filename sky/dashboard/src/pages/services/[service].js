@@ -2075,6 +2075,8 @@ function ServiceDetails() {
         directDemand.recentRequestCount,
         directDemand.requestRate,
         directDemand.inFlightRequests,
+        directDemand.confirmedInFlightRequests,
+        directDemand.unknownInFlightReplicaCount,
         directDemand.requestQueueDepth,
         directDemand.rejectedRequests,
       ].some((value) => value != null)
@@ -2083,6 +2085,10 @@ function ServiceDetails() {
             requestWindowSeconds: directDemand.requestWindowSeconds ?? null,
             requestRate: directDemand.requestRate ?? null,
             inFlightRequests: directDemand.inFlightRequests ?? null,
+            confirmedInFlightRequests:
+              directDemand.confirmedInFlightRequests ?? null,
+            unknownInFlightReplicaCount:
+              directDemand.unknownInFlightReplicaCount ?? null,
             requestQueueDepth: directDemand.requestQueueDepth ?? null,
             rejectedRequests: directDemand.rejectedRequests ?? null,
             recentRejectedRequests: directDemand.recentRejectedRequests ?? null,
@@ -2534,7 +2540,7 @@ export function ServiceDetailCard({
     usesLogicalReplicas &&
     serviceData.observedReadyReplicas != null &&
     serviceData.observedReadyReplicasFresh === false;
-  if (serviceData.inFlightRequests != null && serviceData.requestRate != null) {
+  if (serviceData.requestRate != null) {
     requestDetails.push(`${formatRequestRate(serviceData.requestRate)} recent`);
   }
   if (
@@ -2555,6 +2561,13 @@ export function ServiceDetailCard({
   }
   if (serviceData.requestQueueDepth != null) {
     requestDetails.push(`${serviceData.requestQueueDepth} queued`);
+  }
+  if (serviceData.unknownInFlightReplicaCount > 0) {
+    requestDetails.push(
+      `${serviceData.unknownInFlightReplicaCount} backend${
+        serviceData.unknownInFlightReplicaCount === 1 ? '' : 's'
+      } with unknown occupancy`
+    );
   }
   if (serviceData.rejectedRequests != null) {
     requestDetails.push(`${serviceData.rejectedRequests} rejected`);
@@ -2755,11 +2768,13 @@ export function ServiceDetailCard({
               <div className="text-base mt-1">
                 {serviceData.inFlightRequests != null
                   ? `${serviceData.inFlightRequests.toLocaleString()} processing`
-                  : serviceData.requestRate != null
-                    ? formatRequestRate(serviceData.requestRate)
-                    : metadataDeferred
-                      ? deferredValue
-                      : '-'}
+                  : serviceData.confirmedInFlightRequests != null
+                    ? `${serviceData.confirmedInFlightRequests.toLocaleString()} confirmed processing`
+                    : serviceData.requestRate != null
+                      ? formatRequestRate(serviceData.requestRate)
+                      : metadataDeferred
+                        ? deferredValue
+                        : '-'}
               </div>
               {requestDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
