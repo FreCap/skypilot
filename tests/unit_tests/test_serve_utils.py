@@ -3073,7 +3073,13 @@ class TestServiceStatusEndpointSnapshot:
                         })), \
              mock.patch('sky.serve.serve_utils.'
                         '_get_to_controller_with_retry',
-                        return_value=response):
+                        return_value=response), \
+             mock.patch('sky.serve.serve_utils.demand_state.'
+                        'get_request_summary',
+                        return_value={
+                            'request_telemetry_state': 'unavailable',
+                            'request_telemetry_reason': 'no_report_received',
+                        }):
             status = serve_utils._get_service_status(
                 'svc-a',
                 pool=False,
