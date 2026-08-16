@@ -235,6 +235,7 @@ class TestGetServiceStatusSummary:
         assert record['in_flight_requests'] == 2
         assert record['request_queue_depth'] == 1
         assert record['rejected_requests'] == 3
+        assert record['observed_ready_replicas_age_seconds'] == 4.0
         assert record['request_stats_age_seconds'] == 4.0
         assert record['committed_version'] == 7
         assert record['applied_version'] == 6

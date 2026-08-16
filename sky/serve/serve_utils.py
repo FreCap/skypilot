@@ -3046,6 +3046,7 @@ def _prepare_service_status(
                 'committed_capacity': 'committed_capacity',
                 'target_utilization_percentage': 'target_utilization_percentage',
                 'latest_scale_up_wave_at': 'latest_scale_up_wave_at',
+                'observed_ready_replicas_age_seconds': 'report_age_seconds',
                 'request_stats_age_seconds': 'report_age_seconds',
                 'committed_version': 'committed_version',
                 'applied_version': 'applied_version',
@@ -3468,7 +3469,12 @@ def _finalize_prepared_service_status(
                     job_ids = list(dict.fromkeys(pool_level_job_ids + job_ids))
                 replica_record['used_by'] = job_ids
     observed_ready = record.get('observed_ready_replicas')
-    report_age = record.get('request_stats_age_seconds')
+    # Demand telemetry and the controller's router-capacity observation have
+    # independent writers and freshness clocks. A fresh demand report must not
+    # revive stale ready capacity, and an unavailable demand report must not
+    # invalidate a fresh controller capacity observation during transition.
+    report_age = record.get('observed_ready_replicas_age_seconds',
+                            record.get('request_stats_age_seconds'))
     observed_ready_is_valid = (isinstance(observed_ready, int) and
                                not isinstance(observed_ready, bool) and
                                observed_ready >= 0)
@@ -3479,8 +3485,9 @@ def _finalize_prepared_service_status(
     if observed_ready_is_valid:
         record['observed_ready_replicas_fresh'] = observed_ready_is_fresh
     # The router observation is the best live logical-capacity count only
-    # while its demand report is fresh.  Once the LB stops reporting, replica
-    # reconciliation can remove backends while this value remains frozen;
+    # while the controller report carrying it is fresh. Once controller
+    # reporting stops, replica reconciliation can remove backends while this
+    # value remains frozen;
     # replacing the current snapshot would then produce impossible displays
     # such as 262 ready / 64 total.  Keep the stale observation as a diagnostic
     # but fall back to the provider/replica-state aggregate for readiness.
