@@ -254,6 +254,11 @@ describe('useServiceDetails stale-response fencing', () => {
       });
       expect(result.current.serviceData.status).toBe('poll-summary');
       expect(dashboardCache.get).toHaveBeenCalledTimes(3);
+      expect(dashboardCache.get.mock.calls).toEqual([
+        [getServices, detailSummaryArgs('svc')],
+        [getServices, detailSummaryArgs('svc')],
+        [getServices, detailSummaryArgs('svc')],
+      ]);
       expect(dashboardCache.invalidate.mock.calls).toEqual([
         [getServices, detailSummaryArgs('svc')],
         [getServices, detailSummaryArgs('svc')],
