@@ -92,6 +92,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/internal/serve/ordinary-launch', 'POST'),
     ('/internal/serve/non-pool-launch', 'POST'),
     ('/internal/resource-actions/v1/launch-identity/canonicalize', 'POST'),
+    ('/api/internal/serve/{service_name}/demand', 'POST'),
     # --- Managed container image writes ---
     ('/images/publications', 'POST'),
     ('/images/artifacts/{image_id}/prepare', 'POST'),
