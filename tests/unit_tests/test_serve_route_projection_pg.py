@@ -612,6 +612,187 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     assert projected.response['capacity_hint']['decoded'] == 1
 
 
+def _prepare_incremental_replica(route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    record_id = str(uuid.uuid4())
+    _insert_replica(engine, record_id)
+    info = types.SimpleNamespace(replica_id=1,
+                                 replica_record_id=record_id,
+                                 version=1)
+    repository.upsert_replica_material(_identity(incarnation), info,
+                                       _material())
+    target = repository.list_probe_targets(_identity(incarnation))[0]
+    assert repository.record_probe_result(target, True, ttl_seconds=60).accepted
+    return engine, incarnation, repository, record_id, target
+
+
+def _decode_incremental_replica(_state_version, state):
+    return types.SimpleNamespace(replica_id=1,
+                                 replica_record_id=state['replica_record_id'],
+                                 version=1)
+
+
+def test_incremental_composition_callbacks_hold_no_database_locks(
+        route_database):
+    engine, incarnation, repository, _, _ = _prepare_incremental_replica(
+        route_database)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def _capacity_hint(_infos, _translation, _logical_versions):
+        callback_entered.set()
+        assert release_callback.wait(timeout=10)
+        return {'replica_unit': 'physical_backend'}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(repository.compose_incremental_snapshot,
+                                 _identity(incarnation),
+                                 1,
+                                 {'load_balancing_policy_name': 'round_robin'},
+                                 _decode_incremental_replica,
+                                 _capacity_hint,
+                                 ttl_seconds=60)
+        try:
+            assert callback_entered.wait(timeout=10)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.select(
+                        serve_state_schema.services_table.c.name).where(
+                            serve_state_schema.services_table.c.name ==
+                            'svc').with_for_update(nowait=True)).one()
+                connection.execute(
+                    sqlalchemy.select(
+                        serve_state_schema.replicas_table.c.replica_id).where(
+                            serve_state_schema.replicas_table.c.service_name ==
+                            'svc').with_for_update(nowait=True)).one()
+        finally:
+            release_callback.set()
+        assert future.result(timeout=10).generation == 1
+
+
+def test_incremental_composition_rejects_replica_change(route_database):
+    engine, incarnation, repository, _, _ = _prepare_incremental_replica(
+        route_database)
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def _capacity_hint(_infos, _translation, _logical_versions):
+        callback_entered.set()
+        assert release_callback.wait(timeout=10)
+        return {'replica_unit': 'physical_backend'}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(repository.compose_incremental_snapshot,
+                                 _identity(incarnation),
+                                 1,
+                                 {'load_balancing_policy_name': 'round_robin'},
+                                 _decode_incremental_replica,
+                                 _capacity_hint,
+                                 ttl_seconds=60)
+        try:
+            assert callback_entered.wait(timeout=10)
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.update(serve_state_schema.replicas_table).where(
+                        serve_state_schema.replicas_table.c.service_name ==
+                        'svc',
+                        serve_state_schema.replicas_table.c.replica_id == 1).
+                    values(
+                        replica_state={'replica_record_id': str(uuid.uuid4())}))
+        finally:
+            release_callback.set()
+        with pytest.raises(route_projection.RouteProjectionConflict,
+                           match='Replica state changed'):
+            future.result(timeout=10)
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                route_projection_schema.serve_route_heads_table)).scalar_one(
+                ) == 0
+
+
+def test_incremental_composition_accepts_monotonic_readiness_refresh(
+        route_database):
+    _, incarnation, repository, _, target = _prepare_incremental_replica(
+        route_database)
+
+    def _capacity_hint(_infos, _translation, _logical_versions):
+        receipt = repository.record_probe_result(target, True, ttl_seconds=60)
+        assert receipt.accepted
+        return {'replica_unit': 'physical_backend'}
+
+    receipt = repository.compose_incremental_snapshot(
+        _identity(incarnation),
+        1, {'load_balancing_policy_name': 'round_robin'},
+        _decode_incremental_replica,
+        _capacity_hint,
+        ttl_seconds=60)
+
+    assert receipt.generation == 1
+
+
+def test_incremental_composition_rejects_changed_temporal_eligibility(
+        route_database):
+    engine, incarnation, repository, _, target = _prepare_incremental_replica(
+        route_database)
+    expired_at = (datetime.datetime.now(datetime.timezone.utc) -
+                  datetime.timedelta(seconds=1))
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_replica_leases_table).
+            values(observed_at=expired_at - datetime.timedelta(seconds=1),
+                   valid_until=expired_at))
+
+    def _capacity_hint(_infos, _translation, _logical_versions):
+        receipt = repository.record_probe_result(target, True, ttl_seconds=60)
+        assert receipt.accepted
+        return {'replica_unit': 'physical_backend'}
+
+    with pytest.raises(route_projection.RouteProjectionConflict,
+                       match='freshness changed'):
+        repository.compose_incremental_snapshot(
+            _identity(incarnation),
+            1, {'load_balancing_policy_name': 'round_robin'},
+            _decode_incremental_replica,
+            _capacity_hint,
+            ttl_seconds=60)
+
+
+def test_incremental_composition_excludes_terminal_replica_history(
+        route_database):
+    _, incarnation, repository, _, _ = _prepare_incremental_replica(
+        route_database)
+    _insert_replica(route_database[0],
+                    str(uuid.uuid4()),
+                    replica_id=2,
+                    status='FAILED_PROVISION')
+    decoded_replica_ids = []
+
+    def _decode(_state_version, state):
+        decoded_replica_ids.append(state['replica_record_id'])
+        return types.SimpleNamespace(
+            replica_id=1,
+            replica_record_id=state['replica_record_id'],
+            version=1)
+
+    def _capacity_hint(infos, _translation, _logical_versions):
+        assert len(infos) == 1
+        return {'replica_unit': 'physical_backend'}
+
+    receipt = repository.compose_incremental_snapshot(
+        _identity(incarnation),
+        1, {'load_balancing_policy_name': 'round_robin'},
+        _decode,
+        _capacity_hint,
+        ttl_seconds=60)
+
+    assert receipt.generation == 1
+    assert len(decoded_replica_ids) == 1
+
+
 def test_semantic_change_retains_bounded_exact_url_alias(route_database):
     engine, incarnation = route_database
     repository = route_projection.RouteProjectionRepository(engine)
