@@ -44,6 +44,15 @@ def upgrade() -> None:
         '(route_projection_capable AND '
         'route_projection_controller_incarnation IS NOT NULL AND '
         'route_projection_protocol_version IN (1, 2)))')
+    op.add_column(
+        'serve_route_snapshots',
+        sa.Column('producer_protocol_version',
+                  sa.Integer(),
+                  nullable=False,
+                  server_default='1'))
+    op.create_check_constraint('serve051_route_producer_protocol_ck',
+                               'serve_route_snapshots',
+                               'producer_protocol_version IN (1, 2)')
 
     op.create_table(
         _LEASES,
@@ -64,6 +73,7 @@ def upgrade() -> None:
         sa.Column('gpu_count', sa.Integer(), nullable=False),
         sa.Column('probe_method', sa.Text(), nullable=False),
         sa.Column('readiness_path', sa.Text(), nullable=False),
+        sa.Column('probe_timeout_seconds', sa.Integer(), nullable=False),
         sa.Column('probe_post_data', postgresql.JSONB(none_as_null=True)),
         sa.Column('probe_headers', postgresql.JSONB(none_as_null=True)),
         sa.Column('async_occupancy', sa.Boolean()),
@@ -71,6 +81,7 @@ def upgrade() -> None:
         sa.Column('is_zero_cost', sa.Boolean(), nullable=False),
         sa.Column('planned_capacity', sa.Integer(), nullable=False),
         sa.Column('route_allowed', sa.Boolean(), nullable=False),
+        sa.Column('requires_route_marker', sa.Boolean(), nullable=False),
         sa.Column('route_marker_payload', postgresql.JSONB(none_as_null=True)),
         sa.Column('material_sha256', sa.Text(), nullable=False),
         sa.Column('material_generation', sa.BigInteger(), nullable=False),
@@ -108,8 +119,10 @@ def upgrade() -> None:
             "probe_method IN ('GET', 'POST') AND "
             "left(readiness_path, 1) = '/'",
             name='serve051_route_lease_probe_ck'),
-        sa.CheckConstraint('gpu_count > 0 AND planned_capacity > 0',
-                           name='serve051_route_lease_capacity_positive_ck'),
+        sa.CheckConstraint(
+            'gpu_count > 0 AND planned_capacity > 0 AND '
+            'probe_timeout_seconds > 0 AND probe_timeout_seconds <= 86400',
+            name='serve051_route_lease_capacity_positive_ck'),
         sa.CheckConstraint("material_sha256 ~ '^[0-9a-f]{64}$'",
                            name='serve051_route_lease_digest_ck'),
         sa.CheckConstraint(

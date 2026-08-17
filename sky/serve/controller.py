@@ -43,6 +43,7 @@ from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
 from sky.serve import demand_state
+from sky.serve import incremental_route_worker
 from sky.serve import kubernetes_identity
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
@@ -650,12 +651,18 @@ class SkyServeController:
         # advertise a newer routing policy than the runtime has actually
         # applied.
         self._routing_spec = self._build_routing_spec(service_spec)
+        route_service_row = serve_state.get_service_from_name(service_name)
+        self._incremental_route_projection_enabled = bool(
+            route_service_row is not None and
+            route_projection.use_incremental_producer(route_service_row))
         if (self._ordinary_launch_binding_authority is not None and
                 not self._is_pool):
-            self._replica_manager.set_route_projection_publisher(
-                self._publish_route_projection)
-            self._replica_manager.set_route_material_writer(
-                self._write_route_materials)
+            if self._incremental_route_projection_enabled:
+                self._replica_manager.set_route_material_writer(
+                    self._write_route_materials)
+            else:
+                self._replica_manager.set_route_projection_publisher(
+                    self._publish_route_projection)
         # Refreshed only by autoscaler/LB-sync paths that already hold a full
         # replica snapshot. Status polling reads this without new DB/API work.
         self._replica_counts_snapshot: dict[str, int | str] | None = None
@@ -2935,6 +2942,57 @@ class SkyServeController:
         repository.upsert_replica_materials(
             route_projection.publisher_identity_from_authority(authority),
             entries)
+
+    def _compose_incremental_route_projection(self) -> None:
+        """Publish one provider-free lease snapshot under current authority."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or self._is_pool or not self._owns_current_service(
+        ):
+            return
+        with self._routing_state_lock:
+            service_version = self._applied_version
+            routing_spec = self._get_routing_spec()
+        if routing_spec is None:
+            return
+
+        def _capacity_hint(
+            replica_infos: list['replica_managers.ReplicaInfo'],
+            translation_cache: dict[int, tuple[str, str, int]],
+            logical_versions: set[int],
+        ) -> dict[str, Any]:
+            replica_counts = self._get_replica_counts(
+                replica_infos, translation_cache=translation_cache)
+            return self._get_capacity_hint(replica_infos,
+                                           logical_versions,
+                                           replica_counts=replica_counts,
+                                           translation_cache=translation_cache)
+
+        latest_spec = serve_state.get_spec(self._service_name, service_version)
+        if latest_spec is None:
+            return
+        ttl_seconds = max(
+            3 * int(latest_spec.endpoint_probe_interval_seconds),
+            3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+        route_projection.RouteProjectionRepository(
+        ).compose_incremental_snapshot(
+            route_projection.publisher_identity_from_authority(authority),
+            service_version,
+            routing_spec,
+            serve_state.replica_from_storage_state,
+            _capacity_hint,
+            ttl_seconds=ttl_seconds)
+
+    def _run_incremental_route_worker(self) -> None:
+        """Supervised entry point for provider-independent route renewal."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None:
+            return
+        worker = incremental_route_worker.IncrementalRouteWorker(
+            route_projection.RouteProjectionRepository(),
+            route_projection.publisher_identity_from_authority(authority),
+            self._compose_incremental_route_projection,
+            self._get_actuation_stop())
+        worker.run()
 
     def _snapshot_replica_occupancy(
         self
@@ -6516,6 +6574,12 @@ class SkyServeController:
             self._run_autoscaler,
             'autoscaler',
             stop_event=self._get_actuation_stop())
+
+        if self._incremental_route_projection_enabled:
+            thread_utils.start_supervised_thread(
+                self._run_incremental_route_worker,
+                'incremental-route-worker',
+                stop_event=self._get_actuation_stop())
 
         if self._reserved_capacity_fill_enabled:
             self._start_reserved_capacity_poller_if_needed()

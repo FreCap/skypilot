@@ -45,6 +45,7 @@ from sky.serve import route_projection
 from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import system_recovery_route_lease
+from sky.serve import system_recovery_state
 from sky.serve import system_recovery_state as recovery_state
 from sky.server.requests import postgres as request_postgres
 from sky.skylet import job_lib
@@ -751,18 +752,21 @@ class TestBackgroundDutyOwnershipLifecycle:
         mgr._route_projection_publisher = publisher
         mgr._get_version_spec = mock.Mock(return_value=types.SimpleNamespace(
             readiness_path='/health',
+            readiness_timeout_seconds=15,
             post_data=None,
             readiness_headers={'X-Probe': 'serve'},
             graceful_drain_async_occupancy=True,
             uses_logical_replicas=False))
         mgr.system_recovery_allows_routing = mock.Mock(return_value=True)
         mgr.system_recovery_route_marker = mock.Mock(return_value=None)
-        info = types.SimpleNamespace(replica_id=1,
-                                     replica_record_id=(
-                                         '00000000-0000-4000-8000-000000000001'),
-                                     version=2,
-                                     is_zero_cost=False,
-                                     planned_capacity=3)
+        info = types.SimpleNamespace(
+            replica_id=1,
+            replica_record_id=('00000000-0000-4000-8000-000000000001'),
+            version=2,
+            is_zero_cost=False,
+            planned_capacity=3,
+            system_recovery_disposition=(
+                system_recovery_state.SystemRecoveryDisposition.ORDINARY))
         resolved = route_projection.ResolvedRouteMaterial(
             'http://10.0.0.1:8000', 'L4', 1)
 

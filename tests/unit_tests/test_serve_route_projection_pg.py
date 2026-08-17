@@ -3,6 +3,7 @@
 
 import datetime
 import time
+import types
 import uuid
 
 from alembic import command as alembic_command
@@ -77,13 +78,15 @@ def _material(url='http://10.0.0.1:8000'):
     return route_projection.RouteLeaseMaterial(
         route=route_projection.ResolvedRouteMaterial(url, 'L4', 1),
         readiness_path='/health',
+        probe_timeout_seconds=15,
         post_data=None,
         headers={'X-Probe': 'serve'},
         async_occupancy=True,
         uses_logical_replicas=False,
         is_zero_cost=False,
         planned_capacity=1,
-        route_allowed=True)
+        route_allowed=True,
+        requires_route_marker=False)
 
 
 def _response(url='http://10.0.0.1:8000'):
@@ -296,6 +299,37 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     assert duplicate.duplicate is True
     legacy = repository.resolve_sync('svc', 'svc-hash', None)
     assert legacy.mode == route_projection.RouteSourceMode.LEGACY_PROXY
+    with pytest.raises(route_projection.RouteProjectionUnavailable,
+                       match='capability'):
+        repository.promote('svc', 'svc-hash')
+
+    _insert_replica(engine, record_id)
+    info = types.SimpleNamespace(replica_id=1,
+                                 replica_record_id=record_id,
+                                 version=1,
+                                 status=types.SimpleNamespace(name='READY'))
+    repository.upsert_replica_material(_identity(incarnation), info,
+                                       _material())
+    target = repository.list_probe_targets(_identity(incarnation))[0]
+    assert repository.record_probe_result(target, True, ttl_seconds=60).accepted
+
+    def _decode(_, state):
+        return types.SimpleNamespace(
+            replica_id=1,
+            replica_record_id=state['replica_record_id'],
+            version=1)
+
+    repository.compose_incremental_snapshot(
+        _identity(incarnation),
+        1, {'load_balancing_policy_name': 'round_robin'},
+        _decode,
+        lambda infos, translation, logical_versions: {
+            'replica_unit': 'physical_backend',
+            'decoded': len(infos),
+            'translated': len(translation),
+            'logical_versions': len(logical_versions),
+        },
+        ttl_seconds=60)
 
     _insert_report(engine)
     assert repository.promote('svc', 'svc-hash') == 1
@@ -303,9 +337,10 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     assert projected.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED
     assert projected.response is not None
     assert projected.response['route_projection_generation'] == 1
-    assert projected.response['route_projection_sha256'] == first.content_sha256
+    assert projected.response['route_projection_sha256'] != first.content_sha256
     assert projected.response['route_source_epoch'] == 1
-    assert projected.response['replica_info'] == _response()['replica_info']
+    assert set(projected.response['replica_info']) == {'http://10.0.0.1:8000'}
+    assert projected.response['capacity_hint']['decoded'] == 1
 
 
 def test_semantic_change_retains_bounded_exact_url_alias(route_database):

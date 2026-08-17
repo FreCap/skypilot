@@ -13636,6 +13636,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 material = route_projection.RouteLeaseMaterial(
                     route=resolved,
                     readiness_path=spec.readiness_path,
+                    probe_timeout_seconds=spec.readiness_timeout_seconds,
                     post_data=spec.post_data,
                     headers=spec.readiness_headers,
                     async_occupancy=(spec.graceful_drain_async_occupancy),
@@ -13643,6 +13644,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     is_zero_cost=info.is_zero_cost,
                     planned_capacity=info.planned_capacity,
                     route_allowed=self.system_recovery_allows_routing(info),
+                    requires_route_marker=(info.system_recovery_disposition ==
+                                           system_recovery_state.
+                                           SystemRecoveryDisposition.CAPABLE),
                     route_marker=self.system_recovery_route_marker(
                         info, resolved.url))
             except (route_projection.RouteProjectionValidationError,

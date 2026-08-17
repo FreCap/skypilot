@@ -33,6 +33,7 @@ from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import pool_capacity_observation_schema
+from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
@@ -4030,6 +4031,8 @@ def transfer_service_owner_in_connection(
                 controller_port=None))
     if updated.rowcount != 1:
         raise OrdinaryLaunchBindingConflict('Service owner transfer lost CAS.')
+    route_projection.revoke_service_leases_in_session(
+        connection, service_name, 'controller_owner_changed')
     connection.execute(
         sqlalchemy.update(ordinary_launch_associations_table).where(
             ordinary_launch_associations_table.c.service_name == service_name,
