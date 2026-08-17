@@ -116,6 +116,36 @@ run "default_permissions_match_the_skypilot_pool_contract" {
   assert {
     condition = length([
       for rule in kubernetes_role_v1.pool.rule : rule
+      if toset(rule.api_groups) == toset([""]) &&
+      toset(rule.resources) == toset(["serviceaccounts"]) &&
+      toset(rule.resource_names) == toset([var.service_account_name]) &&
+      toset(rule.verbs) == toset(["get"])
+    ]) == 1
+    error_message = "The control-plane Role must receive exact-name get on only the configured workload ServiceAccount."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool.rule : rule
+      if contains(rule.resources, "serviceaccounts") && (
+        length(setsubtract(toset(rule.verbs), toset(["get"]))) > 0 ||
+        try(toset(rule.resource_names) != toset([var.service_account_name]), true)
+      )
+    ]) == 0
+    error_message = "The control-plane Role must not enumerate, mutate, or read another ServiceAccount."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool_sa_self_teardown.rule : rule
+      if contains(rule.resources, "serviceaccounts")
+    ]) == 0
+    error_message = "The workload ServiceAccount must receive no ServiceAccount API permission."
+  }
+
+  assert {
+    condition = length([
+      for rule in kubernetes_role_v1.pool.rule : rule
       if contains(rule.resources, "persistentvolumeclaims")
     ]) == 0
     error_message = "PVC reads must remain disabled by default."
