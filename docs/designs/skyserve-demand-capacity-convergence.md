@@ -4,12 +4,12 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, and PR #1529's exact
 reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 411 / release
-`1.1.1315`, merge commit `057a707d31acfdb8e7b5864eb25378dc3e3e43e4`, image
+artifact is deployed directly with Helm as production revision 412 / release
+`1.1.1316`, merge commit `c20eb20eb3e0fab043d85e936da92ce2667d72e0`, image
 digest
-`sha256:903e7290a24fc2650cbc59c464c2fd8173ce13b80afd93819ac21f898c67ab8d`,
+`sha256:0d05c17ceb93cd9f5a40d69c6750bf9c581ef15de515d79bef1e1231c072ec01`,
 and chart digest
-`sha256:6db826ef7928e8e638601d4721ed3ef4e2d6fc0143678bf4b28c39c994f38787`.
+`sha256:413e066ee94b878ac3eccc7325f8c942b4771ed21d8fd7e2749b97be5c532492`.
 The Serve051 migration Job completed, the API reports protocol version 88, and
 the API deployment is ready with zero restarts. No load-balancer slot, service
 version, authority mode, or `boltz-platform` pin changed in this direct Helm
@@ -45,18 +45,27 @@ targets, connection checkout and receipt serialization delayed a first refresh
 by roughly 50 seconds and stretched later nominal five-second refreshes to
 roughly 10--13 seconds.
 
-The current fix-forward moves receipt persistence to one dedicated bounded
-writer. HTTP tasks return immutable exact-generation results; the event loop
-coalesces at most the newest result per exact target; and the writer persists
-one bounded batch with one bulk PostgreSQL update in one transaction. The
-composition lane never invokes or awaits that writer; conflicting exact-row
-transactions retain ordinary bounded PostgreSQL serialization. A stale or
-no-longer-eligible member is rejected independently without
-rolling back accepted siblings, and an unavailable writer loses no safety:
-leases expire and subsequent probes replace the bounded pending result. The
-single-result repository entry point delegates to this canonical batch path.
-Qualification remains open until that correction is merged, deployed, and
-passes ten renewals. No P2c behavior has been promoted on `boltz-l4-fleet`.
+PR #1534 moved receipt persistence to one dedicated bounded writer and is live
+in revision 412. HTTP tasks now return immutable exact-generation results; the
+event loop coalesces at most the newest result per exact target; and the writer
+persists one bounded batch with one bulk PostgreSQL update in one transaction.
+A 12-second production thread profile proved the receipt thread executing the
+bulk update while the incremental event-loop thread independently listed,
+probed, composed, and renewed. Sixty-four current material rows converged to
+64 observed and 64 fresh rows, and the minimum sampled head TTL was 57.426
+seconds.
+
+That qualification exposed the final database-shape defect rather than closing
+the cadence gate. The provider resolver still holds the service-owner row and
+all selected replica/lease rows while executing per-replica identity reads,
+material reads, generation queries, upserts, history queries, and deletes. The
+probe-target reader likewise executes one replica lookup per lease. During a
+natural provider material refresh, one ten-renewal sample included a 16.987
+second interval instead of the nominal five-second cadence even though all 64
+leases stayed fresh. The current fix-forward replaces those fleet-proportional
+round trips with a fixed number of bounded bulk statements while retaining the
+same owner, replica-record, version, revocation, material-generation, and
+history invariants. No P2c behavior has been promoted on `boltz-l4-fleet`.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -645,6 +654,28 @@ transactional serialization, but there is no application-level join or fleet
 barrier. If PostgreSQL receipt persistence is slow, exact leases may expire but
 the last valid head continues to refresh from independently readable state
 until its own TTL; the worker does not assert readiness it failed to persist.
+
+Provider material persistence also has one canonical bounded-batch path. It
+locks the exact service owner once, reads and locks all matching current READY
+replica rows in one statement, and reads their bounded lease histories in one
+statement. It then revokes replaced record identities in one bulk update,
+upserts every accepted material row in one bulk insert/update, and prunes
+history with one ranked delete. Python may validate and construct the bounded
+values documents between those statements, but it performs no database call
+per replica. Lock ordering remains service, replica, then lease, matching route
+composition and central replica mutations; therefore owner replacement,
+replica-record replacement, and lease generation cannot race publication.
+Stale or non-READY siblings are omitted independently, and a revoked row may
+be recreated only through the existing explicit READY/route-allowed rule.
+
+The readiness target reader performs one owner check and one lease-to-current-
+replica join. It neither deserializes ReplicaInfo nor runs an identity query per
+lease. A target that becomes stale after that read remains harmless because
+the receipt bulk update repeats the exact owner, current READY replica,
+material, readiness, and revocation predicates before changing the lease.
+Composition retains its short provider-free owner/replica/lease transaction;
+the fixed-statement material writer removes the fleet-proportional critical
+section that previously delayed it.
 
 The worker never acquires the replica-manager lock, provider phase, physical
 cluster fence, Kubernetes client, Ray handle, cluster database, or the shared
@@ -1335,13 +1366,37 @@ siblings independently. The single writer bounds connection use, the bulk
 statement bounds row-lock time, and composition has no application-level
 dependency on receipt completion.
 
-Local verification for this fix-forward passes the incremental-worker,
-route-projection, controller, controller-event-loop, controller-respawn, and
-route-lease suites, plus the exact formatter, mypy, pylint, and dashboard
-checks. The candidate bulk statement was also executed against the production
-PostgreSQL dialect and schema inside an explicit outer transaction: one stale
-sibling was rejected, one current sibling was accepted, and the transaction
-was rolled back. Full remote PostgreSQL CI remains a merge gate.
+The post-revision-412 material-path review rejected three more partial fixes.
+Removing only the probe-target N+1 query leaves the provider writer holding the
+service owner across fleet-proportional SQL. Committing one material row at a
+time shortens each lock hold but permits partial provider generations and
+multiplies connection/transaction pressure. Dropping the owner and current-
+replica locks in favor of a pre-write existence check permits an owner or
+replica replacement transaction to revoke the old set and then lose a race to
+a stale insert. The accepted fixed-statement batch retains one short ordered
+transaction and exact current-row locks, while eliminating all per-replica
+database round trips. This is the same canonical material path for a single
+entry and a fleet batch; no compatibility branch or timeout adjustment is
+introduced.
+
+Local verification for the receipt-writer fix-forward passes the incremental
+worker, route-projection, controller, controller-event-loop,
+controller-respawn, and route-lease suites, plus the exact formatter, mypy,
+pylint, and dashboard checks. The receipt bulk statement was also executed
+against the production PostgreSQL dialect and schema inside an explicit outer
+transaction: one stale sibling was rejected, one current sibling was accepted,
+and the transaction was rolled back.
+
+The material-batch candidate passes the focused route-projection and
+incremental-worker suites, mypy, and pylint. Its exact module was loaded beside
+the deployed module and executed against all 74 current production material
+rows in an explicit outer transaction with five-second lock and 15-second
+statement ceilings. It accepted 74 duplicate materials, used six statements
+for the whole material batch and two for all probe targets, completed in 3.198
+seconds while sharing locks with the legacy per-row live writer, and was rolled
+back. The real-PostgreSQL tests additionally cover fixed statement count,
+stale/revoked sibling isolation, and a replica-replacement lock race. Full
+remote PostgreSQL CI remains a merge gate.
 
 ## Open gates
 
@@ -1391,8 +1446,13 @@ was rolled back. Full remote PostgreSQL CI remains a merge gate.
   deploy it as direct Helm revision 411 / v1.1.1315. It removed the routing-lock
   dependency, but production exposed synchronous per-probe PostgreSQL receipt
   work on the composition event loop; revision 411 remains unpromoted.
-- [ ] Merge and deploy the bounded batch receipt-writer fix-forward, then prove
-  the ten-renewal provider-stall gate with no event-loop receipt persistence.
+- [x] Merge and deploy PR #1534's bounded batch receipt writer as direct Helm
+  revision 412 / v1.1.1316. Production proves receipt persistence is off the
+  event loop and all 64 current rows become fresh, but a provider material
+  refresh still produced a 16.987-second head interval.
+- [ ] Merge and deploy the fixed-statement material-batch/probe-target-join
+  fix-forward, then prove ten nominal-cadence renewals during provider material
+  refresh and provider stall before promoting route authority.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.
