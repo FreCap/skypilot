@@ -709,8 +709,8 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     for fleet_context in fleet_contexts:
         path = f"context {fleet_context['kubernetes_context']}"
         provider_context = provider_by_name[fleet_context['kubernetes_context']]
-        if (fleet_context['scheduler_name'] !=
-                provider_context['scheduler']['deployment']):
+        if (fleet_context['scheduler_name']
+                != provider_context['scheduler']['deployment']):
             raise BundleValidationError(
                 f'{path} projected scheduler and provider deployment '
                 'disagree.')
