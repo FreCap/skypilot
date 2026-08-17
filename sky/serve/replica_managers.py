@@ -2640,7 +2640,7 @@ class ReplicaManager:
         self._route_projection_publisher: Callable[[ProbeRouteResult],
                                                    None] | None = None
         self._route_material_writer: Callable[
-            [list[tuple['ReplicaInfo', route_projection.RouteLeaseMaterial]]],
+            [list[tuple[ReplicaInfo, route_projection.RouteLeaseMaterial]]],
             None] | None = None
 
     def __init__(self,
