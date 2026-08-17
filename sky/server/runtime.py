@@ -725,7 +725,7 @@ async def _register_runtime_daemons_async(
         background: _BackgroundLoop,
         max_db_connections: int,
         controller_owner: tuple[str, int],
-        pod_identity: request_postgres.ServerPodIdentity,
+        pod_identity: request_postgres.ServerPodIdentity | None,
         *,
         observe_executor_termination: bool = False) -> tuple[str, ...]:
     """Select and register runtime daemons once for this leadership term."""
@@ -741,6 +741,10 @@ async def _register_runtime_daemons_async(
             'Runtime daemon startup requires controller capability authority.')
     selected: list[str] = []
     if observe_executor_termination:
+        if pod_identity is None:
+            raise RuntimeError(
+                'Executor termination observation requires an exact server '
+                'Pod identity.')
         termination_observer = executor_termination_observer.start(
             controller_owner, pod_identity)
 
@@ -1571,14 +1575,12 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
                     if compatibility_controller_owner is None:
                         raise RuntimeError('Runtime daemons require an exact '
                                            'compatibility controller owner.')
-                    if state.instance_lease is None:
-                        raise RuntimeError('Runtime daemons require an exact '
-                                           'server instance lease.')
                     background.run(
                         _register_runtime_daemons_async(
                             background,
                             state.config.num_db_connections_per_worker,
                             compatibility_controller_owner,
+                            None if state.instance_lease is None else
                             state.instance_lease.pod_identity))
                 background.run(_initialize_normal_executor_requests())
 
