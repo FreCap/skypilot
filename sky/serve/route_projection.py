@@ -1001,6 +1001,190 @@ def _owner_matches(identity: RoutePublisherIdentity,
             owner.get('controller_ip') == identity.controller_ip)
 
 
+_ACTIONABLE_REPLICA_STATUSES = tuple(status.value for status in (
+    serve_statuses.ReplicaStatus.PENDING,
+    serve_statuses.ReplicaStatus.PROVISIONING,
+    serve_statuses.ReplicaStatus.STARTING,
+    serve_statuses.ReplicaStatus.READY,
+    serve_statuses.ReplicaStatus.NOT_READY,
+))
+_REPLICA_STATE_SHA256 = '_replica_state_sha256'
+_LEASE_SAFETY_FIELDS = (
+    'service_name',
+    'service_hash',
+    'replica_id',
+    'replica_record_id',
+    'service_lifecycle_epoch',
+    'controller_incarnation',
+    'controller_owner_epoch',
+    'controller_pid',
+    'controller_ip',
+    'service_version',
+    'route_url',
+    'gpu_type',
+    'gpu_count',
+    'probe_method',
+    'readiness_path',
+    'probe_timeout_seconds',
+    'probe_post_data',
+    'probe_headers',
+    'async_occupancy',
+    'uses_logical_replicas',
+    'is_zero_cost',
+    'planned_capacity',
+    'route_allowed',
+    'requires_route_marker',
+    'route_marker_payload',
+    'material_sha256',
+    'material_generation',
+    'ready',
+    'revocation_generation',
+    'revoked_at',
+    'revocation_reason',
+)
+
+
+def _replica_state_sha256_expression() -> Any:
+    """Return a compact exact PostgreSQL JSONB content fingerprint."""
+    state_text = sqlalchemy.cast(_REPLICAS.c.replica_state, sqlalchemy.Text)
+    state_bytes = sqlalchemy.func.convert_to(state_text, 'UTF8')
+    return sqlalchemy.func.encode(sqlalchemy.func.sha256(state_bytes),
+                                  'hex').label(_REPLICA_STATE_SHA256)
+
+
+def _incremental_replica_query(service_name: str, *, include_state: bool,
+                               for_update: bool) -> sqlalchemy.Select:
+    columns = [
+        _REPLICAS.c.replica_id,
+        _REPLICAS.c.replica_state_version,
+        _REPLICAS.c.status,
+        _REPLICAS.c.version,
+        _replica_state_sha256_expression(),
+    ]
+    if include_state:
+        columns.insert(2, _REPLICAS.c.replica_state)
+    query = sqlalchemy.select(*columns).where(
+        _REPLICAS.c.service_name == service_name,
+        _REPLICAS.c.status.in_(_ACTIONABLE_REPLICA_STATUSES),
+    ).order_by(_REPLICAS.c.replica_id)
+    return query.with_for_update() if for_update else query
+
+
+def _incremental_lease_query(identity: RoutePublisherIdentity, *,
+                             for_update: bool) -> sqlalchemy.Select:
+    query = sqlalchemy.select(_LEASES).where(
+        _LEASES.c.service_name == identity.service_name,
+        _LEASES.c.service_hash == identity.service_hash,
+        _LEASES.c.service_lifecycle_epoch == identity.service_lifecycle_epoch,
+        _LEASES.c.controller_incarnation == identity.controller_incarnation,
+        _LEASES.c.controller_owner_epoch == identity.controller_owner_epoch,
+        _LEASES.c.controller_pid == identity.controller_pid,
+        _LEASES.c.controller_ip == identity.controller_ip,
+        _LEASES.c.revoked_at.is_(None),
+    ).order_by(_LEASES.c.replica_id, _LEASES.c.replica_record_id)
+    return query.with_for_update() if for_update else query
+
+
+def _replica_fingerprints(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[tuple[int, int, str, str, int], ...]:
+    fingerprints = []
+    for row in rows:
+        try:
+            digest = row[_REPLICA_STATE_SHA256]
+            if (not isinstance(digest, str) or
+                    _SHA256_RE.fullmatch(digest) is None):
+                raise ValueError('invalid replica state digest')
+            fingerprints.append(
+                (int(row['replica_id']), int(row['replica_state_version']),
+                 digest, str(row['status']), int(row['version'])))
+        except (KeyError, TypeError, ValueError) as error:
+            raise RouteProjectionCorruption(
+                'A current replica fingerprint is corrupt.') from error
+    if len({fingerprint[0] for fingerprint in fingerprints
+           }) != len(fingerprints):
+        raise RouteProjectionCorruption(
+            'Current replica fingerprints contain duplicate IDs.')
+    return tuple(fingerprints)
+
+
+def _lease_key(row: Mapping[str, Any]) -> tuple[int, str]:
+    try:
+        return int(row['replica_id']), str(row['replica_record_id'])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RouteProjectionCorruption(
+            'A current route lease identity is corrupt.') from error
+
+
+def _lease_safety_snapshot(
+    rows: Sequence[Mapping[str,
+                           Any]],) -> dict[tuple[int, str], tuple[Any, ...]]:
+    snapshot: dict[tuple[int, str], tuple[Any, ...]] = {}
+    for row in rows:
+        key = _lease_key(row)
+        if key in snapshot:
+            raise RouteProjectionCorruption(
+                'Current route leases contain duplicate identities.')
+        try:
+            snapshot[key] = tuple(row[field] for field in _LEASE_SAFETY_FIELDS)
+        except KeyError as error:
+            raise RouteProjectionCorruption(
+                'A current route lease is missing safety state.') from error
+    return snapshot
+
+
+def _validate_revalidated_leases(
+    prepared_rows: Sequence[Mapping[str, Any]],
+    current_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    """Accept only identical safety state and monotonic lease extension."""
+    if _lease_safety_snapshot(prepared_rows) != _lease_safety_snapshot(
+            current_rows):
+        raise RouteProjectionConflict(
+            'Route lease safety state changed during composition.')
+    prepared_by_key = {_lease_key(row): row for row in prepared_rows}
+    for current in current_rows:
+        prepared = prepared_by_key[_lease_key(current)]
+        prepared_until = prepared.get('valid_until')
+        current_until = current.get('valid_until')
+        if prepared_until is None:
+            continue
+        if (not isinstance(prepared_until, datetime.datetime) or
+                prepared_until.tzinfo is None or
+                not isinstance(current_until, datetime.datetime) or
+                current_until.tzinfo is None or current_until < prepared_until):
+            raise RouteProjectionConflict(
+                'Route lease validity regressed during composition.')
+
+
+def _lease_freshness_snapshot(
+    rows: Sequence[Mapping[str, Any]],
+    now: datetime.datetime,
+) -> dict[tuple[int, str], bool]:
+    """Return the only time-dependent input to route eligibility."""
+    return {
+        _lease_key(row): (
+            isinstance(row.get('valid_until'), datetime.datetime) and
+            row['valid_until'].tzinfo is not None and
+            row['valid_until'] > now) for row in rows
+    }
+
+
+def _active_versions_from_owner(owner: Mapping[str, Any]) -> set[int]:
+    try:
+        raw_active_versions = owner['active_versions']
+        active_versions = set(
+            json.loads(raw_active_versions) if raw_active_versions else [])
+        if any(
+                type(version) is not int or version < 1
+                for version in active_versions):
+            raise ValueError('invalid active version')
+        return active_versions
+    except (KeyError, TypeError, ValueError) as error:
+        raise RouteProjectionCorruption(
+            'Service active versions are corrupt.') from error
+
+
 def _route_probe_target_from_row(
         identity: RoutePublisherIdentity,
         row: Mapping[str, Any]) -> RouteLeaseProbeTarget:
@@ -1940,7 +2124,7 @@ class RouteProjectionRepository:
         *,
         ttl_seconds: int,
     ) -> RoutePublicationReceipt:
-        """Compose and publish from current rows in one provider-free txn."""
+        """Prepare without locks, then revalidate and publish atomically."""
         if not isinstance(identity, RoutePublisherIdentity):
             raise RouteProjectionValidationError(
                 'Route publisher identity is invalid.')
@@ -1957,6 +2141,96 @@ class RouteProjectionRepository:
             raise RouteProjectionValidationError('Route TTL is invalid.')
 
         try:
+            # The prepare transaction deliberately takes no row locks and ends
+            # before any user-supplied decoder or capacity callback runs.
+            with orm.Session(self.engine) as session, session.begin():
+                prepared_owner = session.execute(
+                    self._owner_query(
+                        identity.service_name)).mappings().one_or_none()
+                if (prepared_owner is None or
+                        not _owner_matches(identity, prepared_owner)):
+                    raise RouteProjectionConflict(
+                        'Incremental route composer no longer owns this '
+                        'service.')
+                if prepared_owner['current_version'] != service_version:
+                    raise RouteProjectionConflict(
+                        'Incremental route version is no longer elected.')
+                prepared_active_versions = _active_versions_from_owner(
+                    prepared_owner)
+                replica_rows = session.execute(
+                    _incremental_replica_query(
+                        identity.service_name,
+                        include_state=True,
+                        for_update=False)).mappings().all()
+                prepared_replica_fingerprints = _replica_fingerprints(
+                    replica_rows)
+                lease_rows = session.execute(
+                    _incremental_lease_query(
+                        identity, for_update=False)).mappings().all()
+                prepared_now = session.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.func.clock_timestamp())).scalar_one()
+
+            replicas: list[IncrementalRouteReplica] = []
+            replica_infos = []
+            for row in replica_rows:
+                try:
+                    state = row['replica_state']
+                    if not isinstance(state, dict):
+                        raise ValueError('replica state is not an object')
+                    replica = IncrementalRouteReplica(
+                        replica_id=int(row['replica_id']),
+                        replica_record_id=state['replica_record_id'],
+                        service_version=int(row['version']),
+                        status=row['status'])
+                    info = decode_replica_state(
+                        int(row['replica_state_version']), state)
+                    if (getattr(info, 'replica_id', None) != replica.replica_id
+                            or getattr(info, 'replica_record_id',
+                                       None) != replica.replica_record_id or
+                            getattr(info, 'version',
+                                    None) != replica.service_version):
+                        raise ValueError(
+                            'replica state disagrees with scalar identity')
+                except (KeyError, TypeError, ValueError,
+                        RouteProjectionValidationError) as error:
+                    raise RouteProjectionCorruption(
+                        'A current replica row is corrupt.') from error
+                replicas.append(replica)
+                replica_infos.append(info)
+
+            preliminary = build_incremental_route_view(
+                replicas,
+                lease_rows,
+                prepared_active_versions,
+                now=prepared_now,
+                service_version=service_version,
+                routing_spec=routing_spec,
+                capacity_hint={})
+            logical_versions = {
+                int(row['service_version'])
+                for row in lease_rows
+                if row.get('uses_logical_replicas') is True
+            }
+            capacity_hint = capacity_hint_builder(replica_infos,
+                                                  preliminary.translation_cache,
+                                                  logical_versions)
+            prepared_route_view = build_incremental_route_view(
+                replicas,
+                lease_rows,
+                prepared_active_versions,
+                now=prepared_now,
+                service_version=service_version,
+                routing_spec=routing_spec,
+                capacity_hint=capacity_hint)
+            response = _validate_response(prepared_route_view.response)
+            current_identities = _validate_identities(
+                prepared_route_view.identities)
+
+            # The publish transaction has one fixed lock order and performs no
+            # decoding, import, provider call, capacity callback, or route JSON
+            # construction. A changed input rejects this tick; the worker
+            # retries from a new snapshot.
             with orm.Session(self.engine) as session, session.begin():
                 owner = session.execute(
                     self._owner_query(
@@ -1969,103 +2243,30 @@ class RouteProjectionRepository:
                 if owner['current_version'] != service_version:
                     raise RouteProjectionConflict(
                         'Incremental route version is no longer elected.')
-                try:
-                    raw_active_versions = owner['active_versions']
-                    active_versions = set(
-                        json.loads(raw_active_versions
-                                  ) if raw_active_versions else [])
-                    if any(
-                            type(version) is not int or version < 1
-                            for version in active_versions):
-                        raise ValueError('invalid active version')
-                except (TypeError, ValueError) as error:
-                    raise RouteProjectionCorruption(
-                        'Service active versions are corrupt.') from error
-
-                replica_rows = session.execute(
-                    sqlalchemy.select(
-                        _REPLICAS.c.replica_id,
-                        _REPLICAS.c.replica_state_version,
-                        _REPLICAS.c.replica_state,
-                        _REPLICAS.c.status,
-                        _REPLICAS.c.version,
-                    ).where(_REPLICAS.c.service_name ==
-                            identity.service_name).order_by(
-                                _REPLICAS.c.replica_id).with_for_update()
-                ).mappings().all()
-                replicas: list[IncrementalRouteReplica] = []
-                replica_infos = []
-                for row in replica_rows:
-                    try:
-                        state = row['replica_state']
-                        if not isinstance(state, dict):
-                            raise ValueError('replica state is not an object')
-                        replica = IncrementalRouteReplica(
-                            replica_id=int(row['replica_id']),
-                            replica_record_id=state['replica_record_id'],
-                            service_version=int(row['version']),
-                            status=row['status'])
-                        info = decode_replica_state(
-                            int(row['replica_state_version']), state)
-                        if (getattr(info, 'replica_id',
-                                    None) != replica.replica_id or
-                                getattr(info, 'replica_record_id',
-                                        None) != replica.replica_record_id or
-                                getattr(info, 'version',
-                                        None) != replica.service_version):
-                            raise ValueError(
-                                'replica state disagrees with scalar identity')
-                    except (KeyError, TypeError, ValueError,
-                            RouteProjectionValidationError) as error:
-                        raise RouteProjectionCorruption(
-                            'A current replica row is corrupt.') from error
-                    replicas.append(replica)
-                    replica_infos.append(info)
-
-                lease_rows = session.execute(
-                    sqlalchemy.select(_LEASES).where(
-                        _LEASES.c.service_name == identity.service_name,
-                        _LEASES.c.service_hash == identity.service_hash,
-                        _LEASES.c.service_lifecycle_epoch ==
-                        identity.service_lifecycle_epoch,
-                        _LEASES.c.controller_incarnation ==
-                        identity.controller_incarnation,
-                        _LEASES.c.controller_owner_epoch ==
-                        identity.controller_owner_epoch,
-                        _LEASES.c.controller_pid == identity.controller_pid,
-                        _LEASES.c.controller_ip == identity.controller_ip,
-                        _LEASES.c.revoked_at.is_(None),
-                    ).order_by(_LEASES.c.replica_id, _LEASES.c.replica_record_id
-                              ).with_for_update()).mappings().all()
+                active_versions = _active_versions_from_owner(owner)
+                if active_versions != prepared_active_versions:
+                    raise RouteProjectionConflict(
+                        'Service active versions changed during composition.')
+                current_replica_rows = session.execute(
+                    _incremental_replica_query(
+                        identity.service_name,
+                        include_state=False,
+                        for_update=True)).mappings().all()
+                if (_replica_fingerprints(current_replica_rows)
+                        != prepared_replica_fingerprints):
+                    raise RouteProjectionConflict(
+                        'Replica state changed during route composition.')
+                current_lease_rows = session.execute(
+                    _incremental_lease_query(identity,
+                                             for_update=True)).mappings().all()
+                _validate_revalidated_leases(lease_rows, current_lease_rows)
                 now = session.execute(
                     sqlalchemy.select(
                         sqlalchemy.func.clock_timestamp())).scalar_one()
-                preliminary = build_incremental_route_view(
-                    replicas,
-                    lease_rows,
-                    active_versions,
-                    now=now,
-                    service_version=service_version,
-                    routing_spec=routing_spec,
-                    capacity_hint={})
-                logical_versions = {
-                    int(row['service_version'])
-                    for row in lease_rows
-                    if row.get('uses_logical_replicas') is True
-                }
-                capacity_hint = capacity_hint_builder(
-                    replica_infos, preliminary.translation_cache,
-                    logical_versions)
-                route_view = build_incremental_route_view(
-                    replicas,
-                    lease_rows,
-                    active_versions,
-                    now=now,
-                    service_version=service_version,
-                    routing_spec=routing_spec,
-                    capacity_hint=capacity_hint)
-                response = _validate_response(route_view.response)
-                current_identities = _validate_identities(route_view.identities)
+                if (_lease_freshness_snapshot(lease_rows, prepared_now)
+                        != _lease_freshness_snapshot(current_lease_rows, now)):
+                    raise RouteProjectionConflict(
+                        'Route lease freshness changed during composition.')
                 return self._publish_in_session(
                     session,
                     owner,
@@ -2073,7 +2274,7 @@ class RouteProjectionRepository:
                     service_version,
                     response,
                     current_identities,
-                    route_view.live_record_ids,
+                    prepared_route_view.live_record_ids,
                     now,
                     ttl_seconds=ttl_seconds,
                     producer_protocol_version=(
