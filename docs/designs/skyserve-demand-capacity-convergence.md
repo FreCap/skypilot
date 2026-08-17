@@ -217,6 +217,28 @@ is the next blocker. Version 58 also retains task-owned Kubernetes
 strict worker-projection builder correctly persisted null rather than blessing
 a competing Pod contract.
 
+Revision 416 / v1.1.1321 deployed PR #1538's bounded logical-retirement scan.
+The exact API image is
+`sha256:19e9859eb32838287273d1cd39fd40075887304ffbafdd63fd9d4856ff41be61`;
+controller health recovered from a five-second timeout to 0.159 seconds and
+`/autoscaler/info` completed in 0.789--2.057 seconds. Both replacement load
+balancer slots reached readiness on that image, in 130 and 24 seconds rather
+than the roughly eight-minute pre-fix delay. This closes the retained-history
+scan gate, but qualification exposed a distinct remaining authority bypass.
+
+The unpromoted service is still `DIRECT_REPLICA`, and its committed version 58
+has a null worker-placement projection. The legacy autoscaler emitted one
+95-slot PHX H200 wave through `scale_up_batch()` using only the base
+protocol-v2 physical fence. Requests 54491--54498 show the consequence: each
+zero-cost launch reached Kubernetes without the projection-owned
+`kueue.x-k8s.io/queue-name` label and failed the namespace admission policy
+with HTTP 422. This was not paid L4 Spot activity. The singular `scale_up()`
+entrypoint already rejects protocol-v2 dictionaries in favor of typed
+`accept_reserved_fill(FillPlan)`, but the batch entrypoint retained a second
+dictionary-shaped admission path. That inconsistency, rather than provider
+scarcity, allowed null-projection service state to materialize rows, threads,
+and API requests.
+
 Revision 408 made no authority promotion or service/config mutation. A
 post-rollout query found zero paid Spot rows with `created_at` at or after the
 09:10:10 UTC Helm upgrade, including after fresh request telemetry resumed.
@@ -1287,6 +1309,24 @@ documented horizon, it removes direct broker-to-replica materialization and
 the transition branch/tests. The feature and removal PR descriptions must name
 the same exact production evidence gate.
 
+The post-revision-416 fix-forward closes the remaining untyped protocol-v2
+batch bypass. `accept_reserved_fill(FillPlan)` is the only public manager
+admission for protocol-v2 reserved fill in both transition modes;
+`scale_up()` and `scale_up_batch()` reject dictionary-shaped v2 fill entries
+before provider admission, replica-row allocation, launch-thread creation, or
+API submission. Ordinary demand, cost rebalance, and protocol-1 compatibility
+entries retain their existing batch behavior. This is a path deletion aligned
+with P3, not a new fallback: a service without a complete immutable worker
+projection receives no v2 fill until sequenced allocation can construct a
+typed plan. Mixed batches fail the v2 entries closed without suppressing
+unrelated ordinary entries, and tests prove the rejection is side-effect free.
+The implemented change deletes the context/UID conflict shim and the
+provider-busy batch exception that existed only for the bypass. Local Python
+3.14 verification passes the complete reserved-capacity-fill suite, the
+durable manager-receipt suite, and the replica-manager scale-up-batch/protocol
+v2 selection. The repository formatter passes YAPF, isort, mypy over 957 source
+files, pylint at 10.00/10, dashboard ESLint, and dashboard formatting.
+
 ### P3: blocked steady-state cleanup
 
 Restack the first cleanup (#1506) onto P2d as API016/Serve053 and keep it draft
@@ -1662,12 +1702,15 @@ dark deployment gate.
   and zero new replicas or `sky.launch` requests; and later legacy H200
   direct-launch attempts were rejected by the new durable fence without a paid
   claim. Promotion and the stacked direct-path removal remain open.
-- [ ] Merge and deploy PR #1538's logical-retirement ready-snapshot
-  fix-forward, then prove controller health and `/autoscaler/info` recover
-  promptly with 38
-  simultaneous retirements and 5,536 retained rows. The pre-fix production
-  child remained near 106% CPU and delayed one LB standby by roughly eight
-  minutes; timeout increases or history deletion do not close this gate.
+- [x] Merge and deploy PR #1538's logical-retirement ready-snapshot
+  fix-forward as revision 416 / v1.1.1321. With 38 simultaneous retirements
+  and 5,536 retained rows, controller health recovered to 0.159 seconds,
+  `/autoscaler/info` to 0.789--2.057 seconds, and the replacement LB slots to
+  130 and 24 seconds. The service remained unpromoted on `DIRECT_REPLICA`.
+- [ ] Close the batch-only untyped protocol-v2 fill bypass, deploy it dark,
+  and prove repeated legacy H200 decisions create zero new replica rows,
+  launch threads, or `sky.launch` requests while ordinary batch entries remain
+  unaffected.
 - [x] Replace the stale revision-407 PHX deployment-policy identities with
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in

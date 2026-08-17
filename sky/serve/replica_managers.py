@@ -2354,52 +2354,6 @@ def _is_lowercase_sha256(value: Any) -> bool:
             all(character in '0123456789abcdef' for character in value))
 
 
-def _conflicting_protocol_v2_fill_override_indexes(
-    resources_overrides: typing.Sequence[Mapping[str, Any] | None],
-) -> set[int]:
-    """Return every v2 batch entry in a conflicting context/UID group."""
-    targets: list[tuple[int, set[str], str]] = []
-    uids_by_context: dict[str, set[str]] = {}
-    for index, resources_override in enumerate(resources_overrides):
-        if not _is_protocol_v2_fill_override(resources_override):
-            continue
-        assert resources_override is not None
-        physical_uid = resources_override.get(
-            serve_constants.RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY)
-        raw_locations = resources_override.get(
-            serve_constants.RESERVED_FILL_ALLOWED_LOCATIONS_OVERRIDE_KEY)
-        if (not isinstance(physical_uid, str) or not physical_uid or
-                not isinstance(raw_locations, list)):
-            # The per-launch validator rejects malformed entries. Only
-            # complete provider-free identities participate in batch conflict
-            # detection, so unrelated valid entries remain launchable.
-            continue
-        contexts: set[str] = set()
-        malformed = False
-        for raw_location in raw_locations:
-            if not isinstance(raw_location, Mapping):
-                malformed = True
-                break
-            kube_context = raw_location.get('region')
-            if not isinstance(kube_context, str) or not kube_context:
-                malformed = True
-                break
-            contexts.add(kube_context)
-        if malformed or not contexts:
-            continue
-        targets.append((index, contexts, physical_uid))
-        for kube_context in contexts:
-            uids_by_context.setdefault(kube_context, set()).add(physical_uid)
-    conflicting_contexts = {
-        context for context, physical_uids in uids_by_context.items()
-        if len(physical_uids) > 1
-    }
-    return {
-        index for index, contexts, _ in targets
-        if contexts & conflicting_contexts
-    }
-
-
 def _protocol_v2_fill_cloud_launch_guard(
     pool_key: str,
     service_generation: int,
@@ -9034,70 +8988,61 @@ class SkyPilotReplicaManager(ReplicaManager):
         (one lock acquisition each) trickle through the short gaps between
         rounds: measured live at a 1000-target / ~340-replica fleet, launch
         enqueueing was the scaling bottleneck at ~100 replicas per several
-        minutes while the launch budget sat idle. Protocol-v2 items take a
-        zero-wait provider phase only at each physical UID proof and durable
-        reservation. This keeps the O(1) manager-lock acquisition while
-        allowing a queued ambient caller its FIFO turn between replicas.
+        minutes while the launch budget sat idle.
 
         Shared zero-cost placement reuses one replica snapshot across the wave.
         The launch path appends each successfully enqueued replica so later
         decisions observe in-wave reservations without querying and unpickling
-        all existing rows once per launch.
+        all existing rows once per launch. Protocol-v2 reserved fill is not a
+        batch dictionary: its sole public admission is the typed, immutable
+        ``accept_reserved_fill()`` plan and receipt boundary.
         """
-        conflicting_v2_indexes = (
-            _conflicting_protocol_v2_fill_override_indexes(resources_overrides))
-        if conflicting_v2_indexes:
-            for _ in sorted(conflicting_v2_indexes):
-                self._log_fill_skip(
-                    'one batch carries conflicting physical-cluster UIDs for '
-                    'the same Kubernetes context')
+        untyped_v2_count = sum(
+            _is_protocol_v2_fill_override(resources_override)
+            for resources_override in resources_overrides)
+        if untyped_v2_count:
+            noun = 'entry' if untyped_v2_count == 1 else 'entries'
+            verb = 'requires' if untyped_v2_count == 1 else 'require'
+            self._log_fill_skip(
+                f'{untyped_v2_count} protocol-v2 batch {noun} {verb} typed '
+                'plan admission')
             resources_overrides = [
-                resources_override
-                for index, resources_override in enumerate(resources_overrides)
-                if index not in conflicting_v2_indexes
+                resources_override for resources_override in resources_overrides
+                if not _is_protocol_v2_fill_override(resources_override)
             ]
             if not resources_overrides:
                 return []
-        try:
-            with self.lock:
-                if self._update_recovery_required:
-                    return []
-                if self._spot_placer is not None:
-                    self._spot_placer.refresh_workspace_policy()
-                needs_reservation = (
-                    self._batch_needs_placement_snapshot(resources_overrides)
-                    and self._uses_shared_zero_cost_demand_budget())
-                batch_kwargs: dict[str, Any] = {}
-                if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
-                    batch_kwargs['launch_priority'] = launch_priority
-                if paid_launch_authority is not None:
-                    batch_kwargs['paid_launch_authority'] = (
-                        paid_launch_authority)
-                if not paid_launch_allowed:
-                    batch_kwargs['paid_launch_allowed'] = False
-                if not needs_reservation:
+        with self.lock:
+            if self._update_recovery_required:
+                return []
+            if self._spot_placer is not None:
+                self._spot_placer.refresh_workspace_policy()
+            needs_reservation = (
+                self._batch_needs_placement_snapshot(resources_overrides) and
+                self._uses_shared_zero_cost_demand_budget())
+            batch_kwargs: dict[str, Any] = {}
+            if launch_priority != serve_constants.LB_REQUEST_PRIORITY_MIN:
+                batch_kwargs['launch_priority'] = launch_priority
+            if paid_launch_authority is not None:
+                batch_kwargs['paid_launch_authority'] = paid_launch_authority
+            if not paid_launch_allowed:
+                batch_kwargs['paid_launch_allowed'] = False
+            if not needs_reservation:
+                return self._scale_up_batch_locked(resources_overrides,
+                                                   expected_version,
+                                                   **batch_kwargs)
+            try:
+                lock = locks.get_lock(
+                    serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
+                with lock.acquire(blocking=False):
                     return self._scale_up_batch_locked(resources_overrides,
                                                        expected_version,
                                                        **batch_kwargs)
-                try:
-                    lock = locks.get_lock(
-                        serve_constants.DEMAND_CAPACITY_RESERVATION_LOCK_ID)
-                    with lock.acquire(blocking=False):
-                        return self._scale_up_batch_locked(
-                            resources_overrides, expected_version,
-                            **batch_kwargs)
-                except locks.LockTimeout:
-                    logger.info(
-                        'Deferring demand scale-up because another service is '
-                        'reserving shared zero-cost capacity.')
-                    return []
-        except exceptions.ProviderPhaseBusyError:
-            # The failed item already rolled back its location reservation and
-            # wrote no row/thread. Stop the wave so this lock is released to
-            # the phase owner; every remaining decision is retried next tick.
-            logger.info('Stopping protocol-v2 scale-up batch at a busy '
-                        'provider/physical phase boundary.')
-            return []
+            except locks.LockTimeout:
+                logger.info(
+                    'Deferring demand scale-up because another service is '
+                    'reserving shared zero-cost capacity.')
+                return []
 
     def _scale_up_batch_locked(
         self,
