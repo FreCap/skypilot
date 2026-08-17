@@ -405,7 +405,7 @@ SERVER_INSTANCES = sqlalchemy.Table(
         '((NOT executor_termination_evidence_capable AND '
         'executor_termination_evidence_protocol_version IS NULL) OR '
         '(executor_termination_evidence_capable AND '
-        'executor_termination_evidence_protocol_version = 1))',
+        'executor_termination_evidence_protocol_version IN (1, 2)))',
         name='ck_api_server_instances_executor_termination_evidence'),
 )
 EXECUTOR_TERMINATION_EVIDENCE = sqlalchemy.Table(
@@ -432,6 +432,8 @@ EXECUTOR_TERMINATION_EVIDENCE = sqlalchemy.Table(
     sqlalchemy.Column('pod_uid', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('container_name', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('pod_resource_version', sqlalchemy.Text, nullable=False),
+    sqlalchemy.Column('pod_event_type', sqlalchemy.Text),
+    sqlalchemy.Column('pod_phase', sqlalchemy.Text),
     sqlalchemy.Column('pod_deletion_timestamp',
                       sqlalchemy.DateTime(timezone=True),
                       nullable=False),
@@ -476,15 +478,16 @@ EXECUTOR_TERMINATION_EVIDENCE = sqlalchemy.Table(
         "('all', 'executor', 'controller')",
         name='ck_api013_executor_termination_worker'),
     sqlalchemy.CheckConstraint(
-        'container_finished_at >= pod_deletion_timestamp AND '
-        'observed_at >= container_finished_at',
-        name='ck_api013_executor_termination_time'),
-    sqlalchemy.CheckConstraint(
         "jsonb_typeof(evidence_payload) = 'object' AND "
         "evidence_digest ~ '^[0-9a-f]{64}$'",
         name='ck_api013_executor_termination_payload'),
-    sqlalchemy.CheckConstraint("source = 'KUBERNETES_POD_TERMINATED_V1'",
-                               name='ck_api013_executor_termination_source'),
+    sqlalchemy.CheckConstraint(
+        "((source = 'KUBERNETES_POD_TERMINATED_V1' AND "
+        'pod_event_type IS NULL AND pod_phase IS NULL) OR '
+        "(source = 'KUBERNETES_POD_FINAL_SUCCEEDED_V2' AND "
+        "pod_event_type = 'DELETED' AND pod_phase = 'Succeeded' AND "
+        'container_exit_code = 0))',
+        name='ck_api014_executor_termination_source'),
 )
 sqlalchemy.Index('uq_api013_executor_termination_execution',
                  EXECUTOR_TERMINATION_EVIDENCE.c.request_id,

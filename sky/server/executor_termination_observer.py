@@ -30,8 +30,9 @@ def observation_from_pod(
     pod: Any,
     *,
     kubernetes_cluster_uid: str,
+    event_type: str,
 ) -> request_postgres.ExecutorTerminationObservation | None:
-    """Extract only a current role-container termination after Pod deletion."""
+    """Extract only a final successful role-container deletion state."""
     metadata = getattr(pod, 'metadata', None)
     status = getattr(pod, 'status', None)
     pod_uid = _required_text(getattr(metadata, 'uid', None))
@@ -40,10 +41,12 @@ def observation_from_pod(
     resource_version = _required_text(
         getattr(metadata, 'resource_version', None))
     deletion_timestamp = getattr(metadata, 'deletion_timestamp', None)
+    pod_phase = _required_text(getattr(status, 'phase', None))
     if (pod_uid is None or namespace is None or pod_name is None or
             resource_version is None or
             not isinstance(deletion_timestamp, datetime.datetime) or
-            deletion_timestamp.tzinfo is None):
+            deletion_timestamp.tzinfo is None or event_type != 'DELETED' or
+            pod_phase != 'Succeeded'):
         return None
     container_statuses = getattr(status, 'container_statuses', None)
     if not isinstance(container_statuses, list):
@@ -63,10 +66,13 @@ def observation_from_pod(
     terminated = getattr(state, 'terminated', None)
     finished_at = getattr(terminated, 'finished_at', None)
     exit_code = getattr(terminated, 'exit_code', None)
+    # deletionTimestamp is written by the API server while finishedAt is
+    # written by the kubelet.  Their wall clocks are not ordered.  The final
+    # resource-versioned final object with Succeeded phase and the role
+    # container's *current* exit-zero terminated state form the stop proof.
     if (not isinstance(finished_at, datetime.datetime) or
-            finished_at.tzinfo is None or finished_at < deletion_timestamp or
-            isinstance(exit_code, bool) or not isinstance(exit_code, int) or
-            exit_code < 0):
+            finished_at.tzinfo is None or isinstance(exit_code, bool) or
+            not isinstance(exit_code, int) or exit_code != 0):
         return None
     cluster_uid = _required_text(kubernetes_cluster_uid)
     container_name = _required_text(getattr(container_status, 'name', None))
@@ -82,6 +88,8 @@ def observation_from_pod(
         pod_uid=pod_uid,
         container_name=container_name,
         pod_resource_version=resource_version,
+        pod_event_type=event_type,
+        pod_phase=pod_phase,
         pod_deletion_timestamp=deletion_timestamp,
         container_finished_at=finished_at,
         container_exit_code=exit_code,
@@ -110,9 +118,11 @@ class ExecutorTerminationEvidenceObserver:
                 'Executor termination observer requires a Pod namespace.')
         self._thread.start()
 
-    def _record_pod(self, pod: Any, cluster_uid: str) -> None:
+    def _record_pod(self, pod: Any, cluster_uid: str,
+                    event_type: str | None) -> None:
         observation = observation_from_pod(pod,
-                                           kubernetes_cluster_uid=cluster_uid)
+                                           kubernetes_cluster_uid=cluster_uid,
+                                           event_type=event_type or '')
         if observation is None:
             return
         recorded: tuple[str, ...] = ()
@@ -143,7 +153,9 @@ class ExecutorTerminationEvidenceObserver:
         for pod in items:
             if self._stop_event.is_set():
                 return
-            self._record_pod(pod, cluster_uid)
+            # A list snapshot establishes continuity but cannot prove that the
+            # API server has delivered the final successful deletion object.
+            self._record_pod(pod, cluster_uid, None)
         resource_version = _required_text(
             getattr(getattr(pod_list, 'metadata', None), 'resource_version',
                     None))
@@ -179,6 +191,8 @@ class ExecutorTerminationEvidenceObserver:
                 if self._stop_event.is_set():
                     return
                 pod = event.get('object') if isinstance(event, dict) else None
+                event_type = (event.get('type')
+                              if isinstance(event, dict) else None)
                 resource_version = _required_text(
                     getattr(getattr(pod, 'metadata', None), 'resource_version',
                             None))
@@ -187,13 +201,13 @@ class ExecutorTerminationEvidenceObserver:
                         'Kubernetes Pod watch event has no resourceVersion.')
                 # Advance only after the event is consumed. An unexpected
                 # persistence failure must replay this exact event.
-                self._record_pod(pod, cluster_uid)
+                self._record_pod(pod, cluster_uid, event_type)
                 self._resource_version = resource_version
         except kubernetes.api_exception() as e:
             if getattr(e, 'status', None) != 410:
                 raise
             # Kubernetes no longer retains the requested history. A fresh
-            # list processes any still-deleting Pod before establishing the
+            # list inspects any still-deleting Pod before establishing the
             # next exact watch boundary.
             self._resource_version = None
             logger.warning('Executor termination observer resourceVersion '

@@ -2482,7 +2482,7 @@ def test_retention_pin_primary_key_kind_check_and_request_fk(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '013'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '014'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -2528,6 +2528,12 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
         'executor_termination_evidence_capable',
         'executor_termination_evidence_protocol_version'
     }.issubset(instance_columns)
+    evidence_checks = {
+        constraint['name'] for constraint in inspector.get_check_constraints(
+            'api_request_executor_termination_evidence')
+    }
+    assert 'ck_api013_executor_termination_time' not in evidence_checks
+    assert 'ck_api014_executor_termination_source' in evidence_checks
     binding_index = {
         index['name']: index for index in inspector.get_indexes('api_requests')
     }['uq_api_requests_ordinary_launch_association']
@@ -2867,22 +2873,22 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api013_downgrade_guard_retains_head(request_database):
+def test_api014_downgrade_guard_retains_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
-    with pytest.raises(RuntimeError, match='API013 is forward-only'):
+    with pytest.raises(RuntimeError, match='API014 is forward-only'):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '013'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '014'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
     assert 'api_request_retention_pins' in inspector.get_table_names()
 
 
-def test_api013_downgrade_guard_retains_binding_evidence(request_database):
+def test_api014_downgrade_guard_retains_binding_evidence(request_database):
     engine, _ = request_database
     columns_before = {
         column['name']
@@ -2895,11 +2901,11 @@ def test_api013_downgrade_guard_retains_binding_evidence(request_database):
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
 
-    with pytest.raises(RuntimeError, match='API013 is forward-only'):
+    with pytest.raises(RuntimeError, match='API014 is forward-only'):
         alembic_command.downgrade(config, '008')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '013'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '014'
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
         'execution_quiesced_at', 'ordinary_launch_association_id',
@@ -2982,7 +2988,7 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['ordered_capacity_admission_protocol_version'] == 1
     assert row['ordered_capacity_admission_cohort_epoch'] == 1
     assert row['executor_termination_evidence_capable'] is True
-    assert row['executor_termination_evidence_protocol_version'] == 1
+    assert row['executor_termination_evidence_protocol_version'] == 2
     assert (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME
             in row['supported_handlers'])
     monkeypatch.setenv('HOSTNAME', 'request-overlaid-pod')
@@ -3059,7 +3065,7 @@ def test_executor_termination_evidence_is_exact_idempotent_and_diagnostic(
                 pod_uid=worker_id,
                 pod_namespace='skypilot',
                 pod_ip='10.0.0.1',
-                version='api013',
+                version='api014',
                 started_at=now,
                 heartbeat_at=now,
                 ready=False,
@@ -3072,7 +3078,7 @@ def test_executor_termination_evidence_is_exact_idempotent_and_diagnostic(
                     request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE),
                 execution_quiescence_capable=True,
                 executor_termination_evidence_capable=True,
-                executor_termination_evidence_protocol_version=1))
+                executor_termination_evidence_protocol_version=2))
         connection.execute(
             sqlalchemy.update(request_postgres.REQUESTS).where(
                 request_postgres.REQUESTS.c.request_id ==
@@ -3087,12 +3093,21 @@ def test_executor_termination_evidence_is_exact_idempotent_and_diagnostic(
         pod_uid=worker_id,
         container_name='skypilot-executor',
         pod_resource_version='44',
-        pod_deletion_timestamp=now - datetime.timedelta(seconds=2),
-        container_finished_at=now - datetime.timedelta(seconds=1),
+        pod_event_type='DELETED',
+        pod_phase='Succeeded',
+        # API-server, kubelet, and database clocks are independent.  Exercise
+        # both formerly rejected comparisons in one durable write.
+        pod_deletion_timestamp=now + datetime.timedelta(seconds=120),
+        container_finished_at=now + datetime.timedelta(seconds=60),
         container_exit_code=0,
         container_reason='Completed')
     owner = (observer_id, leader.generation)
     try:
+        with pytest.raises(request_postgres.ExecutorTerminationEvidenceRejected,
+                           match='successful final DELETED'):
+            request_postgres.record_executor_termination_evidence(
+                dataclasses.replace(observation, pod_event_type='MODIFIED'),
+                observer_owner=owner)
         first = request_postgres.record_executor_termination_evidence(
             observation, observer_owner=owner)
         assert len(first) == 1
@@ -3116,8 +3131,13 @@ def test_executor_termination_evidence_is_exact_idempotent_and_diagnostic(
         assert evidence['execution_generation'] == item.execution_generation
         assert str(evidence['claim_token']) == item.claim_token
         assert str(evidence['worker_instance_id']) == worker_id
-        assert evidence['source'] == 'KUBERNETES_POD_TERMINATED_V1'
+        assert evidence['source'] == 'KUBERNETES_POD_FINAL_SUCCEEDED_V2'
+        assert evidence['pod_event_type'] == 'DELETED'
+        assert evidence['pod_phase'] == 'Succeeded'
         assert evidence['observer_controller_generation'] == leader.generation
+        assert evidence['container_finished_at'] < evidence[
+            'pod_deletion_timestamp']
+        assert evidence['observed_at'] < evidence['container_finished_at']
         assert evidence['evidence_digest'] == (
             request_postgres._canonical_evidence_sha256(
                 evidence['evidence_payload']))

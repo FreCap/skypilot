@@ -98,7 +98,7 @@ _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
 _LEGACY_DAEMON_TRANSITION_LOCK_ID = ('skypilot:runtime-daemon-transition:v1')
 _EXECUTOR_TERMINATION_EVIDENCE_NAMESPACE = uuid.UUID(
     '78ac727a-35da-50ff-b667-e5509dba7091')
-EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION = 1
+EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION = 2
 _ORDINARY_LAUNCH_SUBMISSION_NAMESPACE = uuid.UUID(
     '58a82cb0-534c-5a5d-bb5d-681759e60469')
 _BOUND_CANCEL_QUIESCENCE_WAIT_SECONDS = 5.0
@@ -317,7 +317,7 @@ class ServerPodIdentity:
 
 @dataclasses.dataclass(frozen=True)
 class ExecutorTerminationObservation:
-    """One validated current-container termination observed from Kubernetes."""
+    """One exact final successful Pod deletion observed from Kubernetes."""
 
     kubernetes_cluster_uid: str
     pod_namespace: str
@@ -325,6 +325,8 @@ class ExecutorTerminationObservation:
     pod_uid: str
     container_name: str
     pod_resource_version: str
+    pod_event_type: str
+    pod_phase: str
     pod_deletion_timestamp: datetime.datetime
     container_finished_at: datetime.datetime
     container_exit_code: int
@@ -1775,6 +1777,8 @@ def record_executor_termination_evidence(
         'pod_name': observation.pod_name,
         'container_name': observation.container_name,
         'pod_resource_version': observation.pod_resource_version,
+        'pod_event_type': observation.pod_event_type,
+        'pod_phase': observation.pod_phase,
     }
     if any(not isinstance(value, str) or not value.strip() or
            value != value.strip() for value in required_text.values()):
@@ -1792,13 +1796,15 @@ def record_executor_termination_evidence(
             observation.container_exit_code < 0):
         raise ExecutorTerminationEvidenceRejected(
             'Container exit code must be a non-negative integer.')
+    if (observation.pod_event_type != 'DELETED' or
+            observation.pod_phase != 'Succeeded' or
+            observation.container_exit_code != 0):
+        raise ExecutorTerminationEvidenceRejected(
+            'Termination evidence requires a successful final DELETED event.')
     deletion_timestamp = _canonical_termination_timestamp(
         observation.pod_deletion_timestamp, 'pod_deletion_timestamp')
     finished_at = _canonical_termination_timestamp(
         observation.container_finished_at, 'container_finished_at')
-    if observation.container_finished_at < observation.pod_deletion_timestamp:
-        raise ExecutorTerminationEvidenceRejected(
-            'Container termination must finish after Pod deletion begins.')
 
     expected_containers = {
         'all': 'skypilot-api',
@@ -1832,9 +1838,10 @@ def record_executor_termination_evidence(
                 'Terminated Pod does not match a capable registered executor.')
         db_observed_at = connection.execute(
             sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        if db_observed_at < observation.container_finished_at:
-            raise ExecutorTerminationEvidenceRejected(
-                'Database time precedes the observed container finish time.')
+        # API-server deletionTimestamp, kubelet finishedAt, and PostgreSQL
+        # observed_at are different clock domains.  Keep all three for
+        # diagnostics, but never infer ordering across them.  A later consumer
+        # orders new provider observation after observed_at in PostgreSQL.
         requests = connection.execute(
             sqlalchemy.select(
                 REQUESTS.c.request_id, REQUESTS.c.execution_generation,
@@ -1865,12 +1872,14 @@ def record_executor_termination_evidence(
                 'observer_controller_generation': observer_generation,
                 'observer_instance_id': str(observer_instance_id),
                 'pod_deletion_timestamp': deletion_timestamp,
+                'pod_event_type': observation.pod_event_type,
                 'pod_name': observation.pod_name,
                 'pod_namespace': observation.pod_namespace,
+                'pod_phase': observation.pod_phase,
                 'pod_resource_version': observation.pod_resource_version,
                 'pod_uid': observation.pod_uid,
                 'request_id': request_id,
-                'source': 'KUBERNETES_POD_TERMINATED_V1',
+                'source': 'KUBERNETES_POD_FINAL_SUCCEEDED_V2',
                 'worker_instance_id': str(worker_instance_id),
                 'worker_role': worker_role,
                 'claim_token': str(claim_token),
@@ -1889,11 +1898,13 @@ def record_executor_termination_evidence(
                 'pod_uid': observation.pod_uid,
                 'container_name': observation.container_name,
                 'pod_resource_version': observation.pod_resource_version,
+                'pod_event_type': observation.pod_event_type,
+                'pod_phase': observation.pod_phase,
                 'pod_deletion_timestamp': observation.pod_deletion_timestamp,
                 'container_finished_at': observation.container_finished_at,
                 'container_exit_code': observation.container_exit_code,
                 'container_reason': observation.container_reason,
-                'source': 'KUBERNETES_POD_TERMINATED_V1',
+                'source': 'KUBERNETES_POD_FINAL_SUCCEEDED_V2',
                 'evidence_payload': payload,
                 'evidence_digest': digest,
                 'observer_instance_id': observer_instance_id,
