@@ -32,8 +32,13 @@ from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.utils.db import db_utils
 
+# The load-balancer snapshot wire document remains protocol 1.  Serve051
+# changes only its producer: protocol 2 persists and probes exact per-replica
+# material before composing the same immutable full snapshot.
 PROTOCOL_VERSION = 1
+INCREMENTAL_PRODUCER_PROTOCOL_VERSION = 2
 SNAPSHOT_HISTORY_LIMIT = 96
+LEASE_HISTORY_PER_REPLICA_LIMIT = 4
 ALIAS_RETENTION_SECONDS = 430
 MAX_ALIASES_PER_RECORD = 8
 MAX_ROUTE_IDENTITIES = 100_000
@@ -45,7 +50,9 @@ _SESSION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$')
 _SERVICES = serve_state_schema.services_table
 _SNAPSHOTS = route_projection_schema.serve_route_snapshots_table
 _HEADS = route_projection_schema.serve_route_heads_table
+_LEASES = route_projection_schema.serve_route_replica_leases_table
 _DEMAND_REPORTS = demand_state_schema.serve_lb_demand_reports_table
+_REPLICAS = serve_state_schema.replicas_table
 
 
 class RouteProjectionError(RuntimeError):
@@ -116,6 +123,121 @@ class RoutePublisherIdentity:
         _positive_int(self.controller_owner_epoch, 'controller_owner_epoch')
         _positive_int(self.controller_pid, 'controller_pid')
         _nonempty(self.controller_ip, 'controller_ip')
+
+
+@dataclasses.dataclass(frozen=True)
+class RouteLeaseMaterial:
+    """Provider-resolved material consumed by the provider-free worker."""
+
+    route: ResolvedRouteMaterial
+    readiness_path: str
+    post_data: dict[str, Any] | None
+    headers: dict[str, str] | None
+    async_occupancy: bool | None
+    uses_logical_replicas: bool
+    is_zero_cost: bool
+    planned_capacity: int
+    route_allowed: bool
+    route_marker: system_recovery_route_lease.RouteMarker | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.route, ResolvedRouteMaterial):
+            raise RouteProjectionValidationError(
+                'route must be resolved route material.')
+        try:
+            system_recovery_route_lease.normalize_probe_url(
+                self.route.url, self.readiness_path)
+        except system_recovery_route_lease.RouteLeaseError as error:
+            raise RouteProjectionValidationError(
+                'Readiness probe path is invalid.') from error
+        post_data = _validate_optional_json_object(self.post_data, 'post_data')
+        headers = _validate_headers(self.headers)
+        if self.async_occupancy is not None and type(  # pylint: disable=unidiomatic-typecheck
+                self.async_occupancy) is not bool:
+            raise RouteProjectionValidationError(
+                'async_occupancy must be boolean or null.')
+        for field, value in (
+            ('uses_logical_replicas', self.uses_logical_replicas),
+            ('is_zero_cost', self.is_zero_cost),
+            ('route_allowed', self.route_allowed),
+        ):
+            if type(value) is not bool:  # pylint: disable=unidiomatic-typecheck
+                raise RouteProjectionValidationError(
+                    f'{field} must be boolean.')
+        _positive_int(self.planned_capacity, 'planned_capacity')
+        marker = _validate_route_marker(self.route_marker)
+        object.__setattr__(self, 'post_data', post_data)
+        object.__setattr__(self, 'headers', headers)
+        object.__setattr__(self, 'route_marker', marker)
+
+
+@dataclasses.dataclass(frozen=True)
+class RouteLeaseProbeTarget:
+    """One exact lease generation safe to probe without provider state."""
+
+    identity: RoutePublisherIdentity
+    replica_id: int
+    replica_record_id: str
+    service_version: int
+    route_url: str
+    readiness_path: str
+    method: str
+    post_data: dict[str, Any] | None
+    headers: dict[str, str] | None
+    material_sha256: str
+    material_generation: int
+    revocation_generation: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, RoutePublisherIdentity):
+            raise RouteProjectionValidationError(
+                'Route lease target identity is invalid.')
+        _positive_int(self.replica_id, 'replica_id')
+        _canonical_record_id(self.replica_record_id)
+        _positive_int(self.service_version, 'service_version')
+        normalized = _normalize_url(self.route_url)
+        if normalized != self.route_url:
+            raise RouteProjectionValidationError(
+                'Route lease target URL must already be normalized.')
+        try:
+            system_recovery_route_lease.normalize_probe_url(
+                self.route_url, self.readiness_path)
+        except system_recovery_route_lease.RouteLeaseError as error:
+            raise RouteProjectionValidationError(
+                'Route lease target probe path is invalid.') from error
+        post_data = _validate_optional_json_object(self.post_data, 'post_data')
+        headers = _validate_headers(self.headers)
+        expected_method = 'POST' if post_data is not None else 'GET'
+        if self.method != expected_method:
+            raise RouteProjectionValidationError(
+                'Route lease target method disagrees with post_data.')
+        if (not isinstance(self.material_sha256, str) or
+                _SHA256_RE.fullmatch(self.material_sha256) is None):
+            raise RouteProjectionValidationError(
+                'Route lease material digest is invalid.')
+        _positive_int(self.material_generation, 'material_generation')
+        _nonnegative_int(self.revocation_generation, 'revocation_generation')
+        object.__setattr__(self, 'post_data', post_data)
+        object.__setattr__(self, 'headers', headers)
+
+    @property
+    def probe_url(self) -> str:
+        return system_recovery_route_lease.normalize_probe_url(
+            self.route_url, self.readiness_path)
+
+
+@dataclasses.dataclass(frozen=True)
+class RouteLeaseMaterialReceipt:
+    material_generation: int
+    material_sha256: str
+    duplicate: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class RouteLeaseProbeReceipt:
+    accepted: bool
+    readiness_generation: int | None = None
+    valid_until: datetime.datetime | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,6 +317,120 @@ def _canonical_json(value: object) -> bytes:
     except (TypeError, ValueError) as error:
         raise RouteProjectionValidationError(
             'Route projection must contain canonical JSON values.') from error
+
+
+def _validate_optional_json_object(value: object,
+                                   field: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise RouteProjectionValidationError(f'{field} must be an object.')
+    _canonical_json(value)
+    return copy.deepcopy(value)
+
+
+def _validate_headers(value: object) -> dict[str, str] | None:
+    headers = _validate_optional_json_object(value, 'headers')
+    if headers is not None and any(not isinstance(key, str) or not key or
+                                   not isinstance(header_value, str)
+                                   for key, header_value in headers.items()):
+        raise RouteProjectionValidationError(
+            'headers must map nonempty strings to strings.')
+    return headers
+
+
+def _validate_route_marker(
+    marker: object,) -> system_recovery_route_lease.RouteMarker | None:
+    if marker is None:
+        return None
+    if not isinstance(marker, system_recovery_route_lease.RouteMarker):
+        raise RouteProjectionValidationError(
+            'route_marker must use the closed recovery marker type.')
+    try:
+        replica_id = system_recovery_route_lease.canonical_replica_id(
+            marker.replica_id)
+        route_token = system_recovery_route_lease.canonical_route_token(
+            marker.route_token)
+    except system_recovery_route_lease.RouteLeaseError as error:
+        raise RouteProjectionValidationError(
+            'route_marker is invalid.') from error
+    return system_recovery_route_lease.RouteMarker(replica_id, route_token)
+
+
+def _route_marker_payload(
+    marker: system_recovery_route_lease.RouteMarker | None,
+) -> dict[str, str] | None:
+    if marker is None:
+        return None
+    return {
+        'replica_id': marker.replica_id,
+        'route_token': marker.route_token,
+    }
+
+
+def _route_marker_from_payload(
+    payload: object,) -> system_recovery_route_lease.RouteMarker | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or set(payload) != {
+            'replica_id', 'route_token'
+    }:
+        raise RouteProjectionValidationError(
+            'Persisted route marker has an invalid shape.')
+    return _validate_route_marker(
+        system_recovery_route_lease.RouteMarker(
+            replica_id=payload['replica_id'],
+            route_token=payload['route_token']))
+
+
+def _lease_material_payload(material: RouteLeaseMaterial) -> dict[str, Any]:
+    return {
+        'route_url': material.route.url,
+        'gpu_type': material.route.gpu_type,
+        'gpu_count': material.route.gpu_count,
+        'probe_method': 'POST' if material.post_data is not None else 'GET',
+        'readiness_path': material.readiness_path,
+        'probe_post_data': material.post_data,
+        'probe_headers': material.headers,
+        'async_occupancy': material.async_occupancy,
+        'uses_logical_replicas': material.uses_logical_replicas,
+        'is_zero_cost': material.is_zero_cost,
+        'planned_capacity': material.planned_capacity,
+        'route_allowed': material.route_allowed,
+        'route_marker_payload': _route_marker_payload(material.route_marker),
+    }
+
+
+def _validate_lease_material_row(row: Mapping[str, Any]) -> None:
+    """Validate one persisted content-addressed provider result."""
+    try:
+        material = RouteLeaseMaterial(
+            route=ResolvedRouteMaterial(row['route_url'], row['gpu_type'],
+                                        row['gpu_count']),
+            readiness_path=row['readiness_path'],
+            post_data=row['probe_post_data'],
+            headers=row['probe_headers'],
+            async_occupancy=row['async_occupancy'],
+            uses_logical_replicas=row['uses_logical_replicas'],
+            is_zero_cost=row['is_zero_cost'],
+            planned_capacity=row['planned_capacity'],
+            route_allowed=row['route_allowed'],
+            route_marker=_route_marker_from_payload(
+                row['route_marker_payload']))
+        payload = _lease_material_payload(material)
+        digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+        if (not isinstance(row['material_sha256'], str) or
+                _SHA256_RE.fullmatch(row['material_sha256']) is None or
+                digest != row['material_sha256']):
+            raise RouteProjectionValidationError(
+                'Persisted route material digest does not match.')
+        expected_method = 'POST' if material.post_data is not None else 'GET'
+        if row['probe_method'] != expected_method:
+            raise RouteProjectionValidationError(
+                'Persisted route probe method is inconsistent.')
+    except (KeyError, TypeError, ValueError) as error:
+        raise RouteProjectionValidationError(
+            'Persisted route material is corrupt.') from error
 
 
 def _content_sha256(response: object, identities: object) -> str:
@@ -502,6 +738,76 @@ def _owner_matches(identity: RoutePublisherIdentity,
             owner.get('controller_ip') == identity.controller_ip)
 
 
+def _replica_row_matches(session: orm.Session, replica_id: int,
+                         replica_record_id: str, service_version: int,
+                         service_name: str) -> bool:
+    """Check the immutable row identity without deserializing ReplicaInfo."""
+    row = session.execute(
+        sqlalchemy.select(
+            _REPLICAS.c.version,
+            _REPLICAS.c.replica_state['replica_record_id'].as_string().label(
+                'replica_record_id'),
+        ).where(_REPLICAS.c.service_name == service_name, _REPLICAS.c.replica_id
+                == replica_id).with_for_update()).mappings().one_or_none()
+    return bool(row is not None and row['version'] == service_version and
+                row['replica_record_id'] == replica_record_id)
+
+
+def _route_probe_target_from_row(
+        identity: RoutePublisherIdentity,
+        row: Mapping[str, Any]) -> RouteLeaseProbeTarget:
+    _validate_lease_material_row(row)
+    return RouteLeaseProbeTarget(
+        identity=identity,
+        replica_id=int(row['replica_id']),
+        replica_record_id=str(row['replica_record_id']),
+        service_version=int(row['service_version']),
+        route_url=row['route_url'],
+        readiness_path=row['readiness_path'],
+        method=row['probe_method'],
+        post_data=row['probe_post_data'],
+        headers=row['probe_headers'],
+        material_sha256=row['material_sha256'],
+        material_generation=int(row['material_generation']),
+        revocation_generation=int(row['revocation_generation']),
+    )
+
+
+def revoke_replica_lease_in_session(
+    session: orm.Session,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+    reason: str,
+) -> int:
+    """Revoke an exact replica's route material in its state transaction.
+
+    This narrow write boundary deliberately performs no provider read and no
+    commit.  Callers already mutating the replica row own the transaction.
+    Missing pre-Serve051 material is the idempotent zero-row result.
+    """
+    _nonempty(service_name, 'service_name')
+    _positive_int(replica_id, 'replica_id')
+    record_id = uuid.UUID(_canonical_record_id(replica_record_id))
+    _nonempty(reason, 'reason')
+    now = sqlalchemy.func.clock_timestamp()
+    result = session.execute(
+        sqlalchemy.update(_LEASES).where(
+            _LEASES.c.service_name == service_name,
+            _LEASES.c.replica_id == replica_id,
+            _LEASES.c.replica_record_id == record_id,
+            _LEASES.c.revoked_at.is_(None),
+        ).values(
+            ready=False,
+            observed_at=None,
+            valid_until=None,
+            revocation_generation=_LEASES.c.revocation_generation + 1,
+            revoked_at=now,
+            revocation_reason=reason,
+        ))
+    return int(result.rowcount or 0)
+
+
 def snapshot_owner_matches(snapshot: Mapping[str, Any],
                            owner: Mapping[str, Any]) -> bool:
     """Return whether one durable snapshot belongs to the current owner."""
@@ -615,6 +921,347 @@ class RouteProjectionRepository:
                 RouteProjectionValidationError) as error:
             raise RouteProjectionCorruption(
                 'Persisted route snapshot is corrupt.') from error
+
+    def upsert_replica_material(
+        self,
+        identity: RoutePublisherIdentity,
+        replica_info: Any,
+        material: RouteLeaseMaterial,
+    ) -> RouteLeaseMaterialReceipt:
+        """Persist one provider-resolved target without publishing routes."""
+        if not isinstance(identity, RoutePublisherIdentity):
+            raise RouteProjectionValidationError(
+                'Route publisher identity is invalid.')
+        if not isinstance(material, RouteLeaseMaterial):
+            raise RouteProjectionValidationError(
+                'Route lease material is invalid.')
+        replica_id = _positive_int(getattr(replica_info, 'replica_id', None),
+                                   'replica_id')
+        record_id_text = _canonical_record_id(
+            getattr(replica_info, 'replica_record_id', None))
+        record_id = uuid.UUID(record_id_text)
+        service_version = _positive_int(getattr(replica_info, 'version', None),
+                                        'service_version')
+        payload = _lease_material_payload(material)
+        digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+        try:
+            with orm.Session(self.engine) as session, session.begin():
+                owner = session.execute(
+                    self._owner_query(
+                        identity.service_name,
+                        for_update=True)).mappings().one_or_none()
+                if owner is None or not _owner_matches(identity, owner):
+                    raise RouteProjectionConflict(
+                        'Route material writer no longer owns this service.')
+                if not _replica_row_matches(session, replica_id, record_id_text,
+                                            service_version,
+                                            identity.service_name):
+                    raise RouteProjectionConflict(
+                        'Route material replica identity is no longer current.')
+                now = session.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.func.clock_timestamp())).scalar_one()
+                existing = session.execute(
+                    sqlalchemy.select(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.replica_id == replica_id,
+                        _LEASES.c.replica_record_id == record_id,
+                    ).with_for_update()).mappings().one_or_none()
+                session.execute(
+                    sqlalchemy.update(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.replica_id == replica_id,
+                        _LEASES.c.replica_record_id != record_id,
+                        _LEASES.c.revoked_at.is_(None),
+                    ).values(
+                        ready=False,
+                        observed_at=None,
+                        valid_until=None,
+                        revocation_generation=(_LEASES.c.revocation_generation +
+                                               1),
+                        revoked_at=now,
+                        revocation_reason='replica_record_replaced',
+                    ))
+                if existing is not None and existing['revoked_at'] is not None:
+                    raise RouteProjectionConflict(
+                        'Revoked route material cannot be implicitly revived.')
+                duplicate = bool(existing is not None and
+                                 existing['material_sha256'] == digest)
+                if duplicate:
+                    assert existing is not None
+                    generation = int(existing['material_generation'])
+                    session.execute(
+                        sqlalchemy.update(_LEASES).where(
+                            _LEASES.c.service_name == identity.service_name,
+                            _LEASES.c.service_hash == identity.service_hash,
+                            _LEASES.c.replica_id == replica_id,
+                            _LEASES.c.replica_record_id == record_id,
+                        ).values(service_lifecycle_epoch=(
+                            identity.service_lifecycle_epoch),
+                                 controller_incarnation=(
+                                     identity.controller_incarnation),
+                                 controller_owner_epoch=(
+                                     identity.controller_owner_epoch),
+                                 controller_pid=identity.controller_pid,
+                                 controller_ip=identity.controller_ip,
+                                 service_version=service_version,
+                                 resolved_at=now))
+                else:
+                    maximum = session.execute(
+                        sqlalchemy.select(
+                            sqlalchemy.func.max(_LEASES.c.material_generation)).
+                        where(_LEASES.c.service_name == identity.service_name,
+                              _LEASES.c.replica_id == replica_id)).scalar_one()
+                    generation = 1 if maximum is None else int(maximum) + 1
+                    values = dict(
+                        service_name=identity.service_name,
+                        service_hash=identity.service_hash,
+                        replica_id=replica_id,
+                        replica_record_id=record_id,
+                        service_lifecycle_epoch=(
+                            identity.service_lifecycle_epoch),
+                        controller_incarnation=identity.controller_incarnation,
+                        controller_owner_epoch=identity.controller_owner_epoch,
+                        controller_pid=identity.controller_pid,
+                        controller_ip=identity.controller_ip,
+                        service_version=service_version,
+                        material_sha256=digest,
+                        material_generation=generation,
+                        readiness_generation=0,
+                        ready=False,
+                        created_at=(now if existing is None else
+                                    existing['created_at']),
+                        resolved_at=now,
+                        observed_at=None,
+                        valid_until=None,
+                        revocation_generation=(0 if existing is None else int(
+                            existing['revocation_generation'])),
+                        revoked_at=None,
+                        revocation_reason=None,
+                        **payload,
+                    )
+                    insert = postgresql.insert(_LEASES).values(**values)
+                    session.execute(
+                        insert.on_conflict_do_update(
+                            index_elements=[
+                                _LEASES.c.service_name,
+                                _LEASES.c.service_hash,
+                                _LEASES.c.replica_id,
+                                _LEASES.c.replica_record_id,
+                            ],
+                            set_={
+                                key: value
+                                for key, value in values.items()
+                                if key not in {
+                                    'service_name', 'service_hash',
+                                    'replica_id', 'replica_record_id',
+                                    'created_at'
+                                }
+                            }))
+                retained = session.execute(
+                    sqlalchemy.select(
+                        _LEASES.c.service_hash,
+                        _LEASES.c.replica_record_id).where(
+                            _LEASES.c.service_name == identity.service_name,
+                            _LEASES.c.replica_id == replica_id).order_by(
+                                _LEASES.c.material_generation.desc(),
+                                _LEASES.c.created_at.desc())).all()
+                for stale_hash, stale_record_id in retained[
+                        LEASE_HISTORY_PER_REPLICA_LIMIT:]:
+                    session.execute(
+                        sqlalchemy.delete(_LEASES).where(
+                            _LEASES.c.service_name == identity.service_name,
+                            _LEASES.c.service_hash == stale_hash,
+                            _LEASES.c.replica_id == replica_id,
+                            _LEASES.c.replica_record_id == stale_record_id))
+                return RouteLeaseMaterialReceipt(material_generation=generation,
+                                                 material_sha256=digest,
+                                                 duplicate=duplicate)
+        except sqlalchemy.exc.SQLAlchemyError as error:
+            raise RouteProjectionUnavailable(
+                'PostgreSQL route material persistence failed.') from error
+
+    def list_probe_targets(
+        self,
+        identity: RoutePublisherIdentity,
+    ) -> list[RouteLeaseProbeTarget]:
+        """Read current unrevoked targets for provider-free HTTP probes."""
+        if not isinstance(identity, RoutePublisherIdentity):
+            raise RouteProjectionValidationError(
+                'Route publisher identity is invalid.')
+        try:
+            with orm.Session(self.engine) as session, session.begin():
+                owner = session.execute(self._owner_query(
+                    identity.service_name)).mappings().one_or_none()
+                if owner is None or not _owner_matches(identity, owner):
+                    raise RouteProjectionConflict(
+                        'Route probe worker no longer owns this service.')
+                rows = session.execute(
+                    sqlalchemy.select(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.service_lifecycle_epoch ==
+                        identity.service_lifecycle_epoch,
+                        _LEASES.c.controller_incarnation ==
+                        identity.controller_incarnation,
+                        _LEASES.c.controller_owner_epoch ==
+                        identity.controller_owner_epoch,
+                        _LEASES.c.controller_pid == identity.controller_pid,
+                        _LEASES.c.controller_ip == identity.controller_ip,
+                        _LEASES.c.route_allowed.is_(True),
+                        _LEASES.c.revoked_at.is_(None),
+                    ).order_by(_LEASES.c.replica_id,
+                               _LEASES.c.replica_record_id)).mappings().all()
+                targets: list[RouteLeaseProbeTarget] = []
+                for row in rows:
+                    record_id = str(row['replica_record_id'])
+                    if not _replica_row_matches(
+                            session, int(row['replica_id']), record_id,
+                            int(row['service_version']), identity.service_name):
+                        continue
+                    try:
+                        targets.append(
+                            _route_probe_target_from_row(identity, row))
+                    except RouteProjectionValidationError:
+                        # One poisoned row must not stall healthy siblings.
+                        continue
+                return targets
+        except sqlalchemy.exc.SQLAlchemyError as error:
+            raise RouteProjectionUnavailable(
+                'PostgreSQL route probe target read failed.') from error
+
+    def record_probe_result(
+        self,
+        target: RouteLeaseProbeTarget,
+        succeeded: bool,
+        *,
+        ttl_seconds: int,
+    ) -> RouteLeaseProbeReceipt:
+        """Apply an HTTP result only to its exact unrevoked generation."""
+        if not isinstance(target, RouteLeaseProbeTarget):
+            raise RouteProjectionValidationError(
+                'Route probe target is invalid.')
+        if type(succeeded) is not bool:  # pylint: disable=unidiomatic-typecheck
+            raise RouteProjectionValidationError(
+                'Probe result must be boolean.')
+        if (type(ttl_seconds) is not int or  # pylint: disable=unidiomatic-typecheck
+                not 1 <= ttl_seconds <= MAX_ROUTE_TTL_SECONDS):
+            raise RouteProjectionValidationError('Route lease TTL is invalid.')
+        record_id = uuid.UUID(target.replica_record_id)
+        identity = target.identity
+        try:
+            with orm.Session(self.engine) as session, session.begin():
+                owner = session.execute(
+                    self._owner_query(
+                        identity.service_name,
+                        for_update=True)).mappings().one_or_none()
+                if owner is None or not _owner_matches(identity, owner):
+                    return RouteLeaseProbeReceipt(accepted=False)
+                lease = session.execute(
+                    sqlalchemy.select(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.replica_id == target.replica_id,
+                        _LEASES.c.replica_record_id == record_id,
+                    ).with_for_update()).mappings().one_or_none()
+                if (lease is None or lease['revoked_at'] is not None or
+                        lease['route_allowed'] is not True or
+                        lease['material_sha256'] != target.material_sha256 or
+                        lease['material_generation']
+                        != target.material_generation or
+                        lease['revocation_generation']
+                        != target.revocation_generation or
+                        not _replica_row_matches(session, target.replica_id,
+                                                 target.replica_record_id,
+                                                 target.service_version,
+                                                 identity.service_name)):
+                    return RouteLeaseProbeReceipt(accepted=False)
+                now = session.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.func.clock_timestamp())).scalar_one()
+                valid_until = now + datetime.timedelta(seconds=ttl_seconds)
+                readiness_generation = int(lease['readiness_generation']) + 1
+                result = session.execute(
+                    sqlalchemy.update(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.replica_id == target.replica_id,
+                        _LEASES.c.replica_record_id == record_id,
+                        _LEASES.c.material_generation ==
+                        target.material_generation,
+                        _LEASES.c.revocation_generation ==
+                        target.revocation_generation,
+                        _LEASES.c.revoked_at.is_(None),
+                    ).values(
+                        readiness_generation=readiness_generation,
+                        ready=succeeded,
+                        observed_at=now,
+                        valid_until=valid_until,
+                    ))
+                if result.rowcount != 1:
+                    return RouteLeaseProbeReceipt(accepted=False)
+                return RouteLeaseProbeReceipt(
+                    accepted=True,
+                    readiness_generation=readiness_generation,
+                    valid_until=valid_until)
+        except sqlalchemy.exc.SQLAlchemyError as error:
+            raise RouteProjectionUnavailable(
+                'PostgreSQL route probe result persistence failed.') from error
+
+    def revoke_replica(self, identity: RoutePublisherIdentity, replica_id: int,
+                       replica_record_id: str, reason: str) -> int | None:
+        """Durably revoke one exact route generation under owner fencing."""
+        if not isinstance(identity, RoutePublisherIdentity):
+            raise RouteProjectionValidationError(
+                'Route publisher identity is invalid.')
+        _positive_int(replica_id, 'replica_id')
+        record_id = uuid.UUID(_canonical_record_id(replica_record_id))
+        _nonempty(reason, 'reason')
+        try:
+            with orm.Session(self.engine) as session, session.begin():
+                owner = session.execute(
+                    self._owner_query(
+                        identity.service_name,
+                        for_update=True)).mappings().one_or_none()
+                if owner is None or not _owner_matches(identity, owner):
+                    raise RouteProjectionConflict(
+                        'Route revoker no longer owns this service.')
+                lease = session.execute(
+                    sqlalchemy.select(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.replica_id == replica_id,
+                        _LEASES.c.replica_record_id == record_id,
+                    ).with_for_update()).mappings().one_or_none()
+                if lease is None:
+                    return None
+                if lease['revoked_at'] is not None:
+                    return int(lease['revocation_generation'])
+                now = session.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.func.clock_timestamp())).scalar_one()
+                generation = int(lease['revocation_generation']) + 1
+                session.execute(
+                    sqlalchemy.update(_LEASES).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.service_hash == identity.service_hash,
+                        _LEASES.c.replica_id == replica_id,
+                        _LEASES.c.replica_record_id == record_id,
+                    ).values(
+                        ready=False,
+                        observed_at=None,
+                        valid_until=None,
+                        revocation_generation=generation,
+                        revoked_at=now,
+                        revocation_reason=reason,
+                    ))
+                return generation
+        except sqlalchemy.exc.SQLAlchemyError as error:
+            raise RouteProjectionUnavailable(
+                'PostgreSQL route revocation failed.') from error
 
     def publish(
         self,
