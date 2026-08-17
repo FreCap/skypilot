@@ -98,6 +98,7 @@ class ExecutorTerminationEvidenceObserver:
         self._stop_event = threading.Event()
         self._watch_lock = threading.Lock()
         self._watch: Any | None = None
+        self._resource_version: str | None = None
         self._thread = threading.Thread(
             target=self._run,
             name='executor-termination-evidence-observer',
@@ -109,6 +110,48 @@ class ExecutorTerminationEvidenceObserver:
                 'Executor termination observer requires a Pod namespace.')
         self._thread.start()
 
+    def _record_pod(self, pod: Any, cluster_uid: str) -> None:
+        observation = observation_from_pod(pod,
+                                           kubernetes_cluster_uid=cluster_uid)
+        if observation is None:
+            return
+        recorded: tuple[str, ...] = ()
+        try:
+            recorded = request_postgres.record_executor_termination_evidence(
+                observation, observer_owner=self._controller_owner)
+        except request_postgres.ExecutorTerminationEvidenceRejected as e:
+            logger.debug(f'Rejected executor termination observation: {e}')
+            return
+        except request_postgres.ExecutorTerminationEvidenceConflict as e:
+            # A deleting Pod can emit another resource version after its first
+            # valid certificate was persisted. Preserve the immutable first
+            # certificate, surface the disagreement, and keep observing.
+            logger.error('Conflicting executor termination evidence was '
+                         f'rejected: {e}')
+            return
+        if recorded:
+            logger.info('Recorded executor termination evidence for '
+                        f'{len(recorded)} request execution(s) owned by Pod '
+                        f'{observation.pod_namespace}/{observation.pod_name}.')
+
+    def _list_and_anchor(self, core_api: Any, cluster_uid: str) -> None:
+        pod_list = core_api.list_namespaced_pod(namespace=self._namespace,
+                                                _request_timeout=10)
+        items = getattr(pod_list, 'items', None)
+        if not isinstance(items, list):
+            raise RuntimeError('Kubernetes Pod list has no item snapshot.')
+        for pod in items:
+            if self._stop_event.is_set():
+                return
+            self._record_pod(pod, cluster_uid)
+        resource_version = _required_text(
+            getattr(getattr(pod_list, 'metadata', None), 'resource_version',
+                    None))
+        if resource_version is None:
+            raise RuntimeError(
+                'Kubernetes Pod list has no collection resourceVersion.')
+        self._resource_version = resource_version
+
     def _observe_once(self) -> None:
         context = kubernetes.in_cluster_context_name()
         core_api = kubernetes.core_api(context)
@@ -117,6 +160,11 @@ class ExecutorTerminationEvidenceObserver:
             getattr(getattr(cluster, 'metadata', None), 'uid', None))
         if cluster_uid is None:
             raise RuntimeError('kube-system Namespace has no immutable UID.')
+        if self._resource_version is None:
+            self._list_and_anchor(core_api, cluster_uid)
+        if self._stop_event.is_set():
+            return
+        assert self._resource_version is not None
         watcher = kubernetes.watch(context)
         with self._watch_lock:
             if self._stop_event.is_set():
@@ -125,37 +173,31 @@ class ExecutorTerminationEvidenceObserver:
         try:
             stream = watcher.stream(core_api.list_namespaced_pod,
                                     namespace=self._namespace,
+                                    resource_version=self._resource_version,
                                     timeout_seconds=_WATCH_TIMEOUT_SECONDS)
             for event in stream:
                 if self._stop_event.is_set():
                     return
                 pod = event.get('object') if isinstance(event, dict) else None
-                observation = observation_from_pod(
-                    pod, kubernetes_cluster_uid=cluster_uid)
-                if observation is None:
-                    continue
-                recorded: tuple[str, ...] = ()
-                try:
-                    recorded = (
-                        request_postgres.record_executor_termination_evidence(
-                            observation, observer_owner=self._controller_owner))
-                except request_postgres.ExecutorTerminationEvidenceRejected as e:
-                    logger.debug('Rejected executor termination observation: '
-                                 f'{e}')
-                    continue
-                except request_postgres.ExecutorTerminationEvidenceConflict as e:
-                    # A deleting Pod can emit another resource version after
-                    # its first valid certificate was persisted. Preserve the
-                    # immutable first certificate, surface the disagreement,
-                    # and keep observing unrelated Pods on this same watch.
-                    logger.error('Conflicting executor termination evidence '
-                                 f'was rejected: {e}')
-                    continue
-                if recorded:
-                    logger.info('Recorded executor termination evidence for '
-                                f'{len(recorded)} request execution(s) owned '
-                                f'by Pod {observation.pod_namespace}/'
-                                f'{observation.pod_name}.')
+                resource_version = _required_text(
+                    getattr(getattr(pod, 'metadata', None), 'resource_version',
+                            None))
+                if resource_version is None:
+                    raise RuntimeError(
+                        'Kubernetes Pod watch event has no resourceVersion.')
+                # Advance only after the event is consumed. An unexpected
+                # persistence failure must replay this exact event.
+                self._record_pod(pod, cluster_uid)
+                self._resource_version = resource_version
+        except kubernetes.api_exception() as e:
+            if getattr(e, 'status', None) != 410:
+                raise
+            # Kubernetes no longer retains the requested history. A fresh
+            # list processes any still-deleting Pod before establishing the
+            # next exact watch boundary.
+            self._resource_version = None
+            logger.warning('Executor termination observer resourceVersion '
+                           'expired; relisting current Pods.')
         finally:
             with self._watch_lock:
                 if self._watch is watcher:
