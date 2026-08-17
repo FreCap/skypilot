@@ -6380,6 +6380,25 @@ def get_replica_infos(
     return [_replica_from_state(row[0], row[1]) for row in rows]
 
 
+def get_ready_replica_infos(
+        service_name: str) -> list['replica_managers.ReplicaInfo']:
+    """Gets ready replica infos without decoding retained terminal history.
+
+    The scalar status is transactionally maintained with the JSON state and is
+    used only as a conservative SQL prefilter.  Callers must still validate the
+    decoded ``ReplicaInfo`` before treating a row as ready capacity.
+    """
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(replicas_table.c.replica_state_version,
+                              replicas_table.c.replica_state).where(
+                                  replicas_table.c.service_name == service_name,
+                                  replicas_table.c.status ==
+                                  ReplicaStatus.READY.value)).fetchall()
+    return [_replica_from_state(row[0], row[1]) for row in rows]
+
+
 def get_scale_planning_state_fingerprint(service_name: str,
                                          require_version: bool = False
                                         ) -> str | None:

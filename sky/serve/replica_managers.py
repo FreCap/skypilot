@@ -10470,10 +10470,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._persist_replica(replica_id, info)
         self._register_wait_for_idle(info, replica_url=replica_url)
 
-    def _logical_retirement_state(self,
-                                  info: ReplicaInfo,
-                                  *,
-                                  require_victim_idle: bool = True) -> str:
+    def _logical_retirement_state(
+            self,
+            info: ReplicaInfo,
+            *,
+            require_victim_idle: bool = True,
+            replica_infos: list[ReplicaInfo] | None = None) -> str:
         """Return safe, wait, or abort for one off-route logical backend.
 
         ``require_victim_idle=False`` is reserved for an outdated backend
@@ -10481,6 +10483,12 @@ class SkyPilotReplicaManager(ReplicaManager):
         requires a fresh current-epoch/current-target replacement-capacity
         proof; only the retiring backend's otherwise-unprovable idle state is
         omitted from that bounded rolling-update completion check.
+
+        ``replica_infos`` lets a caller revalidate multiple retirements from
+        one coherent ready-capacity read.  The fallback preserves
+        single-retirement callers; batch paths must pass their shared snapshot
+        so retained replica history is not repeatedly decoded while the
+        controller is starting.
         """
         status = info.status_property
         version = status.logical_retirement_version
@@ -10524,7 +10532,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         # remainder can continue draining without fleet-wide churn. Check
         # route coverage before the victim's idle proof: idleness gates
         # destructive teardown, not re-advertising a still-running backend.
-        replica_infos = serve_state.get_replica_infos(self._service_name)
+        if replica_infos is None:
+            replica_infos = serve_state.get_replica_infos(self._service_name)
         excluded_ids = {info.replica_id}
         ready_capacity = self._logical_ready_capacity(
             replica_infos,
@@ -11187,15 +11196,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._persist_replica(info.replica_id, info)
         self._wait_for_idle_trackers.pop(info.replica_id, None)
 
-    def _finish_logical_retirement(self,
-                                   replica_id: int,
-                                   info: ReplicaInfo,
-                                   *,
-                                   require_victim_idle: bool = True) -> None:
+    def _finish_logical_retirement(
+            self,
+            replica_id: int,
+            info: ReplicaInfo,
+            *,
+            require_victim_idle: bool = True,
+            replica_infos: list[ReplicaInfo] | None = None) -> None:
         """Recheck and schedule one fenced logical retirement atomically."""
         with self._logical_state_lock:
             retirement_state = self._logical_retirement_state(
-                info, require_victim_idle=require_victim_idle)
+                info,
+                require_victim_idle=require_victim_idle,
+                replica_infos=replica_infos)
             if retirement_state == 'wait':
                 return
             if retirement_state == 'abort':
@@ -11212,7 +11225,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             # The state lock prevents a later sync from invalidating the
             # confirmation between this final proof and shutdown scheduling.
             if self._logical_retirement_state(
-                    info, require_victim_idle=require_victim_idle) != 'safe':
+                    info,
+                    require_victim_idle=require_victim_idle,
+                    replica_infos=replica_infos) != 'safe':
                 return
             # _terminate_replica atomically clears the durable idle-wait bit
             # with its SCHEDULED down state before installing the worker. Keep
@@ -11294,6 +11309,17 @@ class SkyPilotReplicaManager(ReplicaManager):
             if queued_logical:
                 queued_logical_ids.add(replica_id)
             tracked_infos[replica_id] = info
+
+        # Revalidate every logical retirement in this pass from one coherent
+        # ready-capacity snapshot.  A service can retain thousands of terminal
+        # history rows; decoding that history once per retiring replica starves
+        # the controller during restart even though terminal rows can never
+        # satisfy a replacement-capacity proof.
+        logical_retirement_infos: list[ReplicaInfo] | None = None
+        if any(info.status_property.logical_retirement_version is not None
+               for info in tracked_infos.values()):
+            logical_retirement_infos = serve_state.get_ready_replica_infos(
+                self._service_name)
 
         cluster_names = list(
             dict.fromkeys(info.cluster_name for info in tracked_infos.values()))
@@ -11416,7 +11442,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # victim again.
                     continue
                 with self._logical_state_lock:
-                    retirement_state = self._logical_retirement_state(info)
+                    retirement_state = self._logical_retirement_state(
+                        info, replica_infos=logical_retirement_infos)
                     if retirement_state == 'abort':
                         self._abort_logical_retirement(
                             info, 'the current target or controller fence '
@@ -11432,7 +11459,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if outdated_backend:
                         with self._logical_state_lock:
                             bounded_state = self._logical_retirement_state(
-                                info, require_victim_idle=False)
+                                info,
+                                require_victim_idle=False,
+                                replica_infos=logical_retirement_infos)
                             if bounded_state == 'abort':
                                 self._abort_logical_retirement(
                                     info, 'the bounded rolling-update '
@@ -11447,7 +11476,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'the bounded rolling-update retirement.')
                         self._drain_proof_stats.record_bounded_completion()
                         self._finish_logical_retirement(
-                            replica_id, info, require_victim_idle=False)
+                            replica_id,
+                            info,
+                            require_victim_idle=False,
+                            replica_infos=logical_retirement_infos)
                         continue
                     with self._logical_state_lock:
                         self._abort_logical_retirement(
@@ -11460,7 +11492,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                     # resource budget admits this already-scheduled worker.
                     # Admission below performs the final strict state proof.
                     continue
-                self._finish_logical_retirement(replica_id, info)
+                self._finish_logical_retirement(
+                    replica_id, info, replica_infos=logical_retirement_infos)
                 continue
             if exact_paid_retirement:
                 assert retirement is not None

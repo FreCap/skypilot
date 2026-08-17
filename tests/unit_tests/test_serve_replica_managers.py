@@ -9535,7 +9535,7 @@ class TestLogicalCapacityPlanning:
                 return_value={retiring.replica_id: retiring}), \
              mock.patch.object(
                  replica_managers.serve_state,
-                 'get_replica_infos',
+                 'get_ready_replica_infos',
                  return_value=[retiring, survivor]), \
              mock.patch.object(
                  replica_managers.global_user_state,
@@ -11634,16 +11634,18 @@ class TestLogicalCapacityPlanning:
         mgr._uses_logical_replicas = True
         mgr._is_pool = False
         retiring = self._ready_backend(1, 4)
+        retiring_peer = self._ready_backend(3, 4)
         survivor = self._ready_backend(2, 8)
-        status = retiring.status_property
-        status.is_scale_down = True
-        status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
-        status.wait_for_idle_before_termination = True
-        status.logical_retirement_version = 1
-        status.logical_retirement_controller_epoch = 'test-controller-epoch'
-        status.logical_retirement_generation = 4
-        status.logical_retirement_target_capacity = 8
-        status.logical_retirement_confirmed_generation = None
+        for info in (retiring, retiring_peer):
+            status = info.status_property
+            status.is_scale_down = True
+            status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+            status.wait_for_idle_before_termination = True
+            status.logical_retirement_version = 1
+            status.logical_retirement_controller_epoch = 'test-controller-epoch'
+            status.logical_retirement_generation = 4
+            status.logical_retirement_target_capacity = 8
+            status.logical_retirement_confirmed_generation = None
         mgr._logical_reconcile_snapshot = (
             replica_managers.LogicalReconcileSnapshot(
                 version=1,
@@ -11657,35 +11659,55 @@ class TestLogicalCapacityPlanning:
         mgr._logical_target = (1, 5, 8)
         mgr._wait_for_idle_trackers = {
             1: (mock.Mock(return_value=True),
-                replica_managers.time.monotonic() + 60)
+                replica_managers.time.monotonic() + 60),
+            3: (mock.Mock(return_value=True),
+                replica_managers.time.monotonic() + 60),
         }
         persisted = []
-        mgr._persist_replica = mock.Mock(
-            side_effect=lambda _rid, info: persisted.append(
-                (info.status_property.logical_retirement_confirmed_generation,
-                 info.status_property.wait_for_idle_before_termination)))
+
+        def _record_persisted(replica_id, info):
+            status = info.status_property
+            persisted.append(
+                (replica_id, status.logical_retirement_confirmed_generation,
+                 status.wait_for_idle_before_termination))
+
+        mgr._persist_replica = mock.Mock(side_effect=_record_persisted)
         mgr._terminate_replica = mock.Mock()
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos_from_ids',
-                               return_value={1: retiring}), \
+                               return_value={
+                                   1: retiring,
+                                   3: retiring_peer,
+                               }), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos',
-                               return_value=[retiring, survivor]), \
+                               'get_ready_replica_infos',
+                               return_value=[retiring, retiring_peer,
+                                             survivor]) as scan, \
              mock.patch.object(
                  replica_managers.global_user_state,
                  'get_cluster_status_fields',
-                 return_value={'svc-1': ('UP', 1)}):
+                 return_value={
+                     'svc-1': ('UP', 1),
+                     'svc-3': ('UP', 1),
+                 }):
             mgr._refresh_wait_for_idle()
 
-        assert persisted[-1:] == [(5, True)]
-        mgr._terminate_replica.assert_called_once_with(
-            1,
-            sync_down_logs=False,
-            replica_drain_delay_seconds=0,
-            is_scale_down=True,
-            in_flight_drain_cap_seconds=0)
-        assert 1 in mgr._wait_for_idle_trackers
+        scan.assert_called_once_with('svc')
+        assert persisted[-2:] == [(1, 5, True), (3, 5, True)]
+        assert mgr._terminate_replica.call_args_list == [
+            mock.call(1,
+                      sync_down_logs=False,
+                      replica_drain_delay_seconds=0,
+                      is_scale_down=True,
+                      in_flight_drain_cap_seconds=0),
+            mock.call(3,
+                      sync_down_logs=False,
+                      replica_drain_delay_seconds=0,
+                      is_scale_down=True,
+                      in_flight_drain_cap_seconds=0),
+        ]
+        assert {1, 3}.issubset(mgr._wait_for_idle_trackers)
 
     @pytest.mark.parametrize('retiring_version,should_terminate', [(9, True),
                                                                    (10, False)])
@@ -11705,7 +11727,7 @@ class TestLogicalCapacityPlanning:
                                    'get_replica_infos_from_ids',
                                    return_value={9: retiring}), \
                  mock.patch.object(replica_managers.serve_state,
-                                   'get_replica_infos',
+                                   'get_ready_replica_infos',
                                    return_value=[retiring, survivor]), \
                  mock.patch.object(
                      replica_managers.global_user_state,
@@ -11791,7 +11813,7 @@ class TestLogicalCapacityPlanning:
                                'get_replica_infos_from_ids',
                                return_value={9: retiring}), \
              mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos',
+                               'get_ready_replica_infos',
                                return_value=[retiring, survivor]), \
              mock.patch.object(
                  replica_managers.global_user_state,
@@ -11823,7 +11845,7 @@ class TestLogicalCapacityPlanning:
                                    'get_replica_infos_from_ids',
                                    return_value={9: retiring}), \
                  mock.patch.object(replica_managers.serve_state,
-                                   'get_replica_infos',
+                                   'get_ready_replica_infos',
                                    return_value=[retiring, survivor]), \
                  mock.patch.object(
                      replica_managers.global_user_state,
@@ -11944,6 +11966,9 @@ class TestLogicalCapacityPlanning:
 
         with mock.patch.object(replica_managers.serve_state,
                                'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_ready_replica_infos',
                                return_value=[retiring, survivor]), \
              mock.patch.object(
                  replica_managers.serve_state,
@@ -12365,7 +12390,7 @@ class TestLogicalCapacityPlanning:
                                    'get_replica_infos_from_ids',
                                    return_value={1: retiring}), \
                  mock.patch.object(replica_managers.serve_state,
-                                   'get_replica_infos',
+                                   'get_ready_replica_infos',
                                    return_value=[retiring, survivor]), \
                  mock.patch.object(
                      replica_managers.global_user_state,

@@ -175,6 +175,16 @@ resource "kubernetes_role_v1" "pool" {
     verbs      = ["list"]
   }
 
+  # Server-owned worker projection and reserved-fill provider attestation verify
+  # the exact pre-created workload identity before launch.  SkyPilot still does
+  # not enumerate or mutate ServiceAccounts.
+  rule {
+    api_groups     = [""]
+    resources      = ["serviceaccounts"]
+    resource_names = [var.service_account_name]
+    verbs          = ["get"]
+  }
+
   # SkyPilot checks this exact queue before Pod creation. It does not need to
   # enumerate or mutate queues, and workload Pods must not receive this grant.
   dynamic "rule" {
