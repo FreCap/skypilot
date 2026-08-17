@@ -643,6 +643,16 @@ idempotency key makes repeated broker rounds one intent. Its states are:
 - `TERMINAL`: the grant expired, was superseded, or failed validation before
   materialization.
 
+The same revision adds a per-service `DIRECT_REPLICA` /
+`DURABLE_INTENT` actuation mode and monotonic epoch, plus a capability tuple
+bound to the current controller incarnation and protocol 1. New binaries
+advertise capability without changing the mode. Promotion is an explicit
+PostgreSQL transaction that requires the current generic non-pool binding,
+current protocol-2 reserved-fill authority, no direct admission in flight, and
+the exact controller capability. After promotion, a missing or unavailable
+intent repository fails closed; it never falls back to direct replica
+materialization. This is the single transition boundary removed by #1506.
+
 The per-pool executor leases one intent with PostgreSQL fencing, then acquires
 the process provider phase and physical-cluster identity fence before it may
 materialize a replica row. If either lane is busy, it returns the intent to
@@ -653,11 +663,13 @@ that can expire; a crash after it leaves an exact association that existing
 recovery can reconcile. Executors for other physical pools proceed
 independently.
 
-An unexpired `GRANTED` or `ACTUATING` intent is pending zero-cost capacity in
-the paid-residual transaction, bounded by the broker allocation TTL. `COMMITTED`
-is counted through the replica row, never both representations. This preserves
-no-paid-spill without allowing a dead intent to suppress paid capacity forever.
-The dashboard exposes intent counts separately from queued replicas, provider
+An unexpired `GRANTED`, `ACTUATING`, or `RETRYABLE` intent is pending zero-cost
+capacity in the paid-residual transaction, bounded by the broker allocation
+TTL. `RETRYABLE` is still an accepted grant and therefore cannot open a paid
+deficit while waiting for its next lane lease. `COMMITTED` is counted through
+the replica row, never both representations. This preserves no-paid-spill
+without allowing a dead intent to suppress paid capacity forever. The
+dashboard exposes intent counts separately from queued replicas, provider
 setup, and cleanup uncertainty.
 
 ### Route projection

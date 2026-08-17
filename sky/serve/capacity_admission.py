@@ -28,6 +28,7 @@ from sky.serve import route_projection
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
+from sky.serve import zero_cost_actuation_schema
 from sky.utils.db import db_utils
 
 PROTOCOL_VERSION = 1
@@ -43,6 +44,9 @@ _DEMAND_REPORTS = demand_state_schema.serve_lb_demand_reports_table
 _ROUTE_HEADS = route_projection_schema.serve_route_heads_table
 _ROUTE_SNAPSHOTS = route_projection_schema.serve_route_snapshots_table
 _REPLICAS = serve_state_schema.replicas_table
+_ZERO_COST_INTENTS = (
+    zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+_PENDING_ZERO_COST_INTENT_STATES = ('GRANTED', 'ACTUATING', 'RETRYABLE')
 _TERMINAL_REPLICA_STATUSES = frozenset({
     'SHUTTING_DOWN',
     'FAILED',
@@ -167,6 +171,8 @@ class CapacityPlanInput:
         self,
         *,
         existing_zero_cost_capacity_by_accelerator: Mapping[str, int],
+        pending_zero_cost_capacity_by_accelerator: Mapping[str, int] |
+        None = None,
         existing_paid_capacity_by_accelerator: Mapping[str, int],
         paid_residual_by_accelerator: Mapping[str, int],
     ) -> dict[str, Any]:
@@ -188,13 +194,19 @@ class CapacityPlanInput:
         existing_zero_cost = _canonical_counts(
             existing_zero_cost_capacity_by_accelerator,
             'existing_zero_cost_capacity_by_accelerator')
+        pending_zero_cost = _canonical_counts(
+            ({
+                card: 0 for card in capacity_target
+            } if pending_zero_cost_capacity_by_accelerator is None else
+             pending_zero_cost_capacity_by_accelerator),
+            'pending_zero_cost_capacity_by_accelerator')
         existing_paid = _canonical_counts(
             existing_paid_capacity_by_accelerator,
             'existing_paid_capacity_by_accelerator')
         paid = _canonical_counts(paid_residual_by_accelerator,
                                  'paid_residual_by_accelerator')
         cards = (set(capacity_target) | set(existing_zero_cost) |
-                 set(existing_paid) | set(paid))
+                 set(pending_zero_cost) | set(existing_paid) | set(paid))
         if AGGREGATE_ACCELERATOR in cards and len(cards) != 1:
             raise ValueError('A capacity plan cannot mix aggregate and '
                              'exact-card accounting.')
@@ -202,6 +214,7 @@ class CapacityPlanInput:
             card: max(
                 0,
                 capacity_target.get(card, 0) - existing_zero_cost.get(card, 0) -
+                pending_zero_cost.get(card, 0) -
                 existing_paid.get(card, 0)) for card in cards
         }
         expected_paid = {
@@ -231,6 +244,7 @@ class CapacityPlanInput:
             'normalized_demand': normalized_demand,
             'capacity_target_by_accelerator': capacity_target,
             'existing_zero_cost_capacity_by_accelerator': existing_zero_cost,
+            'pending_zero_cost_capacity_by_accelerator': pending_zero_cost,
             'existing_paid_capacity_by_accelerator': existing_paid,
             'paid_residual_by_accelerator': paid,
         }
@@ -372,6 +386,62 @@ def _locked_capacity_inventory(
     return zero_cost, paid
 
 
+def _locked_pending_zero_cost_inventory(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    service_hash: str,
+    service_version: int,
+    accounting_cards: set[str],
+    now: datetime.datetime,
+) -> dict[str, int]:
+    """Project unmaterialized zero-cost grants under the service mutex."""
+    aggregate = accounting_cards == {AGGREGATE_ACCELERATOR}
+    if not accounting_cards or (AGGREGATE_ACCELERATOR in accounting_cards and
+                                not aggregate):
+        raise CapacityAdmissionConflict(
+            'Pending zero-cost accounting classes are invalid.')
+    rows = connection.execute(
+        sqlalchemy.select(_ZERO_COST_INTENTS).where(
+            _ZERO_COST_INTENTS.c.service_name == service_name,
+            _ZERO_COST_INTENTS.c.service_hash == service_hash,
+            _ZERO_COST_INTENTS.c.service_version == service_version).order_by(
+                _ZERO_COST_INTENTS.c.intent_idempotency_key).with_for_update()
+    ).mappings().all()
+    expired_keys = [
+        row['intent_idempotency_key']
+        for row in rows
+        if row['state'] in _PENDING_ZERO_COST_INTENT_STATES and
+        row['valid_until'] <= now
+    ]
+    if expired_keys:
+        connection.execute(
+            sqlalchemy.update(_ZERO_COST_INTENTS).where(
+                _ZERO_COST_INTENTS.c.intent_idempotency_key.in_(expired_keys),
+                _ZERO_COST_INTENTS.c.state.in_(
+                    _PENDING_ZERO_COST_INTENT_STATES)).values(
+                        state='TERMINAL',
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        last_error='grant_expired',
+                        updated_at=now,
+                        terminal_at=now))
+    result = {card: 0 for card in accounting_cards}
+    for row in rows:
+        if (row['state'] not in _PENDING_ZERO_COST_INTENT_STATES or
+                row['valid_until'] <= now):
+            continue
+        card = (AGGREGATE_ACCELERATOR
+                if aggregate else str(row['accelerator']).casefold())
+        planned_capacity = row['planned_capacity']
+        if (card not in result or not isinstance(planned_capacity, int) or
+                isinstance(planned_capacity, bool) or planned_capacity < 1):
+            raise CapacityAdmissionConflict(
+                'Pending zero-cost intent accounting is malformed.')
+        result[card] += planned_capacity
+    return result
+
+
 def _claim_units_for_plan(
     connection: sqlalchemy.engine.Connection,
     *,
@@ -414,14 +484,16 @@ def _subtract_counts(total: Mapping[str, int],
 def _paid_residual(
     demand: Mapping[str, int],
     existing_zero_cost: Mapping[str, int],
+    pending_zero_cost: Mapping[str, int],
     existing_paid: Mapping[str, int],
 ) -> dict[str, int]:
-    cards = set(demand) | set(existing_zero_cost) | set(existing_paid)
+    cards = (set(demand) | set(existing_zero_cost) | set(pending_zero_cost) |
+             set(existing_paid))
     return {
         card: residual for card in sorted(cards) if (residual := max(
             0,
             demand.get(card, 0) - existing_zero_cost.get(card, 0) -
-            existing_paid.get(card, 0))) > 0
+            pending_zero_cost.get(card, 0) - existing_paid.get(card, 0))) > 0
     }
 
 
@@ -595,6 +667,16 @@ class CapacityAdmissionRepository:
                 service_name=plan.service_name,
                 service_version=plan.service_version,
                 accounting_cards=accounting_cards)
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            pending_zero_cost = _locked_pending_zero_cost_inventory(
+                connection,
+                service_name=plan.service_name,
+                service_hash=plan.service_hash,
+                service_version=plan.service_version,
+                accounting_cards=accounting_cards,
+                now=now)
             head = connection.execute(
                 sqlalchemy.select(_HEADS).where(
                     _HEADS.c.service_name == plan.service_name).with_for_update(
@@ -625,9 +707,12 @@ class CapacityAdmissionRepository:
                                                        prior_claim_units)
                 duplicate_payload = plan.payload(
                     existing_zero_cost_capacity_by_accelerator=full_zero_cost,
+                    pending_zero_cost_capacity_by_accelerator=(
+                        pending_zero_cost),
                     existing_paid_capacity_by_accelerator=prior_paid_baseline,
                     paid_residual_by_accelerator=_paid_residual(
-                        capacity_target, full_zero_cost, prior_paid_baseline))
+                        capacity_target, full_zero_cost, pending_zero_cost,
+                        prior_paid_baseline))
                 duplicate_digest = _sha256(duplicate_payload)
             duplicate = bool(previous is not None and
                              duplicate_digest == previous['content_sha256'])
@@ -639,9 +724,12 @@ class CapacityAdmissionRepository:
             else:
                 payload = plan.payload(
                     existing_zero_cost_capacity_by_accelerator=full_zero_cost,
+                    pending_zero_cost_capacity_by_accelerator=(
+                        pending_zero_cost),
                     existing_paid_capacity_by_accelerator=full_paid,
                     paid_residual_by_accelerator=_paid_residual(
-                        capacity_target, full_zero_cost, full_paid))
+                        capacity_target, full_zero_cost, pending_zero_cost,
+                        full_paid))
                 digest = _sha256(payload)
                 maximum = connection.execute(
                     sqlalchemy.select(sqlalchemy.func.max(
@@ -861,6 +949,15 @@ def validate_paid_claim_in_connection(
         baseline_zero = _canonical_counts(
             payload.get('existing_zero_cost_capacity_by_accelerator', {}),
             'existing_zero_cost_capacity_by_accelerator')
+        raw_pending_zero = payload.get(
+            'pending_zero_cost_capacity_by_accelerator')
+        if raw_pending_zero is None:
+            # Serve050 plans predate grant-before-row admission. They carry no
+            # pending intents, so their additive Serve052 interpretation is an
+            # explicit all-zero map over the existing accounting classes.
+            raw_pending_zero = {card: 0 for card in capacity_target}
+        baseline_pending_zero = _canonical_counts(
+            raw_pending_zero, 'pending_zero_cost_capacity_by_accelerator')
         baseline_paid = _canonical_counts(
             payload.get('existing_paid_capacity_by_accelerator', {}),
             'existing_paid_capacity_by_accelerator')
@@ -872,6 +969,7 @@ def validate_paid_claim_in_connection(
             'Capacity plan accounting is malformed.') from error
     accounting_cards = set(capacity_target)
     if (not accounting_cards or set(baseline_zero) != accounting_cards or
+            set(baseline_pending_zero) != accounting_cards or
             set(baseline_paid) != accounting_cards or
             set(paid) - accounting_cards):
         raise CapacityAdmissionConflict(
@@ -887,11 +985,20 @@ def validate_paid_claim_in_connection(
         service_name=service['name'],
         service_version=int(service['current_version']),
         accounting_cards=accounting_cards)
+    current_pending_zero = _locked_pending_zero_cost_inventory(
+        connection,
+        service_name=service['name'],
+        service_hash=service['hash'],
+        service_version=int(service['current_version']),
+        accounting_cards=accounting_cards,
+        now=now)
     expected_paid = {
         card: baseline_paid.get(card, 0) + claim_units_by_card.get(card, 0)
         for card in accounting_cards
     }
-    if current_zero != baseline_zero or current_paid != expected_paid:
+    if (current_zero != baseline_zero or
+            current_pending_zero != baseline_pending_zero or
+            current_paid != expected_paid):
         raise CapacityAdmissionConflict(
             'Committed capacity changed after the ordered plan snapshot.')
     authorized = paid.get(accelerator, 0)

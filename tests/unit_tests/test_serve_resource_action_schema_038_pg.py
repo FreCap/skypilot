@@ -216,11 +216,11 @@ def test_serve038_lineage_and_dialect_target() -> None:
                                                 migration_utils.SERVE_DB_NAME)
     scripts = alembic_script.ScriptDirectory.from_config(config)
     revision = scripts.get_revision('038')
-    assert scripts.get_heads() == ['051']
+    assert scripts.get_heads() == ['052']
     assert Path(
         revision.path).name == ('038_serve_resource_action_authority.py')
     assert revision.down_revision == '037'
-    assert migration_utils.SERVE_VERSION == '051'
+    assert migration_utils.SERVE_VERSION == '052'
     assert migration_utils.serve_target_version(engine) == '037'
 
 

@@ -51,6 +51,11 @@ _POST_REVISION_001_COLUMNS = {
         'demand_authority_capable',
         'demand_authority_controller_incarnation',
         'demand_authority_protocol_version',
+        'reserved_fill_actuation_mode',
+        'reserved_fill_actuation_epoch',
+        'reserved_fill_actuation_capable',
+        'reserved_fill_actuation_controller_incarnation',
+        'reserved_fill_actuation_protocol_version',
     }),
     'replicas': frozenset({'ordinary_launch_association_id'}),
     'paid_capacity_claims': frozenset({
@@ -72,6 +77,10 @@ _POST_REVISION_001_CONSTRAINTS = {
         'serve050_demand_source_epoch_ck',
         'serve050_demand_capability_shape_ck',
         'serve050_durable_demand_capability_ck',
+        'serve052_fill_actuation_mode_ck',
+        'serve052_fill_actuation_epoch_ck',
+        'serve052_fill_actuation_capability_shape_ck',
+        'serve052_durable_fill_actuation_capability_ck',
     }),
     'paid_capacity_claims': frozenset({
         'serve050_paid_claim_plan_complete_ck',

@@ -1162,15 +1162,22 @@ class DeferredFillIntent:
 
 @dataclasses.dataclass(frozen=True)
 class AcceptedFillIntent:
-    """Durable replica row keyed to the exact intent that created it."""
+    """Durable acceptance keyed to one exact planned intent.
+
+    During the Serve052 transition, direct admission returns the replica ID
+    while grant-before-row admission returns ``None`` until the pool executor
+    materializes the row. Both are durable acceptance receipts and force a
+    fresh capacity replan before paid residual is published.
+    """
 
     intent_idempotency_key: str
-    replica_id: int
+    replica_id: int | None
 
     def __post_init__(self) -> None:
         _require_sha256(self.intent_idempotency_key,
                         'Accepted intent idempotency key')
-        _require_int(self.replica_id, 'Accepted replica ID', minimum=1)
+        if self.replica_id is not None:
+            _require_int(self.replica_id, 'Accepted replica ID', minimum=1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1187,7 +1194,11 @@ class FillCommitResult:
                 for item in self.accepted):
             raise ValueError('Accepted entries must be an immutable tuple of '
                              'AcceptedFillIntent values.')
-        replica_ids = [item.replica_id for item in self.accepted]
+        replica_ids = [
+            item.replica_id
+            for item in self.accepted
+            if item.replica_id is not None
+        ]
         if len(set(replica_ids)) != len(replica_ids):
             raise ValueError('Accepted replica IDs must be unique.')
         accepted_keys = [item.intent_idempotency_key for item in self.accepted]
@@ -1232,8 +1243,8 @@ class FillCommitResult:
                              'intent exactly once by idempotency key.')
 
     def accepted_intents_for_plan(
-            self, plan: FillPlan) -> tuple[tuple[FillIntent, int], ...]:
-        """Return exact accepted intent/replica pairs in plan order."""
+            self, plan: FillPlan) -> tuple[tuple[FillIntent, int | None], ...]:
+        """Return exact accepted intent receipts in plan order."""
         self.validate_for_plan(plan)
         replica_by_intent = {
             item.intent_idempotency_key: item.replica_id
