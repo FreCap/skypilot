@@ -23,9 +23,11 @@ paths pending the documented test-service promotion gates.
 
 The exact post-#1503 P2b2 review scope was 42 files with 4,298 insertions and
 241 deletions relative to `improvements`. The blocked draft removals #1506 and
-#1510 remain unmerged until the promotion and observation gates pass.
+#1510 are now restacked as API014/Serve051 and API015/Serve052 on the G1S
+lineage. They remain unmerged until the promotion, observation, and
+adversarial-review gates pass.
 
-Last updated: 2026-08-16
+Last updated: 2026-08-17
 
 Canonical owner: this file for request telemetry ingestion, paid-capacity
 admission, and the user-visible demand/capacity contract. Durable non-pool
