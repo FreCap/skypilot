@@ -280,7 +280,7 @@ services_table = sqlalchemy.Table(
         'route_projection_protocol_version IS NULL) OR '
         '(route_projection_capable AND '
         'route_projection_controller_incarnation IS NOT NULL AND '
-        'route_projection_protocol_version = 1))',
+        'route_projection_protocol_version IN (1, 2)))',
         name='serve049_route_capability_shape_ck'),
     sqlalchemy.CheckConstraint(
         "route_source_mode <> 'DURABLE_PROJECTED' OR "

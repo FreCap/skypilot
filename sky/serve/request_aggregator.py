@@ -94,6 +94,10 @@ class RequestTimestamp(RequestsAggregator):
     """
 
     def __init__(self) -> None:
+        # A fresh process cannot prove that the preceding autoscaling window
+        # was empty. This durable-report watermark becomes authoritative only
+        # after the recorder has observed one complete window itself.
+        self._demand_window_coverage_started_at = time.time()
         # Bounded: the batch is retained across a failed controller sync (so
         # load signal is not dropped), but a persistent failure must not grow it
         # without limit -- maxlen keeps only the most recent samples (ample for
@@ -363,6 +367,7 @@ class RequestTimestamp(RequestsAggregator):
         return {
             'bucket_seconds': bucket_seconds,
             'window_seconds': window_seconds,
+            'coverage_started_at': self._demand_window_coverage_started_at,
             'buckets': [{
                 'bucket_start': bucket,
                 'request_count': count,

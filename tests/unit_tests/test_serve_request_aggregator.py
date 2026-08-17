@@ -145,6 +145,7 @@ def test_durable_window_survives_controller_drain_and_expires(monkeypatch):
     assert snapshot == {
         'bucket_seconds': constants.LB_DEMAND_WINDOW_BUCKET_SECONDS,
         'window_seconds': constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
+        'coverage_started_at': 120.0,
         'buckets': [{
             'bucket_start': 120,
             'request_count': 1,
@@ -159,4 +160,6 @@ def test_durable_window_survives_controller_drain_and_expires(monkeypatch):
     }
 
     now[0] += constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS + 1
-    assert aggregator.demand_window_snapshot()['buckets'] == []
+    expired = aggregator.demand_window_snapshot()
+    assert expired['buckets'] == []
+    assert expired['coverage_started_at'] == 120.0

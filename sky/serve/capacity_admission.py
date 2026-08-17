@@ -500,13 +500,23 @@ class CapacityAdmissionRepository:
             'sequence': int(row['sequence']),
             'payload_sha256': row['payload_sha256'],
         } for row in reports]
+        zero_plan = bool(
+            plan.capacity_target_by_accelerator and
+            plan.normalized_demand.get('fresh_aggregate_zero') is True and
+            all(count == 0
+                for count in plan.capacity_target_by_accelerator.values()))
+        reports_complete = all(
+            row['complete'] is True and row['protocol_version'] == 2
+            for row in reports)
+        reports_allow_zero = (
+            zero_plan and service['route_projection_protocol_version'] == 2 and
+            demand_state.reports_prove_fresh_aggregate_zero(reports))
         if (watermark != _canonical_watermark(plan.receipt_watermark) or
-                any(row['complete'] is not True or row['protocol_version'] != 2
-                    for row in reports) or
+                not (reports_complete or reports_allow_zero) or
                 not demand_state.reports_match_current_lb_authority(
                     reports, service)):
             raise CapacityAdmissionConflict(
-                'Fresh complete demand receipts changed before publication.')
+                'Fresh demand receipts changed before plan publication.')
         route_head = connection.execute(
             sqlalchemy.select(_ROUTE_HEADS).where(
                 _ROUTE_HEADS.c.service_name ==
@@ -526,13 +536,14 @@ class CapacityAdmissionRepository:
                 route['controller_incarnation']
                 != service['controller_incarnation'] or
                 route['protocol_version'] != PROTOCOL_VERSION or
+                route['producer_protocol_version']
+                != service['route_projection_protocol_version'] or
                 service['route_source_mode'] != 'DURABLE_PROJECTED' or
                 service['route_source_epoch'] != plan.route_source_epoch or
                 service['route_projection_capable'] is not True or
                 service['route_projection_controller_incarnation']
                 != service['controller_incarnation'] or
-                service['route_projection_protocol_version']
-                != PROTOCOL_VERSION):
+                service['route_projection_protocol_version'] not in (1, 2)):
             raise CapacityAdmissionConflict(
                 'Fresh projected route changed before plan publication.')
         try:
@@ -783,6 +794,8 @@ def validate_paid_claim_in_connection(
             route['service_version'] != service['current_version'] or
             route['controller_incarnation'] != service['controller_incarnation']
             or route['protocol_version'] != PROTOCOL_VERSION or
+            route['producer_protocol_version']
+            != service.get('route_projection_protocol_version') or
             service.get('demand_source_mode')
             != DemandSourceMode.DURABLE_FEED.value or
             service.get('demand_source_epoch') != claim_source_epoch or
@@ -795,8 +808,7 @@ def validate_paid_claim_in_connection(
             service.get('route_projection_capable') is not True or
             service.get('route_projection_controller_incarnation')
             != service.get('controller_incarnation') or
-            service.get('route_projection_protocol_version')
-            != PROTOCOL_VERSION):
+            service.get('route_projection_protocol_version') not in (1, 2)):
         raise CapacityAdmissionConflict(
             'Paid claim lost its current fresh capacity-plan authority.')
     try:
@@ -932,7 +944,7 @@ def promote_service_in_connection(
             service['route_projection_capable'] is not True or
             service['route_projection_controller_incarnation']
             != controller_incarnation or
-            service['route_projection_protocol_version'] != PROTOCOL_VERSION or
+            service['route_projection_protocol_version'] not in (1, 2) or
             service_status
             in serve_statuses.ServiceStatus.replica_launch_blocking_statuses()):
         raise CapacityAdmissionConflict(
@@ -993,6 +1005,8 @@ def promote_service_in_connection(
             route['controller_incarnation'] != controller_incarnation or
             route['service_version'] != service['current_version'] or
             route['protocol_version'] != PROTOCOL_VERSION or
+            route['producer_protocol_version']
+            != service['route_projection_protocol_version'] or
             generation is None or not reports or
             any(row['complete'] is not True or row['protocol_version'] != 2
                 for row in reports) or

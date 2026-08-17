@@ -43,6 +43,7 @@ from sky.serve import capacity_admission
 from sky.serve import constants as serve_constants
 from sky.serve import controller_history
 from sky.serve import demand_state
+from sky.serve import incremental_route_worker
 from sky.serve import kubernetes_identity
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
@@ -50,6 +51,7 @@ from sky.serve import lb_ha_observability as lb_ha_obs
 from sky.serve import lb_k8s
 from sky.serve import ordinary_launch_binding
 from sky.serve import paid_capacity
+from sky.serve import paid_retirement
 from sky.serve import placement_policy
 from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
@@ -650,10 +652,18 @@ class SkyServeController:
         # advertise a newer routing policy than the runtime has actually
         # applied.
         self._routing_spec = self._build_routing_spec(service_spec)
+        route_service_row = serve_state.get_service_from_name(service_name)
+        self._incremental_route_projection_enabled = bool(
+            route_service_row is not None and
+            route_projection.use_incremental_producer(route_service_row))
         if (self._ordinary_launch_binding_authority is not None and
                 not self._is_pool):
-            self._replica_manager.set_route_projection_publisher(
-                self._publish_route_projection)
+            if self._incremental_route_projection_enabled:
+                self._replica_manager.set_route_material_writer(
+                    self._write_route_materials)
+            else:
+                self._replica_manager.set_route_projection_publisher(
+                    self._publish_route_projection)
         # Refreshed only by autoscaler/LB-sync paths that already hold a full
         # replica snapshot. Status polling reads this without new DB/API work.
         self._replica_counts_snapshot: dict[str, int | str] | None = None
@@ -2918,6 +2928,72 @@ class SkyServeController:
             route_view.identities,
             route_view.live_record_ids,
             ttl_seconds=ttl_seconds)
+
+    def _write_route_materials(
+        self,
+        entries: list[tuple['replica_managers.ReplicaInfo',
+                            route_projection.RouteLeaseMaterial]],
+    ) -> None:
+        """Persist provider-fenced endpoints with no route publication."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or self._is_pool or not self._owns_current_service(
+        ):
+            return
+        repository = route_projection.RouteProjectionRepository()
+        repository.upsert_replica_materials(
+            route_projection.publisher_identity_from_authority(authority),
+            entries)
+
+    def _compose_incremental_route_projection(self) -> None:
+        """Publish one provider-free lease snapshot under current authority."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or self._is_pool or not self._owns_current_service(
+        ):
+            return
+        with self._routing_state_lock:
+            service_version = self._applied_version
+            routing_spec = self._get_routing_spec()
+        if routing_spec is None:
+            return
+
+        def _capacity_hint(
+            replica_infos: list['replica_managers.ReplicaInfo'],
+            translation_cache: dict[int, tuple[str, str, int]],
+            logical_versions: set[int],
+        ) -> dict[str, Any]:
+            replica_counts = self._get_replica_counts(
+                replica_infos, translation_cache=translation_cache)
+            return self._get_capacity_hint(replica_infos,
+                                           logical_versions,
+                                           replica_counts=replica_counts,
+                                           translation_cache=translation_cache)
+
+        latest_spec = serve_state.get_spec(self._service_name, service_version)
+        if latest_spec is None:
+            return
+        ttl_seconds = max(
+            3 * int(latest_spec.endpoint_probe_interval_seconds),
+            3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
+        route_projection.RouteProjectionRepository(
+        ).compose_incremental_snapshot(
+            route_projection.publisher_identity_from_authority(authority),
+            service_version,
+            routing_spec,
+            serve_state.replica_from_storage_state,
+            _capacity_hint,
+            ttl_seconds=ttl_seconds)
+
+    def _run_incremental_route_worker(self) -> None:
+        """Supervised entry point for provider-independent route renewal."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None:
+            return
+        worker = incremental_route_worker.IncrementalRouteWorker(
+            route_projection.RouteProjectionRepository(),
+            route_projection.publisher_identity_from_authority(authority),
+            self._compose_incremental_route_projection,
+            self._get_actuation_stop())
+        worker.run()
 
     def _snapshot_replica_occupancy(
         self
@@ -5422,7 +5498,10 @@ class SkyServeController:
 
     @staticmethod
     def _ordered_capacity_target(
-        decision_autoscaler: autoscalers.Autoscaler,) -> dict[str, int] | None:
+        decision_autoscaler: autoscalers.Autoscaler,
+        *,
+        force_zero: bool = False,
+    ) -> dict[str, int] | None:
         """Return the supply-aware target used for paid residual accounting.
 
         The public demand target deliberately assigns flexible work to the
@@ -5436,6 +5515,10 @@ class SkyServeController:
         final_target = max(
             0, int(decision_autoscaler.get_final_target_num_replicas()))
         configured = decision_autoscaler.configured_accelerator_shapes
+        if force_zero:
+            if configured:
+                return {str(card).casefold(): 0 for card in configured}
+            return {capacity_admission.AGGREGATE_ACCELERATOR: 0}
         if configured:
             if getattr(decision_autoscaler, 'capacity_target_complete',
                        False) is not True:
@@ -5468,6 +5551,8 @@ class SkyServeController:
         self,
         decision_autoscaler: autoscalers.Autoscaler,
         decision_version: int,
+        *,
+        force_zero: bool = False,
     ) -> capacity_admission.PaidLaunchAuthority | None:
         """Bind a post-zero-cost residual to the current durable demand."""
         snapshot = self._durable_demand_snapshot
@@ -5476,7 +5561,8 @@ class SkyServeController:
                 snapshot.service_hash != self._service_hash or
                 snapshot.demand_source_epoch <= 0):
             return None
-        capacity_target = self._ordered_capacity_target(decision_autoscaler)
+        capacity_target = self._ordered_capacity_target(decision_autoscaler,
+                                                        force_zero=force_zero)
         if capacity_target is None:
             logger.warning('Suppressing paid launch because the autoscaler '
                            'has no complete supply-aware capacity target.')
@@ -5484,6 +5570,7 @@ class SkyServeController:
         normalized_demand = dict(snapshot.normalized_demand)
         normalized_demand.update(
             autoscaler_target=(
+                0 if force_zero else
                 decision_autoscaler.get_final_target_num_replicas()),
             replica_unit=decision_autoscaler.replica_unit,
             demand_target_by_accelerator=(
@@ -5534,6 +5621,8 @@ class SkyServeController:
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
+                durable_snapshot = None
+                fresh_aggregate_zero = False
                 if durable_demand_promoted:
                     durable_snapshot = demand_state.get_autoscaling_snapshot(
                         self._service_name, self._service_hash or '')
@@ -5555,6 +5644,11 @@ class SkyServeController:
                             request_information)
                         self._reconcile_generation += 1
                         self._durable_demand_snapshot = durable_snapshot
+                        fresh_aggregate_zero = (
+                            durable_snapshot.fresh_aggregate_zero)
+                        if fresh_aggregate_zero:
+                            (decision_autoscaler.
+                             clear_paid_launch_authority_for_fresh_zero())
                 with self._routing_state_lock:
                     notification_generation = (
                         self._scale_reconcile_coordinator.generation)
@@ -5570,6 +5664,51 @@ class SkyServeController:
                         f'{self._service_name}')
                 replica_infos = serve_state.get_replica_infos(
                     self._service_name)
+                ordered_paid_authority = None
+                retirement_changed = False
+                if durable_snapshot is not None and fresh_aggregate_zero:
+                    # Revoke every older paid claim before any provider-facing
+                    # zero-cost or ordinary action in this reconcile. Exact
+                    # card compatibility is unnecessary for an all-zero map.
+                    ordered_paid_authority = (
+                        self._publish_ordered_paid_authority(
+                            decision_autoscaler,
+                            decision_version,
+                            force_zero=True))
+                    if ordered_paid_authority is None:
+                        return
+                    retirement_changed = (
+                        self._replica_manager.
+                        reconcile_fresh_zero_paid_retirements(
+                            paid_retirement.FreshZeroAuthority(
+                                service_hash=durable_snapshot.service_hash,
+                                demand_source_epoch=(
+                                    durable_snapshot.demand_source_epoch),
+                                demand_feed_generation=(
+                                    durable_snapshot.demand_feed_generation),
+                                capacity_plan_generation=(
+                                    ordered_paid_authority.generation),
+                                capacity_plan_sha256=(
+                                    ordered_paid_authority.content_sha256),
+                                route_generation=(
+                                    durable_snapshot.route_generation)),
+                            replica_infos))
+                elif durable_snapshot is not None:
+                    normalized = durable_snapshot.normalized_demand
+                    aggregate_positive = any(
+                        int(normalized.get(field, 0) or 0) > 0
+                        for field in ('recent_request_count', 'queue_depth',
+                                      'rejected_in_window',
+                                      'recent_rejected_in_window'))
+                    if aggregate_positive:
+                        retirement_changed = (
+                            self._replica_manager.
+                            cancel_uncommitted_paid_retirements(
+                                durable_snapshot.service_hash,
+                                durable_snapshot.demand_feed_generation))
+                if retirement_changed:
+                    replica_infos = serve_state.get_replica_infos(
+                        self._service_name)
                 self._replica_counts_snapshot = self._get_replica_counts(
                     replica_infos)
                 # Use the active versions set by replica manager to make
@@ -5600,6 +5739,12 @@ class SkyServeController:
                     return
                 (scaling_options, target_num_replicas, rollout_failure,
                  logical_target, invalidate_logical_target) = plan
+                if fresh_aggregate_zero:
+                    target_num_replicas = 0
+                    scaling_options = [
+                        option for option in scaling_options if option.operator
+                        != autoscalers.AutoscalerDecisionOperator.SCALE_UP
+                    ]
                 if not self._scale_actuation_is_current(actuation_generation,
                                                         decision_autoscaler,
                                                         decision_version):
@@ -5660,7 +5805,6 @@ class SkyServeController:
                         # attribution before publishing any paid residual.
                         self._notify_scale_reconcile()
                         return
-                ordered_paid_authority = None
                 if durable_demand_promoted:
                     ordinary_physical_overrides: list[dict[str, Any] | None] = [
                         option.target
@@ -5729,9 +5873,10 @@ class SkyServeController:
                     # zero target.  Duplicate semantic content refreshes the
                     # current head for queued claims; a demand drop mints a
                     # new zero-residual generation and revokes the old one.
-                    ordered_paid_authority = (
-                        self._publish_ordered_paid_authority(
-                            decision_autoscaler, decision_version))
+                    if ordered_paid_authority is None:
+                        ordered_paid_authority = (
+                            self._publish_ordered_paid_authority(
+                                decision_autoscaler, decision_version))
                     if ordered_paid_authority is None:
                         return
                 # Batch consecutive SCALE_UP decisions into ONE
@@ -6499,6 +6644,12 @@ class SkyServeController:
             self._run_autoscaler,
             'autoscaler',
             stop_event=self._get_actuation_stop())
+
+        if getattr(self, '_incremental_route_projection_enabled', False):
+            thread_utils.start_supervised_thread(
+                self._run_incremental_route_worker,
+                'incremental-route-worker',
+                stop_event=self._get_actuation_stop())
 
         if self._reserved_capacity_fill_enabled:
             self._start_reserved_capacity_poller_if_needed()
