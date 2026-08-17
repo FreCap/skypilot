@@ -9,6 +9,7 @@ import pickle
 import threading
 import time
 
+from alembic import command as alembic_command
 import pytest
 import sqlalchemy
 from test_pool_capacity_observation_pg import observation_engine  # noqa: F401
@@ -25,6 +26,7 @@ from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import service_spec
+from sky.utils.db import migration_utils
 
 _SERVICE = 'svc'
 _SERVICE_HASH = 'service-hash'
@@ -128,6 +130,9 @@ def _claim_policy_authority(
 
 @pytest.fixture
 def allocation_engine(observation_engine):  # noqa: F811
+    config = migration_utils.get_alembic_config(observation_engine,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     with observation_engine.begin() as connection:
         connection.execute(
             sqlalchemy.text("""

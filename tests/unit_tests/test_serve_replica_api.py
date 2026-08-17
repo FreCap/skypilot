@@ -103,7 +103,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION)
     assert incremental_route_version == 88
     assert termination_evidence_version < incremental_route_version
-    assert server_constants.API_VERSION == incremental_route_version
+    zero_cost_actuation_version = (
+        server_constants.MIN_SERVE_ZERO_COST_ACTUATION_API_VERSION)
+    assert zero_cost_actuation_version == 89
+    assert incremental_route_version < zero_cost_actuation_version
+    assert server_constants.API_VERSION == zero_cost_actuation_version
 
 
 def test_current_demand_reads_database_without_controller():
@@ -116,6 +120,20 @@ def test_current_demand_reads_database_without_controller():
         'request_telemetry_generation': 7,
         'recent_request_count': 12,
     }
+    actuation = {
+        'zero_cost_actuation_status': 'available',
+        'zero_cost_actuation_reason': 'complete',
+        'zero_cost_actuation_mode': 'DURABLE_INTENT',
+        'zero_cost_actuation_epoch': 2,
+        'zero_cost_actuation_state_counts': {
+            'GRANTED': 0,
+            'ACTUATING': 1,
+            'COMMITTED': 3,
+            'RETRYABLE': 0,
+            'TERMINAL': 0,
+        },
+        'pending_zero_cost_actuation_count': 1,
+    }
     with mock.patch.object(server.serve_utils,
                            'is_consolidation_mode',
                            return_value=True), \
@@ -125,6 +143,9 @@ def test_current_demand_reads_database_without_controller():
          mock.patch.object(server.demand_state,
                            'get_request_summary',
                            return_value=summary) as get_summary, \
+         mock.patch.object(server.zero_cost_actuation,
+                           'get_status_summary',
+                           return_value=actuation) as get_actuation, \
          mock.patch.object(server.executor,
                            'schedule_request_async',
                            new_callable=mock.AsyncMock) as schedule:
@@ -136,8 +157,10 @@ def test_current_demand_reads_database_without_controller():
         'service_name': 'svc',
         'service_hash': 'hash-a',
         **summary,
+        **actuation,
     }
     get_summary.assert_called_once_with('svc', 'hash-a')
+    get_actuation.assert_called_once_with('svc', 'hash-a')
     schedule.assert_not_awaited()
 
 

@@ -365,7 +365,7 @@ class TestSkyPilotReplicaManagerInitOrdering:
         # boot), and the manager lock was already held when it returned —
         # so any daemon started afterwards cannot win it.
         assert mgr.lock.locked() is True
-        assert len(started) == 4
+        assert len(started) == 5
         lock_state_at_daemon_start.append(mgr.lock.locked())
         release.set()
         # Recovery finishes and releases the lock.
@@ -414,12 +414,13 @@ class TestSkyPilotReplicaManagerInitOrdering:
         assert '_job_status_fetcher' in started
         assert '_replica_prober' in started
         assert '_system_recovery_route_prober' in started
+        assert '_zero_cost_actuation_dispatcher' in started
 
     def test_all_daemon_threads_share_manager_stop_event(self):
         calls = []
         mgr = self._build(lambda self_: None, [], supervisor_calls=calls)
 
-        assert len(calls) == 4
+        assert len(calls) == 5
         assert all(kwargs['stop_event'] is mgr._manager_daemon_stop
                    for _, kwargs in calls)
 

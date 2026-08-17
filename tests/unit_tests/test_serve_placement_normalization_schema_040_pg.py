@@ -1112,7 +1112,7 @@ def test_serve040_runtime_authority_rejects_unknown_later_head(
         serve040) -> None:
     with serve040.begin() as connection:
         connection.exec_driver_sql(
-            "UPDATE alembic_version_serve_state_db SET version_num = '052'")
+            "UPDATE alembic_version_serve_state_db SET version_num = '053'")
     with serve040.connect() as connection:
         with pytest.raises(placement_normalization_authority.
                            PlacementNormalizationAuthorityError,

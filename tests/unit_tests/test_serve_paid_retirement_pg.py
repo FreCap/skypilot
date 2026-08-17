@@ -21,7 +21,7 @@ from sky.serve import serve_state_schema
 from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
-pytestmark = pytest.mark.xdist_group(name='serve_paid_retirement_schema_051_pg')
+pytestmark = pytest.mark.xdist_group(name='serve_paid_retirement_schema_052_pg')
 
 _OWNER = (123, '10.0.0.5')
 _ROUTE_URL = 'http://replica:8000'
@@ -40,7 +40,7 @@ def _authority() -> paid_retirement.FreshZeroAuthority:
 def retirement_database(empty_postgres, monkeypatch):
     config = migration_utils.get_alembic_config(empty_postgres,
                                                 migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(config, '051')
+    alembic_command.upgrade(config, migration_utils.SERVE_VERSION)
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     now = datetime.datetime.now(datetime.timezone.utc)
