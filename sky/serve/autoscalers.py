@@ -7584,6 +7584,60 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 if target.get(card, 0) > 0 and (current_ownership.get(
                     card, 0) > 0 or adopted_ownership.get(card, 0) > 0)
             }
+            # The retained exact-card map is a reconciliation fence, not an
+            # economic entitlement.  During a downscale hold it may keep an
+            # older paid card until fresh compatibility evidence permits a
+            # non-preemptive move.  If compatible materialized supply already
+            # covers the supply-aware target, replacing a retiring instance on
+            # that older card would purchase capacity the service does not
+            # need.  Bound the combined current/adopted ownership by the
+            # residual shortage in the fresh supply-aware allocation.  Apply
+            # that bound to shortages rather than absolute card targets so an
+            # unbacked retained same-card target can still retry when the
+            # service is genuinely below its held aggregate capacity.
+            economic_shortage = {
+                card: max(
+                    0,
+                    int(desired_target.get(card, 0)) -
+                    int(nonretiring_supply.get(card, 0))) for card in cards
+            }
+            residual_left = sum(economic_shortage.values())
+            authorized_shortage = {card: 0 for card in cards}
+            # Fresh ownership already intersects the supply-aware target, so
+            # spend the residual on its exact cards first.  If a transition
+            # fence has not admitted that card into `target`, fail closed
+            # instead of transferring its compatibility proof to an older
+            # adopted card.
+            for card in cards:
+                committed_on_card = int(nonretiring_supply.get(card, 0))
+                current_target = min(int(target.get(card, 0)),
+                                     int(current_ownership.get(card, 0)))
+                current_shortage = max(0, current_target - committed_on_card)
+                accepted = min(current_shortage, economic_shortage[card],
+                               residual_left)
+                authorized_shortage[card] += accepted
+                residual_left -= accepted
+            # With no fresh paid owner, the held target may still be the only
+            # compatibility evidence for a genuine capacity deficit. Preserve
+            # its same-card retry, bounded by the remaining economic residual.
+            if not current_ownership:
+                for card in cards:
+                    committed_on_card = int(nonretiring_supply.get(card, 0))
+                    owned_shortage = max(
+                        0,
+                        int(paid_ownership.get(card, 0)) - committed_on_card)
+                    accepted = min(owned_shortage, residual_left)
+                    authorized_shortage[card] += accepted
+                    residual_left -= accepted
+            bounded_paid_ownership: dict[str, int] = {}
+            for card in cards:
+                committed_on_card = int(nonretiring_supply.get(card, 0))
+                owned_target = int(paid_ownership.get(card, 0))
+                bounded_paid_target_on_card = min(
+                    owned_target, committed_on_card + authorized_shortage[card])
+                if bounded_paid_target_on_card > 0:
+                    bounded_paid_ownership[card] = bounded_paid_target_on_card
+            paid_ownership = bounded_paid_ownership
             # Paid ownership is separate from compatibility ownership. A
             # latest-only minimum or headerless queue can buy its allocator-
             # selected card; a mixed-version rollout requires explicit proof.

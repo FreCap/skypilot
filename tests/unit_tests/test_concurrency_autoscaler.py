@@ -1393,6 +1393,66 @@ class TestExactAcceleratorCompatibility(unittest.TestCase):
                     'H200': 2,
                 } for target in scale_down_targets))
 
+    def test_downscale_hold_does_not_replace_paid_card_with_surplus_supply(
+            self):
+        autoscaler = _make_autoscaler(
+            knob=1,
+            min_replicas=0,
+            max_replicas=1000,
+            replica_unit='logical',
+            target_utilization_percentage=100,
+            downscale_delay_seconds=300,
+        )
+        autoscaler.set_configured_accelerator_shapes({
+            'L4': 1,
+            'A100': 1,
+            'A100-80GB': 1,
+        })
+        autoscaler.target_num_replicas = 40
+        autoscaler.target_num_replicas_by_accelerator = {'L4': 40}
+        autoscaler._logical_adopted_paid_target_by_accelerator = {'L4': 40}
+        autoscaler._snap_target_on_next_recompute = False
+
+        paid_l4 = [_replica(replica_id, card='L4') for replica_id in range(31)]
+        zero_cost_a100 = [
+            _replica(replica_id, card='A100', reserved_fill=True)
+            for replica_id in range(100, 136)
+        ]
+        zero_cost_a100_80gb = [
+            _replica(replica_id, card='A100-80GB', reserved_fill=True)
+            for replica_id in range(200, 276)
+        ]
+        for info in paid_l4:
+            info.is_zero_cost = False
+        for info in [*zero_cost_a100, *zero_cost_a100_80gb]:
+            info.is_zero_cost = True
+        replicas = [*paid_l4, *zero_cost_a100, *zero_cost_a100_80gb]
+        _report(
+            autoscaler,
+            in_flight={info.replica_id: 0 for info in replicas},
+            observed_slots={info.replica_id: 1 for info in replicas},
+            queue_depth=7,
+            queued_profiles=[self._profile(50, ['L4', 'A100', 'A100-80GB'], 7)],
+            compatibility_complete=True,
+        )
+
+        with mock.patch.object(autoscalers.time, 'time', return_value=100.0), \
+             mock.patch.object(autoscalers.time,
+                               'monotonic',
+                               return_value=100.0):
+            decisions = _decisions(autoscaler, replicas)
+
+        self.assertEqual(autoscaler._raw_target_num_replicas, 7)
+        self.assertEqual(autoscaler.target_num_replicas, 40)
+        self.assertEqual(autoscaler.target_num_replicas_by_accelerator,
+                         {'L4': 40})
+        self.assertEqual(autoscaler._logical_actuation_target_by_accelerator, {
+            'L4': 33,
+            'A100': 7,
+        })
+        self.assertEqual(autoscaler.cold_launch_authority_by_accelerator, {})
+        self.assertEqual(_scale_ups(decisions), [])
+
     def test_downscale_hold_backed_move_preserves_unrelated_exact_cards(self):
         autoscaler = _make_autoscaler(
             knob=1,
