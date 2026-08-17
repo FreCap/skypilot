@@ -2637,6 +2637,9 @@ class ReplicaManager:
         self._last_probe_route_result: ProbeRouteResult | None = None
         self._route_projection_publisher: Callable[[ProbeRouteResult],
                                                    None] | None = None
+        self._route_material_writer: Callable[
+            [list[tuple['ReplicaInfo', route_projection.RouteLeaseMaterial]]],
+            None] | None = None
 
     def __init__(self,
                  service_name: str,
@@ -3053,6 +3056,15 @@ class ReplicaManager:
             self, publisher: Callable[[ProbeRouteResult], None] | None) -> None:
         """Install the post-readiness publisher for complete probe rounds."""
         self._route_projection_publisher = publisher
+
+    def set_route_material_writer(
+        self,
+        writer: Callable[
+            [list[tuple['ReplicaInfo',
+                        route_projection.RouteLeaseMaterial]]], None] | None,
+    ) -> None:
+        """Install the provider-result writer with no publication authority."""
+        self._route_material_writer = writer
 
     def system_recovery_allows_routing(self, info: 'ReplicaInfo') -> bool:
         """Whether recovery state permits a READY row to route."""
@@ -13605,6 +13617,53 @@ class SkyPilotReplicaManager(ReplicaManager):
             urls.setdefault(info.replica_id, None)
         return urls
 
+    def _write_resolved_route_materials(
+        self,
+        infos: list[ReplicaInfo],
+        resolved_routes: dict[int, route_projection.ResolvedRouteMaterial],
+    ) -> None:
+        """Persist this provider-fenced partition without publishing it."""
+        writer = self._route_material_writer
+        if writer is None:
+            return
+        entries = []
+        for info in infos:
+            resolved = resolved_routes.get(info.replica_id)
+            if resolved is None:
+                continue
+            try:
+                spec = self._get_version_spec(info.version)
+                material = route_projection.RouteLeaseMaterial(
+                    route=resolved,
+                    readiness_path=spec.readiness_path,
+                    post_data=spec.post_data,
+                    headers=spec.readiness_headers,
+                    async_occupancy=(spec.graceful_drain_async_occupancy),
+                    uses_logical_replicas=(spec.uses_logical_replicas is True),
+                    is_zero_cost=info.is_zero_cost,
+                    planned_capacity=info.planned_capacity,
+                    route_allowed=self.system_recovery_allows_routing(info),
+                    route_marker=self.system_recovery_route_marker(
+                        info, resolved.url))
+            except (route_projection.RouteProjectionValidationError,
+                    ValueError) as error:
+                logger.warning(
+                    'Skipping invalid incremental route material for replica '
+                    f'{info.replica_id}: '
+                    f'{common_utils.format_exception(error)}')
+                continue
+            entries.append((info, material))
+        if not entries:
+            return
+        try:
+            writer(entries)
+        except Exception as error:  # pylint: disable=broad-except
+            # Route authority remains fail-closed on its own lease expiry. A
+            # PostgreSQL publication outage must not suppress ordinary
+            # lifecycle/readiness bookkeeping in this provider-owned round.
+            logger.error('Incremental route material persistence failed: '
+                         f'{common_utils.format_exception(error)}')
+
     def _reduce_candidate_probe(
         self,
         info: ReplicaInfo,
@@ -14015,6 +14074,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 deferred_replica_ids=deferred_route_ids,
                 identity_rejected_replica_ids=identity_rejected_route_ids,
                 resolved_route_material=resolved_route_material)
+            if resolved_route_material is not None:
+                self._write_resolved_route_materials(infos_to_probe,
+                                                     resolved_route_material)
             if self._update_recovery_required:
                 return infos
         else:

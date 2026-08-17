@@ -1073,8 +1073,8 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
             == 86)
     assert (
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION == 87)
-    assert (server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION ==
-            88)
+    assert (
+        server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
     assert server_constants.API_VERSION == 88
 
     alembic_command.upgrade(serve_config, '037')

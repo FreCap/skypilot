@@ -41,6 +41,7 @@ from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
 from sky.serve import placement_policy
 from sky.serve import replica_managers
+from sky.serve import route_projection
 from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import system_recovery_route_lease
@@ -741,6 +742,41 @@ class TestBackgroundDutyOwnershipLifecycle:
         assert publisher.call_count == expected_calls
         if complete:
             publisher.assert_called_once_with(route_result)
+
+    def test_provider_resolution_writes_material_without_publication(self):
+        mgr = self._stopped_manager()
+        writer = mock.Mock()
+        publisher = mock.Mock()
+        mgr._route_material_writer = writer
+        mgr._route_projection_publisher = publisher
+        mgr._get_version_spec = mock.Mock(return_value=types.SimpleNamespace(
+            readiness_path='/health',
+            post_data=None,
+            readiness_headers={'X-Probe': 'serve'},
+            graceful_drain_async_occupancy=True,
+            uses_logical_replicas=False))
+        mgr.system_recovery_allows_routing = mock.Mock(return_value=True)
+        mgr.system_recovery_route_marker = mock.Mock(return_value=None)
+        info = types.SimpleNamespace(replica_id=1,
+                                     replica_record_id=(
+                                         '00000000-0000-4000-8000-000000000001'),
+                                     version=2,
+                                     is_zero_cost=False,
+                                     planned_capacity=3)
+        resolved = route_projection.ResolvedRouteMaterial(
+            'http://10.0.0.1:8000', 'L4', 1)
+
+        mgr._write_resolved_route_materials([info], {1: resolved})
+
+        writer.assert_called_once()
+        entries = writer.call_args.args[0]
+        assert len(entries) == 1
+        assert entries[0][0] is info
+        material = entries[0][1]
+        assert material.route == resolved
+        assert material.readiness_path == '/health'
+        assert material.planned_capacity == 3
+        publisher.assert_not_called()
 
     def test_autoscaler_target_publication_is_version_fenced(self):
         mgr = replica_managers.ReplicaManager.__new__(

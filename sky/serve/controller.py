@@ -654,6 +654,8 @@ class SkyServeController:
                 not self._is_pool):
             self._replica_manager.set_route_projection_publisher(
                 self._publish_route_projection)
+            self._replica_manager.set_route_material_writer(
+                self._write_route_materials)
         # Refreshed only by autoscaler/LB-sync paths that already hold a full
         # replica snapshot. Status polling reads this without new DB/API work.
         self._replica_counts_snapshot: dict[str, int | str] | None = None
@@ -2918,6 +2920,21 @@ class SkyServeController:
             route_view.identities,
             route_view.live_record_ids,
             ttl_seconds=ttl_seconds)
+
+    def _write_route_materials(
+        self,
+        entries: list[tuple['replica_managers.ReplicaInfo',
+                            route_projection.RouteLeaseMaterial]],
+    ) -> None:
+        """Persist provider-fenced endpoints with no route publication."""
+        authority = self._ordinary_launch_binding_authority
+        if authority is None or self._is_pool or not self._owns_current_service(
+        ):
+            return
+        repository = route_projection.RouteProjectionRepository()
+        repository.upsert_replica_materials(
+            route_projection.publisher_identity_from_authority(authority),
+            entries)
 
     def _snapshot_replica_occupancy(
         self

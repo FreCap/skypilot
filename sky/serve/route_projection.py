@@ -234,6 +234,15 @@ class RouteLeaseMaterialReceipt:
 
 
 @dataclasses.dataclass(frozen=True)
+class _PreparedRouteLeaseWrite:
+    replica_id: int
+    replica_record_id: str
+    service_version: int
+    payload: dict[str, Any]
+    material_sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
 class RouteLeaseProbeReceipt:
     accepted: bool
     readiness_generation: int | None = None
@@ -431,6 +440,26 @@ def _validate_lease_material_row(row: Mapping[str, Any]) -> None:
     except (KeyError, TypeError, ValueError) as error:
         raise RouteProjectionValidationError(
             'Persisted route material is corrupt.') from error
+
+
+def _prepare_route_lease_write(
+        replica_info: Any,
+        material: RouteLeaseMaterial) -> _PreparedRouteLeaseWrite:
+    if not isinstance(material, RouteLeaseMaterial):
+        raise RouteProjectionValidationError('Route lease material is invalid.')
+    replica_id = _positive_int(getattr(replica_info, 'replica_id', None),
+                               'replica_id')
+    record_id = _canonical_record_id(
+        getattr(replica_info, 'replica_record_id', None))
+    service_version = _positive_int(getattr(replica_info, 'version', None),
+                                    'service_version')
+    payload = _lease_material_payload(material)
+    digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+    return _PreparedRouteLeaseWrite(replica_id=replica_id,
+                                    replica_record_id=record_id,
+                                    service_version=service_version,
+                                    payload=payload,
+                                    material_sha256=digest)
 
 
 def _content_sha256(response: object, identities: object) -> str:
@@ -929,21 +958,159 @@ class RouteProjectionRepository:
         material: RouteLeaseMaterial,
     ) -> RouteLeaseMaterialReceipt:
         """Persist one provider-resolved target without publishing routes."""
+        receipts = self.upsert_replica_materials(identity,
+                                                 [(replica_info, material)])
+        if not receipts:
+            raise RouteProjectionConflict(
+                'Route material replica identity is no longer current or its '
+                'lease was revoked.')
+        return receipts[0]
+
+    @staticmethod
+    def _upsert_prepared_material_in_session(
+        session: orm.Session,
+        identity: RoutePublisherIdentity,
+        prepared: _PreparedRouteLeaseWrite,
+        now: datetime.datetime,
+    ) -> RouteLeaseMaterialReceipt:
+        replica_id = prepared.replica_id
+        record_id = uuid.UUID(prepared.replica_record_id)
+        existing = session.execute(
+            sqlalchemy.select(_LEASES).where(
+                _LEASES.c.service_name == identity.service_name,
+                _LEASES.c.service_hash == identity.service_hash,
+                _LEASES.c.replica_id == replica_id,
+                _LEASES.c.replica_record_id == record_id,
+            ).with_for_update()).mappings().one_or_none()
+        session.execute(
+            sqlalchemy.update(_LEASES).where(
+                _LEASES.c.service_name == identity.service_name,
+                _LEASES.c.service_hash == identity.service_hash,
+                _LEASES.c.replica_id == replica_id,
+                _LEASES.c.replica_record_id != record_id,
+                _LEASES.c.revoked_at.is_(None),
+            ).values(
+                ready=False,
+                observed_at=None,
+                valid_until=None,
+                revocation_generation=_LEASES.c.revocation_generation + 1,
+                revoked_at=now,
+                revocation_reason='replica_record_replaced',
+            ))
+        if existing is not None and existing['revoked_at'] is not None:
+            raise RouteProjectionConflict(
+                'Revoked route material cannot be implicitly revived.')
+        duplicate = bool(
+            existing is not None and
+            existing['material_sha256'] == prepared.material_sha256)
+        if duplicate:
+            assert existing is not None
+            generation = int(existing['material_generation'])
+            session.execute(
+                sqlalchemy.update(_LEASES).where(
+                    _LEASES.c.service_name == identity.service_name,
+                    _LEASES.c.service_hash == identity.service_hash,
+                    _LEASES.c.replica_id == replica_id,
+                    _LEASES.c.replica_record_id == record_id,
+                ).values(
+                    service_lifecycle_epoch=identity.service_lifecycle_epoch,
+                    controller_incarnation=identity.controller_incarnation,
+                    controller_owner_epoch=identity.controller_owner_epoch,
+                    controller_pid=identity.controller_pid,
+                    controller_ip=identity.controller_ip,
+                    service_version=prepared.service_version,
+                    resolved_at=now))
+        else:
+            maximum = session.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.max(_LEASES.c.material_generation)).where(
+                        _LEASES.c.service_name == identity.service_name,
+                        _LEASES.c.replica_id == replica_id)).scalar_one()
+            generation = 1 if maximum is None else int(maximum) + 1
+            values = dict(
+                service_name=identity.service_name,
+                service_hash=identity.service_hash,
+                replica_id=replica_id,
+                replica_record_id=record_id,
+                service_lifecycle_epoch=identity.service_lifecycle_epoch,
+                controller_incarnation=identity.controller_incarnation,
+                controller_owner_epoch=identity.controller_owner_epoch,
+                controller_pid=identity.controller_pid,
+                controller_ip=identity.controller_ip,
+                service_version=prepared.service_version,
+                material_sha256=prepared.material_sha256,
+                material_generation=generation,
+                readiness_generation=0,
+                ready=False,
+                created_at=(now
+                            if existing is None else existing['created_at']),
+                resolved_at=now,
+                observed_at=None,
+                valid_until=None,
+                revocation_generation=(0 if existing is None else int(
+                    existing['revocation_generation'])),
+                revoked_at=None,
+                revocation_reason=None,
+                **prepared.payload,
+            )
+            insert = postgresql.insert(_LEASES).values(**values)
+            session.execute(
+                insert.on_conflict_do_update(
+                    index_elements=[
+                        _LEASES.c.service_name,
+                        _LEASES.c.service_hash,
+                        _LEASES.c.replica_id,
+                        _LEASES.c.replica_record_id,
+                    ],
+                    set_={
+                        key: value
+                        for key, value in values.items()
+                        if key not in {
+                            'service_name', 'service_hash', 'replica_id',
+                            'replica_record_id', 'created_at'
+                        }
+                    }))
+        retained = session.execute(
+            sqlalchemy.select(
+                _LEASES.c.service_hash, _LEASES.c.replica_record_id).where(
+                    _LEASES.c.service_name == identity.service_name,
+                    _LEASES.c.replica_id == replica_id).order_by(
+                        _LEASES.c.material_generation.desc(),
+                        _LEASES.c.created_at.desc())).all()
+        for stale_hash, stale_record_id in retained[
+                LEASE_HISTORY_PER_REPLICA_LIMIT:]:
+            session.execute(
+                sqlalchemy.delete(_LEASES).where(
+                    _LEASES.c.service_name == identity.service_name,
+                    _LEASES.c.service_hash == stale_hash,
+                    _LEASES.c.replica_id == replica_id,
+                    _LEASES.c.replica_record_id == stale_record_id))
+        return RouteLeaseMaterialReceipt(
+            material_generation=generation,
+            material_sha256=(prepared.material_sha256),
+            duplicate=duplicate)
+
+    def upsert_replica_materials(
+        self,
+        identity: RoutePublisherIdentity,
+        entries: list[tuple[Any, RouteLeaseMaterial]],
+    ) -> list[RouteLeaseMaterialReceipt]:
+        """Persist one bounded provider result in one owner-fenced commit."""
         if not isinstance(identity, RoutePublisherIdentity):
             raise RouteProjectionValidationError(
                 'Route publisher identity is invalid.')
-        if not isinstance(material, RouteLeaseMaterial):
+        if not isinstance(entries, list) or len(entries) > MAX_ROUTE_IDENTITIES:
             raise RouteProjectionValidationError(
-                'Route lease material is invalid.')
-        replica_id = _positive_int(getattr(replica_info, 'replica_id', None),
-                                   'replica_id')
-        record_id_text = _canonical_record_id(
-            getattr(replica_info, 'replica_record_id', None))
-        record_id = uuid.UUID(record_id_text)
-        service_version = _positive_int(getattr(replica_info, 'version', None),
-                                        'service_version')
-        payload = _lease_material_payload(material)
-        digest = hashlib.sha256(_canonical_json(payload)).hexdigest()
+                'Route material batch is invalid or unbounded.')
+        prepared = sorted((_prepare_route_lease_write(info, material)
+                           for info, material in entries),
+                          key=lambda item: item.replica_id)
+        replica_ids = [item.replica_id for item in prepared]
+        if len(replica_ids) != len(set(replica_ids)):
+            raise RouteProjectionValidationError(
+                'Route material batch has duplicate replica IDs.')
+        if not prepared:
+            return []
 
         try:
             with orm.Session(self.engine) as session, session.begin():
@@ -954,132 +1121,25 @@ class RouteProjectionRepository:
                 if owner is None or not _owner_matches(identity, owner):
                     raise RouteProjectionConflict(
                         'Route material writer no longer owns this service.')
-                if not _replica_row_matches(session, replica_id, record_id_text,
-                                            service_version,
-                                            identity.service_name):
-                    raise RouteProjectionConflict(
-                        'Route material replica identity is no longer current.')
+                current = [
+                    item for item in prepared if _replica_row_matches(
+                        session, item.replica_id, item.replica_record_id,
+                        item.service_version, identity.service_name)
+                ]
                 now = session.execute(
                     sqlalchemy.select(
                         sqlalchemy.func.clock_timestamp())).scalar_one()
-                existing = session.execute(
-                    sqlalchemy.select(_LEASES).where(
-                        _LEASES.c.service_name == identity.service_name,
-                        _LEASES.c.service_hash == identity.service_hash,
-                        _LEASES.c.replica_id == replica_id,
-                        _LEASES.c.replica_record_id == record_id,
-                    ).with_for_update()).mappings().one_or_none()
-                session.execute(
-                    sqlalchemy.update(_LEASES).where(
-                        _LEASES.c.service_name == identity.service_name,
-                        _LEASES.c.service_hash == identity.service_hash,
-                        _LEASES.c.replica_id == replica_id,
-                        _LEASES.c.replica_record_id != record_id,
-                        _LEASES.c.revoked_at.is_(None),
-                    ).values(
-                        ready=False,
-                        observed_at=None,
-                        valid_until=None,
-                        revocation_generation=(_LEASES.c.revocation_generation +
-                                               1),
-                        revoked_at=now,
-                        revocation_reason='replica_record_replaced',
-                    ))
-                if existing is not None and existing['revoked_at'] is not None:
-                    raise RouteProjectionConflict(
-                        'Revoked route material cannot be implicitly revived.')
-                duplicate = bool(existing is not None and
-                                 existing['material_sha256'] == digest)
-                if duplicate:
-                    assert existing is not None
-                    generation = int(existing['material_generation'])
-                    session.execute(
-                        sqlalchemy.update(_LEASES).where(
-                            _LEASES.c.service_name == identity.service_name,
-                            _LEASES.c.service_hash == identity.service_hash,
-                            _LEASES.c.replica_id == replica_id,
-                            _LEASES.c.replica_record_id == record_id,
-                        ).values(service_lifecycle_epoch=(
-                            identity.service_lifecycle_epoch),
-                                 controller_incarnation=(
-                                     identity.controller_incarnation),
-                                 controller_owner_epoch=(
-                                     identity.controller_owner_epoch),
-                                 controller_pid=identity.controller_pid,
-                                 controller_ip=identity.controller_ip,
-                                 service_version=service_version,
-                                 resolved_at=now))
-                else:
-                    maximum = session.execute(
-                        sqlalchemy.select(
-                            sqlalchemy.func.max(_LEASES.c.material_generation)).
-                        where(_LEASES.c.service_name == identity.service_name,
-                              _LEASES.c.replica_id == replica_id)).scalar_one()
-                    generation = 1 if maximum is None else int(maximum) + 1
-                    values = dict(
-                        service_name=identity.service_name,
-                        service_hash=identity.service_hash,
-                        replica_id=replica_id,
-                        replica_record_id=record_id,
-                        service_lifecycle_epoch=(
-                            identity.service_lifecycle_epoch),
-                        controller_incarnation=identity.controller_incarnation,
-                        controller_owner_epoch=identity.controller_owner_epoch,
-                        controller_pid=identity.controller_pid,
-                        controller_ip=identity.controller_ip,
-                        service_version=service_version,
-                        material_sha256=digest,
-                        material_generation=generation,
-                        readiness_generation=0,
-                        ready=False,
-                        created_at=(now if existing is None else
-                                    existing['created_at']),
-                        resolved_at=now,
-                        observed_at=None,
-                        valid_until=None,
-                        revocation_generation=(0 if existing is None else int(
-                            existing['revocation_generation'])),
-                        revoked_at=None,
-                        revocation_reason=None,
-                        **payload,
-                    )
-                    insert = postgresql.insert(_LEASES).values(**values)
-                    session.execute(
-                        insert.on_conflict_do_update(
-                            index_elements=[
-                                _LEASES.c.service_name,
-                                _LEASES.c.service_hash,
-                                _LEASES.c.replica_id,
-                                _LEASES.c.replica_record_id,
-                            ],
-                            set_={
-                                key: value
-                                for key, value in values.items()
-                                if key not in {
-                                    'service_name', 'service_hash',
-                                    'replica_id', 'replica_record_id',
-                                    'created_at'
-                                }
-                            }))
-                retained = session.execute(
-                    sqlalchemy.select(
-                        _LEASES.c.service_hash,
-                        _LEASES.c.replica_record_id).where(
-                            _LEASES.c.service_name == identity.service_name,
-                            _LEASES.c.replica_id == replica_id).order_by(
-                                _LEASES.c.material_generation.desc(),
-                                _LEASES.c.created_at.desc())).all()
-                for stale_hash, stale_record_id in retained[
-                        LEASE_HISTORY_PER_REPLICA_LIMIT:]:
-                    session.execute(
-                        sqlalchemy.delete(_LEASES).where(
-                            _LEASES.c.service_name == identity.service_name,
-                            _LEASES.c.service_hash == stale_hash,
-                            _LEASES.c.replica_id == replica_id,
-                            _LEASES.c.replica_record_id == stale_record_id))
-                return RouteLeaseMaterialReceipt(material_generation=generation,
-                                                 material_sha256=digest,
-                                                 duplicate=duplicate)
+                receipts = []
+                for item in current:
+                    try:
+                        receipt = self._upsert_prepared_material_in_session(
+                            session, identity, item, now)
+                    except RouteProjectionConflict:
+                        # A revoked/stale sibling is isolated from this one
+                        # complete provider-resolution batch.
+                        continue
+                    receipts.append(receipt)
+                return receipts
         except sqlalchemy.exc.SQLAlchemyError as error:
             raise RouteProjectionUnavailable(
                 'PostgreSQL route material persistence failed.') from error
