@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
+import concurrent.futures
 import threading
 from typing import Any
 
@@ -14,6 +15,63 @@ from sky.serve import route_projection
 from sky.utils import common_utils
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _target_key(
+    target: route_projection.RouteLeaseProbeTarget,
+) -> tuple[int, str, int, int, str]:
+    return (target.replica_id, target.replica_record_id,
+            target.material_generation, target.revocation_generation,
+            target.material_sha256)
+
+
+class _ProbeReceiptWriter:
+    """One bounded PostgreSQL writer outside the composition event loop."""
+
+    def __init__(self, repository: route_projection.RouteProjectionRepository,
+                 ttl_seconds: int) -> None:
+        self._repository = repository
+        self._ttl_seconds = ttl_seconds
+        self._pending: dict[tuple[int, str, int, int, str],
+                            route_projection.RouteLeaseProbeResult] = {}
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='skyserve-route-receipts')
+        self._future: concurrent.futures.Future[list[
+            route_projection.RouteLeaseProbeReceipt]] | None = None
+
+    def add(self, result: route_projection.RouteLeaseProbeResult) -> None:
+        """Coalesce to the newest not-yet-submitted result per exact target."""
+        self._pending[_target_key(result.target)] = result
+
+    def _consume_future(self) -> None:
+        if self._future is None or not self._future.done():
+            return
+        try:
+            self._future.result()
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Incremental route probe receipt batch failed: '
+                           f'{common_utils.format_exception(error)}')
+        finally:
+            self._future = None
+
+    def flush(self) -> None:
+        """Submit at most one bounded batch without waiting for PostgreSQL."""
+        self._consume_future()
+        if self._future is not None or not self._pending:
+            return
+        keys = list(
+            self._pending)[:constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS]
+        batch = [self._pending.pop(key) for key in keys]
+        self._future = self._executor.submit(
+            self._repository.record_probe_results,
+            batch,
+            ttl_seconds=self._ttl_seconds)
+
+    def close(self) -> None:
+        """Reject queued work and release the writer without blocking exit."""
+        self._pending.clear()
+        self._consume_future()
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 class IncrementalRouteWorker:
@@ -39,17 +97,19 @@ class IncrementalRouteWorker:
         self._stop_event = stop_event
         self._interval_seconds = interval_seconds
         self._lease_ttl_seconds = lease_ttl_seconds
+        self._receipt_writer = _ProbeReceiptWriter(repository,
+                                                   lease_ttl_seconds)
 
     @staticmethod
     def _target_key(
         target: route_projection.RouteLeaseProbeTarget,
     ) -> tuple[int, str, int, int, str]:
-        return (target.replica_id, target.replica_record_id,
-                target.material_generation, target.revocation_generation,
-                target.material_sha256)
+        return _target_key(target)
 
-    async def _probe(self, session: aiohttp.ClientSession,
-                     target: route_projection.RouteLeaseProbeTarget) -> None:
+    async def _probe(
+        self, session: aiohttp.ClientSession,
+        target: route_projection.RouteLeaseProbeTarget
+    ) -> route_projection.RouteLeaseProbeResult:
         succeeded = False
         try:
             kwargs: dict[str, Any] = {
@@ -64,35 +124,34 @@ class IncrementalRouteWorker:
                 succeeded = response.status == 200
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             succeeded = False
-        if self._stop_event.is_set():
-            return
-        try:
-            self._repository.record_probe_result(
-                target, succeeded, ttl_seconds=self._lease_ttl_seconds)
-        except Exception as error:  # pylint: disable=broad-except
-            logger.warning(
-                'Incremental route probe receipt failed for replica '
-                f'{target.replica_id}: {common_utils.format_exception(error)}')
+        return route_projection.RouteLeaseProbeResult(target=target,
+                                                      succeeded=succeeded)
 
     @staticmethod
-    def _consume_task_result(task: asyncio.Task[None]) -> None:
+    def _consume_task_result(
+        task: asyncio.Task[route_projection.RouteLeaseProbeResult]
+    ) -> route_projection.RouteLeaseProbeResult | None:
         if task.cancelled():
-            return
+            return None
         try:
-            task.result()
+            return task.result()
         except Exception as error:  # pylint: disable=broad-except
             logger.warning('Incremental route probe task failed: '
                            f'{common_utils.format_exception(error)}')
+            return None
 
     async def _run_tick(
         self,
         session: aiohttp.ClientSession,
-        tasks: dict[tuple[int, str, int, int, str], asyncio.Task[None]],
+        tasks: dict[tuple[int, str, int, int, str],
+                    asyncio.Task[route_projection.RouteLeaseProbeResult]],
     ) -> None:
         """Schedule independent probes and compose without awaiting them."""
         for key, task in list(tasks.items()):
             if task.done():
-                self._consume_task_result(task)
+                result = self._consume_task_result(task)
+                if result is not None and not self._stop_event.is_set():
+                    self._receipt_writer.add(result)
                 tasks.pop(key, None)
         try:
             targets = self._repository.list_probe_targets(self._identity)
@@ -108,12 +167,14 @@ class IncrementalRouteWorker:
         for target in targets:
             key = self._target_key(target)
             if key not in tasks:
-                task = asyncio.create_task(self._probe(session, target))
-                task.add_done_callback(self._consume_task_result)
-                tasks[key] = task
+                tasks[key] = asyncio.create_task(self._probe(session, target))
 
-        # This never awaits the URL tasks above. A slow or hung URL can expire
-        # only its lease; it cannot delay head refresh.
+        # Receipt persistence has one bounded writer and never runs on this
+        # event loop.  A busy writer coalesces newer results per exact target.
+        self._receipt_writer.flush()
+
+        # This invokes or awaits neither the URL tasks nor the receipt writer.
+        # A slow operation can expire exact leases without joining composition.
         try:
             self._compose()
         except Exception as error:  # pylint: disable=broad-except
@@ -124,7 +185,8 @@ class IncrementalRouteWorker:
         """Probe independently and compose on a fixed monotonic cadence."""
         loop = asyncio.get_running_loop()
         next_tick = loop.time()
-        tasks: dict[tuple[int, str, int, int, str], asyncio.Task[None]] = {}
+        tasks: dict[tuple[int, str, int, int, str],
+                    asyncio.Task[route_projection.RouteLeaseProbeResult]] = {}
         connector = aiohttp.TCPConnector(
             limit=constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS)
         async with aiohttp.ClientSession(connector=connector) as session:
@@ -147,6 +209,7 @@ class IncrementalRouteWorker:
                 if tasks:
                     await asyncio.gather(*tasks.values(),
                                          return_exceptions=True)
+                self._receipt_writer.close()
 
     def run(self) -> None:
         """Supervised-thread entry point."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections.abc import Mapping
+from collections.abc import Sequence
 import copy
 import dataclasses
 import datetime
@@ -274,6 +275,22 @@ class RouteLeaseProbeReceipt:
     accepted: bool
     readiness_generation: int | None = None
     valid_until: datetime.datetime | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RouteLeaseProbeResult:
+    """HTTP outcome for one exact route-lease generation."""
+
+    target: RouteLeaseProbeTarget
+    succeeded: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.target, RouteLeaseProbeTarget):
+            raise RouteProjectionValidationError(
+                'Route probe result target is invalid.')
+        if type(self.succeeded) is not bool:  # pylint: disable=unidiomatic-typecheck
+            raise RouteProjectionValidationError(
+                'Route probe result must be boolean.')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1543,77 +1560,146 @@ class RouteProjectionRepository:
         ttl_seconds: int,
     ) -> RouteLeaseProbeReceipt:
         """Apply an HTTP result only to its exact unrevoked generation."""
-        if not isinstance(target, RouteLeaseProbeTarget):
-            raise RouteProjectionValidationError(
-                'Route probe target is invalid.')
-        if type(succeeded) is not bool:  # pylint: disable=unidiomatic-typecheck
-            raise RouteProjectionValidationError(
-                'Probe result must be boolean.')
+        result = RouteLeaseProbeResult(target=target, succeeded=succeeded)
+        return self.record_probe_results([result], ttl_seconds=ttl_seconds)[0]
+
+    def record_probe_results(
+        self,
+        results: Sequence[RouteLeaseProbeResult],
+        *,
+        ttl_seconds: int,
+    ) -> list[RouteLeaseProbeReceipt]:
+        """Persist one bounded exact-generation result batch atomically."""
         if (type(ttl_seconds) is not int or  # pylint: disable=unidiomatic-typecheck
                 not 1 <= ttl_seconds <= MAX_ROUTE_TTL_SECONDS):
             raise RouteProjectionValidationError('Route lease TTL is invalid.')
-        record_id = uuid.UUID(target.replica_record_id)
-        identity = target.identity
+        if not isinstance(results, Sequence):
+            raise RouteProjectionValidationError(
+                'Route probe results must be a sequence.')
+        if len(results) > constants.SYSTEM_RECOVERY_ROUTE_MAX_REPLICAS:
+            raise RouteProjectionValidationError(
+                'Route probe result batch exceeds the bounded maximum.')
+        if not results:
+            return []
+        validated_results: list[RouteLeaseProbeResult] = []
+        for result in results:
+            if not isinstance(result, RouteLeaseProbeResult):
+                raise RouteProjectionValidationError(
+                    'Route probe result is invalid.')
+            validated_results.append(result)
+        identity = validated_results[0].target.identity
+        if any(result.target.identity != identity
+               for result in validated_results[1:]):
+            raise RouteProjectionValidationError(
+                'Route probe result batch mixes publisher identities.')
+        target_keys = [(result.target.replica_id,
+                        result.target.replica_record_id)
+                       for result in validated_results]
+        if len(set(target_keys)) != len(target_keys):
+            raise RouteProjectionValidationError(
+                'Route probe result batch contains a duplicate target.')
         try:
             with orm.Session(self.engine) as session, session.begin():
-                owner = session.execute(
-                    self._owner_query(
-                        identity.service_name,
-                        for_update=True)).mappings().one_or_none()
-                if owner is None or not _owner_matches(identity, owner):
-                    return RouteLeaseProbeReceipt(accepted=False)
-                lease = session.execute(
-                    sqlalchemy.select(_LEASES).where(
-                        _LEASES.c.service_name == identity.service_name,
-                        _LEASES.c.service_hash == identity.service_hash,
-                        _LEASES.c.replica_id == target.replica_id,
-                        _LEASES.c.replica_record_id == record_id,
-                    ).with_for_update()).mappings().one_or_none()
-                if (lease is None or lease['revoked_at'] is not None or
-                        lease['route_allowed'] is not True or
-                        lease['material_sha256'] != target.material_sha256 or
-                        lease['material_generation']
-                        != target.material_generation or
-                        lease['revocation_generation']
-                        != target.revocation_generation or
-                        not _replica_row_matches(session,
-                                                 target.replica_id,
-                                                 target.replica_record_id,
-                                                 target.service_version,
-                                                 identity.service_name,
-                                                 require_route_eligible=True)):
-                    return RouteLeaseProbeReceipt(accepted=False)
                 now = session.execute(
                     sqlalchemy.select(
                         sqlalchemy.func.clock_timestamp())).scalar_one()
                 valid_until = now + datetime.timedelta(seconds=ttl_seconds)
-                readiness_generation = int(lease['readiness_generation']) + 1
-                result = session.execute(
+                input_rows = sqlalchemy.values(
+                    sqlalchemy.column('replica_id', sqlalchemy.Integer),
+                    sqlalchemy.column('replica_record_id',
+                                      sqlalchemy.Uuid(as_uuid=True)),
+                    sqlalchemy.column('service_version', sqlalchemy.Integer),
+                    sqlalchemy.column('material_sha256', sqlalchemy.Text),
+                    sqlalchemy.column('material_generation',
+                                      sqlalchemy.BigInteger),
+                    sqlalchemy.column('revocation_generation',
+                                      sqlalchemy.BigInteger),
+                    sqlalchemy.column('succeeded', sqlalchemy.Boolean),
+                    name='probe_results').data([
+                        (result.target.replica_id,
+                         uuid.UUID(result.target.replica_record_id),
+                         result.target.service_version,
+                         result.target.material_sha256,
+                         result.target.material_generation,
+                         result.target.revocation_generation, result.succeeded)
+                        for result in validated_results
+                    ])
+                owner_is_current = sqlalchemy.exists(
+                    sqlalchemy.select(1).where(
+                        _SERVICES.c.name == identity.service_name,
+                        _SERVICES.c.hash == identity.service_hash,
+                        _SERVICES.c.pool == 0, _SERVICES.c.lifecycle_epoch ==
+                        identity.service_lifecycle_epoch,
+                        _SERVICES.c.controller_incarnation ==
+                        identity.controller_incarnation,
+                        _SERVICES.c.controller_owner_epoch ==
+                        identity.controller_owner_epoch,
+                        _SERVICES.c.controller_pid == identity.controller_pid,
+                        _SERVICES.c.controller_ip == identity.controller_ip))
+                replica_is_current = sqlalchemy.exists(
+                    sqlalchemy.select(1).where(
+                        _REPLICAS.c.service_name == identity.service_name,
+                        _REPLICAS.c.replica_id == input_rows.c.replica_id,
+                        _REPLICAS.c.version == input_rows.c.service_version,
+                        _REPLICAS.c.status ==
+                        serve_statuses.ReplicaStatus.READY.value,
+                        _REPLICAS.c.replica_state['replica_record_id'].
+                        as_string() == sqlalchemy.cast(
+                            input_rows.c.replica_record_id, sqlalchemy.Text)))
+                updated = session.execute(
                     sqlalchemy.update(_LEASES).where(
                         _LEASES.c.service_name == identity.service_name,
                         _LEASES.c.service_hash == identity.service_hash,
-                        _LEASES.c.replica_id == target.replica_id,
-                        _LEASES.c.replica_record_id == record_id,
-                        _LEASES.c.material_generation ==
-                        target.material_generation,
-                        _LEASES.c.revocation_generation ==
-                        target.revocation_generation,
-                        _LEASES.c.revoked_at.is_(None),
-                    ).values(
-                        readiness_generation=readiness_generation,
-                        ready=succeeded,
-                        observed_at=now,
-                        valid_until=valid_until,
-                    ))
-                if result.rowcount != 1:
-                    return RouteLeaseProbeReceipt(accepted=False)
-                return RouteLeaseProbeReceipt(
-                    accepted=True,
-                    readiness_generation=readiness_generation,
-                    valid_until=valid_until)
+                        _LEASES.c.replica_id == input_rows.c.replica_id,
+                        _LEASES.c.replica_record_id ==
+                        input_rows.c.replica_record_id,
+                        _LEASES.c.service_lifecycle_epoch ==
+                        identity.service_lifecycle_epoch,
+                        _LEASES.c.controller_incarnation ==
+                        identity.controller_incarnation,
+                        _LEASES.c.controller_owner_epoch ==
+                        identity.controller_owner_epoch,
+                        _LEASES.c.controller_pid == identity.controller_pid,
+                        _LEASES.c.controller_ip == identity.controller_ip,
+                        _LEASES.c.service_version ==
+                        input_rows.c.service_version,
+                        _LEASES.c.route_allowed.is_(True), _LEASES.c.
+                        material_sha256 == input_rows.c.material_sha256,
+                        _LEASES.c.material_generation == input_rows.c.
+                        material_generation, _LEASES.c.revocation_generation ==
+                        input_rows.c.revocation_generation,
+                        _LEASES.c.revoked_at.is_(None), owner_is_current,
+                        replica_is_current).values(
+                            readiness_generation=_LEASES.c.readiness_generation
+                            + 1,
+                            ready=input_rows.c.succeeded,
+                            observed_at=now,
+                            valid_until=valid_until).returning(
+                                _LEASES.c.replica_id,
+                                _LEASES.c.replica_record_id,
+                                _LEASES.c.readiness_generation,
+                                _LEASES.c.valid_until)).mappings().all()
+                accepted = {
+                    (int(row['replica_id']), str(row['replica_record_id'])): row
+                    for row in updated
+                }
+                receipts: list[RouteLeaseProbeReceipt] = []
+                for result in validated_results:
+                    row = accepted.get((result.target.replica_id,
+                                        result.target.replica_record_id))
+                    receipts.append(
+                        RouteLeaseProbeReceipt(
+                            accepted=row is not None,
+                            readiness_generation=(int(
+                                row['readiness_generation'])
+                                                  if row is not None else None),
+                            valid_until=(row['valid_until']
+                                         if row is not None else None)))
+                return receipts
         except sqlalchemy.exc.SQLAlchemyError as error:
             raise RouteProjectionUnavailable(
-                'PostgreSQL route probe result persistence failed.') from error
+                'PostgreSQL route probe result batch persistence failed.'
+            ) from error
 
     def revoke_replica(self, identity: RoutePublisherIdentity, replica_id: int,
                        replica_record_id: str, reason: str) -> int | None:

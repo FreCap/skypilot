@@ -271,6 +271,47 @@ def test_incremental_material_is_idempotent_and_probe_is_generation_fenced(
     assert row['ready'] is True
 
 
+def test_probe_result_batch_isolates_stale_sibling(route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    first_record_id = str(uuid.uuid4())
+    second_record_id = str(uuid.uuid4())
+    _insert_replica(engine, first_record_id, replica_id=1)
+    _insert_replica(engine, second_record_id, replica_id=2)
+    first_info = types.SimpleNamespace(replica_id=1,
+                                       replica_record_id=first_record_id,
+                                       version=1)
+    second_info = types.SimpleNamespace(replica_id=2,
+                                        replica_record_id=second_record_id,
+                                        version=1)
+    identity = _identity(incarnation)
+    repository.upsert_replica_material(identity, first_info, _material())
+    repository.upsert_replica_material(identity, second_info,
+                                       _material('http://10.0.0.2:8000'))
+    targets = repository.list_probe_targets(identity)
+    stale_first = targets[0]
+    current_second = targets[1]
+    repository.upsert_replica_material(identity, first_info,
+                                       _material('http://10.0.0.3:8000'))
+
+    receipts = repository.record_probe_results([
+        route_projection.RouteLeaseProbeResult(stale_first, True),
+        route_projection.RouteLeaseProbeResult(current_second, True),
+    ],
+                                               ttl_seconds=60)
+
+    assert [receipt.accepted for receipt in receipts] == [False, True]
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sqlalchemy.select(
+                route_projection_schema.serve_route_replica_leases_table.c.
+                replica_id,
+                route_projection_schema.serve_route_replica_leases_table.c.ready
+            ).order_by(route_projection_schema.serve_route_replica_leases_table.
+                       c.replica_id)).all()
+    assert rows == [(1, False), (2, True)]
+
+
 def test_revocation_rejects_delayed_probe_and_implicit_revival(route_database):
     engine, incarnation = route_database
     repository = route_projection.RouteProjectionRepository(engine)
