@@ -12,6 +12,7 @@ from sky.serve import serve_dashboard
 from sky.serve import serve_history
 from sky.serve import serve_state
 from sky.serve import serve_utils
+from sky.serve import zero_cost_actuation
 from sky.serve.server import core
 from sky.server import common as server_common
 from sky.server import stream_utils
@@ -239,6 +240,7 @@ async def current_demand(
             'service_name': service_name,
             'service_hash': expected_service_hash,
             **summary,
+            **zero_cost_actuation.unavailable_status_summary('non_consolidated'),
         }
     service = await asyncio.to_thread(serve_state.get_service_status_snapshot,
                                       service_name)
@@ -249,17 +251,28 @@ async def current_demand(
         raise fastapi.HTTPException(
             status_code=409,
             detail='Service incarnation changed. Refresh and retry.')
-    summary = await asyncio.to_thread(demand_state.get_request_summary,
-                                      service_name, expected_service_hash)
+    summary, actuation = await asyncio.gather(
+        asyncio.to_thread(demand_state.get_request_summary, service_name,
+                          expected_service_hash),
+        asyncio.to_thread(zero_cost_actuation.get_status_summary, service_name,
+                          expected_service_hash))
     if summary.get(
             'request_telemetry_reason') == 'service_incarnation_mismatch':
         raise fastapi.HTTPException(
             status_code=409,
             detail='Service incarnation changed. Refresh and retry.')
+    if actuation.get('zero_cost_actuation_reason') == 'service_hash_mismatch':
+        raise fastapi.HTTPException(
+            status_code=409,
+            detail='Service incarnation changed. Refresh and retry.')
+    if actuation.get('zero_cost_actuation_reason') == 'service_not_found':
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
     return {
         'service_name': service_name,
         'service_hash': expected_service_hash,
         **summary,
+        **actuation,
     }
 
 

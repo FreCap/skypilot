@@ -16,6 +16,7 @@ serve_zero_cost_actuation_intents_table = sqlalchemy.Table(
     sqlalchemy.Column('service_lifecycle_epoch',
                       sqlalchemy.BigInteger,
                       nullable=False),
+    sqlalchemy.Column('actuation_epoch', sqlalchemy.BigInteger, nullable=False),
     sqlalchemy.Column('service_version', sqlalchemy.Integer, nullable=False),
     sqlalchemy.Column('controller_owner', sqlalchemy.Text, nullable=False),
     sqlalchemy.Column('ordinal', sqlalchemy.Integer, nullable=False),
@@ -101,7 +102,8 @@ serve_zero_cost_actuation_intents_table = sqlalchemy.Table(
         "worker_projection_sha256 ~ '^[0-9a-f]{64}$'",
         name='serve052_zero_cost_intent_digest_ck'),
     sqlalchemy.CheckConstraint(
-        'service_lifecycle_epoch > 0 AND service_version > 0 AND ordinal >= 0 '
+        'service_lifecycle_epoch > 0 AND actuation_epoch > 0 AND '
+        'service_version > 0 AND ordinal >= 0 '
         'AND '
         'protocol_version = 2 AND policy_revision > 0 AND '
         'reconcile_generation > 0 AND allocation_generation > 0 AND '

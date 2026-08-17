@@ -804,6 +804,18 @@ describe('getServiceDemand', () => {
         request_queue_depth: 1,
         rejected_requests: 0,
         request_stats_age_seconds: 1.5,
+        zero_cost_actuation_status: 'available',
+        zero_cost_actuation_reason: 'complete',
+        zero_cost_actuation_mode: 'DURABLE_INTENT',
+        zero_cost_actuation_epoch: 1,
+        zero_cost_actuation_state_counts: {
+          GRANTED: 2,
+          ACTUATING: 1,
+          COMMITTED: 4,
+          RETRYABLE: 3,
+          TERMINAL: 5,
+        },
+        pending_zero_cost_actuation_count: 6,
       }),
     });
 
@@ -823,6 +835,16 @@ describe('getServiceDemand', () => {
       recentRequestCount: 12,
       requestRate: 0.2,
       inFlightRequests: 3,
+      zeroCostActuationMode: 'DURABLE_INTENT',
+      zeroCostActuationEpoch: 1,
+      pendingZeroCostActuationCount: 6,
+      zeroCostActuationStateCounts: {
+        GRANTED: 2,
+        ACTUATING: 1,
+        COMMITTED: 4,
+        RETRYABLE: 3,
+        TERMINAL: 5,
+      },
       legacyFallback: false,
     });
   });

@@ -2084,6 +2084,14 @@ function ServiceDetails() {
             directDemand.requestTelemetryCompatibilityComplete ?? null,
           requestReporterCount: directDemand.requestReporterCount ?? null,
           requestStatsAgeSeconds: directDemand.requestStatsAgeSeconds ?? null,
+          zeroCostActuationStatus: directDemand.zeroCostActuationStatus ?? null,
+          zeroCostActuationReason: directDemand.zeroCostActuationReason ?? null,
+          zeroCostActuationMode: directDemand.zeroCostActuationMode ?? null,
+          zeroCostActuationEpoch: directDemand.zeroCostActuationEpoch ?? null,
+          zeroCostActuationStateCounts:
+            directDemand.zeroCostActuationStateCounts ?? null,
+          pendingZeroCostActuationCount:
+            directDemand.pendingZeroCostActuationCount ?? null,
         }
       : {};
     const directDemandMetrics =
@@ -2548,6 +2556,23 @@ export function ServiceDetailCard({
   });
 
   const requestDetails = [];
+  const actuationCounts = serviceData.zeroCostActuationStateCounts;
+  const actuationDetails = [];
+  if (serviceData.zeroCostActuationMode) {
+    actuationDetails.push(
+      serviceData.zeroCostActuationMode === 'DURABLE_INTENT'
+        ? `durable intent · epoch ${serviceData.zeroCostActuationEpoch}`
+        : 'direct replica (not promoted)'
+    );
+  }
+  if (actuationCounts) {
+    actuationDetails.push(
+      `${actuationCounts.GRANTED} granted · ${actuationCounts.ACTUATING} actuating · ${actuationCounts.RETRYABLE} retryable`
+    );
+    actuationDetails.push(
+      `${actuationCounts.COMMITTED} committed · ${actuationCounts.TERMINAL} terminal`
+    );
+  }
   const usesLogicalReplicas = serviceData.replicaUnit === 'logical';
   const logicalCapacityUnverified =
     usesLogicalReplicas &&
@@ -2796,6 +2821,23 @@ export function ServiceDetailCard({
               {requestDetails.length > 0 && (
                 <div className="text-xs text-gray-500 mt-1">
                   {requestDetails.join(' · ')}
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-gray-600 font-medium text-base">
+                Reserved fill grants
+              </div>
+              <div className="text-base mt-1">
+                {serviceData.pendingZeroCostActuationCount != null
+                  ? `${serviceData.pendingZeroCostActuationCount.toLocaleString()} pending before replica rows`
+                  : metadataDeferred
+                    ? deferredValue
+                    : 'Unavailable'}
+              </div>
+              {actuationDetails.length > 0 && (
+                <div className="text-xs text-gray-500 mt-1">
+                  {actuationDetails.join(' · ')}
                 </div>
               )}
             </div>

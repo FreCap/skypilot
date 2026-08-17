@@ -14,8 +14,11 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky import clouds
 from sky.serve import capacity_admission
+from sky.serve import pool_capacity_observation_schema
+from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
+from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_utils
 from sky.serve import spot_placer
@@ -124,6 +127,9 @@ def actuation_database(empty_postgres, monkeypatch):
                 controller_pid=_CONTROLLER_PID,
                 controller_ip=_CONTROLLER_IP,
                 controller_port=_CONTROLLER_PORT,
+                ordinary_launch_binding_capable=True,
+                ordinary_launch_binding_mode='bound',
+                ordinary_launch_binding_epoch=1,
                 reserved_fill_actuation_mode='DURABLE_INTENT',
                 reserved_fill_actuation_epoch=1,
                 reserved_fill_actuation_capable=True,
@@ -169,6 +175,156 @@ def test_grant_is_idempotent_and_allocates_no_replica(
     assert len(rows) == 2
     assert {row['state'] for row in rows} == {'GRANTED'}
     assert replica_count == 0
+
+
+def test_status_summary_keeps_intents_separate_from_replicas(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=2)
+    repository.grant_plan('svc', plan, max_capacity=2)
+
+    summary = zero_cost_actuation.get_status_summary('svc',
+                                                     _SERVICE_HASH,
+                                                     engine=actuation_database)
+
+    assert summary == {
+        'zero_cost_actuation_status': 'available',
+        'zero_cost_actuation_reason': 'complete',
+        'zero_cost_actuation_mode': 'DURABLE_INTENT',
+        'zero_cost_actuation_epoch': 1,
+        'zero_cost_actuation_state_counts': {
+            'GRANTED': 2,
+            'ACTUATING': 0,
+            'COMMITTED': 0,
+            'RETRYABLE': 0,
+            'TERMINAL': 0,
+        },
+        'pending_zero_cost_actuation_count': 2,
+    }
+    assert zero_cost_actuation.get_status_summary(
+        'svc', 'stale-hash', engine=actuation_database
+    ) == zero_cost_actuation.unavailable_status_summary('service_hash_mismatch')
+
+
+def test_capability_advertisement_does_not_promote_service(
+        actuation_database) -> None:
+    services = serve_state_schema.services_table
+    with actuation_database.begin() as connection:
+        incarnation = connection.execute(
+            sqlalchemy.select(services.c.controller_incarnation).where(
+                services.c.name == 'svc')).scalar_one()
+        connection.execute(
+            sqlalchemy.update(services).where(services.c.name == 'svc').values(
+                reserved_fill_actuation_mode='DIRECT_REPLICA',
+                reserved_fill_actuation_epoch=0,
+                reserved_fill_actuation_capable=False,
+                reserved_fill_actuation_controller_incarnation=None,
+                reserved_fill_actuation_protocol_version=None))
+
+    mode = zero_cost_actuation.advertise_capability('svc',
+                                                    incarnation,
+                                                    engine=actuation_database)
+
+    with actuation_database.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == 'svc')).mappings().one()
+    assert mode is zero_cost_actuation.ActuationMode.DIRECT_REPLICA
+    assert service['reserved_fill_actuation_mode'] == 'DIRECT_REPLICA'
+    assert service['reserved_fill_actuation_epoch'] == 0
+    assert service['reserved_fill_actuation_capable'] is True
+    assert (service['reserved_fill_actuation_controller_incarnation'] ==
+            incarnation)
+    assert service['reserved_fill_actuation_protocol_version'] == 1
+
+
+def test_promotion_requires_fleet_barrier_and_is_one_way(
+        actuation_database) -> None:
+    services = serve_state_schema.services_table
+    with actuation_database.begin() as connection:
+        incarnation = connection.execute(
+            sqlalchemy.select(services.c.controller_incarnation).where(
+                services.c.name == 'svc')).scalar_one()
+        connection.execute(
+            sqlalchemy.update(services).where(services.c.name == 'svc').values(
+                reserved_fill_actuation_mode='DIRECT_REPLICA',
+                reserved_fill_actuation_epoch=0,
+                ordinary_launch_binding_epoch=2,
+                non_pool_launch_binding_capable=True,
+                non_pool_launch_controller_incarnation=incarnation,
+                non_pool_launch_binding_protocol_version=2,
+                non_pool_launch_capability_profile_set_digest='a' * 64,
+                non_pool_launch_capability_cohort_epoch=1,
+                non_pool_launch_receipt_protocol_version=1,
+                route_source_mode='DURABLE_PROJECTED',
+                route_source_epoch=1,
+                route_projection_capable=True,
+                route_projection_controller_incarnation=incarnation,
+                route_projection_protocol_version=2,
+                demand_source_mode='DURABLE_FEED',
+                demand_source_epoch=1,
+                demand_authority_capable=True,
+                demand_authority_controller_incarnation=incarnation,
+                demand_authority_protocol_version=1))
+        connection.execute(
+            sqlalchemy.update(
+                pool_capacity_observation_schema.protocol_state_sequence_table).
+            where(pool_capacity_observation_schema.
+                  protocol_state_sequence_table.c.id == 1).values(
+                      protocol_version=2,
+                      image_digest='sha256:' + '1' * 64,
+                      deployment_generation='deployment-1',
+                      deployment_uid='deployment-uid-1',
+                      pod_inventory_count=1,
+                      pod_inventory_sha256='2' * 64,
+                      reconciliation_gate_state='SEQUENCED_ACTIVE',
+                      reconciliation_gate_generation=1,
+                      reclaim_fleet_bundle_sha256='3' * 64,
+                      reclaim_policy_revision='reclaim-v1',
+                      reclaim_provider_inventory_sha256='4' * 64,
+                      reclaim_claim_scope_count=0,
+                      reclaim_claim_scope_sha256='5' * 64,
+                      reclaim_evidence_sha256='6' * 64,
+                      reclaim_authorized_at=1.0))
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationUnavailable):
+        with actuation_database.begin() as connection:
+            zero_cost_actuation.promote_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=incarnation,
+                expected_actuation_epoch=0,
+                participant_barrier_passed=False)
+    with actuation_database.begin() as connection:
+        epoch = zero_cost_actuation.promote_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=incarnation,
+            expected_actuation_epoch=0,
+            participant_barrier_passed=True)
+    assert epoch == 1
+    with actuation_database.connect() as connection:
+        service = connection.execute(
+            sqlalchemy.select(services).where(
+                services.c.name == 'svc')).mappings().one()
+    assert service['reserved_fill_actuation_mode'] == 'DURABLE_INTENT'
+    assert service['reserved_fill_actuation_epoch'] == 1
+    with actuation_database.begin() as connection:
+        assert zero_cost_actuation.promote_service_in_connection(
+            connection,
+            service_name='svc',
+            controller_incarnation=incarnation,
+            expected_actuation_epoch=0,
+            participant_barrier_passed=False) == 1
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict):
+        with actuation_database.begin() as connection:
+            zero_cost_actuation.promote_service_in_connection(
+                connection,
+                service_name='svc',
+                controller_incarnation=incarnation,
+                expected_actuation_epoch=1,
+                participant_barrier_passed=True)
 
 
 def test_pending_grants_enforce_headroom_and_debit_paid_residual(
@@ -230,6 +386,115 @@ def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:
                                     lease_seconds=30)
     assert retried is not None
     assert retried.generation == east_lease.generation + 1
+
+
+def _replica_for_intent(intent: reserved_fill_planner.FillIntent,
+                        replica_id: int) -> replica_managers.ReplicaInfo:
+    location = intent.allowed_locations[0].to_location()
+    info = replica_managers.ReplicaInfo(
+        replica_id=replica_id,
+        cluster_name=f'svc-{replica_id}',
+        replica_port='8080',
+        is_spot=False,
+        location=location,
+        version=intent.service_version,
+        resources_override=location.to_dict(),
+        planned_capacity=intent.capacity_unit.intent_cost(
+            intent.accelerator_count))
+    info.reserved_fill = True
+    info.is_zero_cost = True
+    info.reserved_fill_pool_key = intent.pool_key
+    info.reserved_fill_service_generation = intent.service_generation
+    info.reserved_fill_physical_cluster_uid = intent.physical_cluster_uid
+    info.reserved_fill_kubernetes_context = intent.allowed_locations[0].region
+    info.reserved_fill_allocation_generation = intent.allocation_generation
+    info.reserved_fill_allocation_input_sha256 = intent.allocation_input_sha256
+    info.reserved_fill_allocation_claim_generation = (
+        intent.allocation_claim_generation)
+    info.reserved_fill_reconciliation_gate_generation = (
+        intent.reconciliation_gate_generation)
+    info.reserved_fill_reclaim_fleet_bundle_sha256 = (
+        intent.reclaim_fleet_bundle_sha256)
+    info.reserved_fill_reclaim_policy_revision = intent.reclaim_policy_revision
+    info.reserved_fill_reclaim_provider_inventory_sha256 = (
+        intent.reclaim_provider_inventory_sha256)
+    info.reserved_fill_worker_projection_sha256 = (
+        intent.worker_projection_sha256)
+    info.reserved_fill_observation_generation = intent.observation_generation
+    info.reserved_fill_observation_sequence = intent.observation_sequence
+    info.reserved_fill_intent_idempotency_key = intent.idempotency_key
+    return info
+
+
+def test_replica_and_intent_commit_in_one_transaction(
+        actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    repository.grant_plan('svc', plan, max_capacity=1)
+    lease = repository.lease_next(service_name='svc',
+                                  pool_key=plan.intents[0].pool_key,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=30)
+    assert lease is not None
+    info = _replica_for_intent(lease.intent, 1)
+    record_id = uuid.UUID(info.replica_record_id)
+
+    with actuation_database.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                **serve_state._replica_row_values('svc', 1, info)))
+        zero_cost_actuation.commit_lease_in_connection(
+            connection,
+            lease,
+            service_name='svc',
+            replica_id=1,
+            replica_record_id=record_id,
+            replica_info=info)
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.connect() as connection:
+        row = connection.execute(sqlalchemy.select(intents)).mappings().one()
+    assert row['state'] == 'COMMITTED'
+    assert row['replica_id'] == 1
+    assert row['replica_record_id'] == record_id
+
+
+def test_intent_mismatch_rolls_back_replica_insert(actuation_database) -> None:
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    plan = _plan(free_slots=1)
+    repository.grant_plan('svc', plan, max_capacity=1)
+    lease = repository.lease_next(service_name='svc',
+                                  pool_key=plan.intents[0].pool_key,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=30)
+    assert lease is not None
+    info = _replica_for_intent(lease.intent, 1)
+    info.reserved_fill_physical_cluster_uid = 'different-uid'
+
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict):
+        with actuation_database.begin() as connection:
+            connection.execute(
+                sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                    **serve_state._replica_row_values('svc', 1, info)))
+            zero_cost_actuation.commit_lease_in_connection(
+                connection,
+                lease,
+                service_name='svc',
+                replica_id=1,
+                replica_record_id=uuid.UUID(info.replica_record_id),
+                replica_info=info)
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.connect() as connection:
+        replica_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one()
+        state = connection.execute(sqlalchemy.select(
+            intents.c.state)).scalar_one()
+    assert replica_count == 0
+    assert state == 'ACTUATING'
 
 
 def test_expired_retryable_grant_releases_paid_debit(

@@ -67,6 +67,7 @@ if typing.TYPE_CHECKING:
     from sky.serve import resource_action_state
     from sky.serve import route_projection
     from sky.serve import service_spec
+    from sky.serve import zero_cost_actuation
 else:
     placement_contract_normalization = adaptors_common.LazyImport(
         'sky.serve.placement_contract_normalization')
@@ -80,6 +81,8 @@ else:
         'sky.serve.resource_action_state')
     route_projection = adaptors_common.LazyImport('sky.serve.route_projection')
     service_spec = adaptors_common.LazyImport('sky.serve.service_spec')
+    zero_cost_actuation = adaptors_common.LazyImport(
+        'sky.serve.zero_cost_actuation')
 
 replica_info_lib = adaptors_common.LazyImport('sky.serve.replica_info')
 reserved_capacity = adaptors_common.LazyImport('sky.serve.reserved_capacity')
@@ -126,6 +129,11 @@ _POST_SERVE037_SERVICE_COLUMN_NAMES = frozenset({
     'demand_authority_capable',
     'demand_authority_controller_incarnation',
     'demand_authority_protocol_version',
+    'reserved_fill_actuation_mode',
+    'reserved_fill_actuation_epoch',
+    'reserved_fill_actuation_capable',
+    'reserved_fill_actuation_controller_incarnation',
+    'reserved_fill_actuation_protocol_version',
 })
 _SERVE037_SERVICE_COLUMNS = tuple(
     column for column in services_table.c
@@ -10816,6 +10824,8 @@ def add_replica_if_round_epoch(
     expected_physical_cluster_uid: str | None = None,
     expected_ordinary_zero_cost_admission_sequence: int | None = None,
     expected_lease_token: int | None = None,
+    expected_actuation_mode: str | None = None,
+    actuation_lease: 'zero_cost_actuation.IntentLease | None' = None,
 ) -> bool:
     """Persist a fill row iff every protocol, set, claim, and round fence holds.
 
@@ -10847,6 +10857,19 @@ def add_replica_if_round_epoch(
          replica_info.zero_cost_materialization_sequence is not None)):
         raise ValueError('New zero-cost replica sequences must be assigned '
                          'by PostgreSQL.')
+    if expected_actuation_mode is not None:
+        try:
+            actuation_mode = zero_cost_actuation.ActuationMode(
+                expected_actuation_mode)
+        except ValueError as error:
+            raise ValueError('Expected actuation mode is invalid.') from error
+        if ((actuation_lease is None)
+                != (actuation_mode
+                    is zero_cost_actuation.ActuationMode.DIRECT_REPLICA)):
+            raise ValueError('Durable actuation mode requires one exact lease; '
+                             'direct mode forbids a lease.')
+    elif actuation_lease is not None:
+        raise ValueError('An actuation lease requires an expected mode.')
     engine = _db_manager.get_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
         # A PostgreSQL fill persist is safe only when its caller minted the
@@ -10885,6 +10908,7 @@ def add_replica_if_round_epoch(
             owner = None
             owner_required = (
                 expected_service_hash is not None or
+                expected_actuation_mode is not None or
                 (expected_protocol_version == RESERVED_FILL_PROTOCOL_V2 and
                  gate_state
                  == pool_capacity_observation_schema.SEQUENCED_ACTIVE))
@@ -10896,7 +10920,8 @@ def add_replica_if_round_epoch(
                         services_table.c.current_version,
                         services_table.c.logical_replica_semantics,
                         services_table.c.status,
-                        services_table.c.resource_scope).where(
+                        services_table.c.resource_scope,
+                        services_table.c.reserved_fill_actuation_mode).where(
                             services_table.c.name ==
                             service_name).with_for_update()).fetchone()
                 if owner is None:
@@ -10906,6 +10931,10 @@ def add_replica_if_round_epoch(
                         owner[0] != expected_service_hash or
                     (expected_controller_owner is not None and
                      (owner[1], owner[2]) != expected_controller_owner)):
+                    session.rollback()
+                    return False
+                if (expected_actuation_mode is not None and
+                        owner[7] != expected_actuation_mode):
                     session.rollback()
                     return False
             spec_blob: bytes | None = None
@@ -11249,6 +11278,21 @@ def add_replica_if_round_epoch(
             insert_stmt = _upsert_insert_func(engine)(replicas_table).values(
                 **row_values)
             session.execute(insert_stmt)
+            if actuation_lease is not None:
+                try:
+                    replica_record_id = uuid.UUID(
+                        transaction_replica_info.replica_record_id)
+                    zero_cost_actuation.commit_lease_in_connection(
+                        session.connection(),
+                        actuation_lease,
+                        service_name=service_name,
+                        replica_id=replica_id,
+                        replica_record_id=replica_record_id,
+                        replica_info=transaction_replica_info)
+                except (TypeError, ValueError,
+                        zero_cost_actuation.ZeroCostActuationError):
+                    session.rollback()
+                    return False
             session.commit()
         _publish_committed_zero_cost_sequences(caller_infos, transaction_infos)
         return True

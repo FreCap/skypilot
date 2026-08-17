@@ -15,6 +15,20 @@ the API deployment is ready with zero restarts. No load-balancer slot, service
 version, authority mode, or `boltz-platform` pin changed in this direct Helm
 rollout.
 
+P2d Serve052/API-request-015 is now implemented locally on
+`feat/serve-zero-cost-actuation-intents` and remains unmerged and undeployed.
+It adds the durable intent ledger, API89's exact protocol-2 paid-admission
+fleet barrier, broker publication, per-physical-pool executor, atomic
+intent-to-replica accounting transfer, one-way promotion endpoint, and dark
+capability advertisement. The direct demand endpoint and service UI also expose
+the actuation mode, epoch, pending-before-row count, and state counts separately
+from replica/provider state. The focused local verification is green: 13
+real-PostgreSQL admission/migration tests, 81 manager/broker/binding tests, and
+129 dashboard tests. The complete affected admission surfaces are also green:
+145 API-request PostgreSQL tests and 31 capacity-admission/refill tests.
+Production remains `DIRECT_REPLICA`; no authority promotion or capacity action
+has occurred.
+
 P2c API88/Serve051 is merged in PR #1531 and deployed dark. Its complete remote
 PostgreSQL run passed 17,471 tests (plus 199 subtests), and the final affected
 local PostgreSQL run passed 293 tests. The first production qualification found
@@ -173,7 +187,7 @@ The exact post-#1503 P2b2 review scope was 42 files with 4,298 insertions and
 implemented and tested, but production disproved one of their prerequisites.
 They remain unmerged and undeployed. P2c and P2d below are now required first;
 after their two additive Serve revisions, #1506 must be restacked as
-API015/Serve053 and #1510 immediately above it as API016/Serve054.
+API016/Serve053 and #1510 immediately above it as API017/Serve054.
 
 Last updated: 2026-08-17
 
@@ -636,8 +650,10 @@ idempotency key makes repeated broker rounds one intent. Its states are:
 - `GRANTED`: accepted zero-cost capacity, with no replica or API request;
 - `ACTUATING`: one executor owns the exact pool-lane lease and provider-phase
   admission; still no provider effect is inferred;
-- `COMMITTED`: the executor atomically created the exact replica, generic
-  association/request, and intent-to-replica receipt while retaining the lane;
+- `COMMITTED`: the executor atomically created the exact replica profile and
+  intent-to-replica receipt while retaining the lane; generic non-pool request
+  admission follows from that durable profile through the existing bounded
+  association protocol;
 - `RETRYABLE`: the lane was unavailable or the executor lost ownership before
   row creation, so no replica exists and the same intent may be leased again;
 - `TERMINAL`: the grant expired, was superseded, or failed validation before
@@ -649,7 +665,10 @@ bound to the current controller incarnation and protocol 1. New binaries
 advertise capability without changing the mode. Promotion is an explicit
 PostgreSQL transaction that requires the current generic non-pool binding,
 current protocol-2 reserved-fill authority, no direct admission in flight, and
-the exact controller capability. After promotion, a missing or unavailable
+the exact controller capability. It also requires every live API request
+participant to advertise API-request-015 ordered-capacity protocol 2, proving
+that paid admission debits pending intents during a rolling deployment. After
+promotion, a missing or unavailable
 intent repository fails closed; it never falls back to direct replica
 materialization. This is the single transition boundary removed by #1506.
 
@@ -657,11 +676,13 @@ The per-pool executor leases one intent with PostgreSQL fencing, then acquires
 the process provider phase and physical-cluster identity fence before it may
 materialize a replica row. If either lane is busy, it returns the intent to
 `RETRYABLE`; it must not allocate a replica ID or API request. Once row/action
-creation commits, the generic non-pool executor and its termination evidence
-own every ambiguous outcome. A crash before that commit leaves only a lease
-that can expire; a crash after it leaves an exact association that existing
-recovery can reconcile. Executors for other physical pools proceed
-independently.
+creation commits, the existing generic non-pool admission and executor own the
+request and all provider effects. A crash before the atomic row commit leaves
+only a lease that can expire. A crash after the row commit but before request
+admission leaves an exact durable generic profile that existing pre-admission
+retirement can prove safe or a later association can adopt; a crash after
+request admission has the existing exact association and termination evidence.
+Executors for other physical pools proceed independently.
 
 An unexpired `GRANTED`, `ACTUATING`, or `RETRYABLE` intent is pending zero-cost
 capacity in the paid-residual transaction, bounded by the broker allocation
@@ -1184,24 +1205,38 @@ the generic non-pool executor remains the sole owner after a replica/action
 commit. The old broker-to-manager direct row materialization remains only for
 services outside the protocol-2 cohort during rollout.
 
-Implementation is split into four reviewable commits in one PR stacked on
-P2c:
+Implementation is split into two reviewable commits in one PR stacked on P2c:
 
 1. intent schema/repository, idempotency, TTL, state reducer, and paid-residual
-   debit;
-2. broker publication of exact intents without replica allocation;
-3. per-pool leasing, provider/physical-fence admission, and atomic
-   intent-to-replica/generic-action commit; and
-4. restart recovery, observability/UI status, migration tooling, and removal
-   manifest integration.
+   debit; and
+2. API-request-015's fleet barrier, broker publication without replica
+   allocation, per-pool leasing, provider/physical-fence admission, atomic
+   intent-to-replica commit, restart recovery, and observability/UI status.
 
-Estimated size is 1,800--3,200 source/test additions across 22--35 files and
-one Serve migration. Required tests hold one pool's provider phase indefinitely
+The earlier four-commit estimate was collapsed because broker publication,
+the API015 barrier, and execution are one fail-closed authority change: no
+intermediate commit should advertise or admit a durable grant without both its
+paid-capacity debit and its executor. The schema/repository remains an
+independently reviewable first commit; the second is the complete dark path.
+
+Estimated size is 1,800--3,400 source/test additions across 22--38 files and
+one Serve plus one API-request migration. Required tests hold one pool's
+provider phase indefinitely
 and assert repeated broker rounds create one intent and zero replicas/requests,
 while another pool materializes normally. Crash injection covers every state
 boundary. PostgreSQL tests prove a pending intent debits paid residual exactly
 once, expiry releases it, `COMMITTED` transfers accounting to the replica, and
 reserved fill can never select Spot or On-Demand.
+
+The implemented diff is approximately 3,000 additions across 30 files over the
+two commits, including tests and the canonical design. The focused P2d surface
+passes locally: 13 real-PostgreSQL ledger/API-fleet tests, 81
+manager/broker/binding tests, and 129 dashboard tests. The PostgreSQL suite
+includes lost-response promotion idempotency and atomic intent-to-replica
+accounting transfer; the manager suite includes a held east-pool lane while a
+west-pool intent materializes independently. All 145 API-request PostgreSQL
+tests and all 31 capacity-admission/refill tests pass against the new schema
+heads as well.
 
 #1506 is also the stacked removal for P2d: after every non-pool service uses the
 intent executor and the direct-path usage counter remains zero for the
@@ -1211,10 +1246,10 @@ the same exact production evidence gate.
 
 ### P3: blocked steady-state cleanup
 
-Restack the first cleanup (#1506) onto P2d as API015/Serve053 and keep it draft
+Restack the first cleanup (#1506) onto P2d as API016/Serve053 and keep it draft
 and blocked; API013/API014 remain owned by G1Sb/G1Se executor-termination
 evidence. Restack the second cleanup (#1510) immediately above it as
-API016/Serve054. After the documented rollout gates, the two cleanup PRs remove
+API017/Serve054. After the documented rollout gates, the two cleanup PRs remove
 controller-coupled telemetry ingestion, the protocol-1 all-fleet route
 publisher, direct broker-to-replica fill, unbound non-pool admission/recovery,
 the ordinary-only handler alias, global startup recovery waiting,
@@ -1519,8 +1554,8 @@ dark deployment gate.
 - [x] Complete the first G1S restack of draft #1506 as API015/Serve051 and run
   its full remote CI; complete the local API016/Serve052 #1510 restack and its
   real-PostgreSQL API-request suite. Both remain draft and undeployed.
-- [ ] After P2c/P2d, restack #1506 as API015/Serve053 and #1510 immediately
-  above it as API016/Serve054, expand #1506 with both transition removals, and
+- [ ] After P2d, restack #1506 as API016/Serve053 and #1510 immediately
+  above it as API017/Serve054, expand #1506 with both transition removals, and
   adversarially re-review the exact diffs before either is eligible to merge.
 - [x] Pass the complete G1S precursor crash/mixed-version/provider-evidence
   qualification and record it in merged PR #1528.
@@ -1570,9 +1605,13 @@ dark deployment gate.
   renewals, converged 130/130 current material/readiness rows, and admitted no
   post-upgrade replica or paid launch. Route authority remains dark pending
   P2d and the combined promotion gates.
-- [ ] Implement, adversarially review, and merge P2d Serve052 with its
-  simultaneously maintained #1506 removal diff; deploy dark and prove busy
-  pool, crash, no-paid-spill, and accounting-transfer gates.
+- [ ] Merge P2d Serve052/API-request-015 with its simultaneously maintained
+  #1506 removal diff and deploy dark. Local implementation and adversarial
+  review are complete: 13 PostgreSQL, 81 manager/broker/binding, and 129
+  dashboard tests pass, including pool isolation, promotion retry, and atomic
+  accounting transfer; the full 145-test API-request PostgreSQL and 31-test
+  capacity-admission/refill surfaces also pass. Production dark-rollout and
+  no-paid-spill evidence remain open.
 - [x] Replace the stale revision-407 PHX deployment-policy identities with
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in

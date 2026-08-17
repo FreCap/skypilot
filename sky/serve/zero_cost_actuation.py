@@ -11,6 +11,7 @@ import uuid
 import sqlalchemy
 
 from sky.serve import controller_transport
+from sky.serve import pool_capacity_observation_schema
 from sky.serve import reserved_fill_planner
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
@@ -22,6 +23,8 @@ PROTOCOL_VERSION = 1
 _SERVICES = serve_state_schema.services_table
 _REPLICAS = serve_state_schema.replicas_table
 _INTENTS = (zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+_PROTOCOL = serve_state_schema.reserved_fill_protocol_state_table
+_SEQUENCE = pool_capacity_observation_schema.protocol_state_sequence_table
 _PENDING_STATES = frozenset({'GRANTED', 'ACTUATING', 'RETRYABLE'})
 _TERMINAL_REPLICA_STATUSES = frozenset({
     'SHUTTING_DOWN',
@@ -66,9 +69,89 @@ class IntentLease:
 
     intent: reserved_fill_planner.FillIntent
     service_lifecycle_epoch: int
+    actuation_epoch: int
     owner: uuid.UUID
     generation: int
     expires_at: datetime.datetime
+
+
+def unavailable_status_summary(reason: str) -> dict[str, Any]:
+    """Return the stable public status shape when the ledger is unavailable."""
+    return {
+        'zero_cost_actuation_status': 'unavailable',
+        'zero_cost_actuation_reason': reason,
+        'zero_cost_actuation_mode': None,
+        'zero_cost_actuation_epoch': None,
+        'zero_cost_actuation_state_counts': None,
+        'pending_zero_cost_actuation_count': None,
+    }
+
+
+def get_status_summary(
+    service_name: str,
+    service_hash: str,
+    *,
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> dict[str, Any]:
+    """Read provider-free ledger counts for one exact service incarnation."""
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(service_hash, str) or not service_hash):
+        raise ValueError('Actuation status requires an exact service identity.')
+    database = engine or serve_state_schema.get_database_engine()
+    try:
+        with database.connect() as connection:
+            _require_postgres(connection)
+            service = connection.execute(
+                sqlalchemy.select(
+                    _SERVICES.c.hash, _SERVICES.c.pool,
+                    _SERVICES.c.reserved_fill_actuation_mode,
+                    _SERVICES.c.reserved_fill_actuation_epoch).where(
+                        _SERVICES.c.name ==
+                        service_name)).mappings().one_or_none()
+            if service is None or service['pool'] != 0:
+                return unavailable_status_summary('service_not_found')
+            if service['hash'] != service_hash:
+                return unavailable_status_summary('service_hash_mismatch')
+            try:
+                mode = ActuationMode(service['reserved_fill_actuation_mode'])
+                epoch = int(service['reserved_fill_actuation_epoch'])
+            except (TypeError, ValueError) as error:
+                raise ZeroCostActuationConflict(
+                    'Actuation status found malformed service state.'
+                ) from error
+            rows = connection.execute(
+                sqlalchemy.select(
+                    _INTENTS.c.state,
+                    sqlalchemy.func.count().label(  # pylint: disable=not-callable
+                        'count')).where(
+                            _INTENTS.c.service_name == service_name,
+                            _INTENTS.c.service_hash == service_hash).group_by(
+                                _INTENTS.c.state)).mappings().all()
+        counts = {state.value: 0 for state in IntentState}
+        for row in rows:
+            try:
+                state = IntentState(row['state'])
+            except (TypeError, ValueError) as error:
+                raise ZeroCostActuationConflict(
+                    'Actuation status found an unknown intent state.'
+                ) from error
+            count = row['count']
+            if (not isinstance(count, int) or isinstance(count, bool) or
+                    count < 0):
+                raise ZeroCostActuationConflict(
+                    'Actuation status found a malformed state count.')
+            counts[state.value] = count
+        return {
+            'zero_cost_actuation_status': 'available',
+            'zero_cost_actuation_reason': 'complete',
+            'zero_cost_actuation_mode': mode.value,
+            'zero_cost_actuation_epoch': epoch,
+            'zero_cost_actuation_state_counts': counts,
+            'pending_zero_cost_actuation_count': sum(
+                counts[state] for state in _PENDING_STATES),
+        }
+    except (sqlalchemy.exc.SQLAlchemyError, ZeroCostActuationError):
+        return unavailable_status_summary('database_unavailable')
 
 
 def _require_postgres(connection: sqlalchemy.engine.Connection) -> None:
@@ -86,6 +169,7 @@ def _intent_values(
     *,
     service_name: str,
     service_lifecycle_epoch: int,
+    actuation_epoch: int,
 ) -> dict[str, Any]:
     intent.__post_init__()
     planned_capacity = intent.capacity_unit.intent_cost(
@@ -95,6 +179,7 @@ def _intent_values(
         'service_name': service_name,
         'service_hash': intent.service_incarnation,
         'service_lifecycle_epoch': service_lifecycle_epoch,
+        'actuation_epoch': actuation_epoch,
         'service_version': intent.service_version,
         'controller_owner': intent.controller_owner,
         'ordinal': intent.ordinal,
@@ -289,6 +374,301 @@ def pending_capacity_in_connection(
     return result
 
 
+def advertise_capability(
+    service_name: str,
+    controller_incarnation: uuid.UUID,
+    *,
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> ActuationMode:
+    """Bind protocol support to the current controller without promotion."""
+    if (not isinstance(service_name, str) or not service_name or
+            not isinstance(controller_incarnation, uuid.UUID)):
+        raise ValueError('Actuation capability requires exact service owner.')
+    database = engine or serve_state_schema.get_database_engine()
+    try:
+        with database.begin() as connection:
+            _require_postgres(connection)
+            service = connection.execute(
+                sqlalchemy.select(_SERVICES).where(
+                    _SERVICES.c.name ==
+                    service_name).with_for_update()).mappings().one_or_none()
+            if (service is None or service['pool'] != 0 or
+                    service['controller_incarnation']
+                    != controller_incarnation):
+                raise ZeroCostActuationConflict(
+                    'Actuation capability lost the current service owner.')
+            try:
+                mode = ActuationMode(service['reserved_fill_actuation_mode'])
+            except (TypeError, ValueError) as error:
+                raise ZeroCostActuationConflict(
+                    'Actuation capability found an unknown service mode.'
+                ) from error
+            connection.execute(
+                sqlalchemy.update(_SERVICES).where(
+                    _SERVICES.c.name == service_name,
+                    _SERVICES.c.controller_incarnation ==
+                    controller_incarnation).values(
+                        reserved_fill_actuation_capable=True,
+                        reserved_fill_actuation_controller_incarnation=(
+                            controller_incarnation),
+                        reserved_fill_actuation_protocol_version=(
+                            PROTOCOL_VERSION)))
+            return mode
+    except sqlalchemy.exc.SQLAlchemyError as error:
+        raise ZeroCostActuationUnavailable(
+            'Actuation capability database transaction failed.') from error
+
+
+def promote_service_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    *,
+    service_name: str,
+    controller_incarnation: uuid.UUID,
+    expected_actuation_epoch: int,
+    participant_barrier_passed: bool,
+) -> int:
+    """Make durable intents the sole fill admission path, once."""
+    _require_postgres(connection)
+    if (not isinstance(controller_incarnation, uuid.UUID) or
+            isinstance(expected_actuation_epoch, bool) or
+            not isinstance(expected_actuation_epoch, int) or
+            expected_actuation_epoch < 0):
+        raise ValueError('Actuation promotion requires an exact epoch owner.')
+    service = connection.execute(
+        sqlalchemy.select(_SERVICES).where(_SERVICES.c.name == service_name).
+        with_for_update()).mappings().one_or_none()
+    if service is None:
+        raise ZeroCostActuationConflict('Service no longer exists.')
+    try:
+        mode = ActuationMode(service['reserved_fill_actuation_mode'])
+        status = serve_statuses.ServiceStatus(service['status'])
+    except (TypeError, ValueError) as error:
+        raise ZeroCostActuationConflict(
+            'Actuation promotion found malformed service state.') from error
+    if mode is ActuationMode.DURABLE_INTENT:
+        if (service['reserved_fill_actuation_epoch']
+                != expected_actuation_epoch + 1 or
+                service['controller_incarnation'] != controller_incarnation or
+                service['reserved_fill_actuation_capable'] is not True or
+                service['reserved_fill_actuation_controller_incarnation']
+                != controller_incarnation or
+                service['reserved_fill_actuation_protocol_version']
+                != PROTOCOL_VERSION):
+            raise ZeroCostActuationConflict(
+                'Already-promoted actuation belongs to different authority.')
+        return int(service['reserved_fill_actuation_epoch'])
+    if service['reserved_fill_actuation_epoch'] != expected_actuation_epoch:
+        raise ZeroCostActuationConflict(
+            'Actuation epoch changed before promotion.')
+    if participant_barrier_passed is not True:
+        raise ZeroCostActuationUnavailable(
+            'Actuation promotion requires the API015 fleet capability.')
+    protocol = connection.execute(
+        sqlalchemy.select(_PROTOCOL.c.protocol_version).where(
+            _PROTOCOL.c.id == 1).with_for_update(
+                read=True)).scalar_one_or_none()
+    sequence = connection.execute(
+        sqlalchemy.select(_SEQUENCE.c.reconciliation_gate_state).where(
+            _SEQUENCE.c.id == 1).with_for_update(
+                read=True)).scalar_one_or_none()
+    pending = (connection.execute(
+        sqlalchemy.select(sqlalchemy.literal(True)).where(
+            sqlalchemy.exists().where(
+                _INTENTS.c.service_name == service_name,
+                _INTENTS.c.state.in_(
+                    tuple(_PENDING_STATES))))).scalar_one_or_none())
+    if (service['pool'] != 0 or
+            service['controller_incarnation'] != controller_incarnation or
+            service['reserved_fill_actuation_capable'] is not True or
+            service['reserved_fill_actuation_controller_incarnation']
+            != controller_incarnation or
+            service['reserved_fill_actuation_protocol_version']
+            != PROTOCOL_VERSION or
+            service['ordinary_launch_binding_mode'] != 'bound' or
+            service['ordinary_launch_binding_capable'] is not True or
+            service['non_pool_launch_binding_capable'] is not True or
+            service['non_pool_launch_controller_incarnation']
+            != controller_incarnation or
+            service['non_pool_launch_binding_protocol_version'] != 2 or
+            service['route_source_mode'] != 'DURABLE_PROJECTED' or
+            service['demand_source_mode'] != 'DURABLE_FEED' or protocol != 2 or
+            sequence != pool_capacity_observation_schema.SEQUENCED_ACTIVE or
+            pending is not None or status
+            in serve_statuses.ServiceStatus.replica_launch_blocking_statuses()):
+        raise ZeroCostActuationConflict(
+            'Service is not ready for sole durable-intent authority.')
+    next_epoch = expected_actuation_epoch + 1
+    result = connection.execute(
+        sqlalchemy.update(_SERVICES).where(
+            _SERVICES.c.name == service_name,
+            _SERVICES.c.reserved_fill_actuation_mode ==
+            ActuationMode.DIRECT_REPLICA.value,
+            _SERVICES.c.reserved_fill_actuation_epoch ==
+            expected_actuation_epoch).values(
+                reserved_fill_actuation_mode=ActuationMode.DURABLE_INTENT.value,
+                reserved_fill_actuation_epoch=next_epoch))
+    if result.rowcount != 1:
+        raise ZeroCostActuationConflict(
+            'Actuation promotion lost its compare-and-swap.')
+    return next_epoch
+
+
+def _replica_matches_intent(replica_info: Any,
+                            intent: reserved_fill_planner.FillIntent,
+                            planned_capacity: int) -> bool:
+    """Validate the immutable handoff from a grant to one replica row."""
+    try:
+        location = replica_info.get_spot_location()
+        accelerators = None if location is None else location.accelerators
+        if not isinstance(accelerators, Mapping) or len(accelerators) != 1:
+            return False
+        accelerator, accelerator_count = next(iter(accelerators.items()))
+        return bool(
+            replica_info.version == intent.service_version and
+            replica_info.reserved_fill is True and
+            replica_info.is_zero_cost is True and
+            replica_info.reserved_fill_pool_key == intent.pool_key and
+            replica_info.reserved_fill_service_generation
+            == intent.service_generation and
+            replica_info.reserved_fill_physical_cluster_uid
+            == intent.physical_cluster_uid and
+            replica_info.reserved_fill_kubernetes_context
+            == intent.allowed_locations[0].region and
+            replica_info.reserved_fill_allocation_generation
+            == intent.allocation_generation and
+            replica_info.reserved_fill_allocation_input_sha256
+            == intent.allocation_input_sha256 and
+            replica_info.reserved_fill_allocation_claim_generation
+            == intent.allocation_claim_generation and
+            replica_info.reserved_fill_reconciliation_gate_generation
+            == intent.reconciliation_gate_generation and
+            replica_info.reserved_fill_reclaim_fleet_bundle_sha256
+            == intent.reclaim_fleet_bundle_sha256 and
+            replica_info.reserved_fill_reclaim_policy_revision
+            == intent.reclaim_policy_revision and
+            replica_info.reserved_fill_reclaim_provider_inventory_sha256
+            == intent.reclaim_provider_inventory_sha256 and
+            replica_info.reserved_fill_worker_projection_sha256
+            == intent.worker_projection_sha256 and
+            replica_info.reserved_fill_observation_generation
+            == intent.observation_generation and
+            replica_info.reserved_fill_observation_sequence
+            == intent.observation_sequence and
+            replica_info.reserved_fill_intent_idempotency_key
+            == intent.idempotency_key and
+            replica_info.planned_capacity == planned_capacity and
+            location.region == intent.allowed_locations[0].region and
+            str(accelerator).casefold() == intent.accelerator.casefold() and
+            accelerator_count == intent.accelerator_count)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+
+
+def commit_lease_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    lease: IntentLease,
+    *,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: uuid.UUID,
+    replica_info: Any,
+) -> None:
+    """Transfer one pending debit to its replica in the caller transaction.
+
+    The caller has already inserted the replica row but has not committed.
+    Any mismatch raises, rolling that insert back with this transition.  This
+    is deliberately not exposed as a second transaction: there must be no
+    crash window in which both the intent and replica consume capacity.
+    """
+    _require_postgres(connection)
+    if (not isinstance(lease, IntentLease) or
+            not isinstance(service_name, str) or not service_name or
+            not isinstance(replica_id, int) or isinstance(replica_id, bool) or
+            replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
+        raise ValueError('Intent commit requires exact durable identities.')
+    now = connection.execute(
+        sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+    service = connection.execute(
+        sqlalchemy.select(_SERVICES).where(_SERVICES.c.name == service_name).
+        with_for_update()).mappings().one_or_none()
+    intent_row = connection.execute(
+        sqlalchemy.select(_INTENTS).where(
+            _INTENTS.c.intent_idempotency_key == lease.intent.idempotency_key).
+        with_for_update()).mappings().one_or_none()
+    if service is None or intent_row is None:
+        raise ZeroCostActuationConflict(
+            'Actuation commit lost its service or intent authority.')
+    try:
+        owner = controller_transport.make_controller_owner_fingerprint(
+            service['hash'], service['controller_pid'],
+            service['controller_ip'], service['controller_port'])
+    except (KeyError, TypeError, ValueError,
+            controller_transport.ControllerOwnerError) as error:
+        raise ZeroCostActuationConflict(
+            'Actuation commit found malformed controller authority.') from error
+    if (service['pool'] != 0 or service['status'] in {
+            status.value for status in
+            serve_statuses.ServiceStatus.replica_launch_blocking_statuses()
+    } or service['hash'] != lease.intent.service_incarnation or
+            service['current_version'] != lease.intent.service_version or
+            service['lifecycle_epoch'] != lease.service_lifecycle_epoch or
+            owner != lease.intent.controller_owner or
+            service['reserved_fill_actuation_mode']
+            != ActuationMode.DURABLE_INTENT.value or
+            service['reserved_fill_actuation_epoch'] != lease.actuation_epoch or
+            service['reserved_fill_actuation_capable'] is not True or
+            service['reserved_fill_actuation_controller_incarnation']
+            != service['controller_incarnation'] or
+            service['reserved_fill_actuation_protocol_version']
+            != PROTOCOL_VERSION):
+        raise ZeroCostActuationConflict(
+            'Service actuation authority changed before replica commit.')
+    expected_values = _intent_values(
+        lease.intent,
+        service_name=service_name,
+        service_lifecycle_epoch=lease.service_lifecycle_epoch,
+        actuation_epoch=lease.actuation_epoch)
+    if (not _row_matches_values(intent_row, expected_values) or
+            intent_row['state'] != IntentState.ACTUATING.value or
+            intent_row['lease_owner'] != lease.owner or
+            intent_row['lease_generation'] != lease.generation or
+            intent_row['lease_expires_at'] != lease.expires_at or
+            intent_row['valid_until'] <= now or
+            not _replica_matches_intent(replica_info, lease.intent,
+                                        int(intent_row['planned_capacity']))):
+        raise ZeroCostActuationConflict(
+            'Actuation lease or replica handoff changed before commit.')
+    replica = connection.execute(
+        sqlalchemy.select(
+            _REPLICAS.c.replica_id, _REPLICAS.c.replica_state_version,
+            _REPLICAS.c.replica_state).where(
+                _REPLICAS.c.service_name == service_name, _REPLICAS.c.replica_id
+                == replica_id).with_for_update()).mappings().one_or_none()
+    replica_state = None if replica is None else replica['replica_state']
+    if (replica is None or replica['replica_state_version'] != 1 or
+            not isinstance(replica_state, Mapping) or
+            replica_state.get('replica_record_id') != str(replica_record_id)):
+        raise ZeroCostActuationConflict(
+            'Actuation commit does not own the inserted replica record.')
+    result = connection.execute(
+        sqlalchemy.update(_INTENTS).where(
+            _INTENTS.c.intent_idempotency_key == lease.intent.idempotency_key,
+            _INTENTS.c.state == IntentState.ACTUATING.value,
+            _INTENTS.c.lease_owner == lease.owner,
+            _INTENTS.c.lease_generation == lease.generation).values(
+                state=IntentState.COMMITTED.value,
+                lease_owner=None,
+                lease_expires_at=None,
+                replica_id=replica_id,
+                replica_record_id=replica_record_id,
+                last_error=None,
+                updated_at=now,
+                committed_at=now))
+    if result.rowcount != 1:
+        raise ZeroCostActuationConflict(
+            'Actuation lease changed during replica commit.')
+
+
 class ZeroCostActuationRepository:
     """Transactional owner of grants and per-physical-pool leases."""
 
@@ -393,9 +773,12 @@ class ZeroCostActuationRepository:
                 raise ZeroCostActuationConflict(
                     'Service lifecycle authority is malformed.')
             for intent in plan.intents:
-                values = _intent_values(intent,
-                                        service_name=service_name,
-                                        service_lifecycle_epoch=lifecycle_epoch)
+                values = _intent_values(
+                    intent,
+                    service_name=service_name,
+                    service_lifecycle_epoch=lifecycle_epoch,
+                    actuation_epoch=int(
+                        service['reserved_fill_actuation_epoch']))
                 existing = rows_by_key.get(intent.idempotency_key)
                 if existing is not None:
                     if not _row_matches_values(existing, values):
@@ -522,7 +905,38 @@ class ZeroCostActuationRepository:
                                               updated_at=now))
             intent = _intent_from_row(row)
             return IntentLease(intent, int(row['service_lifecycle_epoch']),
-                               owner, generation, expires_at)
+                               int(row['actuation_epoch']), owner, generation,
+                               expires_at)
+
+    def actionable_pool_keys(self, *, service_name: str) -> tuple[str, ...]:
+        """Return independent physical lanes with work for this service."""
+        with self.engine.begin() as connection:
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            service = connection.execute(
+                sqlalchemy.select(
+                    _SERVICES.c.reserved_fill_actuation_mode).where(
+                        _SERVICES.c.name == service_name)).scalar_one_or_none()
+            if service != ActuationMode.DURABLE_INTENT.value:
+                return ()
+            rows = connection.execute(
+                sqlalchemy.select(_INTENTS).where(
+                    _INTENTS.c.service_name == service_name,
+                    _INTENTS.c.state.in_(tuple(_PENDING_STATES))).order_by(
+                        _INTENTS.c.intent_idempotency_key).with_for_update()
+            ).mappings().all()
+            _retire_expired_locked(connection, rows, now)
+            return tuple(
+                sorted({
+                    str(row['pool_key'])
+                    for row in rows
+                    if row['valid_until'] > now and
+                    (row['state'] in (IntentState.GRANTED.value,
+                                      IntentState.RETRYABLE.value) or
+                     (row['state'] == IntentState.ACTUATING.value and
+                      row['lease_expires_at'] <= now))
+                }))
 
     def release_retryable(self, lease: IntentLease, error: str) -> bool:
         """Release a pre-row failure without inventing a provider effect."""
@@ -550,43 +964,27 @@ class ZeroCostActuationRepository:
                                      else None)))
             return result.rowcount == 1
 
-    def commit(self, lease: IntentLease, *, replica_id: int,
-               replica_record_id: uuid.UUID) -> bool:
-        """Record an already-atomic replica/action commit under the lease."""
-        if (not isinstance(replica_id, int) or isinstance(replica_id, bool) or
-                replica_id < 1 or not isinstance(replica_record_id, uuid.UUID)):
-            raise ValueError('Intent commit requires exact replica identity.')
+    def terminate(self, lease: IntentLease, error: str) -> bool:
+        """Retire a lease whose exact physical authority cannot succeed."""
+        if not isinstance(error, str) or not error:
+            raise ValueError('Terminal release requires a nonempty reason.')
         with self.engine.begin() as connection:
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
-            replica_exists = connection.execute(
-                sqlalchemy.select(_REPLICAS.c.replica_id).where(
-                    _REPLICAS.c.service_name == connection.execute(
-                        sqlalchemy.select(_INTENTS.c.service_name).where(
-                            _INTENTS.c.intent_idempotency_key ==
-                            lease.intent.idempotency_key)).scalar_one_or_none(),
-                    _REPLICAS.c.replica_id ==
-                    replica_id).with_for_update()).scalar_one_or_none()
-            if replica_exists is None:
-                raise ZeroCostActuationConflict(
-                    'Intent commit has no durable replica row.')
             result = connection.execute(
                 sqlalchemy.update(_INTENTS).where(
                     _INTENTS.c.intent_idempotency_key ==
                     lease.intent.idempotency_key,
                     _INTENTS.c.state == IntentState.ACTUATING.value,
                     _INTENTS.c.lease_owner == lease.owner,
-                    _INTENTS.c.lease_generation == lease.generation,
-                    _INTENTS.c.valid_until
-                    > now).values(state=IntentState.COMMITTED.value,
-                                  lease_owner=None,
-                                  lease_expires_at=None,
-                                  replica_id=replica_id,
-                                  replica_record_id=replica_record_id,
-                                  last_error=None,
-                                  updated_at=now,
-                                  committed_at=now))
+                    _INTENTS.c.lease_generation == lease.generation).values(
+                        state=IntentState.TERMINAL.value,
+                        lease_owner=None,
+                        lease_expires_at=None,
+                        last_error=error,
+                        updated_at=now,
+                        terminal_at=now))
             return result.rowcount == 1
 
     def pending_debits(

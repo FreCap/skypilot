@@ -63,10 +63,14 @@ ordinary_launch_binding = adaptors_common.LazyImport(
 capacity_admission = adaptors_common.LazyImport('sky.serve.capacity_admission')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
+zero_cost_actuation = adaptors_common.LazyImport(
+    'sky.serve.zero_cost_actuation')
 managed_job_state_schema = adaptors_common.LazyImport('sky.jobs.state_schema')
 
 REQUEST_BACKEND_ENV_VAR = 'SKYPILOT_API_REQUEST_BACKEND'
 POSTGRES_REQUEST_BACKEND = 'postgres'
+ORDERED_CAPACITY_ADMISSION_PROTOCOL_VERSION = 2
+ORDERED_CAPACITY_ADMISSION_COHORT_EPOCH = 2
 POSTGRES_REQUEST_STORAGE_BACKEND_TYPE = (
     'sky.server.requests.postgres.PostgresRequestBackend')
 POSTGRES_REQUEST_QUEUE_BACKEND_TYPE = (
@@ -741,9 +745,11 @@ class ServerInstanceLease:
                  if non_pool_capable else None),
             'ordered_capacity_admission_capable': ordered_capacity_capable,
             'ordered_capacity_admission_protocol_version':
-                (1 if ordered_capacity_capable else None),
+                (ORDERED_CAPACITY_ADMISSION_PROTOCOL_VERSION
+                 if ordered_capacity_capable else None),
             'ordered_capacity_admission_cohort_epoch':
-                (1 if ordered_capacity_capable else None),
+                (ORDERED_CAPACITY_ADMISSION_COHORT_EPOCH
+                 if ordered_capacity_capable else None),
             'executor_termination_evidence_capable': termination_evidence_capable,
             'executor_termination_evidence_protocol_version':
                 (EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION
@@ -1024,7 +1030,7 @@ def ordered_capacity_admission_fleet_capable(
     quiescence_seconds: float = (
         ORDINARY_LAUNCH_BINDING_PARTICIPANT_QUIESCENCE_SECONDS),
 ) -> bool:
-    """Require one exact API012 cohort across every live participant."""
+    """Require one exact API015 cohort across every live participant."""
     if (isinstance(quiescence_seconds, bool) or
             not isinstance(quiescence_seconds, (int, float)) or
             not math.isfinite(quiescence_seconds) or quiescence_seconds < 0):
@@ -1049,8 +1055,10 @@ def ordered_capacity_admission_fleet_capable(
         executor = False
         for row in rows:
             if (row['ordered_capacity_admission_capable'] is not True or
-                    row['ordered_capacity_admission_protocol_version'] != 1 or
-                    row['ordered_capacity_admission_cohort_epoch'] != 1):
+                    row['ordered_capacity_admission_protocol_version']
+                    != ORDERED_CAPACITY_ADMISSION_PROTOCOL_VERSION or
+                    row['ordered_capacity_admission_cohort_epoch']
+                    != ORDERED_CAPACITY_ADMISSION_COHORT_EPOCH):
                 return False
             ready = row['ready'] and row['draining_at'] is None
             acceptor = acceptor or bool(ready and row['role'] in ('all', 'api'))
@@ -4208,6 +4216,31 @@ def promote_ordered_capacity_admission_service(
             controller_incarnation=authority.controller_incarnation,
             participant_barrier_passed=lambda conn:
             ordered_capacity_admission_fleet_capable(connection=conn))
+        session.commit()
+        return epoch
+
+
+def promote_zero_cost_actuation_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    expected_actuation_epoch: int,
+) -> int:
+    """Promote grant-before-row fill after the exact API015 fleet barrier."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        connection.execute(
+            sqlalchemy.text('LOCK TABLE api_server_instances IN SHARE MODE'))
+        epoch = zero_cost_actuation.promote_service_in_connection(
+            connection,
+            service_name=authority.service_name,
+            controller_incarnation=authority.controller_incarnation,
+            expected_actuation_epoch=expected_actuation_epoch,
+            participant_barrier_passed=(
+                ordered_capacity_admission_fleet_capable(
+                    connection=connection)))
         session.commit()
         return epoch
 

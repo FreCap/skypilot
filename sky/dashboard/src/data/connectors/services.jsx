@@ -480,10 +480,42 @@ export function normalizeServiceDemand(record) {
   if (!record || typeof record !== 'object' || Array.isArray(record)) {
     return null;
   }
+  const rawActuationCounts = record.zero_cost_actuation_state_counts;
+  const actuationCounts =
+    rawActuationCounts &&
+    typeof rawActuationCounts === 'object' &&
+    !Array.isArray(rawActuationCounts)
+      ? Object.fromEntries(
+          ['GRANTED', 'ACTUATING', 'COMMITTED', 'RETRYABLE', 'TERMINAL'].map(
+            (state) => [
+              state,
+              nullableNonnegativeInteger(rawActuationCounts[state]),
+            ]
+          )
+        )
+      : null;
   return {
     serviceName: record.service_name ?? null,
     serviceHash: record.service_hash ?? null,
     ...normalizeRequestTelemetry(record),
+    zeroCostActuationStatus: ['available', 'unavailable'].includes(
+      record.zero_cost_actuation_status
+    )
+      ? record.zero_cost_actuation_status
+      : null,
+    zeroCostActuationReason: record.zero_cost_actuation_reason ?? null,
+    zeroCostActuationMode: ['DIRECT_REPLICA', 'DURABLE_INTENT'].includes(
+      record.zero_cost_actuation_mode
+    )
+      ? record.zero_cost_actuation_mode
+      : null,
+    zeroCostActuationEpoch: nullableNonnegativeInteger(
+      record.zero_cost_actuation_epoch
+    ),
+    zeroCostActuationStateCounts: actuationCounts,
+    pendingZeroCostActuationCount: nullableNonnegativeInteger(
+      record.pending_zero_cost_actuation_count
+    ),
   };
 }
 

@@ -1039,8 +1039,8 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
     api_scripts = alembic_script.ScriptDirectory.from_config(api_config)
     serve_scripts = alembic_script.ScriptDirectory.from_config(serve_config)
 
-    assert api_scripts.get_heads() == ['014']
-    assert api_scripts.get_revision('014').down_revision == '013'
+    assert api_scripts.get_heads() == ['015']
+    assert api_scripts.get_revision('015').down_revision == '014'
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'
@@ -1076,7 +1076,7 @@ def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION == 87)
     assert (
         server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
-    assert server_constants.API_VERSION == 88
+    assert server_constants.API_VERSION == 89
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)

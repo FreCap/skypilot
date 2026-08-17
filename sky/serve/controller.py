@@ -67,6 +67,7 @@ from sky.serve import serve_utils
 from sky.serve import spot_placer
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
+from sky.serve import zero_cost_actuation
 from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import context as sky_context
@@ -3967,6 +3968,24 @@ class SkyServeController:
             if not self._actuation_stop.is_set():
                 self._finish_actuation_transition(transition_generation)
 
+    def _promote_zero_cost_actuation(self,
+                                     expected_actuation_epoch: int) -> int:
+        """Make grant-before-row the sole reserved-fill admission path."""
+        transition_generation = self._begin_actuation_transition()
+        try:
+            authority = self._ordinary_launch_binding_authority
+            if authority is None or not authority.generic_launches_required:
+                raise zero_cost_actuation.ZeroCostActuationUnavailable(
+                    'Actuation promotion requires generic non-pool launch '
+                    'authority first.')
+            epoch = request_postgres.promote_zero_cost_actuation_service(
+                authority, expected_actuation_epoch)
+            self._replica_manager.install_durable_zero_cost_actuation()
+            return epoch
+        finally:
+            if not self._actuation_stop.is_set():
+                self._finish_actuation_transition(transition_generation)
+
     def _get_actuation_stop(self) -> threading.Event:
         return self._actuation_stop
 
@@ -5491,6 +5510,17 @@ class SkyServeController:
                 allocation, replica_infos, scaling_options))
         committed_debits = self._committed_reserved_fill_debits(
             allocation, replica_infos)
+        try:
+            pending_debits = (
+                self._replica_manager.pending_reserved_fill_debits(allocation))
+        except Exception as error:  # pylint: disable=broad-except
+            # Losing accepted grants from the planner debit would issue new
+            # intent keys and could reopen paid residual.  Wait for the next
+            # bounded reconciliation instead of guessing that none exist.
+            logger.warning(
+                'Reserved-fill pending-intent accounting failed closed: %s',
+                common_utils.format_exception(error))
+            return False
         plan = reserved_fill_planner.ReservedFillPlanner.plan(
             policy_revision=decision_version,
             reconcile_generation=max(1, reconcile_generation + 1),
@@ -5503,7 +5533,7 @@ class SkyServeController:
                               reserved_fill_planned_capacity(replica_infos)),
             capacity_unit=capacity_unit,
             ordinary_demand_debits=ordinary_debits,
-            committed_fill_debits=committed_debits,
+            committed_fill_debits=(*committed_debits, *pending_debits),
             rotation_anchor=(
                 decision_autoscaler.reserved_fill_rotation_anchor()))
         if not plan.intents:
@@ -6381,6 +6411,49 @@ class SkyServeController:
                                               status_code=409)
             except Exception as error:  # pylint: disable=broad-except
                 logger.exception('Demand-source transition failed for %s.',
+                                 self._service_name)
+                return responses.JSONResponse(
+                    content={'message': common_utils.format_exception(error)},
+                    status_code=500)
+
+        @self._app.post(
+            serve_constants.CONTROLLER_ZERO_COST_ACTUATION_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        def promote_zero_cost_actuation(
+            request_data: dict[str,
+                               Any] = fastapi.Body(...),) -> fastapi.Response:
+            """Promote the one-way grant-before-row authority switch."""
+            expected_service_hash = request_data.get('expected_service_hash')
+            expected_epoch = request_data.get('expected_actuation_epoch')
+            if (isinstance(expected_epoch, bool) or
+                    not isinstance(expected_epoch, int) or expected_epoch < 0):
+                return responses.JSONResponse(content={
+                    'message': ('expected_actuation_epoch must be a '
+                                'nonnegative integer.')
+                },
+                                              status_code=400)
+            if expected_service_hash != self._service_hash:
+                return responses.JSONResponse(
+                    content={'message': 'Service incarnation changed.'},
+                    status_code=409)
+            try:
+                epoch = self._promote_zero_cost_actuation(expected_epoch)
+                return responses.JSONResponse(
+                    content={
+                        'reserved_fill_actuation_mode': (
+                            zero_cost_actuation.ActuationMode.DURABLE_INTENT.
+                            value),
+                        'reserved_fill_actuation_epoch': epoch,
+                    })
+            except (zero_cost_actuation.ZeroCostActuationError,
+                    RuntimeError) as error:
+                logger.warning(
+                    'Zero-cost actuation promotion rejected for %s: %s',
+                    self._service_name, common_utils.format_exception(error))
+                return responses.JSONResponse(content={'message': str(error)},
+                                              status_code=409)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.exception('Zero-cost actuation promotion failed for %s.',
                                  self._service_name)
                 return responses.JSONResponse(
                     content={'message': common_utils.format_exception(error)},

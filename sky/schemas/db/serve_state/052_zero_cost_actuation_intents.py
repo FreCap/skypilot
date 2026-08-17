@@ -81,6 +81,7 @@ def upgrade() -> None:
         sa.Column('service_name', sa.Text(), nullable=False),
         sa.Column('service_hash', sa.Text(), nullable=False),
         sa.Column('service_lifecycle_epoch', sa.BigInteger(), nullable=False),
+        sa.Column('actuation_epoch', sa.BigInteger(), nullable=False),
         sa.Column('service_version', sa.Integer(), nullable=False),
         sa.Column('controller_owner', sa.Text(), nullable=False),
         sa.Column('ordinal', sa.Integer(), nullable=False),
@@ -149,8 +150,8 @@ def upgrade() -> None:
             "worker_projection_sha256 ~ '^[0-9a-f]{64}$'",
             name='serve052_zero_cost_intent_digest_ck'),
         sa.CheckConstraint(
-            'service_lifecycle_epoch > 0 AND service_version > 0 AND '
-            'ordinal >= 0 AND '
+            'service_lifecycle_epoch > 0 AND actuation_epoch > 0 AND '
+            'service_version > 0 AND ordinal >= 0 AND '
             'protocol_version = 2 AND policy_revision > 0 AND '
             'reconcile_generation > 0 AND allocation_generation > 0 AND '
             'allocation_claim_generation > 0 AND '
