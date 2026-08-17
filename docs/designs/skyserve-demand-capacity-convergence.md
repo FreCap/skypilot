@@ -27,7 +27,9 @@ real-PostgreSQL admission/migration tests, 81 manager/broker/binding tests, and
 145 API-request PostgreSQL tests and 31 capacity-admission/refill tests.
 Production remains `DIRECT_REPLICA`; the initial dark-rollout verification
 found zero intents and zero replicas or `sky.launch` requests created at or
-after the upgrade, so no authority promotion or capacity action occurred.
+after the upgrade. Later samples found legacy direct-controller H200 fill
+attempts, described below; the P2d intent path itself remains dark with no
+authority promotion.
 
 P2c API88/Serve051 is merged in PR #1531 and deployed dark. Its complete remote
 PostgreSQL run passed 17,471 tests (plus 199 subtests), and the final affected
@@ -156,6 +158,19 @@ current occupancy proof. This also invalidates the older point-in-time claim
 that production demand is currently zero; it does not authorize a paid launch
 because the service still uses the legacy demand/controller path and the exact
 zero-cost-first promotion gates remain open.
+
+Later revision-415 samples also corrected the initial zero-launch observation.
+While the service remained `DIRECT_REPLICA`, the legacy controller repeatedly
+materialized H200 fill replicas and submitted `sky.launch` requests before
+owning the P2d per-pool intent lane. Sampled replicas 54468, 54471, and 54473
+requested `H200:1` on `phx_research_cluster_eks` with `use_spot=false`, the
+exact protocol-2 H200 reserved-fill pool identity, and no paid claim. The new
+durable fence rejected each request with `ReservedFillLaunchFenceError` and
+the message that durable reserved-fill reconciliation owns exact cleanup. This
+is fail-closed and proves no paid spill, but it is not the steady state: the
+legacy path still creates speculative replica/request churn before rejection.
+P2d promotion moves that acceptance boundary to the durable zero-cost intent;
+the stacked P3 removal then deletes the direct broker-to-replica path.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -1440,7 +1455,8 @@ Manual production verification records:
 9. readiness, +10, +30, and one complete stale/quiescence horizon before P3;
 10. revision 415's exact API89/Serve052 artifact tuple, migration completion,
     two ready fleet LB slots, zero restarts, unchanged `DIRECT_REPLICA` mode,
-    and zero post-upgrade intents, replicas, or launches; and
+    an initially empty post-upgrade intent/replica/request sample, and later
+    fail-closed legacy H200 direct-launch churn with no paid claim; and
 11. after the ready-snapshot fix-forward, bounded controller startup and
     `/autoscaler/info` latency with the retained 5,536-row history and 38
     simultaneous logical retirements, without deleting audit rows.
@@ -1642,8 +1658,10 @@ dark deployment gate.
 - [x] Merge P2d Serve052/API-request-015 as PR #1537 and deploy it dark as
   direct Helm revision 415 / v1.1.1320. API89/Serve052 are current; both fleet
   LB slots and the API use the exact image with zero restarts; the service
-  remains `DIRECT_REPLICA`; and the initial post-upgrade query found zero
-  intents and zero new replicas or `sky.launch` requests.
+  remains `DIRECT_REPLICA`; the initial post-upgrade query found zero intents
+  and zero new replicas or `sky.launch` requests; and later legacy H200
+  direct-launch attempts were rejected by the new durable fence without a paid
+  claim. Promotion and the stacked direct-path removal remain open.
 - [ ] Merge and deploy PR #1538's logical-retirement ready-snapshot
   fix-forward, then prove controller health and `/autoscaler/info` recover
   promptly with 38
