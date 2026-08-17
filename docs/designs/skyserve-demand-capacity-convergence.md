@@ -4,12 +4,12 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, and PR #1529's exact
 reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 412 / release
-`1.1.1316`, merge commit `c20eb20eb3e0fab043d85e936da92ce2667d72e0`, image
+artifact is deployed directly with Helm as production revision 413 / release
+`1.1.1317`, merge commit `9ec62016b6bf983d31bca2d5d39f8bcc6361fc66`, image
 digest
-`sha256:0d05c17ceb93cd9f5a40d69c6750bf9c581ef15de515d79bef1e1231c072ec01`,
+`sha256:985b4c11ed938e54c489fa8385ba0d84b3adf3b687292885fc4692d433daa425`,
 and chart digest
-`sha256:413e066ee94b878ac3eccc7325f8c942b4771ed21d8fd7e2749b97be5c532492`.
+`sha256:7c48fb90ba00ef3591ce60a9797d2ee662ee5dad8e3b0cdbdf227582d6e3c9ea`.
 The Serve051 migration Job completed, the API reports protocol version 88, and
 the API deployment is ready with zero restarts. No load-balancer slot, service
 version, authority mode, or `boltz-platform` pin changed in this direct Helm
@@ -66,6 +66,41 @@ leases stayed fresh. The current fix-forward replaces those fleet-proportional
 round trips with a fixed number of bounded bulk statements while retaining the
 same owner, replica-record, version, revocation, material-generation, and
 history invariants. No P2c behavior has been promoted on `boltz-l4-fleet`.
+
+PR #1535 merged that fixed-statement writer and revision 413 deployed it dark.
+The exact image is healthy with zero restarts, its migration completed, and all
+121 current exact-owner materials converged to observed, fresh-ready leases.
+Production nevertheless rejected promotion again. One takeover window
+contained a 100.433-second head interval, and steady-state stale-trigger
+captures found repeated 12.675- and 17.406-second intervals. PostgreSQL showed
+the incremental composer connection `idle in transaction` after its
+`SELECT ... FROM replicas ... FOR UPDATE`; the controller stack showed that
+same thread deserializing `ReplicaInfo` and waiting on a lazy Kubernetes module
+load. Material and receipt writers were blocked behind its service-owner lock.
+The remaining defect is therefore not the material batch: composition still
+runs arbitrary Python decoders and the capacity callback while holding the
+service, every replica, and every lease row lock.
+
+The next fix-forward makes composition a two-phase optimistic publication.
+The prepare phase reads owner, replica, and lease inputs without row locks,
+closes its transaction, and performs all deserialization, lazy imports,
+capacity aggregation, and response construction with no database transaction
+open. The publish phase locks the service, replicas, and leases in canonical
+order, revalidates the exact owner plus a compact replica-state fingerprint and
+the route-safety fields of every lease, and uses a fresh database clock to
+verify that route eligibility did not change while preparing. It publishes the
+prebuilt result only if the prepared input is still current.
+Successful readiness refreshes may monotonically extend an otherwise identical
+lease without forcing a retry; revocation, readiness loss, material change,
+record replacement, status/version change, or replica-state change rejects the
+prepared result. No decoder, callback, cloud module, provider operation, or
+fleet-sized JSON object construction runs while publication locks are held.
+Both phases select only the bounded actionable replica set (`PENDING`,
+`PROVISIONING`, `STARTING`, `READY`, and `NOT_READY`). Terminal and superseded
+failure rows remain available through service status/history, but they are not
+routing or admission capacity and cannot make route cadence proportional to
+months of retained diagnostics. A transition into or out of that actionable
+set changes the final locked fingerprint and rejects the prepared publication.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -640,11 +675,16 @@ A dedicated supervised route worker has two provider-free stages:
    bounded batch at a time in one PostgreSQL transaction; each stale or
    no-longer-eligible member is rejected independently without poisoning
    healthy siblings.
-2. The compose stage reads fresh leases plus current replica/service/version
-   rows in one PostgreSQL transaction, excludes individually stale, revoked,
-   non-ready, draining, wrong-version, or owner-mismatched entries, rebuilds the
-   capacity hint from durable replica attribution, and publishes or refreshes
-   the immutable full snapshot/head.
+2. The compose stage first reads fresh leases plus current
+   replica/service/version rows without row locks and closes that prepare
+   transaction. It deserializes replicas and rebuilds the capacity hint and
+   route payload outside every database transaction. A short publish
+   transaction then locks service, replica, and lease rows in canonical order,
+   exact-matches the prepared replica fingerprints and lease safety fields,
+   and verifies at the current database clock that time-dependent route
+   eligibility is unchanged before publishing or refreshing the prebuilt
+   immutable full snapshot/head. Any changed safety input rejects that tick for
+   a fresh retry.
 
 The composition event loop never invokes or awaits readiness HTTP or receipt
 persistence. Receipt persistence never creates one transaction or connection
@@ -673,9 +713,10 @@ replica join. It neither deserializes ReplicaInfo nor runs an identity query per
 lease. A target that becomes stale after that read remains harmless because
 the receipt bulk update repeats the exact owner, current READY replica,
 material, readiness, and revocation predicates before changing the lease.
-Composition retains its short provider-free owner/replica/lease transaction;
-the fixed-statement material writer removes the fleet-proportional critical
-section that previously delayed it.
+Composition retains one short provider-free owner/replica/lease publish
+transaction, but no longer performs decoding or capacity callbacks inside it;
+the fixed-statement material writer and optimistic composer together remove
+both fleet-proportional critical sections that previously delayed renewal.
 
 The worker never acquires the replica-manager lock, provider phase, physical
 cluster fence, Kubernetes client, Ray handle, cluster database, or the shared
@@ -1379,6 +1420,21 @@ database round trips. This is the same canonical material path for a single
 entry and a fleet batch; no compatibility branch or timeout adjustment is
 introduced.
 
+The post-revision-413 composition review rejected three final shortcuts.
+Preloading Kubernetes modules merely hides the observed import once and leaves
+all future decoder or capacity callback work inside the transaction. Removing
+`FOR UPDATE` without revalidation permits a draining or replaced replica to be
+published after its revocation commits. Moving the same locked callback into a
+new thread or process preserves the PostgreSQL critical section even if it
+isolates the controller GIL. The accepted two-phase path has one lock-free
+prepare snapshot and one short ordered publish transaction. Replica-state
+fingerprints reject any changed durable capacity input, while lease validation
+allows only a monotonic TTL extension of otherwise identical readiness and
+material evidence. The final locked validation uses a new database timestamp
+and rejects any route whose temporal eligibility changed, so a lease cannot
+cross expiry during preparation and then be republished as fresh. All route
+JSON construction remains outside the locked transaction.
+
 Local verification for the receipt-writer fix-forward passes the incremental
 worker, route-projection, controller, controller-event-loop,
 controller-respawn, and route-lease suites, plus the exact formatter, mypy,
@@ -1397,6 +1453,17 @@ seconds while sharing locks with the legacy per-row live writer, and was rolled
 back. The real-PostgreSQL tests additionally cover fixed statement count,
 stale/revoked sibling isolation, and a replica-replacement lock race. Full
 remote PostgreSQL CI remains a merge gate.
+
+The two-phase composer candidate passes the complete real-PostgreSQL route
+projection suite plus exact formatting, mypy, and pylint. Focused concurrency
+regressions acquire the service and replica row locks with `NOWAIT` while the
+capacity callback is deliberately suspended, reject a replica-state mutation
+between prepare and publish, accept only a monotonic successful readiness
+refresh whose temporal eligibility stays unchanged, reject an expired route
+that becomes eligible during preparation, and prove retained terminal replica
+history is never decoded or counted as admission capacity. Remote PostgreSQL CI
+and production cadence qualification remain merge and promotion gates,
+respectively.
 
 ## Open gates
 
@@ -1450,9 +1517,14 @@ remote PostgreSQL CI remains a merge gate.
   revision 412 / v1.1.1316. Production proves receipt persistence is off the
   event loop and all 64 current rows become fresh, but a provider material
   refresh still produced a 16.987-second head interval.
-- [ ] Merge and deploy the fixed-statement material-batch/probe-target-join
-  fix-forward, then prove ten nominal-cadence renewals during provider material
-  refresh and provider stall before promoting route authority.
+- [x] Merge and deploy PR #1535's fixed-statement
+  material-batch/probe-target-join fix-forward as direct Helm revision 413 /
+  v1.1.1317. All 121 materials converged, but production found the composer
+  idle inside its locked transaction while decoding replica state; sampled
+  head intervals reached 100.433, 12.675, and 17.406 seconds.
+- [ ] Merge and deploy the two-phase optimistic composer fix-forward, then
+  prove restart takeover plus ten nominal-cadence renewals during provider
+  material refresh and provider stall before promoting route authority.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.
