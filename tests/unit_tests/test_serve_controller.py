@@ -29,6 +29,7 @@ from sky.serve import autoscalers
 from sky.serve import constants
 from sky.serve import controller
 from sky.serve import drain_observability
+from sky.serve import paid_retirement
 from sky.serve import placement_policy
 from sky.serve import replica_managers
 from sky.serve import serve_state
@@ -1119,6 +1120,7 @@ def _register_update_test_routes(
     ctrl._host = '127.0.0.1'  # pylint: disable=protected-access
     ctrl._port = 30000  # pylint: disable=protected-access
     ctrl._reserved_capacity_fill_enabled = False  # pylint: disable=protected-access
+    ctrl._incremental_route_projection_enabled = False  # pylint: disable=protected-access
     ctrl.run()
     return fastapi_testclient.TestClient(ctrl._app)  # pylint: disable=protected-access
 
@@ -3769,7 +3771,7 @@ class TestNumReadyReplicas:
 class TestAutoscalerRuntimeSnapshot:
 
     @staticmethod
-    def _durable_snapshot():
+    def _durable_snapshot(*, fresh_aggregate_zero=False):
         return types.SimpleNamespace(
             service_name='svc',
             service_hash='svc-hash',
@@ -3786,7 +3788,8 @@ class TestAutoscalerRuntimeSnapshot:
             request_information={'request_aggregator': {
                 'timestamps': []
             }},
-            normalized_demand={'queue_depth': 0})
+            normalized_demand={'queue_depth': 0},
+            fresh_aggregate_zero=fresh_aggregate_zero)
 
     @staticmethod
     def _durable_autoscaler(target=1):
@@ -4076,6 +4079,103 @@ class TestAutoscalerRuntimeSnapshot:
 
         publish.assert_called_once_with(ctrl._autoscaler, 1)  # pylint: disable=protected-access
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+
+    def test_fresh_aggregate_zero_retires_paid_before_suppressing_scale_up(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._durable_autoscaler(1)
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        authority = types.SimpleNamespace(generation=6, content_sha256='c' * 64)
+        snapshot = self._durable_snapshot(fresh_aggregate_zero=True)
+        decision = autoscalers.AutoscalerDecision(
+            autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+            {'accelerators': {
+                'L4': 1
+            }})
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               return_value=snapshot), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               side_effect=[[], []]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions',
+                 return_value=[decision]), \
+             mock.patch.object(ctrl,
+                               '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority',
+                               return_value=authority) as publish:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        scaler.clear_paid_launch_authority_for_fresh_zero.assert_called_once_with(
+        )
+        publish.assert_called_once_with(scaler, 1, force_zero=True)
+        retirement_authority = (
+            ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.
+            call_args.args[0])
+        assert retirement_authority == paid_retirement.FreshZeroAuthority(
+            service_hash='svc-hash',
+            demand_source_epoch=1,
+            demand_feed_generation=3,
+            capacity_plan_generation=6,
+            capacity_plan_sha256='c' * 64,
+            route_generation=4)
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+
+    def test_newer_positive_demand_cancels_uncommitted_paid_retirement(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._durable_autoscaler(0)  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        snapshot = self._durable_snapshot()
+        snapshot.normalized_demand['recent_request_count'] = 1
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               return_value=snapshot), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(
+                 autoscalers,
+                 'generate_controller_scaling_decisions',
+                 return_value=[]), \
+             mock.patch.object(ctrl,
+                               '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority',
+                               return_value=mock.Mock()):
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        ctrl._replica_manager.cancel_uncommitted_paid_retirements.assert_called_once_with(
+            'svc-hash', 3)
 
     def test_sequenced_gate_selects_authenticated_map_without_fallback(self):
         ctrl = _make_controller()

@@ -2115,7 +2115,7 @@ either case.
 | 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed as direct Helm revision 407 / release 1.1.1310; all service authority modes remain legacy. |
 | 2a | Policy-bundle schema v3 plus exact live PHX contract and PostgreSQL-backed server-config transaction | Required next; no platform pin. The old bundle and service config are proven stale. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Blocked on 2a and exact source-YAML/config review. |
-| 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | Planned as one additive dark direct-Helm release; #1506 remains its stacked removal. |
+| 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | Implemented and locally reviewed on `fix/serve-route-replica-leases`; remote PostgreSQL CI, merge, dark direct-Helm release, and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Planned as one additive dark direct-Helm release; busy-lane/no-row and crash matrices are merge gates. |
 | 3 | G2/P3 cleanup API015/Serve053 plus final non-pool cleanup API016/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 

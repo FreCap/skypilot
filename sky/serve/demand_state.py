@@ -72,6 +72,7 @@ class DurableAutoscalingSnapshot:
     receipt_watermark: list[dict[str, Any]]
     request_information: dict[str, Any]
     normalized_demand: dict[str, Any]
+    fresh_aggregate_zero: bool
 
 
 def _postgres_engine() -> sqlalchemy.engine.Engine:
@@ -217,11 +218,18 @@ def _validate_demand_window(
     newest = observed_at
     compatibility_complete = value.get('compatibility_complete')
     saturated = value.get('saturated')
+    coverage_started_at = value.get('coverage_started_at')
     if not isinstance(compatibility_complete, bool):
         raise DemandReportError(
             'demand_window compatibility_complete must be boolean.')
     if not isinstance(saturated, bool):
         raise DemandReportError('demand_window saturated must be boolean.')
+    if coverage_started_at is not None:
+        coverage_started_at = _finite_timestamp(
+            coverage_started_at, 'demand_window coverage_started_at')
+        if coverage_started_at > observed_at:
+            raise DemandReportError(
+                'demand_window coverage_started_at is in the future.')
     # A saturated recorder has dropped events.  It may report the retained
     # counts for observability, but it cannot grant exact-card authority.
     compatibility_complete = compatibility_complete and not saturated
@@ -272,6 +280,7 @@ def _validate_demand_window(
     return {
         'bucket_seconds': bucket_seconds,
         'window_seconds': window_seconds,
+        'coverage_started_at': coverage_started_at,
         'buckets': normalized_buckets,
         'compatibility_complete': compatibility_complete,
         'saturated': saturated,
@@ -716,6 +725,48 @@ def reports_match_current_lb_authority(
     return current_active_present
 
 
+def reports_prove_fresh_aggregate_zero(rows: list[Mapping[str, Any]]) -> bool:
+    """Whether fresh protocol-2 reporters cover an entirely quiet window.
+
+    Callers own PostgreSQL freshness and current-LB authority checks. This
+    pure predicate intentionally ignores exact-card compatibility and
+    occupancy: it can revoke paid launch authority, while destructive
+    teardown remains separately gated by each replica's exact idle proof.
+    """
+    if not rows:
+        return False
+    for row in rows:
+        payload = row.get('payload')
+        if (not isinstance(payload, Mapping) or
+                payload.get('protocol_version') != 2):
+            return False
+        window = payload.get('demand_window')
+        observed_at = payload.get('reporter_observed_at')
+        if (not isinstance(window, Mapping) or
+                not isinstance(observed_at,
+                               (int, float)) or isinstance(observed_at, bool)):
+            return False
+        coverage_started_at = window.get('coverage_started_at')
+        window_seconds = window.get('window_seconds')
+        buckets = window.get('buckets')
+        if (not isinstance(coverage_started_at, (int, float)) or
+                isinstance(coverage_started_at, bool) or
+                not isinstance(window_seconds, int) or
+                isinstance(window_seconds, bool) or window_seconds < 1 or
+                float(coverage_started_at) > float(observed_at) - window_seconds
+                or window.get('saturated') is not False or
+                payload.get('offered_arrival_tracking_saturated') is not False
+                or not isinstance(buckets, list) or
+                any(not isinstance(bucket, Mapping) or
+                    bucket.get('request_count') != 0 for bucket in buckets)):
+            return False
+        for field in ('queue_depth', 'rejected_in_window',
+                      'rejected_in_recent_window'):
+            if payload.get(field) != 0:
+                return False
+    return True
+
+
 def _aggregate_fresh_reports(rows: list[Any], generation: int | None,
                              now: datetime.datetime) -> dict[str, Any]:
     """Aggregate already-selected fresh rows, rejecting corrupt state."""
@@ -904,7 +955,7 @@ def get_autoscaling_snapshot(
                 service['route_projection_capable'] is not True or
                 service['route_projection_controller_incarnation']
                 != service['controller_incarnation'] or
-                service['route_projection_protocol_version'] != 1):
+                service['route_projection_protocol_version'] not in (1, 2)):
             return None
         generation = connection.execute(
             sqlalchemy.select(generations.c.generation).where(
@@ -932,7 +983,8 @@ def get_autoscaling_snapshot(
             route['controller_incarnation'] != service['controller_incarnation']
             or route['service_version'] != service['current_version'] or
             route['protocol_version'] != 1 or not rows or
-            any(row['complete'] is not True for row in rows)):
+            route['producer_protocol_version']
+            != service['route_projection_protocol_version']):
         return None
     try:
         _, identities = (route_projection.RouteProjectionRepository.
@@ -967,6 +1019,9 @@ def get_autoscaling_snapshot(
                     'headerless_arrivals_60s', 'headerless_arrivals_300s')
     }
     configured_accelerators: tuple[str, ...] | None = None
+    compatibility_complete = True
+    aggregate_window_covered = True
+    offered_arrival_tracking_saturated = False
     now_epoch = now.timestamp()
 
     def _add_counts(target: dict[str, int], raw: Any) -> bool:
@@ -983,10 +1038,13 @@ def get_autoscaling_snapshot(
         payload = row['payload']
         if (not isinstance(payload, dict) or
                 payload.get('protocol_version') != 2 or
+                payload.get('routing_version') != service['current_version'] or
                 payload.get('route_projection_generation') != route_generation
                 or payload.get('route_projection_sha256') != route_sha256 or
                 payload.get('route_source_epoch') != route_epoch):
             return None
+        compatibility_complete = (compatibility_complete and
+                                  row['complete'] is True)
         configured = tuple(payload.get('configured_accelerators', ()))
         if configured_accelerators is None:
             configured_accelerators = configured
@@ -1018,6 +1076,19 @@ def get_autoscaling_snapshot(
         reporter_epoch = row['reporter_observed_at'].timestamp()
         window = payload['demand_window']
         bucket_seconds = int(window['bucket_seconds'])
+        coverage_started_at = window.get('coverage_started_at')
+        aggregate_window_covered = bool(
+            aggregate_window_covered and isinstance(coverage_started_at,
+                                                    (int, float)) and
+            not isinstance(coverage_started_at, bool) and
+            float(coverage_started_at)
+            <= float(payload['reporter_observed_at']) -
+            int(window['window_seconds']) and
+            not window.get('saturated', True) and
+            not payload.get('offered_arrival_tracking_saturated', True))
+        offered_arrival_tracking_saturated = bool(
+            offered_arrival_tracking_saturated or window.get('saturated') or
+            payload.get('offered_arrival_tracking_saturated'))
         for bucket in window['buckets']:
             effective_end = (row['received_at'].timestamp() +
                              int(bucket['bucket_start']) + bucket_seconds -
@@ -1055,6 +1126,13 @@ def get_autoscaling_snapshot(
     aggregate = ledger.aggregate(stream_owners, now=now_epoch)
     if not aggregate.complete:
         return None
+    fresh_aggregate_zero = bool(
+        service['route_projection_protocol_version'] == 2 and
+        aggregate_window_covered and
+        reports_prove_fresh_aggregate_zero(rows) and not timestamps and
+        queue_depth == 0 and rejected == 0 and recent_rejected == 0)
+    if not compatibility_complete and not fresh_aggregate_zero:
+        return None
 
     def _replica_id(url: str) -> int | None:
         identity = identities.get(url)
@@ -1089,7 +1167,8 @@ def get_autoscaling_snapshot(
         'compatibility_profiles': compatibility_profiles,
         'queued_requests_by_compatibility': queued_profiles,
         'rejected_requests_by_compatibility': rejected_profiles,
-        'compatibility_demand_complete': True,
+        'compatibility_demand_complete': compatibility_complete,
+        'fresh_aggregate_zero': fresh_aggregate_zero,
         'in_flight_by_replica_id': translated_in_flight,
         'unknown_in_flight_replica_ids': sorted(unknown_ids),
         'observed_slots_by_replica_id': observed_slots,
@@ -1101,7 +1180,7 @@ def get_autoscaling_snapshot(
         'rejected_in_recent_window': recent_rejected,
         'rejected_in_window_by_priority': rejected_by_priority,
         'rejected_in_recent_window_by_priority': recent_rejected_by_priority,
-        'offered_arrival_tracking_saturated': False,
+        'offered_arrival_tracking_saturated': offered_arrival_tracking_saturated,
         **optional_counts,
     }
 
@@ -1131,6 +1210,7 @@ def get_autoscaling_snapshot(
         'queue_depth': queue_depth,
         'rejected_in_window': rejected,
         'recent_rejected_in_window': recent_rejected,
+        'fresh_aggregate_zero': fresh_aggregate_zero,
         # Exclude translated event timestamps: receipt time corrects reporter
         # clock skew, so those floats may move slightly on a heartbeat even
         # while the bounded demand classes and target are unchanged.
@@ -1140,14 +1220,15 @@ def get_autoscaling_snapshot(
             'rejected': _compatibility_totals(rejected_profiles),
         },
     }
-    return DurableAutoscalingSnapshot(service_name=service_name,
-                                      service_hash=service_hash,
-                                      demand_source_epoch=int(
-                                          service['demand_source_epoch']),
-                                      demand_feed_generation=int(generation),
-                                      route_generation=route_generation,
-                                      route_sha256=str(route_sha256),
-                                      route_source_epoch=route_epoch,
-                                      receipt_watermark=watermark,
-                                      request_information=request_information,
-                                      normalized_demand=normalized_demand)
+    return DurableAutoscalingSnapshot(
+        service_name=service_name,
+        service_hash=service_hash,
+        demand_source_epoch=int(service['demand_source_epoch']),
+        demand_feed_generation=int(generation),
+        route_generation=route_generation,
+        route_sha256=str(route_sha256),
+        route_source_epoch=route_epoch,
+        receipt_watermark=watermark,
+        request_information=request_information,
+        normalized_demand=normalized_demand,
+        fresh_aggregate_zero=(fresh_aggregate_zero))

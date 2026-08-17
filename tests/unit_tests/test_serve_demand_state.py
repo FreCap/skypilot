@@ -155,6 +155,41 @@ def test_current_lb_authority_requires_exact_ha_active_generation():
     assert not demand_state.reports_match_current_lb_authority(rows, service)
 
 
+def test_fresh_aggregate_zero_requires_full_quiet_window_coverage():
+    report = copy.deepcopy(_report())
+    report['demand_window'].update(
+        coverage_started_at=(report['reporter_observed_at'] -
+                             constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS),
+        buckets=[])
+    report['local_in_flight'] = 0
+    report['http_in_flight'] = {'http://replica': 0}
+    rows = [{'payload': report}]
+
+    assert demand_state.reports_prove_fresh_aggregate_zero(rows)
+
+    report['demand_window']['coverage_started_at'] += 1
+    assert not demand_state.reports_prove_fresh_aggregate_zero(rows)
+    report['demand_window']['coverage_started_at'] -= 1
+    report['queue_depth'] = 1
+    assert not demand_state.reports_prove_fresh_aggregate_zero(rows)
+
+
+def test_fresh_aggregate_zero_ignores_compatibility_and_occupancy_only():
+    report = copy.deepcopy(_report())
+    report['demand_window'].update(
+        coverage_started_at=(report['reporter_observed_at'] -
+                             constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS),
+        buckets=[],
+        compatibility_complete=False)
+    report['local_in_flight'] = 7
+    report['http_in_flight'] = {'http://replica': 7}
+    report['async_occupancy'] = {'http://replica': 3}
+
+    assert demand_state.reports_prove_fresh_aggregate_zero([{
+        'payload': report
+    }])
+
+
 def test_validate_report_never_promotes_incomplete_compatibility():
     report = copy.deepcopy(_report())
     report['demand_window']['compatibility_complete'] = False

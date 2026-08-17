@@ -989,10 +989,12 @@ def _replica_row_matches(session: orm.Session,
                          service_version: int,
                          service_name: str,
                          *,
-                         for_update: bool = True) -> bool:
+                         for_update: bool = True,
+                         require_route_eligible: bool = False) -> bool:
     """Check the immutable row identity without deserializing ReplicaInfo."""
     query = sqlalchemy.select(
         _REPLICAS.c.version,
+        _REPLICAS.c.status,
         _REPLICAS.c.replica_state['replica_record_id'].as_string().label(
             'replica_record_id'),
     ).where(_REPLICAS.c.service_name == service_name,
@@ -1001,7 +1003,9 @@ def _replica_row_matches(session: orm.Session,
         query = query.with_for_update()
     row = session.execute(query).mappings().one_or_none()
     return bool(row is not None and row['version'] == service_version and
-                row['replica_record_id'] == replica_record_id)
+                row['replica_record_id'] == replica_record_id and
+                (not require_route_eligible or
+                 row['status'] == serve_statuses.ReplicaStatus.READY.value))
 
 
 def _route_probe_target_from_row(
@@ -1399,9 +1403,13 @@ class RouteProjectionRepository:
                     raise RouteProjectionConflict(
                         'Route material writer no longer owns this service.')
                 current = [
-                    item for item in prepared if _replica_row_matches(
-                        session, item.replica_id, item.replica_record_id,
-                        item.service_version, identity.service_name)
+                    item for item in prepared
+                    if _replica_row_matches(session,
+                                            item.replica_id,
+                                            item.replica_record_id,
+                                            item.service_version,
+                                            identity.service_name,
+                                            require_route_eligible=True)
                 ]
                 now = session.execute(
                     sqlalchemy.select(
@@ -1460,7 +1468,8 @@ class RouteProjectionRepository:
                                                 record_id,
                                                 int(row['service_version']),
                                                 identity.service_name,
-                                                for_update=False):
+                                                for_update=False,
+                                                require_route_eligible=True):
                         continue
                     try:
                         targets.append(
@@ -1514,10 +1523,12 @@ class RouteProjectionRepository:
                         != target.material_generation or
                         lease['revocation_generation']
                         != target.revocation_generation or
-                        not _replica_row_matches(session, target.replica_id,
+                        not _replica_row_matches(session,
+                                                 target.replica_id,
                                                  target.replica_record_id,
                                                  target.service_version,
-                                                 identity.service_name)):
+                                                 identity.service_name,
+                                                 require_route_eligible=True)):
                     return RouteLeaseProbeReceipt(accepted=False)
                 now = session.execute(
                     sqlalchemy.select(

@@ -60,6 +60,7 @@ if typing.TYPE_CHECKING:
     from sqlalchemy.engine import row
 
     from sky.serve import kubernetes_identity
+    from sky.serve import paid_retirement
     from sky.serve import placement_contract_normalization
     from sky.serve import replica_managers
     from sky.serve import reserved_fill_planner
@@ -69,6 +70,7 @@ if typing.TYPE_CHECKING:
 else:
     placement_contract_normalization = adaptors_common.LazyImport(
         'sky.serve.placement_contract_normalization')
+    paid_retirement = adaptors_common.LazyImport('sky.serve.paid_retirement')
     kubernetes_identity = adaptors_common.LazyImport(
         'sky.serve.kubernetes_identity')
     replica_managers = adaptors_common.LazyImport('sky.serve.replica_managers')
@@ -5607,6 +5609,146 @@ def add_or_update_replica(
     return True
 
 
+def _transition_paid_retirement(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    *,
+    action: str,
+    authority: 'paid_retirement.FreshZeroAuthority | None' = None,
+    positive_demand_generation: int | None = None,
+    requires_idle_proof: bool = True,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> dict[str, Any] | bool:
+    """Atomically pair paid-retirement authority with replica off-route state."""
+    if action not in ('admit', 'commit', 'cancel'):
+        raise ValueError(f'Unsupported paid-retirement action: {action!r}.')
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
+        if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError('Paid retirement requires PostgreSQL.')
+        owner = session.execute(
+            sqlalchemy.select(services_table.c.hash,
+                              services_table.c.controller_pid,
+                              services_table.c.controller_ip).where(
+                                  services_table.c.name ==
+                                  service_name).with_for_update()).fetchone()
+        if (owner is None or owner[0] != expected_service_hash or
+            (owner[1], owner[2]) != expected_controller_owner):
+            session.rollback()
+            return False
+        locked_record_ids = _lock_replica_record_ids_in_session(
+            session, engine, service_name, [replica_id])
+        if (locked_record_ids is None or locked_record_ids.get(replica_id)
+                != replica_info.replica_record_id):
+            session.rollback()
+            return False
+        try:
+            if action == 'admit':
+                assert authority is not None
+                result: dict[str, Any] | bool = dict(
+                    paid_retirement.admit_in_session(
+                        session, service_name, replica_id,
+                        replica_info.replica_record_id, replica_info.version,
+                        requires_idle_proof, authority,
+                        expected_controller_owner))
+            elif action == 'commit':
+                assert authority is not None
+                result = paid_retirement.commit_in_session(
+                    session, service_name, replica_id,
+                    replica_info.replica_record_id, authority,
+                    expected_controller_owner)
+                if result is not True:
+                    session.rollback()
+                    return False
+            else:
+                assert positive_demand_generation is not None
+                result = paid_retirement.cancel_in_session(
+                    session, service_name, replica_id,
+                    replica_info.replica_record_id, positive_demand_generation,
+                    expected_service_hash, expected_controller_owner)
+                if result is not True:
+                    session.rollback()
+                    return False
+        except paid_retirement.PaidRetirementError:
+            session.rollback()
+            return False
+        persisted_infos = _upsert_replica_rows_in_session(
+            session,
+            engine,
+            service_name, [(replica_id, replica_info)],
+            expected_replica_exists=True)
+        if persisted_infos is None:
+            session.rollback()
+            return False
+        session.commit()
+    return result
+
+
+def admit_paid_retirement(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    authority: 'paid_retirement.FreshZeroAuthority',
+    *,
+    requires_idle_proof: bool,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> dict[str, Any] | None:
+    """Persist a fresh-zero intent and its off-route replica state."""
+    result = _transition_paid_retirement(
+        service_name,
+        replica_id,
+        replica_info,
+        action='admit',
+        authority=authority,
+        requires_idle_proof=requires_idle_proof,
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner)
+    return result if isinstance(result, dict) else None
+
+
+def commit_paid_retirement(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    authority: 'paid_retirement.FreshZeroAuthority',
+    *,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> bool:
+    """Commit teardown after exact idle proof without a generation gap."""
+    return _transition_paid_retirement(
+        service_name,
+        replica_id,
+        replica_info,
+        action='commit',
+        authority=authority,
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner) is True
+
+
+def cancel_paid_retirement(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    positive_demand_generation: int,
+    *,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+) -> bool:
+    """Cancel an uncommitted retirement only under newer positive demand."""
+    return _transition_paid_retirement(
+        service_name,
+        replica_id,
+        replica_info,
+        action='cancel',
+        positive_demand_generation=positive_demand_generation,
+        expected_service_hash=expected_service_hash,
+        expected_controller_owner=expected_controller_owner) is True
+
+
 def add_or_update_replica_with_launch_shadow(
     service_name: str,
     replica_id: int,
@@ -5887,6 +6029,8 @@ def remove_replica(
                 route_projection.revoke_replica_lease_in_session(
                     session, service_name, replica_id, current_record_id,
                     'replica_teardown')
+                paid_retirement.delete_in_session(session, service_name,
+                                                  [replica_id])
             result = session.execute(
                 sqlalchemy.delete(replicas_table).where(*predicates))
             if result.rowcount != 1:
@@ -5969,6 +6113,8 @@ def remove_replicas(
                 route_projection.revoke_replica_lease_in_session(
                     session, service_name, replica_id, record_id,
                     'replica_teardown')
+            paid_retirement.delete_in_session(session, service_name,
+                                              present_replica_ids)
         for start in range(0, len(replica_ids), _REPLICA_DELETE_CHUNK_SIZE):
             chunk = replica_ids[start:start + _REPLICA_DELETE_CHUNK_SIZE]
             session.execute(

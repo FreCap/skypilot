@@ -1,4 +1,4 @@
-"""Add incremental provider-free SkyServe route leases.
+"""Add incremental routes and exact-idle paid retirement.
 
 Revision ID: 051
 Revises: 050
@@ -7,7 +7,8 @@ Create Date: 2026-08-17
 Serve051 is additive, dark by default, and PostgreSQL-only.  Protocol 1 route
 publishers remain available for unconverted services while protocol 2 writes
 per-replica material and readiness leases before composing the unchanged
-protocol 1 load-balancer snapshot document.
+protocol 1 load-balancer snapshot document. Exact fresh-zero authority can
+also persist an off-route paid-replica retirement without a deadline fallback.
 """
 # pylint: disable=invalid-name
 from collections.abc import Sequence
@@ -23,6 +24,7 @@ depends_on: str | Sequence[str] | None = None
 
 _SERVICES = 'services'
 _LEASES = 'serve_route_replica_leases'
+_PAID_RETIREMENTS = 'serve_paid_replica_retirements'
 
 
 def _require_postgresql() -> None:
@@ -144,6 +146,65 @@ def upgrade() -> None:
         ['service_name', 'service_hash', 'revoked_at', 'valid_until'])
     op.create_index('ix_serve051_route_lease_replica', _LEASES,
                     ['service_name', 'replica_id'])
+
+    op.create_table(
+        _PAID_RETIREMENTS,
+        sa.Column('service_name', sa.Text(), primary_key=True),
+        sa.Column('replica_id', sa.Integer(), primary_key=True),
+        sa.Column('service_hash', sa.Text(), nullable=False),
+        sa.Column('replica_record_id', sa.Uuid(as_uuid=True), nullable=False),
+        sa.Column('service_lifecycle_epoch', sa.BigInteger(), nullable=False),
+        sa.Column('controller_incarnation',
+                  sa.Uuid(as_uuid=True),
+                  nullable=False),
+        sa.Column('controller_owner_epoch', sa.BigInteger(), nullable=False),
+        sa.Column('controller_pid', sa.Integer(), nullable=False),
+        sa.Column('controller_ip', sa.Text(), nullable=False),
+        sa.Column('service_version', sa.Integer(), nullable=False),
+        sa.Column('demand_source_epoch', sa.BigInteger(), nullable=False),
+        sa.Column('demand_feed_generation', sa.BigInteger(), nullable=False),
+        sa.Column('capacity_plan_generation', sa.BigInteger(), nullable=False),
+        sa.Column('capacity_plan_sha256', sa.Text(), nullable=False),
+        sa.Column('route_generation', sa.BigInteger(), nullable=False),
+        sa.Column('route_url', sa.Text()),
+        sa.Column('requires_idle_proof', sa.Boolean(), nullable=False),
+        sa.Column('state', sa.Text(), nullable=False),
+        sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('committed_at', sa.DateTime(timezone=True)),
+        sa.Column('cancelled_at', sa.DateTime(timezone=True)),
+        sa.ForeignKeyConstraint(['service_name'], ['services.name'],
+                                name='serve051_paid_retirement_service_fk',
+                                ondelete='CASCADE'),
+        sa.CheckConstraint(
+            'replica_id > 0 AND service_lifecycle_epoch > 0 AND '
+            'controller_owner_epoch > 0 AND controller_pid > 0 AND '
+            'service_version > 0 AND demand_source_epoch > 0 AND '
+            'demand_feed_generation > 0 AND capacity_plan_generation > 0 AND '
+            'route_generation > 0',
+            name='serve051_paid_retirement_positive_ck'),
+        sa.CheckConstraint(
+            'length(service_hash) > 0 AND length(controller_ip) > 0 AND '
+            "capacity_plan_sha256 ~ '^[0-9a-f]{64}$'",
+            name='serve051_paid_retirement_text_nonempty_ck'),
+        sa.CheckConstraint(
+            '((requires_idle_proof AND route_url IS NOT NULL AND '
+            'length(route_url) > 0) OR '
+            '(NOT requires_idle_proof AND route_url IS NULL))',
+            name='serve051_paid_retirement_route_shape_ck'),
+        sa.CheckConstraint("state IN ('ACTIVE', 'COMMITTED', 'CANCELLED')",
+                           name='serve051_paid_retirement_state_ck'),
+        sa.CheckConstraint(
+            "((state = 'ACTIVE' AND committed_at IS NULL AND "
+            'cancelled_at IS NULL) OR '
+            "(state = 'COMMITTED' AND committed_at IS NOT NULL AND "
+            'cancelled_at IS NULL) OR '
+            "(state = 'CANCELLED' AND committed_at IS NULL AND "
+            'cancelled_at IS NOT NULL))',
+            name='serve051_paid_retirement_terminal_shape_ck'),
+    )
+    op.create_index('ix_serve051_paid_retirement_active', _PAID_RETIREMENTS,
+                    ['service_name', 'state'])
 
 
 def downgrade() -> None:

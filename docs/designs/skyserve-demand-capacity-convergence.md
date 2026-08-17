@@ -16,6 +16,13 @@ and the other 13 warm-standby LB deployments are ready with zero restarts. The
 inactive `boltz-l4-fleet` standby deliberately remains on revision 407 until a
 future cutover; it is not an active traffic owner.
 
+P2c API88/Serve051 is implemented and locally reviewed on branch
+`fix/serve-route-replica-leases` as four code commits above the revision-408
+source plus this living-design update. Its remote PostgreSQL CI, PR merge,
+immutable image build, dark Helm deployment, and production provider-stall
+qualification remain open. No P2c behavior has been promoted on
+`boltz-l4-fleet`.
+
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
 no generic non-pool capability. Revision 407 nevertheless made the dark P2b1
@@ -928,20 +935,27 @@ only public route protocol. Protocol 1 stays available only for unconverted
 services during the mixed cohort and is removed by the already-authored P3a
 cleanup after the protocol-2 production gate.
 
-Implementation is split into five reviewable commits in one additive PR:
+Implementation is split into four reviewable code commits in one additive PR,
+preceded by the canonical-design update:
 
 1. PostgreSQL schema/repository and pure validation for exact route material,
    readiness leases, owner fencing, revocation, and bounded retention;
 2. provider-fenced resolver writes with no publication side effect;
 3. supervised provider-free HTTP readiness and snapshot composition, including
    controller restart/adoption and one poisoned-row isolation;
-4. service/LB capability, dark protocol-2 selection, promotion gates, metrics,
-   and live migration tooling; and
-5. autoscaler fresh-zero semantics plus per-replica paid drain/occupancy tests
-   and the dashboard explanation for exact versus confirmed processing.
+4. service/LB capability, dark protocol-2 selection, promotion gates, fresh
+   aggregate-zero autoscaler semantics, and per-replica exact-idle paid
+   retirement.
 
-Estimated size is 1,600--2,600 source/test additions across 20--30 files and
-one Serve migration. It is intentionally not a TTL adjustment: the required
+The reviewed branch currently changes 36 files with roughly 4,400 additions
+and 200 deletions relative to revision 408, including the design and one Serve
+migration. This is larger than the original 1,600--2,600-line estimate because
+the final implementation includes immutable material digests, protocol-1/2
+collision fencing, transactional route revocation at every READY-exit path,
+restart recovery, exact paid-retirement authority, and real-PostgreSQL race
+tests. The exact-versus-confirmed processing UI was already merged in PR #1521;
+P2c consumes and preserves that contract rather than adding a second dashboard
+path. It is intentionally not a TTL adjustment: the required
 stress test holds provider I/O forever while at least ten consecutive route
 head renewals stay within the configured cadence, one URL independently
 expires, a replacement URL becomes ready, and demand/dashboard writes remain
@@ -958,6 +972,25 @@ proceed for every paid replica; the teardown executor advances only the subset
 whose current active/draining reporters prove zero occupancy. A later positive
 demand plan may cancel an uncommitted retirement only through the normal
 generation fence, never by silently republishing the revoked lease.
+
+The implemented paid-retirement transaction binds the exact service owner,
+replica record, demand generation, fresh route head, and zero-residual capacity
+plan. Fresh aggregate zero immediately clears cold paid-launch authority and
+publishes a nonempty all-zero capacity target. Every paid replica is then made
+off-route atomically with an `ACTIVE` retirement intent. A never-ready replica
+may commit immediately; a previously routable replica has no deadline-based
+escape and becomes `COMMITTED` only after its retained exact route URL reports
+idle. Positive demand can cancel only an `ACTIVE` intent under a strictly newer
+demand generation. `COMMITTED` is irreversible and recovery re-drives it with
+a zero-second teardown cap.
+
+Local evidence on 2026-08-17 includes the complete Serve controller, replica
+manager, Serve state, concurrency autoscaler, demand, capacity-admission,
+route-projection, incremental-worker, request-aggregator, and migration utility
+suites. The three changed PostgreSQL suites collect successfully but skip
+locally because no Docker daemon is available; remote real-PostgreSQL execution
+is therefore a merge gate. `format.sh` passed mypy over 953 source files,
+changed-file pylint at 10.00/10, dashboard ESLint, and dashboard formatting.
 
 The additive PR must link to draft #1506 as its stacked removal. #1506 is
 expanded and restacked to delete the protocol-1 all-fleet publisher, old route
@@ -1212,6 +1245,16 @@ one optional per-context Kueue contract, one complete audited server-config
 transaction, and one service version with all worker Pod identity/configuration
 owned by the server projection.
 
+The 2026-08-17 exact P2c diff review rejected four unsafe shortcuts. A legacy
+unbounded-looking drain row cannot identify a paid retirement because its JSON
+shape collides with older cleanup states; only the PostgreSQL retirement intent
+is the discriminator, and failure to read that table blocks teardown. An empty
+accelerator map cannot vacuously prove an all-zero target. A protocol-1 route
+owner cannot assert the protocol-2 aggregate-zero exception. Finally, an exact
+route generation is insufficient after its head expires, so retirement
+admission and commit also lock and validate the still-fresh route head. These
+corrections are implemented and covered by focused regressions.
+
 ## Open gates
 
 - [x] Verify the v1.1.1296 production compatibility baseline and the later
@@ -1248,9 +1291,11 @@ owned by the server projection.
 - [x] Run P3a's provider-stall route gate on revision 407. It failed: the
   60-second dark route head remained stale for at least 148 seconds while
   demand stayed fresh. Keep #1506 draft and undeployed.
-- [ ] Implement, adversarially review, and merge P2c API88/Serve051 with its
-  simultaneously maintained #1506 removal diff; deploy dark and prove the
-  ten-renewal provider-stall gate.
+- [ ] Merge P2c API88/Serve051 after remote real-PostgreSQL CI and final exact
+  diff review, update its simultaneously maintained #1506 removal diff, then
+  deploy dark and prove the ten-renewal provider-stall gate. Local
+  implementation and focused review are complete on
+  `fix/serve-route-replica-leases`.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.

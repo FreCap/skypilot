@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
+import math
 from multiprocessing import pool as mp_pool
 import os
 import pathlib
@@ -42,6 +43,7 @@ from sky.serve import drain_observability
 from sky.serve import non_pool_launch_reconciliation
 from sky.serve import ordinary_launch_handoff
 from sky.serve import paid_capacity
+from sky.serve import paid_retirement
 from sky.serve import pool_capacity_observation
 from sky.serve import provider_phase
 from sky.serve import replica_info as replica_info_lib
@@ -3006,6 +3008,24 @@ class ReplicaManager:
         """Scale down replica with replica_id."""
         raise NotImplementedError
 
+    def reconcile_fresh_zero_paid_retirements(
+        self,
+        authority: paid_retirement.FreshZeroAuthority,
+        replica_infos: list['ReplicaInfo'],
+    ) -> bool:
+        """Off-route paid replicas under exact fresh-zero authority."""
+        del authority, replica_infos
+        return False
+
+    def cancel_uncommitted_paid_retirements(
+        self,
+        service_hash: str,
+        positive_demand_generation: int,
+    ) -> bool:
+        """Readmit paid replicas fenced by newer positive demand."""
+        del service_hash, positive_demand_generation
+        return False
+
     def scale_down_logically(
         self,
         replica_id: int,
@@ -5759,8 +5779,33 @@ class SkyPilotReplicaManager(ReplicaManager):
         recovery_wait_urls: dict[int, str | None] = {}
         malformed_waiting_rows: dict[int, str] = {}
         ordinary_waiting_replicas: list[ReplicaInfo] = []
+        try:
+            recovered_paid_retirements = paid_retirement.list_for_service(
+                self._service_name)
+            paid_retirement_read_failed = False
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning('Unable to read paid-retirement state during '
+                           'recovery; exact-idle rows remain blocked: '
+                           f'{common_utils.format_exception(error)}')
+            recovered_paid_retirements = {}
+            paid_retirement_read_failed = True
         if waiting_replicas and not self._is_pool:
             for info in waiting_replicas:
+                record = recovered_paid_retirements.get(info.replica_id)
+                matching_paid_retirement = bool(
+                    record is not None and str(record['replica_record_id'])
+                    == info.replica_record_id and record['state'] in {
+                        paid_retirement.PaidRetirementState.ACTIVE.value,
+                        paid_retirement.PaidRetirementState.COMMITTED.value,
+                    })
+                if (matching_paid_retirement or
+                    (paid_retirement_read_failed and
+                     info.status_property.wait_for_idle_before_termination
+                     is True and
+                     info.status_property.drain_cap_seconds is None)):
+                    recovery_wait_urls[info.replica_id] = (
+                        None if record is None else record.get('route_url'))
+                    continue
                 try:
                     cleanup_fence = (
                         reserved_capacity.parse_protocol_v2_cleanup_fence(info))
@@ -5824,6 +5869,23 @@ class SkyPilotReplicaManager(ReplicaManager):
                 ordinary_wait_urls_resolved = True
                 _resolve_ordinary_recovery_wait_urls()
             try:
+                paid_record = recovered_paid_retirements.get(
+                    replica_info.replica_id)
+                if (paid_record is not None and
+                        str(paid_record['replica_record_id'])
+                        == replica_info.replica_record_id and
+                        paid_record['state']
+                        == paid_retirement.PaidRetirementState.COMMITTED.value):
+                    # Destructive authority was already committed under the
+                    # exact demand/route/plan transaction. Recovery must not
+                    # reinterpret the intentionally absent drain cap as the
+                    # legacy bounded fallback.
+                    self._terminate_replica(replica_info.replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                    continue
                 malformed_identity = malformed_waiting_rows.get(
                     replica_info.replica_id)
                 if malformed_identity is not None:
@@ -9962,20 +10024,47 @@ class SkyPilotReplicaManager(ReplicaManager):
         if info.replica_id in self._wait_for_idle_trackers:
             return
         drain_cap = info.status_property.drain_cap_seconds
+        exact_retirement = None
+        if (info.status_property.wait_for_idle_before_termination is True and
+                drain_cap is None and self._service_hash is not None):
+            try:
+                exact_retirement = paid_retirement.get_for_replica(
+                    self._service_name, info.replica_id)
+            except Exception as error:  # pylint: disable=broad-except
+                # A missing authority read is never permission to reinterpret
+                # an unbounded exact-idle retirement as a bounded legacy drain.
+                logger.warning(
+                    'Unable to read exact paid-retirement authority for '
+                    f'replica {info.replica_id}; keeping teardown blocked: '
+                    f'{common_utils.format_exception(error)}')
+                self._wait_for_idle_trackers[info.replica_id] = (None, math.inf)
+                return
+        if (exact_retirement is not None and
+                str(exact_retirement['replica_record_id'])
+                == info.replica_record_id and exact_retirement['state'] in {
+                    paid_retirement.PaidRetirementState.ACTIVE.value,
+                    paid_retirement.PaidRetirementState.COMMITTED.value,
+                }):
+            deadline = math.inf
+            if exact_retirement['state'] == (
+                    paid_retirement.PaidRetirementState.ACTIVE.value):
+                replica_url = exact_retirement['route_url']
         needs_persist = False
-        if drain_cap is None:
+        if drain_cap is None and exact_retirement is None:
             drain_cap = self._resolve_drain_cap_seconds(info.replica_id, info)
             info.status_property.drain_cap_seconds = drain_cap
             needs_persist = True
         prior_started_at = info.status_property.drain_started_at
-        drain_started_at = _ensure_drain_started_at(info.status_property,
-                                                    drain_cap)
+        drain_started_at = (None if exact_retirement is not None
+                            else _ensure_drain_started_at(
+                                info.status_property, drain_cap))
         if drain_started_at != prior_started_at:
             needs_persist = True
         if needs_persist:
             self._persist_replica(info.replica_id, info)
         drain_started = time.monotonic()
         if deadline is None:
+            assert drain_cap is not None
             remaining = (0.0 if drain_started_at is None else
                          _remaining_drain_seconds(drain_started_at, drain_cap))
             deadline = drain_started + remaining
@@ -10852,6 +10941,16 @@ class SkyPilotReplicaManager(ReplicaManager):
         tracker_items = list(self._wait_for_idle_trackers.items())
         if not tracker_items:
             return
+        try:
+            paid_retirements = paid_retirement.list_for_service(
+                self._service_name)
+        except Exception as error:  # pylint: disable=broad-except
+            # Exact-idle authority is PostgreSQL-owned. A read failure blocks
+            # this entire pass; it can never degrade into deadline authority.
+            logger.warning('Unable to refresh paid-retirement authority; '
+                           'keeping strict teardown blocked: '
+                           f'{common_utils.format_exception(error)}')
+            return
 
         replica_infos = serve_state.get_replica_infos_from_ids(
             self._service_name, [replica_id for replica_id, _ in tracker_items])
@@ -10892,13 +10991,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             dict.fromkeys(info.cluster_name for info in tracked_infos.values()))
         cluster_status_fields = global_user_state.get_cluster_status_fields(
             cluster_names)
+        exact_route_urls = {
+            replica_id: record['route_url']
+            for replica_id, record in paid_retirements.items()
+            if record['state'] == paid_retirement.PaidRetirementState.ACTIVE.
+            value and record['route_url'] is not None
+        }
         retry_url_infos = [
             tracked_infos[replica_id]
             for replica_id, (tracker, _) in tracker_items
             if (tracker is None and replica_id in tracked_infos and
+                replica_id not in exact_route_urls and
                 tracked_infos[replica_id].cluster_name in cluster_status_fields)
         ]
-        retry_urls: dict[int, str | None] = {}
+        retry_urls: dict[int, str | None] = dict(exact_route_urls)
         deferred_url_ids: set[int] = set()
         fenced_retry_infos: list[ReplicaInfo] = []
         ordinary_retry_infos: list[ReplicaInfo] = []
@@ -10976,6 +11082,13 @@ class SkyPilotReplicaManager(ReplicaManager):
                         continue
                 drained = tracker is not None and tracker()
             deadline_expired = time.monotonic() >= deadline
+            retirement = paid_retirements.get(replica_id)
+            exact_paid_retirement = bool(
+                retirement is not None and str(retirement['replica_record_id'])
+                == info.replica_record_id and retirement['state'] in {
+                    paid_retirement.PaidRetirementState.ACTIVE.value,
+                    paid_retirement.PaidRetirementState.COMMITTED.value,
+                })
             logical_retirement = (
                 info.status_property.logical_retirement_version is not None)
             if logical_retirement:
@@ -11041,6 +11154,48 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 self._finish_logical_retirement(replica_id, info)
                 continue
+            if exact_paid_retirement:
+                assert retirement is not None
+                if retirement['state'] == (
+                        paid_retirement.PaidRetirementState.COMMITTED.value):
+                    self._wait_for_idle_trackers.pop(replica_id, None)
+                    self._terminate_replica(replica_id,
+                                            sync_down_logs=False,
+                                            replica_drain_delay_seconds=0,
+                                            is_scale_down=True,
+                                            in_flight_drain_cap_seconds=0)
+                    continue
+                if not drained:
+                    continue
+                authority = paid_retirement.FreshZeroAuthority(
+                    service_hash=retirement['service_hash'],
+                    demand_source_epoch=int(retirement['demand_source_epoch']),
+                    demand_feed_generation=int(
+                        retirement['demand_feed_generation']),
+                    capacity_plan_generation=int(
+                        retirement['capacity_plan_generation']),
+                    capacity_plan_sha256=retirement['capacity_plan_sha256'],
+                    route_generation=int(retirement['route_generation']))
+                info.status_property.wait_for_idle_before_termination = False
+                if (self._service_hash is None or
+                        self._controller_owner is None or
+                        not serve_state.commit_paid_retirement(
+                            self._service_name,
+                            replica_id,
+                            info,
+                            authority,
+                            expected_service_hash=self._service_hash,
+                            expected_controller_owner=self._controller_owner)):
+                    info.status_property.wait_for_idle_before_termination = True
+                    continue
+                self._drain_proof_stats.record_proved_drained()
+                self._wait_for_idle_trackers.pop(replica_id, None)
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+                continue
             if not drained and not deadline_expired:
                 continue
             drain_cap: int | None = 0
@@ -11096,6 +11251,116 @@ class SkyPilotReplicaManager(ReplicaManager):
                     info.unknown_capacity_replacement = False
                     self._persist_replica(replica_id, info)
                 replacement_ids.discard(replica_id)
+
+    @with_lock
+    def reconcile_fresh_zero_paid_retirements(
+        self,
+        authority: paid_retirement.FreshZeroAuthority,
+        replica_infos: list[ReplicaInfo],
+    ) -> bool:
+        """Persist exact-idle-only retirement for every live paid replica."""
+        if (self._update_recovery_required or self._service_hash is None or
+                self._controller_owner is None or
+                authority.service_hash != self._service_hash):
+            return False
+        changed = False
+        for original in sorted(replica_infos, key=lambda item: item.replica_id):
+            if (original.is_terminal or original.is_zero_cost is True or
+                    original.status_property.is_scale_down or
+                    original.status_property.sky_down_status is not None):
+                continue
+            info = serve_state.get_replica_info_from_id(self._service_name,
+                                                        original.replica_id)
+            if (info is None or
+                    info.replica_record_id != original.replica_record_id or
+                    info.is_terminal or info.is_zero_cost is True or
+                    info.status_property.is_scale_down or
+                    info.status_property.sky_down_status is not None):
+                continue
+            requires_idle_proof = bool(
+                info.is_ready or
+                info.status == serve_state.ReplicaStatus.NOT_READY or
+                (isinstance(info.status_property.first_ready_time,
+                            (int, float)) and
+                 not isinstance(info.status_property.first_ready_time, bool) and
+                 info.status_property.first_ready_time >= 0))
+            status = info.status_property
+            status.is_scale_down = True
+            status.purged = False
+            status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+            # An economic zero retirement has no elapsed-time authority.
+            # The separate PostgreSQL intent is the durable discriminator;
+            # these legacy bounded-drain fields remain intentionally empty.
+            status.drain_cap_seconds = None
+            status.drain_started_at = None
+            status.wait_for_idle_before_termination = requires_idle_proof
+            record = serve_state.admit_paid_retirement(
+                self._service_name,
+                info.replica_id,
+                info,
+                authority,
+                requires_idle_proof=requires_idle_proof,
+                expected_service_hash=self._service_hash,
+                expected_controller_owner=self._controller_owner)
+            if record is None:
+                continue
+            changed = True
+            if requires_idle_proof:
+                self._wait_for_idle_trackers.pop(info.replica_id, None)
+                self._register_wait_for_idle(info,
+                                             deadline=math.inf,
+                                             replica_url=record['route_url'])
+            else:
+                self._terminate_replica(info.replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+        return changed
+
+    @with_lock
+    def cancel_uncommitted_paid_retirements(
+        self,
+        service_hash: str,
+        positive_demand_generation: int,
+    ) -> bool:
+        """Cancel only pre-teardown intents under newer positive demand."""
+        if (self._update_recovery_required or self._service_hash is None or
+                self._controller_owner is None or
+                service_hash != self._service_hash):
+            return False
+        changed = False
+        records = paid_retirement.list_for_service(self._service_name)
+        active_ids = [
+            replica_id for replica_id, record in records.items() if
+            record['state'] == paid_retirement.PaidRetirementState.ACTIVE.value
+        ]
+        infos = serve_state.get_replica_infos_from_ids(self._service_name,
+                                                       active_ids)
+        for replica_id in sorted(active_ids):
+            record = records[replica_id]
+            info = infos.get(replica_id)
+            if (info is None or
+                    str(record['replica_record_id']) != info.replica_record_id):
+                continue
+            status = info.status_property
+            status.sky_down_status = None
+            status.is_scale_down = False
+            status.purged = False
+            status.drain_cap_seconds = None
+            status.drain_started_at = None
+            status.wait_for_idle_before_termination = False
+            if not serve_state.cancel_paid_retirement(
+                    self._service_name,
+                    replica_id,
+                    info,
+                    positive_demand_generation,
+                    expected_service_hash=self._service_hash,
+                    expected_controller_owner=self._controller_owner):
+                continue
+            self._wait_for_idle_trackers.pop(replica_id, None)
+            changed = True
+        return changed
 
     @with_lock
     def scale_down(self,

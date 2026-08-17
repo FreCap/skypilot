@@ -19,6 +19,7 @@ import dataclasses
 import functools
 import json
 import logging
+import math
 import os
 import queue
 import threading
@@ -9819,6 +9820,160 @@ class TestLogicalCapacityPlanning:
             mgr._refresh_wait_for_idle()
 
         assert events == [('terminate', 2), ('resolve', [1])]
+
+    def test_fresh_zero_paid_retirement_is_off_route_without_deadline(self):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._update_recovery_required = False
+        retiring = self._ready_backend(1, 1)
+        authority = replica_managers.paid_retirement.FreshZeroAuthority(
+            service_hash='svc-hash',
+            demand_source_epoch=2,
+            demand_feed_generation=7,
+            capacity_plan_generation=9,
+            capacity_plan_sha256='a' * 64,
+            route_generation=11)
+        record = {
+            'replica_record_id': retiring.replica_record_id,
+            'route_url': 'http://replica:8000',
+        }
+        mgr._register_wait_for_idle = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.serve_state,
+                'get_replica_info_from_id',
+                return_value=retiring), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'admit_paid_retirement',
+                 return_value=record) as admit:
+            changed = mgr.reconcile_fresh_zero_paid_retirements(
+                authority, [retiring])
+
+        assert changed
+        assert retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status == (
+            common_utils.ProcessStatus.SCHEDULED)
+        assert retiring.status_property.drain_cap_seconds is None
+        assert retiring.status_property.drain_started_at is None
+        assert retiring.status_property.wait_for_idle_before_termination
+        admit.assert_called_once_with('svc',
+                                      1,
+                                      retiring,
+                                      authority,
+                                      requires_idle_proof=True,
+                                      expected_service_hash='svc-hash',
+                                      expected_controller_owner=(123,
+                                                                 '10.0.0.5'))
+        mgr._register_wait_for_idle.assert_called_once_with(
+            retiring, deadline=math.inf, replica_url='http://replica:8000')
+
+    @pytest.mark.parametrize('idle', [False, True])
+    def test_exact_paid_retirement_never_uses_elapsed_time(self, idle):
+        mgr = _make_manager()
+        mgr._is_pool = False
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._drain_proof_stats_value = mock.Mock()
+        retiring = self._ready_backend(1, 1)
+        retiring.status_property.is_scale_down = True
+        retiring.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        retiring.status_property.wait_for_idle_before_termination = True
+        retiring.status_property.drain_cap_seconds = None
+        mgr._wait_for_idle_trackers = {
+            1: (mock.Mock(return_value=idle), math.inf)
+        }
+        record = {
+            'service_hash': 'svc-hash',
+            'replica_record_id': retiring.replica_record_id,
+            'demand_source_epoch': 2,
+            'demand_feed_generation': 7,
+            'capacity_plan_generation': 9,
+            'capacity_plan_sha256': 'a' * 64,
+            'route_generation': 11,
+            'route_url': 'http://replica:8000',
+            'state': (replica_managers.paid_retirement.PaidRetirementState.
+                      ACTIVE.value),
+        }
+        mgr._terminate_replica = mock.Mock()
+
+        with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_for_service',
+                return_value={1: record}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos_from_ids',
+                 return_value={1: retiring}), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={retiring.cluster_name: ('UP', 1)}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'commit_paid_retirement',
+                 return_value=True) as commit:
+            mgr._refresh_wait_for_idle()
+
+        if idle:
+            commit.assert_called_once()
+            mgr._terminate_replica.assert_called_once_with(
+                1,
+                sync_down_logs=False,
+                replica_drain_delay_seconds=0,
+                is_scale_down=True,
+                in_flight_drain_cap_seconds=0)
+        else:
+            commit.assert_not_called()
+            mgr._terminate_replica.assert_not_called()
+            assert mgr._wait_for_idle_trackers[1][1] == math.inf
+
+    def test_new_positive_generation_cancels_only_active_retirement(self):
+        mgr = _make_manager()
+        mgr._service_hash = 'svc-hash'
+        mgr._controller_owner = (123, '10.0.0.5')
+        mgr._update_recovery_required = False
+        retiring = self._ready_backend(1, 1)
+        retiring.status_property.is_scale_down = True
+        retiring.status_property.sky_down_status = (
+            common_utils.ProcessStatus.SCHEDULED)
+        retiring.status_property.wait_for_idle_before_termination = True
+        mgr._wait_for_idle_trackers = {1: (mock.Mock(), math.inf)}
+        record = {
+            'replica_record_id': retiring.replica_record_id,
+            'state': (replica_managers.paid_retirement.PaidRetirementState.
+                      ACTIVE.value),
+        }
+
+        with mock.patch.object(
+                replica_managers.paid_retirement,
+                'list_for_service',
+                return_value={1: record}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'get_replica_infos_from_ids',
+                 return_value={1: retiring}), \
+             mock.patch.object(
+                 replica_managers.serve_state,
+                 'cancel_paid_retirement',
+                 return_value=True) as cancel:
+            changed = mgr.cancel_uncommitted_paid_retirements('svc-hash', 8)
+
+        assert changed
+        assert not retiring.status_property.is_scale_down
+        assert retiring.status_property.sky_down_status is None
+        assert not retiring.status_property.wait_for_idle_before_termination
+        assert 1 not in mgr._wait_for_idle_trackers
+        cancel.assert_called_once_with('svc',
+                                       1,
+                                       retiring,
+                                       8,
+                                       expected_service_hash='svc-hash',
+                                       expected_controller_owner=(123,
+                                                                  '10.0.0.5'))
 
     def test_initial_v2_strict_drain_uid_mismatch_stays_off_route(self):
         retiring = _stamp_protocol_v2_fill(

@@ -168,6 +168,7 @@ def test_serve049_schema_is_postgresql_only_and_complete(route_database):
     } <= service_columns
     assert inspector.has_table(
         route_projection_schema.serve_route_replica_leases_table.name)
+    assert inspector.has_table('serve_paid_replica_retirements')
 
 
 def test_incremental_material_is_idempotent_and_probe_is_generation_fenced(
@@ -231,6 +232,38 @@ def test_revocation_rejects_delayed_probe_and_implicit_revival(route_database):
                        match='cannot be implicitly revived'):
         repository.upsert_replica_material(_identity(incarnation), info,
                                            _material())
+
+
+def test_delayed_ready_probe_cannot_reactivate_off_route_replica(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    record_id = str(uuid.uuid4())
+    _insert_replica(engine, record_id)
+    info = type('Info', (), {
+        'replica_id': 1,
+        'replica_record_id': record_id,
+        'version': 1,
+    })()
+    repository.upsert_replica_material(_identity(incarnation), info,
+                                       _material())
+    target = repository.list_probe_targets(_identity(incarnation))[0]
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 1).values(
+                    status='SHUTTING_DOWN'))
+
+    assert repository.record_probe_result(target, True,
+                                          ttl_seconds=60).accepted is False
+    with engine.connect() as connection:
+        lease = connection.execute(
+            sqlalchemy.select(
+                route_projection_schema.serve_route_replica_leases_table)
+        ).mappings().one()
+    assert lease['ready'] is False
+    assert lease['valid_until'] is None
 
 
 def test_reused_numeric_id_revokes_old_record_and_isolates_late_result(

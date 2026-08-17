@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 88  # Incremental provider-free route leases
+API_VERSION = 88  # Incremental route leases and safe paid retirement
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
