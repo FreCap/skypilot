@@ -1644,8 +1644,9 @@ dark deployment gate.
   LB slots and the API use the exact image with zero restarts; the service
   remains `DIRECT_REPLICA`; and the initial post-upgrade query found zero
   intents and zero new replicas or `sky.launch` requests.
-- [ ] Merge and deploy the logical-retirement ready-snapshot fix-forward, then
-  prove controller health and `/autoscaler/info` recover promptly with 38
+- [ ] Merge and deploy PR #1538's logical-retirement ready-snapshot
+  fix-forward, then prove controller health and `/autoscaler/info` recover
+  promptly with 38
   simultaneous retirements and 5,536 retained rows. The pre-fix production
   child remained near 106% CPU and delayed one LB standby by roughly eight
   minutes; timeout increases or history deletion do not close this gate.
