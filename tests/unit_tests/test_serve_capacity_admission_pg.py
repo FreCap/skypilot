@@ -23,7 +23,7 @@ from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
-    name='serve_capacity_admission_schema_050_pg')
+    name='serve_capacity_admission_schema_051_pg')
 
 _URL = 'http://replica:8000'
 
@@ -110,6 +110,8 @@ def _demand_report(now: float,
         'demand_window': {
             'bucket_seconds': bucket_seconds,
             'window_seconds': constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS,
+            'coverage_started_at':
+                (now - constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS),
             'buckets': [{
                 'bucket_start': int(now // bucket_seconds) * bucket_seconds,
                 'request_count': request_count,
@@ -146,7 +148,7 @@ def _demand_report(now: float,
 def capacity_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(serve_config, '050')
+    alembic_command.upgrade(serve_config, '051')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     incarnation = uuid.uuid4()
@@ -197,7 +199,15 @@ def capacity_database(empty_postgres, monkeypatch):
                                              _route_identities(record_id),
                                              {record_id},
                                              ttl_seconds=60)
-    assert route_repository.promote('svc', 'svc-hash') == 1
+    # Characterize a retained projected-protocol-1 cohort after Serve051.
+    # New promotion selects protocol 2; an already-promoted service retains
+    # its exact writer until the explicit migration gate.
+    with empty_postgres.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_source_mode='DURABLE_PROJECTED',
+                    route_source_epoch=1))
     demand_state.ingest_report('svc', 'svc-hash',
                                _demand_report(time.time(), route_receipt))
     with empty_postgres.begin() as connection:
@@ -437,6 +447,39 @@ def test_zero_target_mints_revoking_semantic_generation(capacity_database):
                 connection, {
                     **service, 'name': 'svc'
                 }, claim)
+
+
+def test_protocol2_full_window_zero_revokes_paid_authority_without_exact_cards(
+        capacity_database):
+    engine, incarnation, route_receipt = capacity_database
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(
+                route_projection_schema.serve_route_snapshots_table).values(
+                    producer_protocol_version=2))
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2,
+                    route_projection_controller_incarnation=incarnation))
+    report = _demand_report(time.time(),
+                            route_receipt,
+                            sequence=2,
+                            request_count=0)
+    report['demand_window']['compatibility_complete'] = False
+    demand_state.ingest_report('svc', 'svc-hash', report)
+
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    assert snapshot.fresh_aggregate_zero
+    assert not snapshot.request_information['compatibility_demand_complete']
+    repository = capacity_admission.CapacityAdmissionRepository(engine)
+    zero = repository.publish(_plan(0))
+    assert not zero.remaining()
+
+    with pytest.raises(capacity_admission.CapacityAdmissionConflict,
+                       match='demand receipts'):
+        repository.publish(_plan(1))
 
 
 def test_superseded_unclaimed_plan_is_collected(capacity_database):

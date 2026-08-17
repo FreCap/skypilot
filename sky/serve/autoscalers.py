@@ -1069,6 +1069,16 @@ class Autoscaler:
         """Collect request information from aggregator for autoscaling."""
         raise NotImplementedError
 
+    def clear_paid_launch_authority_for_fresh_zero(self) -> None:
+        """Withdraw every process-local cold-launch allowance.
+
+        The durable zero capacity plan is the launch fence.  Clearing this
+        explanatory/process-local map at ingestion keeps status and later
+        planning from carrying a positive allowance across the exact zero
+        decision.
+        """
+        self.cold_launch_authority_by_accelerator = {}
+
     def collect_reserved_capacity(
             self,
             free_slots: int,

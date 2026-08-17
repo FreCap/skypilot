@@ -122,6 +122,15 @@ def _make_autoscaler(**spec_kwargs):
                                              version=1)
 
 
+def test_fresh_zero_withdraws_process_local_cold_launch_authority():
+    autoscaler = _make_autoscaler()
+    autoscaler.cold_launch_authority_by_accelerator = {'L4': 3}
+
+    autoscaler.clear_paid_launch_authority_for_fresh_zero()
+
+    assert autoscaler.cold_launch_authority_by_accelerator == {}
+
+
 def _replica(replica_id,
              gpu_count=1,
              card='L4',

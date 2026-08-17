@@ -1,6 +1,9 @@
 """Pure contracts for the provider-free SkyServe route document."""
 # pylint: disable=protected-access
 
+import datetime
+import hashlib
+import json
 import types
 import uuid
 
@@ -134,3 +137,113 @@ def test_malformed_record_identity_withholds_only_that_replica():
     assert healthy_material.url in result.response['replica_info']
     assert result.response['num_ready_replicas'] == 1
     assert result.live_record_ids == {healthy.replica_record_id}
+
+
+def _incremental_lease(replica_id,
+                       record_id,
+                       url,
+                       now,
+                       *,
+                       ready=True,
+                       valid=True,
+                       requires_marker=False,
+                       marker=None):
+    material = route_projection.RouteLeaseMaterial(
+        route=route_projection.ResolvedRouteMaterial(url, 'L4', 1),
+        readiness_path='/health',
+        probe_timeout_seconds=15,
+        post_data=None,
+        headers=None,
+        async_occupancy=True,
+        uses_logical_replicas=False,
+        is_zero_cost=False,
+        planned_capacity=1,
+        route_allowed=True,
+        requires_route_marker=requires_marker,
+        route_marker=marker)
+    payload = route_projection._lease_material_payload(material)
+    digest = hashlib.sha256(
+        json.dumps(payload,
+                   sort_keys=True,
+                   separators=(',', ':'),
+                   allow_nan=False).encode()).hexdigest()
+    return {
+        'replica_id': replica_id,
+        'replica_record_id': record_id,
+        'service_version': 1,
+        **payload,
+        'material_sha256': digest,
+        'ready': ready,
+        'valid_until': now + datetime.timedelta(seconds=30 if valid else -1),
+        'revoked_at': None,
+    }
+
+
+def test_incremental_view_expires_only_one_replica():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    first = route_projection.IncrementalRouteReplica(1, str(uuid.uuid4()), 1,
+                                                     'READY')
+    second = route_projection.IncrementalRouteReplica(2, str(uuid.uuid4()), 1,
+                                                      'READY')
+    rows = [
+        _incremental_lease(1, first.replica_record_id, 'http://10.0.0.1:8000',
+                           now),
+        _incremental_lease(2,
+                           second.replica_record_id,
+                           'http://10.0.0.2:8000',
+                           now,
+                           valid=False),
+    ]
+
+    result = route_projection.build_incremental_route_view(
+        [first, second],
+        rows, {1},
+        now=now,
+        service_version=1,
+        routing_spec={'load_balancing_policy_name': 'round_robin'},
+        capacity_hint={'replica_unit': 'physical_backend'})
+
+    assert set(result.response['replica_info']) == {'http://10.0.0.1:8000'}
+    assert result.response['num_ready_replicas'] == 1
+    assert set(
+        result.identities) == {'http://10.0.0.1:8000', 'http://10.0.0.2:8000'}
+    assert result.identities['http://10.0.0.2:8000']['advertised'] is False
+
+
+def test_incremental_view_requires_closed_recovery_marker():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    replica = route_projection.IncrementalRouteReplica(1, str(uuid.uuid4()), 1,
+                                                       'READY')
+    row = _incremental_lease(1,
+                             replica.replica_record_id,
+                             'http://10.0.0.1:8000',
+                             now,
+                             requires_marker=True)
+
+    result = route_projection.build_incremental_route_view(
+        [replica], [row], {1},
+        now=now,
+        service_version=1,
+        routing_spec={'load_balancing_policy_name': 'round_robin'},
+        capacity_hint={})
+
+    assert result.response['replica_info']['http://10.0.0.1:8000'] == {
+        constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY:
+            constants.SYSTEM_RECOVERY_ROUTE_FENCE_VERSION,
+    }
+    assert result.response['num_ready_replicas'] == 0
+
+
+def test_incremental_producer_preserves_projected_protocol_one():
+    assert route_projection.use_incremental_producer({
+        'route_source_mode': 'LEGACY_PROXY',
+        'route_projection_protocol_version': 1,
+    })
+    assert not route_projection.use_incremental_producer({
+        'route_source_mode': 'DURABLE_PROJECTED',
+        'route_projection_protocol_version': 1,
+    })
+    assert route_projection.use_incremental_producer({
+        'route_source_mode': 'DURABLE_PROJECTED',
+        'route_projection_protocol_version': 2,
+    })

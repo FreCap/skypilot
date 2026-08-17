@@ -99,7 +99,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION)
     assert termination_evidence_version == 87
     assert partial_in_flight_version < termination_evidence_version
-    assert server_constants.API_VERSION == termination_evidence_version
+    incremental_route_version = (
+        server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION)
+    assert incremental_route_version == 88
+    assert termination_evidence_version < incremental_route_version
+    assert server_constants.API_VERSION == incremental_route_version
 
 
 def test_current_demand_reads_database_without_controller():

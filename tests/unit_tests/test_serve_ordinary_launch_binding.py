@@ -1029,7 +1029,7 @@ def test_decoded_replica_authority_rejects_every_special_profile(
                                       require_launch_authorized=True)
 
 
-def test_api014_serve050_lineage_and_sqlite_stays_at_serve037(
+def test_api014_serve051_lineage_and_sqlite_stays_at_serve037(
         tmp_path: pathlib.Path) -> None:
     sqlite = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "serve.db"}')
     api_config = migration_utils.get_alembic_config(
@@ -1044,7 +1044,7 @@ def test_api014_serve050_lineage_and_sqlite_stays_at_serve037(
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'
-    assert serve_scripts.get_heads() == ['050']
+    assert serve_scripts.get_heads() == ['051']
     assert serve_scripts.get_revision('050').down_revision == '049'
     assert serve_scripts.get_revision('049').down_revision == '048'
     assert serve_scripts.get_revision('047').down_revision == '046'
@@ -1073,7 +1073,9 @@ def test_api014_serve050_lineage_and_sqlite_stays_at_serve037(
             == 86)
     assert (
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION == 87)
-    assert server_constants.API_VERSION == 87
+    assert (
+        server_constants.MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION == 88)
+    assert server_constants.API_VERSION == 88
 
     alembic_command.upgrade(serve_config, '037')
     inspector = sqlalchemy.inspect(sqlite)
