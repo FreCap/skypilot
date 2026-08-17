@@ -4,12 +4,12 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, and PR #1529's exact
 reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 410 / release
-`1.1.1314`, merge commit `5154355f2223a9080e46999c15e4a135e5da7bad`, image
+artifact is deployed directly with Helm as production revision 411 / release
+`1.1.1315`, merge commit `057a707d31acfdb8e7b5864eb25378dc3e3e43e4`, image
 digest
-`sha256:0b4d9ffbd765aa0b7b3f4a952129d2b67406ecf342687221553e2d9983f835e8`,
+`sha256:903e7290a24fc2650cbc59c464c2fd8173ce13b80afd93819ac21f898c67ab8d`,
 and chart digest
-`sha256:ff7774468119816a98abcb05c55c13d37069e24e2ba194fe04abfe8d3a6b8b3d`.
+`sha256:6db826ef7928e8e638601d4721ed3ef4e2d6fc0143678bf4b28c39c994f38787`.
 The Serve051 migration Job completed, the API reports protocol version 88, and
 the API deployment is ready with zero restarts. No load-balancer slot, service
 version, authority mode, or `boltz-platform` pin changed in this direct Helm
@@ -33,11 +33,30 @@ dump showed both the incremental worker and LB sync waiting on
 The worker later recovered to generation 673 with 125 fresh-ready leases only
 after that lock was released; the intervening head expiry still fails the
 cadence contract.
-The current fix-forward publishes version plus routing policy through a separate
+PR #1533's fix-forward publishes version plus routing policy through a separate
 immutable route-contract snapshot and proves composition completes while the
-autoscaler epoch lock is held indefinitely. Qualification remains open until
-that correction is merged, deployed, and passes ten renewals. No P2c behavior
-has been promoted on `boltz-l4-fleet`.
+autoscaler epoch lock is held indefinitely. It is merged and deployed in
+revision 411. Production proves that boundary works: a nonblocking controller
+dump showed the autoscaler doing fleet-wide cost planning while the incremental
+worker proceeded independently. It also exposed the next bounded ownership
+defect. Every completed HTTP probe synchronously opened and committed its own
+PostgreSQL transaction on the worker's asyncio event loop. At 94 current
+targets, connection checkout and receipt serialization delayed a first refresh
+by roughly 50 seconds and stretched later nominal five-second refreshes to
+roughly 10--13 seconds.
+
+The current fix-forward moves receipt persistence to one dedicated bounded
+writer. HTTP tasks return immutable exact-generation results; the event loop
+coalesces at most the newest result per exact target; and the writer persists
+one bounded batch with one bulk PostgreSQL update in one transaction. The
+composition lane never invokes or awaits that writer; conflicting exact-row
+transactions retain ordinary bounded PostgreSQL serialization. A stale or
+no-longer-eligible member is rejected independently without
+rolling back accepted siblings, and an unavailable writer loses no safety:
+leases expire and subsequent probes replace the bounded pending result. The
+single-result repository entry point delegates to this canonical batch path.
+Qualification remains open until that correction is merged, deployed, and
+passes ten renewals. No P2c behavior has been promoted on `boltz-l4-fleet`.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -606,14 +625,26 @@ the endpoint. That resolver performs no fleet publication.
 A dedicated supervised route worker has two provider-free stages:
 
 1. The readiness stage reads only durable candidate rows and immutable version
-   probe settings, probes URLs concurrently with the existing bounded HTTP
-   timeout, and commits each exact lease independently. One timeout or corrupt
-   identity expires/withholds only that row.
+   probe settings and probes URLs concurrently with the existing bounded HTTP
+   timeout. Completed immutable exact-generation results enter one bounded,
+   latest-result-per-target queue. One dedicated writer persists at most one
+   bounded batch at a time in one PostgreSQL transaction; each stale or
+   no-longer-eligible member is rejected independently without poisoning
+   healthy siblings.
 2. The compose stage reads fresh leases plus current replica/service/version
    rows in one PostgreSQL transaction, excludes individually stale, revoked,
    non-ready, draining, wrong-version, or owner-mismatched entries, rebuilds the
    capacity hint from durable replica attribution, and publishes or refreshes
    the immutable full snapshot/head.
+
+The composition event loop never invokes or awaits readiness HTTP or receipt
+persistence. Receipt persistence never creates one transaction or connection
+per probe: it has one writer, one in-flight bulk update transaction, and a
+bounded coalescing backlog. Exact-row conflicts retain PostgreSQL's normal
+transactional serialization, but there is no application-level join or fleet
+barrier. If PostgreSQL receipt persistence is slow, exact leases may expire but
+the last valid head continues to refresh from independently readable state
+until its own TTL; the worker does not assert readiness it failed to persist.
 
 The worker never acquires the replica-manager lock, provider phase, physical
 cluster fence, Kubernetes client, Ray handle, cluster database, or the shared
@@ -1290,6 +1321,28 @@ route generation is insufficient after its head expires, so retirement
 admission and commit also lock and validate the still-fresh route head. These
 corrections are implemented and covered by focused regressions.
 
+The post-revision-411 receipt-path review rejected three further partial
+fixes. Sending every synchronous receipt to the default executor preserves one
+queued task, connection checkout, and transaction per replica and merely moves
+the burst into the shared executor pool. Batching the existing Python loop on
+the asyncio thread still makes head cadence depend on receipt I/O. Moving that
+loop to one thread removes the event-loop stall but holds owner and lease locks
+across hundreds of round trips, recreating a composition barrier in
+PostgreSQL. The accepted path has one dedicated writer, one coalescing
+exact-target backlog, and one `UPDATE ... FROM (VALUES ...)` statement whose
+owner, current replica, material, and revocation predicates reject stale
+siblings independently. The single writer bounds connection use, the bulk
+statement bounds row-lock time, and composition has no application-level
+dependency on receipt completion.
+
+Local verification for this fix-forward passes the incremental-worker,
+route-projection, controller, controller-event-loop, controller-respawn, and
+route-lease suites, plus the exact formatter, mypy, pylint, and dashboard
+checks. The candidate bulk statement was also executed against the production
+PostgreSQL dialect and schema inside an explicit outer transaction: one stale
+sibling was rejected, one current sibling was accepted, and the transaction
+was rolled back. Full remote PostgreSQL CI remains a merge gate.
+
 ## Open gates
 
 - [x] Verify the v1.1.1296 production compatibility baseline and the later
@@ -1334,9 +1387,12 @@ corrections are implemented and covered by focused regressions.
   protocol 2 and wrote 149 exact material rows, but the first head expired and
   all readiness observations remained null because the worker waited on the
   autoscaler routing-epoch lock.
-- [ ] Merge and deploy the independent immutable route-contract fix-forward,
-  then prove the ten-renewal provider-stall gate. Revision 410 remains
-  unpromoted.
+- [x] Merge PR #1533's independent immutable route-contract fix-forward and
+  deploy it as direct Helm revision 411 / v1.1.1315. It removed the routing-lock
+  dependency, but production exposed synchronous per-probe PostgreSQL receipt
+  work on the composition event loop; revision 411 remains unpromoted.
+- [ ] Merge and deploy the bounded batch receipt-writer fix-forward, then prove
+  the ten-renewal provider-stall gate with no event-loop receipt persistence.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.
