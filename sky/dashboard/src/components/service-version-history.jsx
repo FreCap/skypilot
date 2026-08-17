@@ -302,6 +302,8 @@ function SplitYamlDiff({ elected, selected, onClose }) {
 function VersionYamlViewer({ version, onClose }) {
   const [yamlKind, setYamlKind] = useState('submitted');
   const [isCopied, setIsCopied] = useState(false);
+  const copyGeneration = useRef(0);
+  const copyResetTimer = useRef(null);
   const yamlField =
     yamlKind === 'submitted'
       ? 'submitted_yaml_content'
@@ -315,17 +317,43 @@ function VersionYamlViewer({ version, onClose }) {
     [yamlAvailable, yamlContent]
   );
 
-  const selectYamlKind = (kind) => {
-    setYamlKind(kind);
+  useEffect(() => {
+    return () => {
+      copyGeneration.current += 1;
+      if (copyResetTimer.current !== null) {
+        clearTimeout(copyResetTimer.current);
+      }
+    };
+  }, []);
+
+  const resetCopyStatus = () => {
+    copyGeneration.current += 1;
+    if (copyResetTimer.current !== null) {
+      clearTimeout(copyResetTimer.current);
+      copyResetTimer.current = null;
+    }
     setIsCopied(false);
   };
 
+  const selectYamlKind = (kind) => {
+    resetCopyStatus();
+    setYamlKind(kind);
+  };
+
   const copyYaml = async () => {
+    resetCopyStatus();
+    const generation = copyGeneration.current;
     try {
       await navigator.clipboard.writeText(formattedYaml);
+      if (generation !== copyGeneration.current) return;
       setIsCopied(true);
-      setTimeout(() => setIsCopied(false), 2000);
+      copyResetTimer.current = setTimeout(() => {
+        if (generation !== copyGeneration.current) return;
+        setIsCopied(false);
+        copyResetTimer.current = null;
+      }, 2000);
     } catch (copyError) {
+      if (generation !== copyGeneration.current) return;
       console.error('Failed to copy version YAML to clipboard:', copyError);
     }
   };
