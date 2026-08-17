@@ -38,9 +38,22 @@ def _encoded_bundle(document: dict) -> bytes:
                       separators=(',', ':')).encode('utf-8')
 
 
+def _managed_document_context(document: dict) -> dict:
+    return next(context for context in document['fleet']['contexts']
+                if context['kueue_admission'] is not None)
+
+
+def _managed_provider_context(document: dict) -> dict:
+    return next(
+        context for context in document['provider_inventory']['contexts']
+        if context['kueue_enforcement'] is not None)
+
+
 def _quota(context: dict, prefix: str, flavor_name: str,
            resource_name: str) -> dict:
-    for group in context['queues'][f'{prefix}_resource_groups']:
+    admission = context['kueue_admission']
+    assert admission is not None
+    for group in admission['queues'][f'{prefix}_resource_groups']:
         for flavor in group['flavors']:
             if flavor['name'] != flavor_name:
                 continue
@@ -56,14 +69,16 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     east = bundle.fleet_context('prod_research_cluster_eks')
     phx = bundle.fleet_context('phx_research_cluster_eks')
 
-    assert east['local_queue_name'] == 'default'
-    assert east['queues'][
-        'inference_cluster_queue'] == 'skyserve-inference-borrowed'
-    assert east['workload_priority_class_name'] == 'skyserve-inference-low'
+    assert east['kueue_admission'] is None
     assert east['priority_class'][
         'name'] == 'rescluster-k8s-prod-east1-preemptible-inference-low'
-    assert east['service_account_name'] == 'skypilot-inference-sa'
-    assert phx['service_account_name'] == 'skypilot-inference-sa'
+    assert east['service_account_name'] == 'skypilot-pool-sa'
+    assert phx['service_account_name'] == 'skypilot-pool-sa'
+    assert phx['kueue_admission']['local_queue_name'] == 'be'
+    assert phx['kueue_admission']['queues'][
+        'inference_cluster_queue'] == 'skypilot-be'
+    assert phx['kueue_admission']['workload_priority_class_name'] == 'be-ls'
+    assert phx['kueue_admission']['workload_priority_value'] == 12
     assert east['accelerators']['a100-80gb'] == {
         'count': 1,
         'flavors': ['ml.p4de.24xlarge'],
@@ -77,16 +92,12 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['accelerators']['h200']['product_label_values'] == [
         'NVIDIA-H200'
     ]
-    assert _quota(east, 'inference', 'ml.p4d.24xlarge',
-                  'cpu')['borrowing_limit'] == '256'
-    assert _quota(east, 'inference', 'ml.p4de.24xlarge',
-                  'memory')['borrowing_limit'] == '4224Gi'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
-                  'cpu')['borrowing_limit'] == '2048'
+                  'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
-                  'memory')['borrowing_limit'] == '8192Gi'
-    assert _quota(east, 'research', 'ml.p4d.24xlarge',
-                  'nvidia.com/gpu')['borrowing_limit'] == '0'
+                  'memory')['borrowing_limit'] == '120Ti'
+    assert _quota(phx, 'research', 'ml.p5e.48xlarge',
+                  'nvidia.com/gpu')['borrowing_limit'] == '512'
 
 
 def test_bundle_hashes_are_domain_separated_and_order_independent():
@@ -96,8 +107,11 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
     reordered['fleet']['contexts'].reverse()
     reordered['provider_inventory']['contexts'].reverse()
     for context in reordered['fleet']['contexts']:
+        admission = context['kueue_admission']
+        if admission is None:
+            continue
         for prefix in ('inference', 'research'):
-            groups = context['queues'][f'{prefix}_resource_groups']
+            groups = admission['queues'][f'{prefix}_resource_groups']
             groups.reverse()
             for group in groups:
                 group['covered_resources'].reverse()
@@ -120,7 +134,7 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
 def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
     with pytest.raises(bundle_lib.BundleValidationError, match='Duplicate'):
         bundle_lib.parse_bundle_bytes(
-            b'{"schema_version":2,"schema_version":2}')
+            b'{"schema_version":3,"schema_version":3}')
 
     document = _bundle_document()
     document['unknown'] = True
@@ -129,15 +143,15 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    _quota(context, 'inference', 'ml.p4de.24xlarge',
+    context = _managed_document_context(document)
+    _quota(context, 'inference', 'ml.p5e.48xlarge',
            'nvidia.com/gpu')['nominal_quota'] = '1'
     with pytest.raises(bundle_lib.BundleValidationError, match='zero-nominal'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    document['provider_inventory']['contexts'][0]['node_inventory'][0][
-        'product_label_value'] = 'NVIDIA-H200'
+    _managed_provider_context(
+        document)['node_inventory'][0]['product_label_value'] = 'NVIDIA-A100'
     with pytest.raises(bundle_lib.BundleValidationError,
                        match='reviewed flavor, Node selector, and product'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
@@ -145,8 +159,8 @@ def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
 
 def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
     document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    group = context['queues']['inference_resource_groups'][0]
+    context = _managed_document_context(document)
+    group = context['kueue_admission']['queues']['inference_resource_groups'][0]
     group['covered_resources'].remove('cpu')
     for flavor in group['flavors']:
         flavor['resources'] = [
@@ -154,20 +168,20 @@ def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
             if resource['resource_name'] != 'cpu'
         ]
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='exactly one inference resource group'):
+                       match='co-locate GPU, CPU, and memory'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    _quota(context, 'inference', 'ml.p4de.24xlarge',
-           'cpu')['borrowing_limit'] = '1055'
+    context = _managed_document_context(document)
+    _quota(context, 'inference', 'ml.p5e.48xlarge',
+           'cpu')['borrowing_limit'] = '2047'
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='exact reviewed worker-fit'):
+                       match='cannot fit the reviewed workers'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    group = context['queues']['inference_resource_groups'][0]
+    context = _managed_document_context(document)
+    group = context['kueue_admission']['queues']['inference_resource_groups'][0]
     memory_flavors = []
     for flavor in group['flavors']:
         memory = next(resource for resource in flavor['resources']
@@ -178,80 +192,43 @@ def test_bundle_requires_exact_worker_fit_cpu_and_memory_in_gpu_group():
             'resources': [memory],
         })
     group['covered_resources'].remove('memory')
-    context['queues']['inference_resource_groups'].append({
+    context['kueue_admission']['queues']['inference_resource_groups'].append({
         'covered_resources': ['memory'],
         'flavors': memory_flavors,
     })
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='exactly one inference resource group'):
+                       match='co-locate GPU, CPU, and memory'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
-def test_bundle_bounds_each_inference_resource_by_research_nominal():
+def test_bundle_bounds_each_inference_resource_by_paired_research_capacity():
     document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    _quota(context, 'research', 'ml.p4de.24xlarge',
-           'memory')['nominal_quota'] = '4000Gi'
+    context = _managed_document_context(document)
+    _quota(context, 'research', 'ml.p5e.48xlarge',
+           'memory')['borrowing_limit'] = '8000Gi'
 
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='bounded by matching research nominal'):
+                       match='bounded by the paired research queue'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
-def test_bundle_rejects_extra_inference_group_and_quota_atom():
-    document = _bundle_document()
-    queues = document['fleet']['contexts'][0]['queues']
-    queues['inference_resource_groups'].append({
-        'covered_resources': ['example.com/unreviewed'],
-        'flavors': [{
-            'name': 'unreviewed',
-            'resources': [{
-                'resource_name': 'example.com/unreviewed',
-                'nominal_quota': '0',
-                'borrowing_limit': '1',
-            }],
-        }],
-    })
-    with pytest.raises(bundle_lib.BundleValidationError,
-                       match='exactly one inference resource group'):
-        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+def test_bundle_allows_ancillary_resources_but_rejects_unclaimed_gpu_flavor():
+    bundle_lib.parse_bundle_bytes(_encoded_bundle(_bundle_document()))
 
     document = _bundle_document()
-    group = document['fleet']['contexts'][0]['queues'][
-        'inference_resource_groups'][0]
-    group['covered_resources'].append('example.com/unreviewed')
-    for flavor in group['flavors']:
-        flavor['resources'].append({
-            'resource_name': 'example.com/unreviewed',
-            'nominal_quota': '0',
-            'borrowing_limit': '1',
-        })
+    context = _managed_document_context(document)
+    _quota(context, 'inference', 'ml.m6i.4xlarge',
+           'nvidia.com/gpu')['borrowing_limit'] = '1'
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='covering only GPU, CPU, and memory'):
-        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
-
-
-@pytest.mark.parametrize(('resource_name', 'borrowing_limit'), [
-    ('cpu', '1057'),
-    ('memory', '4225Gi'),
-])
-def test_bundle_rejects_oversized_worker_fit_quota(resource_name,
-                                                   borrowing_limit):
-    document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    _quota(context, 'inference', 'ml.p4de.24xlarge',
-           resource_name)['borrowing_limit'] = borrowing_limit
-
-    with pytest.raises(bundle_lib.BundleValidationError,
-                       match='exact reviewed worker-fit'):
+                       match='positive borrowed GPU flavors'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
 def test_bundle_rejects_fractional_gpu_borrowing():
     document = _bundle_document()
-    context = document['fleet']['contexts'][0]
-    _quota(context, 'inference', 'ml.p4de.24xlarge',
-           'nvidia.com/gpu')['borrowing_limit'] = '263.5'
+    context = _managed_document_context(document)
+    _quota(context, 'inference', 'ml.p5e.48xlarge',
+           'nvidia.com/gpu')['borrowing_limit'] = '511.5'
 
     with pytest.raises(bundle_lib.BundleValidationError,
                        match='positive integral borrowed GPU'):
@@ -274,15 +251,35 @@ def test_bundle_requires_one_node_contract_per_provider_flavor():
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
     document = _bundle_document()
-    document['provider_inventory']['contexts'][0]['kueue_webhooks'][
+    _managed_provider_context(document)['kueue_enforcement']['webhooks'][
         'validating']['operations'] = ['CREATE']
     with pytest.raises(bundle_lib.BundleValidationError,
                        match='exact reviewed Pod operations'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
+def test_bundle_requires_matching_kueue_admission_and_enforcement():
+    document = _bundle_document()
+    _managed_provider_context(document)['kueue_enforcement'] = None
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='both null or both configured'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
+def test_bundle_binds_projected_scheduler_to_provider_deployment():
+    document = _bundle_document()
+    _managed_document_context(document)['scheduler_name'] = 'default-scheduler'
+
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='projected scheduler and provider deployment'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+
 def _admission(context: dict,
                accelerator: str) -> reclaim.ReclaimProjectedAdmission:
+    kueue_admission = context['kueue_admission']
+    assert kueue_admission is not None
     return reclaim.ReclaimProjectedAdmission(
         worker_projection_sha256='a' * 64,
         kubernetes_context=context['kubernetes_context'],
@@ -293,8 +290,9 @@ def _admission(context: dict,
         priority_class_name=context['priority_class']['name'],
         priority_value=context['priority_class']['value'],
         preemption_policy=context['priority_class']['preemption_policy'],
-        local_queue_name=context['local_queue_name'],
-        workload_priority_class_name=context['workload_priority_class_name'],
+        local_queue_name=kueue_admission['local_queue_name'],
+        workload_priority_class_name=(
+            kueue_admission['workload_priority_class_name']),
         accelerator=accelerator,
         accelerator_count=context['accelerators'][accelerator]['count'],
         accelerator_scheduling=reclaim.ReclaimAcceleratorScheduling(
@@ -336,6 +334,7 @@ def _claim(context: dict,
 
 
 def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
+    admission = context['kueue_admission']
     return policy_lib._ContextProof(
         aws=aws_attestation.PodIdentityProof(
             kubernetes_context=context['kubernetes_context'],
@@ -349,10 +348,14 @@ def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
             kubernetes_context=context['kubernetes_context'],
             physical_cluster_uid=context['physical_cluster_uid'],
             namespace_uid=provider['namespace_uid'],
-            local_queue_name=context['local_queue_name'],
-            cluster_queue_name=context['queues']['inference_cluster_queue'],
+            kueue_managed=admission is not None,
+            local_queue_name=(admission['local_queue_name']
+                              if admission is not None else None),
+            cluster_queue_name=(admission['queues']['inference_cluster_queue']
+                                if admission is not None else None),
             pod_identity_irsa_annotation_absent=True,
-            assign_queue_labels_for_pods=True,
+            assign_queue_labels_for_pods=(True
+                                          if admission is not None else None),
             node_flavors=tuple(
                 kubernetes_attestation.NodeFlavorProof(
                     flavor=node['flavor'],
@@ -398,43 +401,66 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
         assert authorization.identity == identity
 
 
-def test_one_context_can_claim_multiple_exact_card_edges(monkeypatch):
+def test_unmanaged_context_cannot_claim_with_forged_admission(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
-    attest = mock.Mock(side_effect=_fake_attest(policy))
-    monkeypatch.setattr(policy, '_attest_contexts', attest)
-    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    provider_calls = mock.Mock()
+    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
     context = policy._bundle.fleet_context('prod_research_cluster_eks')
-    edges = tuple(sorted((_edge(context, 'a100'), _edge(context, 'a100-80gb'))))
+    accelerator = context['accelerators']['a100']
+    admission = reclaim.ReclaimProjectedAdmission(
+        worker_projection_sha256='a' * 64,
+        kubernetes_context=context['kubernetes_context'],
+        namespace=context['namespace'],
+        service_account_name=context['service_account_name'],
+        pod_identity_role_arn=context['pod_identity_role_arn'],
+        scheduler_name=context['scheduler_name'],
+        priority_class_name=context['priority_class']['name'],
+        priority_value=context['priority_class']['value'],
+        preemption_policy=context['priority_class']['preemption_policy'],
+        local_queue_name='forged',
+        workload_priority_class_name='forged',
+        accelerator='a100',
+        accelerator_count=accelerator['count'],
+        accelerator_scheduling=reclaim.ReclaimAcceleratorScheduling(
+            label_key=accelerator['product_label_key'],
+            label_values=tuple(accelerator['product_label_values']),
+            resource_key=accelerator['resource_name']))
+    pool_key = json.dumps(['v2', context['physical_cluster_uid'], 'a100'])
+    edge = reclaim.ReclaimClaimEdge(
+        pool_key=pool_key,
+        access_context=context['kubernetes_context'],
+        physical_cluster_uid=context['physical_cluster_uid'],
+        accelerator_names=('a100',),
+        projected_admissions=(admission,))
     scope = reclaim.ReclaimClaimSetScope(
-        service_name='east-all-cards',
-        service_incarnation='incarnation-east-all-cards',
+        service_name='east-unmanaged',
+        service_incarnation='incarnation-east-unmanaged',
         service_version=1,
-        semantic_hash='semantic-east-all-cards',
-        edges=edges)
+        semantic_hash='semantic-east-unmanaged',
+        edges=(edge,))
 
-    authorization = policy.authorize_claim_set(
-        scope,
-        expected_identity=policy.policy_identity(),
-        expected_gate_generation=7,
-        deadline_monotonic=time.monotonic() + 5)
-
-    assert authorization.scope == scope
-    assert attest.call_args.args[0] == ('prod_research_cluster_eks',)
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='no managed Kueue reclaim contract'):
+        policy.authorize_claim_set(scope,
+                                   expected_identity=policy.policy_identity(),
+                                   expected_gate_generation=7,
+                                   deadline_monotonic=time.monotonic() + 5)
+    provider_calls.assert_not_called()
 
 
 def test_claim_set_rejects_duplicate_physical_card_atom(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     provider_calls = mock.Mock()
     monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
-    context = policy._bundle.fleet_context('prod_research_cluster_eks')
-    first = _edge(context, 'a100')
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    first = _edge(context, 'h200')
     second_admission = dataclasses.replace(first.projected_admissions[0],
                                            worker_projection_sha256='b' * 64)
     second = dataclasses.replace(first,
                                  projected_admissions=(second_admission,))
     scope = reclaim.ReclaimClaimSetScope(
-        service_name='duplicate-east-card',
-        service_incarnation='incarnation-duplicate-east-card',
+        service_name='duplicate-phx-card',
+        service_incarnation='incarnation-duplicate-phx-card',
         service_version=1,
         semantic_hash='semantic-duplicate-east-card',
         edges=tuple(sorted((first, second))))
@@ -509,13 +535,13 @@ def test_activation_rejects_accelerator_scheduling_mismatch(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     provider_calls = mock.Mock()
     monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
-    context = policy._bundle.fleet_context('prod_research_cluster_eks')
-    claim = _claim(context, 'a100')
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    claim = _claim(context, 'h200')
     admission = dataclasses.replace(
         claim.projected_admissions[0],
         accelerator_scheduling=reclaim.ReclaimAcceleratorScheduling(
             label_key='nvidia.com/gpu.product',
-            label_values=('NVIDIA-A100-SXM4-80GB',),
+            label_values=('NVIDIA-H100',),
             resource_key='nvidia.com/gpu'))
     claim = dataclasses.replace(claim, projected_admissions=(admission,))
 
@@ -585,14 +611,13 @@ def test_activation_attests_whole_fleet_with_zero_current_claims(monkeypatch):
     assert attest.call_args.args[0] == policy._bundle.contexts
 
 
-def test_activation_accepts_multiple_cards_in_one_context(monkeypatch):
+def test_activation_accepts_managed_phx_claim(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     attest = mock.Mock(side_effect=_fake_attest(policy))
     monkeypatch.setattr(policy, '_attest_contexts', attest)
     monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
-    context = policy._bundle.fleet_context('prod_research_cluster_eks')
-    claims = tuple(
-        sorted((_claim(context, 'a100'), _claim(context, 'a100-80gb'))))
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    claims = (_claim(context, 'h200'),)
 
     evidence = policy.attest_activation(claims,
                                         writer_image_digest='sha256:' +
@@ -607,10 +632,10 @@ def test_activation_rejects_duplicate_physical_card_atom(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     provider_calls = mock.Mock()
     monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
-    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
     claims = tuple(
-        sorted((_claim(context, 'a100'),
-                _claim(context, 'a100', projection_sha256='b' * 64))))
+        sorted((_claim(context, 'h200'),
+                _claim(context, 'h200', projection_sha256='b' * 64))))
 
     with pytest.raises(reclaim.ReclaimAttestationError,
                        match='same physical accelerator pool twice'):
@@ -777,7 +802,9 @@ def _active_object(name: str, spec: dict, namespace: str | None = None) -> dict:
 
 
 def _queue_object(context: dict, *, inference: bool) -> dict:
-    queues = context['queues']
+    admission = context['kueue_admission']
+    assert admission is not None
+    queues = admission['queues']
     prefix = 'inference' if inference else 'research'
     resource_groups = queues[f'{prefix}_resource_groups']
     spec = {
@@ -891,9 +918,14 @@ def _pod_webhook_configuration(contract: dict, controller: dict, *,
 
 def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     namespace = context['namespace']
-    admission = provider['admission_policy']
-    controller = provider['kueue_controller']
-    webhooks = provider['kueue_webhooks']
+    kueue_admission = context['kueue_admission']
+    enforcement = provider['kueue_enforcement']
+    assert kueue_admission is not None
+    assert enforcement is not None
+    admission = enforcement['admission_policy']
+    controller = enforcement['controller']
+    webhooks = enforcement['webhooks']
+    queues = kueue_admission['queues']
     return {
         'namespace': {
             'metadata': {
@@ -925,13 +957,13 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
         },
         'workload_priority_class': {
             'metadata': {
-                'name': context['workload_priority_class_name']
+                'name': kueue_admission['workload_priority_class_name']
             },
-            'value': context['priority_class']['value'],
+            'value': kueue_admission['workload_priority_value'],
         },
         'local_queue': _active_object(
-            context['local_queue_name'], {
-                'clusterQueue': context['queues']['inference_cluster_queue'],
+            kueue_admission['local_queue_name'], {
+                'clusterQueue': queues['inference_cluster_queue'],
                 'stopPolicy': 'None',
             }, namespace),
         'inference_cluster_queue': _queue_object(context, inference=True),
@@ -1055,6 +1087,90 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     }
 
 
+def _unmanaged_kubernetes_snapshot(context: dict, provider: dict) -> dict:
+    namespace = context['namespace']
+    return {
+        'namespace': {
+            'metadata': {
+                'name': namespace,
+                'uid': provider['namespace_uid'],
+                'labels': {},
+            },
+            'status': {
+                'phase': 'Active'
+            },
+        },
+        'service_account': {
+            'metadata': {
+                'name': context['service_account_name'],
+                'namespace': namespace,
+                'annotations': {},
+            }
+        },
+        'priority_class': {
+            'metadata': {
+                'name': context['priority_class']['name']
+            },
+            'value': context['priority_class']['value'],
+            'globalDefault': False,
+            'preemptionPolicy': context['priority_class']['preemption_policy'],
+        },
+        'resource_flavors': {
+            flavor['name']: {
+                'metadata': {
+                    'name': flavor['name']
+                },
+                'spec': {
+                    'nodeLabels': copy.deepcopy(flavor['node_labels'])
+                },
+            } for flavor in provider['resource_flavors']
+        },
+        'nodes': {
+            node['flavor']: {
+                'items': [{
+                    'metadata': {
+                        'name': f"initializing-{node['flavor']}",
+                        'labels': {
+                            node['selector_label_key']:
+                                node['selector_label_value'],
+                            node['product_label_key']:
+                                node['product_label_value'],
+                        },
+                    },
+                    'status': {
+                        'capacity': {
+                            node['resource_name']: str(node['capacity_per_node']
+                                                      )
+                        },
+                    },
+                }]
+            } for node in provider['node_inventory']
+        },
+        'scheduler': _deployment(provider['scheduler'], 'containers'),
+    }
+
+
+def test_kubernetes_snapshot_proves_unmanaged_context_without_kueue_reads():
+    bundle = bundle_lib.load_embedded_bundle()
+    context = bundle.fleet_context('prod_research_cluster_eks')
+    provider = bundle.provider_context('prod_research_cluster_eks')
+    snapshot = _unmanaged_kubernetes_snapshot(context, provider)
+
+    proof = kubernetes_attestation.validate_snapshot(context, provider,
+                                                     snapshot)
+
+    assert not proof.kueue_managed
+    assert proof.local_queue_name is None
+    assert proof.cluster_queue_name is None
+    assert proof.assign_queue_labels_for_pods is None
+
+    snapshot['namespace']['metadata']['labels'][
+        'boltz.bio/kueue-managed'] = 'true'
+    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
+                       match='carries the managed Kueue label'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+
 def test_kubernetes_snapshot_proves_exact_reclaim_topology():
     bundle = bundle_lib.load_embedded_bundle()
     context = bundle.fleet_context('phx_research_cluster_eks')
@@ -1063,7 +1179,9 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
     proof = kubernetes_attestation.validate_snapshot(
         context, provider, _kubernetes_snapshot(context, provider))
 
-    assert proof.cluster_queue_name == 'skyserve-inference-borrowed'
+    assert proof.kueue_managed
+    assert proof.local_queue_name == 'be'
+    assert proof.cluster_queue_name == 'skypilot-be'
     assert proof.pod_identity_irsa_annotation_absent
     assert proof.assign_queue_labels_for_pods
     assert proof.node_flavors == (kubernetes_attestation.NodeFlavorProof(
@@ -1179,8 +1297,8 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
      'reclaim contract'),
     (lambda snapshot: _set_inference_borrowing(snapshot, 'memory', '8191Gi'),
      'reclaim contract'),
-    (_move_inference_memory_to_another_group, 'reclaim contract'),
-    (_add_inference_quota_atom, 'reclaim contract'),
+    (_move_inference_memory_to_another_group, 'exact resource group'),
+    (_add_inference_quota_atom, 'exact resource group'),
     (_add_inference_resource_group, 'reclaim contract'),
     (_duplicate_inference_resource_group, 'overlapping resource groups'),
     (_duplicate_inference_quota_atom, 'duplicate quota atoms'),

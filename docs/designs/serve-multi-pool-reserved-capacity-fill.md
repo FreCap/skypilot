@@ -23,7 +23,12 @@ fleet bundle still contains the retired `default`,
 `skyserve-inference-borrowed`, `skyserve-inference-low`, and
 `skypilot-inference-sa` identities. That bundle and the direct-Helm server
 configuration must be corrected in one release contract before a new service
-version can become fill-capable.
+version can become fill-capable. A follow-up read also proved that PHX's Kueue
+controller has two ready replicas, `be-ls` has value 12, and the expected
+`gpu-binpack-scheduler` Deployment is absent. The missing scheduler is an
+independent activation gate: the policy correction records the intended exact
+deployment but must remain dark until the provider-owned object exists and
+passes attestation.
 
 All platform-pin and Terragrunt deployment sequences retained later in this
 file are historical review records, not current gates or deployment authority.
@@ -1173,13 +1178,17 @@ The PHX best-effort ClusterQueue has zero nominal GPU quota in the same
 `withinClusterQueue: LowerPriority`; the research queue retains
 `reclaimWithinCohort: Any`. East has no Kueue admission pair and must not be
 forced through a nonexistent queue. Bundle schema v3 therefore carries one
-nullable `kueue_admission` object per context instead of mandatory parallel
-queue strings: null proves the unmanaged east contract, while PHX binds `be`,
-`skypilot-be`, and `be-ls` together. The policy proves the exact LocalQueue
-target and current Active ClusterQueues when the object is non-null, plus
-cohort, namespace selectors, GPU flavor quotas, preemption policies,
-provider-owned ResourceFlavor instance selectors, WorkloadPriorityClass, Pod PriorityClass,
-immutable custom scheduler deployment, current Kueue controller, Pod
+nullable `kueue_admission` object per fleet context instead of mandatory
+parallel queue strings, plus one matching nullable `kueue_enforcement` object
+per provider context. Both objects must be null or both non-null. Null proves
+that the namespace does not carry the code-owned managed label and makes the
+context ineligible for reclaim claims; it does not silently downgrade reclaim
+to Pod priority. The PHX pair binds `be`, `skypilot-be`, and `be-ls` together.
+The policy proves the exact LocalQueue target and current Active ClusterQueues
+when the pair is non-null, plus cohort, namespace selectors, GPU flavor quotas,
+preemption policies, provider-owned ResourceFlavor instance selectors,
+WorkloadPriorityClass name/value, Pod PriorityClass, immutable custom scheduler
+deployment, current Kueue controller, Pod
 integration,
 `AssignQueueLabelsForPods: true`, and the Deny queue-name admission-policy
 binding. It does not infer Pod admission from a webhook configuration name:
@@ -2011,9 +2020,14 @@ east and PHX lacked the historical `default` /
 adopted the exact `be` -> `skypilot-be` contract and `be-ls`/`be-lt` workload
 priorities; east intentionally remains outside Kueue. Both retain the exact Pod
 PriorityClass at value -1000 with `preemptionPolicy: Never`, and
-`skypilot-pool-sa` is the exact worker service account. East's
-research GPU quotas are nominal 64/264 with borrowing limits 0/0; PHX is
-nominal 512 with borrowing limit 512. The inference service accounts have no
+`skypilot-pool-sa` is the exact worker service account. PHX's `skypilot-be`
+queue has zero nominal quota and borrowing limits of 512 GPUs, 12100 CPU,
+120Ti memory, and 2048 EFA; its paired `hyperpod-ns-research-clusterqueue`
+also has zero nominal H200 quota and a 512-GPU borrowing limit. Reclaim is
+therefore proved by the shared cohort, the research queue's
+`reclaimWithinCohort: Any`, and the exact priority ordering rather than by the
+superseded assumption that one research ClusterQueue owns all nominal quota.
+The inference service accounts have no
 IRSA annotation. East has one Pod Identity association,
 `a-rsvzwdtaesxvxorkh` to `research-dropzone-irsa`, but it belongs to the
 separate research namespace/service account; PHX has no association. The
@@ -2027,11 +2041,14 @@ A100-40GB GPUs each and 33 `ml.p4de.24xlarge` Nodes with 8 A100-80GB GPUs each;
 PHX exposes 64 `ml.p5e.48xlarge` Nodes with 8 H200 GPUs each. The east
 ResourceFlavor selectors are the live beta/stable/HyperPod labels for p4d and
 beta/HyperPod labels for p4de; PHX has beta/stable/HyperPod labels for p5e.
-The queue-name Deny policy and binding are absent in east and present in PHX;
-Kueue webhooks fail closed in both. A direct 2026-08-13 east read additionally
-confirmed that the new exact mutating and validating Pod-webhook contracts
-match the live v0.18 objects; PHX must pass the same code-owned v0.19 contract
-through deployment preflight before activation. The current hub writer is forbidden from
+The queue-name Deny policy and binding are absent in east and present in PHX.
+Schema v3 therefore performs no Kueue controller, policy, or webhook reads for
+the unmanaged east context and instead proves that the namespace lacks the
+code-owned managed label. PHX must pass the complete code-owned v0.19 Kueue
+contract through deployment preflight before activation. The 2026-08-17 read
+found two ready Kueue controller replicas and no `gpu-binpack-scheduler`
+Deployment, so the intended custom-scheduler contract is not yet attestable.
+The current hub writer is forbidden from
 reading the required Namespace, ServiceAccount, queue, priority, flavor, Node,
 scheduler, controller, and admission objects in both spokes. These are exact
 platform IAM/RBAC and object gates; SkyPilot core does not duplicate their

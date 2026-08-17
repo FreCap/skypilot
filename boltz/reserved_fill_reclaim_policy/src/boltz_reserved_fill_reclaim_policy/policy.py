@@ -87,6 +87,11 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if not isinstance(accelerator, Mapping):
             raise reclaim.ReclaimAttestationError(
                 'The projected accelerator is not allowlisted in this context.')
+        kueue_admission = context['kueue_admission']
+        if not isinstance(kueue_admission, Mapping):
+            raise reclaim.ReclaimAttestationError(
+                'The projected context has no managed Kueue reclaim '
+                'contract.')
         expected_scheduling = reclaim.ReclaimAcceleratorScheduling(
             label_key=accelerator['product_label_key'],
             label_values=tuple(sorted(accelerator['product_label_values'])),
@@ -101,9 +106,10 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 admission.priority_class_name != priority['name'] or
                 admission.priority_value != priority['value'] or
                 admission.preemption_policy != priority['preemption_policy'] or
-                admission.local_queue_name != context['local_queue_name'] or
+                admission.local_queue_name
+                != kueue_admission['local_queue_name'] or
                 admission.workload_priority_class_name
-                != context['workload_priority_class_name'] or
+                != kueue_admission['workload_priority_class_name'] or
                 admission.accelerator_count != accelerator['count'] or
                 admission.accelerator_scheduling != expected_scheduling):
             raise reclaim.ReclaimAttestationError(

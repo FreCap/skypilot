@@ -19,14 +19,16 @@ _ROLE_ARN_RE: Final = re.compile(
     r'role/[A-Za-z0-9+=,.@_/-]+$')
 _UUID_RE: Final = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
                              r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v2\x00'
-_PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v1\x00'
+_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v3\x00'
+_PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v2\x00'
 _REQUIRED_QUEUE_RESOURCES: Final = frozenset(
     {'cpu', 'memory', 'nvidia.com/gpu'})
 _RESOURCE_GROUP_KEYS: Final = frozenset({'covered_resources', 'flavors'})
 _RESOURCE_FLAVOR_KEYS: Final = frozenset({'name', 'resources'})
 _RESOURCE_QUOTA_KEYS: Final = frozenset(
     {'resource_name', 'nominal_quota', 'borrowing_limit'})
+_KUEUE_MANAGED_LABEL_KEY: Final = 'boltz.bio/kueue-managed'
+_KUEUE_MANAGED_LABEL_VALUE: Final = 'true'
 _QUANTITY_RE: Final = re.compile(
     r'^(?P<number>[0-9]+(?:\.[0-9]+)?)'
     r'(?P<suffix>n|u|m|k|K|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$')
@@ -217,14 +219,12 @@ def _validate_fleet_context(value: object, path: str) -> None:
     context = _mapping(value, path)
     _exact_keys(
         context, {
-            'accelerators', 'kubernetes_context', 'local_queue_name',
+            'accelerators', 'kubernetes_context', 'kueue_admission',
             'namespace', 'physical_cluster_uid', 'pod_identity_role_arn',
-            'priority_class', 'queues', 'scheduler_name',
-            'service_account_name', 'workload_priority_class_name'
+            'priority_class', 'scheduler_name', 'service_account_name'
         }, path)
-    for key in ('kubernetes_context', 'local_queue_name', 'namespace',
-                'scheduler_name', 'service_account_name',
-                'workload_priority_class_name'):
+    for key in ('kubernetes_context', 'namespace', 'scheduler_name',
+                'service_account_name'):
         _text(context[key], f'{path}.{key}')
     if _UUID_RE.fullmatch(
             _text(context['physical_cluster_uid'],
@@ -303,92 +303,179 @@ def _validate_fleet_context(value: object, path: str) -> None:
         raise BundleValidationError(
             f'{path}.priority_class.preemption_policy is unsupported.')
 
-    queues = _mapping(context['queues'], f'{path}.queues')
+    raw_admission = context['kueue_admission']
+    if raw_admission is None:
+        return
+    admission = _mapping(raw_admission, f'{path}.kueue_admission')
+    _exact_keys(
+        admission, {
+            'local_queue_name', 'queues', 'workload_priority_class_name',
+            'workload_priority_value'
+        }, f'{path}.kueue_admission')
+    _text(admission['local_queue_name'],
+          f'{path}.kueue_admission.local_queue_name')
+    _text(admission['workload_priority_class_name'],
+          f'{path}.kueue_admission.workload_priority_class_name')
+    _integer(admission['workload_priority_value'],
+             f'{path}.kueue_admission.workload_priority_value',
+             minimum=-2147483648)
+    if admission['workload_priority_value'] > 1000000000:
+        raise BundleValidationError(
+            f'{path}.kueue_admission.workload_priority_value exceeds '
+            'Kubernetes limits.')
+
+    queues = _mapping(admission['queues'], f'{path}.kueue_admission.queues')
     _exact_keys(
         queues, {
             'cohort', 'inference_cluster_queue', 'inference_resource_groups',
             'inference_preemption', 'research_cluster_queue',
             'research_resource_groups', 'research_namespace',
             'research_preemption'
-        }, f'{path}.queues')
+        }, f'{path}.kueue_admission.queues')
     for key in ('cohort', 'inference_cluster_queue', 'research_cluster_queue',
                 'research_namespace'):
-        _text(queues[key], f'{path}.queues.{key}')
-    inference_groups = _list(queues['inference_resource_groups'],
-                             f'{path}.queues.inference_resource_groups')
-    if (len(inference_groups) != 1 or
-            not isinstance(inference_groups[0], dict) or
-            set(inference_groups[0].get('covered_resources',
-                                        ())) != _REQUIRED_QUEUE_RESOURCES):
-        raise BundleValidationError(
-            f'{path}.queues must have exactly one inference resource group '
-            'covering only GPU, CPU, and memory.')
+        _text(queues[key], f'{path}.kueue_admission.queues.{key}')
+    inference_groups = _list(
+        queues['inference_resource_groups'], f'{path}.kueue_admission.queues.'
+        'inference_resource_groups')
     inference_quotas = _validate_resource_groups(
-        inference_groups, f'{path}.queues.inference_resource_groups')
+        inference_groups,
+        f'{path}.kueue_admission.queues.inference_resource_groups')
     research_quotas = _validate_resource_groups(
         queues['research_resource_groups'],
-        f'{path}.queues.research_resource_groups')
+        f'{path}.kueue_admission.queues.research_resource_groups')
     _validate_preemption(queues['inference_preemption'],
-                         f'{path}.queues.inference_preemption')
+                         f'{path}.kueue_admission.queues.inference_preemption')
     _validate_preemption(queues['research_preemption'],
-                         f'{path}.queues.research_preemption')
-    inference_gpu_flavors = {
-        flavor for flavor, resource_name in inference_quotas
-        if resource_name == 'nvidia.com/gpu'
+                         f'{path}.kueue_admission.queues.research_preemption')
+    positive_inference_gpu_flavors = {
+        flavor for (flavor,
+                    resource_name), (_, borrowing) in inference_quotas.items()
+        if resource_name == 'nvidia.com/gpu' and borrowing > 0
     }
-    positive_research_gpu_flavors = {
-        flavor for (flavor, resource_name), (nominal,
-                                             _) in research_quotas.items()
-        if resource_name == 'nvidia.com/gpu' and nominal > 0
-    }
-    if (not inference_gpu_flavors or
-            inference_gpu_flavors != positive_research_gpu_flavors):
+    if positive_inference_gpu_flavors != set(claimed_flavors):
         raise BundleValidationError(
-            f'{path}.queues GPU flavor inventories must agree exactly.')
-    for flavor in inference_gpu_flavors:
+            f'{path}.kueue_admission.queues positive borrowed GPU flavors '
+            'must exactly cover the accelerator contracts.')
+    if any(nominal != 0 for nominal, _ in inference_quotas.values()):
+        raise BundleValidationError(
+            f'{path}.kueue_admission.queues inference quotas must all be '
+            'zero-nominal.')
+    for flavor in positive_inference_gpu_flavors:
         gpu_borrowing = inference_quotas[(flavor, 'nvidia.com/gpu')][1]
         if (gpu_borrowing <= 0 or
                 gpu_borrowing != gpu_borrowing.to_integral_value()):
             raise BundleValidationError(
-                f'{path}.queues must expose positive integral borrowed GPU '
-                'capacity.')
+                f'{path}.kueue_admission.queues must expose positive '
+                'integral borrowed GPU capacity.')
         for resource_name in _REQUIRED_QUEUE_RESOURCES:
             atom = (flavor, resource_name)
             inference_quota = inference_quotas.get(atom)
             research_quota = research_quotas.get(atom)
             if inference_quota is None or research_quota is None:
                 raise BundleValidationError(
-                    f'{path}.queues must co-locate GPU, CPU, and memory '
-                    'quota atoms for every inference flavor.')
+                    f'{path}.kueue_admission.queues must co-locate GPU, CPU, '
+                    'and memory quota atoms for every accelerator flavor.')
             inference_nominal, inference_borrowing = inference_quota
-            research_nominal, _ = research_quota
-            if (inference_nominal != 0 or
-                    inference_borrowing > research_nominal):
+            research_nominal, research_borrowing = research_quota
+            if (inference_nominal != 0 or inference_borrowing
+                    > research_nominal + research_borrowing):
                 raise BundleValidationError(
-                    f'{path}.queues inference quotas must be zero-nominal '
-                    'and bounded by matching research nominal quotas.')
+                    f'{path}.kueue_admission.queues borrowed inference '
+                    'capacity must be bounded by the paired research queue.')
             minimum_borrowing = (gpu_borrowing *
                                  _WORKER_RESOURCE_PER_GPU[resource_name])
-            if inference_borrowing != minimum_borrowing:
+            if inference_borrowing < minimum_borrowing:
                 raise BundleValidationError(
-                    f'{path}.queues {resource_name} borrowing quota is '
-                    'not the exact reviewed worker-fit quantity.')
-    if (queues['inference_preemption'] != {
-            'borrow_within_cohort': 'Never',
-            'reclaim_within_cohort': 'Never',
-            'within_cluster_queue': 'Never'
-    } or queues['research_preemption']['reclaim_within_cohort'] != 'Any'):
+                    f'{path}.kueue_admission.queues {resource_name} borrowing '
+                    'quota cannot fit the reviewed workers.')
+    if queues['research_preemption']['reclaim_within_cohort'] != 'Any':
         raise BundleValidationError(
-            f'{path}.queues does not make inference a reclaimable borrower.')
+            f'{path}.kueue_admission.queues does not make inference a '
+            'reclaimable borrower.')
+
+
+def _validate_deployment_contract(value: object, path: str, *,
+                                  controller: bool) -> None:
+    deployment = _mapping(value, path)
+    expected = {'deployment', 'namespace', 'replicas', 'images'}
+    if controller:
+        expected.add('config_map')
+    else:
+        expected.remove('images')
+        expected.add('containers')
+    _exact_keys(deployment, expected, path)
+    for key in ('deployment', 'namespace'):
+        _text(deployment[key], f'{path}.{key}')
+    if controller:
+        _text(deployment['config_map'], f'{path}.config_map')
+        images = _mapping(deployment['images'], f'{path}.images')
+    else:
+        images = _mapping(deployment['containers'], f'{path}.containers')
+    _integer(deployment['replicas'], f'{path}.replicas')
+    if not images:
+        raise BundleValidationError(f'{path} image set must not be empty.')
+    for name, image in images.items():
+        _text(name, f'{path} image name')
+        image_text = _text(image, f'{path}.{name}')
+        if not controller and ('@' not in image_text or _SHA256_RE.search(
+                image_text.split('@', 1)[-1]) is None):
+            raise BundleValidationError(
+                f'{path}.{name} must use an immutable digest.')
+
+
+def _validate_kueue_enforcement(value: object, path: str) -> None:
+    enforcement = _mapping(value, path)
+    _exact_keys(enforcement, {'admission_policy', 'controller', 'webhooks'},
+                path)
+    _validate_deployment_contract(enforcement['controller'],
+                                  f'{path}.controller',
+                                  controller=True)
+    admission = _mapping(enforcement['admission_policy'],
+                         f'{path}.admission_policy')
+    _exact_keys(admission, {
+        'binding_name', 'name', 'namespace_label_key', 'namespace_label_value'
+    }, f'{path}.admission_policy')
+    for key, item in admission.items():
+        _text(item, f'{path}.admission_policy.{key}')
+    if (admission['namespace_label_key'] != _KUEUE_MANAGED_LABEL_KEY or
+            admission['namespace_label_value'] != _KUEUE_MANAGED_LABEL_VALUE):
+        raise BundleValidationError(
+            f'{path}.admission_policy must use the code-owned managed '
+            'namespace label.')
+    webhooks = _mapping(enforcement['webhooks'], f'{path}.webhooks')
+    _exact_keys(webhooks,
+                {'mutating', 'service_name', 'service_port', 'validating'},
+                f'{path}.webhooks')
+    _text(webhooks['service_name'], f'{path}.webhooks.service_name')
+    service_port = _integer(webhooks['service_port'],
+                            f'{path}.webhooks.service_port')
+    if service_port < 1 or service_port > 65535:
+        raise BundleValidationError(f'{path}.webhooks.service_port is invalid.')
+    for kind, required_operations in (('mutating', ('CREATE',)),
+                                      ('validating', ('CREATE', 'UPDATE'))):
+        contract = _mapping(webhooks[kind], f'{path}.webhooks.{kind}')
+        _exact_keys(
+            contract,
+            {'configuration_name', 'operations', 'path', 'webhook_name'},
+            f'{path}.webhooks.{kind}')
+        for key in ('configuration_name', 'path', 'webhook_name'):
+            _text(contract[key], f'{path}.webhooks.{kind}.{key}')
+        operations = tuple(
+            _text(item, f'{path}.webhooks.{kind}.operations') for item in _list(
+                contract['operations'], f'{path}.webhooks.{kind}.operations'))
+        if operations != required_operations:
+            raise BundleValidationError(
+                f'{path}.webhooks.{kind} does not intercept the exact '
+                'reviewed Pod operations.')
 
 
 def _validate_provider_context(value: object, path: str) -> None:
     context = _mapping(value, path)
     _exact_keys(
         context, {
-            'admission_policy', 'eks', 'kubernetes_context', 'kueue_controller',
-            'kueue_webhooks', 'namespace_uid', 'node_inventory',
-            'resource_flavors', 'scheduler'
+            'eks', 'kubernetes_context', 'kueue_enforcement', 'namespace_uid',
+            'node_inventory', 'resource_flavors', 'scheduler'
         }, path)
     _text(context['kubernetes_context'], f'{path}.kubernetes_context')
     if _UUID_RE.fullmatch(
@@ -413,75 +500,12 @@ def _validate_provider_context(value: object, path: str) -> None:
     if eks['cluster_arn'] != expected_arn:
         raise BundleValidationError(f'{path}.eks.cluster_arn is inconsistent.')
 
-    for deployment_key in ('kueue_controller', 'scheduler'):
-        deployment = _mapping(context[deployment_key],
-                              f'{path}.{deployment_key}')
-        expected = {'deployment', 'namespace', 'replicas', 'images'}
-        if deployment_key == 'kueue_controller':
-            expected.add('config_map')
-        else:
-            expected.remove('images')
-            expected.add('containers')
-        _exact_keys(deployment, expected, f'{path}.{deployment_key}')
-        for key in ('deployment', 'namespace'):
-            _text(deployment[key], f'{path}.{deployment_key}.{key}')
-        if deployment_key == 'kueue_controller':
-            _text(deployment['config_map'],
-                  f'{path}.{deployment_key}.config_map')
-            images = _mapping(deployment['images'],
-                              f'{path}.{deployment_key}.images')
-        else:
-            images = _mapping(deployment['containers'],
-                              f'{path}.{deployment_key}.containers')
-        _integer(deployment['replicas'], f'{path}.{deployment_key}.replicas')
-        if not images:
-            raise BundleValidationError(
-                f'{path}.{deployment_key} image set must not be empty.')
-        for name, image in images.items():
-            _text(name, f'{path}.{deployment_key} image name')
-            image_text = _text(image, f'{path}.{deployment_key}.{name}')
-            if deployment_key == 'scheduler' and '@' not in image_text:
-                raise BundleValidationError(
-                    f'{path}.{deployment_key}.{name} must be immutable.')
-            if deployment_key == 'scheduler' and _SHA256_RE.search(
-                    image_text.split('@', 1)[-1]) is None:
-                raise BundleValidationError(
-                    f'{path}.{deployment_key}.{name} has an invalid digest.')
-
-    admission = _mapping(context['admission_policy'],
-                         f'{path}.admission_policy')
-    _exact_keys(admission, {
-        'binding_name', 'name', 'namespace_label_key', 'namespace_label_value'
-    }, f'{path}.admission_policy')
-    for key, item in admission.items():
-        _text(item, f'{path}.admission_policy.{key}')
-    webhooks = _mapping(context['kueue_webhooks'], f'{path}.kueue_webhooks')
-    _exact_keys(webhooks,
-                {'mutating', 'service_name', 'service_port', 'validating'},
-                f'{path}.kueue_webhooks')
-    _text(webhooks['service_name'], f'{path}.kueue_webhooks.service_name')
-    service_port = _integer(webhooks['service_port'],
-                            f'{path}.kueue_webhooks.service_port')
-    if service_port < 1 or service_port > 65535:
-        raise BundleValidationError(
-            f'{path}.kueue_webhooks.service_port is invalid.')
-    for kind, required_operations in (('mutating', ('CREATE',)),
-                                      ('validating', ('CREATE', 'UPDATE'))):
-        contract = _mapping(webhooks[kind], f'{path}.kueue_webhooks.{kind}')
-        _exact_keys(
-            contract,
-            {'configuration_name', 'operations', 'path', 'webhook_name'},
-            f'{path}.kueue_webhooks.{kind}')
-        for key in ('configuration_name', 'path', 'webhook_name'):
-            _text(contract[key], f'{path}.kueue_webhooks.{kind}.{key}')
-        operations = tuple(
-            _text(item, f'{path}.kueue_webhooks.{kind}.operations')
-            for item in _list(contract['operations'],
-                              f'{path}.kueue_webhooks.{kind}.operations'))
-        if operations != required_operations:
-            raise BundleValidationError(
-                f'{path}.kueue_webhooks.{kind} does not intercept the exact '
-                'reviewed Pod operations.')
+    _validate_deployment_contract(context['scheduler'],
+                                  f'{path}.scheduler',
+                                  controller=False)
+    enforcement = context['kueue_enforcement']
+    if enforcement is not None:
+        _validate_kueue_enforcement(enforcement, f'{path}.kueue_enforcement')
 
     flavors = _list(context['resource_flavors'], f'{path}.resource_flavors')
     if not flavors:
@@ -567,7 +591,9 @@ def _normalized_section(section: dict[str, Any]) -> dict[str, Any]:
     normalized = json.loads(_canonical_bytes(section))
     normalized['contexts'].sort(key=lambda item: item['kubernetes_context'])
     for context in normalized['contexts']:
-        queues = context.get('queues')
+        admission = context.get('kueue_admission')
+        queues = (admission.get('queues')
+                  if isinstance(admission, dict) else None)
         if isinstance(queues, dict):
             for key in ('inference_resource_groups',
                         'research_resource_groups'):
@@ -648,7 +674,7 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     root = _mapping(document, 'bundle')
     _exact_keys(root, {'schema_version', 'fleet', 'provider_inventory'},
                 'bundle')
-    if root['schema_version'] != 2:
+    if root['schema_version'] != 3:
         raise BundleValidationError(
             'Fleet bundle schema version is unsupported.')
     fleet = _mapping(root['fleet'], 'bundle.fleet')
@@ -683,6 +709,11 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     for fleet_context in fleet_contexts:
         path = f"context {fleet_context['kubernetes_context']}"
         provider_context = provider_by_name[fleet_context['kubernetes_context']]
+        if (fleet_context['scheduler_name'] !=
+                provider_context['scheduler']['deployment']):
+            raise BundleValidationError(
+                f'{path} projected scheduler and provider deployment '
+                'disagree.')
         flavor_labels = {
             item['name']: item['node_labels']
             for item in provider_context['resource_flavors']
@@ -690,23 +721,21 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
         node_inventory = {
             item['flavor']: item for item in provider_context['node_inventory']
         }
-        queue_flavors = {
-            flavor['name']
-            for group in fleet_context['queues']['inference_resource_groups']
-            if 'nvidia.com/gpu' in group['covered_resources']
-            for flavor in group['flavors']
-        }
-        if (queue_flavors != set(flavor_labels) or
-                queue_flavors != set(node_inventory)):
-            raise BundleValidationError(
-                f'{path} queue and provider flavor inventories disagree.')
         accelerator_flavors = {
             flavor for contract in fleet_context['accelerators'].values()
             for flavor in contract['flavors']
         }
-        if accelerator_flavors != queue_flavors:
+        if (accelerator_flavors != set(flavor_labels) or
+                accelerator_flavors != set(node_inventory)):
             raise BundleValidationError(
-                f'{path} accelerator and queue flavor inventories disagree.')
+                f'{path} accelerator and provider flavor inventories '
+                'disagree.')
+        managed = fleet_context['kueue_admission'] is not None
+        enforced = provider_context['kueue_enforcement'] is not None
+        if managed != enforced:
+            raise BundleValidationError(
+                f'{path} Kueue admission and enforcement must be both null '
+                'or both configured.')
         for accelerator, contract in fleet_context['accelerators'].items():
             for flavor, product in zip(contract['flavors'],
                                        contract['product_label_values']):
