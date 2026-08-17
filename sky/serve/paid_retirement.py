@@ -135,6 +135,7 @@ sqlalchemy.Index('ix_serve051_paid_retirement_active',
                  serve_paid_replica_retirements_table.c.state)
 
 _RETIREMENTS = serve_paid_replica_retirements_table
+_TABLE_SESSION_CACHE_KEY = 'serve_paid_retirement_table_available'
 _SERVICES = serve_state_schema.services_table
 _REPLICAS = serve_state_schema.replicas_table
 _DEMAND_GENERATIONS = (demand_state_schema.serve_demand_feed_generations_table)
@@ -458,6 +459,17 @@ def delete_in_session(session: orm.Session, service_name: str,
                       replica_ids: list[int]) -> None:
     """Delete terminal operational intents with their exact replica rows."""
     if not replica_ids:
+        return
+    cached = session.info.get(_TABLE_SESSION_CACHE_KEY)
+    if cached is None:
+        cached = sqlalchemy.inspect(session.connection()).has_table(
+            _RETIREMENTS.name)
+        # Limit the compatibility result to this state transaction.  Migration
+        # tests replace the schema beneath a shared engine.
+        session.info[_TABLE_SESSION_CACHE_KEY] = cached
+    if not cached:
+        # Before Serve051 no retirement intent can exist, so replica-row
+        # cleanup is already complete.  Authority reads remain fail-closed.
         return
     session.execute(
         sqlalchemy.delete(_RETIREMENTS).where(

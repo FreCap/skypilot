@@ -196,6 +196,14 @@ def retirement_database(empty_postgres, monkeypatch):
     return empty_postgres, info
 
 
+def test_delete_cleanup_noops_before_serve051(empty_postgres):
+    config = migration_utils.get_alembic_config(empty_postgres,
+                                                migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(config, '050')
+    with sqlalchemy.orm.Session(empty_postgres) as session, session.begin():
+        paid_retirement.delete_in_session(session, 'svc', [1])
+
+
 def _mark_retiring(info):
     info.status_property.is_scale_down = True
     info.status_property.sky_down_status = common_utils.ProcessStatus.SCHEDULED

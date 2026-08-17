@@ -980,6 +980,15 @@ replica-ID-zero sentinels because neither can have a valid lease. Once Serve051
 exists, all valid route identities take the single transactional revocation
 path. Paid-retirement authority does not share this compatibility behavior:
 missing retirement state remains a fail-closed error on destructive paths.
+The one exception is the replica-row cleanup DELETE itself, which is also an
+idempotent no-op before its Serve051 table exists because there is no intent to
+remove and it grants no teardown authority.
+
+Local fix-forward verification on 2026-08-17 passed all 293 affected tests on
+PostgreSQL 14, including the pre-Serve051 schema hooks, the full route and paid
+retirement suites, reserved-fill broker races, system-recovery persistence,
+resource-action state, launch authority, and capacity observations. Remote CI
+remains the merge gate.
 
 The implemented paid-retirement transaction binds the exact service owner,
 replica record, demand generation, fresh route head, and zero-residual capacity
