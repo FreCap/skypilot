@@ -3,13 +3,14 @@
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, PR #1529's exact
-reserved-fill deployment-policy bundle, and P2d PR #1537 are also merged. The
-newest exact artifact is deployed directly with Helm as production revision
-415 / release `1.1.1320`, merge commit
-`ec2f05ac145f72e3309fcfdc68f1aec27f77ee00`, image digest
-`sha256:a4e7b81009d3acdabdc58f03b479278daf811e92960ec6f101eaa0faf2aafd14`,
+reserved-fill deployment-policy bundle, P2d PR #1537, and PR #1540's closure
+of the untyped protocol-v2 fill batch path are also merged. The newest exact
+artifact is deployed directly with Helm as production revision 417 / release
+`1.1.1323`, merge commit
+`4a2a2579c9897c1087023159c9436f0203924e2a`, image digest
+`sha256:2c706d74bea2cb48789634ebd84046426627146f64c4d539d540b14ca3fbb78c`,
 and chart digest
-`sha256:96a4e21cbaa0686be97da7376b200a0644e47fe1c732fc96e185997c7184635d`.
+`sha256:5c86e58e6eeef319d371f4dfe9b10bd8ba107b6d735b934297876ec55da40f1f`.
 The Serve052/API-request-015 migration Job completed, the API reports protocol
 version 89, and the API plus both `boltz-l4-fleet` load-balancer slots are ready
 on the exact image with zero restarts. No service version, authority mode, or
@@ -238,6 +239,39 @@ entrypoint already rejects protocol-v2 dictionaries in favor of typed
 dictionary-shaped admission path. That inconsistency, rather than provider
 scarcity, allowed null-projection service state to materialize rows, threads,
 and API requests.
+
+PR #1540 removed that second admission path and revision 417 deployed it dark.
+Repeated legacy H200 broker decisions after the rollout created no replica
+row, launch thread, or `sky.launch` request. The service remained on elected
+version 58 and on legacy route/demand/ordinary-action authority plus
+`DIRECT_REPLICA` fill; neither the service nor `boltz-platform` was changed.
+The API, migration Job, and both load-balancer slots are healthy on the exact
+revision-417 image with zero restarts.
+
+The same qualification exposed a separate paid-authority defect in the legacy
+controller. A 300-second aggregate downscale hold correctly retained a
+40-slot safety floor, but its adopted exact-card state also retained stale L4
+paid ownership. With only seven units of fresh compatible work and 112 ready
+zero-cost A100/A100-80GB slots, the supply-aware actuator selected a 40-slot
+target backed by existing supply. Its conservative reconciliation map
+nevertheless retained 33 L4 slots while moving seven slots to A100. Two
+retiring L4 rows then appeared as same-card shortages, and stale adopted paid
+ownership authorized candidate replicas 54535 and 54536. The placer selected
+one AWS and one GCP L4 Spot location. Both candidates were superseded and their
+rows deleted before any `sky.launch` API request or provider launch, so this
+was paid planning churn rather than two cloud instances. It still violates the
+steady-state contract: a reconciliation-only exact-card hold cannot mint paid
+authority after compatible supply has eliminated the economic residual.
+
+The accepted fix keeps the aggregate and exact-card reconciliation fences but
+bounds their combined current/adopted paid ownership by the global shortage in
+the fresh supply-aware allocation. The bound applies to uncommitted shortages,
+not absolute card targets. A genuinely under-capacity held target therefore
+retains same-card retry authority, while surplus compatible zero-cost or paid
+supply reduces paid authority to zero even if an older exact-card map remains
+temporarily pinned for non-preemptive reconciliation. This is one additional
+guard on the canonical supply-aware path; it introduces no second allocator,
+fallback, timeout, or service-specific rule.
 
 Revision 408 made no authority promotion or service/config mutation. A
 post-rollout query found zero paid Spot rows with `created_at` at or after the
@@ -1707,10 +1741,16 @@ dark deployment gate.
   and 5,536 retained rows, controller health recovered to 0.159 seconds,
   `/autoscaler/info` to 0.789--2.057 seconds, and the replacement LB slots to
   130 and 24 seconds. The service remained unpromoted on `DIRECT_REPLICA`.
-- [ ] Close the batch-only untyped protocol-v2 fill bypass, deploy it dark,
-  and prove repeated legacy H200 decisions create zero new replica rows,
-  launch threads, or `sky.launch` requests while ordinary batch entries remain
-  unaffected.
+- [x] Close the batch-only untyped protocol-v2 fill bypass in PR #1540, deploy
+  it dark as revision 417 / v1.1.1323, and prove repeated legacy H200
+  decisions create zero new replica rows, launch threads, or `sky.launch`
+  requests while ordinary batch entries remain unaffected.
+- [ ] Merge and deploy the supply-aware paid-residual bound. Reproduce the
+  live 40-slot hold with 31 paid L4 plus 112 compatible zero-cost A100/
+  A100-80GB slots; prove the actuation map may retain its conservative card
+  fence while cold paid authority and post-rollout `sky.launch` requests stay
+  zero. Also prove a genuinely under-capacity held same-card target still
+  retries within its existing wave budget.
 - [x] Replace the stale revision-407 PHX deployment-policy identities with
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in
