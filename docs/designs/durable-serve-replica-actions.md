@@ -1385,13 +1385,66 @@ Kubernetes watch is admitted. Qualification enables it only for the exact test
 cohort, verifies its least-privilege release-namespace Pod get/list/watch RBAC,
 and injects both a planned deletion and a liveness restart. G1Sc removes the
 flag and mixed-version grace-variable fallback only after the complete cohort
-and crash-matrix gates pass. Before G1Sc merges, every release's stored values
-must be snapshotted and the transition-only
+and crash-matrix gates pass. Before each G1Sc deployment, the release's stored
+values must be snapshotted. The cleanup upgrade uses direct Helm
+`--reuse-values` and an explicit null override for the transition-only
 `apiService.highAvailability.executorTerminationEvidenceObserverEnabled` key
-must be absent; the cleanup deploy then uses the same direct Helm
-`--reuse-values` contract. The existing reviewed Serve047 legacy attestation
-remains the only path for historical/incomplete infrastructure evidence; it is
-not converted into an API013 automatic certificate.
+so Helm removes it from the stored values in the same revision that makes the
+observer unconditional. Absence is a post-upgrade gate; leaving either a
+boolean or null stored value blocks qualification. The existing reviewed
+Serve047 legacy attestation remains the only path for historical/incomplete
+infrastructure evidence; it is not converted into an API013 automatic
+certificate.
+
+#### `boltz-test` G1Sb qualification evidence (2026-08-17)
+
+The exact G1Sb merge `b82aabf86524cae887b53ede6b3d809ead673a6f`
+was deployed directly with Helm as release `1.1.1307`. The immutable test image
+is
+`361913687221.dkr.ecr.us-east-1.amazonaws.com/skypilot-ha@sha256:7f08d2516d2b8f92b05fd2b223ea9f90e3d5356799a4920b72d6aa8372199888`;
+the chart digest is
+`sha256:de863b05bc24cbbce69c55f9ec1840cf82bf8fa8053b13903e9c81b4f8c0581b`
+and the verified chart package SHA-256 is
+`72014d538c7d1e79707e37d631096b83c8916548f4a9f0fe1e7ae86ee7a1d676`.
+Revision 107 deployed API013 dark from a complete revision-106 Helm and
+PostgreSQL snapshot. API, controller, and executor each completed one planned
+retirement with a durable drain witness, zero owned active claims, and 2/2
+replacement readiness on the exact digest. Focused tests prove the marker is
+written before readiness delay and SIGTERM; wall-clock comparison between the
+Kubernetes and PostgreSQL timestamps is intentionally not used as substitute
+proof because those clocks were visibly offset during the live run.
+
+Dry-run-only launch request
+`991cce8f-08e3-44e0-83d4-2a4de0d32112` was then hard-killed with the observer
+still dark. The exact executor Pod UID and generation-1 claim were resolved
+before deletion. After the 30-second lease horizon the request was
+`CANCELLED/execution_lease_expired`, retained its exact worker and claim
+tombstone, required quiescence with no generation receipt, had no queue row and
+no API013 certificate, and created no `clusters` row. The executor recovered
+2/2 on the immutable image. This is the required isolated ambiguous action;
+neither Pod absence nor lease expiry was recorded as stop proof.
+
+Revision 109 is the authoritative observer-enabled Helm release. Revision 108
+contained a malformed controller digest override and never replaced either
+healthy old controller; the correct digest was sourced from the live API
+Deployment to complete the atomic rollout, then revision 109 immediately
+persisted that exact value for all roles. All roles converged 2/2, API013
+remained the schema head, the controller service account proved Pod
+get/list/watch in `skypilot-ha` and `kube-system` Namespace get, and controller
+generation 193 owned the singleton observer. A first planned-certificate
+attempt overlapped the revision-109/Karpenter controller replacement and is
+excluded from qualification. The stable-cohort retry on dry-run request
+`7a21b329-b9f6-42bc-abbf-7a6ba6fa87bc` recorded one exact immutable
+`KUBERNETES_POD_TERMINATED_V1` certificate for executor Pod UID
+`3cb5ca0c-5174-4f14-a6dd-e8aeba2f8355`, exit code 0, with equal deletion and
+finish timestamps; the wrapper's generation-1 quiescence receipt remained
+independent. Finally, request `d93ae077-19c3-4ba0-9d19-aef6ae08b168` retained a
+settled claim for Pod UID `8a857742-fa39-48f4-8661-fae868e3f629`. Killing the
+runtime child restarted the container under the same Pod UID with restart
+count 1, current state running, `lastState.terminated` exit 137, no deletion
+timestamp, and certificate count unchanged at zero. The G1Sc crash-matrix gate
+therefore passes; its test deployment must now scrub the stored transition key
+and confirm the unconditional observer on the cleanup artifact.
 
 API013 certificates are not cleanup authority by themselves. G2/API014 and
 Serve051 may consume one only as proof that the named executor can no longer
@@ -2619,7 +2672,7 @@ approved canary:
   completion, and typed executor-termination evidence across the complete
   rollout/crash matrix before either cleanup becomes merge-eligible. Do not
   treat Pod absence or lease expiry as automatic execution proof.
-- [ ] Deploy G1S dark and pass one planned retirement per API, executor, and
+- [x] Deploy G1S dark and pass one planned retirement per API, executor, and
   controller role plus one injected hard-kill quarantine test before enabling
   its automatic infrastructure certificate issuer or merging its cleanup.
 - [ ] Merge G2 only after zero legacy-capable participants, zero old-handler
