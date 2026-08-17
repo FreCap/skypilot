@@ -2,22 +2,21 @@
 
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
-executor-termination precursor stack through PR #1528, and PR #1529's exact
-reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 414 / release
-`1.1.1318`, merge commit `a166a433cd048bd277205614e276d7329b88b2c7`, image
-digest
-`sha256:d247e233a80af6d1d15af63fd6f989cca3056fcee8315975365a05c30434ab85`,
+executor-termination precursor stack through PR #1528, PR #1529's exact
+reserved-fill deployment-policy bundle, and P2d PR #1537 are also merged. The
+newest exact artifact is deployed directly with Helm as production revision
+415 / release `1.1.1320`, merge commit
+`ec2f05ac145f72e3309fcfdc68f1aec27f77ee00`, image digest
+`sha256:a4e7b81009d3acdabdc58f03b479278daf811e92960ec6f101eaa0faf2aafd14`,
 and chart digest
-`sha256:3380708cf55458a583c53d4400902aee08a1ec651d3a416121162401cad9aa7f`.
-The Serve051 migration Job completed, the API reports protocol version 88, and
-the API deployment is ready with zero restarts. No load-balancer slot, service
-version, authority mode, or `boltz-platform` pin changed in this direct Helm
-rollout.
+`sha256:96a4e21cbaa0686be97da7376b200a0644e47fe1c732fc96e185997c7184635d`.
+The Serve052/API-request-015 migration Job completed, the API reports protocol
+version 89, and the API plus both `boltz-l4-fleet` load-balancer slots are ready
+on the exact image with zero restarts. No service version, authority mode, or
+`boltz-platform` pin changed in this direct Helm rollout.
 
-P2d Serve052/API-request-015 is now implemented locally on
-`feat/serve-zero-cost-actuation-intents` and remains unmerged and undeployed.
-It adds the durable intent ledger, API89's exact protocol-2 paid-admission
+P2d Serve052/API-request-015 is merged and deployed dark. It adds the durable
+intent ledger, API89's exact protocol-2 paid-admission
 fleet barrier, broker publication, per-physical-pool executor, atomic
 intent-to-replica accounting transfer, one-way promotion endpoint, and dark
 capability advertisement. The direct demand endpoint and service UI also expose
@@ -26,8 +25,9 @@ from replica/provider state. The focused local verification is green: 13
 real-PostgreSQL admission/migration tests, 81 manager/broker/binding tests, and
 129 dashboard tests. The complete affected admission surfaces are also green:
 145 API-request PostgreSQL tests and 31 capacity-admission/refill tests.
-Production remains `DIRECT_REPLICA`; no authority promotion or capacity action
-has occurred.
+Production remains `DIRECT_REPLICA`; the initial dark-rollout verification
+found zero intents and zero replicas or `sky.launch` requests created at or
+after the upgrade, so no authority promotion or capacity action occurred.
 
 P2c API88/Serve051 is merged in PR #1531 and deployed dark. Its complete remote
 PostgreSQL run passed 17,471 tests (plus 199 subtests), and the final affected
@@ -128,6 +128,34 @@ created after the Helm upgrade, the fresh demand projection remained zero,
 and no paid Spot launch was admitted. Route authority remains deliberately
 `LEGACY_PROXY`; this evidence qualifies the implementation but does not skip
 P2d or the documented promotion gates.
+
+Revision 415 deployed P2d dark and exposed a separate controller-startup
+complexity defect. The service retained 5,536 replica rows, including 38
+logical-retirement rows and 160 current ready rows. Each retirement re-ran
+`get_replica_infos()` and decoded the complete retained history twice during
+its final safety check. A nonblocking production thread profile captured that
+exact call chain in `_refresh_wait_for_idle`; the child remained near 106%
+CPU, `/autoscaler/info` timed out, and one new load-balancer standby needed
+roughly eight minutes to synchronize while its old peer continued serving.
+The fix-forward uses the scalar `READY` projection as a conservative SQL
+prefilter, decodes one shared ready-capacity snapshot per refresh pass, and
+retains every existing decoded-state and exact occupancy check. Terminal
+history therefore remains available for audit and status without participating
+in destructive replacement-capacity proof. This changes database transfer and
+deserialization from O(retirements x retained history) to one O(current ready
+capacity) snapshot per pass; the small decoded snapshot is still checked for
+each retirement. It introduces no timeout, cache, alternate authority path,
+schema change, or behavior change.
+
+The revision-415 durable demand sample was fresh but compatibility-incomplete:
+31 accepted arrivals in 60 seconds (0.5167 requests/second), 36 confirmed
+in-flight requests, zero queue, and 61 routed backends with unknown occupancy.
+The UI can therefore display `36 confirmed processing` plus the coverage gap,
+but exact processing correctly remains null until every routed backend has a
+current occupancy proof. This also invalidates the older point-in-time claim
+that production demand is currently zero; it does not authorize a paid launch
+because the service still uses the legacy demand/controller path and the exact
+zero-cost-first promotion gates remain open.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -1409,7 +1437,13 @@ Manual production verification records:
 8. PHX H200 intent-to-Pod admission with exact server-owned Kueue and
    reclaimable-priority evidence, plus zero speculative rows under a held pool
    lane; and
-9. readiness, +10, +30, and one complete stale/quiescence horizon before P3.
+9. readiness, +10, +30, and one complete stale/quiescence horizon before P3;
+10. revision 415's exact API89/Serve052 artifact tuple, migration completion,
+    two ready fleet LB slots, zero restarts, unchanged `DIRECT_REPLICA` mode,
+    and zero post-upgrade intents, replicas, or launches; and
+11. after the ready-snapshot fix-forward, bounded controller startup and
+    `/autoscaler/info` latency with the retained 5,536-row history and 38
+    simultaneous logical retirements, without deleting audit rows.
 
 ## Adversarial review decision
 
@@ -1605,13 +1639,16 @@ dark deployment gate.
   renewals, converged 130/130 current material/readiness rows, and admitted no
   post-upgrade replica or paid launch. Route authority remains dark pending
   P2d and the combined promotion gates.
-- [ ] Merge P2d Serve052/API-request-015 with its simultaneously maintained
-  #1506 removal diff and deploy dark. Local implementation and adversarial
-  review are complete: 13 PostgreSQL, 81 manager/broker/binding, and 129
-  dashboard tests pass, including pool isolation, promotion retry, and atomic
-  accounting transfer; the full 145-test API-request PostgreSQL and 31-test
-  capacity-admission/refill surfaces also pass. Production dark-rollout and
-  no-paid-spill evidence remain open.
+- [x] Merge P2d Serve052/API-request-015 as PR #1537 and deploy it dark as
+  direct Helm revision 415 / v1.1.1320. API89/Serve052 are current; both fleet
+  LB slots and the API use the exact image with zero restarts; the service
+  remains `DIRECT_REPLICA`; and the initial post-upgrade query found zero
+  intents and zero new replicas or `sky.launch` requests.
+- [ ] Merge and deploy the logical-retirement ready-snapshot fix-forward, then
+  prove controller health and `/autoscaler/info` recover promptly with 38
+  simultaneous retirements and 5,536 retained rows. The pre-fix production
+  child remained near 106% CPU and delayed one LB standby by roughly eight
+  minutes; timeout increases or history deletion do not close this gate.
 - [x] Replace the stale revision-407 PHX deployment-policy identities with
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in

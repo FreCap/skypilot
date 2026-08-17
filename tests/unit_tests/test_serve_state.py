@@ -1306,6 +1306,23 @@ def test_replica_status_counts_are_grouped_in_sql(_mock_serve_db):
     assert status_counts == {'PENDING': 1, 'READY': 1}
 
 
+def test_ready_replica_infos_exclude_terminal_history(_mock_serve_db):
+    ready = _replica(1)
+    ready.status_property.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    ready.status_property.service_ready_now = True
+    pending = _replica(2)
+    failed = _replica(3)
+    failed.status_property.sky_launch_status = common_utils.ProcessStatus.FAILED
+    serve_state.add_or_update_replicas('svc', [(1, ready), (2, pending),
+                                               (3, failed)])
+
+    with _count_sql_statements(_mock_serve_db) as counts:
+        infos = serve_state.get_ready_replica_infos('svc')
+
+    assert counts['n'] == 1
+    assert [info.replica_id for info in infos] == [1]
+
+
 def test_replica_status_and_capacity_counts_use_compact_json(_mock_serve_db):
     ready = _replica(1)
     ready.planned_capacity = 8
