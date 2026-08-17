@@ -119,6 +119,81 @@ it('shows the submitted and compiled YAML for each version', async () => {
   );
 });
 
+it('does not confirm a stale YAML copy after switching kinds', async () => {
+  const clipboardWrite = deferred();
+  const originalClipboard = navigator.clipboard;
+  const writeText = jest.fn(() => clipboardWrite.promise);
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText },
+  });
+
+  try {
+    render(<ServiceVersionHistory serviceName="svc" />);
+    await screen.findByText(/Elected 3/);
+    fireEvent.click(
+      screen.getByRole('button', { name: 'View YAML for version 1' })
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy YAML' }));
+    expect(writeText).toHaveBeenCalledWith(
+      expect.stringContaining('min_replicas: 1')
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+    await act(async () => {
+      clipboardWrite.resolve();
+      await clipboardWrite.promise;
+    });
+
+    expect(screen.getByRole('button', { name: 'Copy YAML' })).toBeTruthy();
+  } finally {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: originalClipboard,
+    });
+  }
+});
+
+it('keeps newer YAML copy feedback independent of an older timer', async () => {
+  const originalClipboard = navigator.clipboard;
+  const writeText = jest.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText },
+  });
+  render(<ServiceVersionHistory serviceName="svc" />);
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(
+    screen.getByRole('button', { name: 'View YAML for version 1' })
+  );
+  jest.useFakeTimers();
+
+  try {
+    fireEvent.click(screen.getByRole('button', { name: 'Copy YAML' }));
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole('button', { name: 'Copied!' })).toBeTruthy();
+
+    act(() => jest.advanceTimersByTime(1000));
+    fireEvent.click(screen.getByRole('button', { name: 'compiled' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Copy YAML' }));
+    await act(async () => Promise.resolve());
+    expect(writeText).toHaveBeenCalledTimes(2);
+
+    act(() => jest.advanceTimersByTime(1000));
+    expect(screen.getByRole('button', { name: 'Copied!' })).toBeTruthy();
+    act(() => jest.advanceTimersByTime(1000));
+    expect(screen.getByRole('button', { name: 'Copy YAML' })).toBeTruthy();
+  } finally {
+    jest.runOnlyPendingTimers();
+    jest.useRealTimers();
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: originalClipboard,
+    });
+  }
+});
+
 it('explains when a version does not have retained YAML', async () => {
   getServiceVersions.mockResolvedValue({
     ...history,
