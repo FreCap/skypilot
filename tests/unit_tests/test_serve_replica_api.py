@@ -95,7 +95,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_PARTIAL_IN_FLIGHT_TELEMETRY_API_VERSION)
     assert partial_in_flight_version == 86
     assert ordered_capacity_version < partial_in_flight_version
-    assert server_constants.API_VERSION == partial_in_flight_version
+    termination_evidence_version = (
+        server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION)
+    assert termination_evidence_version == 87
+    assert partial_in_flight_version < termination_evidence_version
+    assert server_constants.API_VERSION == termination_evidence_version
 
 
 def test_current_demand_reads_database_without_controller():

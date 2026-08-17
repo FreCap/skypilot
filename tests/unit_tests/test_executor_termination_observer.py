@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest import mock
 import uuid
 
+import pytest
+
 from sky.server import executor_termination_observer as observer
 from sky.server.requests import postgres as request_postgres
 
@@ -59,8 +61,11 @@ def test_start_is_dark_and_requires_owner_to_equal_pod_uid(monkeypatch):
                                                       ip='10.0.0.1')
     monkeypatch.delenv(observer.OBSERVER_ENABLED_ENV_VAR, raising=False)
     assert observer.start(owner, pod_identity) is None
+    assert observer.start(owner, None) is None
 
     monkeypatch.setenv(observer.OBSERVER_ENABLED_ENV_VAR, 'true')
+    with pytest.raises(RuntimeError, match='exact server Pod identity'):
+        observer.start(owner, None)
     try:
         observer.start(owner, pod_identity)
     except RuntimeError as error:

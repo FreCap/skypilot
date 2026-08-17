@@ -201,11 +201,15 @@ class ExecutorTerminationEvidenceObserver:
 
 def start(
     controller_owner: tuple[str, int],
-    pod_identity: ServerPodIdentity,
+    pod_identity: ServerPodIdentity | None,
 ) -> ExecutorTerminationEvidenceObserver | None:
     """Start the transition observer only for an enabled exact controller."""
     if not enabled():
         return None
+    if pod_identity is None:
+        raise RuntimeError(
+            'Executor termination observer requires an exact server Pod '
+            'identity.')
     if controller_owner[0] != pod_identity.uid:
         raise RuntimeError(
             'Executor termination observer owner must be this Pod UID.')
