@@ -76,10 +76,10 @@ class IncrementalRouteWorker:
 
     @staticmethod
     def _consume_task_result(task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
         try:
             task.result()
-        except asyncio.CancelledError:
-            pass
         except Exception as error:  # pylint: disable=broad-except
             logger.warning('Incremental route probe task failed: '
                            f'{common_utils.format_exception(error)}')
