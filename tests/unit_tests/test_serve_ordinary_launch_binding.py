@@ -1029,7 +1029,7 @@ def test_decoded_replica_authority_rejects_every_special_profile(
                                       require_launch_authorized=True)
 
 
-def test_api013_serve050_lineage_and_sqlite_stays_at_serve037(
+def test_api014_serve050_lineage_and_sqlite_stays_at_serve037(
         tmp_path: pathlib.Path) -> None:
     sqlite = sqlalchemy.create_engine(f'sqlite:///{tmp_path / "serve.db"}')
     api_config = migration_utils.get_alembic_config(
@@ -1039,7 +1039,8 @@ def test_api013_serve050_lineage_and_sqlite_stays_at_serve037(
     api_scripts = alembic_script.ScriptDirectory.from_config(api_config)
     serve_scripts = alembic_script.ScriptDirectory.from_config(serve_config)
 
-    assert api_scripts.get_heads() == ['013']
+    assert api_scripts.get_heads() == ['014']
+    assert api_scripts.get_revision('014').down_revision == '013'
     assert api_scripts.get_revision('013').down_revision == '012'
     assert api_scripts.get_revision('012').down_revision == '011'
     assert api_scripts.get_revision('011').down_revision == '010'

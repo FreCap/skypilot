@@ -26,10 +26,11 @@ released plugin `claim_scope` API remains as an inert `GENERAL`-only
 compatibility shim; its retired authority value is rejected and does not affect
 queue selection.
 The generalized non-pool binding is merged through PR #1498. The first G2
-authority cleanup is restacked as API014/Serve051 in draft PR #1506, and the
-final generic non-pool cleanup is restacked immediately above it as
-API015/Serve052 in draft PR #1510. Their operational and adversarial-review
-merge gates remain open.
+authority cleanup in draft PR #1506 must be restacked as API015/Serve051, and
+the final generic non-pool cleanup in draft PR #1510 must be restacked
+immediately above it as API016/Serve052. API014 is now the forward-only
+executor-evidence clock-domain correction described under G1Se. The cleanup
+PRs' operational and adversarial-review merge gates remain open.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
@@ -596,12 +597,12 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API014/Serve051 are the first blocked cleanup heads, and API015/Serve052 are
+- API015/Serve051 are the first blocked cleanup heads, and API016/Serve052 are
   the immediately stacked final non-pool cleanup heads. They remove protocol-
-  v1/new-admission compatibility and transition columns/constraints only after
-  G2's gates; they preserve immutable tombstones, typed profiles, current
-  cohort, route history needed by live clients, and permanent reserved
-  authorization.
+  v1/new-admission compatibility, API013 evidence participant-version 1, and
+  transition columns/constraints only after G2's gates; they preserve immutable
+  V1 evidence rows as diagnostic tombstones, typed profiles, current cohort,
+  route history needed by live clients, and permanent reserved authorization.
 
 An active correlated bound request without its queue row is invariant
 corruption, not an activation state. Startup locks and types the correlated
@@ -1213,13 +1214,14 @@ disposition is unknown.
 
 G2 is authored with G1 and the demand-convergence P2 change and remains
 draft/blocked until every gate below is recorded. Its first migration-bearing
-cleanup must be restacked onto forward-only API-request revision 014 and Serve
+cleanup must be restacked onto forward-only API-request revision 015 and Serve
 revision 051; its immediately stacked final non-pool cleanup must move to
-API-request revision 015 and Serve revision 052. API012 and Serve048--050 are
+API-request revision 016 and Serve revision 052. API012 and Serve048--050 are
 already published by demand, route, and ordered-admission convergence; API013
-is reserved by G1Sb's executor-termination evidence. Any earlier cleanup draft
-using API013 is stale and must not merge. Migration numbers are globally unique
-and already-published revisions are immutable.
+is G1Sb's executor-termination evidence and API014 is G1Se's correction of its
+invalid cross-clock constraint. Any cleanup draft using API013 or API014 is
+stale and must not merge. Migration numbers are globally unique and
+already-published revisions are immutable.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
 only handler/profile alias, cluster-name quiescence as active authority, global
@@ -1233,7 +1235,7 @@ one executor topology, and the existing provider path.
 
 ### G1S: additive executor-retirement hardening
 
-G1S is a three-PR stack above the deployed G1/P2 baseline and below the G2
+G1S began as a three-PR stack above the deployed G1/P2 baseline and below the G2
 cleanup. G1Sa is schema-free: it makes the existing drain marker active in API,
 executor, and controller runtimes; records an immutable drain-start against the
 exact `api_server_instances` identity while retaining the heartbeat; fences new
@@ -1247,6 +1249,10 @@ retains the reviewed manual-attestation path for historical or incomplete
 infrastructure evidence. G1Sc is the simultaneously authored blocked cleanup;
 it removes the mixed-version sleep-only behavior and transition-only
 compatibility surface only after the exact rollout gates pass.
+Qualification then found two independent defects in the new observer. G1Sd
+supplies the resource-versioned list/watch continuity fix, and G1Se supplies
+the forward-only API014 clock-domain correction. These are fix-forwards on the
+one canonical observer path, not compatibility branches.
 
 As of 2026-08-16, G1Sa is merged as PR #1519 at merge commit
 `8a9a0d5b6ecd21085e194c4cc46ad288bd719bec`. Its focused Python runtime,
@@ -1268,7 +1274,11 @@ variable fallback, and sleep-only chart projection. The final chart supplies
 exactly one execution-drain variable in both HA and compatibility topology,
 and only the dedicated HA controller owns the termination observer. Its first
 cleanup-artifact retirement probe exposed the reconnect gap described below;
-G1S completion and G2 remain blocked on the G1Sd watch-continuity fix-forward.
+G1Sd merged as PR #1526 at
+`ef62d6d44a935b1669f646d65f2d2637d3c7fa13`. Its deployment proved watch
+continuity and exposed the independent clock-domain defect described below.
+G1S completion and G2 remain blocked on the G1Se API014 fix-forward and a fresh
+positive retirement probe.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1366,18 +1376,16 @@ queue state, claim identity,
 `execution_quiescence_required`, `execution_quiesced_generation`, or an
 association resolution.
 
-Automatic source `KUBERNETES_POD_TERMINATED_V1` is deliberately narrower than
-Pod disappearance. A singleton controller observer must read the immutable
-`kube-system` Namespace UID for the current in-cluster API, then observe a Pod
-object whose UID equals the request's worker-instance and registered lease UID,
-whose namespace and name equal that lease, whose deletion timestamp is set,
-and whose role container is in a current `terminated` state with a finish time
-at or after deletion began. The observer records the Pod resource version and
-container exit details in the canonical payload. A `last_state.terminated`
-entry is never automatic authority: the same Pod UID can execute again after a
-liveness restart. `NotFound`, an expired lease, a replacement Pod, a missing
-process-map entry, a watch reconnect, or a Pod with a running/waiting target
-container records no certificate.
+API013 source `KUBERNETES_POD_TERMINATED_V1` was deliberately narrower than
+Pod disappearance: it required a deletion timestamp, current role-container
+termination, and a kubelet finish timestamp at or after the API-server deletion
+timestamp. The live G1Sd probe below proved that last comparison invalid
+because the writers use independent clocks. API014 preserves every immutable
+V1 row as diagnostic history but no cleanup consumer may treat V1 as automatic
+stop authority. The sole current source is G1Se's
+`KUBERNETES_POD_FINAL_SUCCEEDED_V2` contract below. A
+`last_state.terminated` entry remains inadmissible because the same Pod UID can
+execute again after a liveness restart.
 
 The observer is dark behind one transition-only HA value in G1Sb. While dark,
 API013 readers and writers are deployed and mixed-version tolerant but no
@@ -1473,9 +1481,9 @@ Deployment recovered 2/2, but no Kubernetes certificate appeared after the
 complete observer polling window. No certificate was fabricated and the
 failed probe does not satisfy G1S qualification.
 
-G1Sd fixes the root cause before P3. The G1Sb observer opened a new unversioned
-five-second watch on every loop, leaving a reconnect interval in which a Pod
-could be deleted without any later object to observe. The Kubernetes
+G1Sd fixes the first root cause before P3. The G1Sb observer opened a new
+unversioned five-second watch on every loop, leaving a reconnect interval in
+which a Pod could be deleted without any later object to observe. The Kubernetes
 [list-then-watch contract](https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes)
 requires a collection list, a watch starting at that collection
 `resourceVersion`, and reconnect from the last consumed event
@@ -1484,16 +1492,81 @@ observer path. It processes already-deleting Pods from the initial/fresh list,
 advances the watch cursor only after an event is consumed, replays an event
 after unexpected persistence failure, and relists on explicit history expiry.
 It does not infer evidence from a missing Pod or from expired watch history.
-G1Sd must pass exact-head CI, deploy as a direct Helm fix-forward, and record an
-exact planned-retirement certificate across at least one forced watch timeout
-before G1S is complete or P3a may merge.
+G1Sd passed exact-head CI as PR #1526 and shipped at merge
+`ef62d6d44a935b1669f646d65f2d2637d3c7fa13` as release `1.1.1309`. Test Helm
+revision 111 deployed its exact image digest
+`sha256:7728b1ecb0df228981cf22615a48de6752d1d9f4c15c766a1148b45a1fbc5999`
+and chart digest
+`sha256:e14772ab2958861cecee781cedfc16a8bd2cdc49965f8b36cdba65dc1ef519b9`;
+the verified chart package SHA-256 is
+`a6c7401dd95e40c3c74017f87fc67b1929570bf80e7c946b4ecf26a675cd8baf`
+and the preflight PostgreSQL dump SHA-256 is
+`d424f2bac6b8a2808dad872fb29a5046abc82a3320252fe1a245c988d380e8d5`.
+All three roles converged 2/2, API health reported the exact release/commit,
+API013/Serve050 remained the heads, and the removed Helm transition key stayed
+absent.
 
-API013 certificates are not cleanup authority by themselves. G2/API014 and
-Serve051 may consume one only as proof that the named executor can no longer
-create effects after `container_finished_at`. A request that crossed or may
-have crossed the effect boundary remains post-effect ambiguous. Any provider
-absence observation must begin after that timestamp, copy the exact certificate
-identity/digest into the locked association, and revalidate the request,
+The planned-retirement probe on request
+`c50c8588-6e28-48ed-b72f-ad861fe7841e`, exact executor Pod UID
+`5f04c581-f6fa-4d7b-bd5f-7f70976ca521` proved that continuity was fixed and
+found a second root cause. An independent versioned watch observed resource
+versions `197170975`, `197171019`, `197171027`, and `197171028` without a gap.
+The same Pod object first showed deletion at `04:48:37Z` while running, then
+showed the target container currently terminated with kubelet finish time
+`04:47:40Z`; a later object reported deletion at `04:47:41Z`. The API-server
+and kubelet clocks therefore disagreed by 57 seconds and, even after the
+deletion timestamp was corrected, by one second. The request independently
+committed generation-1 quiescence and the executor recovered 2/2, but the
+application and API013 database constraint rejected the exact stop evidence.
+No certificate was fabricated, so G1S and P3 remain blocked.
+
+G1Se is the single-path clock-domain and proof-boundary correction.
+Forward-only API014 leaves published API013 immutable, drops
+`ck_api013_executor_termination_time`, adds the nullable V2 Pod event and phase
+fields, and permits V1 and V2 participant rows during rolling overlap.
+Its closed source constraint requires historical V1 rows to keep all V2 fields
+null and requires every `KUBERNETES_POD_FINAL_SUCCEEDED_V2` row to record a
+`DELETED` event, `Succeeded` Pod phase, and role-container exit code 0. New
+participants advertise protocol 2 and only an exact protocol-2 worker can
+receive V2 evidence.
+
+The singleton observer still authenticates the in-cluster Kubernetes UID and
+exact registered Pod identity. It now records only the final object delivered
+by the continuous versioned watch for a `DELETED` event, and only when that
+object has `Succeeded` Pod phase and the role container's current state is
+`terminated` with exit code 0. Kubernetes' [Pod lifecycle
+contract](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination-flow)
+defines `Succeeded` as all containers terminated successfully without restart
+and, for ordinary Pod deletion, has the kubelet publish terminal phase before
+API removal. Requiring successful final state deliberately excludes the
+control-plane `Failed` phase used during orphan/PodGC cleanup. Force deletion
+of a running process, node loss, PodGC cleanup, a list snapshot, `MODIFIED`,
+`NotFound`, expired history, non-success phase, nonzero exit, or
+`last_state.terminated` records no V2 certificate.
+
+The observer and writer require timezone-aware values but never compare
+API-server `deletionTimestamp`, kubelet `finishedAt`, or PostgreSQL
+`observed_at`. Timestamp values remain immutable diagnostics in the payload;
+event type, successful terminal phase, exit outcome, and resource version are
+part of the canonical digest. The migration precedes new writers. Old observers
+may emit only diagnostic V1 rows during overlap, and an application rollback
+may read the broader retained table without issuing V2 evidence.
+The API014 instance-version allowance is isolated rollout code. The already
+blocked G2/P3a cleanup PR #1506 must remove participant protocol 1 after the
+complete stale-writer/quiescence horizon while retaining immutable V1 evidence
+rows under the closed source constraint.
+G1Se must pass exact-head CI, deploy by direct Helm fix-forward, record a fresh
+planned-retirement certificate across watch reconnects, and repeat the
+liveness-restart negative test before G1S is complete or P3a may merge.
+
+V1 certificates are never cleanup authority, and a V2 certificate is not
+cleanup authority by itself. G2/API015 and Serve051 may consume V2 only as
+proof that the named executor was stopped by the database evidence-ingestion
+boundary. A request that crossed or may have crossed the effect boundary
+remains post-effect ambiguous. Any provider absence observation must begin
+after the certificate's PostgreSQL
+`observed_at`, copy the exact certificate identity/digest into the locked
+association, and revalidate the request,
 certificate, provider physical UID, service owner, and replica under the
 canonical lock order before projection. Until that consumer exists, a
 certificate is diagnostic durable history and cannot unblock a successor.
@@ -2669,8 +2742,8 @@ approved canary:
   (API012/Serve048--050).
 - [x] Merge G1Sa as PR #1519 and G1Sb executor-termination evidence on API013
   as PR #1522; author G1Sc as draft PR #1523 with its exact merge gate.
-- [x] Restack blocked G2 PR #1506 onto API014/Serve051.
-- [x] Restack PR #1510 immediately above #1506 onto API015/Serve052.
+- [ ] Restack blocked G2 PR #1506 onto API015/Serve051 after G1Se merges.
+- [ ] Restack PR #1510 immediately above #1506 onto API016/Serve052.
 - [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
   may merge until that review and the operational gates are complete.
 - [ ] Prove each schema
@@ -2719,9 +2792,13 @@ approved canary:
   its automatic infrastructure certificate issuer or merging its cleanup.
 - [x] Merge and deploy G1Sc cleanup as PR #1523 / release `1.1.1308`; prove the
   stored observer key is absent and all roles converge 2/2 on its exact image.
-- [ ] Merge and deploy G1Sd watch continuity, then record one exact automatic
-  certificate after a forced watch timeout. The failed revision-110 probe is
-  evidence of the reconnect defect, not a passing certificate gate.
+- [x] Merge and deploy G1Sd watch continuity as PR #1526 / release `1.1.1309`.
+  Revision 111 proved continuous resource-version delivery; its failed
+  certificate probes exposed the separate cross-clock rejection.
+- [ ] Merge and deploy G1Se/API014, then record one exact automatic certificate
+  after a forced watch timeout and repeat the liveness-restart negative test.
+  The revision-110 and revision-111 probes are diagnostic evidence, not passing
+  certificate gates.
 - [ ] Merge G2 only after zero legacy-capable participants, zero old-handler
   active/unsettled requests, and zero unbound non-pool rows requiring recovery.
   After G2, roll forward only.

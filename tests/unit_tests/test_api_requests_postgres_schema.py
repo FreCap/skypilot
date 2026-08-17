@@ -73,11 +73,11 @@ def test_postgres_record_schema_topology() -> None:
             ('evidence_id', 'request_id', 'execution_generation', 'claim_token',
              'worker_instance_id', 'worker_role', 'kubernetes_cluster_uid',
              'pod_namespace', 'pod_name', 'pod_uid', 'container_name',
-             'pod_resource_version', 'pod_deletion_timestamp',
-             'container_finished_at', 'container_exit_code', 'container_reason',
-             'source', 'evidence_payload', 'evidence_digest',
-             'observer_instance_id', 'observer_controller_generation',
-             'observed_at', 'created_at'),
+             'pod_resource_version', 'pod_event_type', 'pod_phase',
+             'pod_deletion_timestamp', 'container_finished_at',
+             'container_exit_code', 'container_reason', 'source',
+             'evidence_payload', 'evidence_digest', 'observer_instance_id',
+             'observer_controller_generation', 'observed_at', 'created_at'),
         'api_controller_leadership':
             ('leadership_key', 'generation', 'instance_id', 'lock_backend_pid',
              'generation_lock_key', 'origin_capability_sha256', 'acquired_at',
@@ -127,6 +127,25 @@ def test_execution_quiescence_required_keeps_api007_insert_default() -> None:
 
     assert column.server_default is not None
     assert str(column.server_default.arg) == 'false'
+
+
+def test_executor_termination_evidence_keeps_v1_and_requires_v2_stop_proof(
+) -> None:
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in
+        postgres_schema.EXECUTOR_TERMINATION_EVIDENCE.constraints
+        if constraint.name is not None
+    }
+
+    assert 'ck_api013_executor_termination_time' not in constraints
+    source = ''.join(
+        constraints['ck_api014_executor_termination_source'].split())
+    assert "source='KUBERNETES_POD_TERMINATED_V1'" in source
+    assert "source='KUBERNETES_POD_FINAL_SUCCEEDED_V2'" in source
+    assert "pod_event_type='DELETED'" in source
+    assert "pod_phase='Succeeded'" in source
+    assert 'container_exit_code=0' in source
 
 
 def test_managed_job_origin_schema_is_complete_and_exactly_indexed() -> None:

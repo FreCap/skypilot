@@ -13,10 +13,12 @@ def _pod(*,
          deleting: bool = True,
          current_terminated: bool = True,
          last_terminated: bool = False,
+         phase: str | None = None,
+         exit_code: int = 0,
          resource_version: str = '42'):
     now = datetime.datetime.now(datetime.timezone.utc)
     terminated = SimpleNamespace(finished_at=now,
-                                 exit_code=0,
+                                 exit_code=exit_code,
                                  reason='Completed')
     state = SimpleNamespace(
         terminated=terminated if current_terminated else None,
@@ -31,25 +33,54 @@ def _pod(*,
             resource_version=resource_version,
             deletion_timestamp=(now - datetime.timedelta(seconds=1)
                                 if deleting else None)),
-        status=SimpleNamespace(container_statuses=[
-            SimpleNamespace(
-                name='skypilot-executor', state=state, last_state=last_state)
-        ]))
+        status=SimpleNamespace(
+            phase=(phase or ('Succeeded' if current_terminated else 'Running')),
+            container_statuses=[
+                SimpleNamespace(name='skypilot-executor',
+                                state=state,
+                                last_state=last_state)
+            ]))
 
 
-def test_observation_requires_deleting_pod_and_current_terminated_state():
+def test_observation_requires_final_successful_deleted_pod():
     cluster_uid = str(uuid.uuid4())
     exact = observer.observation_from_pod(_pod(),
-                                          kubernetes_cluster_uid=cluster_uid)
+                                          kubernetes_cluster_uid=cluster_uid,
+                                          event_type='DELETED')
     assert exact is not None
     assert exact.kubernetes_cluster_uid == cluster_uid
     assert exact.container_name == 'skypilot-executor'
 
-    assert observer.observation_from_pod(
-        _pod(deleting=False), kubernetes_cluster_uid=cluster_uid) is None
-    assert observer.observation_from_pod(
-        _pod(current_terminated=False, last_terminated=True),
-        kubernetes_cluster_uid=cluster_uid) is None
+    assert observer.observation_from_pod(_pod(deleting=False),
+                                         kubernetes_cluster_uid=cluster_uid,
+                                         event_type='DELETED') is None
+    assert observer.observation_from_pod(_pod(current_terminated=False,
+                                              last_terminated=True),
+                                         kubernetes_cluster_uid=cluster_uid,
+                                         event_type='DELETED') is None
+    assert observer.observation_from_pod(_pod(),
+                                         kubernetes_cluster_uid=cluster_uid,
+                                         event_type='MODIFIED') is None
+    assert observer.observation_from_pod(_pod(phase='Failed'),
+                                         kubernetes_cluster_uid=cluster_uid,
+                                         event_type='DELETED') is None
+    assert observer.observation_from_pod(_pod(exit_code=137),
+                                         kubernetes_cluster_uid=cluster_uid,
+                                         event_type='DELETED') is None
+
+
+def test_observation_accepts_cross_clock_timestamp_skew():
+    cluster_uid = str(uuid.uuid4())
+    pod = _pod()
+    pod.status.container_statuses[0].state.terminated.finished_at = (
+        pod.metadata.deletion_timestamp - datetime.timedelta(seconds=60))
+
+    observation = observer.observation_from_pod(
+        pod, kubernetes_cluster_uid=cluster_uid, event_type='DELETED')
+
+    assert observation is not None
+    assert (observation.container_finished_at
+            < observation.pod_deletion_timestamp)
 
 
 def test_start_requires_owner_to_equal_pod_uid():
@@ -68,7 +99,13 @@ def test_start_requires_owner_to_equal_pod_uid():
 
 def test_conflicting_pod_update_does_not_break_watch(monkeypatch):
     cluster_uid = str(uuid.uuid4())
-    events = ({'object': _pod()}, {'object': _pod()})
+    events = ({
+        'type': 'DELETED',
+        'object': _pod()
+    }, {
+        'type': 'DELETED',
+        'object': _pod()
+    })
     watcher = mock.Mock()
     watcher.stream.return_value = events
     core_api = mock.Mock()
@@ -106,6 +143,7 @@ def test_watch_reconnect_resumes_after_last_consumed_resource_version(
     cluster_uid = str(uuid.uuid4())
     watcher_one = mock.Mock()
     watcher_one.stream.return_value = ({
+        'type': 'MODIFIED',
         'object': _pod(deleting=False, resource_version='41')
     },)
     watcher_two = mock.Mock()
@@ -139,7 +177,7 @@ def test_watch_reconnect_resumes_after_last_consumed_resource_version(
                                                timeout_seconds=5)
 
 
-def test_initial_list_records_deleting_pod_before_watch_anchor(monkeypatch):
+def test_initial_list_does_not_certify_before_deleted_event(monkeypatch):
     cluster_uid = str(uuid.uuid4())
     deleting_pod = _pod(resource_version='41')
     watcher = mock.Mock()
@@ -163,7 +201,7 @@ def test_initial_list_records_deleting_pod_before_watch_anchor(monkeypatch):
 
     instance._observe_once()  # pylint: disable=protected-access
 
-    record.assert_called_once()
+    record.assert_not_called()
     watcher.stream.assert_called_once_with(core_api.list_namespaced_pod,
                                            namespace='skypilot',
                                            resource_version='42',
@@ -174,9 +212,15 @@ def test_unexpected_persistence_failure_replays_same_watch_event(monkeypatch):
     cluster_uid = str(uuid.uuid4())
     deleting_pod = _pod(resource_version='41')
     failing_watcher = mock.Mock()
-    failing_watcher.stream.return_value = ({'object': deleting_pod},)
+    failing_watcher.stream.return_value = ({
+        'type': 'DELETED',
+        'object': deleting_pod
+    },)
     resumed_watcher = mock.Mock()
-    resumed_watcher.stream.return_value = ({'object': deleting_pod},)
+    resumed_watcher.stream.return_value = ({
+        'type': 'DELETED',
+        'object': deleting_pod
+    },)
     core_api = mock.Mock()
     core_api.read_namespace.return_value = SimpleNamespace(
         metadata=SimpleNamespace(uid=cluster_uid))
