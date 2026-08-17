@@ -1212,6 +1212,24 @@ class RouteProjectionRepository:
             _SERVICES.c.name == service_name)
         return query.with_for_update() if for_update else query
 
+    def current_owner_uses_incremental_producer(
+            self, identity: RoutePublisherIdentity) -> bool:
+        """Select the one route writer from exact current-schema authority."""
+        if not isinstance(identity, RoutePublisherIdentity):
+            raise RouteProjectionValidationError(
+                'Route publisher identity is invalid.')
+        try:
+            with orm.Session(self.engine) as session, session.begin():
+                owner = session.execute(self._owner_query(
+                    identity.service_name)).mappings().one_or_none()
+                if owner is None or not _owner_matches(identity, owner):
+                    raise RouteProjectionConflict(
+                        'Route producer no longer owns this service.')
+                return use_incremental_producer(owner)
+        except sqlalchemy.exc.SQLAlchemyError as error:
+            raise RouteProjectionUnavailable(
+                'PostgreSQL route producer selection failed.') from error
+
     @staticmethod
     def validate_snapshot_row(
         row: Mapping[str,

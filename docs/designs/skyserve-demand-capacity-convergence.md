@@ -4,24 +4,29 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, and PR #1529's exact
 reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 408 / release
-`1.1.1312`, commit `966f74369d0722b253c7d47dad12248711928e70`, image
+artifact is deployed directly with Helm as production revision 409 / release
+`1.1.1313`, merge commit `a81a76729c663883a99dddd2152e936a814c4b84`, image
 digest
-`sha256:004478e3f12e2d217beea95acd6ddc79629cc064fdb87f002e8f6017d843dcc7`,
+`sha256:5fb7e2af6719fd66ce384f7a6a1896835533c2d83cc80d6939f95b18db0de656`,
 and chart digest
-`sha256:18125d491ea2fd416f70b0f1f6c902747420c157fe018ca887d3ca48cb122825`.
-The migration Job completed at API-request revision 014 and Serve revision 050;
-the API reports protocol version 87. The API, active `boltz-l4-fleet` LB slot,
-and the other 13 warm-standby LB deployments are ready with zero restarts. The
-inactive `boltz-l4-fleet` standby deliberately remains on revision 407 until a
-future cutover; it is not an active traffic owner.
+`sha256:e3165c064fb6c753b7b885eb68631de754dba5fbcb369459d4c0673ac39ea85b`.
+The Serve051 migration Job completed, the API reports protocol version 88, and
+the API deployment is ready with zero restarts. No load-balancer slot, service
+version, authority mode, or `boltz-platform` pin changed in this direct Helm
+rollout.
 
-P2c API88/Serve051 is implemented and locally reviewed in PR #1531 from branch
-`fix/serve-route-replica-leases` as four implementation milestones plus
-review/CI fix-forward commits above the revision-408 source. Its remote
-PostgreSQL CI, PR merge, immutable image build, dark Helm deployment, and
-production provider-stall qualification remain open. No P2c behavior has been
-promoted on `boltz-l4-fleet`.
+P2c API88/Serve051 is merged in PR #1531 and deployed dark. Its complete remote
+PostgreSQL run passed 17,471 tests (plus 199 subtests), and the final affected
+local PostgreSQL run passed 293 tests. The first production qualification found
+a bootstrap integration defect before provider-stall injection: the controller
+selected its route producer from `get_service_from_name()`, whose deliberate
+Serve037 compatibility projection omits `route_source_mode` and
+`route_projection_protocol_version`. The deployed controller therefore kept
+publishing protocol 1, wrote zero exact route leases, and could not exercise the
+P2c renewal contract. The fix-forward changes that bootstrap read to the route
+repository's exact current-owner projection; qualification remains open until
+that correction is merged and deployed. No P2c behavior has been promoted on
+`boltz-l4-fleet`.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -987,8 +992,9 @@ remove and it grants no teardown authority.
 Local fix-forward verification on 2026-08-17 passed all 293 affected tests on
 PostgreSQL 14, including the pre-Serve051 schema hooks, the full route and paid
 retirement suites, reserved-fill broker races, system-recovery persistence,
-resource-action state, launch authority, and capacity observations. Remote CI
-remains the merge gate.
+resource-action state, launch authority, and capacity observations. The final
+remote Python 3.14/PostgreSQL run passed 17,471 tests, one expected failure, 199
+subtests, and no failures before PR #1531 merged.
 
 The implemented paid-retirement transaction binds the exact service owner,
 replica record, demand generation, fresh route head, and zero-residual capacity
@@ -1003,10 +1009,8 @@ a zero-second teardown cap.
 
 Local evidence on 2026-08-17 includes the complete Serve controller, replica
 manager, Serve state, concurrency autoscaler, demand, capacity-admission,
-route-projection, incremental-worker, request-aggregator, and migration utility
-suites. The three changed PostgreSQL suites collect successfully but skip
-locally because no Docker daemon is available; remote real-PostgreSQL execution
-is therefore a merge gate. `format.sh` passed mypy over 953 source files,
+route-projection, incremental-worker, request-aggregator, migration utility,
+and real-PostgreSQL suites. `format.sh` passed mypy over 953 source files,
 changed-file pylint at 10.00/10, dashboard ESLint, and dashboard formatting.
 
 The additive PR must link to draft #1506 as its stacked removal. #1506 is
@@ -1308,11 +1312,12 @@ corrections are implemented and covered by focused regressions.
 - [x] Run P3a's provider-stall route gate on revision 407. It failed: the
   60-second dark route head remained stale for at least 148 seconds while
   demand stayed fresh. Keep #1506 draft and undeployed.
-- [ ] Merge P2c API88/Serve051 after remote real-PostgreSQL CI and final exact
-  diff review, update its simultaneously maintained #1506 removal diff, then
-  deploy dark and prove the ten-renewal provider-stall gate. Local
-  implementation and focused review are complete on
-  `fix/serve-route-replica-leases`.
+- [x] Merge P2c API88/Serve051 after remote real-PostgreSQL CI and final exact
+  diff review, update its simultaneously maintained #1506 removal diff, and
+  deploy it dark as direct Helm revision 409 / v1.1.1313.
+- [ ] Merge and deploy the exact-owner route-producer bootstrap fix-forward,
+  then prove the ten-renewal provider-stall gate. Revision 409 exposed the
+  omitted-field defect before stall injection and remains unpromoted.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.

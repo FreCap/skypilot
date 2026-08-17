@@ -652,10 +652,13 @@ class SkyServeController:
         # advertise a newer routing policy than the runtime has actually
         # applied.
         self._routing_spec = self._build_routing_spec(service_spec)
-        route_service_row = serve_state.get_service_from_name(service_name)
+        route_repository = route_projection.RouteProjectionRepository()
         self._incremental_route_projection_enabled = bool(
-            route_service_row is not None and
-            route_projection.use_incremental_producer(route_service_row))
+            self._ordinary_launch_binding_authority is not None and
+            not self._is_pool and
+            route_repository.current_owner_uses_incremental_producer(
+                route_projection.publisher_identity_from_authority(
+                    self._ordinary_launch_binding_authority)))
         if (self._ordinary_launch_binding_authority is not None and
                 not self._is_pool):
             if self._incremental_route_projection_enabled:
