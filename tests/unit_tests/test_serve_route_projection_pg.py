@@ -192,6 +192,47 @@ def test_serve049_schema_is_postgresql_only_and_complete(route_database):
     assert inspector.has_table('serve_paid_replica_retirements')
 
 
+def test_route_producer_selection_reads_exact_current_owner(route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    identity = _identity(incarnation)
+
+    # A legacy-proxy service must start the protocol-2 producer dark.  These
+    # fields are deliberately absent from get_service_from_name()'s Serve037
+    # compatibility projection, so bootstrap must read this canonical owner.
+    assert repository.current_owner_uses_incremental_producer(identity)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_source_mode='DURABLE_PROJECTED',
+                    route_source_epoch=1,
+                    route_projection_capable=True,
+                    route_projection_controller_incarnation=incarnation,
+                    route_projection_protocol_version=1))
+    assert not repository.current_owner_uses_incremental_producer(identity)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_projection_protocol_version=2))
+    assert repository.current_owner_uses_incremental_producer(identity)
+
+    stale = route_projection.RoutePublisherIdentity(
+        service_name=identity.service_name,
+        service_hash=identity.service_hash,
+        service_lifecycle_epoch=identity.service_lifecycle_epoch,
+        controller_incarnation=identity.controller_incarnation,
+        controller_owner_epoch=identity.controller_owner_epoch + 1,
+        controller_pid=identity.controller_pid,
+        controller_ip=identity.controller_ip)
+    with pytest.raises(route_projection.RouteProjectionConflict,
+                       match='no longer owns'):
+        repository.current_owner_uses_incremental_producer(stale)
+
+
 def test_incremental_material_is_idempotent_and_probe_is_generation_fenced(
         route_database):
     engine, incarnation = route_database
