@@ -64,6 +64,7 @@ from sky.utils.db import migration_utils
 
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
+    from sky.serve import zero_cost_actuation
 
 logger = sky_logging.init_logger(__name__)
 
@@ -1669,7 +1670,9 @@ def persist_fill_replica(
     expected_physical_cluster_uid: str | None = None,
     expected_ordinary_zero_cost_admission_sequence: int | None = None,
     expected_service_hash: str | None = None,
-    expected_controller_owner: tuple[int | None, str | None] | None = None
+    expected_controller_owner: tuple[int | None, str | None] | None = None,
+    expected_actuation_mode: str | None = None,
+    actuation_lease: 'zero_cost_actuation.IntentLease | None' = None,
 ) -> bool:
     """Atomically persists a fill replica row, excluded from broker rounds.
 
@@ -1733,7 +1736,9 @@ def persist_fill_replica(
                     expected_ordinary_zero_cost_admission_sequence),
                 expected_lease_token=lease_token,
                 expected_service_hash=expected_service_hash,
-                expected_controller_owner=expected_controller_owner)
+                expected_controller_owner=expected_controller_owner,
+                expected_actuation_mode=expected_actuation_mode,
+                actuation_lease=actuation_lease)
     except locks.LockTimeout:
         return False
 

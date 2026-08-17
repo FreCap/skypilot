@@ -23,7 +23,7 @@ from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
-    name='serve_capacity_admission_schema_051_pg')
+    name='serve_capacity_admission_schema_052_pg')
 
 _URL = 'http://replica:8000'
 
@@ -148,7 +148,11 @@ def _demand_report(now: float,
 def capacity_database(empty_postgres, monkeypatch):
     serve_config = migration_utils.get_alembic_config(
         empty_postgres, migration_utils.SERVE_DB_NAME)
-    alembic_command.upgrade(serve_config, '051')
+    # Capacity admission uses the current service metadata and, as of
+    # Serve052, atomically accounts for grant-before-row intents.  Keep the
+    # fixture at the current schema head while retaining the focused Serve050
+    # behavioral assertions below.
+    alembic_command.upgrade(serve_config, '052')
     monkeypatch.setattr(serve_state_schema._db_manager, '_engine',
                         empty_postgres)
     incarnation = uuid.uuid4()

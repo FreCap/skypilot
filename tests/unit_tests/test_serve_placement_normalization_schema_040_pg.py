@@ -243,7 +243,7 @@ def _insert_manifest(connection: sqlalchemy.engine.Connection,
 
 
 def test_serve040_lineage_and_postgresql_only() -> None:
-    assert migration_utils.SERVE_VERSION == '051'
+    assert migration_utils.SERVE_VERSION == '052'
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
                                                 migration_utils.SERVE_DB_NAME)
@@ -1076,7 +1076,8 @@ def test_serve040_runtime_authority_rejects_wrong_revision(serve040) -> None:
 
 
 @pytest.mark.parametrize('revision', [
-    '041', '042', '043', '044', '045', '046', '047', '048', '049', '050', '051'
+    '041', '042', '043', '044', '045', '046', '047', '048', '049', '050', '051',
+    '052'
 ])
 def test_serve040_runtime_authority_accepts_recognized_additive_head(
         serve040, revision: str) -> None:
@@ -1091,7 +1092,7 @@ def test_serve040_runtime_authority_accepts_recognized_additive_head(
 
 
 def test_later_head_still_rejects_revision_040_function_drift(serve040) -> None:
-    _upgrade(serve040, '051')
+    _upgrade(serve040, '052')
     function = placement_normalization_authority.AUTHORITY_FUNCTION
     with serve040.begin() as connection:
         connection.exec_driver_sql(
@@ -1111,7 +1112,7 @@ def test_serve040_runtime_authority_rejects_unknown_later_head(
         serve040) -> None:
     with serve040.begin() as connection:
         connection.exec_driver_sql(
-            "UPDATE alembic_version_serve_state_db SET version_num = '052'")
+            "UPDATE alembic_version_serve_state_db SET version_num = '053'")
     with serve040.connect() as connection:
         with pytest.raises(placement_normalization_authority.
                            PlacementNormalizationAuthorityError,

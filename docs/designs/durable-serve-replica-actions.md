@@ -31,9 +31,9 @@ revision 407 / release `1.1.1310` at API-request 014/Serve050. Live
 qualification disproved the first cleanup's route-freshness prerequisite and
 also confirmed row-before-pool-lane reserved-fill actuation. P2c Serve051 and
 P2d Serve052 in `skyserve-demand-capacity-convergence.md` must land first. The
-G2 authority cleanup in draft PR #1506 is then restacked as API015/Serve053,
+G2 authority cleanup in draft PR #1506 is then restacked as API016/Serve053,
 and final generic non-pool cleanup #1510 immediately above it as
-API016/Serve054. Both cleanup PRs remain draft and undeployed until their
+API017/Serve054. Both cleanup PRs remain draft and undeployed until their
 operational and adversarial-review gates pass.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
@@ -601,7 +601,7 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API015/Serve053 are the first blocked cleanup heads, and API016/Serve054 are
+- API016/Serve053 are the first blocked cleanup heads, and API017/Serve054 are
   the immediately stacked final non-pool cleanup heads. They remove protocol-
   v1/new-admission compatibility, API013 evidence participant-version 1, and
   transition columns/constraints only after G2's gates; they preserve immutable
@@ -1284,7 +1284,7 @@ continuity and exposed the independent clock-domain defect described below.
 G1Se merged as PR #1527 at
 `bf9e2907a39ef90a6e9f741be050da9b3fe662a5`; the exact `boltz-test`
 qualification below passed. G1S is complete. G2 remains blocked on its
-API015/Serve053 and API016/Serve054 restack plus the independent operational
+API016/Serve053 and API017/Serve054 restack plus the independent operational
 and adversarial-review gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
@@ -2794,8 +2794,8 @@ approved canary:
 - [x] Merge G1Sa as PR #1519 and G1Sb executor-termination evidence on API013
   as PR #1522; author G1Sc as draft PR #1523 with its exact merge gate.
 - [ ] Land P2c Serve051 and P2d Serve052, then restack blocked G2 PR #1506
-  onto API015/Serve053.
-- [ ] Restack PR #1510 immediately above #1506 onto API016/Serve054.
+  onto API016/Serve053.
+- [ ] Restack PR #1510 immediately above #1506 onto API017/Serve054.
 - [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
   may merge until that review and the operational gates are complete.
 - [ ] Prove each schema

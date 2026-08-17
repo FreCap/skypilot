@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import enum
 import functools
+import hashlib
 import math
 from multiprocessing import pool as mp_pool
 import os
@@ -59,6 +60,7 @@ from sky.serve import system_oom_recovery
 from sky.serve import system_oom_recovery_observability
 from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
+from sky.serve import zero_cost_actuation
 from sky.server import common as server_common
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -181,6 +183,8 @@ _ZERO_COST_SPECULATIVE_LAUNCHES_PER_LOCATION = 4
 # I/O remains outside the manager mutex.
 _RESERVED_FILL_PHYSICAL_PREFLIGHT_TIMEOUT_SECONDS = 45
 _RESERVED_FILL_PHYSICAL_PREFLIGHT_RELEASE_TIMEOUT_SECONDS = 1
+_ZERO_COST_ACTUATION_LEASE_SECONDS = 90
+_ZERO_COST_ACTUATION_POLL_SECONDS = 1
 # Sentinel for drain registration's optional pre-resolved replica URL. ``None``
 # is a real batched result: the cluster has no resolvable endpoint and the
 # bounded deadline must remain the only completion path.
@@ -2952,6 +2956,17 @@ class ReplicaManager:
         del plan
         raise NotImplementedError
 
+    def pending_reserved_fill_debits(
+        self, allocation: reserved_fill_planner.AuthenticatedAllocationMap
+    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
+        """Return accepted-but-unmaterialized debits for one allocation."""
+        del allocation
+        return ()
+
+    def install_durable_zero_cost_actuation(self) -> None:
+        """Install a committed durable reserved-fill authority."""
+        raise NotImplementedError
+
     def scale_up_to_logical_capacity(
         self,
         target_capacity: int,
@@ -3261,6 +3276,18 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._ordinary_launch_binding_transition_lock = threading.Lock()
         self._ordinary_launch_binding_transition_in_progress = (
             threading.Event())
+        # Real controllers replace this from PostgreSQL during __init__.  The
+        # direct default preserves lightweight manager test doubles that do
+        # not own a central database.
+        self._reserved_fill_actuation_mode: (
+            zero_cost_actuation.ActuationMode |
+            None) = zero_cost_actuation.ActuationMode.DIRECT_REPLICA
+        self._zero_cost_actuation_repository = (
+            zero_cost_actuation.ZeroCostActuationRepository())
+        self._zero_cost_actuation_executor_id = uuid.uuid4()
+        self._zero_cost_actuation_event = threading.Event()
+        self._zero_cost_actuation_lane_lock = threading.Lock()
+        self._zero_cost_actuation_lanes: dict[str, threading.Thread] = {}
 
     def _publish_legacy_mutation_runtime_state(
             self, runtime: _LegacyReplicaMutationRuntime) -> None:
@@ -5059,6 +5086,20 @@ class SkyPilotReplicaManager(ReplicaManager):
                                   controller_ip is not None else None)
         self._enforce_launch_fence = enforce_launch_fence
         self._ordinary_launch_binding_authority = controller_binding_authority
+        if controller_binding_authority is None:
+            self._reserved_fill_actuation_mode = (
+                zero_cost_actuation.get_service_mode(service_name))
+        else:
+            try:
+                self._reserved_fill_actuation_mode = (
+                    zero_cost_actuation.advertise_capability(
+                        service_name,
+                        controller_binding_authority.controller_incarnation))
+            except zero_cost_actuation.ZeroCostActuationError as error:
+                self._reserved_fill_actuation_mode = None
+                logger.warning(
+                    'Zero-cost actuation capability could not be installed: '
+                    '%s', common_utils.format_exception(error))
         yaml_content = serve_state.get_yaml_content(service_name, version)
         assert yaml_content is not None, (
             f'yaml content not found for {service_name} version {version}')
@@ -5158,6 +5199,10 @@ class SkyPilotReplicaManager(ReplicaManager):
         thread_utils.start_supervised_thread(
             self._system_recovery_route_prober,
             'replica-system-recovery-route-prober',
+            stop_event=self._manager_daemon_stop)
+        thread_utils.start_supervised_thread(
+            self._zero_cost_actuation_dispatcher,
+            'replica-zero-cost-actuation-dispatcher',
             stop_event=self._manager_daemon_stop)
 
     def _recover_replica_operations(self):
@@ -6035,6 +6080,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                    None) = None,
         try_provider_phase_admission: bool = False,
         require_preinitialized_physical_fence: bool = False,
+        zero_cost_actuation_lease: (zero_cost_actuation.IntentLease |
+                                    None) = None,
     ) -> _ReplicaLaunchResult | None:
         """Enqueue one replica launch.
 
@@ -6106,6 +6153,17 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'controller update requires supervised recovery.', replica_id)
             return None
         protocol_v2_fill = _is_protocol_v2_fill_override(resources_override)
+        if protocol_v2_fill:
+            mode = self._reserved_fill_actuation_mode
+            if (mode is None or
+                ((zero_cost_actuation_lease is None)
+                 != (mode
+                     is zero_cost_actuation.ActuationMode.DIRECT_REPLICA))):
+                self._log_fill_skip(
+                    'reserved-fill actuation mode and lease do not match')
+                return None
+        elif zero_cost_actuation_lease is not None:
+            raise ValueError('A zero-cost actuation lease requires a v2 fill.')
         if try_provider_phase_admission and (
                 not protocol_v2_fill or provider_phase_admission is not None):
             raise exceptions.ProviderPhaseMisuseError(
@@ -7283,6 +7341,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                    else
                                                    contextlib.nullcontext())
                             with logical_state_guard:
+                                actuation_mode = (
+                                    self._reserved_fill_actuation_mode)
+                                assert actuation_mode is not None
                                 pending_version = self._pending_version
                                 if (require_preinitialized_physical_fence and
                                         pending_version is not None and
@@ -7321,6 +7382,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                                             fill_physical_cluster_uid),
                                         expected_ordinary_zero_cost_admission_sequence
                                         =(fill_ordinary_admission_sequence),
+                                        expected_actuation_mode=(
+                                            actuation_mode.value),
+                                        actuation_lease=(
+                                            zero_cost_actuation_lease),
                                         **self._db_fence_kwargs()):
                                     self._release_unstarted_location_retry(
                                         location)
@@ -7914,6 +7979,8 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_phase_admission: (provider_phase.ProviderPhaseAdmission |
                                    None) = None,
         require_preinitialized_physical_fence: bool = False,
+        zero_cost_actuation_lease: (zero_cost_actuation.IntentLease |
+                                    None) = None,
     ) -> _ReplicaLaunchResult | None:
         """Allocate an id and enqueue one replica launch. Lock must be held.
 
@@ -7965,6 +8032,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'require_preinitialized_physical_fence'] = True
             elif _is_protocol_v2_fill_override(resources_override):
                 direct_launch_kwargs['try_provider_phase_admission'] = True
+            if zero_cost_actuation_lease is not None:
+                direct_launch_kwargs['zero_cost_actuation_lease'] = (
+                    zero_cost_actuation_lease)
             launch_result = self._launch_replica(self._next_replica_id,
                                                  resources_override,
                                                  **direct_launch_kwargs)
@@ -8004,6 +8074,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'require_preinitialized_physical_fence'] = True
             elif _is_protocol_v2_fill_override(resources_override):
                 launch_kwargs['try_provider_phase_admission'] = True
+            if zero_cost_actuation_lease is not None:
+                launch_kwargs['zero_cost_actuation_lease'] = (
+                    zero_cost_actuation_lease)
             launch_result = self._launch_replica(self._next_replica_id,
                                                  resources_override,
                                                  **launch_kwargs)
@@ -8127,15 +8200,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         self, plan: reserved_fill_planner.FillPlan
     ) -> tuple[int, list['ReplicaInfo'], set[int]]:
         """Read the current fleet once and return exact remaining capacity."""
-        spec = self._version_specs.get(self.latest_version)
-        if spec is None:
-            spec = serve_state.get_spec(self._service_name, self.latest_version)
-        if spec is None:
-            raise ValueError('the current service specification is missing')
-        maximum = (spec.max_replicas
-                   if spec.max_replicas is not None else spec.min_replicas)
-        if type(maximum) is not int or maximum < 0:
-            raise ValueError('the current service maximum is malformed')
+        maximum = self._reserved_fill_max_capacity_locked()
         infos = serve_state.get_replica_infos(self._service_name)
         used_replica_ids = {info.replica_id for info in infos}
         current_capacity = 0
@@ -8152,6 +8217,49 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'a nonterminal logical replica has malformed capacity')
             current_capacity += planned_capacity
         return max(0, maximum - current_capacity), infos, used_replica_ids
+
+    def _reserved_fill_max_capacity_locked(self) -> int:
+        """Return the exact current service ceiling in the plan's unit."""
+        spec = self._version_specs.get(self.latest_version)
+        if spec is None:
+            spec = serve_state.get_spec(self._service_name, self.latest_version)
+        if spec is None:
+            raise ValueError('the current service specification is missing')
+        maximum = (spec.max_replicas
+                   if spec.max_replicas is not None else spec.min_replicas)
+        if type(maximum) is not int or maximum < 0:
+            raise ValueError('the current service maximum is malformed')
+        return maximum
+
+    def pending_reserved_fill_debits(
+        self, allocation: reserved_fill_planner.AuthenticatedAllocationMap
+    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
+        """Return exact durable grants still awaiting replica rows."""
+        allocation.__post_init__()
+        mode = self._reserved_fill_actuation_mode
+        if mode is zero_cost_actuation.ActuationMode.DIRECT_REPLICA:
+            return ()
+        if mode is None:
+            raise zero_cost_actuation.ZeroCostActuationUnavailable(
+                'Reserved-fill actuation mode is unavailable.')
+        service_hash = self._service_hash
+        if not isinstance(service_hash, str) or not service_hash:
+            raise zero_cost_actuation.ZeroCostActuationConflict(
+                'Reserved-fill manager has no service incarnation.')
+        return self._zero_cost_actuation_repository.pending_debits(
+            service_name=self._service_name,
+            service_hash=service_hash,
+            allocation_generation=allocation.allocation_generation,
+            allocation_input_sha256=allocation.allocation_input_sha256,
+            allocation_claim_generation=(
+                allocation.allocation_claim_generation))
+
+    def install_durable_zero_cost_actuation(self) -> None:
+        """Publish a committed one-way promotion to manager workers."""
+        with self.lock:
+            self._reserved_fill_actuation_mode = (
+                zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+            self._zero_cost_actuation_event.set()
 
     @staticmethod
     def _reserved_fill_override(
@@ -8316,6 +8424,152 @@ class SkyPilotReplicaManager(ReplicaManager):
                 'the physical Kubernetes cluster identity preflight failed',
                 False)
 
+    def _zero_cost_actuation_authority_current(
+            self, intent: reserved_fill_planner.FillIntent) -> bool:
+        """Cheap in-process fence before a leased intent touches a provider."""
+        if (self._reserved_fill_actuation_mode
+                is not zero_cost_actuation.ActuationMode.DURABLE_INTENT or
+                self._update_recovery_required or
+                self._ownership_lost.is_set() or self._is_pool or
+                intent.service_version != self.latest_version or
+                intent.service_incarnation != self._service_hash or
+                self._resource_scope != self._service_hash or
+                self._controller_owner is None or
+                not self._enforce_launch_fence):
+            return False
+        try:
+            owner = serve_state.get_service_controller_owner(self._service_name)
+            if owner is None:
+                return False
+            owner_fingerprint = serve_utils.make_controller_owner_fingerprint(
+                owner.get('hash'), owner.get('controller_pid'),
+                owner.get('controller_ip'), owner.get('controller_port'))
+        except Exception:  # pylint: disable=broad-except
+            return False
+        return bool(
+            owner.get('hash') == self._service_hash and
+            (owner.get('controller_pid'), owner.get('controller_ip'))
+            == self._controller_owner and owner.get('status')
+            not in serve_state.ServiceStatus.replica_launch_blocking_statuses()
+            and owner_fingerprint == intent.controller_owner)
+
+    def _actuate_zero_cost_pool(self, pool_key: str) -> None:
+        """Execute at most one lease in a physical-pool concurrency lane."""
+        lease: zero_cost_actuation.IntentLease | None = None
+        preflights: _ReservedFillPhysicalPreflightBatch | None = None
+        try:
+            lease = self._zero_cost_actuation_repository.lease_next(
+                service_name=self._service_name,
+                pool_key=pool_key,
+                owner=self._zero_cost_actuation_executor_id,
+                lease_seconds=_ZERO_COST_ACTUATION_LEASE_SECONDS)
+            if lease is None:
+                return
+            intent = lease.intent
+            if not self._zero_cost_actuation_authority_current(intent):
+                self._zero_cost_actuation_repository.release_retryable(
+                    lease, 'controller_authority_unavailable')
+                return
+            with provider_phase.try_provider_phase(
+                    provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
+                preflights = self._start_reserved_fill_physical_preflights(
+                    (intent,), admission, self._workspace)
+                try:
+                    preflight = preflights.preflights[(
+                        intent.allowed_locations[0].region,
+                        intent.physical_cluster_uid)]
+                    if preflight.error is not None:
+                        raise preflight.error
+                    with self.lock:
+                        if not self._zero_cost_actuation_authority_current(
+                                intent):
+                            (self._zero_cost_actuation_repository.
+                             release_retryable(lease,
+                                               'controller_authority_changed'))
+                            return
+                        infos = serve_state.get_replica_infos(
+                            self._service_name)
+                        used_replica_ids = {info.replica_id for info in infos}
+                        result = self._scale_up_one_locked(
+                            self._reserved_fill_override(intent),
+                            used_replica_ids,
+                            infos,
+                            paid_launch_allowed=False,
+                            provider_phase_admission=admission,
+                            require_preinitialized_physical_fence=True,
+                            zero_cost_actuation_lease=lease)
+                        if result is None:
+                            (self._zero_cost_actuation_repository.
+                             release_retryable(lease,
+                                               'replica_commit_deferred'))
+                            return
+                finally:
+                    self._release_reserved_fill_physical_preflights(preflights)
+                    preflights = None
+            self._scale_reconciliation_event.set()
+        except (exceptions.ProviderPhaseBusyError,
+                exceptions.ProviderPhaseTimeoutError,
+                exceptions.KubernetesPhysicalClusterFenceBusyError,
+                TimeoutError) as error:
+            if lease is not None:
+                self._zero_cost_actuation_repository.release_retryable(
+                    lease,
+                    type(error).__name__)
+        except exceptions.KubernetesPhysicalClusterIdentityError as error:
+            if lease is not None:
+                self._zero_cost_actuation_repository.terminate(
+                    lease, 'physical_cluster_identity_changed')
+            logger.info('Terminalized zero-cost actuation for pool %s: %s',
+                        pool_key, common_utils.format_exception(error))
+        except Exception as error:  # pylint: disable=broad-except
+            if lease is not None:
+                try:
+                    self._zero_cost_actuation_repository.release_retryable(
+                        lease,
+                        type(error).__name__)
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        'Could not release zero-cost actuation '
+                        'lease for pool %s.', pool_key)
+            logger.exception('Zero-cost actuation failed for pool %s: %s',
+                             pool_key, common_utils.format_exception(error))
+        finally:
+            if preflights is not None:
+                self._release_reserved_fill_physical_preflights(preflights)
+
+    def _zero_cost_actuation_dispatcher(self) -> None:
+        """Supervise one independent executor lane per physical pool."""
+        while not self._manager_daemon_should_stop():
+            mode = zero_cost_actuation.get_service_mode(self._service_name)
+            self._reserved_fill_actuation_mode = mode
+            pool_keys: tuple[str, ...] = ()
+            if mode is zero_cost_actuation.ActuationMode.DURABLE_INTENT:
+                pool_keys = (
+                    self._zero_cost_actuation_repository.actionable_pool_keys(
+                        service_name=self._service_name))
+            with self._zero_cost_actuation_lane_lock:
+                self._zero_cost_actuation_lanes = {
+                    key: worker
+                    for key, worker in self._zero_cost_actuation_lanes.items()
+                    if worker.is_alive()
+                }
+                for pool_key in pool_keys:
+                    if pool_key in self._zero_cost_actuation_lanes:
+                        continue
+                    worker = thread_utils.SafeThread(
+                        target=self._actuate_zero_cost_pool,
+                        args=(pool_key,),
+                        name=
+                        ('replica-zero-cost-actuation-'
+                         f'{hashlib.sha256(pool_key.encode()).hexdigest()[:8]}'
+                        ),
+                        daemon=True)
+                    self._zero_cost_actuation_lanes[pool_key] = worker
+                    worker.start()
+            self._zero_cost_actuation_event.clear()
+            self._zero_cost_actuation_event.wait(
+                _ZERO_COST_ACTUATION_POLL_SECONDS)
+
     def accept_reserved_fill(
         self, plan: reserved_fill_planner.FillPlan
     ) -> reserved_fill_planner.FillCommitResult:
@@ -8337,6 +8591,60 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not plan.intents:
             return reserved_fill_planner.FillCommitResult(
                 accepted=(), deferred=(), authority_current=True)
+
+        actuation_mode = self._reserved_fill_actuation_mode
+        if actuation_mode is None:
+            return self._reserved_fill_commit_result(
+                plan, [],
+                self._reserved_fill_deferred_tail(
+                    plan, 0,
+                    reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                    'the durable reserved-fill actuation mode is unavailable'),
+                authority_current=False)
+        if actuation_mode is zero_cost_actuation.ActuationMode.DURABLE_INTENT:
+            # Publication owns no provider phase, physical-cluster call,
+            # replica ID, request, or worker thread.  PostgreSQL serializes
+            # the service ceiling and records every accepted grant first.
+            with self.lock:
+                authority_failure = (
+                    self._reserved_fill_manager_authority_failure(plan))
+                if authority_failure is not None:
+                    reason, detail = authority_failure
+                    return self._reserved_fill_commit_result(
+                        plan, [],
+                        self._reserved_fill_deferred_tail(
+                            plan, 0, reason, detail),
+                        authority_current=False)
+                try:
+                    maximum = self._reserved_fill_max_capacity_locked()
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Durable reserved-fill admission could not establish '
+                        'the service ceiling: %s',
+                        common_utils.format_exception(error))
+                    return self._reserved_fill_commit_result(
+                        plan, [],
+                        self._reserved_fill_deferred_tail(
+                            plan, 0, reserved_fill_planner.DeferredFillReason.
+                            SUPERSEDED_POLICY,
+                            'the service ceiling could not be established'),
+                        authority_current=False)
+            try:
+                receipt = self._zero_cost_actuation_repository.grant_plan(
+                    self._service_name, plan, max_capacity=maximum)
+                if receipt.accepted:
+                    self._zero_cost_actuation_event.set()
+                return receipt
+            except zero_cost_actuation.ZeroCostActuationError as error:
+                logger.warning('Durable reserved-fill grant failed closed: %s',
+                               common_utils.format_exception(error))
+                return self._reserved_fill_commit_result(
+                    plan, [],
+                    self._reserved_fill_deferred_tail(
+                        plan, 0,
+                        reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                        'durable actuation authority changed before grant'),
+                    authority_current=False)
 
         with self.lock:
             authority_failure = self._reserved_fill_manager_authority_failure(

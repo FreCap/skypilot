@@ -18,6 +18,7 @@ from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import spot_placer
+from sky.serve import zero_cost_actuation
 from sky.utils import common_utils
 
 _SERVICE_HASH = 'service-incarnation'
@@ -258,6 +259,137 @@ def test_accept_reserved_fill_returns_exact_rows_and_preflights_in_parallel(
         assert override['_reserved_fill_intent_idempotency_key'] == (
             intent.idempotency_key)
         assert '_zero_cost_admission_sequence' not in override
+
+
+def test_durable_accept_publishes_grants_without_provider_or_replica_io(
+) -> None:
+    manager = _manager(maximum=7)
+    manager._reserved_fill_actuation_mode = (  # pylint: disable=protected-access
+        zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
+    receipt = reserved_fill_planner.FillCommitResult(
+        accepted=(reserved_fill_planner.AcceptedFillIntent(
+            plan.intents[0].idempotency_key, None),),
+        deferred=(),
+        authority_current=True)
+    repository = mock.Mock()
+    repository.grant_plan.return_value = receipt
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+
+    with mock.patch.object(
+            replica_managers.serve_state,
+            'get_service_controller_owner',
+            return_value=_owner_record()), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase') as provider_admission, mock.patch.object(
+                    replica_managers.serve_state,
+                    'get_replica_infos') as replica_read:
+        actual = manager.accept_reserved_fill(plan)
+
+    assert actual == receipt
+    repository.grant_plan.assert_called_once_with('svc', plan, max_capacity=7)
+    provider_admission.assert_not_called()
+    replica_read.assert_not_called()
+
+
+def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:
+    manager = _manager()
+    manager.lock = threading.Lock()
+    manager._workspace = 'workspace-a'  # pylint: disable=protected-access
+    manager._zero_cost_actuation_executor_id = (  # pylint: disable=protected-access
+        mock.sentinel.executor_id)
+    manager._scale_reconciliation_event = threading.Event()  # pylint: disable=protected-access
+    east = _snapshot('east-context', 'uid-east', 1)
+    west = _snapshot('west-context', 'uid-west', 1)
+    plan = _plan((east, west))
+    leases = {
+        intent.pool_key: SimpleNamespace(intent=intent)
+        for intent in plan.intents
+    }
+    repository = mock.Mock()
+    repository.lease_next.side_effect = (
+        lambda **kwargs: leases[kwargs['pool_key']])
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+    blocked_entered = threading.Event()
+    release_blocked = threading.Event()
+    healthy_committed = threading.Event()
+
+    def start_preflight(intents, _admission, _workspace):
+        intent = intents[0]
+        context_name = intent.allowed_locations[0].region
+        if context_name == 'east-context':
+            blocked_entered.set()
+            assert release_blocked.wait(timeout=2)
+        return SimpleNamespace(
+            preflights={
+                (context_name, intent.physical_cluster_uid): SimpleNamespace(
+                    error=None)
+            })
+
+    def scale_one(resources_override, *_args, **_kwargs):
+        if resources_override[
+                replica_managers.serve_constants.
+                RESERVED_FILL_PHYSICAL_CLUSTER_UID_OVERRIDE_KEY] == 'uid-west':
+            healthy_committed.set()
+        return replica_managers._ReplicaLaunchResult(  # pylint: disable=protected-access
+            replica_id=91,
+            planned_capacity=1,
+            funding=replica_managers._ReplicaLaunchFunding.ZERO_COST)  # pylint: disable=protected-access
+
+    provider_admission = contextlib.contextmanager(lambda: iter(
+        (mock.sentinel.admission,)))
+    with mock.patch.object(
+            manager,
+            '_zero_cost_actuation_authority_current',
+            return_value=True), mock.patch.object(
+                replica_managers.provider_phase,
+                'try_provider_phase',
+                side_effect=lambda *_args, **_kwargs: provider_admission()), \
+            mock.patch.object(
+                manager,
+                '_start_reserved_fill_physical_preflights',
+                side_effect=start_preflight), mock.patch.object(
+                    manager,
+                    '_release_reserved_fill_physical_preflights'), mock.patch.object(
+                        replica_managers.serve_state,
+                        'get_replica_infos',
+                        return_value=[]), mock.patch.object(
+                       manager,
+                       '_scale_up_one_locked',
+                       side_effect=scale_one):
+        blocked = threading.Thread(target=manager._actuate_zero_cost_pool,
+                                   args=(east.pool_key,))
+        healthy = threading.Thread(target=manager._actuate_zero_cost_pool,
+                                   args=(west.pool_key,))
+        blocked.start()
+        assert blocked_entered.wait(timeout=1)
+        healthy.start()
+        assert healthy_committed.wait(timeout=1)
+        release_blocked.set()
+        blocked.join(timeout=2)
+        healthy.join(timeout=2)
+
+    assert not blocked.is_alive()
+    assert not healthy.is_alive()
+    assert repository.lease_next.call_count == 2
+    repository.release_retryable.assert_not_called()
+    repository.terminate.assert_not_called()
+
+
+def test_unknown_actuation_mode_fails_closed_before_provider_io() -> None:
+    manager = _manager()
+    manager._reserved_fill_actuation_mode = None  # pylint: disable=protected-access
+    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
+
+    with mock.patch.object(replica_managers.provider_phase,
+                           'try_provider_phase') as provider_admission:
+        receipt = manager.accept_reserved_fill(plan)
+
+    provider_admission.assert_not_called()
+    assert not receipt.accepted
+    assert receipt.authority_current is False
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.LOST_OWNER)
 
 
 def test_locked_fill_dispatch_requires_the_preinitialized_capture() -> None:

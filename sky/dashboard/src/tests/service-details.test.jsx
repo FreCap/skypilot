@@ -3722,6 +3722,17 @@ describe('ServiceDetailCard cost and request estimates', () => {
           rejectedRequests: 0,
           requestStatsAgeSeconds: 2,
           requestTelemetryState: 'fresh',
+          zeroCostActuationStatus: 'available',
+          zeroCostActuationMode: 'DURABLE_INTENT',
+          zeroCostActuationEpoch: 3,
+          pendingZeroCostActuationCount: 3,
+          zeroCostActuationStateCounts: {
+            GRANTED: 1,
+            ACTUATING: 1,
+            COMMITTED: 4,
+            RETRYABLE: 1,
+            TERMINAL: 2,
+          },
           costPerThousandRequests: null,
         }}
       />
@@ -3732,6 +3743,13 @@ describe('ServiceDetailCard cost and request estimates', () => {
     expect(
       screen.getByText(
         '0.00 req/s recent · 0 requests in 60s · 0 queued · 0 rejected · activity report 2s old'
+      )
+    ).toBeTruthy();
+    expect(screen.getByText('Reserved fill grants')).toBeTruthy();
+    expect(screen.getByText('3 pending before replica rows')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'durable intent · epoch 3 · 1 granted · 1 actuating · 1 retryable · 4 committed · 2 terminal'
       )
     ).toBeTruthy();
     expect(screen.queryByText(/telemetry stale/)).toBeNull();

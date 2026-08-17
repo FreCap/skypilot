@@ -191,6 +191,25 @@ services_table = sqlalchemy.Table(
     sqlalchemy.Column('demand_authority_controller_incarnation',
                       sqlalchemy.Uuid(as_uuid=True)),
     sqlalchemy.Column('demand_authority_protocol_version', sqlalchemy.Integer),
+    # Serve052 moves reserved-fill admission ahead of replica allocation.  The
+    # legacy default preserves direct row materialization until one exact
+    # controller incarnation is explicitly promoted to the durable executor.
+    sqlalchemy.Column('reserved_fill_actuation_mode',
+                      sqlalchemy.Text,
+                      nullable=False,
+                      server_default='DIRECT_REPLICA'),
+    sqlalchemy.Column('reserved_fill_actuation_epoch',
+                      sqlalchemy.BigInteger,
+                      nullable=False,
+                      server_default='0'),
+    sqlalchemy.Column('reserved_fill_actuation_capable',
+                      sqlalchemy.Boolean,
+                      nullable=False,
+                      server_default=sqlalchemy.false()),
+    sqlalchemy.Column('reserved_fill_actuation_controller_incarnation',
+                      sqlalchemy.Uuid(as_uuid=True)),
+    sqlalchemy.Column('reserved_fill_actuation_protocol_version',
+                      sqlalchemy.Integer),
     # A placement normalization updates persisted representation without
     # changing service semantics.  The requested run fences controller reload;
     # the remaining fields are the durable receipt written only after that
@@ -303,6 +322,25 @@ services_table = sqlalchemy.Table(
         "demand_source_mode <> 'DURABLE_FEED' OR "
         '(demand_source_epoch > 0 AND demand_authority_capable)',
         name='serve050_durable_demand_capability_ck'),
+    sqlalchemy.CheckConstraint(
+        "reserved_fill_actuation_mode IN ('DIRECT_REPLICA', "
+        "'DURABLE_INTENT')",
+        name='serve052_fill_actuation_mode_ck'),
+    sqlalchemy.CheckConstraint('reserved_fill_actuation_epoch >= 0',
+                               name='serve052_fill_actuation_epoch_ck'),
+    sqlalchemy.CheckConstraint(
+        '((NOT reserved_fill_actuation_capable AND '
+        'reserved_fill_actuation_controller_incarnation IS NULL AND '
+        'reserved_fill_actuation_protocol_version IS NULL) OR '
+        '(reserved_fill_actuation_capable AND '
+        'reserved_fill_actuation_controller_incarnation IS NOT NULL AND '
+        'reserved_fill_actuation_protocol_version = 1))',
+        name='serve052_fill_actuation_capability_shape_ck'),
+    sqlalchemy.CheckConstraint(
+        "reserved_fill_actuation_mode <> 'DURABLE_INTENT' OR "
+        '(reserved_fill_actuation_epoch > 0 AND '
+        'reserved_fill_actuation_capable)',
+        name='serve052_durable_fill_actuation_capability_ck'),
 )
 
 replicas_table = sqlalchemy.Table(

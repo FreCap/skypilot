@@ -398,8 +398,9 @@ SERVER_INSTANCES = sqlalchemy.Table(
         '(ordered_capacity_admission_capable AND '
         'ordered_capacity_admission_protocol_version IS NOT NULL AND '
         'ordered_capacity_admission_cohort_epoch IS NOT NULL AND '
-        'ordered_capacity_admission_protocol_version = 1 AND '
-        'ordered_capacity_admission_cohort_epoch = 1))',
+        'ordered_capacity_admission_protocol_version IN (1, 2) AND '
+        'ordered_capacity_admission_cohort_epoch = '
+        'ordered_capacity_admission_protocol_version))',
         name='ck_api_server_instances_ordered_capacity_complete'),
     sqlalchemy.CheckConstraint(
         '((NOT executor_termination_evidence_capable AND '

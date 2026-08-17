@@ -2117,7 +2117,7 @@ either case.
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Blocked on 2a and exact source-YAML/config review. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Planned as one additive dark direct-Helm release; busy-lane/no-row and crash matrices are merge gates. |
-| 3 | G2/P3 cleanup API015/Serve053 plus final non-pool cleanup API016/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
+| 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
 path through the generic non-pool handler, and
@@ -3176,7 +3176,7 @@ legacy activation.
 - [ ] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests.
-- [ ] Restack cleanup #1506 as API015/Serve053 and #1510 as API016/Serve054.
+- [ ] Restack cleanup #1506 as API016/Serve053 and #1510 as API017/Serve054.
   Merge them only after the complete capability, stale-writer, route, demand,
   and actuation horizon proves zero old-path use and zero unsettled unbound
   work.

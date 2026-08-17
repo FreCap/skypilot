@@ -2482,7 +2482,7 @@ def test_retention_pin_primary_key_kind_check_and_request_fk(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '014'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '015'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
@@ -2873,22 +2873,22 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api014_downgrade_guard_retains_head(request_database):
+def test_api015_downgrade_guard_retains_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
-    with pytest.raises(RuntimeError, match='API014 is forward-only'):
+    with pytest.raises(RuntimeError, match='API015 is forward-only'):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '014'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '015'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
     assert 'api_request_retention_pins' in inspector.get_table_names()
 
 
-def test_api014_downgrade_guard_retains_binding_evidence(request_database):
+def test_api015_downgrade_guard_retains_binding_evidence(request_database):
     engine, _ = request_database
     columns_before = {
         column['name']
@@ -2901,11 +2901,11 @@ def test_api014_downgrade_guard_retains_binding_evidence(request_database):
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
 
-    with pytest.raises(RuntimeError, match='API014 is forward-only'):
+    with pytest.raises(RuntimeError, match='API015 is forward-only'):
         alembic_command.downgrade(config, '008')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '014'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '015'
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
         'execution_quiesced_at', 'ordinary_launch_association_id',
@@ -2985,8 +2985,8 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['execution_quiescence_capable'] is True
     assert row['ordinary_launch_binding_capable'] is True
     assert row['ordered_capacity_admission_capable'] is True
-    assert row['ordered_capacity_admission_protocol_version'] == 1
-    assert row['ordered_capacity_admission_cohort_epoch'] == 1
+    assert row['ordered_capacity_admission_protocol_version'] == 2
+    assert row['ordered_capacity_admission_cohort_epoch'] == 2
     assert row['executor_termination_evidence_capable'] is True
     assert row['executor_termination_evidence_protocol_version'] == 2
     assert (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME
@@ -3245,16 +3245,16 @@ def test_binding_fleet_requires_every_recent_participant_and_local_handler(
     assert not request_postgres.ordinary_launch_binding_fleet_capable()
 
 
-def test_ordered_capacity_fleet_requires_exact_recent_api012_cohort(
+def test_ordered_capacity_fleet_requires_exact_recent_api015_cohort(
         request_database):
     engine, _ = request_database
 
-    def _insert_instance(connection, role, *, capable=True):
+    def _insert_instance(connection, role, *, capable=True, protocol=2):
         instance_id = uuid.uuid4()
         values = {
             'instance_id': instance_id,
             'role': role,
-            'version': 'api012',
+            'version': 'api015',
             'started_at': sqlalchemy.func.clock_timestamp(),
             'heartbeat_at': sqlalchemy.func.clock_timestamp(),
             'ready': True,
@@ -3264,8 +3264,8 @@ def test_ordered_capacity_fleet_requires_exact_recent_api012_cohort(
         }
         if capable:
             values.update(ordered_capacity_admission_capable=True,
-                          ordered_capacity_admission_protocol_version=1,
-                          ordered_capacity_admission_cohort_epoch=1)
+                          ordered_capacity_admission_protocol_version=protocol,
+                          ordered_capacity_admission_cohort_epoch=protocol)
         connection.execute(
             sqlalchemy.insert(
                 request_postgres.SERVER_INSTANCES).values(**values))
@@ -3277,7 +3277,7 @@ def test_ordered_capacity_fleet_requires_exact_recent_api012_cohort(
     assert request_postgres.ordered_capacity_admission_fleet_capable()
 
     with engine.begin() as connection:
-        legacy = _insert_instance(connection, 'controller', capable=False)
+        legacy = _insert_instance(connection, 'controller', protocol=1)
     assert not request_postgres.ordered_capacity_admission_fleet_capable()
 
     with engine.begin() as connection:
@@ -3297,7 +3297,7 @@ def test_ordered_capacity_fleet_requires_exact_recent_api012_cohort(
                 sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
                     instance_id=uuid.uuid4(),
                     role='controller',
-                    version='api012',
+                    version='api015',
                     started_at=sqlalchemy.func.clock_timestamp(),
                     heartbeat_at=sqlalchemy.func.clock_timestamp(),
                     ready=False,
