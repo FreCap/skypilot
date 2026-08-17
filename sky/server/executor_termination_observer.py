@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import os
 import threading
 import typing
 from typing import Any
@@ -18,16 +17,9 @@ if typing.TYPE_CHECKING:
 logger = sky_logging.init_logger(__name__)
 kubernetes = adaptors_common.LazyImport('sky.adaptors.kubernetes')
 
-OBSERVER_ENABLED_ENV_VAR = (
-    'SKYPILOT_API_EXECUTOR_TERMINATION_EVIDENCE_OBSERVER_ENABLED')
 _WATCH_TIMEOUT_SECONDS = 5
 _RECONNECT_SECONDS = 1
 _STOP_TIMEOUT_SECONDS = _WATCH_TIMEOUT_SECONDS + 10
-
-
-def enabled() -> bool:
-    """Whether the transition-only Kubernetes observer is enabled."""
-    return os.environ.get(OBSERVER_ENABLED_ENV_VAR, '').lower() == 'true'
 
 
 def _required_text(value: Any) -> str | None:
@@ -201,15 +193,9 @@ class ExecutorTerminationEvidenceObserver:
 
 def start(
     controller_owner: tuple[str, int],
-    pod_identity: ServerPodIdentity | None,
-) -> ExecutorTerminationEvidenceObserver | None:
-    """Start the transition observer only for an enabled exact controller."""
-    if not enabled():
-        return None
-    if pod_identity is None:
-        raise RuntimeError(
-            'Executor termination observer requires an exact server Pod '
-            'identity.')
+    pod_identity: ServerPodIdentity,
+) -> ExecutorTerminationEvidenceObserver:
+    """Start the exact dedicated-controller termination observer."""
     if controller_owner[0] != pod_identity.uid:
         raise RuntimeError(
             'Executor termination observer owner must be this Pod UID.')

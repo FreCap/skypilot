@@ -105,7 +105,11 @@ async def test_runtime_daemon_inventory_and_skip_evaluated_once(monkeypatch):
 
     try:
         selected = await runtime._register_runtime_daemons_async(
-            background, 4, _CONTROLLER_OWNER, pod_identity)
+            background,
+            4,
+            _CONTROLLER_OWNER,
+            pod_identity,
+            observe_executor_termination=True)
     finally:
         controller_capability.clear_process_local()
 
@@ -117,6 +121,36 @@ async def test_runtime_daemon_inventory_and_skip_evaluated_once(monkeypatch):
     daemon_factory = singleton.call_args.args[1]
     assert daemon_factory.args[-1] == _CONTROLLER_OWNER
     background.create_task.assert_called_once_with(singleton_task)
+
+
+@pytest.mark.asyncio
+async def test_compatibility_daemon_inventory_does_not_start_observer(
+        monkeypatch):
+    background = mock.Mock()
+    monkeypatch.setattr(runtime.daemons, 'RUNTIME_DAEMONS', ())
+    monkeypatch.setattr(runtime.clean_env_module, 'get_clean_server_env',
+                        lambda: {'PATH': '/bin'})
+    monkeypatch.setattr(runtime, '_executor_process_start_time_ticks',
+                        lambda pid: 123)
+    start_observer = mock.Mock()
+    monkeypatch.setattr(runtime.executor_termination_observer, 'start',
+                        start_observer)
+    pod_identity = request_postgres.ServerPodIdentity(name='compatibility-all',
+                                                      namespace='skypilot',
+                                                      uid=_CONTROLLER_OWNER[0],
+                                                      ip='10.0.0.1')
+    capability = controller_capability.generate()
+    controller_capability.install_process_local(capability)
+
+    try:
+        selected = await runtime._register_runtime_daemons_async(
+            background, 4, _CONTROLLER_OWNER, pod_identity)
+    finally:
+        controller_capability.clear_process_local()
+
+    assert selected == ()
+    start_observer.assert_not_called()
+    background.add_graceful_shutdown_hook.assert_not_called()
 
 
 @pytest.mark.asyncio

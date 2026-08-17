@@ -134,13 +134,12 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
-            name: SKYPILOT_GRACE_PERIOD_SECONDS
-            value: "30"
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
             name: SKYPILOT_EXECUTION_DRAIN_SECONDS
             value: "30"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SKYPILOT_GRACE_PERIOD_SECONDS
       - contains:
           path: spec.template.spec.containers[0].env
           content:

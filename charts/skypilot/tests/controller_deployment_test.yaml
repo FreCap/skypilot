@@ -110,11 +110,6 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].env
           content:
-            name: SKYPILOT_GRACE_PERIOD_SECONDS
-            value: "30"
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
             name: SKYPILOT_EXECUTION_DRAIN_SECONDS
             value: "30"
       - contains:
@@ -132,11 +127,10 @@ tests:
           content:
             name: SKYPILOT_CONTROLLER_CUTOVER_QUIESCENCE_SECONDS
             value: "85"
-      - contains:
+      - notContains:
           path: spec.template.spec.containers[0].env
           content:
-            name: SKYPILOT_API_EXECUTOR_TERMINATION_EVIDENCE_OBSERVER_ENABLED
-            value: "false"
+            name: SKYPILOT_GRACE_PERIOD_SECONDS
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -194,25 +188,6 @@ tests:
           content:
             name: metrics
             containerPort: 9090
-
-  - it: should enable termination evidence only for the explicit HA cohort
-    set:
-      apiService.highAvailability.enabled: true
-      apiService.highAvailability.executorTerminationEvidenceObserverEnabled: true
-      apiService.replicas: 2
-      apiService.upgradeStrategy: RollingUpdate
-      apiService.dbConnectionSecretName: external-db
-      requestStore.backend: postgres
-      requestStore.enforceBuiltinExecutionQuiescenceBackends: true
-      storage.enabled: true
-      storage.accessMode: ReadWriteMany
-      controllerService.replicas: 2
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: SKYPILOT_API_EXECUTOR_TERMINATION_EVIDENCE_OBSERVER_ENABLED
-            value: "true"
 
   - it: should expose controller multiprocess metrics from leaders and standbys
     set:
