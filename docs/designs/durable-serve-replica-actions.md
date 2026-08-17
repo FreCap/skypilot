@@ -25,12 +25,16 @@ its +10-minute gate at 03:49:03 UTC and +30-minute gate at 04:08:49 UTC. The
 released plugin `claim_scope` API remains as an inert `GENERAL`-only
 compatibility shim; its retired authority value is rejected and does not affect
 queue selection.
-The generalized non-pool binding is merged through PR #1498. The first G2
-authority cleanup in draft PR #1506 must be restacked as API015/Serve051, and
-the final generic non-pool cleanup in draft PR #1510 must be restacked
-immediately above it as API016/Serve052. API014 is now the forward-only
-executor-evidence clock-domain correction described under G1Se. The cleanup
-PRs' operational and adversarial-review merge gates remain open.
+The generalized non-pool binding is merged through PR #1498 and the complete
+G1S executor-termination precursor through PR #1528 is deployed as production
+revision 407 / release `1.1.1310` at API-request 014/Serve050. Live
+qualification disproved the first cleanup's route-freshness prerequisite and
+also confirmed row-before-pool-lane reserved-fill actuation. P2c Serve051 and
+P2d Serve052 in `skyserve-demand-capacity-convergence.md` must land first. The
+G2 authority cleanup in draft PR #1506 is then restacked as API015/Serve053,
+and final generic non-pool cleanup #1510 immediately above it as
+API016/Serve054. Both cleanup PRs remain draft and undeployed until their
+operational and adversarial-review gates pass.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
@@ -597,7 +601,7 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API015/Serve051 are the first blocked cleanup heads, and API016/Serve052 are
+- API015/Serve053 are the first blocked cleanup heads, and API016/Serve054 are
   the immediately stacked final non-pool cleanup heads. They remove protocol-
   v1/new-admission compatibility, API013 evidence participant-version 1, and
   transition columns/constraints only after G2's gates; they preserve immutable
@@ -1280,7 +1284,7 @@ continuity and exposed the independent clock-domain defect described below.
 G1Se merged as PR #1527 at
 `bf9e2907a39ef90a6e9f741be050da9b3fe662a5`; the exact `boltz-test`
 qualification below passed. G1S is complete. G2 remains blocked on its
-API015/Serve051 and API016/Serve052 restack plus the independent operational
+API015/Serve053 and API016/Serve054 restack plus the independent operational
 and adversarial-review gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
@@ -1607,7 +1611,7 @@ result. G1S is complete; this evidence does not by itself satisfy G2's
 separate cleanup, absence-projection, rollout-horizon, or review gates.
 
 V1 certificates are never cleanup authority, and a V2 certificate is not
-cleanup authority by itself. G2/API015 and Serve051 may consume V2 only as
+cleanup authority by itself. G2/API015 and Serve053 may consume V2 only as
 proof that the named executor was stopped by the database evidence-ingestion
 boundary. A request that crossed or may have crossed the effect boundary
 remains post-effect ambiguous. Any provider absence observation must begin
@@ -2789,8 +2793,9 @@ approved canary:
   (API012/Serve048--050).
 - [x] Merge G1Sa as PR #1519 and G1Sb executor-termination evidence on API013
   as PR #1522; author G1Sc as draft PR #1523 with its exact merge gate.
-- [ ] Restack blocked G2 PR #1506 onto API015/Serve051 after G1Se merges.
-- [ ] Restack PR #1510 immediately above #1506 onto API016/Serve052.
+- [ ] Land P2c Serve051 and P2d Serve052, then restack blocked G2 PR #1506
+  onto API015/Serve053.
+- [ ] Restack PR #1510 immediately above #1506 onto API016/Serve054.
 - [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
   may merge until that review and the operational gates are complete.
 - [ ] Prove each schema

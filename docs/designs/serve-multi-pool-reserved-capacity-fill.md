@@ -1,28 +1,37 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Status: Serve046 merged in source PR #1451. ReplicaInfo v18 and its one-shot
-normalizer then merged in PR #1483 at
-`df71f6cff011a74ddce2c23245629a6b83d306cf` (tree
-`e47880cf96d1df0611b8ae03be8148b8ed9f8e67`) and were published successfully
-as `v1.1.1277`. That published precursor is historical evidence only and is
-activation-ineligible: it predates the capacity, generated-Service annotation,
-and audit-target contracts in this design and the corresponding CI-isolation
-fix. Activation successor A is the single current source successor. It
-subsumes that v18-only precursor and adds all three pre-activation contracts.
-A read-only production census on 2026-08-15 disproved the prior assumption that
-all retained JSON rows were already v17: exact historical v3, v6, v7, v12,
-v13, and v14 rows remain. A narrowly bounded reader bridge for only their
-observed closed shapes shipped in PR #1492 as `v1.1.1284`. That bridge is a
-`LEGACY_ACTIVE` compatibility rollout only: it does not weaken v17/v18
-validation, run normalization, or authorize sequenced fill. Exact-only
-publisher B, the generalized non-pool binding transition (API011/Serve047),
-the API012/Serve048 demand/route convergence, and final Serve049 cleanup C
-remain pending. The prior review record is
-historical; the 2026-08-15 material correction resets the final generalized
-binding/A/B/C review count to zero. Reserved-fill activation has not occurred,
-and cleanup remains blocked on the documented live receipt gates.
+Status: the additive reserved-fill, exact worker-projection, generalized
+non-pool binding, demand, route, and executor-termination prerequisites are
+merged through PR #1528 and deployed directly with Helm as production revision
+407 / release `1.1.1310`. The migration heads are API-request 014 and Serve050.
+`boltz-l4-fleet` remains on legacy fill/binding/route/demand authority; no
+cleanup or final activation is approved.
 
-Last updated: 2026-08-16 (v1.1.1284 bridge and generalized binding plan)
+Production qualification on 2026-08-17 found two remaining fill-boundary
+failures. First, attempts 53925--53933 created speculative H200 replica/request
+rows before the physical-pool actuation lane was owned; they later converged to
+`FAILED_PROVISION`, but the row-first boundary remains wrong. P2d in
+`skyserve-demand-capacity-convergence.md` supersedes that boundary with a
+durable grant-before-row actuation intent and per-physical-pool executor.
+Second, every Pod was rejected from
+`rescluster-k8s-prod-east1-preemptible-inference` because the launch omitted its
+required Kueue queue label. The live PHX contract is LocalQueue `be`,
+ClusterQueue `skypilot-be`, `mt_hybrid` WorkloadPriorityClass `be-ls`, service
+account `skypilot-pool-sa`, and Pod PriorityClass
+`rescluster-k8s-prod-east1-preemptible-inference-low`. Revision 407's embedded
+fleet bundle still contains the retired `default`,
+`skyserve-inference-borrowed`, `skyserve-inference-low`, and
+`skypilot-inference-sa` identities. That bundle and the direct-Helm server
+configuration must be corrected in one release contract before a new service
+version can become fill-capable.
+
+All platform-pin and Terragrunt deployment sequences retained later in this
+file are historical review records, not current gates or deployment authority.
+The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
+directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
+updated.
+
+Last updated: 2026-08-17 (revision-407 live fill and Kueue correction)
 
 Canonical owner: this file
 
@@ -42,9 +51,11 @@ concurrent physical-pool observation
   -> one authenticated service-wide allocation map
   -> the ordinary autoscaler reconciliation coordinator
   -> pure typed fill plan
-  -> locked durable capacity admission plus atomic replica-row, typed launch
-     association, API request, queue, and retention-pin acceptance
-  -> exact accepted/deferred commit receipt carrying association/request IDs
+  -> locked durable zero-cost actuation-intent admission
+  -> one per-physical-pool executor owns its PostgreSQL lane and provider fence
+  -> atomic replica-row, typed launch association, API request, queue, and
+     retention-pin acceptance
+  -> exact committed/deferred receipt carrying intent/association/request IDs
   -> exact projection revalidation and deployment-policy authorization at the
      terminal provider boundary
   -> one-way Pod materialization boundary and fresh authority around every
@@ -53,19 +64,24 @@ concurrent physical-pool observation
      request handler
 ```
 
-The target correction removes the two root causes of the 2026-08-11 underfill:
+The target correction removes three root causes now proven in production:
 
 1. Physical-capacity reads no longer wait behind slow replica actuation while
    their conservative freshness timestamp expires.
-2. Planned fill capacity is no longer counted as spent unless the replica
-   manager returns a receipt for the exact rows that became durable.
+2. Planned fill capacity is counted only after an unexpired durable actuation
+   intent commits; replica/action rows are created only after the exact pool
+   lane and provider fence are owned.
+3. Worker admission configuration and the deployment-policy bundle are one
+   exact release contract, so a stale queue, workload priority, service
+   account, or cluster attestation fails before replica materialization.
 
-The terminal PostgreSQL insert is also an admission ledger, not a passive
-recording step. Under the service-owner and replica-row locks it re-parses the
-authenticated map, rejects an intent replay, recomputes the durable service
-ceiling, and spends one physical pool/card slot. A delayed or concurrent
+The actuation-intent insert is the capacity-admission ledger, not passive
+recording. Under service/allocation locks it re-parses the authenticated map,
+rejects idempotency replay, recomputes the durable service ceiling, and spends
+one physical pool/card slot for a bounded interval. A delayed or concurrent
 caller therefore cannot oversubscribe capacity that an in-memory planner once
-observed.
+observed. The later replica/association/request transaction transfers that
+debit from intent to durable replica without double counting.
 
 One PostgreSQL selector changes the whole writer fleet from the compatibility
 path to the sequenced path. The transition is one way. After activation, an
@@ -78,61 +94,46 @@ activation is repaired by deploying a successor image and authorizing one new
 gate generation through the same command and transaction used for first
 activation. The prior generation then fails closed.
 
-An earlier ordinary-FEV2-only rollout may replace A in place on the existing
-single-`all` Recreate topology solely to restore bounded historical reads and
-authenticated queue capacity while the gate remains `LEGACY_ACTIVE`. That
-rollout neither invokes normalization nor participates in reserved-fill
-activation. The reserved-fill cross-repository rollout then has one ordered
-fix-forward stack:
+The remaining rollout is one SkyPilot fix-forward stack deployed through the
+existing single-`all` Recreate Helm topology:
 
-1. Activation successor A is the final release produced by the old publisher.
-   It carries ReplicaInfo v18, the six-version/eight-shape reader bridge and
-   one-shot normalizer together with the authenticated queue-capacity, generic
-   generated-Service annotation, and audit-target contracts below. For the
-   reserved-fill sequence, platform PR 14 pins A's one immutable source,
-   image, chart, and module tuple, migrates the live one-pod `all` topology to
-   an exact 2/2/2 `api`/`controller`/`executor` cohort, physically deletes
-   `all`, and proves all six Ready writers run that tuple.
-2. Platform PR 17 invokes A's one-shot normalization against the unchanged PR
-   14 tuple and archives its receipt. It performs no image, chart, module,
-   values, topology, Pod, or Helm-revision change.
-3. Only after that receipt, independently releasable publisher B establishes
-   the sole exact source image/chart publication contract and physically
-   deletes superseded moving-tag, overlay, and parallel chart publication
-   paths. Its first run must fail closed without publishing because the
-   canonical role does not exist yet. Platform PR 18 then adopts and hardens
-   the Rainier runtime and Como chart registries and publisher roles in
-   separate account applies/readbacks; it creates no Helm revision.
-4. Only after both PR 18 readbacks and generalized binding G1 qualification,
-   final cleanup C drops the pickle column and
-   physically removes the temporary v17 runtime reader, normalizer, one-pod/
-   `all` source controls, and every other transition-only executable path. The
-   canonical roles publish C's immutable Serve049 image/chart tuple. Platform
-   PR 19 alone pins that tuple, upgrades the already-split release in place,
-   enables typed storage, and physically removes the remaining platform and
-   publisher transition paths.
+1. Merge and publish the exact policy-bundle correction together with tests
+   that bind the live PHX `be`/`skypilot-be`/`be-ls` and
+   `skypilot-pool-sa` contract. Render a complete direct Helm upgrade with the
+   matching `mt_hybrid` PHX context config, use `--reuse-values`, and prove the
+   API/LB image and ConfigMap are the reviewed tuple. No service authority is
+   promoted by this binary/config deployment.
+2. Commit a new immutable service version from the corrected effective config.
+   Its worker projection must be non-null and exact before election. Prove one
+   H200 Pod is Kueue-admitted with the expected queue, ClusterQueue, workload
+   priority, Pod priority, service account, scheduler, accelerator, and
+   physical cluster identity. Do not use paid compute for this gate.
+3. Merge/deploy P2d's grant-before-row actuation intent. Under a held PHX pool
+   lane, the broker may commit one bounded intent but must create zero replica
+   rows and zero API requests; another physical pool must continue. Pass every
+   pre/post-commit crash boundary and no-paid-spill accounting test.
+4. Only after the transition horizon, merge the already-authored cleanup stack
+   that removes speculative direct fill and legacy non-pool launch paths. The
+   offline migration is forward-only and is repaired by another
+   schema-compatible Helm fix-forward if it fails after commit.
 
-The last successfully published precursor is source/tag commit
-`df71f6cff011a74ddce2c23245629a6b83d306cf`, Git tag `v1.1.1277`, source tree
-`e47880cf96d1df0611b8ae03be8148b8ed9f8e67`, runtime image
-`255203429798.dkr.ecr.us-east-1.amazonaws.com/skypilot-nightly-boltz:1.1.1277@sha256:a84ec11d8838b5367c4669bd5c4792ef96b735a8503ba2f2de6bf054459e3470`,
-and chart
-`oci://699626303757.dkr.ecr.us-east-1.amazonaws.com/helm-charts/skypilot:1.1.1277@sha256:4efdeb85a46dbcfcea1269d9a75f15891a83161741381e12fcb8b70a74329561`.
-Its chart tree is `e8828c247` and module tree is `39e3108c65`. Publication
-succeeded, but this tuple is not a PR 14 candidate and must not be activated:
-it lacks A's three pre-activation contracts and did not include the CI-isolation
-fix. PR 14 must bind fresh live Helm values and an exact render to A's later
-immutable publication receipt. Revision-389 release 1.1.1273 at source commit
-`c24ae4fe08a03101180c8401a34a1b241444116b` is historical audit evidence only,
-never an operational checkpoint, split target, intermediate apply, or fallback.
+The current exact production artifact is merge
+`bf9e2907a39ef90a6e9f741be050da9b3fe662a5`, release `1.1.1310`, image digest
+`sha256:b25e0f61ecfc164b30044644f0d5140be320fe172dbed27b4ff754ed6fdf1bbf`,
+and chart package digest
+`sha256:a9f5579e46b496a3eea5ba9f74f0991cf8cd8289fa459c63ebc3db33ceda6165`.
+It is compatibility evidence, not an activation candidate, because its PHX
+policy bundle is stale and it still materializes replicas before pool-lane
+ownership. Releases 1.1.1273/1.1.1277 and the A/B/C/platform nomenclature below
+are retained only to explain already-merged transition contracts; they do not
+authorize rollback, pinning, or another deployment path.
 
-## Activation successor A pre-activation contracts
+## Retained pre-activation contracts
 
-A is one artifact, not a second v18 precursor. It inherits the already-merged
-v18 writer and normalizer and adds the contracts that PR 14 needs before it can
-both split and roll the fleet. These contracts are deliberately independent of
-reserved-fill activation: they can be rendered, started, and read back while
-the generation gate remains closed.
+The current release inherits the following pre-activation contracts from the
+historical A/B/C work. They remain useful while the generation gate is closed,
+but P2d and the exact policy/config correction above define the steady-state
+activation boundary.
 
 ### Authenticated request-queue capacity
 
@@ -1160,21 +1161,24 @@ second scheduling path exists. The exact shared object contract is:
 | Physical cluster UID | `14de98b4-cb7b-4f82-beb7-6f754a96f1dd` | `ba2dcdca-2a0d-447f-ad8a-31849a63c1d5` |
 | Namespace / service account | `rescluster-k8s-prod-east1-preemptible-inference` / `skypilot-pool-sa` | same |
 | Pod Identity | absent | absent |
-| LocalQueue (spoke-module-owned) | `default` | `default` |
-| ClusterQueue (Kueue-chart-owned) | `skyserve-inference-borrowed` | same |
-| WorkloadPriorityClass (Kueue-chart-owned) | `skyserve-inference-low` | same |
+| Kueue admission | absent; east remains ordinary Pod scheduling | LocalQueue `be` -> ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls` for the `mt_hybrid` serving workspace |
 | Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
 | Scheduler | `gpu-binpack-scheduler` | same |
 | GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
 | Exact worker accelerator scheduling | `A100`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`, `nvidia.com/gpu`; `A100-80GB`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu` | `H200`: `nvidia.com/gpu.product=NVIDIA-H200`, `nvidia.com/gpu` |
 
-The inference ClusterQueue has zero nominal GPU quota in the same cohort as
-the research queue. Its per-flavor borrowing limits are bounded by research's
-nominal GPU quota, and it has no preemption permission of its own. The research
-queue must retain `reclaimWithinCohort: Any`. The policy proves the exact
-LocalQueue target, both current Active ClusterQueues, cohort, namespace
-selectors, GPU flavor quotas, preemption policies, provider-owned
-ResourceFlavor instance selectors, WorkloadPriorityClass, Pod PriorityClass,
+The PHX best-effort ClusterQueue has zero nominal GPU quota in the same
+`shared-pool` cohort as the research queue. Its exact live preemption tuple is
+`borrowWithinCohort: Never`, `reclaimWithinCohort: LowerPriority`, and
+`withinClusterQueue: LowerPriority`; the research queue retains
+`reclaimWithinCohort: Any`. East has no Kueue admission pair and must not be
+forced through a nonexistent queue. Bundle schema v3 therefore carries one
+nullable `kueue_admission` object per context instead of mandatory parallel
+queue strings: null proves the unmanaged east contract, while PHX binds `be`,
+`skypilot-be`, and `be-ls` together. The policy proves the exact LocalQueue
+target and current Active ClusterQueues when the object is non-null, plus
+cohort, namespace selectors, GPU flavor quotas, preemption policies,
+provider-owned ResourceFlavor instance selectors, WorkloadPriorityClass, Pod PriorityClass,
 immutable custom scheduler deployment, current Kueue controller, Pod
 integration,
 `AssignQueueLabelsForPods: true`, and the Deny queue-name admission-policy
@@ -2001,12 +2005,13 @@ deployment-policy matrix pass, and all three restarted consecutive adversarial
 reviews passed without findings.
 
 The audit also proved that BCL reclaim is a deployment prerequisite rather
-than a Pod-priority property. A read-only production audit on 2026-08-13 found
-that both east and PHX lack the inference `default` LocalQueue,
-`skyserve-inference-borrowed` ClusterQueue, and
-`skyserve-inference-low` WorkloadPriorityClass. Both already have the exact
-Pod PriorityClass at value -1000 with `preemptionPolicy: Never`, and both
-research ClusterQueues are Active with `reclaimWithinCohort: Any`. East's
+than a Pod-priority property. A read-only audit on 2026-08-13 found that both
+east and PHX lacked the historical `default` /
+`skyserve-inference-borrowed` / `skyserve-inference-low` objects. PHX has since
+adopted the exact `be` -> `skypilot-be` contract and `be-ls`/`be-lt` workload
+priorities; east intentionally remains outside Kueue. Both retain the exact Pod
+PriorityClass at value -1000 with `preemptionPolicy: Never`, and
+`skypilot-pool-sa` is the exact worker service account. East's
 research GPU quotas are nominal 64/264 with borrowing limits 0/0; PHX is
 nominal 512 with borrowing limit 512. The inference service accounts have no
 IRSA annotation. East has one Pod Identity association,
@@ -2090,14 +2095,12 @@ either case.
 | 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045/046 reclaim-policy identity | Merged in source PR #1451. Its prior freeze/reviews are historical evidence, not a pass for the current stack. |
 | 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
 | 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Merged in PR #1492 and published as v1.1.1284; removable only after the v18 normalization receipt. Its rollout is `LEGACY_ACTIVE` only. |
-| 1d | Narrow ordinary-FEV2 rollout of v1.1.1284 on the existing single-`all` Recreate topology | Pending production deployment; permitted only for backward reads and authenticated queue capacity at `LEGACY_ACTIVE`. It performs no normalization, role split, publisher migration, or reserved-fill activation. |
-| 1e | Generalized binding G1: API011/Serve047, typed non-pool profiles, atomic reserved-fill association/request admission, per-row reconciliation, and provider-free routes | Planned and required before activation. Its blocked cleanup G2 is authored simultaneously. |
-| 2a | Activation successor A and platform PR 14: publish/pin A, migrate one-pod `all` directly to exact split 2/2/2 on A, and delete `all` | A is local and PR 14 is not applied; both are blocked on A review, CI, publication, and exact tuple binding. |
-| 2b | Platform PR 17: invoke normalization and accept its receipt on the unchanged PR 14 A tuple | Blocked until PR 14's exact split-A rollout/readback passes; PR 17 creates no rollout or Helm revision. |
-| 2c | Publisher B and platform PR 18: exact-only source publication, expected pre-adoption no-publish, then separate registry/role adoption and readbacks with no Helm revision | Not merged or applied. |
-| 2d | Deployment-owned Kueue bundle, unique entry-point policy, and generation-fenced authorization | Not activated; the live IAM/RBAC/Kueue attestation gates remain open. |
-| 2e | Demand/route convergence: API012/Serve048 durable demand feed, zero-cost-before-paid ordering, and provider-free route projection | Planned after G1 and before cleanup. |
-| 3 | Source cleanup C/G2 and platform PR 19: publish/pin Serve049, upgrade the already-split release, enable typed storage, and physically delete transition paths | C is being restacked and is unmerged/unpublished; PR 19 is blocked on C's immutable publication receipt and final absence gates. |
+| 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed as direct Helm revision 407 / release 1.1.1310; all service authority modes remain legacy. |
+| 2a | Policy-bundle schema v3 plus exact live PHX contract and PostgreSQL-backed server-config transaction | Required next; no platform pin. The old bundle and service config are proven stale. |
+| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Blocked on 2a and exact source-YAML/config review. |
+| 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | Planned as one additive dark direct-Helm release; #1506 remains its stacked removal. |
+| 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Planned as one additive dark direct-Helm release; busy-lane/no-row and crash matrices are merge gates. |
+| 3 | G2/P3 cleanup API015/Serve053 plus final non-pool cleanup API016/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
 path through the generic non-pool handler, and
@@ -2105,6 +2108,12 @@ status projects the same allocation/observation evidence used by
 reconciliation; neither is a second source of launch authority.
 
 ## Deployment, activation, and fix-forward reauthorization
+
+The current executable sequence is the four-step direct-Helm rollout in the
+Decision summary and phase table above. The A/B/C, split-topology, publisher,
+and platform-PR sequences retained in the subsections below are historical
+review evidence only. They must not be executed, used as merge gates, or
+treated as deployment authority after revision 407.
 
 ### Generalized binding prerequisite
 
@@ -3122,67 +3131,35 @@ legacy activation.
 
 ## Open gates
 
-- Author/review generalized binding G1 (API011/Serve047), demand convergence
-  (API012/Serve048), and blocked C/G2 (API013/Serve049) together. Link the
-  stack and record C/G2's exact merge
-  gates; do not reuse the migration numbers claimed by superseded drafts.
-- Converge and drain the exact API/request-backend/executor/GC/controller/
-  profile capability cohort. Prove the old handler cannot claim a generic
-  `RESERVED_FILL/v1` request.
-- Reconcile the seven mixed-version incident rows from real provider/result
-  evidence. Never fabricate quiescence, synthesize an association, or infer
-  absence from generation zero, missing process identity, or
-  `execution_quiescence_required = false`.
-- Before reserved activation, prove zero unbound active request and zero
-  unbound `PENDING`/`PROVISIONING` row; prove each accepted fill receipt names
-  the atomic replica/association/request identities.
-- Pass the typed provider present/absent/unknown/replaced, legacy-real-effect,
-  modern-pre-effect, lost-ACK, crash-boundary, poisoned-row progress,
-  provider-free route, bounded-lock, broker-conservation, and no-paid-spill
-  tests.
-
-- Complete A's independent security/contract review, exact validation, and CI;
-  merge and publish A through the old publisher, then bind that exact tuple to
-  platform PR 14. The published 1.1.1277 precursor is not eligible.
-- Apply platform PR 14 once to convert one-pod `all` directly to exact split
-  2/2/2 on A and delete `all`; archive its live Helm/render/lease proof, exact
-  cold queue-capacity response, all-role annotation projection, canonical
-  generated-Service ownership ledgers, and exact audit-target proof.
-- Apply PR 17 only as the one-shot normalization operation on PR 14's unchanged
-  A tuple; archive the normalization receipt and prove no Helm revision, Pod
-  rollout, values change, or second release occurred.
-- Merge B only after that receipt. Prove B's expected no-publish run, then
-  apply and read back PR 18's separate canonical registry/role adoptions; PR 18
-  must create no Helm revision.
-- Record the pre-activation writer/image/schema proof.
-- Deploy and attest the separately owned Kueue inference queue/preemption
-  contract for every reserved context; current east1 evidence does not pass.
-- Deploy the combined immutable image containing the code-owned
-  `ReservedFillReclaimPolicy` from the separately packaged
-  `boltz-skypilot-reserved-fill-reclaim-policy` wheel and its ongoing
-  claim-admission and launch fence. The policy
-  must consume and authorize the projected `scheduler_name` and nullable Pod
-  Identity role together with the existing namespace, service-account,
-  priority, Kueue, and accelerator fields. For the identity-free inference
-  partition it must positively prove that no Pod Identity association exists;
-  null is not permission to skip the check.
-  Converge the full split-role fleet on that one digest and repeat the
-  pre-activation proof; no generic assertion bypass or generic-only image path
-  exists.
-- Perform initial activation only after A and generalized-binding G1 are in the
-  exact capable cohort, then run non-compute manual verification through the
-  one generation-fenced command. Keep that compatible artifact live until every
-  cleanup-C runtime gate and removal horizon passes; later fixes use the same
-  command.
-- Only then complete C, merge it, and archive its canonical immutable
-  image/chart publication receipt. Amend PR 19 with that exact tuple, freeze
-  every final generalized-binding/A/B/C/platform head, then pass three
-  consecutive pragmatic adversarial rounds; the 2026-08-15 correction resets
-  the prior count to zero and any further material change resets it again.
-- Pass every final absence gate, then apply PR 19 to upgrade the already-split
-  release in place, delete all remaining transition paths, and reauthorize C
-  through the same generation-fenced command.
-
-Until those gates are recorded, this document must not describe A, B, C, or
-platform PR 14/17/18/19 as merged, published, deployed, activated, or proven by
-live capacity.
+- [x] Deploy and qualify the generalized binding, demand/route projections,
+  and G1S precursor as direct Helm revision 407 / release 1.1.1310 without
+  promoting service authority.
+- [x] Record exact terminal failure evidence for H200 attempts 53925--53933:
+  every request failed closed on the missing PHX Kueue label and no attempt
+  remains phantom capacity.
+- [ ] Implement bundle schema v3 with nullable per-context Kueue admission,
+  `skypilot-pool-sa`, unmanaged east, and the exact PHX
+  `be`/`skypilot-be`/`be-ls` contract. Re-run bundle, policy, live-snapshot,
+  digest, and negative-drift tests.
+- [ ] Snapshot/hash the PostgreSQL-backed API-server config and update it only
+  through the audited workspace-config transaction. Add the complete
+  server-owned `mt_hybrid` worker identity/projection inputs; do not patch the
+  database or create a platform runtime pin.
+- [ ] Remove task-owned Kubernetes Pod config, identity, priority, scratch, and
+  provisioning overrides from the canonical service YAML, set
+  `min_replicas: 0`, and commit a new immutable version with non-null exact
+  east/PHX worker projections before election.
+- [ ] Prove one zero-cost PHX H200 Pod is admitted through `be` ->
+  `skypilot-be` with `be-ls`, the -1000/`Never` Pod priority,
+  `skypilot-pool-sa`, `gpu-binpack-scheduler`, and exact H200/cluster identity.
+  Do not launch paid compute for this gate.
+- [ ] Implement P2d Serve052 grant-before-row actuation. Under a held physical
+  pool lane, require one bounded intent, zero replica/request rows, and sibling
+  pool progress; pass every crash and accounting-transfer boundary.
+- [ ] Pass typed provider present/absent/unknown/replaced,
+  legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
+  no-paid-spill, and full restart/adoption tests.
+- [ ] Restack cleanup #1506 as API015/Serve053 and #1510 as API016/Serve054.
+  Merge them only after the complete capability, stale-writer, route, demand,
+  and actuation horizon proves zero old-path use and zero unsettled unbound
+  work.
