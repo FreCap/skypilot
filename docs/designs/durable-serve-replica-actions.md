@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-16
+Last updated: 2026-08-17
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -25,6 +25,11 @@ its +10-minute gate at 03:49:03 UTC and +30-minute gate at 04:08:49 UTC. The
 released plugin `claim_scope` API remains as an inert `GENERAL`-only
 compatibility shim; its retired authority value is rejected and does not affect
 queue selection.
+The generalized non-pool binding is merged through PR #1498. The first G2
+authority cleanup is restacked as API014/Serve051 in draft PR #1506, and the
+final generic non-pool cleanup is restacked immediately above it as
+API015/Serve052 in draft PR #1510. Their operational and adversarial-review
+merge gates remain open.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
@@ -92,7 +97,18 @@ forward heads to API-request 012/Serve050 without promoting a service. The
 earlier audit incorrectly treated a checked-in platform runtime pin as the
 deployment authority. The production contract is a reviewed direct Helm
 fix-forward from merged SkyPilot artifacts; it requires no `boltz-platform`
-pin or Terragrunt apply. G1 adds
+pin or Terragrunt apply. Direct Helm revision 406 subsequently deployed PR
+#1521 as release `1.1.1305`, API version 86, image digest
+`sha256:b493c8a03d32f62307af9c4093ad94cbe20cf80fde4915f907548d8149954173`,
+and chart digest
+`sha256:170056bb3654f35ba52d6a42421d4feacf31233a9e028407ccb796a2fdfe7e62`.
+The migration hook succeeded, the API and both credential init containers
+converged on that exact image, all 14 warm-standby load-balancer Deployments
+became ready on the same digest, and the live demand read exposed a confirmed
+in-flight lower bound plus the unknown-occupancy backend count instead of
+hiding all processing activity. That telemetry correction is observability,
+not authority promotion; the service remained on legacy allocation authority.
+G1 adds
 the generalized non-pool association/admission path, exact legacy-evidence
 ledger, bounded current-protocol provider-evidence reconciler, pointerless
 pre-admission retirement, failure-isolated startup recovery, and exact
@@ -580,10 +596,12 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API014/Serve051 are the blocked cleanup heads. They remove protocol-v1/new-
-  admission compatibility and transition columns/constraints only after G2's
-  gates; they preserve immutable tombstones, typed profiles, current cohort,
-  route history needed by live clients, and permanent reserved authorization.
+- API014/Serve051 are the first blocked cleanup heads, and API015/Serve052 are
+  the immediately stacked final non-pool cleanup heads. They remove protocol-
+  v1/new-admission compatibility and transition columns/constraints only after
+  G2's gates; they preserve immutable tombstones, typed profiles, current
+  cohort, route history needed by live clients, and permanent reserved
+  authorization.
 
 An active correlated bound request without its queue row is invariant
 corruption, not an activation state. Startup locks and types the correlated
@@ -1194,13 +1212,14 @@ disposition is unknown.
 ### G2: blocked steady-state cleanup
 
 G2 is authored with G1 and the demand-convergence P2 change and remains
-draft/blocked until every gate below is recorded. Its migration-bearing cleanup
-must be restacked onto forward-only API-request revision 014 and Serve revision
-051. API012 and Serve048--050 are already published by demand, route, and
-ordered-admission convergence; API013 is reserved by G1Sb's executor-
-termination evidence. Any earlier cleanup draft using API013/Serve049 is stale
-and must not merge. Migration numbers are globally unique and already-published
-revisions are immutable.
+draft/blocked until every gate below is recorded. Its first migration-bearing
+cleanup must be restacked onto forward-only API-request revision 014 and Serve
+revision 051; its immediately stacked final non-pool cleanup must move to
+API-request revision 015 and Serve revision 052. API012 and Serve048--050 are
+already published by demand, route, and ordered-admission convergence; API013
+is reserved by G1Sb's executor-termination evidence. Any earlier cleanup draft
+using API013 is stale and must not merge. Migration numbers are globally unique
+and already-published revisions are immutable.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
 only handler/profile alias, cluster-name quiescence as active authority, global
@@ -1229,19 +1248,25 @@ infrastructure evidence. G1Sc is the simultaneously authored blocked cleanup;
 it removes the mixed-version sleep-only behavior and transition-only
 compatibility surface only after the exact rollout gates pass.
 
-As of 2026-08-16, G1Sa is implemented and locally verified on
-`feat/serve-executor-retirement-hardening`; it remains draft and is not
-merge-eligible until G1Sb and G1Sc are authored and linked. Its focused Python
-runtime, executor, shutdown-deadline, and wire-contract suites pass; all 160
-focused API/controller/executor Helm tests pass; the generated values schema is
-exact; and repository-wide mypy, changed-file pylint, dashboard lint/format,
-Python compilation, and `git diff --check` pass. G1Sa is draft PR #1519 with
-implementation commit `5781701e05492cb76211a2d962c3f4cbd3f031cf`. G1Sb is
-authored as draft PR #1522 with implementation commit
-`795c1e91ec49b74e169a1e13f06bc3b409a92b82`. G1Sc is authored simultaneously
-as draft PR #1523 with cleanup commit
-`2fe5b0e25dea9830c7ff92b75b8e1812589fa7ea`; its exact merge gate is recorded
-in that PR and below. G1Sc remains blocked until qualification.
+As of 2026-08-16, G1Sa is merged as PR #1519 at merge commit
+`8a9a0d5b6ecd21085e194c4cc46ad288bd719bec`. Its focused Python runtime,
+executor, shutdown-deadline, and wire-contract suites pass; all focused
+API/controller/executor Helm tests pass; the generated values schema is exact;
+and exact-head CI completed with format, mypy, pylint, dashboard, documentation,
+static-analysis, Helm, and every Python test shard green. G1Sb is authored as
+PR #1522, is restacked directly on `improvements`, and retains stable
+implementation commit
+`2c225667e12cb8a6ba4570756b152ab34d39dde9`: API013, the controller-
+generation-owned observer, immutable evidence writer, transition Helm surface,
+and focused real-PostgreSQL/observer/Helm tests pass locally. Its exact
+implementation head also passed every CI check; the sole first-attempt failure
+was an unchanged abrupt-parent-death process-group test that passed five
+consecutive local runs and the unmodified CI rerun. G1Sc is authored
+simultaneously as draft PR #1523 at
+`6010a240ef0c308f13a5566d33af9c0a1ca629a7`; its exact merge gate is recorded
+in that PR and below. It removes the observer flag, legacy grace-variable
+fallback, and sleep-only chart projection. G1Sc remains blocked until
+qualification.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1320,6 +1345,57 @@ the additive evidence schema remains unread-but-tolerated; it must not restore
 the sleep-only chart hook after the first service relies on early retirement.
 The stacked cleanup merges only after all old chart/runtime cohorts age beyond
 the stale-writer and quiescence horizons.
+
+#### G1Sb certificate contract
+
+API013 adds one append-only
+`api_request_executor_termination_evidence` relation. One row names the exact
+request ID, execution generation, claim token, worker-instance UUID, Kubernetes
+cluster UID, namespace, Pod name/UID, role container, Pod resource version,
+deletion timestamp, container termination outcome and finish timestamp,
+observer identity and controller generation, closed evidence source, canonical
+payload, and digest. The
+unique execution tuple is immutable and an exact replay is idempotent; a
+different payload for that tuple fails closed. PostgreSQL rejects every
+`UPDATE`, `DELETE`, and `TRUNCATE`; a later valid Pod resource version cannot
+replace the first certificate and does not interrupt observation of unrelated
+Pods. This relation is evidence only: its writer never changes request status,
+queue state, claim identity,
+`execution_quiescence_required`, `execution_quiesced_generation`, or an
+association resolution.
+
+Automatic source `KUBERNETES_POD_TERMINATED_V1` is deliberately narrower than
+Pod disappearance. A singleton controller observer must read the immutable
+`kube-system` Namespace UID for the current in-cluster API, then observe a Pod
+object whose UID equals the request's worker-instance and registered lease UID,
+whose namespace and name equal that lease, whose deletion timestamp is set,
+and whose role container is in a current `terminated` state with a finish time
+at or after deletion began. The observer records the Pod resource version and
+container exit details in the canonical payload. A `last_state.terminated`
+entry is never automatic authority: the same Pod UID can execute again after a
+liveness restart. `NotFound`, an expired lease, a replacement Pod, a missing
+process-map entry, a watch reconnect, or a Pod with a running/waiting target
+container records no certificate.
+
+The observer is dark behind one transition-only HA value in G1Sb. While dark,
+API013 readers and writers are deployed and mixed-version tolerant but no
+Kubernetes watch is admitted. Qualification enables it only for the exact test
+cohort, verifies its least-privilege release-namespace Pod get/list/watch RBAC,
+and injects both a planned deletion and a liveness restart. G1Sc removes the
+flag and mixed-version grace-variable fallback only after the complete cohort
+and crash-matrix gates pass. The existing reviewed Serve047 legacy attestation
+remains the only path for historical/incomplete infrastructure evidence; it is
+not converted into an API013 automatic certificate.
+
+API013 certificates are not cleanup authority by themselves. G2/API014 and
+Serve051 may consume one only as proof that the named executor can no longer
+create effects after `container_finished_at`. A request that crossed or may
+have crossed the effect boundary remains post-effect ambiguous. Any provider
+absence observation must begin after that timestamp, copy the exact certificate
+identity/digest into the locked association, and revalidate the request,
+certificate, provider physical UID, service owner, and replica under the
+canonical lock order before projection. Until that consumer exists, a
+certificate is diagnostic durable history and cannot unblock a successor.
 
 ### Historical R0 deployment record
 
@@ -2490,9 +2566,13 @@ approved canary:
 
 - [x] Author, review, and merge G1 (API011/Serve047) and demand convergence
   (API012/Serve048--050).
-- [ ] Author G1Sb executor-termination evidence on API013 and restack the
-  blocked G2 cleanup onto API014/Serve051; link the PRs and state G1Sc/G2's
-  exact merge gates.
+- [x] Merge G1Sa as PR #1519; author G1Sb executor-termination evidence on
+  API013 as draft PR #1522 and G1Sc as draft PR #1523 with its exact merge
+  gate.
+- [x] Restack blocked G2 PR #1506 onto API014/Serve051.
+- [x] Restack PR #1510 immediately above #1506 onto API015/Serve052.
+- [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
+  may merge until that review and the operational gates are complete.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
@@ -2529,11 +2609,11 @@ approved canary:
 - [ ] Run three new consecutive pragmatic adversarial reviews against the exact
   frozen G1/G2 and reserved-fill heads. The 2026-08-15 material correction
   resets prior ordinary-only and Serve047-cleanup review counts to zero.
-- [ ] Author G1S and its stacked sleep-only cleanup. Validate the three-part
+- [x] Author G1S and its stacked sleep-only cleanup. Validate the three-part
   Helm shutdown budget, exact drain-marker ownership transition, real receipt
   completion, and typed executor-termination evidence across the complete
-  rollout/crash matrix. Do not treat Pod absence or lease expiry as automatic
-  execution proof.
+  rollout/crash matrix before its cleanup becomes merge-eligible. Do not treat
+  Pod absence or lease expiry as automatic execution proof.
 - [ ] Deploy G1S dark and pass one planned retirement per API, executor, and
   controller role plus one injected hard-kill quarantine test before enabling
   its automatic infrastructure certificate issuer or merging its cleanup.

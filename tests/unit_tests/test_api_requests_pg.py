@@ -2482,14 +2482,15 @@ def test_retention_pin_primary_key_kind_check_and_request_fk(request_database):
 def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     engine, _ = request_database
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '012'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '013'
     inspector = sqlalchemy.inspect(engine)
     assert {
         'api_requests', 'api_request_queue', 'api_server_instances',
         'api_request_store_metadata', 'api_controller_leadership',
         'api_controller_action_reservations', 'resource_events',
         'resource_event_targets', 'api_resource_actions',
-        'api_resource_action_attempts', 'api_request_retention_pins'
+        'api_resource_action_attempts', 'api_request_retention_pins',
+        'api_request_executor_termination_evidence'
     }.issubset(inspector.get_table_names())
     request_columns = {
         column['name'] for column in inspector.get_columns('api_requests')
@@ -2523,7 +2524,9 @@ def test_schema_bootstrap_is_postgres_only_and_versioned(request_database):
     assert {
         'ordered_capacity_admission_capable',
         'ordered_capacity_admission_protocol_version',
-        'ordered_capacity_admission_cohort_epoch'
+        'ordered_capacity_admission_cohort_epoch', 'pod_namespace',
+        'executor_termination_evidence_capable',
+        'executor_termination_evidence_protocol_version'
     }.issubset(instance_columns)
     binding_index = {
         index['name']: index for index in inspector.get_indexes('api_requests')
@@ -2864,22 +2867,22 @@ def test_correlated_request_gc_waits_for_settled_attempt(
     assert all(not path.exists() for path in files)
 
 
-def test_api012_downgrade_guard_retains_head(request_database):
+def test_api013_downgrade_guard_retains_head(request_database):
     engine, _ = request_database
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
-    with pytest.raises(RuntimeError, match='API012 is forward-only'):
+    with pytest.raises(RuntimeError, match='API013 is forward-only'):
         alembic_command.downgrade(config, '005')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '012'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '013'
     inspector = sqlalchemy.inspect(engine)
     assert 'api_resource_actions' in inspector.get_table_names()
     assert 'api_resource_action_attempts' in inspector.get_table_names()
     assert 'api_request_retention_pins' in inspector.get_table_names()
 
 
-def test_api012_downgrade_guard_retains_binding_evidence(request_database):
+def test_api013_downgrade_guard_retains_binding_evidence(request_database):
     engine, _ = request_database
     columns_before = {
         column['name']
@@ -2892,11 +2895,11 @@ def test_api012_downgrade_guard_retains_binding_evidence(request_database):
     config = migration_utils.get_alembic_config(
         engine, migration_utils.API_REQUESTS_DB_NAME)
 
-    with pytest.raises(RuntimeError, match='API012 is forward-only'):
+    with pytest.raises(RuntimeError, match='API013 is forward-only'):
         alembic_command.downgrade(config, '008')
 
     assert migration_utils.get_current_alembic_revision(
-        engine, migration_utils.API_REQUESTS_DB_NAME) == '012'
+        engine, migration_utils.API_REQUESTS_DB_NAME) == '013'
     assert {
         'execution_quiescence_required', 'execution_quiesced_generation',
         'execution_quiesced_at', 'ordinary_launch_association_id',
@@ -2921,7 +2924,9 @@ def test_api012_downgrade_guard_retains_binding_evidence(request_database):
         'non_pool_launch_receipt_protocol_version',
         'ordered_capacity_admission_capable',
         'ordered_capacity_admission_protocol_version',
-        'ordered_capacity_admission_cohort_epoch'
+        'ordered_capacity_admission_cohort_epoch', 'pod_namespace',
+        'executor_termination_evidence_capable',
+        'executor_termination_evidence_protocol_version'
     } <= instance_columns_before
     assert instance_columns_before == {
         column['name'] for column in sqlalchemy.inspect(engine).get_columns(
@@ -2940,7 +2945,8 @@ def test_server_instance_lease_publishes_ready_and_draining(
                         str(drain_marker))
     monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR, instance_id)
     monkeypatch.setenv('HOSTNAME', 'executor-pod')
-    monkeypatch.setenv('SKYPILOT_POD_UID', 'pod-uid')
+    monkeypatch.setenv('SKYPILOT_POD_UID', instance_id)
+    monkeypatch.setenv('SKYPILOT_POD_NAMESPACE', 'skypilot')
     monkeypatch.setenv('POD_IP', '10.0.0.1')
     monkeypatch.setenv(request_postgres.REQUEST_BACKEND_ENV_VAR,
                        request_postgres.POSTGRES_REQUEST_BACKEND)
@@ -2960,7 +2966,8 @@ def test_server_instance_lease_publishes_ready_and_draining(
                     instance_id))).mappings().one()
     assert row['role'] == 'executor'
     assert row['pod_name'] == 'executor-pod'
-    assert row['pod_uid'] == 'pod-uid'
+    assert row['pod_uid'] == instance_id
+    assert row['pod_namespace'] == 'skypilot'
     assert row['ready']
     assert row['draining_at'] is None
     assert row['health_detail'] == {'phase': 'claiming'}
@@ -2974,6 +2981,8 @@ def test_server_instance_lease_publishes_ready_and_draining(
     assert row['ordered_capacity_admission_capable'] is True
     assert row['ordered_capacity_admission_protocol_version'] == 1
     assert row['ordered_capacity_admission_cohort_epoch'] == 1
+    assert row['executor_termination_evidence_capable'] is True
+    assert row['executor_termination_evidence_protocol_version'] == 1
     assert (ordinary_launch_request.BOUND_ORDINARY_LAUNCH_HANDLER_NAME
             in row['supported_handlers'])
     monkeypatch.setenv('HOSTNAME', 'request-overlaid-pod')
@@ -2986,7 +2995,8 @@ def test_server_instance_lease_publishes_ready_and_draining(
                 request_postgres.SERVER_INSTANCES.c.instance_id == uuid.UUID(
                     instance_id))).mappings().one()
     assert immutable_row['pod_name'] == 'executor-pod'
-    assert immutable_row['pod_uid'] == 'pod-uid'
+    assert immutable_row['pod_uid'] == instance_id
+    assert immutable_row['pod_namespace'] == 'skypilot'
     assert immutable_row['pod_ip'] == '10.0.0.1'
     drain_marker.touch()
     assert not lease.is_locally_ready()
@@ -3020,6 +3030,117 @@ def test_server_instance_lease_publishes_ready_and_draining(
                     instance_id))).mappings().one()
     assert not row['ready']
     assert row['draining_at'] is not None
+
+
+def test_executor_termination_evidence_is_exact_idempotent_and_diagnostic(
+        request_database, monkeypatch):
+    engine, _ = request_database
+    worker_id = str(uuid.uuid4())
+    observer_id = str(uuid.uuid4())
+    monkeypatch.setenv(request_postgres.SERVER_INSTANCE_ID_ENV_VAR, worker_id)
+    backend = request_postgres.PostgresRequestBackend()
+    request = _request('terminated-executor-request')
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.REQUESTS).values(
+                **request_postgres._request_values_for_db(request)))
+        connection.execute(
+            sqlalchemy.insert(request_postgres.QUEUE).values(
+                **request_postgres._queue_values(request)))
+    item = _claim(backend, request.request_id)
+    assert item.claim_token is not None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.insert(request_postgres.SERVER_INSTANCES).values(
+                instance_id=uuid.UUID(worker_id),
+                role='executor',
+                pod_name='executor-pod',
+                pod_uid=worker_id,
+                pod_namespace='skypilot',
+                pod_ip='10.0.0.1',
+                version='api013',
+                started_at=now,
+                heartbeat_at=now,
+                ready=False,
+                health_detail={'phase': 'draining'},
+                supported_handlers=[],
+                supported_payload_versions={},
+                request_storage_backend=(
+                    request_postgres.POSTGRES_REQUEST_STORAGE_BACKEND_TYPE),
+                request_queue_backend=(
+                    request_postgres.POSTGRES_REQUEST_QUEUE_BACKEND_TYPE),
+                execution_quiescence_capable=True,
+                executor_termination_evidence_capable=True,
+                executor_termination_evidence_protocol_version=1))
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id).values(execution_quiescence_required=True))
+
+    leader = _controller_leader(engine, monkeypatch, observer_id)
+    assert leader.generation is not None
+    observation = request_postgres.ExecutorTerminationObservation(
+        kubernetes_cluster_uid=str(uuid.uuid4()),
+        pod_namespace='skypilot',
+        pod_name='executor-pod',
+        pod_uid=worker_id,
+        container_name='skypilot-executor',
+        pod_resource_version='44',
+        pod_deletion_timestamp=now - datetime.timedelta(seconds=2),
+        container_finished_at=now - datetime.timedelta(seconds=1),
+        container_exit_code=0,
+        container_reason='Completed')
+    owner = (observer_id, leader.generation)
+    try:
+        first = request_postgres.record_executor_termination_evidence(
+            observation, observer_owner=owner)
+        assert len(first) == 1
+        assert request_postgres.record_executor_termination_evidence(
+            observation, observer_owner=owner) == first
+        changed = dataclasses.replace(observation, pod_resource_version='45')
+        with pytest.raises(
+                request_postgres.ExecutorTerminationEvidenceConflict):
+            request_postgres.record_executor_termination_evidence(
+                changed, observer_owner=owner)
+        with engine.connect() as connection:
+            evidence = connection.execute(
+                sqlalchemy.select(request_postgres.EXECUTOR_TERMINATION_EVIDENCE
+                                 )).mappings().one()
+            stored_request = connection.execute(
+                sqlalchemy.select(request_postgres.REQUESTS).where(
+                    request_postgres.REQUESTS.c.request_id ==
+                    request.request_id)).mappings().one()
+        assert str(evidence['evidence_id']) == first[0]
+        assert evidence['request_id'] == request.request_id
+        assert evidence['execution_generation'] == item.execution_generation
+        assert str(evidence['claim_token']) == item.claim_token
+        assert str(evidence['worker_instance_id']) == worker_id
+        assert evidence['source'] == 'KUBERNETES_POD_TERMINATED_V1'
+        assert evidence['observer_controller_generation'] == leader.generation
+        assert evidence['evidence_digest'] == (
+            request_postgres._canonical_evidence_sha256(
+                evidence['evidence_payload']))
+        assert stored_request['execution_quiesced_at'] is None
+        assert stored_request['execution_quiesced_generation'] is None
+        with pytest.raises(sqlalchemy.exc.DBAPIError, match='append-only'):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.update(
+                        request_postgres.EXECUTOR_TERMINATION_EVIDENCE).values(
+                            container_reason='Changed'))
+        with pytest.raises(sqlalchemy.exc.DBAPIError, match='append-only'):
+            with engine.begin() as connection:
+                connection.execute(
+                    sqlalchemy.delete(
+                        request_postgres.EXECUTOR_TERMINATION_EVIDENCE))
+    finally:
+        leader.release()
+
+    with pytest.raises(request_postgres.ExecutorTerminationEvidenceRejected,
+                       match='no longer owns'):
+        request_postgres.record_executor_termination_evidence(
+            observation, observer_owner=owner)
 
 
 def test_binding_fleet_requires_every_recent_participant_and_local_handler(

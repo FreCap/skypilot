@@ -38,6 +38,7 @@ from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import daemons
 from sky.server import database_migrations
+from sky.server import executor_termination_observer
 from sky.server import file_mount_uploads
 from sky.server import metrics
 from sky.server import plugins
@@ -722,7 +723,9 @@ async def _supervise_runtime_daemon(daemon_id: str, clean_env: dict[str, str],
 
 async def _register_runtime_daemons_async(
         background: _BackgroundLoop, max_db_connections: int,
-        controller_owner: tuple[str, int]) -> tuple[str, ...]:
+        controller_owner: tuple[str, int],
+        pod_identity: request_postgres.ServerPodIdentity | None
+) -> tuple[str, ...]:
     """Select and register runtime daemons once for this leadership term."""
     clean_env = clean_env_module.get_clean_server_env()
     if clean_env is None:
@@ -735,6 +738,14 @@ async def _register_runtime_daemons_async(
         raise RuntimeError(
             'Runtime daemon startup requires controller capability authority.')
     selected: list[str] = []
+    termination_observer = executor_termination_observer.start(
+        controller_owner, pod_identity)
+    if termination_observer is not None:
+
+        async def stop_termination_observer() -> None:
+            await asyncio.to_thread(termination_observer.stop)
+
+        background.add_graceful_shutdown_hook(stop_termination_observer)
     for daemon in daemons.RUNTIME_DAEMONS:
         if daemon.should_skip():
             continue
@@ -1295,7 +1306,8 @@ def _run_controller_role(state: RuntimeState, args: argparse.Namespace) -> None:
         background.run(
             _register_runtime_daemons_async(
                 background, state.config.num_db_connections_per_worker,
-                (lease.instance_id, generation)))
+                (lease.instance_id, generation),
+                state.instance_lease.pod_identity))
 
         _start_surface_interrupted_cluster_launches()
 
@@ -1559,7 +1571,9 @@ def run_role(state: RuntimeState, args: argparse.Namespace) -> None:
                         _register_runtime_daemons_async(
                             background,
                             state.config.num_db_connections_per_worker,
-                            compatibility_controller_owner))
+                            compatibility_controller_owner,
+                            None if state.instance_lease is None else
+                            state.instance_lease.pod_identity))
                 background.run(_initialize_normal_executor_requests())
 
             if state.role == 'executor':

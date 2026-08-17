@@ -96,6 +96,9 @@ _CONTROLLER_LEADERSHIP_KEY = 'api-controller'
 _CONTROLLER_LEADER_LOCK_ID = 'skypilot:api-controller-leader:v1'
 _CONTROLLER_GENERATION_LOCK_PREFIX = ('skypilot:api-controller-generation:v1:')
 _LEGACY_DAEMON_TRANSITION_LOCK_ID = ('skypilot:runtime-daemon-transition:v1')
+_EXECUTOR_TERMINATION_EVIDENCE_NAMESPACE = uuid.UUID(
+    '78ac727a-35da-50ff-b667-e5509dba7091')
+EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION = 1
 _ORDINARY_LAUNCH_SUBMISSION_NAMESPACE = uuid.UUID(
     '58a82cb0-534c-5a5d-bb5d-681759e60469')
 _BOUND_CANCEL_QUIESCENCE_WAIT_SECONDS = 5.0
@@ -313,6 +316,22 @@ class ServerPodIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class ExecutorTerminationObservation:
+    """One validated current-container termination observed from Kubernetes."""
+
+    kubernetes_cluster_uid: str
+    pod_namespace: str
+    pod_name: str
+    pod_uid: str
+    container_name: str
+    pod_resource_version: str
+    pod_deletion_timestamp: datetime.datetime
+    container_finished_at: datetime.datetime
+    container_exit_code: int
+    container_reason: str | None
+
+
+@dataclasses.dataclass(frozen=True)
 class BoundOrdinaryLaunchProjectionInput:
     """Typed terminal result supplied to an atomic ReplicaInfo projector."""
 
@@ -442,6 +461,7 @@ RESOURCE_ACTION_ATTEMPTS = postgres_schema.RESOURCE_ACTION_ATTEMPTS
 QUEUE = postgres_schema.QUEUE
 STORE_METADATA = postgres_schema.STORE_METADATA
 SERVER_INSTANCES = postgres_schema.SERVER_INSTANCES
+EXECUTOR_TERMINATION_EVIDENCE = (postgres_schema.EXECUTOR_TERMINATION_EVIDENCE)
 CONTROLLER_LEADERSHIP = postgres_schema.CONTROLLER_LEADERSHIP
 CONTROLLER_ACTION_RESERVATIONS = (
     postgres_schema.CONTROLLER_ACTION_RESERVATIONS)
@@ -590,6 +610,23 @@ def _ordered_capacity_admission_process_capable(role: str,
             role in ('all', 'api', 'executor', 'controller'))
 
 
+def _executor_termination_evidence_process_capable(
+    role: str,
+    backend_capable: bool,
+    pod_identity: ServerPodIdentity,
+    instance_id: str,
+) -> bool:
+    """Whether this executor identity can be certified by Pod UID."""
+    if not backend_capable or role not in ('all', 'executor', 'controller'):
+        return False
+    if not all((pod_identity.name, pod_identity.namespace, pod_identity.uid)):
+        return False
+    try:
+        return str(uuid.UUID(pod_identity.uid)) == instance_id
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def execution_quiescence_backend_guard_enabled() -> bool:
     return os.environ.get(EXECUTION_QUIESCENCE_BACKEND_GUARD_ENV_VAR) == 'true'
 
@@ -654,6 +691,10 @@ class ServerInstanceLease:
             self.role, quiescence_capable)
         ordered_capacity_capable = (_ordered_capacity_admission_process_capable(
             self.role, quiescence_capable))
+        termination_evidence_capable = (
+            _executor_termination_evidence_process_capable(
+                self.role, quiescence_capable, self._pod_identity,
+                self.instance_id))
         with self._state_lock:
             ready = self._ready
             draining = self._draining
@@ -667,6 +708,7 @@ class ServerInstanceLease:
             'role': self.role,
             'pod_name': self._pod_identity.name or None,
             'pod_uid': self._pod_identity.uid or None,
+            'pod_namespace': self._pod_identity.namespace or None,
             'pod_ip': self._pod_identity.ip,
             'version': sky.__version__,
             'heartbeat_at': now,
@@ -700,6 +742,10 @@ class ServerInstanceLease:
                 (1 if ordered_capacity_capable else None),
             'ordered_capacity_admission_cohort_epoch':
                 (1 if ordered_capacity_capable else None),
+            'executor_termination_evidence_capable': termination_evidence_capable,
+            'executor_termination_evidence_protocol_version':
+                (EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION
+                 if termination_evidence_capable else None),
         }
         if include_started_at:
             values['started_at'] = now
@@ -1680,6 +1726,208 @@ def controller_leadership_is_current(instance_id: str, generation: int) -> bool:
         return connection.execute(
             _current_controller_leadership_statement(
                 instance_id, generation)).scalar_one_or_none() is not None
+
+
+class ExecutorTerminationEvidenceRejected(RuntimeError):
+    """The observation cannot prove termination of an exact executor claim."""
+
+
+class ExecutorTerminationEvidenceConflict(RuntimeError):
+    """An execution tuple already has different immutable evidence."""
+
+
+def _canonical_termination_timestamp(value: datetime.datetime,
+                                     field: str) -> str:
+    if not isinstance(value, datetime.datetime) or value.tzinfo is None:
+        raise ExecutorTerminationEvidenceRejected(
+            f'{field} must be a timezone-aware datetime.')
+    return value.astimezone(datetime.timezone.utc).isoformat()
+
+
+def record_executor_termination_evidence(
+    observation: ExecutorTerminationObservation,
+    *,
+    observer_owner: tuple[str, int],
+) -> tuple[str, ...]:
+    """Append evidence for claims owned by one exactly terminated Pod.
+
+    The transaction holds a shared lock on the live controller generation and
+    never rewrites request, queue, or quiescence state.  A repeated Kubernetes
+    event is idempotent only when its canonical evidence is byte-equivalent.
+    """
+    if not isinstance(observation, ExecutorTerminationObservation):
+        raise TypeError('observation must be ExecutorTerminationObservation.')
+    try:
+        observer_instance_id = uuid.UUID(observer_owner[0])
+        observer_generation = int(observer_owner[1])
+        worker_instance_id = uuid.UUID(observation.pod_uid)
+    except (AttributeError, TypeError, ValueError) as e:
+        raise ExecutorTerminationEvidenceRejected(
+            'Observer and Pod identities must be UUIDs.') from e
+    if (str(observer_instance_id) != observer_owner[0] or
+            isinstance(observer_owner[1], bool) or observer_generation <= 0 or
+            str(worker_instance_id) != observation.pod_uid):
+        raise ExecutorTerminationEvidenceRejected(
+            'Observer generation and UUID identities must be canonical.')
+    required_text = {
+        'kubernetes_cluster_uid': observation.kubernetes_cluster_uid,
+        'pod_namespace': observation.pod_namespace,
+        'pod_name': observation.pod_name,
+        'container_name': observation.container_name,
+        'pod_resource_version': observation.pod_resource_version,
+    }
+    if any(not isinstance(value, str) or not value.strip() or
+           value != value.strip() for value in required_text.values()):
+        raise ExecutorTerminationEvidenceRejected(
+            'Kubernetes termination identity fields must be canonical and '
+            'nonempty.')
+    if (observation.container_reason is not None and
+        (not isinstance(observation.container_reason, str) or
+         not observation.container_reason.strip() or
+         observation.container_reason != observation.container_reason.strip())):
+        raise ExecutorTerminationEvidenceRejected(
+            'Container reason must be canonical nonempty text when present.')
+    if (isinstance(observation.container_exit_code, bool) or
+            not isinstance(observation.container_exit_code, int) or
+            observation.container_exit_code < 0):
+        raise ExecutorTerminationEvidenceRejected(
+            'Container exit code must be a non-negative integer.')
+    deletion_timestamp = _canonical_termination_timestamp(
+        observation.pod_deletion_timestamp, 'pod_deletion_timestamp')
+    finished_at = _canonical_termination_timestamp(
+        observation.container_finished_at, 'container_finished_at')
+    if observation.container_finished_at < observation.pod_deletion_timestamp:
+        raise ExecutorTerminationEvidenceRejected(
+            'Container termination must finish after Pod deletion begins.')
+
+    expected_containers = {
+        'all': 'skypilot-api',
+        'executor': 'skypilot-executor',
+        'controller': 'skypilot-controller',
+    }
+    engine = initialize_and_get_db()
+    recorded: list[str] = []
+    with engine.begin() as connection:
+        if not _lock_current_controller_leadership(
+                connection, str(observer_instance_id), observer_generation):
+            raise ExecutorTerminationEvidenceRejected(
+                'Observer no longer owns the exact controller generation.')
+        worker = connection.execute(
+            sqlalchemy.select(SERVER_INSTANCES).where(
+                SERVER_INSTANCES.c.instance_id == worker_instance_id).
+            with_for_update(read=True)).mappings().one_or_none()
+        if worker is None:
+            raise ExecutorTerminationEvidenceRejected(
+                'Terminated Pod has no exact registered server instance.')
+        worker_role = str(worker['role'])
+        if (worker['pod_uid'] != observation.pod_uid or
+                worker['pod_name'] != observation.pod_name or
+                worker['pod_namespace'] != observation.pod_namespace or
+                expected_containers.get(worker_role)
+                != observation.container_name or
+                worker['executor_termination_evidence_capable'] is not True or
+                worker['executor_termination_evidence_protocol_version']
+                != EXECUTOR_TERMINATION_EVIDENCE_PROTOCOL_VERSION):
+            raise ExecutorTerminationEvidenceRejected(
+                'Terminated Pod does not match a capable registered executor.')
+        db_observed_at = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        if db_observed_at < observation.container_finished_at:
+            raise ExecutorTerminationEvidenceRejected(
+                'Database time precedes the observed container finish time.')
+        requests = connection.execute(
+            sqlalchemy.select(
+                REQUESTS.c.request_id, REQUESTS.c.execution_generation,
+                REQUESTS.c.claim_token, REQUESTS.c.worker_instance_id).where(
+                    REQUESTS.c.worker_instance_id == worker_instance_id,
+                    REQUESTS.c.execution_generation > 0,
+                    REQUESTS.c.claim_token.is_not(None),
+                    REQUESTS.c.execution_quiescence_required).with_for_update(
+                        read=True)).mappings().all()
+        for request in requests:
+            claim_token = request['claim_token']
+            if not isinstance(claim_token, uuid.UUID):
+                raise ExecutorTerminationEvidenceRejected(
+                    'Claim token must be an exact UUID.')
+            execution_generation = int(request['execution_generation'])
+            request_id = str(request['request_id'])
+            evidence_id = uuid.uuid5(
+                _EXECUTOR_TERMINATION_EVIDENCE_NAMESPACE, ':'.join(
+                    (request_id, str(execution_generation), str(claim_token),
+                     str(worker_instance_id))))
+            payload = {
+                'container_exit_code': observation.container_exit_code,
+                'container_finished_at': finished_at,
+                'container_name': observation.container_name,
+                'container_reason': observation.container_reason,
+                'execution_generation': execution_generation,
+                'kubernetes_cluster_uid': observation.kubernetes_cluster_uid,
+                'observer_controller_generation': observer_generation,
+                'observer_instance_id': str(observer_instance_id),
+                'pod_deletion_timestamp': deletion_timestamp,
+                'pod_name': observation.pod_name,
+                'pod_namespace': observation.pod_namespace,
+                'pod_resource_version': observation.pod_resource_version,
+                'pod_uid': observation.pod_uid,
+                'request_id': request_id,
+                'source': 'KUBERNETES_POD_TERMINATED_V1',
+                'worker_instance_id': str(worker_instance_id),
+                'worker_role': worker_role,
+                'claim_token': str(claim_token),
+            }
+            digest = _canonical_evidence_sha256(payload)
+            values = {
+                'evidence_id': evidence_id,
+                'request_id': request_id,
+                'execution_generation': execution_generation,
+                'claim_token': claim_token,
+                'worker_instance_id': worker_instance_id,
+                'worker_role': worker_role,
+                'kubernetes_cluster_uid': observation.kubernetes_cluster_uid,
+                'pod_namespace': observation.pod_namespace,
+                'pod_name': observation.pod_name,
+                'pod_uid': observation.pod_uid,
+                'container_name': observation.container_name,
+                'pod_resource_version': observation.pod_resource_version,
+                'pod_deletion_timestamp': observation.pod_deletion_timestamp,
+                'container_finished_at': observation.container_finished_at,
+                'container_exit_code': observation.container_exit_code,
+                'container_reason': observation.container_reason,
+                'source': 'KUBERNETES_POD_TERMINATED_V1',
+                'evidence_payload': payload,
+                'evidence_digest': digest,
+                'observer_instance_id': observer_instance_id,
+                'observer_controller_generation': observer_generation,
+                'observed_at': db_observed_at,
+            }
+            inserted = connection.execute(
+                postgresql.insert(EXECUTOR_TERMINATION_EVIDENCE).values(
+                    **values).on_conflict_do_nothing(index_elements=[
+                        EXECUTOR_TERMINATION_EVIDENCE.c.request_id,
+                        EXECUTOR_TERMINATION_EVIDENCE.c.execution_generation,
+                        EXECUTOR_TERMINATION_EVIDENCE.c.claim_token,
+                        EXECUTOR_TERMINATION_EVIDENCE.c.worker_instance_id,
+                    ]).returning(EXECUTOR_TERMINATION_EVIDENCE.c.evidence_id)
+            ).scalar_one_or_none()
+            if inserted is None:
+                existing = connection.execute(
+                    sqlalchemy.select(EXECUTOR_TERMINATION_EVIDENCE).where(
+                        EXECUTOR_TERMINATION_EVIDENCE.c.request_id ==
+                        request_id,
+                        EXECUTOR_TERMINATION_EVIDENCE.c.execution_generation ==
+                        execution_generation,
+                        EXECUTOR_TERMINATION_EVIDENCE.c.claim_token ==
+                        claim_token,
+                        EXECUTOR_TERMINATION_EVIDENCE.c.worker_instance_id ==
+                        worker_instance_id)).mappings().one()
+                if (existing['evidence_id'] != evidence_id or
+                        existing['evidence_digest'] != digest or
+                        existing['evidence_payload'] != payload):
+                    raise ExecutorTerminationEvidenceConflict(
+                        'Execution tuple already has different termination '
+                        'evidence.')
+            recorded.append(str(evidence_id))
+    return tuple(recorded)
 
 
 def controller_origin_capability_is_current(instance_id: str, generation: int,
