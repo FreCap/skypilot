@@ -1277,8 +1277,11 @@ cleanup-artifact retirement probe exposed the reconnect gap described below;
 G1Sd merged as PR #1526 at
 `ef62d6d44a935b1669f646d65f2d2637d3c7fa13`. Its deployment proved watch
 continuity and exposed the independent clock-domain defect described below.
-G1S completion and G2 remain blocked on the G1Se API014 fix-forward and a fresh
-positive retirement probe.
+G1Se merged as PR #1527 at
+`bf9e2907a39ef90a6e9f741be050da9b3fe662a5`; the exact `boltz-test`
+qualification below passed. G1S is complete. G2 remains blocked on its
+API015/Serve051 and API016/Serve052 restack plus the independent operational
+and adversarial-review gates below.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1555,9 +1558,53 @@ The API014 instance-version allowance is isolated rollout code. The already
 blocked G2/P3a cleanup PR #1506 must remove participant protocol 1 after the
 complete stale-writer/quiescence horizon while retaining immutable V1 evidence
 rows under the closed source constraint.
-G1Se must pass exact-head CI, deploy by direct Helm fix-forward, record a fresh
-planned-retirement certificate across watch reconnects, and repeat the
-liveness-restart negative test before G1S is complete or P3a may merge.
+G1Se passed all 31 exact-head CI checks and merged as PR #1527 at
+`bf9e2907a39ef90a6e9f741be050da9b3fe662a5`. Release `1.1.1310` records that
+exact revision. The source and copied `boltz-test` images share digest
+`sha256:b25e0f61ecfc164b30044644f0d5140be320fe172dbed27b4ff754ed6fdf1bbf`;
+the chart digest is
+`sha256:51c2f169cb6dd92ac2bacb0f8403c96a945e614ee08005b1d60431d513d1d22a`
+and its package SHA-256 is
+`a9f5579e46b496a3eea5ba9f74f0991cf8cd8289fa459c63ebc3db33ceda6165`.
+Direct atomic Helm revision 112 used `--reuse-values` and exact digest
+overrides for API, controller, and executor. Its revision-111 preflight
+PostgreSQL dump SHA-256 is
+`831ff258ff51ad44155ae1ec2a5214d2c2e9751bcb4ebeb4f9a41ad7ca713bf6`.
+The migration job succeeded, every role converged 2/2 on the exact digest,
+health reported the exact release and merge, API014/Serve050 became the schema
+heads, controller and executor participants advertised protocol 2, and the
+stored observer-transition key remained absent. The prior V1 diagnostic row
+and deliberately ambiguous hard-kill tombstone remained intact.
+
+Under stable controller generation 198, planned-retirement request
+`97fc1c50-0b1d-4799-96f4-3a71d8e73cab` crossed a forced watch timeout while
+retaining generation 1, claim
+`659ff6b6-3618-4469-8e31-8425c034a673`, and executor Pod UID
+`0c39e018-aed8-4a08-b903-233b6d96d81b`. Graceful deletion produced exactly
+one `KUBERNETES_POD_FINAL_SUCCEEDED_V2` row at resource version `197191085`,
+event `DELETED`, phase `Succeeded`, current-container exit code 0, and digest
+`f49f9558cc9b411bacb3f304dfdb927de50530aded0903d9cbae1c6fe8a87cb8`.
+The API-server deletion timestamp was `05:36:04Z`, the kubelet finish timestamp
+was `05:36:03Z`, and PostgreSQL observation was `05:36:04.821798Z`; the
+one-second skew was accepted without ordering those clocks. The request's
+independent generation-1 quiescence receipt committed and the executor
+Deployment recovered 2/2. The evidence digest remained unchanged after
+recovery.
+
+Liveness request `f3633a68-c2e2-4481-962e-bd763b15517d` then retained a
+settled generation-1 claim on Pod UID
+`859fe686-9e84-4604-9ddd-4971901b0d94`. Killing the exact executor runtime
+child restarted the container under that same non-deleting Pod UID; restart
+count became 1, current state returned to ready/running, and
+`lastState.terminated` recorded exit 137. Its certificate count remained zero
+before and after. Two excluded harness attempts also failed closed: request
+`c9776bbf-4b92-4d05-ad4a-6212398120ec` observed terminal status before the
+asynchronous quiescence receipt and stopped before mutation; request
+`4539bb1b-19ac-4a74-aa5e-116b00e72f2f` signalled the `tini` supervisor rather
+than its runtime child, caused no restart, and was interrupted without a
+certificate. The corrected exact-runtime probe above is the qualification
+result. G1S is complete; this evidence does not by itself satisfy G2's
+separate cleanup, absence-projection, rollout-horizon, or review gates.
 
 V1 certificates are never cleanup authority, and a V2 certificate is not
 cleanup authority by itself. G2/API015 and Serve051 may consume V2 only as
@@ -2795,7 +2842,7 @@ approved canary:
 - [x] Merge and deploy G1Sd watch continuity as PR #1526 / release `1.1.1309`.
   Revision 111 proved continuous resource-version delivery; its failed
   certificate probes exposed the separate cross-clock rejection.
-- [ ] Merge and deploy G1Se/API014, then record one exact automatic certificate
+- [x] Merge and deploy G1Se/API014, then record one exact automatic certificate
   after a forced watch timeout and repeat the liveness-restart negative test.
   The revision-110 and revision-111 probes are diagnostic evidence, not passing
   certificate gates.
