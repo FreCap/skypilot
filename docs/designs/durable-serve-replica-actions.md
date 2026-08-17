@@ -1261,14 +1261,14 @@ generation-owned observer, immutable evidence writer, transition Helm surface,
 and focused real-PostgreSQL/observer/Helm tests pass locally. Its exact
 implementation head also passed every CI check; the sole first-attempt failure
 was an unchanged abrupt-parent-death process-group test that passed five
-consecutive local runs and the unmodified CI rerun. G1Sc is authored
-simultaneously as draft PR #1523 at
-`6010a240ef0c308f13a5566d33af9c0a1ca629a7`; its exact merge gate is recorded
-in that PR and below. It removes the observer flag, legacy grace-variable
-fallback, and sleep-only chart projection. The final chart supplies exactly
-one execution-drain variable in both HA and compatibility topology, and only
-the dedicated HA controller owns the termination observer. G1Sc remains
-blocked until qualification.
+consecutive local runs and the unmodified CI rerun. G1Sc merged as PR #1523 at
+`2f01e7c717bc7c325341a78d7c44f7be09995e74` after its exact-head CI and G1Sb
+qualification gates passed. It removes the observer flag, legacy grace-
+variable fallback, and sleep-only chart projection. The final chart supplies
+exactly one execution-drain variable in both HA and compatibility topology,
+and only the dedicated HA controller owns the termination observer. Its first
+cleanup-artifact retirement probe exposed the reconnect gap described below;
+G1S completion and G2 remain blocked on the G1Sd watch-continuity fix-forward.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1445,6 +1445,48 @@ count 1, current state running, `lastState.terminated` exit 137, no deletion
 timestamp, and certificate count unchanged at zero. The G1Sc crash-matrix gate
 therefore passes; its test deployment must now scrub the stored transition key
 and confirm the unconditional observer on the cleanup artifact.
+
+#### `boltz-test` G1Sc deployment and G1Sd reconnect correction
+
+G1Sc merge `2f01e7c717bc7c325341a78d7c44f7be09995e74` shipped as release
+`1.1.1308`. The source and exact copied test image share digest
+`sha256:a69ded95df3270b205c64aa16a15bbfc3863d9c544b66a6bc8671bc0a36ff00b`;
+the chart digest is
+`sha256:f380c0c3390d6b841384449d22dded71a4d183240aeed5f3f01127a4b6a03e77`
+and its verified package SHA-256 is
+`751269b937490216c2f65e2669cd723d7d6c3fadca6161ed300e55ac276940d4`.
+Revision 110 deployed from a revision-109 Helm/Kubernetes/PostgreSQL snapshot
+whose dump SHA-256 is
+`3578250e822f75e3cbe9cbf5b0e7e04d5ec7f43381294519681ce0feebfc7d87`.
+The stored transition key is absent rather than null; all three roles are 2/2
+on the exact digest, have no observer or legacy grace environment variable,
+and retain one execution-drain variable. API health reports the exact release
+and merge; API013/Serve050, the prior certificate, and the deliberately
+ambiguous hard-kill tombstone remain intact.
+
+The required post-cleanup retirement probe then identified a real gap. Under
+stable controller generation 195, request
+`e252ed22-876f-4302-aba0-0298d588a1c3` was captured running on exact executor
+Pod UID `01ec52c6-fcf5-4ebe-8b3b-fd5dbb158113` and gracefully deleted. The
+request independently committed generation-1 quiescence and the executor
+Deployment recovered 2/2, but no Kubernetes certificate appeared after the
+complete observer polling window. No certificate was fabricated and the
+failed probe does not satisfy G1S qualification.
+
+G1Sd fixes the root cause before P3. The G1Sb observer opened a new unversioned
+five-second watch on every loop, leaving a reconnect interval in which a Pod
+could be deleted without any later object to observe. The Kubernetes
+[list-then-watch contract](https://kubernetes.io/docs/reference/using-api/api-concepts/#efficient-detection-of-changes)
+requires a collection list, a watch starting at that collection
+`resourceVersion`, and reconnect from the last consumed event
+`resourceVersion`; `410 Gone` requires a fresh list. G1Sd makes that the sole
+observer path. It processes already-deleting Pods from the initial/fresh list,
+advances the watch cursor only after an event is consumed, replays an event
+after unexpected persistence failure, and relists on explicit history expiry.
+It does not infer evidence from a missing Pod or from expired watch history.
+G1Sd must pass exact-head CI, deploy as a direct Helm fix-forward, and record an
+exact planned-retirement certificate across at least one forced watch timeout
+before G1S is complete or P3a may merge.
 
 API013 certificates are not cleanup authority by themselves. G2/API014 and
 Serve051 may consume one only as proof that the named executor can no longer
@@ -2675,6 +2717,11 @@ approved canary:
 - [x] Deploy G1S dark and pass one planned retirement per API, executor, and
   controller role plus one injected hard-kill quarantine test before enabling
   its automatic infrastructure certificate issuer or merging its cleanup.
+- [x] Merge and deploy G1Sc cleanup as PR #1523 / release `1.1.1308`; prove the
+  stored observer key is absent and all roles converge 2/2 on its exact image.
+- [ ] Merge and deploy G1Sd watch continuity, then record one exact automatic
+  certificate after a forced watch timeout. The failed revision-110 probe is
+  evidence of the reconnect defect, not a passing certificate gate.
 - [ ] Merge G2 only after zero legacy-capable participants, zero old-handler
   active/unsettled requests, and zero unbound non-pool rows requiring recovery.
   After G2, roll forward only.
