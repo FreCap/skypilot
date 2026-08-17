@@ -54,6 +54,7 @@ _HEADS = route_projection_schema.serve_route_heads_table
 _LEASES = route_projection_schema.serve_route_replica_leases_table
 _DEMAND_REPORTS = demand_state_schema.serve_lb_demand_reports_table
 _REPLICAS = serve_state_schema.replicas_table
+_LEASE_TABLE_SESSION_CACHE_KEY = 'serve_route_lease_table_available'
 
 
 class RouteProjectionError(RuntimeError):
@@ -1043,9 +1044,16 @@ def revoke_replica_lease_in_session(
     Missing pre-Serve051 material is the idempotent zero-row result.
     """
     _nonempty(service_name, 'service_name')
+    # Historical rows may use replica ID 0 as a non-routable sentinel.  No
+    # Serve051 lease can represent it because the lease schema requires a
+    # positive ID, so revocation is already complete.
+    if type(replica_id) is int and replica_id <= 0:  # pylint: disable=unidiomatic-typecheck
+        return 0
     _positive_int(replica_id, 'replica_id')
     record_id = uuid.UUID(_canonical_record_id(replica_record_id))
     _nonempty(reason, 'reason')
+    if not _route_lease_table_available(session):
+        return 0
     now = sqlalchemy.func.clock_timestamp()
     result = session.execute(
         sqlalchemy.update(_LEASES).where(
@@ -1074,6 +1082,8 @@ def revoke_service_leases_in_session(
     """Revoke all or retired-version leases in a service-row transaction."""
     _nonempty(service_name, 'service_name')
     _nonempty(reason, 'reason')
+    if not _route_lease_table_available(session):
+        return 0
     predicates = [
         _LEASES.c.service_name == service_name,
         _LEASES.c.revoked_at.is_(None),
@@ -1097,6 +1107,31 @@ def revoke_service_leases_in_session(
             revocation_reason=reason,
         ))
     return int(result.rowcount or 0)
+
+
+def _route_lease_table_available(
+    session: orm.Session | sqlalchemy.engine.Connection,) -> bool:
+    """Return whether the additive Serve051 lease schema is installed.
+
+    Replica and service state mutations are also exercised against historical
+    migration revisions.  Before Serve051 there is no route lease that could
+    survive a state transition, so the revocation hook is already satisfied.
+    Checking before issuing DML is required because PostgreSQL marks the whole
+    transaction failed after an undefined-table error.
+    """
+    if isinstance(session, orm.Session):
+        cached = session.info.get(_LEASE_TABLE_SESSION_CACHE_KEY)
+        if cached is not None:
+            return bool(cached)
+        connection = session.connection()
+    else:
+        connection = session
+    available = sqlalchemy.inspect(connection).has_table(_LEASES.name)
+    if isinstance(session, orm.Session):
+        # Cache only for this short-lived state transaction.  An engine-level
+        # cache would become stale while migration tests replace the schema.
+        session.info[_LEASE_TABLE_SESSION_CACHE_KEY] = available
+    return available
 
 
 def snapshot_owner_matches(snapshot: Mapping[str, Any],
@@ -1229,7 +1264,7 @@ class RouteProjectionRepository:
         if not receipts:
             raise RouteProjectionConflict(
                 'Route material replica identity is no longer current or its '
-                'lease was revoked.')
+                'lease was revoked and cannot be implicitly revived.')
         return receipts[0]
 
     @staticmethod

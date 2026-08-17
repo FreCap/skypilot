@@ -16,12 +16,12 @@ and the other 13 warm-standby LB deployments are ready with zero restarts. The
 inactive `boltz-l4-fleet` standby deliberately remains on revision 407 until a
 future cutover; it is not an active traffic owner.
 
-P2c API88/Serve051 is implemented and locally reviewed on branch
-`fix/serve-route-replica-leases` as four code commits above the revision-408
-source plus this living-design update. Its remote PostgreSQL CI, PR merge,
-immutable image build, dark Helm deployment, and production provider-stall
-qualification remain open. No P2c behavior has been promoted on
-`boltz-l4-fleet`.
+P2c API88/Serve051 is implemented and locally reviewed in PR #1531 from branch
+`fix/serve-route-replica-leases` as four implementation milestones plus
+review/CI fix-forward commits above the revision-408 source. Its remote
+PostgreSQL CI, PR merge, immutable image build, dark Helm deployment, and
+production provider-stall qualification remain open. No P2c behavior has been
+promoted on `boltz-l4-fleet`.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -972,6 +972,14 @@ proceed for every paid replica; the teardown executor advances only the subset
 whose current active/draining reporters prove zero occupancy. A later positive
 demand plan may cancel an uncommitted retirement only through the normal
 generation fence, never by silently republishing the revoked lease.
+
+The route-revocation hook first checks for the additive Serve051 lease table
+and caches that answer only for the current state transaction. It is an
+idempotent no-op on pre-Serve051 schemas and for historical non-routable
+replica-ID-zero sentinels because neither can have a valid lease. Once Serve051
+exists, all valid route identities take the single transactional revocation
+path. Paid-retirement authority does not share this compatibility behavior:
+missing retirement state remains a fail-closed error on destructive paths.
 
 The implemented paid-retirement transaction binds the exact service owner,
 replica record, demand generation, fresh route head, and zero-residual capacity

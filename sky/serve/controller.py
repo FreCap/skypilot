@@ -6645,7 +6645,7 @@ class SkyServeController:
             'autoscaler',
             stop_event=self._get_actuation_stop())
 
-        if self._incremental_route_projection_enabled:
+        if getattr(self, '_incremental_route_projection_enabled', False):
             thread_utils.start_supervised_thread(
                 self._run_incremental_route_worker,
                 'incremental-route-worker',

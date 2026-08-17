@@ -233,7 +233,7 @@ def test_admission_atomically_revokes_route_and_persists_exact_intent(
             sqlalchemy.select(
                 serve_state_schema.replicas_table.c.status)).scalar_one()
     assert intent['state'] == paid_retirement.PaidRetirementState.ACTIVE.value
-    assert lease['revocation_reason'] == 'replica_route_ineligible'
+    assert lease['revocation_reason'] == 'replica_became_route_ineligible'
     assert replica == 'SHUTTING_DOWN'
 
 

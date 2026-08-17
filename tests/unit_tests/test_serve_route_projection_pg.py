@@ -148,6 +148,27 @@ def _insert_report(engine, session_id='pod-a'):
                     payload={}))
 
 
+def _compose_empty_incremental(repository, incarnation):
+    return repository.compose_incremental_snapshot(
+        _identity(incarnation),
+        1, {'load_balancing_policy_name': 'round_robin'},
+        lambda _version, _state: None,
+        lambda _infos, _translation, _logical_versions:
+        {'replica_unit': 'physical_backend'},
+        ttl_seconds=60)
+
+
+def test_revocation_hooks_noop_before_serve051(empty_postgres):
+    serve_config = migration_utils.get_alembic_config(
+        empty_postgres, migration_utils.SERVE_DB_NAME)
+    alembic_command.upgrade(serve_config, '050')
+    with sqlalchemy.orm.Session(empty_postgres) as session, session.begin():
+        assert route_projection.revoke_replica_lease_in_session(
+            session, 'svc', 1, str(uuid.uuid4()), 'historical_schema') == 0
+        assert route_projection.revoke_service_leases_in_session(
+            session, 'svc', 'historical_schema') == 0
+
+
 def test_serve049_schema_is_postgresql_only_and_complete(route_database):
     engine, _ = route_database
     inspector = sqlalchemy.inspect(engine)
@@ -352,7 +373,7 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
             replica_record_id=state['replica_record_id'],
             version=1)
 
-    repository.compose_incremental_snapshot(
+    composed = repository.compose_incremental_snapshot(
         _identity(incarnation),
         1, {'load_balancing_policy_name': 'round_robin'},
         _decode,
@@ -369,7 +390,9 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     projected = repository.resolve_sync('svc', 'svc-hash', 'pod-a')
     assert projected.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED
     assert projected.response is not None
-    assert projected.response['route_projection_generation'] == 1
+    assert composed.generation == 2
+    assert (projected.response['route_projection_generation'] ==
+            composed.generation)
     assert projected.response['route_projection_sha256'] != first.content_sha256
     assert projected.response['route_source_epoch'] == 1
     assert set(projected.response['replica_info']) == {'http://10.0.0.1:8000'}
@@ -419,6 +442,7 @@ def test_projected_mode_never_falls_back_when_head_or_membership_is_stale(
                        _response(),
                        _identity_payload(record_id), {record_id},
                        ttl_seconds=60)
+    _compose_empty_incremental(repository, incarnation)
     repository.promote('svc', 'svc-hash')
 
     with pytest.raises(route_projection.RouteProjectionUnavailable,
@@ -448,6 +472,7 @@ def test_owner_takeover_invalidates_old_projection(route_database):
                        _response(),
                        _identity_payload(record_id), {record_id},
                        ttl_seconds=60)
+    _compose_empty_incremental(repository, incarnation)
     _insert_report(engine)
     repository.promote('svc', 'svc-hash')
     with engine.begin() as connection:
