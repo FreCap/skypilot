@@ -149,6 +149,10 @@ failure skips the generic write and retains both snapshots for retry, so a
 concurrent rollup cannot permanently latch a transient unsupported row. A
 malformed version 1 envelope is acknowledged and any independently valid
 arrival rows remain null and visibly incomplete rather than falsely complete.
+Conversely, a valid version 1 classification remains durable when its optional
+arrival snapshot is malformed: the classification transaction omits support
+promotion, while the generic writer independently acknowledges and drops the
+invalid arrival snapshot.
 
 A distinct `request_classification_history_accepted` response acknowledges only
 the supported classification snapshot. For a valid version 1 envelope, the

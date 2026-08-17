@@ -4344,6 +4344,47 @@ class TestServeStatusHistoryPG:
                 ).order_by(daily.c.service_name)).fetchall()
         assert daily_rows == [('mixed', None, None, True), ('svc', 3, 1, False)]
 
+    def test_valid_classification_survives_malformed_arrival_snapshot(
+            self, history_engine):
+        day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
+        timestamp = day.timestamp() + 30
+        bucket_start = int(day.timestamp())
+        classification_history = {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'classified_request_count': 2,
+                'counted_rejected_count': 1,
+            }],
+        }
+        malformed_request_history = {
+            'bucket_seconds': 60,
+            'buckets': 'not-a-list',
+        }
+
+        assert serve_history.record_request_classification(
+            'svc',
+            'hash-a',
+            'reporter',
+            classification_history,
+            timestamp,
+            request_history=malformed_request_history) == 1
+        with pytest.raises(ValueError, match='buckets must be a list'):
+            serve_history.record_request_activity('svc', 'hash-a', 'reporter',
+                                                  malformed_request_history,
+                                                  timestamp)
+
+        raw = serve_history.serve_request_activity_history_table
+        with history_engine.connect() as connection:
+            row = connection.execute(
+                sqlalchemy.select(
+                    raw.c.request_count,
+                    raw.c.classified_request_count,
+                    raw.c.counted_rejected_count,
+                )).one()
+        assert row == (0, 2, 1)
+
     def test_request_classification_constraints_reject_one_sided_nulls(
             self, history_engine):
         day = datetime.datetime(2026, 7, 31, tzinfo=datetime.timezone.utc)
