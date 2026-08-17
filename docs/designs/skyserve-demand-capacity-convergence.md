@@ -4,12 +4,12 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, and PR #1529's exact
 reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 409 / release
-`1.1.1313`, merge commit `a81a76729c663883a99dddd2152e936a814c4b84`, image
+artifact is deployed directly with Helm as production revision 410 / release
+`1.1.1314`, merge commit `5154355f2223a9080e46999c15e4a135e5da7bad`, image
 digest
-`sha256:5fb7e2af6719fd66ce384f7a6a1896835533c2d83cc80d6939f95b18db0de656`,
+`sha256:0b4d9ffbd765aa0b7b3f4a952129d2b67406ecf342687221553e2d9983f835e8`,
 and chart digest
-`sha256:e3165c064fb6c753b7b885eb68631de754dba5fbcb369459d4c0673ac39ea85b`.
+`sha256:ff7774468119816a98abcb05c55c13d37069e24e2ba194fe04abfe8d3a6b8b3d`.
 The Serve051 migration Job completed, the API reports protocol version 88, and
 the API deployment is ready with zero restarts. No load-balancer slot, service
 version, authority mode, or `boltz-platform` pin changed in this direct Helm
@@ -23,10 +23,21 @@ selected its route producer from `get_service_from_name()`, whose deliberate
 Serve037 compatibility projection omits `route_source_mode` and
 `route_projection_protocol_version`. The deployed controller therefore kept
 publishing protocol 1, wrote zero exact route leases, and could not exercise the
-P2c renewal contract. The fix-forward changes that bootstrap read to the route
-repository's exact current-owner projection; qualification remains open until
-that correction is merged and deployed. No P2c behavior has been promoted on
-`boltz-l4-fleet`.
+P2c renewal contract. PR #1532 changed that bootstrap read to the route
+repository's exact current-owner projection and revision 410 deployed it.
+Production then selected protocol 2 and wrote 149 exact material rows (16 A100,
+15 A100-80GB, and 118 paid L4), but generation 660 expired after its first
+publication and none of the readiness leases was observed. A nonblocking thread
+dump showed both the incremental worker and LB sync waiting on
+`_routing_state_lock` while the autoscaler held it for fleet-wide cost planning.
+The worker later recovered to generation 673 with 125 fresh-ready leases only
+after that lock was released; the intervening head expiry still fails the
+cadence contract.
+The current fix-forward publishes version plus routing policy through a separate
+immutable route-contract snapshot and proves composition completes while the
+autoscaler epoch lock is held indefinitely. Qualification remains open until
+that correction is merged, deployed, and passes ten renewals. No P2c behavior
+has been promoted on `boltz-l4-fleet`.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -605,9 +616,12 @@ A dedicated supervised route worker has two provider-free stages:
    the immutable full snapshot/head.
 
 The worker never acquires the replica-manager lock, provider phase, physical
-cluster fence, Kubernetes client, Ray handle, or cluster database. Its cadence
-and head TTL are fixed operational bounds; a worker stall still expires the
-head, but a provider stall cannot. There is no all-fleet `complete` bit. A new
+cluster fence, Kubernetes client, Ray handle, cluster database, or the shared
+autoscaler/demand routing-epoch lock. Version and routing policy are published
+to it as one immutable snapshot behind a dedicated constant-time lock; reads
+copy that snapshot only after releasing the lock. Its cadence and head TTL are
+fixed operational bounds; a worker stall still expires the head, but a provider
+or cost-planning stall cannot. There is no all-fleet `complete` bit. A new
 endpoint simply remains absent until its own material and readiness lease are
 valid, while every healthy sibling continues to renew.
 
@@ -1315,9 +1329,14 @@ corrections are implemented and covered by focused regressions.
 - [x] Merge P2c API88/Serve051 after remote real-PostgreSQL CI and final exact
   diff review, update its simultaneously maintained #1506 removal diff, and
   deploy it dark as direct Helm revision 409 / v1.1.1313.
-- [ ] Merge and deploy the exact-owner route-producer bootstrap fix-forward,
-  then prove the ten-renewal provider-stall gate. Revision 409 exposed the
-  omitted-field defect before stall injection and remains unpromoted.
+- [x] Merge and deploy PR #1532's exact-owner route-producer bootstrap
+  fix-forward as direct Helm revision 410 / v1.1.1314. The owner selected
+  protocol 2 and wrote 149 exact material rows, but the first head expired and
+  all readiness observations remained null because the worker waited on the
+  autoscaler routing-epoch lock.
+- [ ] Merge and deploy the independent immutable route-contract fix-forward,
+  then prove the ten-renewal provider-stall gate. Revision 410 remains
+  unpromoted.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.
