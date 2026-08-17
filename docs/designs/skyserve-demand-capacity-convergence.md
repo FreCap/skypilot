@@ -1,17 +1,20 @@
 # SkyServe demand, capacity, and telemetry convergence
 
 Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
-#1504. PR #1521's partial-coverage in-flight observability and the complete G1S
-executor-termination precursor stack through PR #1528 are also merged. The
-exact merged artifact is deployed directly with Helm as production revision
-407 / release `1.1.1310`, commit
-`bf9e2907a39ef90a6e9f741be050da9b3fe662a5`, image digest
-`sha256:b25e0f61ecfc164b30044644f0d5140be320fe172dbed27b4ff754ed6fdf1bbf`,
+#1504. PR #1521's partial-coverage in-flight observability, the complete G1S
+executor-termination precursor stack through PR #1528, and PR #1529's exact
+reserved-fill deployment-policy bundle are also merged. The newest exact
+artifact is deployed directly with Helm as production revision 408 / release
+`1.1.1312`, commit `966f74369d0722b253c7d47dad12248711928e70`, image
+digest
+`sha256:004478e3f12e2d217beea95acd6ddc79629cc064fdb87f002e8f6017d843dcc7`,
 and chart digest
-`sha256:a9f5579e46b496a3eea5ba9f74f0991cf8cd8289fa459c63ebc3db33ceda6165`.
+`sha256:18125d491ea2fd416f70b0f1f6c902747420c157fe018ca887d3ca48cb122825`.
 The migration Job completed at API-request revision 014 and Serve revision 050;
-the API reports protocol version 87, and the API plus all 14 warm-standby LB
-Pods converged on the exact image with zero restarts.
+the API reports protocol version 87. The API, active `boltz-l4-fleet` LB slot,
+and the other 13 warm-standby LB deployments are ready with zero restarts. The
+inactive `boltz-l4-fleet` standby deliberately remains on revision 407 until a
+future cutover; it is not an active traffic owner.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -45,12 +48,26 @@ ClusterQueue `skypilot-be`; the `mt_hybrid` service workspace selects
 WorkloadPriorityClass `be-ls`, while the lower-throughput partition workspace
 uses `be-lt`. The selected Pod identity remains `skypilot-pool-sa` with Pod
 PriorityClass `rescluster-k8s-prod-east1-preemptible-inference-low` (-1000,
-`Never`). Revision 407's embedded policy bundle is independently stale: it
-still asserts `default`, `skyserve-inference-borrowed`,
-`skyserve-inference-low`, and the nonexistent `skypilot-inference-sa`.
-Version 58 also retains task-owned Kubernetes `pod_config`, `remote_identity`,
-and `provision_timeout` overrides, so the strict worker-projection builder
-correctly persisted null rather than blessing a competing Pod contract.
+`Never`). Revision 408 replaces that stale embedded policy with schema-v3
+exact context contracts: east is explicitly unmanaged by Kueue and cannot
+claim fill, while PHX names LocalQueue `be`, ClusterQueue `skypilot-be`,
+WorkloadPriorityClass `be-ls`, and service account `skypilot-pool-sa`. The
+policy remains correctly fail-closed. Its first live attestation blocker is
+now explicit: the API-server IAM principal receives Kubernetes 403 when it
+reads ServiceAccount `skypilot-pool-sa` in the PHX namespace. Once that
+read-only RBAC is granted, the missing PHX `gpu-binpack-scheduler` Deployment
+is the next blocker. Version 58 also retains task-owned Kubernetes
+`pod_config`, `remote_identity`, and `provision_timeout` overrides, so the
+strict worker-projection builder correctly persisted null rather than blessing
+a competing Pod contract.
+
+Revision 408 made no authority promotion or service/config mutation. A
+post-rollout query found zero paid Spot rows with `created_at` at or after the
+09:10:10 UTC Helm upgrade, including after fresh request telemetry resumed.
+The latest sampled report had six confirmed processing requests, two
+occupancy-unknown backends, zero queue, and fresh but incomplete compatibility
+coverage. This proves the release stayed economically dark while also proving
+why the UI must display confirmed processing and unknown coverage separately.
 
 The exact post-#1503 P2b2 review scope was 42 files with 4,298 insertions and
 241 deletions relative to `improvements`. Draft removals #1506 and #1510 are
@@ -933,6 +950,15 @@ authority immediately, off-route draining for paid endpoints, no destructive
 teardown for an occupancy-unknown URL, and teardown of each independently
 proved-idle paid replica.
 
+The paid-retirement state is durable and explicitly exact-idle-only. It is not
+the existing bounded graceful-drain fallback: elapsed time, a missing route,
+or controller restart never converts unknown occupancy into teardown
+authority. Admission revokes the exact route in the same transaction and may
+proceed for every paid replica; the teardown executor advances only the subset
+whose current active/draining reporters prove zero occupancy. A later positive
+demand plan may cancel an uncommitted retirement only through the normal
+generation fence, never by silently republishing the revoked lease.
+
 The additive PR must link to draft #1506 as its stacked removal. #1506 is
 expanded and restacked to delete the protocol-1 all-fleet publisher, old route
 mode, transition capability/metrics, and transition tests only after one
@@ -1014,8 +1040,9 @@ compatible with the current schema; otherwise merge, publish, and deploy a new
 fix-forward artifact.
 
 P1, P2, P2c, and P2d are additive and dark before per-service promotion.
-Revision 407 is the current exact G1S/P2-capable cohort; deployment alone did
-not change any `boltz-l4-fleet` authority mode. P2c and P2d each deploy first as
+Revision 408 is the current exact G1S/P2/policy-capable cohort; deployment
+alone did not change any `boltz-l4-fleet` authority mode. P2c and P2d each
+deploy first as
 an additive direct-Helm revision with `--reuse-values --atomic --wait
 --wait-for-jobs`, then activate only on one exact capable cohort after their
 dark gates. Promotion requires no unsettled unbound work for that service,
@@ -1030,6 +1057,14 @@ the migration transaction commits. All old central participants remain stopped
 for the documented horizon; any post-commit failure is repaired with a new
 schema-compatible image and another direct Helm fix-forward. After P3,
 automatic or manual restoration of removed paths is forbidden.
+
+Revision 408 used the intended exact chart/image and `--reuse-values` path,
+but its preflight also executed a server-side Helm dry run and the final
+command omitted `--atomic --wait-for-jobs`. The server dry run completed
+without mutation and the actual migration/rollout completed successfully, but
+both are recorded deviations rather than new precedent. Subsequent additive
+rollouts use the canonical client-side render and atomic wait-for-jobs command
+above.
 
 The PHX fill admission correction is an operational prerequisite rather than a
 SkyPilot image pin. The exact live read on 2026-08-17 resolved the release
@@ -1052,16 +1087,14 @@ server-owned `mt_hybrid` PHX `kueue.local_queue_name: be` and
 `serve_worker_kueue_workload_priority_class_name: be-ls`, together with the
 complete server-owned priority, service-account, scheduler, accelerator,
 cache, and scratch projection inputs. Do not seed or patch the database out of
-band. The same merged SkyPilot release must correct the embedded Boltz policy
-bundle from its stale
-`default`/`skyserve-inference-*`/`skypilot-inference-sa` identities to the
-exact live objects above and their full queue/preemption/quota attestations.
-The production control-plane identity has exact-name `get` permission for
-LocalQueue `be` and ClusterQueue `skypilot-be`; the deployment-policy audit
-role remains responsible for the broader cluster-scoped attestation. Render
-and diff the complete Helm upgrade, deploy the image with `--reuse-values`,
-apply the exact config transaction, then compile/elect a new service version
-after removing those Kubernetes overrides from the service task and setting
+band. Revision 408 already corrected the embedded Boltz policy bundle and
+deployed it dark. The next operational prerequisite is a narrowly scoped
+read-only RBAC grant that lets the API-server principal attest ServiceAccount
+`skypilot-pool-sa`; the current request is denied with Kubernetes 403. The
+following prerequisite is deployment of the exact
+`gpu-binpack-scheduler` named by both the live worker contract and policy. Only
+after both attestations pass may the audited config transaction compile/elect
+a new service version with task-owned Kubernetes overrides removed and
 `min_replicas: 0`. Its immutable worker placement projection must contain the
 exact pair. A successful H200 Pod must show the `be` queue label,
 `skypilot-be` Kueue admission, `be-ls` workload priority, and the approved
@@ -1103,7 +1136,7 @@ Automated tests must cover:
 Manual production verification records:
 
 1. the live deployment tuple at rollout time, including direct Helm revision
-   407's exact v1.1.1310 artifacts, unchanged single-`all` topology, and the
+   408's exact v1.1.1312 artifacts, unchanged single-`all` topology, and the
    forward Serve050/API-request-014 database heads;
 2. the completed pre-migration inventory of retained legacy rows and unsettled
    requests; reconcile only rows that actually remain. Record the historical
@@ -1123,8 +1156,9 @@ Manual production verification records:
    paid Spot launch only after a recorded positive residual;
 6. scale from zero, scale back to zero, controller restart, and service update;
 7. dashboard in-flight/queued/completed counts and freshness matching the
-   durable feed. The revision-407 baseline is zero recent, 25 in the prior
-   hour, zero confirmed processing, and 27 occupancy-unknown backends;
+   durable feed. Revision 408 has additionally shown six confirmed processing,
+   two occupancy-unknown backends, and zero queue after rollout; neither
+   unknown coverage nor an arrival rate may be presented as exact processing;
 8. PHX H200 intent-to-Pod admission with exact server-owned Kueue and
    reclaimable-priority evidence, plus zero speculative rows under a held pool
    lane; and
@@ -1205,6 +1239,9 @@ owned by the server projection.
 - [x] Deploy the reviewed Serve049/050 registry lineage and G1S precursor as
   direct Helm revision 407 / v1.1.1310; verify API014/Serve050, exact images,
   migration completion, all API/LB readiness, and zero restarts.
+- [x] Merge PR #1529 and deploy its exact schema-v3 policy bundle as direct
+  Helm revision 408 / v1.1.1312; verify API014/Serve050, active fleet LB
+  cutover, health, zero restarts, and zero paid rows created after the upgrade.
 - [ ] Verify ordinary typed cleanup converges replicas 52688 and 52690 without
   manual deletion. Both rows are now absent; audit their exact terminal
   receipts before closing this gate because absence alone is not evidence.
@@ -1217,11 +1254,17 @@ owned by the server projection.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.
-- [ ] Merge one policy/config correction that replaces the stale revision-407
-  PHX deployment-policy identities with LocalQueue `be`, ClusterQueue
-  `skypilot-be`, WorkloadPriorityClass `be-ls`, and service account
-  `skypilot-pool-sa`; deploy matching direct Helm values and prove an H200
-  reserved-fill Pod is admitted with the exact low preemptible Pod priority.
+- [x] Replace the stale revision-407 PHX deployment-policy identities with
+  LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
+  and service account `skypilot-pool-sa`; deploy the correction dark in
+  revision 408.
+- [ ] Grant the API-server principal exact read-only attestation access to PHX
+  ServiceAccount `skypilot-pool-sa`, deploy the exact
+  `gpu-binpack-scheduler`, then prove the policy preflight passes without
+  weakening any check.
+- [ ] Apply the complete audited server-owned worker config, compile/elect a
+  clean service version, and prove an H200 reserved-fill Pod is admitted with
+  the exact queue, workload priority, and low preemptible Pod priority.
 - [ ] Pass demand conservation, no-paid-spill, provider-free route publication,
   fresh-zero paid drain, grant-before-row pool isolation, controller stall
   isolation, and dashboard tests.
