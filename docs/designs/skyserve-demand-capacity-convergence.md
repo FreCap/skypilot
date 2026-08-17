@@ -4,12 +4,12 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, and PR #1529's exact
 reserved-fill deployment-policy bundle are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 413 / release
-`1.1.1317`, merge commit `9ec62016b6bf983d31bca2d5d39f8bcc6361fc66`, image
+artifact is deployed directly with Helm as production revision 414 / release
+`1.1.1318`, merge commit `a166a433cd048bd277205614e276d7329b88b2c7`, image
 digest
-`sha256:985b4c11ed938e54c489fa8385ba0d84b3adf3b687292885fc4692d433daa425`,
+`sha256:d247e233a80af6d1d15af63fd6f989cca3056fcee8315975365a05c30434ab85`,
 and chart digest
-`sha256:7c48fb90ba00ef3591ce60a9797d2ee662ee5dad8e3b0cdbdf227582d6e3c9ea`.
+`sha256:3380708cf55458a583c53d4400902aee08a1ec651d3a416121162401cad9aa7f`.
 The Serve051 migration Job completed, the API reports protocol version 88, and
 the API deployment is ready with zero restarts. No load-balancer slot, service
 version, authority mode, or `boltz-platform` pin changed in this direct Helm
@@ -81,7 +81,7 @@ The remaining defect is therefore not the material batch: composition still
 runs arbitrary Python decoders and the capacity callback while holding the
 service, every replica, and every lease row lock.
 
-The next fix-forward makes composition a two-phase optimistic publication.
+PR #1536 makes composition a two-phase optimistic publication.
 The prepare phase reads owner, replica, and lease inputs without row locks,
 closes its transaction, and performs all deserialization, lazy imports,
 capacity aggregation, and response construction with no database transaction
@@ -101,6 +101,19 @@ failure rows remain available through service status/history, but they are not
 routing or admission capacity and cannot make route cadence proportional to
 months of retained diagnostics. A transition into or out of that actionable
 set changes the final locked fingerprint and rejects the prepared publication.
+
+Revision 414 deployed PR #1536 dark and closed the composition cadence gate.
+After controller takeover, approximately 40 consecutive refreshed route heads
+landed 4.329--5.827 seconds apart while the controller independently reported
+provider-health read timeouts. Exact-owner material briefly advanced from 57
+to 130 rows; readiness caught up to 130/130 without delaying head renewal.
+PostgreSQL sampling found no fleet-sized idle transaction: the observed
+composer owner read held its transaction for roughly 6.7 milliseconds rather
+than the 6--100 second revision-413 critical sections. No replica row was
+created after the Helm upgrade, the fresh demand projection remained zero,
+and no paid Spot launch was admitted. Route authority remains deliberately
+`LEGACY_PROXY`; this evidence qualifies the implementation but does not skip
+P2d or the documented promotion gates.
 
 The `boltz-l4-fleet` authority modes remain deliberately unpromoted:
 `LEGACY_CONTROLLER` demand, `LEGACY_PROXY` routes, legacy ordinary binding, and
@@ -808,6 +821,22 @@ shows demand target, ready compatible capacity, zero-cost committed/granted,
 paid committed, residual deficit, and the exact observation generations. This
 makes a paid Spot launch explainable from the UI.
 
+Revision 414 production qualification also separates the remaining request-UI
+work from telemetry collection. The direct demand endpoint is fresh with two
+reporters and currently returns zero recent arrivals, zero queue, zero
+rejections, a confirmed in-flight lower bound of zero, and an exact in-flight
+value of null because two routed backend URLs lack current occupancy evidence.
+The request-history projection is available and contains 42 accepted arrivals
+in the latest hour across 11 nonempty minute buckets. The existing `Requests
+now` card is wired to both projections, but it must make `0 confirmed
+processing; 2 backends unknown` visually explicit instead of allowing the
+nullable exact count to resemble missing telemetry. Closing those two
+occupancy gaps is required before the card may display exact zero processing.
+Accepted arrivals/history are not a completed-request counter; if operators
+need cumulative completions, the load-balancer report and PostgreSQL minute
+history must carry an explicit idempotent outcome counter. The UI must never
+derive completions from arrivals, request rate, or an in-flight delta.
+
 ## Architecture and invariants
 
 ### Ownership
@@ -1454,16 +1483,17 @@ back. The real-PostgreSQL tests additionally cover fixed statement count,
 stale/revoked sibling isolation, and a replica-replacement lock race. Full
 remote PostgreSQL CI remains a merge gate.
 
-The two-phase composer candidate passes the complete real-PostgreSQL route
+The merged two-phase composer passes the complete real-PostgreSQL route
 projection suite plus exact formatting, mypy, and pylint. Focused concurrency
 regressions acquire the service and replica row locks with `NOWAIT` while the
 capacity callback is deliberately suspended, reject a replica-state mutation
 between prepare and publish, accept only a monotonic successful readiness
 refresh whose temporal eligibility stays unchanged, reject an expired route
 that becomes eligible during preparation, and prove retained terminal replica
-history is never decoded or counted as admission capacity. Remote PostgreSQL CI
-and production cadence qualification remain merge and promotion gates,
-respectively.
+history is never decoded or counted as admission capacity. PR #1536 passed all
+31 required GitHub checks, including the complete unit-test shard.
+The revision-414 production cadence qualification described above closes its
+dark deployment gate.
 
 ## Open gates
 
@@ -1522,9 +1552,12 @@ respectively.
   v1.1.1317. All 121 materials converged, but production found the composer
   idle inside its locked transaction while decoding replica state; sampled
   head intervals reached 100.433, 12.675, and 17.406 seconds.
-- [ ] Merge and deploy the two-phase optimistic composer fix-forward, then
-  prove restart takeover plus ten nominal-cadence renewals during provider
-  material refresh and provider stall before promoting route authority.
+- [x] Merge PR #1536 and deploy the two-phase optimistic composer as direct
+  Helm revision 414 / v1.1.1318. Controller takeover plus provider-health
+  timeout stress retained approximately 40 consecutive 4.329--5.827-second
+  renewals, converged 130/130 current material/readiness rows, and admitted no
+  post-upgrade replica or paid launch. Route authority remains dark pending
+  P2d and the combined promotion gates.
 - [ ] Implement, adversarially review, and merge P2d Serve052 with its
   simultaneously maintained #1506 removal diff; deploy dark and prove busy
   pool, crash, no-paid-spill, and accounting-transfer gates.
