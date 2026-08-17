@@ -373,6 +373,8 @@ def _make_controller() -> controller.SkyServeController:
     ctrl._routing_spec = None  # pylint: disable=protected-access
     ctrl._applied_version = 1  # pylint: disable=protected-access
     ctrl._routing_state_lock = threading.RLock()  # pylint: disable=protected-access
+    ctrl._route_projection_contract_lock = threading.Lock()  # pylint: disable=protected-access
+    ctrl._route_projection_contract = (1, {})  # pylint: disable=protected-access
     ctrl._actuation_epoch_lock = threading.RLock()  # pylint: disable=protected-access
     ctrl._actuation_generation = 0  # pylint: disable=protected-access
     ctrl._actuation_stop = threading.Event()  # pylint: disable=protected-access
@@ -387,6 +389,61 @@ def _make_controller() -> controller.SkyServeController:
         controller.scale_reconciliation.ScaleReconcileCoordinator(
             ctrl._reconcile_scale_once))
     return ctrl
+
+
+def test_route_projection_contract_is_independent_and_immutable():
+    ctrl = _make_controller()
+    routing_spec = {'policy': {'name': 'round_robin'}}
+    ctrl._publish_route_projection_contract(  # pylint: disable=protected-access
+        2, routing_spec)
+    routing_spec['policy']['name'] = 'mutated'
+
+    version, first = ctrl._get_route_projection_contract()  # pylint: disable=protected-access
+    first['policy']['name'] = 'also-mutated'
+    assert version == 2
+    assert ctrl._get_route_projection_contract() == (  # pylint: disable=protected-access
+        2, {
+            'policy': {
+                'name': 'round_robin'
+            }
+        })
+
+
+def test_incremental_route_compose_ignores_autoscaler_epoch_lock():
+    ctrl = _make_controller()
+    ctrl._ordinary_launch_binding_authority = object()  # pylint: disable=protected-access
+    ctrl._publish_route_projection_contract(  # pylint: disable=protected-access
+        2, {'policy': 'round_robin'})
+    repository = mock.Mock()
+    finished = threading.Event()
+
+    def _compose():
+        ctrl._compose_incremental_route_projection()  # pylint: disable=protected-access
+        finished.set()
+
+    with mock.patch.object(controller.route_projection,
+                           'RouteProjectionRepository',
+                           return_value=repository), \
+         mock.patch.object(controller.route_projection,
+                           'publisher_identity_from_authority',
+                           return_value=object()), \
+         mock.patch.object(
+             controller.serve_state,
+             'get_spec',
+             return_value=types.SimpleNamespace(
+                 endpoint_probe_interval_seconds=5)):
+        # Simulate an indefinitely blocked cost/provider planning pass.  The
+        # protocol-2 composer must use only its independent contract snapshot.
+        with ctrl._routing_state_lock:  # pylint: disable=protected-access
+            worker = threading.Thread(target=_compose)
+            worker.start()
+            assert finished.wait(timeout=5)
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    compose = repository.compose_incremental_snapshot
+    assert compose.call_count == 1
+    assert compose.call_args.args[1:3] == (2, {'policy': 'round_robin'})
 
 
 def _explicit_placement_contract_spec():

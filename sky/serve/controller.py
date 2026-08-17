@@ -7,6 +7,7 @@ from collections.abc import Callable
 import concurrent.futures
 import contextlib
 import contextvars
+import copy
 import dataclasses
 import functools
 import hashlib
@@ -459,6 +460,12 @@ class SkyServeController:
         # an old-version report can never be validated before an update and
         # collected against the new exact-card catalog after it.
         self._routing_state_lock = threading.RLock()
+        # Route renewal has a stricter liveness contract than autoscaling and
+        # demand ingestion: neither a provider stall nor an expensive planning
+        # pass may delay it.  Publish the small immutable route contract through
+        # a dedicated lock instead of making the protocol-2 worker enter the
+        # routing/autoscaler epoch lock above.
+        self._route_projection_contract_lock = threading.Lock()
         self._update_apply_error: str | None = None
         self._update_apply_failures = 0
         self._update_recovery_required = False
@@ -652,6 +659,8 @@ class SkyServeController:
         # advertise a newer routing policy than the runtime has actually
         # applied.
         self._routing_spec = self._build_routing_spec(service_spec)
+        self._route_projection_contract = (version,
+                                           copy.deepcopy(self._routing_spec))
         route_repository = route_projection.RouteProjectionRepository()
         self._incremental_route_projection_enabled = bool(
             self._ordinary_launch_binding_authority is not None and
@@ -2953,9 +2962,7 @@ class SkyServeController:
         if authority is None or self._is_pool or not self._owns_current_service(
         ):
             return
-        with self._routing_state_lock:
-            service_version = self._applied_version
-            routing_spec = self._get_routing_spec()
+        service_version, routing_spec = self._get_route_projection_contract()
         if routing_spec is None:
             return
 
@@ -3553,6 +3560,23 @@ class SkyServeController:
         steady-state DB reads on the hottest serve control-plane path.
         """
         return self._routing_spec
+
+    def _publish_route_projection_contract(
+        self,
+        service_version: int,
+        routing_spec: dict[str, Any] | None,
+    ) -> None:
+        """Atomically publish the provider-independent route input."""
+        immutable_spec = copy.deepcopy(routing_spec)
+        with self._route_projection_contract_lock:
+            self._route_projection_contract = (service_version, immutable_spec)
+
+    def _get_route_projection_contract(
+            self) -> tuple[int, dict[str, Any] | None]:
+        """Read a private copy without entering the autoscaler epoch lock."""
+        with self._route_projection_contract_lock:
+            service_version, routing_spec = self._route_projection_contract
+        return service_version, copy.deepcopy(routing_spec)
 
     def _load_service_for_update(self, version: int, yaml_content: str) -> Any:
         """Parse a new update or reuse an exact legacy committed spec.
@@ -4901,6 +4925,8 @@ class SkyServeController:
                 # ingestion take this lock, so no response/report can observe a
                 # mixed epoch.
                 self._applied_version = max(self._applied_version, version)
+                self._publish_route_projection_contract(self._applied_version,
+                                                        self._routing_spec)
             if not self._mark_controller_applied_version(version):
                 raise RuntimeError(
                     f'Could not durably mark service version {version} as '
