@@ -16,6 +16,8 @@ The module grants:
   protocol-v2 reserved fill deduplicate context aliases and fence retargeting;
 - namespaced pod lifecycle, exec, and port-forward permissions;
 - namespaced service lifecycle and event-list permissions;
+- exact-name `get` on the configured workload ServiceAccount for server-owned
+  worker projection and reserved-fill provider attestation;
 - optional exact-name `get` on one Kueue LocalQueue, ClusterQueue, and
   partition Namespace, plus exact `GET /apis` and `GET /apis/`, for
   control-plane preflight;
@@ -92,6 +94,11 @@ mutation permission. It also receives non-resource `GET /apis` and
 clients on clusters that do not grant the usual discovery role. The workload
 ServiceAccount's self-teardown Role receives no Kueue permission. Omitting the
 input creates no Kueue RBAC and is backward compatible.
+
+The namespaced control-plane Role can also `get` only the configured workload
+ServiceAccount. It cannot list, watch, create, update, patch, or delete
+ServiceAccounts, and the workload ServiceAccount's self-teardown Role receives
+no ServiceAccount API permission.
 
 `cluster_queue_name` must be one DNS-1123 label of at most 63 characters, even
 though the ClusterQueue API itself accepts a DNS subdomain. Strict SkyPilot
