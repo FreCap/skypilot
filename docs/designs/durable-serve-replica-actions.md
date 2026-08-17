@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-16
+Last updated: 2026-08-17
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -25,6 +25,11 @@ its +10-minute gate at 03:49:03 UTC and +30-minute gate at 04:08:49 UTC. The
 released plugin `claim_scope` API remains as an inert `GENERAL`-only
 compatibility shim; its retired authority value is rejected and does not affect
 queue selection.
+The generalized non-pool binding is merged through PR #1498. The first G2
+authority cleanup is restacked as API014/Serve051 in draft PR #1506, and the
+final generic non-pool cleanup is restacked immediately above it as
+API015/Serve052 in draft PR #1510. Their operational and adversarial-review
+merge gates remain open.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
@@ -1249,13 +1254,16 @@ executor, shutdown-deadline, and wire-contract suites pass; all focused
 API/controller/executor Helm tests pass; the generated values schema is exact;
 and exact-head CI completed with format, mypy, pylint, dashboard, documentation,
 static-analysis, Helm, and every Python test shard green. G1Sb is authored as
-draft PR #1522, is restacked directly on `improvements`, and retains stable
+PR #1522, is restacked directly on `improvements`, and retains stable
 implementation commit
-`795c1e91ec49b74e169a1e13f06bc3b409a92b82`: API013, the controller-
+`2c225667e12cb8a6ba4570756b152ab34d39dde9`: API013, the controller-
 generation-owned observer, immutable evidence writer, transition Helm surface,
-and focused real-PostgreSQL/observer/Helm tests pass locally. G1Sc is authored
-simultaneously as draft PR #1523 with cleanup commit
-`2fe5b0e25dea9830c7ff92b75b8e1812589fa7ea`; its exact merge gate is recorded
+and focused real-PostgreSQL/observer/Helm tests pass locally. Its exact
+implementation head also passed every CI check; the sole first-attempt failure
+was an unchanged abrupt-parent-death process-group test that passed five
+consecutive local runs and the unmodified CI rerun. G1Sc is authored
+simultaneously as draft PR #1523 at
+`6010a240ef0c308f13a5566d33af9c0a1ca629a7`; its exact merge gate is recorded
 in that PR and below. It removes the observer flag, legacy grace-variable
 fallback, and sleep-only chart projection. G1Sc remains blocked until
 qualification.
@@ -2561,9 +2569,10 @@ approved canary:
 - [x] Merge G1Sa as PR #1519; author G1Sb executor-termination evidence on
   API013 as draft PR #1522 and G1Sc as draft PR #1523 with its exact merge
   gate.
-- [ ] Restack blocked G2 PR #1506 onto API014/Serve051 and PR #1510 immediately
-  above it onto API015/Serve052. Both remain on the stale pre-G1S lineage and
-  must not merge until the restack and adversarial re-review are complete.
+- [x] Restack blocked G2 PR #1506 onto API014/Serve051.
+- [x] Restack PR #1510 immediately above #1506 onto API015/Serve052.
+- [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
+  may merge until that review and the operational gates are complete.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs
@@ -2600,11 +2609,11 @@ approved canary:
 - [ ] Run three new consecutive pragmatic adversarial reviews against the exact
   frozen G1/G2 and reserved-fill heads. The 2026-08-15 material correction
   resets prior ordinary-only and Serve047-cleanup review counts to zero.
-- [ ] Author G1S and its stacked sleep-only cleanup. Validate the three-part
+- [x] Author G1S and its stacked sleep-only cleanup. Validate the three-part
   Helm shutdown budget, exact drain-marker ownership transition, real receipt
   completion, and typed executor-termination evidence across the complete
-  rollout/crash matrix. Do not treat Pod absence or lease expiry as automatic
-  execution proof.
+  rollout/crash matrix before its cleanup becomes merge-eligible. Do not treat
+  Pod absence or lease expiry as automatic execution proof.
 - [ ] Deploy G1S dark and pass one planned retirement per API, executor, and
   controller role plus one injected hard-kill quarantine test before enabling
   its automatic infrastructure certificate issuer or merging its cleanup.
