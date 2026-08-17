@@ -4,13 +4,14 @@ Status: P1, P2a, P2b1, and P2b2 are merged in PRs #1498, #1499, #1503, and
 #1504. PR #1521's partial-coverage in-flight observability, the complete G1S
 executor-termination precursor stack through PR #1528, PR #1529's exact
 reserved-fill deployment-policy bundle, P2d PR #1537, and PR #1540's closure
-of the untyped protocol-v2 fill batch path are also merged. The newest exact
-artifact is deployed directly with Helm as production revision 417 / release
-`1.1.1323`, merge commit
-`4a2a2579c9897c1087023159c9436f0203924e2a`, image digest
-`sha256:2c706d74bea2cb48789634ebd84046426627146f64c4d539d540b14ca3fbb78c`,
+of the untyped protocol-v2 fill batch path are also merged. PR #1542's
+supply-aware paid-residual bound is merged and qualified. The newest exact
+artifact is deployed directly with Helm as production revision 418 / release
+`1.1.1325`, merge commit
+`f5cf1c74cfe2c417a3551f70951f0191e762bad4`, image digest
+`sha256:e330fb42865854864645dcc603862b9c43185f70b2097f57e054f28a17e24a32`,
 and chart digest
-`sha256:5c86e58e6eeef319d371f4dfe9b10bd8ba107b6d735b934297876ec55da40f1f`.
+`sha256:586ee4ec9d764d906833430298459905a3260ca7fe19deede5b04683706edd07`.
 The Serve052/API-request-015 migration Job completed, the API reports protocol
 version 89, and the API plus both `boltz-l4-fleet` load-balancer slots are ready
 on the exact image with zero restarts. No service version, authority mode, or
@@ -272,6 +273,20 @@ supply reduces paid authority to zero even if an older exact-card map remains
 temporarily pinned for non-preemptive reconciliation. This is one additional
 guard on the canonical supply-aware path; it introduces no second allocator,
 fallback, timeout, or service-specific rule.
+
+PR #1542 merged that guard after all 31 required checks passed, including the
+complete unit-test shard. Revision 418 then deployed the exact merge artifact
+and completed its migration successfully. The API and both `boltz-l4-fleet`
+load-balancer slots converged to the exact image with zero restarts. Across
+repeated post-upgrade autoscaler cycles, the public conservative card map still
+held `L4: 6`, while observed scale-up decisions were protocol-2 zero-cost-only
+H200/A100-80GB grants. With fresh demand at 14 recent requests, 0.2333
+requests/second, four confirmed in-flight requests, and zero queue, the
+replica watermark remained 54530: no row at or above 54531 and no
+`sky.launch` request at or after the original 21:20 UTC audit boundary. The
+adjacent under-capacity regression also proves that removing both compatible
+materialized supply and its redundant paid source restores exactly one
+same-card cold-launch authority rather than suppressing a legitimate retry.
 
 Revision 408 made no authority promotion or service/config mutation. A
 post-rollout query found zero paid Spot rows with `created_at` at or after the
@@ -1745,7 +1760,7 @@ dark deployment gate.
   it dark as revision 417 / v1.1.1323, and prove repeated legacy H200
   decisions create zero new replica rows, launch threads, or `sky.launch`
   requests while ordinary batch entries remain unaffected.
-- [ ] Merge and deploy the supply-aware paid-residual bound. Reproduce the
+- [x] Merge and deploy the supply-aware paid-residual bound. Reproduce the
   live 40-slot hold with 31 paid L4 plus 112 compatible zero-cost A100/
   A100-80GB slots; prove the actuation map may retain its conservative card
   fence while cold paid authority and post-rollout `sky.launch` requests stay
