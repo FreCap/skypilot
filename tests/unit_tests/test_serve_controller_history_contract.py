@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import pickle
+import time
 import types
 from unittest import mock
 
@@ -222,6 +223,41 @@ def test_classification_writer_uses_independent_snapshot():
         request_data['request_classification_history'],
         request_history=request_data['request_history'],
     )
+
+
+def test_valid_classification_persists_with_malformed_arrival_snapshot():
+    instance = _controller()
+    bucket_start = int(time.time() // 60) * 60
+    request_data = {
+        'lb_session_id': 'lb-a',
+        'request_history_session_id': 'a' * 32,
+        'request_classification_history': {
+            'classification_version': 1,
+            'bucket_seconds': 60,
+            'buckets': [{
+                'bucket_start': bucket_start,
+                'classified_request_count': 2,
+                'counted_rejected_count': 1,
+            }],
+        },
+        'request_history': {
+            'bucket_seconds': 60,
+            'buckets': 'not-a-list',
+        },
+    }
+    engine = mock.MagicMock()
+    connection = engine.begin.return_value.__enter__.return_value
+
+    with mock.patch.object(controller.serve_history,
+                           '_postgres_engine',
+                           return_value=engine):
+        accepted = asyncio.run(
+            instance._persist_request_classification_history(  # pylint: disable=protected-access
+                request_data))
+
+    assert accepted is True
+    engine.begin.assert_called_once_with()
+    connection.execute.assert_called_once_with(mock.ANY)
 
 
 def test_future_classification_version_is_not_acknowledged():

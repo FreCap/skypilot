@@ -1274,9 +1274,17 @@ def record_request_classification(
         request_classification_history, observed_at)
     support_rows = []
     if request_history is not None:
-        support_rows = _request_history_rows(service_name, service_hash,
-                                             reporter_session_id,
-                                             request_history, observed_at)
+        try:
+            support_rows = _request_history_rows(service_name, service_hash,
+                                                 reporter_session_id,
+                                                 request_history, observed_at)
+        except ValueError:
+            # Classification and arrival history have independent
+            # acknowledgements. Preserve a valid terminal-classification
+            # snapshot even when its optional arrival snapshot is malformed;
+            # the generic writer will acknowledge and drop that sibling
+            # snapshot without promoting false support evidence.
+            support_rows = []
         for support_row in support_rows:
             support_row['request_count'] = 0
             support_row['rejected_count'] = 0
