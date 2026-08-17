@@ -1,7 +1,9 @@
 """PostgreSQL contracts for durable provider-free SkyServe routes."""
 # pylint: disable=not-callable,redefined-outer-name,unused-import
 
+import concurrent.futures
 import datetime
+import threading
 import time
 import types
 import uuid
@@ -310,6 +312,135 @@ def test_probe_result_batch_isolates_stale_sibling(route_database):
             ).order_by(route_projection_schema.serve_route_replica_leases_table.
                        c.replica_id)).all()
     assert rows == [(1, False), (2, True)]
+
+
+def test_material_batch_has_fixed_statement_count_and_joined_target_read(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    identity = _identity(incarnation)
+    entries = []
+    for replica_id in range(1, 4):
+        record_id = str(uuid.uuid4())
+        _insert_replica(engine, record_id, replica_id=replica_id)
+        entries.append((
+            types.SimpleNamespace(replica_id=replica_id,
+                                  replica_record_id=record_id,
+                                  version=1),
+            _material(f'http://10.0.0.{replica_id}:8000'),
+        ))
+
+    statements = []
+
+    def _record_statement(*args):
+        del args
+        statements.append(None)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _record_statement)
+    try:
+        receipts = repository.upsert_replica_materials(identity, entries)
+        material_statement_count = len(statements)
+        statements.clear()
+        targets = repository.list_probe_targets(identity)
+        target_statement_count = len(statements)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _record_statement)
+
+    assert len(receipts) == 3
+    assert [receipt.material_generation for receipt in receipts] == [1, 1, 1]
+    # The material transaction is owner, replicas, histories, sibling revoke,
+    # bulk upsert, and ranked history prune regardless of fleet batch size.
+    assert material_statement_count == 6
+    # Probe targets are one owner fence and one lease/current-replica join.
+    assert target_statement_count == 2
+    assert [target.replica_id for target in targets] == [1, 2, 3]
+
+
+def test_material_batch_isolates_revoked_and_stale_siblings(route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    identity = _identity(incarnation)
+    record_ids = [str(uuid.uuid4()) for _ in range(3)]
+    infos = []
+    for replica_id, record_id in enumerate(record_ids, start=1):
+        _insert_replica(engine, record_id, replica_id=replica_id)
+        infos.append(
+            types.SimpleNamespace(replica_id=replica_id,
+                                  replica_record_id=record_id,
+                                  version=1))
+    repository.upsert_replica_materials(
+        identity, [(info, _material(f'http://10.0.0.{info.replica_id}:8000'))
+                   for info in infos])
+    assert repository.revoke_replica(identity, 1, record_ids[0],
+                                     'scale_down_admitted') == 1
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 2).values(
+                    status='SHUTTING_DOWN'))
+
+    receipts = repository.upsert_replica_materials(identity, [
+        (infos[0], _material('http://10.0.1.1:8000')),
+        (infos[1], _material('http://10.0.1.2:8000')),
+        (infos[2], _material('http://10.0.1.3:8000')),
+    ])
+
+    assert len(receipts) == 1
+    assert receipts[0].material_generation == 2
+    targets = repository.list_probe_targets(identity)
+    assert [target.replica_id for target in targets] == [3]
+    assert targets[0].route_url == 'http://10.0.1.3:8000'
+
+
+def test_material_batch_serializes_replica_replacement(route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    old_record_id = str(uuid.uuid4())
+    new_record_id = str(uuid.uuid4())
+    _insert_replica(engine, old_record_id)
+    old_info = types.SimpleNamespace(replica_id=1,
+                                     replica_record_id=old_record_id,
+                                     version=1)
+
+    blocker = engine.connect()
+    transaction = blocker.begin()
+    replica_lock_attempted = threading.Event()
+
+    def _observe_lock_attempt(_connection, _cursor, statement, *_args):
+        if 'FROM replicas' in statement and 'FOR UPDATE' in statement:
+            replica_lock_attempted.set()
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _observe_lock_attempt)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        blocker.execute(
+            sqlalchemy.update(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == 'svc',
+                serve_state_schema.replicas_table.c.replica_id == 1).values(
+                    replica_state={'replica_record_id': new_record_id}))
+        future = executor.submit(repository.upsert_replica_materials,
+                                 _identity(incarnation),
+                                 [(old_info, _material())])
+        assert replica_lock_attempted.wait(timeout=5)
+        assert not future.done()
+        transaction.commit()
+        assert future.result(timeout=5) == []
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        executor.shutdown(wait=True)
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _observe_lock_attempt)
+        blocker.close()
+
+    with engine.connect() as connection:
+        assert connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                route_projection_schema.serve_route_replica_leases_table)
+        ).scalar_one() == 0
 
 
 def test_revocation_rejects_delayed_probe_and_implicit_revival(route_database):
