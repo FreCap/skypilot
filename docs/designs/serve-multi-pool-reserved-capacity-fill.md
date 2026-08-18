@@ -4,18 +4,23 @@ Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
-#1547, #1548, #1549, and #1552. Production Helm revision 428 / release `1.1.1335`
-runs the exact 2 API / 2 controller / 2 executor split-role cohort on RWX
-storage. Service version 61 has `min_replicas: 0`, a zero fill floor, and a
-utilization gate, but its immutable PHX projection was committed before the
-server configuration converged and still names `gpu-binpack-scheduler`.
+#1547, #1548, #1549, #1552, and #1553. Production Helm revision 429 / release
+`1.1.1336` runs the exact 2 API / 2 controller / 2 executor split-role cohort
+on RWX storage. Service version 61 has `min_replicas: 0`, a zero fill floor,
+and a utilization gate, but its immutable PHX projection was committed before
+the server configuration converged and still names `gpu-binpack-scheduler`.
 It is therefore not an activation candidate. Production committed and elected
-successor version 62 on 2026-08-18. Exact database readback proves its PHX H200
-projection uses `default-scheduler`, `be`/`be-ls`, priority -1000/`Never`,
+successor version 62 on 2026-08-18, and the live controller has applied its
+configuration. Exact database readback proves its PHX H200 projection uses
+`default-scheduler`, `be`/`be-ls`, priority -1000/`Never`,
 `skypilot-pool-sa`, and no Pod Identity role; both east projections retain
-`gpu-binpack-scheduler`. Version 58 remains the only active version. The
-reconciliation gate remains `LEGACY_ACTIVE`; no cleanup or final service
-activation is approved yet.
+`gpu-binpack-scheduler`. Version 58 remains the only active version because a
+true scale-to-zero successor has no reason to manufacture a ready replica
+without admitted demand. The reconciliation gate remains `LEGACY_ACTIVE`; no
+cleanup or final service activation is approved yet. Adversarial review also
+found that the separately exposed demand and actuation promotions leave an
+observable intermediate authority pair; phase 2e closes that cutover race
+before activation.
 
 The first revision-423 activation attempt failed closed before durable
 mutation. The common typed reclaim view required non-null Kueue admission for
@@ -95,9 +100,14 @@ live Kueue v0.19 configuration relies on the upstream default for
 `AssignQueueLabelsForPods`; the attested contract deliberately requires the
 gate to be explicit. The platform correction pins it `true` independently of
 TAS rather than weakening attestation or installing a second scheduler. East
-proved its exact custom scheduler, selectors, GPU products, and capacity, but
-failed only because its two provider-owned ResourceFlavors now expose the
-same `hyperpod` topology that the immutable inventory had left null.
+initially failed only because its two provider-owned ResourceFlavors expose the
+same `hyperpod` topology that the immutable inventory had left null. PR #1553
+bound that exact topology and production revision 429 now passes the complete
+east AWS and Kubernetes proof. Platform PRs #8631 and #8638 published the PHX
+gate as immutable external bundle `v5.57.2`; PR #8639 merged the PHX-only
+environment pin. The fresh two-context preflight now fails only on the still
+unapplied live PHX gate: PHX AWS identity passes, while Kubernetes reports
+`Kueue Pod integration or a required feature gate is disabled`.
 
 At 2026-08-18 01:01 UTC the service had real demand (queue depth 325,
 confirmed in-flight 106, and 98 recent requests in 60 seconds). Paid Spot
@@ -107,6 +117,58 @@ committed. The PR #1542 guard is deliberately narrower and cannot correct a
 service that has not committed projections and promoted the durable reserved
 path. The long-term correction is the one canonical sequenced path below, not
 a broader legacy heuristic.
+
+At 2026-08-18 14:06 UTC the durable protocol-v2 LB report was fresh and
+complete with 21 asynchronous predictions processing, zero HTTP in-flight,
+zero queued, zero recent rejected, and 368 completed predictions in the prior
+ten minutes. The controller nevertheless reported `in_flight_total: null`
+because the service still selects `LEGACY_CONTROLLER` demand. Route ownership
+is already `DURABLE_PROJECTED` at epoch 1; it is not a remaining promotion.
+This exact split explains the dashboard gap and makes an artificial
+pre-promotion H200 replica the wrong gate. The clean order is: apply and attest
+the worker contract, activate sequenced reconciliation, promote bound then
+generic launch authority, atomically promote the durable demand report and
+durable grant-before-row actuation, and prove the first real-demand H200
+admission on that final path. A temporary replica floor or direct-fill canary
+would violate scale-to-zero and test the path being removed.
+
+The atomic promotion is required, not merely operator convenience. The current
+separate controller transitions each hold the actuation generation odd only
+for their own request. Durable demand is a prerequisite of durable actuation,
+so invoking the two endpoints in order exposes an even-generation interval in
+which a reconciliation tick can observe `DURABLE_FEED` with
+`DIRECT_REPLICA`. Zero-cost-first planning prevents paid spill in that interval,
+but a direct replica can still become the first H200 admission and preserve the
+transition path as a second happy path. The steady-state endpoint must hold one
+odd actuation generation and the routing-state linearization lock while one
+PostgreSQL transaction validates both capability barriers and advances both
+epochs. Only after that transaction commits may the controller install the
+durable manager mode and release reconciliation. A post-commit in-memory
+installation failure permanently fences that child and delegates recovery to
+the supervisor; restart reads the already-atomic durable modes. The separate
+promotion endpoints are transition-only compatibility surfaces, are deprecated
+for activation, and are removed in the stacked cleanup after the production
+horizon.
+
+The stale demand selector is also the immediate blocker for an existing paid
+retirement wave, not only a dashboard presentation bug. At 2026-08-18 14:19
+UTC, all 151 Spot rows were still `SHUTTING_DOWN` with
+`sky_down_status=SCHEDULED`, `wait_for_idle_before_termination=true`, and an
+uncommitted logical-retirement fence despite being 12.6--32.7 hours old and
+having a 3,900-second drain cap. A read-only provider query through each
+server-owned workspace proved that 116 GCP L4 instances were still `UP` (106
+in `asia-northeast3`, 10 in `us-east4`); 35 GCP targets and the sole AWS target
+were already absent. The controller reports the exact cause every 120 seconds:
+the legacy autoscaler signal is stale, its exact-card target is incomplete, and
+logical-retirement recovery therefore has no fresh coherent target/capacity
+snapshot from which to commit teardown. This is correct fail-closed behavior
+for ambiguous demand, but it makes durable-demand promotion a cost-critical
+production gate. After promotion, recovery must re-fence the old-version
+retirements under a newer complete snapshot, retain only the capacity needed
+for the authenticated target, and drive ordinary `sky.down` for the rest.
+Provider absence, not row deletion or cached SkyPilot status, is the completion
+proof. If the promoted feed does not produce that snapshot, fix the canonical
+durable snapshot/recovery path before any manual cleanup.
 
 An activation preflight on 2026-08-18 also found that the mechanical
 transition still required the historical *exact* Serve047/API011 revisions,
@@ -124,7 +186,8 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (split-role production preflight and typed scheduler/Kueue reclaim authority)
+Last updated: 2026-08-18 (revision-429 preflight evidence and canonical
+promotion/admission order)
 
 Canonical owner: this file
 
@@ -2265,13 +2328,14 @@ either case.
 | 1 | Observation ledger, admission sequence, authenticated map, coordinator, pure planner, manager receipt, diagnostics, and Serve045/046 reclaim-policy identity | Merged in source PR #1451. Its prior freeze/reviews are historical evidence, not a pass for the current stack. |
 | 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
 | 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Merged in PR #1492 and published as v1.1.1284; removable only after the v18 normalization receipt. Its rollout is `LEGACY_ACTIVE` only. |
-| 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed as direct Helm revision 407 / release 1.1.1310; all service authority modes remain legacy. |
+| 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed. Route authority is live at `DURABLE_PROJECTED` epoch 1; ordinary binding and demand remain legacy. |
 | 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
 | 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
-| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Required next. Remove the stale east inference association, publish/deploy the policy fix directly with Helm, and require a successful full two-context preflight. |
+| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. The PHX `AssignQueueLabelsForPods=true` platform pin is merged but still requires its zero-replacement production apply and a successful full two-context preflight. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.2. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
+| 2e | Atomic per-service durable-demand plus durable-actuation promotion | Required before activation. Replace the two promotion requests with one controller fence and one PostgreSQL transaction; deprecate the separate promotion surfaces and create their stacked removal. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -3357,17 +3421,21 @@ legacy activation.
   fail-closed preflight without widening the writer role. Revision 428 proves
   both AWS and Kubernetes reads use the exact assumed audit sessions; exact
   east Pod Identity association `a-rsvzwdtaesxvxorkh` is absent.
-- [ ] Deploy the immutable east `topologyName: hyperpod` inventory correction
-  and the platform-owned explicit PHX `AssignQueueLabelsForPods: true` pin,
-  then obtain one fresh successful two-context preflight.
+- [ ] Complete the PHX-only production plan/apply for external bundle
+  `v5.57.2`, require zero destroy/replacement, and obtain one fresh successful
+  two-context preflight. The immutable east `topologyName: hyperpod` inventory
+  correction is deployed and the complete east proof passes; the explicit PHX
+  gate and environment pin are merged but not yet live.
 - [x] Commit and elect successor version 62 whose non-null immutable east and
   PHX worker projections exactly match the corrected server configuration.
   Version 58 remains the only active version until the remaining preflight and
   authority gates pass.
-- [ ] Prove one zero-cost PHX H200 Pod is admitted through `be` ->
-  `skypilot-be` with `be-ls`, the -1000/`Never` Pod priority,
+- [ ] After the sequenced, bound/generic, durable-demand, and durable-actuation
+  promotions below, prove one real-demand zero-cost PHX H200 Pod is admitted
+  through `be` -> `skypilot-be` with `be-ls`, the -1000/`Never` Pod priority,
   `skypilot-pool-sa`, `default-scheduler`, a Kueue TAS assignment, and exact
-  H200/cluster identity. Do not launch paid compute for this gate.
+  H200/cluster identity. Do not create a temporary floor, use direct fill, or
+  launch paid compute for this gate.
 - [x] Implement P2d Serve052 grant-before-row actuation in PR #1537 and deploy
   it dark. Under a held physical pool lane, require one bounded intent, zero
   replica/request rows, and sibling pool progress; production evidence remains
@@ -3375,23 +3443,34 @@ legacy activation.
 - [x] Resolve PR #1524 by semantic comparison rather than merging its
   conflicting 109-file branch. G1 recovery contracts shipped through
   #1519/#1526/#1527/#1528; #1524 is closed as superseded.
-- [ ] Commit and elect one clean service version, then promote ordinary
-  binding, generic non-pool binding, route, demand, reserved reconciliation,
-  `DURABLE_INTENT` actuation, and resource-action authority through their
-  canonical generation-fenced transactions. Promotion is one way and
-  fix-forward only.
+- [ ] Activate reserved reconciliation, promote ordinary binding and generic
+  non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
+  through one canonical generation-fenced transaction. No reconciliation tick
+  may observe the intermediate `DURABLE_FEED`/`DIRECT_REPLICA` pair. Version 62
+  is already committed, elected, and controller-applied; route authority is
+  already
+  `DURABLE_PROJECTED` at epoch 1 and must be verified rather than promoted.
+  Resource-action authority remains gated by its separate shadow horizon.
+  Promotion is one way and fix-forward only.
 - [ ] With authenticated live demand, prove 80--90 eligible H200 workloads are
   durably submitted within a few minutes, multiple Pods initialize
   concurrently, and a held pool lane does not block another pool.
 - [ ] Prove reserved supply is committed before the paid residual, no new Spot
-  launches occur while compatible reserved supply covers demand, existing Spot
-  drains, and `SHUTTING_DOWN` resources terminate and cease billing.
+  launches occur while compatible reserved supply covers demand, and the 151
+  existing Spot retirements converge from a fresh exact-card durable-demand
+  snapshot. Re-query provider truth until the 116 observed live GCP instances
+  are absent, let the normal cleanup path remove the 36 already-absent targets,
+  and confirm `SHUTTING_DOWN` resources cease billing without manual row
+  deletion.
 - [ ] Adjudicate orphaned/ambiguous historical rows only from durable
   quiescence and provider evidence. Keep historical failed rows out of current
   capacity, placement, and UI totals without deleting evidence-bearing rows.
-- [ ] Expose fresh confirmed-processing, queued, in-flight, and completed
-  request counters independently of provider/controller stalls, with paid,
-  reserved, provisioning, shutting-down, and historical-failed replica classes.
+- [ ] Promote the fresh durable demand report and verify the dashboard exposes
+  confirmed processing, queued, in-flight, rejected, completed, and freshness
+  independently of provider/controller stalls. The underlying LB report and
+  prediction-history rows are already fresh; the live gap is the selected
+  legacy demand source. Also separate paid, reserved, provisioning,
+  shutting-down, and historical-failed replica classes.
 - [ ] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests.
