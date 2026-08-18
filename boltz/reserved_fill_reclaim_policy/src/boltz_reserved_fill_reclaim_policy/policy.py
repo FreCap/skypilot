@@ -88,10 +88,18 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             raise reclaim.ReclaimAttestationError(
                 'The projected accelerator is not allowlisted in this context.')
         kueue_admission = context['kueue_admission']
-        if not isinstance(kueue_admission, Mapping):
+        if kueue_admission is None:
+            admission_mode = reclaim.ReclaimAdmissionMode.KUBERNETES_SCHEDULER
+            local_queue_name = None
+            workload_priority_class_name = None
+        elif isinstance(kueue_admission, Mapping):
+            admission_mode = reclaim.ReclaimAdmissionMode.KUEUE
+            local_queue_name = kueue_admission['local_queue_name']
+            workload_priority_class_name = (
+                kueue_admission['workload_priority_class_name'])
+        else:
             raise reclaim.ReclaimAttestationError(
-                'The projected context has no managed Kueue reclaim '
-                'contract.')
+                'The reviewed fleet admission contract is malformed.')
         expected_scheduling = reclaim.ReclaimAcceleratorScheduling(
             label_key=accelerator['product_label_key'],
             label_values=tuple(sorted(accelerator['product_label_values'])),
@@ -106,10 +114,10 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 admission.priority_class_name != priority['name'] or
                 admission.priority_value != priority['value'] or
                 admission.preemption_policy != priority['preemption_policy'] or
-                admission.local_queue_name
-                != kueue_admission['local_queue_name'] or
+                admission.admission_mode is not admission_mode or
+                admission.local_queue_name != local_queue_name or
                 admission.workload_priority_class_name
-                != kueue_admission['workload_priority_class_name'] or
+                != workload_priority_class_name or
                 admission.accelerator_count != accelerator['count'] or
                 admission.accelerator_scheduling != expected_scheduling):
             raise reclaim.ReclaimAttestationError(
