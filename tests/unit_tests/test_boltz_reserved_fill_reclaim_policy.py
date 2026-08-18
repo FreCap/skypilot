@@ -1451,13 +1451,22 @@ def test_kubernetes_snapshot_proves_unmanaged_context_without_kueue_reads():
     assert proof.assign_queue_labels_for_pods is None
     assert proof.topology_aware_scheduling is None
     assert proof.custom_scheduler_deployment_proven
-    assert proof.resource_flavor_topology_names == (('ml.p4d.24xlarge', None),
-                                                    ('ml.p4de.24xlarge', None))
+    assert proof.resource_flavor_topology_names == (
+        ('ml.p4d.24xlarge', 'hyperpod'),
+        ('ml.p4de.24xlarge', 'hyperpod'),
+    )
 
     snapshot['namespace']['metadata']['labels'][
         'boltz.bio/kueue-managed'] = 'true'
     with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
                        match='carries the managed Kueue label'):
+        kubernetes_attestation.validate_snapshot(context, provider, snapshot)
+
+    snapshot = _unmanaged_kubernetes_snapshot(context, provider)
+    snapshot['resource_flavors']['ml.p4d.24xlarge']['spec'][
+        'topologyName'] = 'wrong'
+    with pytest.raises(kubernetes_attestation.KubernetesAttestationError,
+                       match='topology'):
         kubernetes_attestation.validate_snapshot(context, provider, snapshot)
 
 
