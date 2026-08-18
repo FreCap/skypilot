@@ -152,6 +152,79 @@ def test_version_history_marks_elected_and_active_versions():
     }]
 
 
+def test_version_history_metadata_does_not_render_yaml():
+    record = {
+        'pool': False,
+        'elected_version': 1,
+        'active_versions': [1],
+    }
+    version_record = {
+        'version': 1,
+        'spec':
+            mock.Mock(autoscaling_policy_str=mock.Mock(return_value='policy-1')
+                     ),
+        'yaml_content': 'large: compiled-yaml',
+        'submitted_yaml_content': 'large: submitted-yaml',
+        'created_at': 1001.0,
+        'created_by': 'user-1',
+        'quarantined_at': None,
+        'quarantine_reason': None,
+        'controller_job_projection': None,
+        'controller_work_cache': None,
+        'worker_placement_projections': None,
+    }
+    with mock.patch.object(server.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(server.serve_state,
+                           'get_version_records',
+                           return_value=[version_record]) as get_versions, \
+         mock.patch.object(server,
+                           '_redact_version_yaml',
+                           side_effect=AssertionError('must remain lazy')):
+        history = server._service_version_history('svc', include_yaml=False)
+
+    get_versions.assert_called_once_with('svc', include_yaml=False)
+
+    assert history['versions'][0]['submitted_yaml_content'] is None
+    assert history['versions'][0]['compiled_yaml_content'] is None
+    assert history['versions'][0]['yaml_included'] is False
+
+
+def test_version_detail_reads_only_requested_version():
+    request = types.SimpleNamespace(state=types.SimpleNamespace(auth_user=None))
+    record = {
+        'pool': False,
+        'elected_version': 3,
+        'active_versions': [3],
+    }
+    version_record = {
+        'version': 2,
+        'spec': None,
+        'yaml_content': 'compiled: yaml',
+        'submitted_yaml_content': 'submitted: yaml',
+        'created_at': 1002.0,
+        'created_by': 'user-2',
+        'quarantined_at': None,
+        'quarantine_reason': None,
+        'controller_job_projection': None,
+        'controller_work_cache': None,
+        'worker_placement_projections': None,
+    }
+    with mock.patch.object(server.serve_state,
+                           'get_service_from_name',
+                           return_value=record), \
+         mock.patch.object(server.serve_state,
+                           'get_version_record',
+                           return_value=version_record) as get_version:
+        detail = server.version_detail(request, 'svc', 2)
+
+    get_version.assert_called_once_with('svc', 2)
+    assert detail['version'] == 2
+    assert detail['submitted_yaml_content'] == 'submitted: yaml\n'
+    assert detail['compiled_yaml_content'] == 'compiled: yaml\n'
+
+
 def test_elect_version_reuses_safe_update_path():
     task = mock.Mock()
     lifecycle_lock = contextlib.nullcontext()

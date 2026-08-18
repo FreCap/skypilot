@@ -5196,7 +5196,7 @@ class TestRecoveryVersionSelection:
 
     def test_version_records_include_commit_provenance(self, _mock_serve_db,
                                                        monkeypatch):
-        timestamps = iter([1001.0, 1002.0])
+        timestamps = iter([1000.0, 1001.0])
         monkeypatch.setattr(serve_state.time, 'time', lambda: next(timestamps))
         assert _add_minimal_service('svc',
                                     spec=_service_spec('spec-1'),
@@ -5218,7 +5218,7 @@ class TestRecoveryVersionSelection:
             'spec': 'spec-1',
             'yaml_content': 'yaml: v1',
             'submitted_yaml_content': 'submitted: v1',
-            'created_at': 1001.0,
+            'created_at': 1000.0,
             'created_by': 'alice',
             'quarantined_at': None,
             'quarantine_reason': None,
@@ -5230,7 +5230,7 @@ class TestRecoveryVersionSelection:
             'spec': 'spec-2',
             'yaml_content': 'yaml: v2',
             'submitted_yaml_content': 'submitted: v2',
-            'created_at': 1002.0,
+            'created_at': 1001.0,
             'created_by': 'bob',
             'quarantined_at': None,
             'quarantine_reason': None,
@@ -5238,6 +5238,21 @@ class TestRecoveryVersionSelection:
             'controller_work_cache': None,
             'worker_placement_projections': None,
         }]
+
+        version_two = serve_state.get_version_record('svc', 2)
+        assert version_two is not None
+        assert version_two['version'] == 2
+        assert version_two['spec'].test_label == 'spec-2'
+        assert version_two['yaml_content'] == 'yaml: v2'
+        assert serve_state.get_version_record('svc', 3) is None
+        with pytest.raises(ValueError, match='positive integer'):
+            serve_state.get_version_record('svc', True)
+
+        metadata = serve_state.get_version_records('svc', include_yaml=False)
+        assert [record['version'] for record in metadata] == [1, 2]
+        assert all(record['yaml_content'] is None for record in metadata)
+        assert all(
+            record['submitted_yaml_content'] is None for record in metadata)
 
     def test_quarantine_is_durable_and_applicable_snapshot_skips_it(
             self, _mock_serve_db):
