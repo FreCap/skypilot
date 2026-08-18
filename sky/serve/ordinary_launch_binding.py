@@ -31,6 +31,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission
+from sky.serve import capacity_authority
 from sky.serve import constants as serve_constants
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import route_projection
@@ -4031,6 +4032,16 @@ def transfer_service_owner_in_connection(
                 controller_port=None))
     if updated.rowcount != 1:
         raise OrdinaryLaunchBindingConflict('Service owner transfer lost CAS.')
+    try:
+        capacity_authority.rebind_service_after_controller_takeover_in_connection(
+            connection,
+            service_name=service_name,
+            controller_incarnation=new_incarnation,
+            controller_owner_epoch=new_epoch)
+    except capacity_admission.CapacityAdmissionError as error:
+        raise OrdinaryLaunchBindingConflict(
+            'Controller transfer could not preserve capacity authority.'
+        ) from error
     route_projection.revoke_service_leases_in_session(
         connection, service_name, 'controller_owner_changed')
     connection.execute(
