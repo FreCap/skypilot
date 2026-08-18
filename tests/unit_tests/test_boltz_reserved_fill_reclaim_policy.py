@@ -303,7 +303,9 @@ def test_bundle_requires_one_scheduler_or_tas_topology_authority():
 def _admission(context: dict,
                accelerator: str) -> reclaim.ReclaimProjectedAdmission:
     kueue_admission = context['kueue_admission']
-    assert kueue_admission is not None
+    admission_mode = (reclaim.ReclaimAdmissionMode.KUBERNETES_SCHEDULER
+                      if kueue_admission is None else
+                      reclaim.ReclaimAdmissionMode.KUEUE)
     return reclaim.ReclaimProjectedAdmission(
         worker_projection_sha256='a' * 64,
         kubernetes_context=context['kubernetes_context'],
@@ -314,8 +316,11 @@ def _admission(context: dict,
         priority_class_name=context['priority_class']['name'],
         priority_value=context['priority_class']['value'],
         preemption_policy=context['priority_class']['preemption_policy'],
-        local_queue_name=kueue_admission['local_queue_name'],
+        admission_mode=admission_mode,
+        local_queue_name=(None if kueue_admission is None else
+                          kueue_admission['local_queue_name']),
         workload_priority_class_name=(
+            None if kueue_admission is None else
             kueue_admission['workload_priority_class_name']),
         accelerator=accelerator,
         accelerator_count=context['accelerators'][accelerator]['count'],
@@ -447,6 +452,7 @@ def test_unmanaged_context_cannot_claim_with_forged_admission(monkeypatch):
         priority_class_name=context['priority_class']['name'],
         priority_value=context['priority_class']['value'],
         preemption_policy=context['priority_class']['preemption_policy'],
+        admission_mode=reclaim.ReclaimAdmissionMode.KUEUE,
         local_queue_name='forged',
         workload_priority_class_name='forged',
         accelerator='a100',
@@ -470,12 +476,36 @@ def test_unmanaged_context_cannot_claim_with_forged_admission(monkeypatch):
         edges=(edge,))
 
     with pytest.raises(reclaim.ReclaimAttestationError,
-                       match='no managed Kueue reclaim contract'):
+                       match='reviewed fleet bundle'):
         policy.authorize_claim_set(scope,
                                    expected_identity=policy.policy_identity(),
                                    expected_gate_generation=7,
                                    deadline_monotonic=time.monotonic() + 5)
     provider_calls.assert_not_called()
+
+
+def test_unmanaged_context_accepts_exact_scheduler_admission(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    monkeypatch.setattr(policy, '_attest_contexts', _fake_attest(policy))
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    context = policy._bundle.fleet_context('prod_research_cluster_eks')
+    edge = _edge(context, 'a100')
+    scope = reclaim.ReclaimClaimSetScope(
+        service_name='east-scheduler',
+        service_incarnation='incarnation-east-scheduler',
+        service_version=1,
+        semantic_hash='semantic-east-scheduler',
+        edges=(edge,))
+
+    authorization = policy.authorize_claim_set(
+        scope,
+        expected_identity=policy.policy_identity(),
+        expected_gate_generation=7,
+        deadline_monotonic=time.monotonic() + 5)
+
+    assert authorization.scope == scope
+    assert edge.projected_admissions[0].admission_mode is (
+        reclaim.ReclaimAdmissionMode.KUBERNETES_SCHEDULER)
 
 
 def test_claim_set_rejects_duplicate_physical_card_atom(monkeypatch):

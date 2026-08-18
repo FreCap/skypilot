@@ -79,6 +79,7 @@ def _admission(
         priority_class_name='inference-low',
         priority_value=-1000,
         preemption_policy='Never',
+        admission_mode=attestation.ReclaimAdmissionMode.KUEUE,
         local_queue_name='inference',
         workload_priority_class_name='inference-low',
         accelerator=accelerator,
@@ -112,6 +113,57 @@ def test_projected_admission_requires_typed_accelerator_scheduling() -> None:
     with pytest.raises(ValueError,
                        match='accelerator_scheduling must be typed'):
         dataclasses.replace(_admission(), accelerator_scheduling=None)
+
+
+def test_projected_admission_accepts_scheduler_authority_without_kueue(
+) -> None:
+    admission = dataclasses.replace(
+        _admission(),
+        scheduler_name='gpu-binpack-scheduler',
+        admission_mode=attestation.ReclaimAdmissionMode.KUBERNETES_SCHEDULER,
+        local_queue_name=None,
+        workload_priority_class_name=None)
+
+    assert admission.admission_mode is (
+        attestation.ReclaimAdmissionMode.KUBERNETES_SCHEDULER)
+    assert admission.local_queue_name is None
+    assert admission.workload_priority_class_name is None
+
+
+def test_projection_derives_scheduler_authority_without_kueue() -> None:
+    admission = attestation.projected_admission_from_worker_projection(
+        {
+            'kubernetes_context': 'research',
+            'namespace': 'inference',
+            'service_account_name': 'inference-sa',
+            'pod_identity_role_arn': None,
+            'scheduler_name': 'gpu-binpack-scheduler',
+            'priority_class_name': 'inference-low',
+            'priority_value': -1000,
+            'preemption_policy': 'Never',
+            'kueue_admission': None,
+            'accelerator_name': 'A100',
+            'accelerator_count': 1,
+            'accelerator_scheduling': {
+                'label_key': 'nvidia.com/gpu.product',
+                'label_values': ['NVIDIA-A100-SXM4-40GB'],
+                'resource_key': 'nvidia.com/gpu',
+            },
+        },
+        worker_projection_sha256='f' * 64)
+
+    assert admission.admission_mode is (
+        attestation.ReclaimAdmissionMode.KUBERNETES_SCHEDULER)
+    assert admission.scheduler_name == 'gpu-binpack-scheduler'
+    assert admission.local_queue_name is None
+
+
+def test_projected_admission_rejects_mode_payload_mismatch() -> None:
+    with pytest.raises(ValueError, match='cannot carry Kueue queue identity'):
+        dataclasses.replace(
+            _admission(),
+            admission_mode=(
+                attestation.ReclaimAdmissionMode.KUBERNETES_SCHEDULER))
 
 
 def test_accelerator_scheduling_requires_canonical_label_values() -> None:
@@ -274,9 +326,9 @@ def test_activation_receipt_projection_is_deterministic() -> None:
     assert first.identity == _evidence(claims).identity
     assert first.claim_scope_count == 2
     assert first.claim_scope_sha256 == (
-        '5c9d7b3121d21d0f4cfe69e69fffa9cc5122ce495362b78166b868f46ac89e9b')
+        '9fad48ed2c59631c2d0c4433edf8e0f7785a5667734288e980aa2f340e454264')
     assert first.evidence_sha256 == (
-        'a96074f69933c8bf91e13cde0b2f629e974267dabc6bec5eebc6cb7533662f1a')
+        'c0d6c131d94380ef7210fd855d562c55b15ca8833b036053cb26d13d393a7f9b')
 
 
 @pytest.mark.parametrize(

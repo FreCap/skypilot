@@ -46,6 +46,13 @@ class ReclaimEnforcementContract(str, enum.Enum):
         'GLOBAL_FLEET_CLAIM_ADMISSION_AND_LAUNCH_FENCES_V2')
 
 
+class ReclaimAdmissionMode(str, enum.Enum):
+    """Closed worker-admission authorities accepted by reclaim policy."""
+
+    KUBERNETES_SCHEDULER = 'KUBERNETES_SCHEDULER'
+    KUEUE = 'KUEUE'
+
+
 def _require_nonempty_text(value: object, name: str) -> str:
     if type(value) is not str or not value:
         raise ValueError(f'{name} must be nonempty text.')
@@ -109,7 +116,7 @@ class ReclaimAcceleratorScheduling:
 
 @dataclasses.dataclass(frozen=True, order=True)
 class ReclaimProjectedAdmission:
-    """Exact immutable Kubernetes/Kueue admission for one worker candidate."""
+    """Exact immutable Kubernetes admission for one worker candidate."""
 
     worker_projection_sha256: str
     kubernetes_context: str
@@ -120,8 +127,9 @@ class ReclaimProjectedAdmission:
     priority_class_name: str
     priority_value: int
     preemption_policy: str
-    local_queue_name: str
-    workload_priority_class_name: str
+    admission_mode: ReclaimAdmissionMode
+    local_queue_name: str | None
+    workload_priority_class_name: str | None
     accelerator: str
     accelerator_count: int
     accelerator_scheduling: ReclaimAcceleratorScheduling
@@ -136,11 +144,19 @@ class ReclaimProjectedAdmission:
             ('scheduler_name', self.scheduler_name),
             ('priority_class_name', self.priority_class_name),
             ('preemption_policy', self.preemption_policy),
-            ('local_queue_name', self.local_queue_name),
-            ('workload_priority_class_name', self.workload_priority_class_name),
             ('accelerator', self.accelerator),
         ):
             _require_nonempty_text(value, name)
+        if not isinstance(self.admission_mode, ReclaimAdmissionMode):
+            raise ValueError('admission_mode must be typed.')
+        if self.admission_mode is ReclaimAdmissionMode.KUEUE:
+            _require_nonempty_text(self.local_queue_name, 'local_queue_name')
+            _require_nonempty_text(self.workload_priority_class_name,
+                                   'workload_priority_class_name')
+        elif (self.local_queue_name is not None or
+              self.workload_priority_class_name is not None):
+            raise ValueError('Kubernetes scheduler admission cannot carry '
+                             'Kueue queue identity.')
         if self.pod_identity_role_arn is not None:
             _require_nonempty_text(self.pod_identity_role_arn,
                                    'pod_identity_role_arn')
@@ -171,9 +187,19 @@ def projected_admission_from_worker_projection(
     if not isinstance(projection, Mapping):
         raise ValueError('Worker projection must be a mapping.')
     kueue_admission = projection.get('kueue_admission')
-    if not isinstance(kueue_admission, Mapping):
-        raise ValueError('Sequenced reclaim requires projected Kueue '
-                         'admission.')
+    if kueue_admission is None:
+        admission_mode = ReclaimAdmissionMode.KUBERNETES_SCHEDULER
+        local_queue_name = None
+        workload_priority_class_name = None
+    elif isinstance(kueue_admission, Mapping):
+        admission_mode = ReclaimAdmissionMode.KUEUE
+        local_queue_name = typing.cast(str,
+                                       kueue_admission.get('local_queue_name'))
+        workload_priority_class_name = typing.cast(
+            str, kueue_admission.get('workload_priority_class_name'))
+    else:
+        raise ValueError('Projected Kueue admission must be null or a '
+                         'mapping.')
     priority_class_name = projection.get('priority_class_name')
     priority_value = projection.get('priority_value')
     preemption_policy = projection.get('preemption_policy')
@@ -209,10 +235,9 @@ def projected_admission_from_worker_projection(
         priority_class_name=priority_class_name,
         priority_value=priority_value,
         preemption_policy=preemption_policy,
-        local_queue_name=typing.cast(str,
-                                     kueue_admission.get('local_queue_name')),
-        workload_priority_class_name=typing.cast(
-            str, kueue_admission.get('workload_priority_class_name')),
+        admission_mode=admission_mode,
+        local_queue_name=local_queue_name,
+        workload_priority_class_name=workload_priority_class_name,
         accelerator=typing.cast(str, projection.get('accelerator_name')),
         accelerator_count=typing.cast(int, projection.get('accelerator_count')),
         accelerator_scheduling=scheduling,
