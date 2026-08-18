@@ -752,7 +752,9 @@ def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
                                    audit_session=audit_session)
 
 
-def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(monkeypatch):
+@pytest.mark.parametrize('already_frozen', [False, True])
+def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(
+        monkeypatch, already_frozen):
     frozen_credentials = object()
 
     class Credentials:
@@ -779,7 +781,7 @@ def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(monkeypatch):
 
         @staticmethod
         def get_credentials():
-            return Credentials()
+            return frozen_credentials if already_frozen else Credentials()
 
     signer_call = {}
 

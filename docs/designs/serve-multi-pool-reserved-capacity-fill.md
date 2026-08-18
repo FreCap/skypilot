@@ -4,7 +4,7 @@ Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
-#1547, #1548, and #1549. Production Helm revision 425 / release `1.1.1332`
+#1547, #1548, and #1549. Production Helm revision 426 / release `1.1.1333`
 runs the exact 2 API / 2 controller / 2 executor split-role cohort on RWX
 storage. Service version 61 has `min_replicas: 0`, a zero fill floor, and a
 utilization gate, but its immutable PHX projection was committed before the
@@ -76,6 +76,16 @@ from an in-memory kubeconfig document, verifies the `kube-system` UID before
 the object-read batch, and scrubs/closes that client after the proof. It never mutates the ambient
 kubeconfig, never grants audit reads to the ordinary writer identity, and
 never caches provider observations or bearer tokens.
+
+Revision 426 deployed the isolated audit-role Kubernetes client and the exact
+east association is now absent. Its first two-context preflight failed closed
+without durable activation because the EKS signer treated the bounded audit
+session's already-immutable botocore `ReadOnlyCredentials` as refreshable and
+called `get_frozen_credentials()` a second time. Both AWS inventory/identity
+proofs passed; both Kubernetes domains stopped at that local credential-shape
+error before API reads. The fix-forward signer accepts either botocore shape,
+freezing refreshable credentials once and passing already-frozen credentials
+directly to `RequestSigner`; tests cover both paths.
 
 At 2026-08-18 01:01 UTC the service had real demand (queue depth 325,
 confirmed in-flight 106, and 98 recent requests in 60 seconds). Paid Spot
@@ -3321,9 +3331,10 @@ legacy activation.
   `min_replicas: 0`. Production committed version 61, but its immutable PHX
   projection captured the retired scheduler and is not an activation
   candidate.
-- [ ] Deploy the isolated audit-role Kubernetes client, remove exact east Pod
-  Identity association `a-rsvzwdtaesxvxorkh`, and obtain one fresh successful
-  two-context preflight without widening the writer role.
+- [ ] Deploy the audit-role credential-shape fix after revision 426's
+  fail-closed preflight, then obtain one fresh successful two-context preflight
+  without widening the writer role. The isolated client is deployed and exact
+  east Pod Identity association `a-rsvzwdtaesxvxorkh` is already absent.
 - [x] Commit and elect successor version 62 whose non-null immutable east and
   PHX worker projections exactly match the corrected server configuration.
   Version 58 remains the only active version until the remaining preflight and

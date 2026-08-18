@@ -103,7 +103,12 @@ def _eks_bearer_token(audit_session: Any, *, region: str, cluster_name: str,
     if credentials is None:
         raise KubernetesAttestationError(
             'The audit role returned no signing credentials.')
-    frozen_credentials = credentials.get_frozen_credentials()
+    # boto3 Sessions normally expose refreshable botocore Credentials, but
+    # the deployment's bounded assumed-role session deliberately exposes an
+    # already-frozen ReadOnlyCredentials value. RequestSigner accepts both;
+    # freeze only when the provider supports that operation.
+    freeze = getattr(credentials, 'get_frozen_credentials', None)
+    frozen_credentials = freeze() if callable(freeze) else credentials
     signer = botocore_signers.RequestSigner(
         sts.meta.service_model.service_id,
         region,
