@@ -28,6 +28,8 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 CONFIG_KEY = "api_server_config"
 DESIRED_PATH = "/seed/config.yaml"
 PRUNE_RETIRED_KEYS_ENV = "SKYPILOT_PRUNE_RETIRED_SERVE_CONTROLLER_KEYS"
+CONFIG_TABLE_WAIT_ATTEMPTS = 120
+CONFIG_TABLE_WAIT_SECONDS = 5
 _RETIRED_SERVE_CONTROLLER_KEYS = (
     "consolidation_mode",
     "external_load_balancer",
@@ -59,8 +61,7 @@ def prune_retired_serve_controller_keys(config: dict) -> dict:
     if not isinstance(serve, dict):
         raise ValueError(
             f"serve config is not a mapping ({type(serve).__name__}); "
-            "refusing to prune retired controller keys"
-        )
+            "refusing to prune retired controller keys")
     if "controller" not in serve:
         return dict(config)
 
@@ -68,8 +69,7 @@ def prune_retired_serve_controller_keys(config: dict) -> dict:
     if not isinstance(controller, dict):
         raise ValueError(
             "serve.controller config is not a mapping "
-            f"({type(controller).__name__}); refusing to prune retired keys"
-        )
+            f"({type(controller).__name__}); refusing to prune retired keys")
 
     pruned_controller = dict(controller)
     for key in _RETIRED_SERVE_CONTROLLER_KEYS:
@@ -99,7 +99,9 @@ def seed(
     with engine.begin() as conn:
         row = conn.execute(
             text("select value from config_yaml where key = :k for update"),
-            {"k": CONFIG_KEY},
+            {
+                "k": CONFIG_KEY
+            },
         ).fetchone()
 
         existing = yaml.safe_load(row[0]) if row and row[0] else {}
@@ -109,8 +111,7 @@ def seed(
             # Never overwrite an unexpected payload — fail loud instead of wiping the config.
             sys.exit(
                 f"[seed] ABORT: api_server_config is not a mapping ({type(existing).__name__}); "
-                "refusing to overwrite"
-            )
+                "refusing to overwrite")
 
         merge_base = existing
         if prune_retired_controller_keys:
@@ -130,16 +131,20 @@ def seed(
             except ValueError as err:
                 sys.exit(f"[seed] ABORT: {err}")
         if merged == existing:
-            print("[seed] api_server_config already current; nothing to do", flush=True)
+            print("[seed] api_server_config already current; nothing to do",
+                  flush=True)
             return
 
-        new_value = yaml.safe_dump(merged, default_flow_style=False, sort_keys=False)
+        new_value = yaml.safe_dump(merged,
+                                   default_flow_style=False,
+                                   sort_keys=False)
         conn.execute(
-            text(
-                "insert into config_yaml (key, value) values (:k, :v) "
-                "on conflict (key) do update set value = :v"
-            ),
-            {"k": CONFIG_KEY, "v": new_value},
+            text("insert into config_yaml (key, value) values (:k, :v) "
+                 "on conflict (key) do update set value = :v"),
+            {
+                "k": CONFIG_KEY,
+                "v": new_value
+            },
         )
         print(
             f"[seed] seeded api_server_config; keys: {sorted(merged.keys())}",
@@ -148,7 +153,8 @@ def seed(
 
 
 def main() -> None:
-    desired = yaml.safe_load(pathlib.Path(DESIRED_PATH).read_text()) or {}
+    desired = yaml.safe_load(
+        pathlib.Path(DESIRED_PATH).read_text(encoding="utf-8")) or {}
     if not isinstance(desired, dict):
         sys.exit(
             f"[seed] ABORT: desired config is not a mapping ({type(desired).__name__})"
@@ -159,7 +165,11 @@ def main() -> None:
 
     # config_yaml is created by api-server migrations on first boot; retry until reachable.
     last_err = None
-    for attempt in range(60):
+    # Match the module's ten-minute Job timeout. This replaces the Terraform
+    # dependency on helm_release: on a fresh install the seed and Helm release
+    # may start concurrently, while an existing installation can reconcile
+    # config without planning or mutating the runtime release.
+    for attempt in range(CONFIG_TABLE_WAIT_ATTEMPTS):
         try:
             seed(
                 engine,
@@ -169,10 +179,9 @@ def main() -> None:
             return
         except (OperationalError, ProgrammingError) as err:
             last_err = err
-            print(
-                f"[seed] waiting for config_yaml (attempt {attempt}): {err}", flush=True
-            )
-            time.sleep(5)
+            print(f"[seed] waiting for config_yaml (attempt {attempt}): {err}",
+                  flush=True)
+            time.sleep(CONFIG_TABLE_WAIT_SECONDS)
     sys.exit(f"[seed] config_yaml never became readable: {last_err}")
 
 
