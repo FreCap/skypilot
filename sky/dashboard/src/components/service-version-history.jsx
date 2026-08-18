@@ -23,6 +23,7 @@ import {
 import { getCurrentUserRole } from '@/data/connectors/client';
 import {
   electServiceVersion,
+  getServiceVersion,
   getServiceVersions,
 } from '@/data/connectors/services';
 import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
@@ -418,8 +419,10 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
   const [selectedVersion, setSelectedVersion] = useState(null);
   const [viewedVersion, setViewedVersion] = useState(null);
   const [electingVersion, setElectingVersion] = useState(null);
+  const [loadingYaml, setLoadingYaml] = useState(false);
   const [error, setError] = useState(null);
   const loadGeneration = useRef(0);
+  const detailGeneration = useRef(0);
 
   const loadHistory = useCallback(async () => {
     if (!serviceName) {
@@ -447,7 +450,9 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
     setHistory(null);
     setSelectedVersion(null);
     setViewedVersion(null);
+    setLoadingYaml(false);
     setError(null);
+    detailGeneration.current += 1;
     (async () => {
       try {
         const user = await getCurrentUserRole();
@@ -469,6 +474,7 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
     return () => {
       mounted = false;
       loadGeneration.current += 1;
+      detailGeneration.current += 1;
     };
   }, [loadHistory]);
 
@@ -489,6 +495,70 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
       null,
     [history, viewedVersion]
   );
+
+  const loadVersionYaml = async (versions) => {
+    const missing = versions.filter(
+      (version) => version?.yaml_included === false
+    );
+    if (missing.length === 0) return true;
+    const generation = detailGeneration.current;
+    const details = await Promise.all(
+      missing.map((version) => getServiceVersion(serviceName, version.version))
+    );
+    if (generation !== detailGeneration.current) return false;
+    const byVersion = new Map(
+      details.map((version) => [version.version, version])
+    );
+    setHistory((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        versions: current.versions.map((version) =>
+          byVersion.has(version.version)
+            ? { ...version, ...byVersion.get(version.version) }
+            : version
+        ),
+      };
+    });
+    return true;
+  };
+
+  const viewYaml = async (version) => {
+    const generation = detailGeneration.current;
+    setLoadingYaml(true);
+    setError(null);
+    try {
+      if (await loadVersionYaml([version])) {
+        setViewedVersion(version.version);
+        setSelectedVersion(null);
+      }
+    } catch (detailError) {
+      if (generation === detailGeneration.current) {
+        setError(detailError.message);
+      }
+    } finally {
+      if (generation === detailGeneration.current) setLoadingYaml(false);
+    }
+  };
+
+  const compareYaml = async (version) => {
+    if (!elected) return;
+    const generation = detailGeneration.current;
+    setLoadingYaml(true);
+    setError(null);
+    try {
+      if (await loadVersionYaml([elected, version])) {
+        setSelectedVersion(version.version);
+        setViewedVersion(null);
+      }
+    } catch (detailError) {
+      if (generation === detailGeneration.current) {
+        setError(detailError.message);
+      }
+    } finally {
+      if (generation === detailGeneration.current) setLoadingYaml(false);
+    }
+  };
 
   if (!isAdmin && !loading) {
     return (
@@ -618,9 +688,14 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                         aria-label={`View YAML for version ${version.version}`}
                         aria-pressed={viewedVersion === version.version}
                         onClick={() => {
-                          setViewedVersion(version.version);
-                          setSelectedVersion(null);
+                          if (version.yaml_included === false) {
+                            void viewYaml(version);
+                          } else {
+                            setViewedVersion(version.version);
+                            setSelectedVersion(null);
+                          }
                         }}
+                        disabled={loadingYaml}
                       >
                         View YAML
                       </Button>
@@ -630,9 +705,17 @@ export function ServiceVersionHistory({ serviceName, onElectionComplete }) {
                           size="sm"
                           className="h-7 px-2 text-xs"
                           onClick={() => {
-                            setSelectedVersion(version.version);
-                            setViewedVersion(null);
+                            if (
+                              version.yaml_included === false ||
+                              elected.yaml_included === false
+                            ) {
+                              void compareYaml(version);
+                            } else {
+                              setSelectedVersion(version.version);
+                              setViewedVersion(null);
+                            }
                           }}
+                          disabled={loadingYaml}
                         >
                           Compare
                         </Button>

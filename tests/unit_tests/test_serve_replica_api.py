@@ -107,7 +107,11 @@ def test_replica_reads_have_a_distinct_api_capability_version():
         server_constants.MIN_SERVE_ZERO_COST_ACTUATION_API_VERSION)
     assert zero_cost_actuation_version == 89
     assert incremental_route_version < zero_cost_actuation_version
-    assert server_constants.API_VERSION == zero_cost_actuation_version
+    lazy_version_yaml_version = (
+        server_constants.MIN_SERVE_LAZY_VERSION_YAML_API_VERSION)
+    assert lazy_version_yaml_version == 90
+    assert zero_cost_actuation_version < lazy_version_yaml_version
+    assert server_constants.API_VERSION == lazy_version_yaml_version
 
 
 def test_current_demand_reads_database_without_controller():

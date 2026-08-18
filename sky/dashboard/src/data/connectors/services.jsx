@@ -1657,9 +1657,16 @@ async function parseImmediateResponse(response, fallback) {
 
 export async function getServiceVersions(serviceName) {
   const response = await apiClient.get(
-    `/serve/${encodeURIComponent(serviceName)}/versions`
+    `/serve/${encodeURIComponent(serviceName)}/versions?include_yaml=false`
   );
   return parseImmediateResponse(response, 'Failed to fetch service versions');
+}
+
+export async function getServiceVersion(serviceName, version) {
+  const response = await apiClient.get(
+    `/serve/${encodeURIComponent(serviceName)}/versions/${encodeURIComponent(version)}`
+  );
+  return parseImmediateResponse(response, 'Failed to fetch service version');
 }
 
 export async function electServiceVersion(serviceName, version) {

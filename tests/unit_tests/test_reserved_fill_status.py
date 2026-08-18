@@ -35,7 +35,7 @@ def test_status_contract_has_distinct_api_capability_version() -> None:
             == 86)
     assert (
         server_constants.MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION == 87)
-    assert server_constants.API_VERSION == 89
+    assert server_constants.API_VERSION == 90
 
 
 def _allocation(

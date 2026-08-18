@@ -70,7 +70,46 @@ def _redact_version_yaml(yaml_content: str | None,
     return debug_dump_helpers.redact_task_yaml(yaml_content)
 
 
-def _service_version_history(service_name: str) -> dict:
+def _service_version_payload(version_record: dict, elected_version: int | None,
+                             active_versions: list[int],
+                             include_yaml: bool) -> dict:
+    """Build one version response, redacting YAML only when requested."""
+    version = version_record['version']
+    spec = version_record['spec']
+    payload = {
+        'version': version,
+        'submitted_yaml_content':
+            (_redact_version_yaml(version_record['submitted_yaml_content'])
+             if include_yaml else None),
+        'compiled_yaml_content':
+            (_redact_version_yaml(version_record['yaml_content'],
+                                  stable_order=True) if include_yaml else None),
+        'created_at': version_record['created_at'],
+        'created_by': version_record['created_by'],
+        'quarantined_at': version_record['quarantined_at'],
+        'quarantine_reason': version_record['quarantine_reason'],
+        'controller_job_identity':
+            kubernetes_identity.validate_controller_job_projection(
+                version_record.get('controller_job_projection')),
+        'controller_work_cache':
+            kubernetes_identity.validate_controller_work_cache_projection(
+                version_record.get('controller_work_cache')),
+        'worker_placement_identities':
+            kubernetes_identity.validate_worker_placement_projections(
+                version_record.get('worker_placement_projections')),
+        'policy': (spec.autoscaling_policy_str() if spec is not None else None),
+        'elected': version == elected_version,
+        'active': version in active_versions,
+    }
+    if not include_yaml:
+        # Old API consumers keep the exact response shape. The dashboard asks
+        # for this explicit marker and fetches YAML for one version on demand.
+        payload['yaml_included'] = False
+    return payload
+
+
+def _service_version_history(service_name: str,
+                             include_yaml: bool = True) -> dict:
     """Return redacted immutable versions and current rollout state."""
     record = serve_state.get_service_from_name(service_name)
     if record is None or record.get('pool'):
@@ -80,33 +119,11 @@ def _service_version_history(service_name: str) -> dict:
     active_versions = record.get('active_versions', [])
     versions = []
     for version_record in reversed(
-            serve_state.get_version_records(service_name)):
-        version = version_record['version']
-        spec = version_record['spec']
-        versions.append({
-            'version': version,
-            'submitted_yaml_content': _redact_version_yaml(
-                version_record['submitted_yaml_content']),
-            'compiled_yaml_content': _redact_version_yaml(
-                version_record['yaml_content'], stable_order=True),
-            'created_at': version_record['created_at'],
-            'created_by': version_record['created_by'],
-            'quarantined_at': version_record['quarantined_at'],
-            'quarantine_reason': version_record['quarantine_reason'],
-            'controller_job_identity':
-                kubernetes_identity.validate_controller_job_projection(
-                    version_record.get('controller_job_projection')),
-            'controller_work_cache':
-                kubernetes_identity.validate_controller_work_cache_projection(
-                    version_record.get('controller_work_cache')),
-            'worker_placement_identities':
-                kubernetes_identity.validate_worker_placement_projections(
-                    version_record.get('worker_placement_projections')),
-            'policy':
-                (spec.autoscaling_policy_str() if spec is not None else None),
-            'elected': version == elected_version,
-            'active': version in active_versions,
-        })
+            serve_state.get_version_records(service_name,
+                                            include_yaml=include_yaml)):
+        versions.append(
+            _service_version_payload(version_record, elected_version,
+                                     active_versions, include_yaml))
     return {
         'service_name': service_name,
         'placement_projection_protocol_version':
@@ -180,10 +197,30 @@ async def set_ordinary_launch_binding_mode(
 
 
 @router.get('/{service_name}/versions')
-def version_history(request: fastapi.Request, service_name: str) -> dict:
+def version_history(request: fastapi.Request,
+                    service_name: str,
+                    include_yaml: bool = True) -> dict:
     """Return immutable version history to an administrator."""
     _require_admin(request)
-    return _service_version_history(service_name)
+    return _service_version_history(service_name, include_yaml=include_yaml)
+
+
+@router.get('/{service_name}/versions/{version}')
+def version_detail(request: fastapi.Request, service_name: str,
+                   version: int) -> dict:
+    """Return one immutable version, including its redacted YAML."""
+    _require_admin(request)
+    record = serve_state.get_service_from_name(service_name)
+    if record is None or record.get('pool'):
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service not found.')
+    version_record = serve_state.get_version_record(service_name, version)
+    if version_record is None:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail='Service version not found.')
+    return _service_version_payload(version_record,
+                                    record.get('elected_version'),
+                                    record.get('active_versions', []), True)
 
 
 @router.get('/{service_name}/history')
