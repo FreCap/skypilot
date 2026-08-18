@@ -4,9 +4,9 @@ Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
-#1547, #1548, #1549, #1552, and #1553. Production Helm revision 429 / release
-`1.1.1336` runs the exact 2 API / 2 controller / 2 executor split-role cohort
-on RWX storage. Service version 61 has `min_replicas: 0`, a zero fill floor,
+#1547, #1548, #1549, #1552, #1553, and #1555. Production Helm revision 431 /
+release `1.1.1338` runs the exact 2 API / 2 controller / 2 executor split-role
+cohort on RWX storage. Service version 61 has `min_replicas: 0`, a zero fill floor,
 and a utilization gate, but its immutable PHX projection was committed before
 the server configuration converged and still names `gpu-binpack-scheduler`.
 It is therefore not an activation candidate. Production committed and elected
@@ -17,12 +17,36 @@ configuration. Exact database readback proves its PHX H200 projection uses
 `gpu-binpack-scheduler`. Version 58 remains the only active version because a
 true scale-to-zero successor has no reason to manufacture a ready replica
 without admitted demand. The reconciliation gate remains `LEGACY_ACTIVE`; no
-cleanup or final service activation is approved yet. Adversarial review also
-found that the separately exposed demand and actuation promotions leave an
-observable intermediate authority pair; phase 2e closes that cutover race
-before activation. Phase 2e is implemented in PR #1555, with the exact
-post-horizon removal of both separate transition surfaces stacked as draft PR
-#1556.
+cleanup or final service activation is approved yet. Adversarial review found
+that the separately exposed demand and actuation promotions leave an
+observable intermediate authority pair. PR #1555 closed that cutover race with
+one atomic transition and is deployed dark in revision 431. The exact
+post-horizon removal of both separate transition surfaces remains stacked as
+draft PR #1556.
+
+Revision 431's first atomic-activation preflight found one unrelated retained
+claimant, `opendde-10c200s-v4`, whose old version 4 carried null worker
+projections. A normal service update committed version 6, removed its two
+task-owned Kubernetes candidates and reserved-fill policy, retained its 36
+cloud candidates, and let the owner-fenced poller withdraw its authoritative
+claim. It remains correctly scaled to zero. The next preflight exposed a
+deployment-policy bug: activation validates the global claim scope containing
+both `boltz-l4-fleet` and `boltz-l4-fleet-test`, but reused a single-service
+duplicate-atom set across the whole scope. It therefore rejected the intended
+case where two services share the same physical pool/card. The corrected
+contract validates duplicate `(physical_cluster_uid, exact_card)` atoms within
+each service while allowing the broker's documented cross-service sharing;
+provider attestation still runs once for the whole immutable fleet.
+
+`boltz-l4-fleet-test` was briefly found at scale zero but is not dormant: its
+durable load-balancer report showed real demand during the preflight. A
+successor version 67 restored its exact reserved-fill policy after a version 66
+diagnostic update. No ready replica was removed by those updates. While the
+sequenced gate remains inactive, its legacy controller correctly skips typed
+protocol-v2 fill and can still request paid Spot capacity for that demand; the
+observed Spot attempts failed provisioning. This is further evidence that the
+activation policy correction and final sequenced cutover, rather than removing
+the test claimant, are required for cost convergence.
 
 The first revision-423 activation attempt failed closed before durable
 mutation. The common typed reclaim view required non-null Kueue admission for
@@ -188,8 +212,8 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (revision-429 preflight evidence and canonical
-promotion/admission order)
+Last updated: 2026-08-18 (revision-431 atomic-transition deployment,
+cross-service claim preflight, and canonical promotion/admission order)
 
 Canonical owner: this file
 
@@ -658,11 +682,13 @@ independent, deterministically ordered edges. The repeated context is valid:
 only an overlap on the same physical UID/card is ambiguous. Context aliases
 that prove the same UID/card cannot multiply one physical pool, and aliases
 that disagree on width for that exact card fail closed.
-The deployment policy enforces the same atom invariant through one shared
-claim-set validator used by both activation and every later claim replacement:
-it accepts multiple edges sharing an access context, attests that context once,
-and rejects only a second claim on the same
-`(physical_cluster_uid, exact_card)` atom before provider calls.
+The deployment policy enforces the same atom invariant per service through one
+shared claim-set validator used by both activation and every later claim
+replacement. Activation groups its global scope by service before applying the
+validator: it accepts multiple services claiming the same brokered pool/card,
+accepts multiple edges sharing an access context within one service, attests
+each context once, and rejects only a second claim by the same service on the
+same `(physical_cluster_uid, exact_card)` atom before provider calls.
 The typed admission for that atom also carries the normalized accelerator
 scheduling tuple: label key, sorted label values, and extended-resource key.
 Activation, every claim-set replacement, and every terminal launch must match
@@ -2334,10 +2360,11 @@ either case.
 | 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
 | 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. The PHX `AssignQueueLabelsForPods=true` platform pin is merged but still requires its zero-replacement production apply and a successful full two-context preflight. |
+| 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.2. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
-| 2e | Atomic per-service durable-demand plus durable-actuation promotion | Implemented in PR #1555: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Neither PR is yet deployed. |
+| 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.2 and 2a.3. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch

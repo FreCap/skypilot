@@ -707,6 +707,27 @@ def test_activation_rejects_duplicate_physical_card_atom(monkeypatch):
     provider_calls.assert_not_called()
 
 
+def test_activation_accepts_shared_physical_card_across_services(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    attest = mock.Mock(side_effect=_fake_attest(policy))
+    monkeypatch.setattr(policy, '_attest_contexts', attest)
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    first = dataclasses.replace(_claim(context, 'h200'),
+                                service_name='service-a')
+    second = dataclasses.replace(_claim(context, 'h200'),
+                                 service_name='service-b')
+    claims = tuple(sorted((first, second)))
+
+    evidence = policy.attest_activation(claims,
+                                        writer_image_digest='sha256:' +
+                                        'b' * 64,
+                                        deadline_monotonic=time.monotonic() + 5)
+
+    assert evidence.claimed_contexts == claims
+    assert attest.call_args.args[0] == policy._bundle.contexts
+
+
 def test_provider_domains_and_contexts_start_concurrently(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     barrier = threading.Barrier(4)

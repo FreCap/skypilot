@@ -219,6 +219,17 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             physical_card_atoms.update(edge_atoms)
         return tuple(sorted(set(context_names)))
 
+    def _require_activation_claims(
+        self,
+        claims: Sequence[reclaim.ReservedContextClaim],
+    ) -> None:
+        """Validate duplicate pools within, rather than across, services."""
+        claims_by_service: dict[str, list[reclaim.ReservedContextClaim]] = {}
+        for claim in claims:
+            claims_by_service.setdefault(claim.service_name, []).append(claim)
+        for service_claims in claims_by_service.values():
+            self._require_claim_edges(service_claims)
+
     def _provider_job(self, context_name: str, domain: str,
                       deadline_monotonic: float,
                       cancellation: threading.Event) -> object:
@@ -366,7 +377,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         if (_IMAGE_DIGEST_RE.fullmatch(writer_image_digest) is None):
             raise reclaim.ReclaimAttestationError(
                 'Activation requires an immutable writer image digest.')
-        self._require_claim_edges(claimed_contexts)
+        self._require_activation_claims(claimed_contexts)
         # Activation always proves the whole static fleet, including contexts
         # with no current claim, so the one-way gate authorizes future claims.
         proofs = self._attest_contexts(self._bundle.contexts,
