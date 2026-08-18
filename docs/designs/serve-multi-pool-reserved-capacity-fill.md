@@ -205,15 +205,20 @@ retirement recovery without its second fence. The canonical bridge has these
 invariants:
 
 - under the same `_routing_state_lock` that ingests a validated durable report,
-  collect feed generation `N` and stage (but do not expose) a snapshot at `N`
-  with the exact observed-slot, in-flight, and unknown-replica maps;
+  treat `DurableAutoscalingSnapshot.demand_feed_generation` as the authority,
+  require the embedded request-information generation and the autoscaler's
+  collected-generation echo to equal it, and stage (but do not expose) a
+  snapshot at that exact generation `N` with the observed-slot, in-flight, and
+  unknown-replica maps;
 - only after planning returns a valid logical target, rollout failure is
   excluded, and the actuation, notification, and demand generations are still
   current may the controller reacquire that routing lock and publish. One
-  `ReplicaManager` operation installs target `N` first and snapshot `N` second
-  under `_logical_state_lock`; locking readers see either the old coherent pair
-  or the new pair, while even a non-locking intermediate sees new-target plus
-  old-snapshot and therefore fails closed;
+  `ReplicaManager` operation installs target `N` and snapshot `N` through a
+  single immutable reconcile-state reference under `_logical_state_lock`.
+  Every manager fence captures that reference once, including scale-up's
+  initial and per-launch checks, so readers see the complete old publication or
+  the complete new publication even for a same-generation replay or generation
+  regression;
 - plan failure, target invalidation, rollout failure, or generation mismatch
   publishes neither half. The controller-local `_reconcile_generation` remains
   only an optimistic in-process race fence and never stamps durable evidence;
@@ -3510,10 +3515,12 @@ legacy activation.
   #1519/#1526/#1527/#1528; #1524 is closed as superseded.
 - [x] Implement the surgical durable logical-snapshot bridge without schema,
   Helm, Terragrunt, or teardown changes. Focused tests prove exact feed/target
-  generation equality under both locks, atomic target/snapshot publication,
-  same-generation replay, stale and plan-failure fail-closed behavior, and
-  absence of a new teardown path. This supersedes only #1506's
-  controller-local `+ 1` generation hunk.
+  generation equality under both locks, feed/request/autoscaler mismatch
+  rejection, immutable target/snapshot publication during a forced
+  same-generation interleaving, stale and plan-failure fail-closed behavior,
+  publication-rejection and final-currentness actuation fences, and absence of
+  a new teardown path. This supersedes only #1506's controller-local `+ 1`
+  generation hunk.
 - [ ] Merge and deploy that bridge before authority activation. Verify feed
   generation `N` publishes both logical target and manager evidence at `N`, a
   repeated `N` cannot release adopted retirements, and a fresh `N + 1` lets the

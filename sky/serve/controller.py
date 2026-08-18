@@ -5744,8 +5744,7 @@ class SkyServeController:
                                 actuation_generation, decision_autoscaler,
                                 decision_version):
                             return
-                        decision_autoscaler.collect_request_information(
-                            request_information)
+                        durable_reconcile_generation = None
                         if decision_autoscaler.replica_unit == 'logical':
                             if not isinstance(
                                     decision_autoscaler,
@@ -5755,9 +5754,30 @@ class SkyServeController:
                                     'because its autoscaler does not expose '
                                     'the logical reconcile generation.')
                                 return
-                            durable_reconcile_generation = request_information[
-                                'reconcile_generation']
-                            if (decision_autoscaler.reconcile_generation
+                            durable_reconcile_generation = (
+                                durable_snapshot.demand_feed_generation)
+                            request_reconcile_generation = (
+                                request_information.get('reconcile_generation'))
+                            if (type(durable_reconcile_generation) is not int or
+                                    type(request_reconcile_generation)
+                                    is not int or request_reconcile_generation
+                                    != durable_reconcile_generation):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because its request-information '
+                                    'generation does not match the durable '
+                                    'feed generation.')
+                                return
+                        decision_autoscaler.collect_request_information(
+                            request_information)
+                        if decision_autoscaler.replica_unit == 'logical':
+                            assert isinstance(decision_autoscaler,
+                                              autoscalers.ConcurrencyAutoscaler)
+                            assert durable_reconcile_generation is not None
+                            autoscaler_reconcile_generation = (
+                                decision_autoscaler.reconcile_generation)
+                            if (type(autoscaler_reconcile_generation) is not int
+                                    or autoscaler_reconcile_generation
                                     != durable_reconcile_generation):
                                 logger.warning(
                                     'Suppressing durable logical demand '
@@ -5928,9 +5948,9 @@ class SkyServeController:
                     else:
                         # Revalidate the exact demand/notification epoch under
                         # the ingestion lock, then install one target/snapshot
-                        # pair under ReplicaManager's logical-state lock. The
-                        # target is written first there, so even an observer
-                        # outside that lock sees a fail-closed intermediate.
+                        # immutable pair under ReplicaManager's logical-state
+                        # lock. Every manager reader captures that one pair, so
+                        # it cannot mix halves from concurrent publications.
                         with self._routing_state_lock:
                             if (not self._scale_actuation_is_current(
                                     actuation_generation, decision_autoscaler,

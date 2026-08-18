@@ -14,6 +14,7 @@ Covers:
 # pylint: disable=unused-argument,invalid-name,line-too-long
 # pylint: disable=missing-class-docstring,unnecessary-dunder-call
 import asyncio
+import collections.abc
 import contextlib
 import dataclasses
 import functools
@@ -8089,6 +8090,77 @@ class TestLogicalCapacityPlanning:
         assert mgr._logical_reconcile_snapshot.observed_slots_by_replica_id == {
             10: 2
         }
+
+    def test_same_generation_replay_never_exposes_mixed_pair(self):
+
+        class _BlockingMapping(collections.abc.Mapping):
+
+            def __init__(self, values, started, release):
+                self._values = values
+                self._started = started
+                self._release = release
+
+            def __getitem__(self, key):
+                return self._values[key]
+
+            def __iter__(self):
+                self._started.set()
+                assert self._release.wait(timeout=5)
+                return iter(self._values)
+
+            def __len__(self):
+                return len(self._values)
+
+        mgr = _make_manager()
+        mgr._update_recovery_required = False
+        mgr.latest_version = 1
+        old_snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=7,
+            observed_slots_by_replica_id={10: 1},
+            in_flight_by_replica_id={10: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic())
+        mgr._logical_target = (1, 7, 1)
+        mgr._logical_reconcile_snapshot = old_snapshot
+        old_state = mgr._logical_reconcile_state
+        copy_started = threading.Event()
+        release_copy = threading.Event()
+        replay_snapshot = dataclasses.replace(
+            old_snapshot,
+            observed_slots_by_replica_id=
+            _BlockingMapping(  # type: ignore[arg-type]
+                {10: 2}, copy_started, release_copy))
+        results = []
+
+        publisher = threading.Thread(target=lambda: results.append(
+            mgr.publish_logical_reconcile_state((1, 7, 2), replay_snapshot)))
+        publisher.start()
+        assert copy_started.wait(timeout=5)
+        try:
+            observed_during_publish = mgr._logical_reconcile_state
+            assert observed_during_publish is old_state
+            assert observed_during_publish.target == (1, 7, 1)
+            assert observed_during_publish.snapshot is old_snapshot
+            assert mgr._logical_target_fence_holds(
+                1, 7, 1, logical_state=observed_during_publish)
+            assert not mgr._logical_target_fence_holds(
+                1, 7, 2, logical_state=observed_during_publish)
+        finally:
+            release_copy.set()
+            publisher.join(timeout=5)
+
+        assert not publisher.is_alive()
+        assert results == [True]
+        replay_state = mgr._logical_reconcile_state
+        assert replay_state is not old_state
+        assert replay_state.target == (1, 7, 2)
+        assert replay_state.snapshot is not None
+        assert replay_state.snapshot.observed_slots_by_replica_id == {10: 2}
+        assert mgr._logical_target_fence_holds(1,
+                                               7,
+                                               2,
+                                               logical_state=replay_state)
 
     def test_plans_complete_shapes_until_target_is_covered(self):
         mgr = _make_manager()

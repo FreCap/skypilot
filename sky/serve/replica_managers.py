@@ -340,6 +340,14 @@ LogicalTargetState = (tuple[int, int, int] |
 
 
 @dataclasses.dataclass(frozen=True)
+class _LogicalReconcileState:
+    """One atomically published logical target/capacity observation."""
+
+    target: LogicalTargetState | None
+    snapshot: LogicalReconcileSnapshot | None
+
+
+@dataclasses.dataclass(frozen=True)
 class _LogicalPendingLaunchAdmission:
     """One exact-card pending-launch admission calculation."""
 
@@ -2579,12 +2587,11 @@ class ReplicaManager:
         self._lb_in_flight_report: tuple[float, dict[str, int], set[str] | None,
                                          set[str], set[str],
                                          str | None] | None = None
-        self._logical_reconcile_snapshot: LogicalReconcileSnapshot | None = (
-            None)
         self._logical_state_lock = threading.RLock()
+        self._logical_reconcile_state = _LogicalReconcileState(target=None,
+                                                               snapshot=None)
         self._logical_controller_epoch = uuid.uuid4().hex
         self._unknown_capacity_replacement_ids: set[int] = set()
-        self._logical_target: LogicalTargetState | None = None
         self._superseded_prune_pending = True
         self._target_num_replicas_lock = threading.Lock()
         self._target_num_replicas: int | None = None
@@ -2736,6 +2743,32 @@ class ReplicaManager:
                                          ()), set(draining_urls or
                                                   ()), lb_session_id)
 
+    @property
+    def _logical_target(self) -> LogicalTargetState | None:
+        """Compatibility view of the atomically published logical state."""
+        return self._logical_reconcile_state.target
+
+    @_logical_target.setter
+    def _logical_target(self, target: LogicalTargetState | None) -> None:
+        # Focused manager tests and recovery fixtures historically construct
+        # the two inputs independently. Each assignment still publishes one
+        # immutable pair; production readers capture the pair exactly once.
+        state = self._logical_reconcile_state
+        self._logical_reconcile_state = _LogicalReconcileState(
+            target=target, snapshot=state.snapshot)
+
+    @property
+    def _logical_reconcile_snapshot(self) -> LogicalReconcileSnapshot | None:
+        """Compatibility view of the atomically published logical state."""
+        return self._logical_reconcile_state.snapshot
+
+    @_logical_reconcile_snapshot.setter
+    def _logical_reconcile_snapshot(
+            self, snapshot: LogicalReconcileSnapshot | None) -> None:
+        state = self._logical_reconcile_state
+        self._logical_reconcile_state = _LogicalReconcileState(
+            target=state.target, snapshot=snapshot)
+
     def update_logical_reconcile_snapshot(
         self,
         version: int,
@@ -2746,13 +2779,16 @@ class ReplicaManager:
     ) -> None:
         """Atomically publish one complete logical-capacity observation."""
         with self._logical_state_lock:
-            self._logical_reconcile_snapshot = LogicalReconcileSnapshot(
+            state = self._logical_reconcile_state
+            snapshot = LogicalReconcileSnapshot(
                 version=version,
                 generation=generation,
                 observed_slots_by_replica_id=dict(observed_slots_by_replica_id),
                 in_flight_by_replica_id=dict(in_flight_by_replica_id),
                 unknown_replica_ids=frozenset(unknown_replica_ids),
                 received_at=time.monotonic())
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=state.target, snapshot=snapshot)
 
     def publish_logical_target(
             self,
@@ -2766,6 +2802,7 @@ class ReplicaManager:
         with self._logical_state_lock:
             if self._update_recovery_required:
                 return
+            state = self._logical_reconcile_state
             candidate: LogicalTargetState
             if target_capacity_by_accelerator or accelerator_shapes:
                 candidate = (version, generation, target_capacity,
@@ -2775,9 +2812,11 @@ class ReplicaManager:
             if _logical_target_state_components(candidate) is None:
                 logger.warning('Discarding malformed published logical target '
                                f'{candidate!r}.')
-                self._logical_target = None
+                self._logical_reconcile_state = _LogicalReconcileState(
+                    target=None, snapshot=state.snapshot)
                 return
-            self._logical_target = candidate
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=candidate, snapshot=state.snapshot)
 
     def publish_logical_reconcile_state(
             self, target: LogicalTargetState,
@@ -2808,12 +2847,11 @@ class ReplicaManager:
                 in_flight_by_replica_id=dict(snapshot.in_flight_by_replica_id),
                 unknown_replica_ids=frozenset(snapshot.unknown_replica_ids),
                 received_at=snapshot.received_at)
-            # Target first is the fail-closed order even for an observer that
-            # does not participate in _logical_state_lock: the old snapshot
-            # cannot satisfy a newer target generation. Locking readers see
-            # only the old pair or the complete new pair.
-            self._logical_target = target
-            self._logical_reconcile_snapshot = published_snapshot
+            # One reference assignment is the publication boundary. Readers
+            # capture this immutable pair once, so a same-generation replay or
+            # generation regression cannot expose cross-publication halves.
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=target, snapshot=published_snapshot)
             return True
 
     def invalidate_logical_target(self) -> None:
@@ -2821,7 +2859,9 @@ class ReplicaManager:
         with self._logical_state_lock:
             if self._update_recovery_required:
                 return
-            self._logical_target = None
+            state = self._logical_reconcile_state
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=None, snapshot=state.snapshot)
 
     def _logical_target_fence_holds(
             self,
@@ -2831,7 +2871,8 @@ class ReplicaManager:
             target_capacity_by_accelerator: LogicalAcceleratorState |
         None = None,
             accelerator_shapes: LogicalAcceleratorState | None = None,
-            require_exact_generation: bool = False) -> bool:
+            require_exact_generation: bool = False,
+            logical_state: _LogicalReconcileState | None = None) -> bool:
         """Whether a logical target intent is still authorized.
 
         Capacity reports may advance while the autoscaler waits for the
@@ -2841,8 +2882,10 @@ class ReplicaManager:
         the authority that invalidates the intent when the autoscaler takes a
         newer decision tick.
         """
-        snapshot = self._logical_reconcile_snapshot
-        target_state = _logical_target_state_components(self._logical_target)
+        if logical_state is None:
+            logical_state = self._logical_reconcile_state
+        snapshot = logical_state.snapshot
+        target_state = _logical_target_state_components(logical_state.target)
         if target_state is None:
             return False
         (target_version, target_generation, current_target,
@@ -2874,6 +2917,7 @@ class ReplicaManager:
         fence: LogicalTargetState,
         *,
         require_exact_generation: bool = False,
+        logical_state: _LogicalReconcileState | None = None,
     ) -> bool:
         components = _logical_target_state_components(fence)
         if components is None:
@@ -2886,7 +2930,8 @@ class ReplicaManager:
             target,
             target_by_card if exact else None,
             shapes if exact else None,
-            require_exact_generation=require_exact_generation)
+            require_exact_generation=require_exact_generation,
+            logical_state=logical_state)
 
     @staticmethod
     def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
@@ -9237,9 +9282,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             (str(card), int(value))
             for card, value in accelerator_shapes.items())
                                    if accelerator_shapes is not None else None)
-        if not self._logical_target_fence_holds(
-                version, reconcile_generation, target_capacity,
-                target_by_accelerator_state, accelerator_shape_state):
+        logical_state = self._logical_reconcile_state
+        if not self._logical_target_fence_holds(version,
+                                                reconcile_generation,
+                                                target_capacity,
+                                                target_by_accelerator_state,
+                                                accelerator_shape_state,
+                                                logical_state=logical_state):
             logger.info('Discarding stale logical scale-up intent for '
                         f'version {version}, generation '
                         f'{reconcile_generation}.')
@@ -9252,7 +9301,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info('Deferring logical scale-up until the current launch '
                         'wave has remaining authority.')
             return []
-        snapshot = self._logical_reconcile_snapshot
+        snapshot = logical_state.snapshot
         assert snapshot is not None
         # An unknown backend may have recovered while this decision waited for
         # the manager lock. A newer snapshot can safely narrow the bounded
@@ -9501,17 +9550,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         launched_capacity = 0
         accepted: list[_ReplicaLaunchResult] = []
         while True:
+            logical_state = self._logical_reconcile_state
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
                     target_capacity,
                     card_target_state,
                     shape_state,
-                    require_exact_generation=bool(replace_unknown_replica_ids)):
+                    require_exact_generation=bool(replace_unknown_replica_ids),
+                    logical_state=logical_state):
                 logger.info('Stopping logical scale-up batch after its '
                             'reconciliation fence advanced.')
                 break
-            current_snapshot = self._logical_reconcile_snapshot
+            current_snapshot = logical_state.snapshot
             assert current_snapshot is not None
             committed = _committed_capacity(current_snapshot)
             committed_by_card = _committed_by_card(current_snapshot)
@@ -10484,8 +10535,9 @@ class SkyPilotReplicaManager(ReplicaManager):
             return 'abort'
         if controller_epoch != self._logical_controller_epoch:
             return 'abort'
-        snapshot = self._logical_reconcile_snapshot
-        target_state = _logical_target_state_components(self._logical_target)
+        logical_state = self._logical_reconcile_state
+        snapshot = logical_state.snapshot
+        target_state = _logical_target_state_components(logical_state.target)
         if (snapshot is None or snapshot.generation < selection_generation or
                 target_state is None):
             return 'wait'
@@ -10809,9 +10861,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
 
             with self._logical_state_lock:
-                snapshot = self._logical_reconcile_snapshot
+                logical_state = self._logical_reconcile_state
+                snapshot = logical_state.snapshot
                 target_state = _logical_target_state_components(
-                    self._logical_target)
+                    logical_state.target)
                 if (snapshot is None or target_state is None or
                         not self._logical_snapshot_is_fresh(snapshot) or
                         snapshot.version != self.latest_version):
@@ -10933,9 +10986,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
 
         with self._logical_state_lock:
-            snapshot = self._logical_reconcile_snapshot
+            logical_state = self._logical_reconcile_state
+            snapshot = logical_state.snapshot
             target_state = _logical_target_state_components(
-                self._logical_target)
+                logical_state.target)
             if (snapshot is None or target_state is None or
                     not self._logical_snapshot_is_fresh(snapshot) or
                     snapshot.version != self.latest_version):
@@ -11197,7 +11251,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._abort_logical_retirement(
                     info, 'the current target or coverage fence changed')
                 return
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = self._logical_reconcile_state.snapshot
             assert snapshot is not None
             info.status_property.logical_retirement_confirmed_generation = (
                 snapshot.generation)
@@ -11554,7 +11608,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not replacement_ids:
             return
         with self._logical_state_lock:
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = self._logical_reconcile_state.snapshot
             if snapshot is None or not self._logical_snapshot_is_fresh(
                     snapshot):
                 return
@@ -11747,15 +11801,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise RuntimeError('Logical scale-down sent to a physical '
                                'replica service.')
         with self._logical_state_lock:
+            logical_state = self._logical_reconcile_state
             if not self._logical_target_fence_holds(
-                    version, reconcile_generation, target_capacity,
-                    target_capacity_by_accelerator, accelerator_shapes):
+                    version,
+                    reconcile_generation,
+                    target_capacity,
+                    target_capacity_by_accelerator,
+                    accelerator_shapes,
+                    logical_state=logical_state):
                 logger.info(
                     'Discarding stale logical scale-down batch for version '
                     f'{version}, generation {reconcile_generation}, target '
                     f'{target_capacity} with {len(replica_ids)} victim(s).')
                 return
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = logical_state.snapshot
             assert snapshot is not None
 
             # This is the only fleet read for the whole wave. Resolve victims
@@ -12244,7 +12303,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                   reason='not-applicable')
 
         with self._logical_state_lock:
-            target_fence = self._logical_target
+            logical_state = self._logical_reconcile_state
+            target_fence = logical_state.target
             target_state = _logical_target_state_components(target_fence)
             if (target_state is None or target_fence is None or
                     len(target_fence) != 5):
@@ -12254,8 +12314,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     authorized_ids=frozenset(),
                     reason='target-missing-or-malformed',
                     details=f'target={target_fence!r}')
-            if not self._logical_reconcile_fence_holds(target_fence):
-                snapshot = self._logical_reconcile_snapshot
+            if not self._logical_reconcile_fence_holds(
+                    target_fence, logical_state=logical_state):
+                snapshot = logical_state.snapshot
                 snapshot_summary = (None if snapshot is None else
                                     (snapshot.version, snapshot.generation,
                                      round(
@@ -12349,15 +12410,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         # A newer autoscaler tick may publish while the fleet read above is in
         # flight. Never let an authorization set cross that target boundary.
         with self._logical_state_lock:
-            if (self._logical_target != target_fence or
-                    not self._logical_reconcile_fence_holds(target_fence)):
+            current_state = self._logical_reconcile_state
+            if (current_state.target != target_fence or
+                    not self._logical_reconcile_fence_holds(
+                        target_fence, logical_state=current_state)):
                 return _LogicalPendingLaunchAdmission(
                     applicable=True,
                     target_fence=None,
                     authorized_ids=frozenset(),
                     reason='target-changed-during-replica-read',
                     details=(f'previous_target={target_fence!r}, '
-                             f'current_target={self._logical_target!r}'))
+                             f'current_target={current_state.target!r}'))
         candidate_ids_first_16 = {
             card: [info.replica_id for info in card_candidates[:16]]
             for card, card_candidates in candidates.items()
@@ -13182,7 +13245,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._abort_logical_retirement(
                                     info, 'shutdown admission fence changed')
                                 continue
-                            snapshot = self._logical_reconcile_snapshot
+                            snapshot = self._logical_reconcile_state.snapshot
                             assert snapshot is not None
                             info.status_property.logical_retirement_confirmed_generation = (
                                 snapshot.generation)
