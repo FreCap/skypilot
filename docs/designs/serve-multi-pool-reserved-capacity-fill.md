@@ -38,6 +38,10 @@ replica rows remain durable. Route authority is intentionally left cold, so no
 demand, reserved-fill, or paid actuation resumes until the replacement publishes
 its own route generation and the load balancer replaces the stale report with a
 fresh complete report naming that generation and digest.
+Grant admission additionally requires the calling manager's exact durable
+controller incarnation and owner epoch under the same locked service-row
+transaction. This fences predecessor in-memory plans even if the operating
+system reuses the same PID/IP/port transport fingerprint.
 
 Revision 431's first atomic-activation preflight found one unrelated retained
 claimant, `opendde-10c200s-v4`, whose old version 4 carried null worker
@@ -227,9 +231,9 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (controller-takeover capacity-authority correction,
-revision-431 atomic-transition deployment, and canonical promotion/admission
-order)
+Last updated: 2026-08-18 (controller-takeover capacity-authority and grant
+fencing correction, revision-431 atomic-transition deployment, and canonical
+promotion/admission order)
 
 Canonical owner: this file
 
@@ -1376,12 +1380,28 @@ the owner transfer rolls back. The deprecated live repair surface may finish a
 authority is still intact; a replacement controller never adopts or
 re-advertises that partial state.
 
+Immediately before a Helm upgrade containing this takeover contract, the
+operator must read every non-pool service row in the deployment database and
+prove that the count of either asymmetric pair is zero. An earlier audit is not
+sufficient while the deprecated separate promotion surfaces remain deployed.
+If `DURABLE_FEED`/`DIRECT_REPLICA` is found and its current controller authority
+is intact, finish the existing atomic fix-forward promotion before the upgrade.
+If current authority cannot be proven, recover the old binary/controller first.
+Do not repair an asymmetric pair with manual row mutation. The Helm apply is
+blocked until a fresh deployment-wide read proves only complete legacy or
+complete durable pairs.
+
 The takeover also marks predecessor `GRANTED`, `ACTUATING`, and `RETRYABLE`
 zero-cost intents terminal before commit. Those grants have no materialized
 replica row and cannot be adopted safely because their existing controller
 fingerprint does not include the UUID incarnation and a PID/IP/port can be
 reused. `COMMITTED` intents are not changed: their exact replica rows and any
 generalized launch associations remain under the existing recovery contract.
+An unpersisted predecessor plan has no row to terminalize, so durable grant
+admission also supplies the calling manager's immutable controller incarnation
+and owner epoch and compares both with the already locked service row. A
+replacement that happens to reuse the complete transport fingerprint therefore
+cannot make an old manager's in-memory plan authoritative.
 Provider effects covered by the service launch-authority guard continue to
 exclude takeover. An uncommitted intent-to-replica handoff separately orders on
 the locked service row: if takeover wins, the intent becomes terminal and the

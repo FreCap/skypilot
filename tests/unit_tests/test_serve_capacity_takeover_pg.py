@@ -15,6 +15,7 @@ from test_serve_capacity_admission_pg import _route_response
 from test_serve_capacity_admission_pg import capacity_database
 from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
+from test_zero_cost_actuation_pg import _grant_plan as _grant_zero_cost_plan
 from test_zero_cost_actuation_pg import _plan as _zero_cost_plan
 from test_zero_cost_actuation_pg import _replica_for_intent
 from test_zero_cost_actuation_pg import actuation_database
@@ -278,7 +279,7 @@ def test_takeover_retires_pre_row_intents_before_new_demand(
     engine = actuation_database
     repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
     plan = _zero_cost_plan(free_slots=2)
-    repository.grant_plan('svc', plan, max_capacity=2)
+    _grant_zero_cost_plan(repository, plan, max_capacity=2)
     services = serve_state_schema.services_table
     with engine.begin() as connection:
         incarnation = connection.execute(
@@ -321,7 +322,7 @@ def test_takeover_wins_uncommitted_replica_handoff_and_rolls_back_row(
     engine = actuation_database
     repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
     plan = _zero_cost_plan(free_slots=1)
-    repository.grant_plan('svc', plan, max_capacity=1)
+    _grant_zero_cost_plan(repository, plan, max_capacity=1)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -406,3 +407,141 @@ def test_takeover_wins_uncommitted_replica_handoff_and_rolls_back_row(
     assert intent['state'] == 'TERMINAL'
     assert intent['last_error'] == 'controller_owner_changed'
     assert replica_count == 0
+
+
+def test_takeover_rejects_unpersisted_plan_after_transport_fingerprint_aba(
+        actuation_database) -> None:
+    engine = actuation_database
+    repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
+    predecessor_plan = _zero_cost_plan(free_slots=1)
+    services = serve_state_schema.services_table
+    with engine.begin() as connection:
+        predecessor_incarnation = connection.execute(
+            sqlalchemy.select(services.c.controller_incarnation).where(
+                services.c.name == 'svc')).scalar_one()
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name='svc', epoch=3))
+        connection.execute(
+            sqlalchemy.update(services).where(services.c.name == 'svc').values(
+                demand_source_mode='DURABLE_FEED',
+                demand_source_epoch=1,
+                demand_authority_capable=True,
+                demand_authority_controller_incarnation=(
+                    predecessor_incarnation),
+                demand_authority_protocol_version=1))
+
+    replacement_incarnation = uuid.uuid4()
+    with engine.begin() as connection:
+        replacement_authority = (
+            ordinary_launch_binding.transfer_service_owner_in_connection(
+                connection,
+                service_name='svc',
+                expected_incarnation=predecessor_incarnation,
+                expected_owner_epoch=4,
+                new_incarnation=replacement_incarnation,
+                new_controller_pid=41,
+                new_controller_ip='10.0.0.7',
+                capable=True))
+    assert ordinary_launch_binding.publish_controller_port_if_authority(
+        replacement_authority, 8123)
+
+    # PID, IP, and port now reproduce the predecessor plan's fingerprint.  The
+    # old process authority must still fail inside the grant transaction.
+    with pytest.raises(zero_cost_actuation.ZeroCostActuationConflict,
+                       match='authority changed before grant'):
+        repository.grant_plan(
+            'svc',
+            predecessor_plan,
+            max_capacity=1,
+            expected_controller_incarnation=predecessor_incarnation,
+            expected_controller_owner_epoch=4)
+
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    with engine.connect() as connection:
+        intent_count = connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.func.count()).select_from(intents)).scalar_one()
+    assert intent_count == 0
+
+
+def test_handoff_wins_takeover_and_committed_replica_survives(
+        actuation_database) -> None:
+    engine = actuation_database
+    repository = zero_cost_actuation.ZeroCostActuationRepository(engine)
+    plan = _zero_cost_plan(free_slots=1)
+    _grant_zero_cost_plan(repository, plan, max_capacity=1)
+    lease = repository.lease_next(service_name='svc',
+                                  pool_key=plan.intents[0].pool_key,
+                                  owner=uuid.uuid4(),
+                                  lease_seconds=30)
+    assert lease is not None
+    info = _replica_for_intent(lease.intent, 1)
+    record_id = uuid.UUID(info.replica_record_id)
+    services = serve_state_schema.services_table
+    with engine.begin() as connection:
+        incarnation = connection.execute(
+            sqlalchemy.select(services.c.controller_incarnation).where(
+                services.c.name == 'svc')).scalar_one()
+        connection.execute(
+            sqlalchemy.insert(
+                serve_state_schema.service_lifecycle_fences_table).values(
+                    name='svc', epoch=3))
+        connection.execute(
+            sqlalchemy.update(services).where(services.c.name == 'svc').values(
+                demand_source_mode='DURABLE_FEED',
+                demand_source_epoch=1,
+                demand_authority_capable=True,
+                demand_authority_controller_incarnation=incarnation,
+                demand_authority_protocol_version=1))
+
+    handoff_locked = threading.Event()
+    release_handoff = threading.Event()
+    takeover_started = threading.Event()
+    replacement = uuid.uuid4()
+
+    def _commit_handoff():
+        with engine.begin() as connection:
+            connection.execute(
+                sqlalchemy.select(services.c.name).where(
+                    services.c.name == 'svc').with_for_update()).scalar_one()
+            connection.execute(
+                sqlalchemy.insert(serve_state_schema.replicas_table).values(
+                    **serve_state._replica_row_values('svc', 1, info)))
+            zero_cost_actuation.commit_lease_in_connection(
+                connection,
+                lease,
+                service_name='svc',
+                replica_id=1,
+                replica_record_id=record_id,
+                replica_info=info)
+            handoff_locked.set()
+            assert release_handoff.wait(5)
+
+    def _takeover():
+        takeover_started.set()
+        return _transfer(engine, incarnation, 4, replacement)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        handoff = executor.submit(_commit_handoff)
+        assert handoff_locked.wait(5)
+        takeover = executor.submit(_takeover)
+        assert takeover_started.wait(5)
+        assert not takeover.done()
+        release_handoff.set()
+        assert handoff.result(timeout=5) is None
+        assert takeover.result(timeout=5).controller_incarnation == replacement
+
+    intents = (
+        zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table)
+    with engine.connect() as connection:
+        intent = connection.execute(sqlalchemy.select(intents)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.replicas_table)).mappings().one()
+    assert intent['state'] == 'COMMITTED'
+    assert intent['replica_id'] == 1
+    assert intent['replica_record_id'] == record_id
+    assert replica['replica_id'] == 1

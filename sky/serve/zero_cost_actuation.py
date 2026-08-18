@@ -684,8 +684,14 @@ class ZeroCostActuationRepository:
         return engine
 
     @staticmethod
-    def _validate_service(service: Mapping[str, Any], *, service_name: str,
-                          plan: reserved_fill_planner.FillPlan) -> None:
+    def _validate_service(
+        service: Mapping[str, Any],
+        *,
+        service_name: str,
+        plan: reserved_fill_planner.FillPlan,
+        expected_controller_incarnation: uuid.UUID,
+        expected_controller_owner_epoch: int,
+    ) -> None:
         if not plan.intents:
             return
         first = plan.intents[0]
@@ -704,6 +710,10 @@ class ZeroCostActuationRepository:
                 status in serve_statuses.ServiceStatus.
                 replica_launch_blocking_statuses() or
                 owner != first.controller_owner or
+                service['controller_incarnation']
+                != expected_controller_incarnation or
+                service['controller_owner_epoch']
+                != expected_controller_owner_epoch or
                 service['reserved_fill_actuation_mode']
                 != ActuationMode.DURABLE_INTENT.value or
                 service['reserved_fill_actuation_epoch'] <= 0 or
@@ -721,6 +731,8 @@ class ZeroCostActuationRepository:
         plan: reserved_fill_planner.FillPlan,
         *,
         max_capacity: int,
+        expected_controller_incarnation: uuid.UUID,
+        expected_controller_owner_epoch: int,
     ) -> reserved_fill_planner.FillCommitResult:
         """Persist plan intents before any replica ID or request exists."""
         if not isinstance(plan, reserved_fill_planner.FillPlan):
@@ -728,8 +740,14 @@ class ZeroCostActuationRepository:
         plan.__post_init__()
         if (not isinstance(service_name, str) or not service_name or
                 not isinstance(max_capacity, int) or
-                isinstance(max_capacity, bool) or max_capacity < 0):
-            raise ValueError('Grant admission requires a valid service limit.')
+                isinstance(max_capacity, bool) or max_capacity < 0 or
+                not isinstance(expected_controller_incarnation, uuid.UUID) or
+                not isinstance(expected_controller_owner_epoch, int) or
+                isinstance(expected_controller_owner_epoch, bool) or
+                expected_controller_owner_epoch < 1):
+            raise ValueError(
+                'Grant admission requires a valid service limit and exact '
+                'controller authority.')
         if not plan.intents:
             return reserved_fill_planner.FillCommitResult(
                 accepted=(), deferred=(), authority_current=True)
@@ -745,7 +763,11 @@ class ZeroCostActuationRepository:
                 raise ZeroCostActuationConflict('Service no longer exists.')
             self._validate_service(service,
                                    service_name=service_name,
-                                   plan=plan)
+                                   plan=plan,
+                                   expected_controller_incarnation=(
+                                       expected_controller_incarnation),
+                                   expected_controller_owner_epoch=(
+                                       expected_controller_owner_epoch))
             now = connection.execute(
                 sqlalchemy.select(
                     sqlalchemy.func.clock_timestamp())).scalar_one()
