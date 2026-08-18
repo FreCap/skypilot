@@ -8,6 +8,8 @@ import unittest
 from unittest import mock
 
 from seed_config import _read_bool_env
+from seed_config import CONFIG_TABLE_WAIT_ATTEMPTS
+from seed_config import CONFIG_TABLE_WAIT_SECONDS
 from seed_config import deep_merge
 from seed_config import PRUNE_RETIRED_KEYS_ENV
 from seed_config import prune_retired_serve_controller_keys
@@ -264,6 +266,10 @@ class SeedTest(unittest.TestCase):
 
 class ReadBoolEnvTest(unittest.TestCase):
 
+    def test_migration_wait_matches_job_timeout(self) -> None:
+        self.assertEqual(CONFIG_TABLE_WAIT_ATTEMPTS * CONFIG_TABLE_WAIT_SECONDS,
+                         600)
+
     def test_defaults_to_false(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(_read_bool_env(PRUNE_RETIRED_KEYS_ENV))
@@ -472,6 +478,21 @@ class ControlPlaneModuleSourceTest(unittest.TestCase):
         self.assertNotIn(
             'SKYPILOT_SUPPRESS_API_SERVER_RECONCILE_FOR_MIGRATION',
             self.config_seed_hcl,
+        )
+
+    def test_config_seed_does_not_depend_on_runtime_helm_release(self) -> None:
+        job = re.search(
+            r'resource "kubernetes_job_v1" "seed_config" '
+            r'\{(?P<body>.*?)\n\}\n\n# Reconcile',
+            self.config_seed_hcl,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(job)
+        assert job is not None
+        self.assertNotIn('helm_release.skypilot', job.group('body'))
+        self.assertIn(
+            'depends_on          = [kubernetes_config_map_v1.seed_config]',
+            job.group('body'),
         )
 
     def test_role_restarts_use_helm_readiness_budget(self) -> None:

@@ -107,8 +107,12 @@ resource "kubernetes_job_v1" "seed_config" {
     }
   }
 
-  # The api-server creates config_yaml on first boot; order after the release to avoid a migration race.
-  depends_on          = [helm_release.skypilot, kubernetes_config_map_v1.seed_config]
+  # Keep config reconciliation independent from runtime Helm ownership. The
+  # seed script waits for the API migration to create config_yaml, so a fresh
+  # install remains ordered by readiness without pulling helm_release into a
+  # targeted config-only plan. This also lets operators fix forward the live
+  # runtime with Helm while Terraform continues to own the DB-backed config.
+  depends_on          = [kubernetes_config_map_v1.seed_config]
   wait_for_completion = true
 
   timeouts {
