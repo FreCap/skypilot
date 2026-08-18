@@ -24,6 +24,25 @@ one atomic transition and is deployed dark in revision 431. The exact
 post-horizon removal of both separate transition surfaces remains stacked as
 draft PR #1556.
 
+Post-deployment takeover review found one remaining ownership gap in that
+atomic pair. A replacement controller incarnation already adopts generalized
+launch authority, revokes route leases, and later re-advertises zero-cost
+actuation, but the promoted `demand_authority_controller_incarnation` remained
+bound to the predecessor. A `DURABLE_FEED` service consequently failed closed
+forever after any child or pod takeover. The fix-forward correction makes the
+existing fenced service-owner transfer also rebind the demand and zero-cost
+capability advertisements in the same PostgreSQL transaction, without changing
+either one-way mode or epoch. It terminalizes only unmaterialized
+grant-before-row intents from the predecessor; committed intents and their
+replica rows remain durable. Route authority is intentionally left cold, so no
+demand, reserved-fill, or paid actuation resumes until the replacement publishes
+its own route generation and the load balancer replaces the stale report with a
+fresh complete report naming that generation and digest.
+Grant admission additionally requires the calling manager's exact durable
+controller incarnation and owner epoch under the same locked service-row
+transaction. This fences predecessor in-memory plans even if the operating
+system reuses the same PID/IP/port transport fingerprint.
+
 Revision 431's first atomic-activation preflight found one unrelated retained
 claimant, `opendde-10c200s-v4`, whose old version 4 carried null worker
 projections. A normal service update committed version 6, removed its two
@@ -212,8 +231,9 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (revision-431 atomic-transition deployment,
-cross-service claim preflight, and canonical promotion/admission order)
+Last updated: 2026-08-18 (controller-takeover capacity-authority and grant
+fencing correction, revision-431 atomic-transition deployment, and canonical
+promotion/admission order)
 
 Canonical owner: this file
 
@@ -1341,6 +1361,69 @@ publication for healthy rows. The generous regression ceilings are one cold
 840-route read within ten seconds and 100 subsequent reads with p99 below one
 second; they are not permission to add another in-process cache.
 
+### 7a. Controller takeover of promoted capacity authority
+
+Controller incarnation is part of the durable demand, route, and zero-cost
+capability fences, not process metadata. The one canonical takeover transaction
+therefore locks the lifecycle and service rows, compare-and-swaps the exact
+previous controller incarnation and owner epoch, and installs the replacement
+incarnation on generalized launch authority. If demand is already
+`DURABLE_FEED`, that same transaction re-advertises both demand and zero-cost
+capability under the replacement incarnation. It does not change
+`demand_source_mode`, `demand_source_epoch`,
+`reserved_fill_actuation_mode`, or `reserved_fill_actuation_epoch`; takeover is
+neither a second promotion nor a demotion. Takeover accepts only the complete
+`LEGACY_CONTROLLER`/`DIRECT_REPLICA` or
+`DURABLE_FEED`/`DURABLE_INTENT` pair. Either asymmetric state is rejected and
+the owner transfer rolls back. The deprecated live repair surface may finish a
+`DURABLE_FEED`/`DIRECT_REPLICA` transition only while the current controller
+authority is still intact; a replacement controller never adopts or
+re-advertises that partial state.
+
+Immediately before a Helm upgrade containing this takeover contract, the
+operator must read every non-pool service row in the deployment database and
+prove that the count of either asymmetric pair is zero. An earlier audit is not
+sufficient while the deprecated separate promotion surfaces remain deployed.
+If `DURABLE_FEED`/`DIRECT_REPLICA` is found and its current controller authority
+is intact, finish the existing atomic fix-forward promotion before the upgrade.
+If current authority cannot be proven, recover the old binary/controller first.
+Do not repair an asymmetric pair with manual row mutation. The Helm apply is
+blocked until a fresh deployment-wide read proves only complete legacy or
+complete durable pairs.
+
+The takeover also marks predecessor `GRANTED`, `ACTUATING`, and `RETRYABLE`
+zero-cost intents terminal before commit. Those grants have no materialized
+replica row and cannot be adopted safely because their existing controller
+fingerprint does not include the UUID incarnation and a PID/IP/port can be
+reused. `COMMITTED` intents are not changed: their exact replica rows and any
+generalized launch associations remain under the existing recovery contract.
+An unpersisted predecessor plan has no row to terminalize, so durable grant
+admission also supplies the calling manager's immutable controller incarnation
+and owner epoch and compares both with the already locked service row. A
+replacement that happens to reuse the complete transport fingerprint therefore
+cannot make an old manager's in-memory plan authoritative.
+Provider effects covered by the service launch-authority guard continue to
+exclude takeover. An uncommitted intent-to-replica handoff separately orders on
+the locked service row: if takeover wins, the intent becomes terminal and the
+blocked handoff fails its authority check, rolling back the replica insert.
+
+Route capability is deliberately not rebound by owner transfer. Existing route
+leases are revoked in the same transaction, and the replacement must publish a
+new owner-bound immutable route generation. Still-fresh predecessor reports
+name the previous route generation/digest and remain display-only. The durable
+demand reader, capacity-plan publisher, paid-claim validator, and zero-cost
+planner all fail closed until a current authoritative LB session publishes a
+fresh complete protocol-v2 report naming the replacement route generation,
+digest, and unchanged route-source epoch. Thus the safe recovery interval is
+underfill: neither paid nor zero-cost provider actuation can use stale demand.
+
+The owner-incarnation/owner-epoch compare-and-swap decides concurrent takeover.
+The winner rebinds the complete capability pair and revokes the old route in one
+commit; a blocked or concurrent loser observes the advanced owner fence and
+changes nothing. A later supervised restart repeats the same transaction with a
+new incarnation and repairs a demand capability left stale by an older binary,
+again without advancing either source epoch.
+
 ### Boltz deployment policy bundle
 
 Boltz implements this interface in the separate
@@ -2365,6 +2448,7 @@ either case.
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.2 and 2a.3. |
+| 2f | Promoted capacity-authority controller takeover | Fix-forward implementation is under review: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. This is an activation prerequisite because a promoted service must survive child and pod takeover. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -2885,6 +2969,7 @@ terraform -chdir=infra/terraform/modules/skypilot-spoke-workspace-pool-eks \
 
 # Existing reserved-fill protocol regression set.
 uv run --no-sync pytest -q \
+  tests/unit_tests/test_serve_capacity_takeover_pg.py \
   tests/unit_tests/test_pool_capacity_observation.py \
   tests/unit_tests/test_pool_capacity_observer.py \
   tests/unit_tests/test_reserved_fill_planner.py \
@@ -3472,6 +3557,13 @@ legacy activation.
 - [x] Resolve PR #1524 by semantic comparison rather than merging its
   conflicting 109-file branch. G1 recovery contracts shipped through
   #1519/#1526/#1527/#1528; #1524 is closed as superseded.
+- [ ] Merge and deploy the promoted capacity-authority takeover fix before
+  one-way activation. PostgreSQL tests must prove stale predecessor reports
+  and pre-row intents cannot actuate, a fresh complete report bound to the
+  replacement route restores planning, stale persisted demand ownership is
+  repaired without epoch changes, and a concurrent loser changes nothing.
+  Then exercise one controller child restart and one controller-pod takeover
+  after promotion before opening the cleanup horizon.
 - [ ] Activate reserved reconciliation, promote ordinary binding and generic
   non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
   through one canonical generation-fenced transaction. No reconciliation tick

@@ -138,6 +138,27 @@ def actuation_database(empty_postgres, monkeypatch):
     return empty_postgres
 
 
+def _grant_plan(
+    repository: zero_cost_actuation.ZeroCostActuationRepository,
+    plan: reserved_fill_planner.FillPlan,
+    *,
+    max_capacity: int,
+) -> reserved_fill_planner.FillCommitResult:
+    with repository.engine.connect() as connection:
+        controller = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.controller_incarnation,
+                serve_state_schema.services_table.c.controller_owner_epoch).
+            where(serve_state_schema.services_table.c.name ==
+                  'svc')).mappings().one()
+    return repository.grant_plan(
+        'svc',
+        plan,
+        max_capacity=max_capacity,
+        expected_controller_incarnation=controller['controller_incarnation'],
+        expected_controller_owner_epoch=controller['controller_owner_epoch'])
+
+
 def test_serve052_lineage_and_postgresql_only() -> None:
     sqlite = sqlalchemy.create_engine('sqlite://')
     config = migration_utils.get_alembic_config(sqlite,
@@ -158,8 +179,8 @@ def test_grant_is_idempotent_and_allocates_no_replica(
         actuation_database)
     plan = _plan(free_slots=2)
 
-    first = repository.grant_plan('svc', plan, max_capacity=2)
-    second = repository.grant_plan('svc', plan, max_capacity=2)
+    first = _grant_plan(repository, plan, max_capacity=2)
+    second = _grant_plan(repository, plan, max_capacity=2)
 
     assert len(first.accepted) == 2
     assert [item.replica_id for item in first.accepted] == [None, None]
@@ -182,7 +203,7 @@ def test_status_summary_keeps_intents_separate_from_replicas(
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=2)
-    repository.grant_plan('svc', plan, max_capacity=2)
+    _grant_plan(repository, plan, max_capacity=2)
 
     summary = zero_cost_actuation.get_status_summary('svc',
                                                      _SERVICE_HASH,
@@ -332,7 +353,7 @@ def test_pending_grants_enforce_headroom_and_debit_paid_residual(
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=2)
-    receipt = repository.grant_plan('svc', plan, max_capacity=1)
+    receipt = _grant_plan(repository, plan, max_capacity=1)
     assert len(receipt.accepted) == 1
     assert len(receipt.deferred) == 1
     assert receipt.deferred[0].reason is (
@@ -360,8 +381,8 @@ def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:
         actuation_database)
     east = _plan(free_slots=1, context='east', physical_uid='uid-east')
     west = _plan(free_slots=1, context='west', physical_uid='uid-west')
-    repository.grant_plan('svc', east, max_capacity=2)
-    repository.grant_plan('svc', west, max_capacity=2)
+    _grant_plan(repository, east, max_capacity=2)
+    _grant_plan(repository, west, max_capacity=2)
     owner = uuid.uuid4()
 
     east_lease = repository.lease_next(service_name='svc',
@@ -431,7 +452,7 @@ def test_replica_and_intent_commit_in_one_transaction(
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
-    repository.grant_plan('svc', plan, max_capacity=1)
+    _grant_plan(repository, plan, max_capacity=1)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -464,7 +485,7 @@ def test_intent_mismatch_rolls_back_replica_insert(actuation_database) -> None:
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1)
-    repository.grant_plan('svc', plan, max_capacity=1)
+    _grant_plan(repository, plan, max_capacity=1)
     lease = repository.lease_next(service_name='svc',
                                   pool_key=plan.intents[0].pool_key,
                                   owner=uuid.uuid4(),
@@ -502,7 +523,7 @@ def test_expired_retryable_grant_releases_paid_debit(
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
     plan = _plan(free_slots=1, valid_until=time.time() + 0.3)
-    repository.grant_plan('svc', plan, max_capacity=1)
+    _grant_plan(repository, plan, max_capacity=1)
     time.sleep(0.4)
 
     with actuation_database.begin() as connection:
@@ -527,7 +548,7 @@ def test_schema_rejects_invalid_state_shape(actuation_database) -> None:
     plan = _plan(free_slots=1)
     repository = zero_cost_actuation.ZeroCostActuationRepository(
         actuation_database)
-    repository.grant_plan('svc', plan, max_capacity=1)
+    _grant_plan(repository, plan, max_capacity=1)
     intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
     with pytest.raises(sqlalchemy.exc.IntegrityError):
         with actuation_database.begin() as connection:
