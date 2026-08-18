@@ -3,8 +3,9 @@
 Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, and supply-aware paid-residual prerequisites
-are merged through PRs #1537, #1540, and #1542 and deployed directly with Helm
-as production revision 418 / release `1.1.1325`. `boltz-l4-fleet` nevertheless
+are merged through PRs #1537, #1540, #1542, and #1547 and deployed directly
+with Helm as production revision 421 / release `1.1.1330`.
+`boltz-l4-fleet` nevertheless
 remains elected on stored version 58 with legacy binding/route/demand authority
 and `DIRECT_REPLICA` fill actuation. That version has task-owned Kubernetes
 overrides, `min_replicas: 1`, a ten-replica fill floor, no utilization gate,
@@ -53,13 +54,23 @@ service that has not committed projections and promoted the durable reserved
 path. The long-term correction is the one canonical sequenced path below, not
 a broader legacy heuristic.
 
+An activation preflight on 2026-08-18 also found that the mechanical
+transition still required the historical *exact* Serve047/API011 revisions,
+so it rejected the valid deployed Serve052/API015 successor heads. The same
+documented `python -m` command did not select server context or load the
+deployment reclaim-policy plugin. The transition now requires the exact
+heads supported by its deployed binary, verifies that those numeric linear
+heads retain the Serve047/API011 prerequisites, and initializes the server
+MAIN plugin context itself. This preserves the no-divergent-head invariant
+without pinning activation forever to one historical schema pair.
+
 All platform-pin and Terragrunt deployment sequences retained later in this
 file are historical review records, not current gates or deployment authority.
 The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (schema-v4/proof-v2 and enforced worker projection)
+Last updated: 2026-08-18 (successor-safe, self-contained activation command)
 
 Canonical owner: this file
 
@@ -2554,13 +2565,17 @@ python -m sky.serve.reserved_fill_reconciliation_transition activate
 python -m sky.serve.reserved_fill_reconciliation_transition status --json
 ```
 
+The module entrypoint selects `IS_SKYPILOT_SERVER=true` before reading
+server-sensitive state and loads the deployment's MAIN plugin context before
+status or activation. Operators do not need a second wrapper or a hand-authored
+plugin bootstrap.
+
 Activation fails unless all of the following are true:
 
 - the database is central PostgreSQL;
 - reserved-fill protocol version is exactly 2;
-- the deployed transition is at least generalized-binding Serve047 and
-  API-request 011 (or final Serve049/API013 after G2/C), with no divergent
-  migration head;
+- the deployed transition's current Serve and API-request schema heads are
+  exact, non-divergent successors of generalized-binding Serve047/API011;
 - Kubernetes and PostgreSQL inventory attest exactly the split roles
   `api`, `controller`, and `executor`, with no compatibility `all` writer;
 - all attested writer pods are Ready and all recent process leases match that
@@ -2608,9 +2623,9 @@ reserved-capacity underfill, not duplicate fill or paid spill.
 No step below creates compute.
 
 1. Confirm the transition status reports protocol 2,
-   `SEQUENCED_ACTIVE`, generalized-binding Serve047/API011 (or final
-   Serve049/API013), the exact generic capability cohort, and the expected
-   durable reclaim identity.
+   `SEQUENCED_ACTIVE`, the deployed binary's current Serve/API-request heads
+   (each a successor of Serve047/API011), the exact generic capability cohort,
+   and the expected durable reclaim identity.
    Confirm the full fleet reports public server API capability 77 and worker
    placement projection protocol 2.
 2. Confirm every claimed physical pool is producing completed `SUCCESS` or

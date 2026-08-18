@@ -32,8 +32,8 @@ def _status(
     gate_state: str = 'LEGACY_ACTIVE',
     gate_generation: int = 4,
     protocol_version: int = 2,
-    serve_revision: str = '047',
-    api_revision: str = '011',
+    serve_revision: str = transition.migration_utils.SERVE_VERSION,
+    api_revision: str = transition.migration_utils.API_REQUESTS_VERSION,
     reclaim_policy_identity: dict[str, str] | None = None,
     reclaim_activation_receipt: dict[str, Any] | None = None,
     reclaim_authorized_at: float | None = None,
@@ -166,17 +166,39 @@ def _repository(
     return repository
 
 
-def test_activation_schema_is_exact_and_protocol_v2() -> None:
+def test_activation_schema_requires_current_successor_heads_and_protocol_v2(
+) -> None:
     transition._require_activation_schema(_status())
     with pytest.raises(transition.ReconciliationTransitionError,
                        match='protocol v2'):
         transition._require_activation_schema(_status(protocol_version=1))
     with pytest.raises(transition.ReconciliationTransitionError,
-                       match='Serve schema revision 047'):
+                       match='Serve schema revision 047 or a successor'):
         transition._require_activation_schema(_status(serve_revision='042'))
     with pytest.raises(transition.ReconciliationTransitionError,
-                       match='API-request schema revision 011'):
+                       match='API-request schema revision 011 or a successor'):
         transition._require_activation_schema(_status(api_revision='008'))
+    with pytest.raises(transition.ReconciliationTransitionError,
+                       match=('current deployed Serve schema head '
+                              f'{transition.migration_utils.SERVE_VERSION}')):
+        transition._require_activation_schema(_status(serve_revision='047'))
+    with pytest.raises(
+            transition.ReconciliationTransitionError,
+            match=('current deployed API-request schema head '
+                   f'{transition.migration_utils.API_REQUESTS_VERSION}')):
+        transition._require_activation_schema(_status(api_revision='011'))
+
+
+def test_activation_schema_rejects_malformed_or_invalid_deployed_head() -> None:
+    with pytest.raises(
+            transition.ReconciliationTransitionError,
+            match="Serve schema revision 'uninitialized' is malformed"):
+        transition._require_activation_schema(
+            _status(serve_revision='uninitialized'))
+    with mock.patch.object(transition.migration_utils, 'SERVE_VERSION', '046'), \
+         pytest.raises(transition.ReconciliationTransitionError,
+                       match='does not contain required revision 047'):
+        transition._require_activation_schema(_status(serve_revision='046'))
 
 
 def test_writer_attestation_rejects_compatibility_all_topology() -> None:
@@ -523,3 +545,54 @@ def test_reclaim_attestation_loads_the_unique_policy() -> None:
     assert call.args == ((),)
     assert call.kwargs['writer_image_digest'] == 'sha256:' + 'a' * 64
     assert call.kwargs['deadline_monotonic'] > 0
+
+
+def test_deployed_cli_context_selects_server_and_loads_main_plugins(
+        monkeypatch) -> None:
+    marker = transition.skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER
+    monkeypatch.delenv(marker, raising=False)
+
+    def load(context: Any) -> object:
+        assert transition.os.environ[marker] == 'true'
+        assert context.context == transition.plugins.PluginContext.MAIN
+        return mock.sentinel.registration_barrier
+
+    with mock.patch.object(transition.plugins,
+                           'plugins_loaded',
+                           return_value=False), \
+         mock.patch.object(transition.plugins,
+                           'load_plugins',
+                           side_effect=load) as load_plugins:
+        transition._initialize_deployed_cli_context()
+
+    assert transition.os.environ[marker] == 'true'
+    context = load_plugins.call_args.args[0]
+    assert context.context == transition.plugins.PluginContext.MAIN
+
+
+def test_deployed_cli_context_does_not_reload_plugins(monkeypatch) -> None:
+    marker = transition.skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER
+    monkeypatch.delenv(marker, raising=False)
+    with mock.patch.object(transition.plugins,
+                           'plugins_loaded',
+                           return_value=True), \
+         mock.patch.object(transition.plugins, 'load_plugins') as load_plugins:
+        transition._initialize_deployed_cli_context()
+
+    assert transition.os.environ[marker] == 'true'
+    load_plugins.assert_not_called()
+
+
+def test_main_initializes_deployed_context_before_running_command(
+        capsys) -> None:
+    with mock.patch.object(transition,
+                           '_initialize_deployed_cli_context') as initialize, \
+         mock.patch.object(transition,
+                           'run_cli',
+                           return_value=(0, 'ready')) as run_cli:
+        exit_code = transition.main(['status', '--json'])
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == 'ready\n'
+    initialize.assert_called_once_with()
+    run_cli.assert_called_once_with(['status', '--json'])
