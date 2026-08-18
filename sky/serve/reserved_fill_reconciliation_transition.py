@@ -22,6 +22,7 @@ from sky.serve import pool_capacity_observation
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
+from sky.server import plugins
 from sky.skylet import constants as skylet_constants
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -110,16 +111,43 @@ def _require_activation_schema(status: ReconciliationTransitionStatus) -> None:
     if status.protocol_version != reserved_capacity_broker.PROTOCOL_V2:
         raise ReconciliationTransitionError(
             'Reserved-fill protocol v2 must already be active.')
-    if status.serve_schema_revision != _REQUIRED_SERVE_SCHEMA:
+    _require_current_successor_schema(
+        schema_name='Serve',
+        observed=status.serve_schema_revision,
+        required=_REQUIRED_SERVE_SCHEMA,
+        deployed_head=migration_utils.SERVE_VERSION)
+    _require_current_successor_schema(
+        schema_name='API-request',
+        observed=status.api_request_schema_revision,
+        required=_REQUIRED_API_REQUEST_SCHEMA,
+        deployed_head=migration_utils.API_REQUESTS_VERSION)
+
+
+def _require_current_successor_schema(*, schema_name: str, observed: str,
+                                      required: str,
+                                      deployed_head: str) -> None:
+    """Requires the deployed linear migration head to retain a prerequisite."""
+    try:
+        observed_number = int(observed)
+        required_number = int(required)
+        deployed_head_number = int(deployed_head)
+    except ValueError as error:
         raise ReconciliationTransitionError(
-            'Sequenced reconciliation requires exact Serve schema revision '
-            f'{_REQUIRED_SERVE_SCHEMA}; observed '
-            f'{status.serve_schema_revision}.')
-    if status.api_request_schema_revision != _REQUIRED_API_REQUEST_SCHEMA:
+            f'{schema_name} schema revision {observed!r} is malformed.') \
+            from error
+    if deployed_head_number < required_number:
         raise ReconciliationTransitionError(
-            'Sequenced reconciliation requires exact API-request schema '
-            f'revision {_REQUIRED_API_REQUEST_SCHEMA}; observed '
-            f'{status.api_request_schema_revision}.')
+            f'The deployed {schema_name} schema head {deployed_head} does not '
+            f'contain required revision {required}.')
+    if observed_number < required_number:
+        raise ReconciliationTransitionError(
+            f'Sequenced reconciliation requires {schema_name} schema '
+            f'revision {required} or a successor; observed {observed}.')
+    if observed != deployed_head:
+        raise ReconciliationTransitionError(
+            f'Sequenced reconciliation requires the current deployed '
+            f'{schema_name} schema head {deployed_head}; observed {observed}. '
+            'Complete or repair the forward migration before activation.')
 
 
 def _attest_split_role_writer_cohort() -> _WriterCohortAttestation:
@@ -351,8 +379,23 @@ def run_cli(argv: Sequence[str] | None = None) -> tuple[int, str]:
         return 1, f'Reserved-fill reconciliation transition failed: {error}'
 
 
+def _initialize_deployed_cli_context() -> None:
+    """Loads the same server-owned policy registry used by the main role."""
+    os.environ.setdefault(skylet_constants.ENV_VAR_IS_SKYPILOT_SERVER, 'true')
+    if not plugins.plugins_loaded():
+        plugins.load_plugins(
+            plugins.ExtensionContext(context=plugins.PluginContext.MAIN))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    exit_code, output = run_cli(argv)
+    try:
+        _initialize_deployed_cli_context()
+        exit_code, output = run_cli(argv)
+    except (ImportError, KeyError, TypeError, ValueError,
+            RuntimeError) as error:
+        exit_code = 1
+        output = ('Reserved-fill reconciliation transition failed to '
+                  f'initialize the deployed server context: {error}')
     print(output, file=sys.stderr if exit_code else sys.stdout)
     return exit_code
 
