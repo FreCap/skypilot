@@ -5724,6 +5724,8 @@ class SkyServeController:
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
                 durable_snapshot = None
+                durable_logical_snapshot: (
+                    replica_managers.LogicalReconcileSnapshot | None) = None
                 fresh_aggregate_zero = False
                 if durable_demand_promoted:
                     durable_snapshot = demand_state.get_autoscaling_snapshot(
@@ -5744,6 +5746,45 @@ class SkyServeController:
                             return
                         decision_autoscaler.collect_request_information(
                             request_information)
+                        if decision_autoscaler.replica_unit == 'logical':
+                            if not isinstance(
+                                    decision_autoscaler,
+                                    autoscalers.ConcurrencyAutoscaler):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because its autoscaler does not expose '
+                                    'the logical reconcile generation.')
+                                return
+                            durable_reconcile_generation = request_information[
+                                'reconcile_generation']
+                            if (decision_autoscaler.reconcile_generation
+                                    != durable_reconcile_generation):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because the collected autoscaler '
+                                    'generation does not match the durable '
+                                    'feed generation.')
+                                return
+                            # Stage the capacity/occupancy half of the manager
+                            # fence without exposing it. Planning may block or
+                            # fail, and a newer snapshot paired with an older
+                            # lower target could otherwise release a recovered
+                            # retirement. A valid target and this snapshot are
+                            # installed atomically below.
+                            durable_logical_snapshot = (
+                                replica_managers.LogicalReconcileSnapshot(
+                                    version=decision_version,
+                                    generation=durable_reconcile_generation,
+                                    observed_slots_by_replica_id=dict(
+                                        request_information[
+                                            'observed_slots_by_replica_id']),
+                                    in_flight_by_replica_id=dict(
+                                        request_information[
+                                            'in_flight_by_replica_id']),
+                                    unknown_replica_ids=frozenset(
+                                        request_information[
+                                            'unknown_in_flight_replica_ids']),
+                                    received_at=time.monotonic()))
                         self._reconcile_generation += 1
                         self._durable_demand_snapshot = durable_snapshot
                         fresh_aggregate_zero = (
@@ -5881,8 +5922,29 @@ class SkyServeController:
                         os._exit(1)  # pylint: disable=protected-access
                     return
                 if logical_target is not None:
-                    self._replica_manager.publish_logical_target(
-                        *logical_target)
+                    if durable_logical_snapshot is None:
+                        self._replica_manager.publish_logical_target(
+                            *logical_target)
+                    else:
+                        # Revalidate the exact demand/notification epoch under
+                        # the ingestion lock, then install one target/snapshot
+                        # pair under ReplicaManager's logical-state lock. The
+                        # target is written first there, so even an observer
+                        # outside that lock sees a fail-closed intermediate.
+                        with self._routing_state_lock:
+                            if (not self._scale_actuation_is_current(
+                                    actuation_generation, decision_autoscaler,
+                                    decision_version) or
+                                    self._scale_reconcile_coordinator.generation
+                                    != notification_generation or
+                                    self._reconcile_generation
+                                    != demand_generation):
+                                return
+                            if not (self._replica_manager.
+                                    publish_logical_reconcile_state(
+                                        logical_target,
+                                        durable_logical_snapshot)):
+                                return
                 elif invalidate_logical_target:
                     # Exact-card retirement must fail closed while the LB
                     # compatibility report is incomplete. Explicitly revoke an

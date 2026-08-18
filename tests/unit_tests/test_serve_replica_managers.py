@@ -8063,6 +8063,33 @@ class TestLogicalCapacityPlanning:
             replica_managers._validate_logical_capacity_sources(
                 default_capacity=8, placer=None, num_nodes=2)
 
+    def test_atomic_logical_state_rejects_new_snapshot_with_old_target(self):
+        mgr = _make_manager()
+        mgr._update_recovery_required = False
+        old_snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=5,
+            observed_slots_by_replica_id={10: 1},
+            in_flight_by_replica_id={10: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic())
+        mgr._logical_target = (1, 5, 1)
+        mgr._logical_reconcile_snapshot = old_snapshot
+        new_snapshot = dataclasses.replace(old_snapshot,
+                                           generation=6,
+                                           observed_slots_by_replica_id={10: 2})
+
+        assert not mgr.publish_logical_reconcile_state((1, 5, 1), new_snapshot)
+        assert mgr._logical_target == (1, 5, 1)
+        assert mgr._logical_reconcile_snapshot is old_snapshot
+
+        assert mgr.publish_logical_reconcile_state((1, 6, 2), new_snapshot)
+        assert mgr._logical_target == (1, 6, 2)
+        assert mgr._logical_reconcile_snapshot.generation == 6
+        assert mgr._logical_reconcile_snapshot.observed_slots_by_replica_id == {
+            10: 2
+        }
+
     def test_plans_complete_shapes_until_target_is_covered(self):
         mgr = _make_manager()
         mgr._uses_logical_replicas = True

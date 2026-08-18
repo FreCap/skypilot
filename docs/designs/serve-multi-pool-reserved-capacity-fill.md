@@ -196,6 +196,41 @@ Provider absence, not row deletion or cached SkyPilot status, is the completion
 proof. If the promoted feed does not produce that snapshot, fix the canonical
 durable snapshot/recovery path before any manual cleanup.
 
+The 2026-08-18 follow-up code audit found exactly that promotion blocker in
+the current durable path. `_reconcile_scale_once()` collects the complete
+PostgreSQL demand report into `ConcurrencyAutoscaler`, but only the legacy LB
+sync path publishes the matching capacity/occupancy snapshot to
+`ReplicaManager`. Durable promotion by itself would therefore leave logical
+retirement recovery without its second fence. The canonical bridge has these
+invariants:
+
+- under the same `_routing_state_lock` that ingests a validated durable report,
+  collect feed generation `N` and stage (but do not expose) a snapshot at `N`
+  with the exact observed-slot, in-flight, and unknown-replica maps;
+- only after planning returns a valid logical target, rollout failure is
+  excluded, and the actuation, notification, and demand generations are still
+  current may the controller reacquire that routing lock and publish. One
+  `ReplicaManager` operation installs target `N` first and snapshot `N` second
+  under `_logical_state_lock`; locking readers see either the old coherent pair
+  or the new pair, while even a non-locking intermediate sees new-target plus
+  old-snapshot and therefore fails closed;
+- plan failure, target invalidation, rollout failure, or generation mismatch
+  publishes neither half. The controller-local `_reconcile_generation` remains
+  only an optimistic in-process race fence and never stamps durable evidence;
+- replay of feed generation `N` republishes `N`, never synthetic `N + 1`.
+  Recovery may adopt/re-fence an old-controller retirement at `N`, but only a
+  genuinely newer durable report can provide the strict `N + 1` release; and
+- this bridge publishes evidence only. It adds no scale-down, termination,
+  provider, row-deletion, or alternate cleanup path.
+
+Draft cleanup PR #1506 contains a superficially similar hunk that derives
+`next_demand_generation = self._reconcile_generation + 1`. That is unsafe: the
+live durable feed was already at generation 68023 while a restarted controller
+counter begins at zero, and replay would manufacture false new evidence. This
+focused fix supersedes only that controller-local-generation hunk. The rest of
+#1506 remains draft, blocked, and governed by its existing production removal
+gates.
+
 An activation preflight on 2026-08-18 also found that the mechanical
 transition still required the historical *exact* Serve047/API011 revisions,
 so it rejected the valid deployed Serve052/API015 successor heads. The same
@@ -213,7 +248,8 @@ directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
 Last updated: 2026-08-18 (revision-431 atomic-transition deployment,
-cross-service claim preflight, and canonical promotion/admission order)
+cross-service claim preflight, canonical promotion/admission order, and exact
+durable logical-snapshot bridge)
 
 Canonical owner: this file
 
@@ -3472,6 +3508,16 @@ legacy activation.
 - [x] Resolve PR #1524 by semantic comparison rather than merging its
   conflicting 109-file branch. G1 recovery contracts shipped through
   #1519/#1526/#1527/#1528; #1524 is closed as superseded.
+- [x] Implement the surgical durable logical-snapshot bridge without schema,
+  Helm, Terragrunt, or teardown changes. Focused tests prove exact feed/target
+  generation equality under both locks, atomic target/snapshot publication,
+  same-generation replay, stale and plan-failure fail-closed behavior, and
+  absence of a new teardown path. This supersedes only #1506's
+  controller-local `+ 1` generation hunk.
+- [ ] Merge and deploy that bridge before authority activation. Verify feed
+  generation `N` publishes both logical target and manager evidence at `N`, a
+  repeated `N` cannot release adopted retirements, and a fresh `N + 1` lets the
+  existing manager path resume normal evidence-backed convergence.
 - [ ] Activate reserved reconciliation, promote ordinary binding and generic
   non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
   through one canonical generation-fenced transaction. No reconciliation tick

@@ -2779,6 +2779,43 @@ class ReplicaManager:
                 return
             self._logical_target = candidate
 
+    def publish_logical_reconcile_state(
+            self, target: LogicalTargetState,
+            snapshot: LogicalReconcileSnapshot) -> bool:
+        """Atomically publish one coherent logical target/capacity pair."""
+        with self._logical_state_lock:
+            if self._update_recovery_required:
+                return False
+            components = _logical_target_state_components(target)
+            if components is None:
+                logger.warning('Discarding malformed logical reconcile target '
+                               f'{target!r}.')
+                return False
+            target_version, target_generation, _, _, _ = components
+            if (snapshot.version, snapshot.generation) != (target_version,
+                                                           target_generation):
+                logger.warning(
+                    'Discarding incoherent logical reconcile state: target '
+                    f'version/generation={(target_version, target_generation)!r}, '
+                    'snapshot version/generation='
+                    f'{(snapshot.version, snapshot.generation)!r}.')
+                return False
+            published_snapshot = LogicalReconcileSnapshot(
+                version=snapshot.version,
+                generation=snapshot.generation,
+                observed_slots_by_replica_id=dict(
+                    snapshot.observed_slots_by_replica_id),
+                in_flight_by_replica_id=dict(snapshot.in_flight_by_replica_id),
+                unknown_replica_ids=frozenset(snapshot.unknown_replica_ids),
+                received_at=snapshot.received_at)
+            # Target first is the fail-closed order even for an observer that
+            # does not participate in _logical_state_lock: the old snapshot
+            # cannot satisfy a newer target generation. Locking readers see
+            # only the old pair or the complete new pair.
+            self._logical_target = target
+            self._logical_reconcile_snapshot = published_snapshot
+            return True
+
     def invalidate_logical_target(self) -> None:
         """Revoke authority for pending logical-capacity retirements."""
         with self._logical_state_lock:
