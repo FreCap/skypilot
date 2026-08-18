@@ -5719,6 +5719,7 @@ class SkyServeController:
                     # A central-state read failure cannot silently revive the
                     # legacy autoscaler path after a durable promotion.
                     self._durable_demand_snapshot = None
+                    self._replica_manager.invalidate_logical_reconcile_state()
                     return
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
@@ -5728,13 +5729,25 @@ class SkyServeController:
                     replica_managers.LogicalReconcileSnapshot | None) = None
                 fresh_aggregate_zero = False
                 if durable_demand_promoted:
-                    durable_snapshot = demand_state.get_autoscaling_snapshot(
-                        self._service_name, self._service_hash or '')
+                    try:
+                        durable_snapshot = demand_state.get_autoscaling_snapshot(
+                            self._service_name, self._service_hash or '')
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Revoking durable logical reconcile authority '
+                            'because its PostgreSQL snapshot is unavailable: '
+                            f'{common_utils.format_exception(error)}')
+                        self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
+                        return
                     if durable_snapshot is None:
                         # Stale or incomplete is unknown, never zero.  Do not
                         # reuse the last promoted snapshot for either free or
                         # paid capacity actuation.
                         self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
                         return
                     request_information = dict(
                         durable_snapshot.request_information)
@@ -5804,7 +5817,11 @@ class SkyServeController:
                                     unknown_replica_ids=frozenset(
                                         request_information[
                                             'unknown_in_flight_replica_ids']),
-                                    received_at=time.monotonic()))
+                                    received_at=(
+                                        durable_snapshot.reconcile_authority.
+                                        read_started_monotonic),
+                                    authority=(
+                                        durable_snapshot.reconcile_authority)))
                         self._reconcile_generation += 1
                         self._durable_demand_snapshot = durable_snapshot
                         fresh_aggregate_zero = (

@@ -224,9 +224,74 @@ invariants:
   only an optimistic in-process race fence and never stamps durable evidence;
 - replay of feed generation `N` republishes `N`, never synthetic `N + 1`.
   Recovery may adopt/re-fence an old-controller retirement at `N`, but only a
-  genuinely newer durable report can provide the strict `N + 1` release; and
-- this bridge publishes evidence only. It adds no scale-down, termination,
-  provider, row-deletion, or alternate cleanup path.
+  genuinely newer durable report can provide the strict `N + 1` release.
+
+The initial bridge published evidence only. Exact-head review of the existing
+logical-retirement consumer then found that process-local freshness and the
+ordinary replica-row write boundary were insufficient for irreversible
+teardown: a generation could advance after the controller read its evidence but
+before the queued worker was admitted. PR #1561 therefore narrows the existing
+logical teardown admission to one PostgreSQL commit seam; it does not add a
+second scale-down or provider-cleanup path. Its contract is:
+
+- `get_autoscaling_snapshot()` reads the service, demand generation, exact
+  report rows, route head, and immutable route snapshot in one explicit
+  PostgreSQL `REPEATABLE READ`, `READ ONLY` transaction. A generation-`N` read
+  can never be paired with report rows from `N + 1`;
+- that read mints one immutable authority token containing the exact service
+  lifecycle/version and controller owner, demand source epoch/generation and
+  receipt watermark, route source/head/digest, HA slot/cutover authority,
+  fresh-zero bit, and selected occupancy-sample URLs. Its deadline is computed
+  once at read start as the minimum remaining route-head TTL, report TTL, and
+  selected occupancy-sample lifetime after the reporters' supplied sample
+  ages. The controller and manager carry that same deadline; no receive,
+  publication, or retry timestamp refreshes it. A stale, incomplete, missing,
+  or failed PostgreSQL read revokes both the manager target and snapshot;
+- destructive admission requires a genuinely newer feed generation than the
+  retirement's reversible selection generation. Under the established global
+  SQL order, the transaction locks the zero-cost protocol singleton, then the
+  service row, then the exact replica row. The service row is the shared
+  service-local mutex with demand ingestion: if `N + 1` ingestion commits
+  first, the old token is rejected; if retirement holds the row first, its
+  commit is ordered before that report. No participant acquires the protocol
+  row after a service row, preserving the common
+  `protocol -> service -> replica` order used by admission, materialization,
+  handoff, takeover, and fill;
+- while holding those locks, the commit revalidates the exact service and
+  controller owner, source/feed/receipt tuple, route head and immutable digest,
+  HA authority, selected fresh occupancy set, database-clock expiry, and
+  replica record/precommit fence. It atomically records the confirmed
+  generation, `logical_retirement_committed=true`, `sky_down_status=RUNNING`,
+  and exact route-lease revocation. Only an unambiguous commit result may start
+  the already-queued worker;
+- a rejected transaction revokes manager authority and starts no worker. A
+  failed commit call is `AMBIGUOUS`: the original worker is discarded and only
+  an exact durable row readback may reconstruct cleanup. A committed row is
+  detached into ordinary idempotent cleanup; an unchanged reversible row is
+  requeued behind the same later authority seam; malformed state remains
+  off-route for inspection; and
+- a pre-commit-bit legacy ambiguous row is never grandfathered into teardown.
+  Fresh durable generation `N` first normalizes it to a current-controller,
+  `committed=false`, strict-idle reversible precommit and starts no worker. A
+  lost normalization acknowledgement is resolved by exact readback of that
+  same reversible shape. Only a genuine `N + 1` can then traverse the normal
+  PostgreSQL commit seam above.
+
+Real-PostgreSQL tests force the generation/read interleaving, assert the
+canonical protocol/service/replica SQL lock order, execute both report-first
+and retirement-first service-row orderings, and inject a commit-lost-ack.
+Manager tests prove the original worker never starts on ambiguity and that
+legacy normalization, including its lost-ack readback, still requires strict
+`N + 1`. The change requires no schema, Helm, Terragrunt, EFS, or alternate
+storage path.
+
+A read-only production audit at revision 432 found all seven live services
+still on `LEGACY_CONTROLLER` plus `DIRECT_REPLICA`, no live row matching the
+legacy ambiguous precommit shape, and all 151 `boltz-l4-fleet` logical
+retirement rows explicitly uncommitted. The exact-head code is therefore dark
+until the documented one-way authority promotion; it is generic migration and
+restart safety, not authorization for manual row deletion or immediate
+provider teardown.
 
 The single-operation coherence guarantee above is specifically the durable
 promotion bridge. Before promotion, legacy LB ingestion still publishes a
@@ -265,9 +330,8 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (revision-431 atomic-transition deployment,
-cross-service claim preflight, canonical promotion/admission order, and exact
-durable logical-snapshot bridge)
+Last updated: 2026-08-18 (revision-432 read-only authority audit and PR #1561
+exact-head durable logical-retirement commit contract)
 
 Canonical owner: this file
 
@@ -3527,7 +3591,7 @@ legacy activation.
   conflicting 109-file branch. G1 recovery contracts shipped through
   #1519/#1526/#1527/#1528; #1524 is closed as superseded.
 - [x] Implement the surgical durable logical-snapshot bridge without schema,
-  Helm, Terragrunt, or teardown changes. Focused tests prove exact feed/target
+  Helm or Terragrunt changes. Focused tests prove exact feed/target
   generation equality under both locks, feed/request/autoscaler mismatch
   rejection, immutable target/snapshot publication during a forced
   same-generation interleaving, stale and plan-failure fail-closed behavior,
@@ -3536,10 +3600,20 @@ legacy activation.
   duplicate/regressed capacity snapshot and a regressed target while retaining
   the intentional newer-capacity/older-target contract. This supersedes only
   #1506's controller-local `+ 1` generation hunk.
-- [ ] Merge and deploy that bridge before authority activation. Verify feed
+- [x] Implement PR #1561's exact-head hardening: one read-only repeatable-read
+  source snapshot, its unchanged bounded authority token, the canonical
+  protocol/service/replica lock order, a service-row-serialized PostgreSQL
+  logical-retirement commit, explicit rejected/ambiguous outcomes, and legacy
+  normalization through the same strict `N + 1` seam. Real-PostgreSQL races and
+  manager lost-ack tests pass; no schema, storage, Helm, Terragrunt, or provider
+  path is added.
+- [ ] Merge and deploy the bridge plus exact-head hardening before authority
+  activation. Verify feed
   generation `N` publishes both logical target and manager evidence at `N`, a
   repeated `N` cannot release adopted retirements, and a fresh `N + 1` lets the
-  existing manager path resume normal evidence-backed convergence.
+  existing manager path commit through the exact database seam and resume
+  normal evidence-backed convergence. Confirm stale/unavailable reads revoke
+  the full manager pair and no ambiguous outcome starts its original worker.
 - [ ] Activate reserved reconciliation, promote ordinary binding and generic
   non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
   through one canonical generation-fenced transaction. No reconciliation tick

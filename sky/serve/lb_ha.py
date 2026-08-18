@@ -129,6 +129,7 @@ class AggregatedDrainReport:
     unknown_urls: list[str]
     draining_urls: list[str]
     occupancy_sampled_urls: list[str]
+    occupancy_sample_ages_seconds: dict[str, float]
 
 
 class LbSessionLedger:
@@ -279,7 +280,8 @@ class LbSessionLedger:
                                              routing_urls=None,
                                              unknown_urls=[],
                                              draining_urls=[],
-                                             occupancy_sampled_urls=[])
+                                             occupancy_sampled_urls=[],
+                                             occupancy_sample_ages_seconds={})
             reports.append(report)
 
         local_in_flight = 0
@@ -325,6 +327,10 @@ class LbSessionLedger:
             unknown_urls=sorted(unknown_urls),
             draining_urls=sorted(draining_urls),
             occupancy_sampled_urls=sorted(freshest_async),
+            occupancy_sample_ages_seconds={
+                url: max(0.0, current_time - observed_at)
+                for url, (observed_at, _, _) in freshest_async.items()
+            },
         )
 
 

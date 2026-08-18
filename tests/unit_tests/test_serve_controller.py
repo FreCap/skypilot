@@ -3937,6 +3937,7 @@ class TestAutoscalerRuntimeSnapshot:
         observed_slots = dict(observed_slots or {})
         in_flight = dict(in_flight or {})
         unknown_replica_ids = set(unknown_replica_ids or ())
+        read_started_monotonic = time.monotonic()
         return types.SimpleNamespace(
             service_name='svc',
             service_hash='svc-hash',
@@ -3964,7 +3965,10 @@ class TestAutoscalerRuntimeSnapshot:
                 'rejected_in_recent_window': 0,
             },
             normalized_demand={'queue_depth': 0},
-            fresh_aggregate_zero=fresh_aggregate_zero)
+            fresh_aggregate_zero=fresh_aggregate_zero,
+            reconcile_authority=types.SimpleNamespace(
+                read_started_monotonic=read_started_monotonic,
+                deadline_monotonic=read_started_monotonic + 60))
 
     @staticmethod
     def _durable_autoscaler(target=1):
@@ -4118,6 +4122,31 @@ class TestAutoscalerRuntimeSnapshot:
         ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
+
+    def test_promoted_durable_snapshot_read_error_revokes_manager_authority(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._durable_demand_snapshot = object()  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               side_effect=RuntimeError('database unavailable')), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos') as get_replicas:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        get_replicas.assert_not_called()
+        assert ctrl._durable_demand_snapshot is None  # pylint: disable=protected-access
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
     def test_promoted_logical_request_generation_mismatch_fails_closed(self):
         ctrl = _make_controller()
@@ -4367,6 +4396,7 @@ class TestAutoscalerRuntimeSnapshot:
         get_replicas.assert_not_called()
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
     def test_promoted_zero_cost_commit_forces_replan_before_paid_plan(self):
         ctrl = _make_controller()

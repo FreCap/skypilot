@@ -16,6 +16,7 @@ Covers:
 import asyncio
 import collections.abc
 import contextlib
+import copy
 import dataclasses
 import functools
 import json
@@ -8091,6 +8092,33 @@ class TestLogicalCapacityPlanning:
             10: 2
         }
 
+    def test_durable_logical_publication_never_renews_authority_deadline(
+            self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr(replica_managers.time, 'monotonic', lambda: now[0])
+        mgr = _make_manager()
+        mgr._update_recovery_required = False
+        authority = types.SimpleNamespace(deadline_monotonic=101.0)
+        snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=5,
+            observed_slots_by_replica_id={10: 1},
+            in_flight_by_replica_id={10: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=1.0,
+            authority=authority)
+
+        assert mgr.publish_logical_reconcile_state((1, 5, 1), snapshot)
+        published = mgr._logical_reconcile_snapshot
+        assert published is not None
+        assert published.authority is authority
+        now[0] = 101.1
+        assert not mgr._logical_snapshot_is_fresh(published)
+
+        replay = dataclasses.replace(snapshot, received_at=now[0])
+        assert not mgr.publish_logical_reconcile_state((1, 5, 1), replay)
+        assert mgr._logical_reconcile_snapshot is published
+
     def test_legacy_half_publishers_reject_nonadvancing_evidence(self):
         mgr = _make_manager()
         mgr._update_recovery_required = False
@@ -12076,6 +12104,127 @@ class TestLogicalCapacityPlanning:
                     common_utils.ProcessStatus.SCHEDULED)
             persist.assert_not_called()
 
+    def _run_durable_logical_down_admission(self, tmp_path, commit_result):
+        mgr, retiring, survivor = self._pending_logical_retirement()
+        mgr._service_hash = 'hash'
+        mgr._controller_owner = (123, '127.0.0.1')
+        status = retiring.status_property
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_confirmed_generation = 5
+        authority = types.SimpleNamespace(deadline_monotonic=math.inf)
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, generation=6, authority=authority)
+        mgr._logical_target = (10, 6, 1)
+        down_thread = mock.Mock()
+        down_thread.is_alive.return_value = False
+        mgr._down_thread_pool = thread_utils.ThreadSafeDict({9: down_thread})
+        commit_effect = (commit_result if callable(commit_result) else
+                         lambda *_args, **_kwargs: commit_result)
+
+        with mock.patch.object(mgr, '_refresh_wait_for_idle'), \
+             mock.patch.object(
+                 mgr, '_clear_known_unknown_capacity_replacements'), \
+             mock.patch.object(mgr, '_reconcile_failed_cleanup'), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]), \
+             mock.patch.object(replica_managers.serve_state,
+                               'commit_logical_retirement',
+                               side_effect=commit_effect) as commit, \
+             mock.patch.object(controller_utils, 'get_resources_lock_path',
+                               return_value=str(tmp_path / 'resources.lock')), \
+             mock.patch.object(controller_utils, 'in_flight_launch_count',
+                               return_value=0), \
+             mock.patch.object(controller_utils,
+                               'can_terminate',
+                               return_value=True):
+            mgr._refresh_thread_pool()
+        return mgr, retiring, down_thread, commit
+
+    def test_durable_logical_commit_precedes_worker_start(self, tmp_path):
+
+        def _commit(*_args, **_kwargs):
+            # The typed repository returns the exact committed row.
+            retiring = _args[2]
+            retiring.status_property.logical_retirement_confirmed_generation = 6
+            retiring.status_property.logical_retirement_committed = True
+            retiring.status_property.sky_down_status = (
+                common_utils.ProcessStatus.RUNNING)
+            return replica_managers.serve_state.LogicalRetirementCommitResult(
+                replica_managers.serve_state.LogicalRetirementCommitState.
+                COMMITTED, retiring)
+
+        mgr, _, down_thread, commit = (self._run_durable_logical_down_admission(
+            tmp_path, _commit))
+
+        commit.assert_called_once()
+        down_thread.start.assert_called_once_with()
+        mgr._persist_replica.assert_not_called()
+
+    def test_ambiguous_logical_commit_never_starts_original_worker(
+            self, tmp_path):
+        ambiguous = replica_managers.serve_state.LogicalRetirementCommitResult(
+            replica_managers.serve_state.LogicalRetirementCommitState.AMBIGUOUS)
+        mgr, retiring, down_thread, commit = (
+            self._run_durable_logical_down_admission(tmp_path, ambiguous))
+
+        commit.assert_called_once()
+        down_thread.start.assert_not_called()
+        assert 9 not in mgr._down_thread_pool
+        assert mgr._ambiguous_logical_retirement_commit_ids == {9}
+        assert mgr._logical_reconcile_state == (
+            replica_managers._LogicalReconcileState(target=None, snapshot=None))
+
+        # A fresh durable readback, never the lost acknowledgement, decides
+        # whether and how to reconstruct cleanup.
+        retiring.status_property.logical_retirement_confirmed_generation = 6
+        retiring.status_property.logical_retirement_committed = True
+        retiring.status_property.sky_down_status = (
+            common_utils.ProcessStatus.RUNNING)
+        mgr._terminate_replica = mock.Mock()
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}):
+            mgr._reconcile_ambiguous_logical_retirement_commits()
+
+        mgr._terminate_replica.assert_called_once_with(
+            9,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+        assert not mgr._ambiguous_logical_retirement_commit_ids
+
+    def test_ambiguous_logical_commit_uncommitted_readback_requeues(
+            self, tmp_path):
+        ambiguous = replica_managers.serve_state.LogicalRetirementCommitResult(
+            replica_managers.serve_state.LogicalRetirementCommitState.AMBIGUOUS)
+        mgr, retiring, down_thread, _ = (
+            self._run_durable_logical_down_admission(tmp_path, ambiguous))
+
+        down_thread.start.assert_not_called()
+        assert 9 not in mgr._down_thread_pool
+        assert mgr._ambiguous_logical_retirement_commit_ids == {9}
+        # The commit did not land. Exact readback retains the reversible
+        # admission precommit; reconstructing its unstarted worker does not
+        # authorize start because the manager authority was revoked.
+        mgr._terminate_replica = mock.Mock()
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}):
+            mgr._reconcile_ambiguous_logical_retirement_commits()
+
+        mgr._terminate_replica.assert_called_once_with(
+            9,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+        assert not mgr._ambiguous_logical_retirement_commit_ids
+
     @pytest.mark.parametrize('scenario', [
         'outdated_bounded_start',
         'same_version_abort',
@@ -12214,6 +12363,10 @@ class TestLogicalCapacityPlanning:
         status.logical_retirement_bounded_deadline = bounded_deadline
         status.logical_retirement_committed = committed
         status.sky_down_status = down_status
+        if committed is None:
+            mgr._logical_reconcile_snapshot = dataclasses.replace(
+                mgr._logical_reconcile_snapshot,
+                authority=types.SimpleNamespace(deadline_monotonic=math.inf))
         down_thread = mock.Mock()
         down_thread.is_alive.return_value = False
         down_thread.format_exc = None
@@ -12319,7 +12472,7 @@ class TestLogicalCapacityPlanning:
         assert not retiring.status_property.logical_retirement_committed
         assert 9 not in mgr._down_thread_pool
 
-    def test_recovery_adopts_legacy_ambiguous_scheduled_retirement(
+    def test_recovery_adopts_legacy_ambiguous_as_reversible_precommit(
             self, tmp_path):
         mgr, retiring, down_thread = self._recover_logical_teardown(
             tmp_path,
@@ -12327,16 +12480,20 @@ class TestLogicalCapacityPlanning:
             bounded_deadline=False,
             committed=None)
 
-        down_thread.start.assert_called_once_with()
+        down_thread.start.assert_not_called()
         assert retiring.status_property.is_scale_down
         assert (retiring.status_property.sky_down_status ==
-                common_utils.ProcessStatus.RUNNING)
-        assert retiring.status_property.logical_retirement_version is None
+                common_utils.ProcessStatus.SCHEDULED)
+        assert retiring.status_property.logical_retirement_version == 10
+        assert retiring.status_property.wait_for_idle_before_termination
+        assert retiring.status_property.logical_retirement_committed is False
+        assert (retiring.status_property.logical_retirement_generation ==
+                mgr._logical_reconcile_snapshot.generation)
         assert 9 not in mgr._legacy_uncertain_logical_retirement_ids
-        assert 9 in mgr._down_thread_pool
+        assert 9 not in mgr._down_thread_pool
 
     def test_newer_snapshot_adopts_legacy_ambiguous_retirement(self):
-        mgr, retiring, survivor = self._pending_logical_retirement()
+        mgr, retiring, _ = self._pending_logical_retirement()
         status = retiring.status_property
         status.logical_retirement_controller_epoch = 'old-controller-epoch'
         status.wait_for_idle_before_termination = False
@@ -12344,26 +12501,63 @@ class TestLogicalCapacityPlanning:
         status.logical_retirement_committed = None
         mgr._legacy_uncertain_logical_retirement_ids = {9}
         mgr._logical_reconcile_snapshot = dataclasses.replace(
-            mgr._logical_reconcile_snapshot, generation=6)
+            mgr._logical_reconcile_snapshot,
+            generation=6,
+            authority=types.SimpleNamespace(deadline_monotonic=math.inf))
 
         with mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_infos_from_ids',
                 return_value={9: retiring}), \
-             mock.patch.object(replica_managers.serve_state,
-                               'get_replica_infos',
-                               return_value=[retiring, survivor]):
+             mock.patch.object(mgr, '_register_wait_for_idle') as register:
             mgr._reconcile_legacy_uncertain_logical_retirements()
 
-        assert status.logical_retirement_committed
+        assert status.logical_retirement_committed is False
+        assert status.wait_for_idle_before_termination
         assert status.logical_retirement_generation == 6
+        assert status.logical_retirement_confirmed_generation is None
         assert 9 not in mgr._legacy_uncertain_logical_retirement_ids
-        mgr._terminate_replica.assert_called_once_with(
-            9,
-            sync_down_logs=False,
-            replica_drain_delay_seconds=0,
-            is_scale_down=True,
-            in_flight_drain_cap_seconds=0)
+        register.assert_called_once_with(retiring, replica_url=None)
+        mgr._terminate_replica.assert_not_called()
+
+    def test_legacy_normalization_lost_ack_adopts_exact_durable_readback(self):
+        mgr, retiring, _ = self._pending_logical_retirement()
+        status = retiring.status_property
+        status.logical_retirement_controller_epoch = 'old-controller-epoch'
+        status.wait_for_idle_before_termination = False
+        status.logical_retirement_confirmed_generation = 5
+        status.logical_retirement_committed = None
+        mgr._legacy_uncertain_logical_retirement_ids = {9}
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot,
+            generation=6,
+            authority=types.SimpleNamespace(deadline_monotonic=math.inf))
+        stored = {}
+
+        def _commit_then_lose_ack(_replica_id, info):
+            stored['info'] = copy.deepcopy(info)
+            raise RuntimeError('lost acknowledgement')
+
+        mgr._persist_replica.side_effect = _commit_then_lose_ack
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}):
+            mgr._reconcile_legacy_uncertain_logical_retirements()
+
+        assert mgr._legacy_uncertain_logical_retirement_ids == {9}
+        durable = stored['info']
+        assert durable.status_property.logical_retirement_committed is False
+        assert durable.status_property.wait_for_idle_before_termination
+        mgr._persist_replica.reset_mock(side_effect=True)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: durable}), \
+             mock.patch.object(mgr, '_register_wait_for_idle') as register:
+            mgr._reconcile_legacy_uncertain_logical_retirements()
+
+        assert not mgr._legacy_uncertain_logical_retirement_ids
+        register.assert_called_once_with(durable, replica_url=None)
+        mgr._terminate_replica.assert_not_called()
 
     @pytest.mark.parametrize('down_status', [
         common_utils.ProcessStatus.RUNNING,
@@ -12381,7 +12575,7 @@ class TestLogicalCapacityPlanning:
         assert retiring.status_property.logical_retirement_version is None
         assert 9 in mgr._down_thread_pool
 
-    def test_recovery_keeps_legacy_ambiguous_retirement_off_route_until_covered(
+    def test_recovery_normalizes_legacy_ambiguous_retirement_even_if_uncovered(
             self, tmp_path):
         mgr, retiring, down_thread = self._recover_logical_teardown(
             tmp_path,
@@ -12394,8 +12588,11 @@ class TestLogicalCapacityPlanning:
         assert retiring.status_property.is_scale_down
         assert (retiring.status_property.sky_down_status ==
                 common_utils.ProcessStatus.SCHEDULED)
-        assert (retiring.status_property.logical_retirement_committed is None)
-        assert 9 in mgr._legacy_uncertain_logical_retirement_ids
+        assert retiring.status_property.logical_retirement_committed is False
+        assert retiring.status_property.wait_for_idle_before_termination
+        assert (retiring.status_property.logical_retirement_generation ==
+                mgr._logical_reconcile_snapshot.generation)
+        assert 9 not in mgr._legacy_uncertain_logical_retirement_ids
         assert 9 not in mgr._down_thread_pool
 
     def test_recovery_revalidates_unadmitted_bounded_retirement_after_growth(

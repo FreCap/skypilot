@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from typing import Any
 
 import sqlalchemy
@@ -59,6 +60,41 @@ class DemandReportReceipt:
 
 
 @dataclasses.dataclass(frozen=True)
+class DurableReconcileAuthority:
+    """Exact PostgreSQL evidence that can authorize logical reconciliation.
+
+    ``deadline_monotonic`` is derived once from PostgreSQL's remaining
+    validity at the start of the read.  Consumers must carry it unchanged;
+    receiving or publishing the object locally can never grant a fresh TTL.
+    ``valid_until`` is the matching database-clock boundary rechecked by the
+    destructive commit transaction.
+    """
+
+    service_name: str
+    service_hash: str
+    service_lifecycle_epoch: int
+    service_version: int
+    controller_incarnation: str
+    controller_owner_epoch: int
+    controller_pid: int
+    controller_ip: str
+    demand_source_epoch: int
+    demand_feed_generation: int
+    receipt_watermark: tuple[tuple[str, int, str], ...]
+    route_generation: int
+    route_sha256: str
+    route_source_epoch: int
+    lb_ha_enabled: bool
+    lb_active_slot: str | None
+    lb_cutover_generation: int
+    fresh_aggregate_zero: bool
+    occupancy_sampled_urls: tuple[str, ...]
+    valid_until: datetime.datetime
+    read_started_monotonic: float
+    deadline_monotonic: float
+
+
+@dataclasses.dataclass(frozen=True)
 class DurableAutoscalingSnapshot:
     """One fresh, route-translated demand snapshot for the autoscaler."""
 
@@ -73,6 +109,7 @@ class DurableAutoscalingSnapshot:
     request_information: dict[str, Any]
     normalized_demand: dict[str, Any]
     fresh_aggregate_zero: bool
+    reconcile_authority: DurableReconcileAuthority
 
 
 def _postgres_engine() -> sqlalchemy.engine.Engine:
@@ -938,46 +975,52 @@ def get_autoscaling_snapshot(
     routes = route_projection_schema.serve_route_snapshots_table
     route_heads = route_projection_schema.serve_route_heads_table
     services = serve_state_schema.services_table
-    with engine.connect() as connection:
-        now = connection.execute(
-            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
-        service = connection.execute(
-            sqlalchemy.select(services).where(
-                services.c.name == service_name)).mappings().one_or_none()
-        if (service is None or service['hash'] != service_hash or
-                service['pool'] != 0 or
-                service['demand_source_mode'] != 'DURABLE_FEED' or
-                service['demand_authority_capable'] is not True or
-                service['demand_authority_controller_incarnation']
-                != service['controller_incarnation'] or
-                service['demand_authority_protocol_version'] != 1 or
-                service['route_source_mode'] != 'DURABLE_PROJECTED' or
-                service['route_projection_capable'] is not True or
-                service['route_projection_controller_incarnation']
-                != service['controller_incarnation'] or
-                service['route_projection_protocol_version'] not in (1, 2)):
-            return None
-        generation = connection.execute(
-            sqlalchemy.select(generations.c.generation).where(
-                generations.c.service_name == service_name,
-                generations.c.service_hash ==
-                service_hash)).scalar_one_or_none()
-        head = connection.execute(
-            sqlalchemy.select(route_heads).where(
-                route_heads.c.service_name ==
-                service_name)).mappings().one_or_none()
-        if (generation is None or head is None or head['valid_until'] <= now):
-            return None
-        route = connection.execute(
-            sqlalchemy.select(routes).where(
-                routes.c.service_name == service_name, routes.c.generation ==
-                head['generation'])).mappings().one_or_none()
-        rows = connection.execute(
-            sqlalchemy.select(reports_table).where(
-                reports_table.c.service_name == service_name,
-                reports_table.c.service_hash == service_hash,
-                reports_table.c.valid_until > now).order_by(
-                    reports_table.c.reporter_session_id)).mappings().all()
+    read_started_monotonic = time.monotonic()
+    with engine.connect().execution_options(
+            isolation_level='REPEATABLE READ') as connection:
+        with connection.begin():
+            connection.exec_driver_sql('SET TRANSACTION READ ONLY')
+            now = connection.execute(
+                sqlalchemy.select(
+                    sqlalchemy.func.clock_timestamp())).scalar_one()
+            service = connection.execute(
+                sqlalchemy.select(services).where(
+                    services.c.name == service_name)).mappings().one_or_none()
+            if (service is None or service['hash'] != service_hash or
+                    service['pool'] != 0 or
+                    service['demand_source_mode'] != 'DURABLE_FEED' or
+                    service['demand_authority_capable'] is not True or
+                    service['demand_authority_controller_incarnation']
+                    != service['controller_incarnation'] or
+                    service['demand_authority_protocol_version'] != 1 or
+                    service['route_source_mode'] != 'DURABLE_PROJECTED' or
+                    service['route_projection_capable'] is not True or
+                    service['route_projection_controller_incarnation']
+                    != service['controller_incarnation'] or
+                    service['route_projection_protocol_version'] not in (1, 2)):
+                return None
+            generation = connection.execute(
+                sqlalchemy.select(generations.c.generation).where(
+                    generations.c.service_name == service_name,
+                    generations.c.service_hash ==
+                    service_hash)).scalar_one_or_none()
+            head = connection.execute(
+                sqlalchemy.select(route_heads).where(
+                    route_heads.c.service_name ==
+                    service_name)).mappings().one_or_none()
+            if (generation is None or head is None or
+                    head['valid_until'] <= now):
+                return None
+            route = connection.execute(
+                sqlalchemy.select(routes).where(
+                    routes.c.service_name == service_name, routes.c.generation
+                    == head['generation'])).mappings().one_or_none()
+            rows = connection.execute(
+                sqlalchemy.select(reports_table).where(
+                    reports_table.c.service_name == service_name,
+                    reports_table.c.service_hash == service_hash,
+                    reports_table.c.valid_until > now).order_by(
+                        reports_table.c.reporter_session_id)).mappings().all()
     if (route is None or route['service_hash'] != service_hash or
             route['service_lifecycle_epoch'] != service['lifecycle_epoch'] or
             route['controller_incarnation'] != service['controller_incarnation']
@@ -1133,6 +1176,32 @@ def get_autoscaling_snapshot(
         queue_depth == 0 and rejected == 0 and recent_rejected == 0)
     if not compatibility_complete and not fresh_aggregate_zero:
         return None
+    remaining_validity_seconds = min(
+        [(head['valid_until'] - now).total_seconds()] +
+        [(row['valid_until'] - now).total_seconds() for row in rows])
+    for age_seconds in aggregate.occupancy_sample_ages_seconds.values():
+        remaining_validity_seconds = min(
+            remaining_validity_seconds,
+            constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS - age_seconds)
+    authority_deadline = (read_started_monotonic +
+                          max(0.0, remaining_validity_seconds))
+    # Query and translation time consumes the original PostgreSQL allowance.
+    # It must never be replaced with a fresh process-local receive timestamp.
+    if remaining_validity_seconds <= 0 or time.monotonic(
+    ) >= authority_deadline:
+        return None
+    controller_pid = service['controller_pid']
+    controller_ip = service['controller_ip']
+    controller_owner_epoch = service['controller_owner_epoch']
+    if (not isinstance(controller_pid, int) or
+            isinstance(controller_pid, bool) or controller_pid < 1 or
+            not isinstance(controller_ip, str) or not controller_ip or
+            not isinstance(controller_owner_epoch, int) or
+            isinstance(controller_owner_epoch, bool) or
+            controller_owner_epoch < 1):
+        return None
+    authority_valid_until = now + datetime.timedelta(
+        seconds=remaining_validity_seconds)
 
     def _replica_id(url: str) -> int | None:
         identity = identities.get(url)
@@ -1220,15 +1289,41 @@ def get_autoscaling_snapshot(
             'rejected': _compatibility_totals(rejected_profiles),
         },
     }
-    return DurableAutoscalingSnapshot(
+    reconcile_authority = DurableReconcileAuthority(
         service_name=service_name,
         service_hash=service_hash,
+        service_lifecycle_epoch=int(service['lifecycle_epoch']),
+        service_version=int(service['current_version']),
+        controller_incarnation=str(service['controller_incarnation']),
+        controller_owner_epoch=controller_owner_epoch,
+        controller_pid=controller_pid,
+        controller_ip=controller_ip,
         demand_source_epoch=int(service['demand_source_epoch']),
         demand_feed_generation=int(generation),
+        receipt_watermark=tuple(
+            (str(item['reporter_session_id']), int(item['sequence']),
+             str(item['payload_sha256'])) for item in watermark),
         route_generation=route_generation,
         route_sha256=str(route_sha256),
         route_source_epoch=route_epoch,
-        receipt_watermark=watermark,
-        request_information=request_information,
-        normalized_demand=normalized_demand,
-        fresh_aggregate_zero=(fresh_aggregate_zero))
+        lb_ha_enabled=service['lb_ha_enabled'] == 1,
+        lb_active_slot=service['lb_active_slot'],
+        lb_cutover_generation=int(service['lb_cutover_generation']),
+        fresh_aggregate_zero=fresh_aggregate_zero,
+        occupancy_sampled_urls=tuple(aggregate.occupancy_sampled_urls),
+        valid_until=authority_valid_until,
+        read_started_monotonic=read_started_monotonic,
+        deadline_monotonic=authority_deadline)
+    return DurableAutoscalingSnapshot(service_name=service_name,
+                                      service_hash=service_hash,
+                                      demand_source_epoch=int(
+                                          service['demand_source_epoch']),
+                                      demand_feed_generation=int(generation),
+                                      route_generation=route_generation,
+                                      route_sha256=str(route_sha256),
+                                      route_source_epoch=route_epoch,
+                                      receipt_watermark=watermark,
+                                      request_information=request_information,
+                                      normalized_demand=normalized_demand,
+                                      fresh_aggregate_zero=fresh_aggregate_zero,
+                                      reconcile_authority=reconcile_authority)
