@@ -4,7 +4,7 @@ Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
-#1547, #1548, and #1549. Production Helm revision 427 / release `1.1.1334`
+#1547, #1548, #1549, and #1552. Production Helm revision 428 / release `1.1.1335`
 runs the exact 2 API / 2 controller / 2 executor split-role cohort on RWX
 storage. Service version 61 has `min_replicas: 0`, a zero fill floor, and a
 utilization gate, but its immutable PHX projection was committed before the
@@ -54,19 +54,19 @@ ResourceFlavor topology contract; east retains its existing attested custom
 scheduler.
 
 The exact per-spoke audit IAM roles, EKS access entries, and read-only RBAC are
-now deployed from the already-pinned Terraform module. A production preflight
-on 2026-08-18 proved that both AWS role assumptions work, but exposed two
-remaining real activation blockers. First, the policy uses the assumed audit
-session only for AWS inventory and still constructs Kubernetes clients from
-the ambient writer kubeconfig. The ambient writer is correctly forbidden from
-the audit-only Namespace, PriorityClass, and other cluster-scoped reads, so
-both Kubernetes proofs fail with HTTP 403. Second, the exact east inference
-namespace/service-account unexpectedly owns Pod Identity association
-`a-rsvzwdtaesxvxorkh` to `research-dropzone-irsa`, while the reviewed worker
-projection and bundle require an identity-free inference partition. The
-association is unnecessary for the model path, which uses explicit R2
-credentials, and must be removed rather than broadening the inference worker
-identity contract.
+deployed from the already-pinned Terraform module. The exact east inference
+namespace/service-account no longer owns stale Pod Identity association
+`a-rsvzwdtaesxvxorkh`; the reviewed worker projection remains identity-free.
+Revision 428 proves both AWS role assumptions and both Kubernetes API
+authentications use the same bounded audit sessions. That successful
+authentication exposed the remaining object-contract blockers: PHX still
+inherits rather than explicitly pins `AssignQueueLabelsForPods: true`, and
+east's provider-owned `ml.p4d.24xlarge` and `ml.p4de.24xlarge`
+ResourceFlavors both carry `topologyName: hyperpod` while the embedded
+inventory still expects null. The clean correction pins the PHX gate in the
+owning platform module and binds the live east topology in the immutable
+bundle. It does not enable Kueue admission in east or create a second
+scheduler.
 
 The steady-state authentication correction uses the same short-lived assumed
 audit-role session for both EKS inventory and Kubernetes API reads. It obtains
@@ -90,11 +90,14 @@ and reconstructs an immutable `Credentials` provider from the bounded
 read-only tuple. It neither refreshes nor selects a new identity source, and
 tests cover both shapes at the exact signer seam.
 
-A read-only diagnostic wrapper reached the PHX Kubernetes validator and found
-that the live Kueue v0.19 configuration relies on the upstream default for
+Revision 428's isolated audit client reached both Kubernetes validators. PHX's
+live Kueue v0.19 configuration relies on the upstream default for
 `AssignQueueLabelsForPods`; the attested contract deliberately requires the
 gate to be explicit. The platform correction pins it `true` independently of
-TAS rather than weakening attestation or installing a second scheduler.
+TAS rather than weakening attestation or installing a second scheduler. East
+proved its exact custom scheduler, selectors, GPU products, and capacity, but
+failed only because its two provider-owned ResourceFlavors now expose the
+same `hyperpod` topology that the immutable inventory had left null.
 
 At 2026-08-18 01:01 UTC the service had real demand (queue depth 325,
 confirmed in-flight 106, and 98 recent requests in 60 seconds). Paid Spot
@@ -1301,13 +1304,20 @@ custom-scheduler Deployment nullable and adds exact Kueue TAS feature-gate and
 ResourceFlavor topology-name fields. Fleet `scheduler_name` remains a required
 string because it is part of the immutable worker projection; it is
 `default-scheduler` for PHX and the custom deployment name for east.
+`ResourceFlavor.spec.topologyName` is exact provider inventory, not an
+authority discriminator: a provider-owned flavor may retain that field while
+an inference namespace remains outside Kueue. The nullable admission and
+enforcement pair plus the scheduler contract select the sole placement path.
 The policy proves the exact LocalQueue target and current Active ClusterQueues
 when the pair is non-null, plus cohort, namespace selectors, GPU flavor quotas,
 preemption policies, provider-owned ResourceFlavor instance selectors,
 WorkloadPriorityClass name/value, Pod PriorityClass, and the context's one
 scheduler/topology mode. For east it attests the immutable custom scheduler
-Deployment. For PHX it rejects a custom scheduler, requires projected
-`default-scheduler`, binds the H200 ResourceFlavor's `topologyName: hyperpod`,
+Deployment and both provider-owned ResourceFlavors' live
+`topologyName: hyperpod`; this inventory binding does not enable Kueue
+admission or controller reads there. For PHX it rejects a custom scheduler,
+requires projected `default-scheduler`, binds the H200 ResourceFlavor's
+`topologyName: hyperpod`,
 and attests the current Kueue controller, Pod integration,
 `AssignQueueLabelsForPods: true`, `TopologyAwareScheduling: true`, and the
 reviewed TAS replacement/multilayer feature gates, plus the Deny queue-name
@@ -2163,7 +2173,9 @@ product labels. East exposes 8 non-deleting `ml.p4d.24xlarge` Nodes with 8
 A100-40GB GPUs each and 33 `ml.p4de.24xlarge` Nodes with 8 A100-80GB GPUs each;
 PHX exposes 64 `ml.p5e.48xlarge` Nodes with 8 H200 GPUs each. The east
 ResourceFlavor selectors are the live beta/stable/HyperPod labels for p4d and
-beta/HyperPod labels for p4de; PHX has beta/stable/HyperPod labels for p5e.
+beta/HyperPod labels for p4de, and both east flavors carry
+`topologyName: hyperpod`; PHX has beta/stable/HyperPod labels for p5e with the
+same topology name.
 The queue-name Deny policy and binding are absent in east and present in PHX.
 Schema v3 therefore performs no Kueue controller, policy, or webhook reads for
 the unmanaged east context and instead proves that the namespace lacks the
@@ -2182,8 +2194,9 @@ custom scheduler, or an unmanaged context without its configured scheduler,
 fails closed; dual placement paths are not supported.
 
 The audit role intentionally needs no read of the `Topology` object itself.
-The exact `ResourceFlavor.spec.topologyName` and the exact Kueue controller
-feature-gate set are the durable admission contract; node/flavor reads continue
+The exact `ResourceFlavor.spec.topologyName` in every context and the exact PHX
+Kueue controller feature-gate set are the durable inventory/admission
+contract; node/flavor reads continue
 to prove physical capacity and accelerator identity. The `hyperpod` Topology
 levels are verified as a deployment preflight/readback. This keeps the
 existing Terraform module pin and avoids broadening ongoing controller RBAC.
@@ -3340,10 +3353,13 @@ legacy activation.
   `min_replicas: 0`. Production committed version 61, but its immutable PHX
   projection captured the retired scheduler and is not an activation
   candidate.
-- [ ] Deploy the RequestSigner credential-provider fix after revision 427's
-  fail-closed preflight, then obtain one fresh successful two-context preflight
-  without widening the writer role. The isolated client is deployed and exact
-  east Pod Identity association `a-rsvzwdtaesxvxorkh` is already absent.
+- [x] Deploy the RequestSigner credential-provider fix after revision 427's
+  fail-closed preflight without widening the writer role. Revision 428 proves
+  both AWS and Kubernetes reads use the exact assumed audit sessions; exact
+  east Pod Identity association `a-rsvzwdtaesxvxorkh` is absent.
+- [ ] Deploy the immutable east `topologyName: hyperpod` inventory correction
+  and the platform-owned explicit PHX `AssignQueueLabelsForPods: true` pin,
+  then obtain one fresh successful two-context preflight.
 - [x] Commit and elect successor version 62 whose non-null immutable east and
   PHX worker projections exactly match the corrected server configuration.
   Version 58 remains the only active version until the remaining preflight and

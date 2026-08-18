@@ -774,11 +774,10 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
                     'authority with default-scheduler and exact topology '
                     'names.')
         elif (not isinstance(scheduler, Mapping) or
-              fleet_context['scheduler_name'] != scheduler['deployment'] or
-              topology_names != {None}):
+              fleet_context['scheduler_name'] != scheduler['deployment']):
             raise BundleValidationError(
                 f'{path} unmanaged scheduling must bind the exact custom '
-                'scheduler deployment and no Kueue topology.')
+                'scheduler deployment.')
         for accelerator, contract in fleet_context['accelerators'].items():
             for flavor, product in zip(contract['flavors'],
                                        contract['product_label_values']):

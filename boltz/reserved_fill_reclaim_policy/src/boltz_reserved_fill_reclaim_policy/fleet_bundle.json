@@ -265,7 +265,7 @@
               "node.kubernetes.io/instance-type": "ml.p4d.24xlarge",
               "sagemaker.amazonaws.com/compute-type": "hyperpod"
             },
-            "topology_name": null
+            "topology_name": "hyperpod"
           },
           {
             "name": "ml.p4de.24xlarge",
@@ -273,7 +273,7 @@
               "beta.kubernetes.io/instance-type": "ml.p4de.24xlarge",
               "sagemaker.amazonaws.com/compute-type": "hyperpod"
             },
-            "topology_name": null
+            "topology_name": "hyperpod"
           }
         ],
         "scheduler": {
