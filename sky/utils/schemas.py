@@ -2935,46 +2935,12 @@ def get_config_schema():
                         },
                         'serve_controller_workspace': _SERVE_CONTROLLER_WORKSPACE_SCHEMA,
                         'serve_controller_context': _SERVE_CONTROLLER_CONTEXT_SCHEMA,
-                        'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
-                        'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
-                        'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
-                        'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
-                        'serve_worker_scratch': _SERVE_WORKER_SCRATCH_SCHEMA,
-                        'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
-                        'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
-                        'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
-                        'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
-                        'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
-                        'serve_worker_pod_identity_role_arn': _SERVE_WORKER_POD_IDENTITY_ROLE_ARN_SCHEMA,
-                        'namespace': {
-                            'type': 'string',
-                        },
-                        'kueue': {
-                            'type': 'object',
-                            'required': [],
-                            'additionalProperties': False,
-                            'properties': {
-                                'local_queue_name': {
-                                    'type': 'string',
-                                },
-                                'require_managed': {
-                                    'type': 'boolean',
-                                },
-                            },
-                        },
-                        'quota': {
-                            'type': 'object',
-                            'required': [],
-                            # Permissive — see the per-context quota block
-                            # below; mirrors that policy at the workspace
-                            # cloud level.
-                            'additionalProperties': True,
-                            'properties': {
-                                'queue': {
-                                    'type': 'string',
-                                },
-                            },
-                        },
+                        # Workspace Kubernetes overrides use the same regional
+                        # property contract as the global Kubernetes config.
+                        # Keep this as the single source of truth so new
+                        # properties cannot validate globally but fail when
+                        # scoped to a workspace.
+                        **_CONTEXT_CONFIG_SCHEMA_KUBERNETES,
                         'context_configs': {
                             'type': 'object',
                             'required': [],
@@ -2992,46 +2958,7 @@ def get_config_schema():
                                 'additionalProperties':
                                     _allow_additional_properties(),
                                 'properties': {
-                                    'namespace': {
-                                        'type': 'string',
-                                    },
-                                    'kueue': {
-                                        'type': 'object',
-                                        'required': [],
-                                        'additionalProperties': False,
-                                        'properties': {
-                                            'local_queue_name': {
-                                                'type': 'string',
-                                            },
-                                            'require_managed': {
-                                                'type': 'boolean',
-                                            },
-                                        },
-                                    },
-                                    'quota': {
-                                        'type': 'object',
-                                        'required': [],
-                                        # Permissive — see the per-context
-                                        # quota block under
-                                        # _CONTEXT_CONFIG_SCHEMA_KUBERNETES.
-                                        'additionalProperties': True,
-                                        'properties': {
-                                            'queue': {
-                                                'type': 'string',
-                                            },
-                                        },
-                                    },
-                                    'serve_controller_work_cache': _SERVE_CONTROLLER_WORK_CACHE_SCHEMA,
-                                    'serve_controller_lb_data_plane_auth': _SERVE_CONTROLLER_LB_DATA_PLANE_AUTH_SCHEMA,
-                                    'serve_controller_priority_class_name': _SERVE_CONTROLLER_PRIORITY_CLASS_NAME_SCHEMA,
-                                    'serve_worker_cache': _SERVE_WORKER_CACHE_SCHEMA,
-                                    'serve_worker_scratch': _SERVE_WORKER_SCRATCH_SCHEMA,
-                                    'serve_worker_priority_class_name': _SERVE_WORKER_PRIORITY_CLASS_NAME_SCHEMA,
-                                    'serve_worker_kueue_workload_priority_class_name': _SERVE_WORKER_KUEUE_WORKLOAD_PRIORITY_CLASS_NAME_SCHEMA,
-                                    'serve_worker_priority_value': _SERVE_WORKER_PRIORITY_VALUE_SCHEMA,
-                                    'serve_worker_preemption_policy': _SERVE_WORKER_PREEMPTION_POLICY_SCHEMA,
-                                    'serve_worker_accelerator_scheduling': _SERVE_WORKER_ACCELERATOR_SCHEDULING_SCHEMA,
-                                    'serve_worker_pod_identity_role_arn': _SERVE_WORKER_POD_IDENTITY_ROLE_ARN_SCHEMA,
+                                    **_CONTEXT_CONFIG_SCHEMA_KUBERNETES,
                                     **_extra_kubernetes_properties,
                                     **_REMOTE_IDENTITY_SCHEMA_KUBERNETES,
                                 },
