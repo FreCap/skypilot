@@ -57,6 +57,9 @@ class KubernetesContextProof:
     cluster_queue_name: str | None
     pod_identity_irsa_annotation_absent: bool
     assign_queue_labels_for_pods: bool | None
+    topology_aware_scheduling: bool | None
+    custom_scheduler_deployment_proven: bool
+    resource_flavor_topology_names: tuple[tuple[str, str | None], ...]
     node_flavors: tuple[NodeFlavorProof, ...]
 
 
@@ -549,10 +552,13 @@ def _validate_kueue_snapshot(fleet_context: Mapping[str, Any],
                        'Kueue integration frameworks')
     feature_gates = _dict(manager_config.get('featureGates'),
                           'Kueue feature gates')
-    if ('pod' not in frameworks or
-            feature_gates.get('AssignQueueLabelsForPods') is not True):
+    required_feature_gates = _dict(controller['required_feature_gates'],
+                                   'required Kueue feature gates')
+    if ('pod' not in frameworks or any(
+            feature_gates.get(name) is not enabled
+            for name, enabled in required_feature_gates.items())):
         raise KubernetesAttestationError(
-            'Kueue Pod integration or AssignQueueLabelsForPods is disabled.')
+            'Kueue Pod integration or a required feature gate is disabled.')
 
     admission_policy = _dict(enforcement['admission_policy'],
                              'admission policy contract')
@@ -642,33 +648,37 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     observed_flavors = _dict(snapshot.get('resource_flavors'),
                              'ResourceFlavor inventory')
     expected_flavors = {
-        item['name']: item['node_labels']
-        for item in provider_context['resource_flavors']
+        item['name']: item for item in provider_context['resource_flavors']
     }
     if set(observed_flavors) != set(expected_flavors):
         raise KubernetesAttestationError(
             'The ResourceFlavor inventory is incomplete.')
-    for name, expected_labels in expected_flavors.items():
+    topology_names: list[tuple[str, str | None]] = []
+    for name, expected_contract in expected_flavors.items():
         flavor = _dict(observed_flavors[name], f'ResourceFlavor {name}')
         _metadata(flavor, name=name)
         spec = _dict(flavor.get('spec'), f'ResourceFlavor {name} spec')
         labels = _dict(spec.get('nodeLabels'),
                        f'ResourceFlavor {name} node labels')
+        expected_labels = expected_contract['node_labels']
         if any(
                 labels.get(key) != value
-                for key, value in expected_labels.items()):
+                for key, value in expected_labels.items()) or spec.get(
+                    'topologyName') != expected_contract['topology_name']:
             raise KubernetesAttestationError(
                 f'ResourceFlavor {name!r} does not bind the reviewed '
-                'provider-owned instance selector.')
+                'provider-owned instance selector and topology.')
+        topology_names.append((name, expected_contract['topology_name']))
     node_flavors = _validate_node_inventory(provider_context, snapshot)
 
     scheduler = provider_context['scheduler']
-    _validate_deployment(_dict(snapshot.get('scheduler'),
-                               'scheduler Deployment'),
-                         name=scheduler['deployment'],
-                         namespace=scheduler['namespace'],
-                         replicas=scheduler['replicas'],
-                         expected_images=scheduler['containers'])
+    if scheduler is not None:
+        _validate_deployment(_dict(snapshot.get('scheduler'),
+                                   'scheduler Deployment'),
+                             name=scheduler['deployment'],
+                             namespace=scheduler['namespace'],
+                             replicas=scheduler['replicas'],
+                             expected_images=scheduler['containers'])
     return KubernetesContextProof(
         kubernetes_context=fleet_context['kubernetes_context'],
         physical_cluster_uid=fleet_context['physical_cluster_uid'],
@@ -678,6 +688,9 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
         cluster_queue_name=cluster_queue_name,
         pod_identity_irsa_annotation_absent=True,
         assign_queue_labels_for_pods=True if managed else None,
+        topology_aware_scheduling=True if managed else None,
+        custom_scheduler_deployment_proven=scheduler is not None,
+        resource_flavor_topology_names=tuple(sorted(topology_names)),
         node_flavors=node_flavors)
 
 
@@ -767,13 +780,14 @@ def attest_context(fleet_context: Mapping[str, Any],
                             _request_timeout=kubernetes_adaptor.API_TIMEOUT))
                     for node in provider_context['node_inventory']
                 },
-                'scheduler': _serialized(
+            }
+            if scheduler is not None:
+                snapshot['scheduler'] = _serialized(
                     client,
                     apps.read_namespaced_deployment(
                         scheduler['deployment'],
                         scheduler['namespace'],
-                        _request_timeout=kubernetes_adaptor.API_TIMEOUT)),
-            }
+                        _request_timeout=kubernetes_adaptor.API_TIMEOUT))
             raw_kueue_admission = fleet_context['kueue_admission']
             if raw_kueue_admission is not None:
                 kueue_admission = _dict(raw_kueue_admission,

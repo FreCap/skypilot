@@ -19,11 +19,22 @@ _ROLE_ARN_RE: Final = re.compile(
     r'role/[A-Za-z0-9+=,.@_/-]+$')
 _UUID_RE: Final = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-'
                              r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
-_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v3\x00'
-_PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v2\x00'
+_FLEET_HASH_DOMAIN: Final = b'boltz-reserved-fill/fleet/v4\x00'
+_PROVIDER_HASH_DOMAIN: Final = b'boltz-reserved-fill/provider/v3\x00'
 _REQUIRED_QUEUE_RESOURCES: Final = frozenset(
     {'cpu', 'memory', 'nvidia.com/gpu'})
 _RESOURCE_GROUP_KEYS: Final = frozenset({'covered_resources', 'flavors'})
+_REQUIRED_KUEUE_TAS_FEATURE_GATES: Final = frozenset({
+    'AssignQueueLabelsForPods',
+    'TASFailedNodeReplacement',
+    'TASFailedNodeReplacementFailFast',
+    'TASHandleOverlappingFlavors',
+    'TASMultiLayerTopology',
+    'TASProfileMixed',
+    'TASReplaceNodeOnNodeTaints',
+    'TASReplaceNodeOnPodTermination',
+    'TopologyAwareScheduling',
+})
 _RESOURCE_FLAVOR_KEYS: Final = frozenset({'name', 'resources'})
 _RESOURCE_QUOTA_KEYS: Final = frozenset(
     {'resource_name', 'nominal_quota', 'borrowing_limit'})
@@ -401,6 +412,7 @@ def _validate_deployment_contract(value: object, path: str, *,
     expected = {'deployment', 'namespace', 'replicas', 'images'}
     if controller:
         expected.add('config_map')
+        expected.add('required_feature_gates')
     else:
         expected.remove('images')
         expected.add('containers')
@@ -409,6 +421,17 @@ def _validate_deployment_contract(value: object, path: str, *,
         _text(deployment[key], f'{path}.{key}')
     if controller:
         _text(deployment['config_map'], f'{path}.config_map')
+        feature_gates = _mapping(deployment['required_feature_gates'],
+                                 f'{path}.required_feature_gates')
+        if set(feature_gates) != _REQUIRED_KUEUE_TAS_FEATURE_GATES:
+            raise BundleValidationError(
+                f'{path}.required_feature_gates must contain the exact '
+                'reviewed Kueue TAS gate set.')
+        for name, enabled in feature_gates.items():
+            _text(name, f'{path}.required_feature_gates key')
+            if enabled is not True:
+                raise BundleValidationError(
+                    f'{path}.required_feature_gates.{name} must be true.')
         images = _mapping(deployment['images'], f'{path}.images')
     else:
         images = _mapping(deployment['containers'], f'{path}.containers')
@@ -500,9 +523,11 @@ def _validate_provider_context(value: object, path: str) -> None:
     if eks['cluster_arn'] != expected_arn:
         raise BundleValidationError(f'{path}.eks.cluster_arn is inconsistent.')
 
-    _validate_deployment_contract(context['scheduler'],
-                                  f'{path}.scheduler',
-                                  controller=False)
+    scheduler = context['scheduler']
+    if scheduler is not None:
+        _validate_deployment_contract(scheduler,
+                                      f'{path}.scheduler',
+                                      controller=False)
     enforcement = context['kueue_enforcement']
     if enforcement is not None:
         _validate_kueue_enforcement(enforcement, f'{path}.kueue_enforcement')
@@ -514,7 +539,7 @@ def _validate_provider_context(value: object, path: str) -> None:
     flavor_names: list[str] = []
     for index, item in enumerate(flavors):
         flavor = _mapping(item, f'{path}.resource_flavors[{index}]')
-        _exact_keys(flavor, {'name', 'node_labels'},
+        _exact_keys(flavor, {'name', 'node_labels', 'topology_name'},
                     f'{path}.resource_flavors[{index}]')
         flavor_names.append(
             _text(flavor['name'], f'{path}.resource_flavors[{index}].name'))
@@ -527,6 +552,10 @@ def _validate_provider_context(value: object, path: str) -> None:
         for key, item in labels.items():
             _text(key, f'{path}.resource_flavors[{index}] label key')
             _text(item, f'{path}.resource_flavors[{index}].{key}')
+        topology_name = flavor['topology_name']
+        if topology_name is not None:
+            _text(topology_name,
+                  f'{path}.resource_flavors[{index}].topology_name')
     if len(flavor_names) != len(set(flavor_names)):
         raise BundleValidationError(f'{path}.resource_flavors has duplicates.')
 
@@ -674,7 +703,7 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     root = _mapping(document, 'bundle')
     _exact_keys(root, {'schema_version', 'fleet', 'provider_inventory'},
                 'bundle')
-    if root['schema_version'] != 3:
+    if root['schema_version'] != 4:
         raise BundleValidationError(
             'Fleet bundle schema version is unsupported.')
     fleet = _mapping(root['fleet'], 'bundle.fleet')
@@ -709,11 +738,7 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
     for fleet_context in fleet_contexts:
         path = f"context {fleet_context['kubernetes_context']}"
         provider_context = provider_by_name[fleet_context['kubernetes_context']]
-        if (fleet_context['scheduler_name']
-                != provider_context['scheduler']['deployment']):
-            raise BundleValidationError(
-                f'{path} projected scheduler and provider deployment '
-                'disagree.')
+        scheduler = provider_context['scheduler']
         flavor_labels = {
             item['name']: item['node_labels']
             for item in provider_context['resource_flavors']
@@ -736,6 +761,24 @@ def parse_bundle_bytes(encoded: bytes) -> FleetBundle:
             raise BundleValidationError(
                 f'{path} Kueue admission and enforcement must be both null '
                 'or both configured.')
+        topology_names = {
+            item['topology_name']
+            for item in provider_context['resource_flavors']
+        }
+        if managed:
+            if (scheduler is not None or
+                    fleet_context['scheduler_name'] != 'default-scheduler' or
+                    None in topology_names):
+                raise BundleValidationError(
+                    f'{path} managed Kueue TAS must be the sole topology '
+                    'authority with default-scheduler and exact topology '
+                    'names.')
+        elif (not isinstance(scheduler, Mapping) or
+              fleet_context['scheduler_name'] != scheduler['deployment'] or
+              topology_names != {None}):
+            raise BundleValidationError(
+                f'{path} unmanaged scheduling must bind the exact custom '
+                'scheduler deployment and no Kueue topology.')
         for accelerator, contract in fleet_context['accelerators'].items():
             for flavor, product in zip(contract['flavors'],
                                        contract['product_label_values']):

@@ -9,9 +9,9 @@ supply-aware paid-residual bound is merged and qualified. The newest exact
 artifact is deployed directly with Helm as production revision 418 / release
 `1.1.1325`, merge commit
 `f5cf1c74cfe2c417a3551f70951f0191e762bad4`, image digest
-`sha256:e330fb42865854864645dcc603862b9c43185f70b2097f57e054f28a17e24a32`,
+`sha256:e330fb8d0cdff9e153291173c513eb6aca34b0556d51ce435906ce82cce7fc49`,
 and chart digest
-`sha256:586ee4ec9d764d906833430298459905a3260ca7fe19deede5b04683706edd07`.
+`sha256:586ee857f199713522432431291363a55ee7dcb930a13616d4229533df87d512`.
 The Serve052/API-request-015 migration Job completed, the API reports protocol
 version 89, and the API plus both `boltz-l4-fleet` load-balancer slots are ready
 on the exact image with zero restarts. No service version, authority mode, or
@@ -210,11 +210,15 @@ PriorityClass `rescluster-k8s-prod-east1-preemptible-inference-low` (-1000,
 exact context contracts: east is explicitly unmanaged by Kueue and cannot
 claim fill, while PHX names LocalQueue `be`, ClusterQueue `skypilot-be`,
 WorkloadPriorityClass `be-ls`, and service account `skypilot-pool-sa`. The
-policy remains correctly fail-closed. Its first live attestation blocker is
-now explicit: the API-server IAM principal receives Kubernetes 403 when it
-reads ServiceAccount `skypilot-pool-sa` in the PHX namespace. Once that
-read-only RBAC is granted, the missing PHX `gpu-binpack-scheduler` Deployment
-is the next blocker. Version 58 also retains task-owned Kubernetes
+policy remains correctly fail-closed. The exact ServiceAccount RBAC read is
+now present, but the per-spoke audit IAM roles and EKS access entries are not.
+The 2026-08-18 audit also invalidated the old scheduler premise: platform PRs
+#8524/#8526/#8527 deliberately replaced PHX `gpu-binpack-scheduler` with Kueue
+v0.19 topology-aware scheduling plus `default-scheduler`. Reinstalling the
+custom scheduler would create a second placement authority. Policy schema v4
+therefore binds the exact TAS feature gates and H200 ResourceFlavor
+`topologyName: hyperpod` while retaining east's custom scheduler. Version 58
+also retains task-owned Kubernetes
 `pod_config`, `remote_identity`, and `provision_timeout` overrides, so the
 strict worker-projection builder correctly persisted null rather than blessing
 a competing Pod contract.
@@ -1455,8 +1459,9 @@ contract for `boltz-l4-fleet`'s `mt_hybrid` workspace as:
   `be-ls` (value 12, latency-sensitive best effort);
 - Pod PriorityClass
   `rescluster-k8s-prod-east1-preemptible-inference-low` (value -1000,
-  `Never`), scheduler `gpu-binpack-scheduler`, H200 ResourceFlavor
-  `ml.p5e.48xlarge`, and physical cluster UID
+  `Never`), Kubernetes `default-scheduler`, Kueue v0.19 topology-aware
+  scheduling with H200 ResourceFlavor `ml.p5e.48xlarge` and
+  `topologyName: hyperpod`, and physical cluster UID
   `ba2dcdca-2a0d-447f-ad8a-31849a63c1d5`.
 
 Production uses PostgreSQL-backed API-server configuration; the mounted
@@ -1467,12 +1472,12 @@ server-owned `mt_hybrid` PHX `kueue.local_queue_name: be` and
 complete server-owned priority, service-account, scheduler, accelerator,
 cache, and scratch projection inputs. Do not seed or patch the database out of
 band. Revision 408 already corrected the embedded Boltz policy bundle and
-deployed it dark. The next operational prerequisite is a narrowly scoped
-read-only RBAC grant that lets the API-server principal attest ServiceAccount
-`skypilot-pool-sa`; the current request is denied with Kubernetes 403. The
-following prerequisite is deployment of the exact
-`gpu-binpack-scheduler` named by both the live worker contract and policy. Only
-after both attestations pass may the audited config transaction compile/elect
+deployed it dark. The exact ServiceAccount read is now present. The remaining
+identity prerequisite is creation of the two narrowly scoped cross-account
+audit roles, their EKS access/RBAC, and the hub controller's exact
+AssumeRole/TagSession permission. Policy schema v4 must then attest PHX's
+existing Kueue TAS/default-scheduler contract; no custom scheduler is
+installed. Only after both attestations pass may the audited config transaction compile/elect
 a new service version with task-owned Kubernetes overrides removed and
 `min_replicas: 0`. Its immutable worker placement projection must contain the
 exact pair. A successful H200 Pod must show the `be` queue label,
@@ -1770,10 +1775,10 @@ dark deployment gate.
   LocalQueue `be`, ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls`,
   and service account `skypilot-pool-sa`; deploy the correction dark in
   revision 408.
-- [ ] Grant the API-server principal exact read-only attestation access to PHX
-  ServiceAccount `skypilot-pool-sa`, deploy the exact
-  `gpu-binpack-scheduler`, then prove the policy preflight passes without
-  weakening any check.
+- [ ] Create the exact east and PHX cross-account audit roles, EKS access/RBAC,
+  and hub source permission; deploy policy schema v4 and prove east's custom
+  scheduler plus PHX's Kueue TAS/default-scheduler topology contract without
+  weakening any check. The direct ServiceAccount read is already proven.
 - [ ] Apply the complete audited server-owned worker config, compile/elect a
   clean service version, and prove an H200 reserved-fill Pod is admitted with
   the exact queue, workload priority, and low preemptible Pod priority.

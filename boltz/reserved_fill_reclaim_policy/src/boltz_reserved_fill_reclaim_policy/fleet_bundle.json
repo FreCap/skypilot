@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "fleet": {
     "contexts": [
       {
@@ -219,7 +219,7 @@
           "preemption_policy": "Never",
           "value": -1000
         },
-        "scheduler_name": "gpu-binpack-scheduler",
+        "scheduler_name": "default-scheduler",
         "service_account_name": "skypilot-pool-sa"
       }
     ]
@@ -264,14 +264,16 @@
               "beta.kubernetes.io/instance-type": "ml.p4d.24xlarge",
               "node.kubernetes.io/instance-type": "ml.p4d.24xlarge",
               "sagemaker.amazonaws.com/compute-type": "hyperpod"
-            }
+            },
+            "topology_name": null
           },
           {
             "name": "ml.p4de.24xlarge",
             "node_labels": {
               "beta.kubernetes.io/instance-type": "ml.p4de.24xlarge",
               "sagemaker.amazonaws.com/compute-type": "hyperpod"
-            }
+            },
+            "topology_name": null
           }
         ],
         "scheduler": {
@@ -307,7 +309,18 @@
               "manager": "registry.k8s.io/kueue/kueue:v0.19.0"
             },
             "namespace": "kueue-system",
-            "replicas": 2
+            "replicas": 2,
+            "required_feature_gates": {
+              "AssignQueueLabelsForPods": true,
+              "TASFailedNodeReplacement": true,
+              "TASFailedNodeReplacementFailFast": true,
+              "TASHandleOverlappingFlavors": true,
+              "TASMultiLayerTopology": true,
+              "TASProfileMixed": true,
+              "TASReplaceNodeOnNodeTaints": true,
+              "TASReplaceNodeOnPodTermination": true,
+              "TopologyAwareScheduling": true
+            }
           },
           "webhooks": {
             "mutating": {
@@ -350,18 +363,11 @@
               "beta.kubernetes.io/instance-type": "ml.p5e.48xlarge",
               "node.kubernetes.io/instance-type": "ml.p5e.48xlarge",
               "sagemaker.amazonaws.com/compute-type": "hyperpod"
-            }
+            },
+            "topology_name": "hyperpod"
           }
         ],
-        "scheduler": {
-          "containers": {
-            "gpu-pod-mutator": "699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-gpu-binpack-scheduler@sha256:044d29f2c545b81fc3b27ce381c37eda64321bb44f97208dedf3dc1c11a96bfa",
-            "kube-scheduler": "699626303757.dkr.ecr.us-east-1.amazonaws.com/boltz-gpu-binpack-scheduler@sha256:044d29f2c545b81fc3b27ce381c37eda64321bb44f97208dedf3dc1c11a96bfa"
-          },
-          "deployment": "gpu-binpack-scheduler",
-          "namespace": "kube-system",
-          "replicas": 2
-        }
+        "scheduler": null
       }
     ]
   }

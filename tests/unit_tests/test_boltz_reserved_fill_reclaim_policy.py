@@ -79,6 +79,8 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
         'inference_cluster_queue'] == 'skypilot-be'
     assert phx['kueue_admission']['workload_priority_class_name'] == 'be-ls'
     assert phx['kueue_admission']['workload_priority_value'] == 12
+    assert east['scheduler_name'] == 'gpu-binpack-scheduler'
+    assert phx['scheduler_name'] == 'default-scheduler'
     assert east['accelerators']['a100-80gb'] == {
         'count': 1,
         'flavors': ['ml.p4de.24xlarge'],
@@ -134,7 +136,7 @@ def test_bundle_hashes_are_domain_separated_and_order_independent():
 def test_bundle_rejects_duplicate_keys_unknown_keys_and_unsafe_quota():
     with pytest.raises(bundle_lib.BundleValidationError, match='Duplicate'):
         bundle_lib.parse_bundle_bytes(
-            b'{"schema_version":3,"schema_version":3}')
+            b'{"schema_version":4,"schema_version":4}')
 
     document = _bundle_document()
     document['unknown'] = True
@@ -267,12 +269,34 @@ def test_bundle_requires_matching_kueue_admission_and_enforcement():
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
-def test_bundle_binds_projected_scheduler_to_provider_deployment():
+def test_bundle_requires_one_scheduler_or_tas_topology_authority():
     document = _bundle_document()
-    _managed_document_context(document)['scheduler_name'] = 'default-scheduler'
+    _managed_document_context(document)['scheduler_name'] = (
+        'gpu-binpack-scheduler')
 
     with pytest.raises(bundle_lib.BundleValidationError,
-                       match='projected scheduler and provider deployment'):
+                       match='Kueue TAS must be the sole topology authority'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    _managed_provider_context(document)['scheduler'] = copy.deepcopy(
+        document['provider_inventory']['contexts'][0]['scheduler'])
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='Kueue TAS must be the sole topology authority'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    _managed_provider_context(
+        document)['resource_flavors'][0]['topology_name'] = None
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exact topology names'):
+        bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
+
+    document = _bundle_document()
+    del _managed_provider_context(document)['kueue_enforcement']['controller'][
+        'required_feature_gates']['TopologyAwareScheduling']
+    with pytest.raises(bundle_lib.BundleValidationError,
+                       match='exact reviewed Kueue TAS gate set'):
         bundle_lib.parse_bundle_bytes(_encoded_bundle(document))
 
 
@@ -356,6 +380,12 @@ def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
             pod_identity_irsa_annotation_absent=True,
             assign_queue_labels_for_pods=(True
                                           if admission is not None else None),
+            topology_aware_scheduling=(True if admission is not None else None),
+            custom_scheduler_deployment_proven=(provider['scheduler']
+                                                is not None),
+            resource_flavor_topology_names=tuple(
+                sorted((flavor['name'], flavor['topology_name'])
+                       for flavor in provider['resource_flavors'])),
             node_flavors=tuple(
                 kubernetes_attestation.NodeFlavorProof(
                     flavor=node['flavor'],
@@ -926,7 +956,7 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
     controller = enforcement['controller']
     webhooks = enforcement['webhooks']
     queues = kueue_admission['queues']
-    return {
+    snapshot = {
         'namespace': {
             'metadata': {
                 'name': namespace,
@@ -974,7 +1004,8 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                     'name': flavor['name']
                 },
                 'spec': {
-                    'nodeLabels': copy.deepcopy(flavor['node_labels'])
+                    'nodeLabels': copy.deepcopy(flavor['node_labels']),
+                    'topologyName': flavor['topology_name'],
                 },
             } for flavor in provider['resource_flavors']
         },
@@ -1003,7 +1034,6 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                 }]
             } for node in provider['node_inventory']
         },
-        'scheduler': _deployment(provider['scheduler'], 'containers'),
         'kueue_controller': _deployment(controller, 'images'),
         'kueue_config': {
             'metadata': {
@@ -1013,7 +1043,10 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
             'data': {
                 'controller_manager_config.yaml':
                     ('integrations:\n  frameworks:\n  - pod\n'
-                     'featureGates:\n  AssignQueueLabelsForPods: true\n')
+                     'featureGates:\n' +
+                     ''.join(f'  {name}: {str(enabled).lower()}\n'
+                             for name, enabled in
+                             controller['required_feature_gates'].items()))
             },
         },
         'admission_policy': {
@@ -1085,6 +1118,9 @@ def _kubernetes_snapshot(context: dict, provider: dict) -> dict:
                                                        controller,
                                                        mutating=True),
     }
+    if provider['scheduler'] is not None:
+        snapshot['scheduler'] = _deployment(provider['scheduler'], 'containers')
+    return snapshot
 
 
 def _unmanaged_kubernetes_snapshot(context: dict, provider: dict) -> dict:
@@ -1121,7 +1157,8 @@ def _unmanaged_kubernetes_snapshot(context: dict, provider: dict) -> dict:
                     'name': flavor['name']
                 },
                 'spec': {
-                    'nodeLabels': copy.deepcopy(flavor['node_labels'])
+                    'nodeLabels': copy.deepcopy(flavor['node_labels']),
+                    'topologyName': flavor['topology_name'],
                 },
             } for flavor in provider['resource_flavors']
         },
@@ -1163,6 +1200,10 @@ def test_kubernetes_snapshot_proves_unmanaged_context_without_kueue_reads():
     assert proof.local_queue_name is None
     assert proof.cluster_queue_name is None
     assert proof.assign_queue_labels_for_pods is None
+    assert proof.topology_aware_scheduling is None
+    assert proof.custom_scheduler_deployment_proven
+    assert proof.resource_flavor_topology_names == (('ml.p4d.24xlarge', None),
+                                                    ('ml.p4de.24xlarge', None))
 
     snapshot['namespace']['metadata']['labels'][
         'boltz.bio/kueue-managed'] = 'true'
@@ -1184,6 +1225,10 @@ def test_kubernetes_snapshot_proves_exact_reclaim_topology():
     assert proof.cluster_queue_name == 'skypilot-be'
     assert proof.pod_identity_irsa_annotation_absent
     assert proof.assign_queue_labels_for_pods
+    assert proof.topology_aware_scheduling
+    assert not proof.custom_scheduler_deployment_proven
+    assert proof.resource_flavor_topology_names == (('ml.p5e.48xlarge',
+                                                     'hyperpod'),)
     assert proof.node_flavors == (kubernetes_attestation.NodeFlavorProof(
         flavor='ml.p5e.48xlarge',
         non_deleting_node_count=1,
@@ -1268,6 +1313,8 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
     (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec']
      ['nodeLabels'].__setitem__('beta.kubernetes.io/instance-type', 'ml.wrong'),
      'instance selector'),
+    (lambda snapshot: snapshot['resource_flavors']['ml.p5e.48xlarge']['spec'].
+     __setitem__('topologyName', 'wrong'), 'topology'),
     (lambda snapshot: snapshot['nodes'][
         'ml.p5e.48xlarge']['items'][0]['metadata']['labels'].__setitem__(
             'nvidia.com/gpu.product', 'NVIDIA-A100'), 'GPU product'),
@@ -1278,7 +1325,7 @@ def _duplicate_inference_quota_atom(snapshot: dict) -> None:
     (lambda snapshot: snapshot['kueue_config']['data'].__setitem__(
         'controller_manager_config.yaml',
         'integrations:\n  frameworks:\n  - pod\nfeatureGates: {}\n'),
-     'AssignQueueLabelsForPods'),
+     'required feature gate'),
     (lambda snapshot: snapshot['admission_policy_binding']['spec'].__setitem__(
         'validationActions', ['Warn']), 'binding'),
     (lambda snapshot: snapshot['admission_policy']['spec']['validations'][0].
@@ -1375,7 +1422,7 @@ def test_machine_readable_proof_exposes_identity_absence(monkeypatch):
 
     payload = policy.preflight(deadline_monotonic=time.monotonic() + 5)
 
-    assert payload['schema_version'] == 1
+    assert payload['schema_version'] == 2
     assert payload['operation'] == 'preflight'
     assert payload['success'] is True
     assert len(payload['contexts']) == 2
@@ -1395,7 +1442,7 @@ def test_preflight_cli_prints_exactly_one_json_object(monkeypatch, capsys):
             assert emit_log is False
             print('provider operation noise')
             return {
-                'schema_version': 1,
+                'schema_version': 2,
                 'operation': 'preflight',
                 'success': True,
             }
@@ -1405,10 +1452,31 @@ def test_preflight_cli_prints_exactly_one_json_object(monkeypatch, capsys):
     assert preflight.main() == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out) == {
-        'schema_version': 1,
+        'schema_version': 2,
         'operation': 'preflight',
         'success': True,
     }
     assert captured.out.count('\n') == 1
     assert 'provider startup noise' in captured.err
     assert 'provider operation noise' in captured.err
+
+
+def test_preflight_cli_failure_uses_current_proof_schema(monkeypatch, capsys):
+
+    class FailingPolicy:
+
+        def __init__(self):
+            raise RuntimeError('attestation failed')
+
+    monkeypatch.setattr(preflight, 'BoltzReservedFillReclaimPolicy',
+                        FailingPolicy)
+
+    assert preflight.main() == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        'schema_version': 2,
+        'operation': 'preflight',
+        'success': False,
+        'error_code': 'ATTESTATION_FAILED',
+    }
+    assert captured.out.count('\n') == 1
