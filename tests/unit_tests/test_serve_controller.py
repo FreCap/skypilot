@@ -1385,6 +1385,105 @@ def test_binding_promotion_refresh_failure_keeps_local_authority(monkeypatch):
     assert ctrl._ordinary_launch_binding_authority is previous  # pylint: disable=protected-access
 
 
+def test_atomic_capacity_promotion_holds_one_fence_until_manager_install(
+        monkeypatch):
+    ctrl = _make_update_controller()
+    authority = _binding_authority('bound', 6, generic=True)
+    ctrl._ordinary_launch_binding_authority = authority  # pylint: disable=protected-access
+
+    epochs = types.SimpleNamespace(demand_source_epoch=1,
+                                   zero_cost_actuation_epoch=1)
+
+    def _promote(installed_authority, demand_epoch, actuation_epoch):
+        assert installed_authority is authority
+        assert (demand_epoch, actuation_epoch) == (0, 0)
+        assert ctrl.get_actuation_generation() == 1
+        assert ctrl._routing_state_lock._is_owned()  # pylint: disable=protected-access
+        return epochs
+
+    def _install():
+        assert ctrl.get_actuation_generation() == 1
+        assert ctrl._routing_state_lock._is_owned()  # pylint: disable=protected-access
+
+    promote = mock.Mock(side_effect=_promote)
+    ctrl._replica_manager.install_durable_zero_cost_actuation.side_effect = (  # pylint: disable=protected-access
+        _install)
+    monkeypatch.setattr(controller.request_postgres,
+                        'promote_capacity_authorities_service', promote)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+
+    response = client.post(
+        constants.CONTROLLER_CAPACITY_AUTHORITY_ENDPOINT_PATH,
+        json={
+            'expected_service_hash': 'incarnation-a',
+            'expected_demand_source_epoch': 0,
+            'expected_zero_cost_actuation_epoch': 0,
+        })
+
+    assert response.status_code == 200
+    assert response.json() == {
+        'demand_source_mode': 'durable',
+        'demand_source_epoch': 1,
+        'reserved_fill_actuation_mode': 'DURABLE_INTENT',
+        'reserved_fill_actuation_epoch': 1,
+    }
+    promote.assert_called_once_with(authority, 0, 0)
+    ctrl._replica_manager.install_durable_zero_cost_actuation.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
+    )
+    assert ctrl.get_actuation_generation() == 2
+
+
+def test_separate_demand_transition_is_deprecated(monkeypatch):
+    ctrl = _make_update_controller()
+    transition = mock.Mock()
+    ctrl._transition_demand_source = transition  # type: ignore[method-assign]  # pylint: disable=protected-access
+    client = _register_update_test_routes(ctrl, monkeypatch)
+
+    response = client.post(constants.CONTROLLER_DEMAND_SOURCE_ENDPOINT_PATH,
+                           json={
+                               'mode': 'durable',
+                               'expected_service_hash': 'incarnation-a',
+                               'expected_source_epoch': 0,
+                           })
+
+    assert response.status_code == 409
+    assert 'atomic capacity-authority endpoint' in response.json()['message']
+    transition.assert_not_called()
+
+
+def test_atomic_capacity_install_failure_fences_child_for_recovery(monkeypatch):
+    ctrl = _make_update_controller()
+    authority = _binding_authority('bound', 6, generic=True)
+    ctrl._ordinary_launch_binding_authority = authority  # pylint: disable=protected-access
+    epochs = types.SimpleNamespace(demand_source_epoch=1,
+                                   zero_cost_actuation_epoch=1)
+    monkeypatch.setattr(controller.request_postgres,
+                        'promote_capacity_authorities_service',
+                        lambda *_args: epochs)
+    ctrl._replica_manager.install_durable_zero_cost_actuation.side_effect = (  # pylint: disable=protected-access
+        RuntimeError('local install failed'))
+    recovery = mock.Mock()
+    monkeypatch.setattr(ctrl, '_schedule_supervised_recovery', recovery)
+    client = _register_update_test_routes(ctrl, monkeypatch)
+
+    response = client.post(
+        constants.CONTROLLER_CAPACITY_AUTHORITY_ENDPOINT_PATH,
+        json={
+            'expected_service_hash': 'incarnation-a',
+            'expected_demand_source_epoch': 0,
+            'expected_zero_cost_actuation_epoch': 0,
+        })
+
+    assert response.status_code == 409
+    assert 'supervised recovery scheduled' in response.json()['message']
+    assert ctrl._update_recovery_required  # pylint: disable=protected-access
+    assert ctrl._actuation_stop.is_set()  # pylint: disable=protected-access
+    assert ctrl.get_actuation_generation() == 1
+    ctrl._replica_manager.fence_launches_for_update_recovery.assert_called_once_with(  # pylint: disable=line-too-long,protected-access
+    )
+    recovery.assert_called_once_with()
+
+
 @pytest.mark.parametrize('path,body,expected_status', [
     ('/controller/update_service', {
         'version': 2,

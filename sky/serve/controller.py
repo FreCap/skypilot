@@ -3986,6 +3986,49 @@ class SkyServeController:
             if not self._actuation_stop.is_set():
                 self._finish_actuation_transition(transition_generation)
 
+    def _promote_capacity_authorities(
+        self,
+        expected_demand_source_epoch: int,
+        expected_zero_cost_actuation_epoch: int,
+    ) -> tuple[int, int]:
+        """Atomically install durable demand and zero-cost actuation."""
+        transition_generation = self._begin_actuation_transition()
+        try:
+            authority = self._ordinary_launch_binding_authority
+            if authority is None or not authority.generic_launches_required:
+                raise capacity_admission.CapacityAdmissionUnavailable(
+                    'Capacity promotion requires generic non-pool launch '
+                    'authority first.')
+            # Keep legacy LB sync ingestion and every reconcile capture fenced
+            # until PostgreSQL and the manager expose the same authority pair.
+            with self._routing_state_lock:
+                epochs = (request_postgres.promote_capacity_authorities_service(
+                    authority, expected_demand_source_epoch,
+                    expected_zero_cost_actuation_epoch))
+                try:
+                    self._replica_manager.install_durable_zero_cost_actuation()
+                except Exception as error:  # pylint: disable=broad-except
+                    # PostgreSQL already committed both modes.  Never release
+                    # this child with a stale in-memory manager; its supervised
+                    # replacement reconstructs the exact durable pair.
+                    try:
+                        self._fence_actuation_for_update_recovery()
+                    except Exception:  # pylint: disable=broad-except
+                        logger.exception(
+                            'Failed to finish fencing a controller after '
+                            'capacity-authority installation failed.')
+                    finally:
+                        self._schedule_supervised_recovery()
+                    raise RuntimeError(
+                        'Durable capacity authority committed but local '
+                        'installation failed; supervised recovery scheduled.'
+                    ) from error
+            return (epochs.demand_source_epoch,
+                    epochs.zero_cost_actuation_epoch)
+        finally:
+            if not self._actuation_stop.is_set():
+                self._finish_actuation_transition(transition_generation)
+
     def _get_actuation_stop(self) -> threading.Event:
         return self._actuation_stop
 
@@ -6396,21 +6439,63 @@ class SkyServeController:
                 return responses.JSONResponse(
                     content={'message': 'Service incarnation changed.'},
                     status_code=409)
-            try:
-                epoch = self._transition_demand_source(mode, expected_epoch)
+            return responses.JSONResponse(content={
+                'message': ('Separate demand-source transitions are '
+                            'deprecated; use the atomic capacity-authority '
+                            'endpoint.')
+            },
+                                          status_code=409)
+
+        @self._app.post(
+            serve_constants.CONTROLLER_CAPACITY_AUTHORITY_ENDPOINT_PATH,
+            dependencies=[admin_auth_dependency, controller_owner_dependency])
+        def promote_capacity_authorities(
+            request_data: dict[str,
+                               Any] = fastapi.Body(...),) -> fastapi.Response:
+            """Atomically promote the sole demand and fill-actuation paths."""
+            expected_service_hash = request_data.get('expected_service_hash')
+            expected_demand_epoch = request_data.get(
+                'expected_demand_source_epoch')
+            expected_actuation_epoch = request_data.get(
+                'expected_zero_cost_actuation_epoch')
+            if (isinstance(expected_demand_epoch, bool) or
+                    not isinstance(expected_demand_epoch, int) or
+                    expected_demand_epoch < 0 or
+                    isinstance(expected_actuation_epoch, bool) or
+                    not isinstance(expected_actuation_epoch, int) or
+                    expected_actuation_epoch < 0):
                 return responses.JSONResponse(content={
-                    'demand_source_mode': mode,
-                    'demand_source_epoch': epoch,
-                })
+                    'message': ('Expected demand and actuation epochs must be '
+                                'nonnegative integers.')
+                },
+                                              status_code=400)
+            if expected_service_hash != self._service_hash:
+                return responses.JSONResponse(
+                    content={'message': 'Service incarnation changed.'},
+                    status_code=409)
+            try:
+                demand_epoch, actuation_epoch = (
+                    self._promote_capacity_authorities(
+                        expected_demand_epoch, expected_actuation_epoch))
+                return responses.JSONResponse(
+                    content={
+                        'demand_source_mode': 'durable',
+                        'demand_source_epoch': demand_epoch,
+                        'reserved_fill_actuation_mode': (
+                            zero_cost_actuation.ActuationMode.DURABLE_INTENT.
+                            value),
+                        'reserved_fill_actuation_epoch': actuation_epoch,
+                    })
             except (capacity_admission.CapacityAdmissionError,
+                    zero_cost_actuation.ZeroCostActuationError,
                     RuntimeError) as error:
-                logger.warning('Demand-source transition rejected for %s: %s',
-                               self._service_name,
-                               common_utils.format_exception(error))
+                logger.warning(
+                    'Capacity-authority transition rejected for %s: %s',
+                    self._service_name, common_utils.format_exception(error))
                 return responses.JSONResponse(content={'message': str(error)},
                                               status_code=409)
             except Exception as error:  # pylint: disable=broad-except
-                logger.exception('Demand-source transition failed for %s.',
+                logger.exception('Capacity-authority transition failed for %s.',
                                  self._service_name)
                 return responses.JSONResponse(
                     content={'message': common_utils.format_exception(error)},

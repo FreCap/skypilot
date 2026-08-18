@@ -54,6 +54,7 @@ from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
 
 if typing.TYPE_CHECKING:
+    from sky.serve import capacity_authority as capacity_authority_lib
     from sky.serve import ordinary_launch_binding as ordinary_launch_binding_lib
     from sky.serve import replica_managers
 
@@ -61,6 +62,7 @@ logger = sky_logging.init_logger(__name__)
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 capacity_admission = adaptors_common.LazyImport('sky.serve.capacity_admission')
+capacity_authority = adaptors_common.LazyImport('sky.serve.capacity_authority')
 serve_state = adaptors_common.LazyImport('sky.serve.serve_state')
 serve_state_schema = adaptors_common.LazyImport('sky.serve.serve_state_schema')
 zero_cost_actuation = adaptors_common.LazyImport(
@@ -4218,6 +4220,33 @@ def promote_ordered_capacity_admission_service(
             ordered_capacity_admission_fleet_capable(connection=conn))
         session.commit()
         return epoch
+
+
+def promote_capacity_authorities_service(
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    expected_demand_source_epoch: int,
+    expected_zero_cost_actuation_epoch: int,
+) -> capacity_authority_lib.CapacityAuthorityEpochs:
+    """Atomically promote durable demand and grant-before-row actuation."""
+    if not isinstance(authority,
+                      ordinary_launch_binding.ControllerBindingAuthority):
+        raise TypeError('authority must be ControllerBindingAuthority.')
+    with serve_state.service_replica_launch_authority_write_session(
+            authority.service_name) as (_, session):
+        connection = session.connection()
+        connection.execute(
+            sqlalchemy.text('LOCK TABLE api_server_instances IN SHARE MODE'))
+        epochs = capacity_authority.promote_service_in_connection(
+            connection,
+            service_name=authority.service_name,
+            controller_incarnation=authority.controller_incarnation,
+            expected_demand_source_epoch=expected_demand_source_epoch,
+            expected_zero_cost_actuation_epoch=(
+                expected_zero_cost_actuation_epoch),
+            participant_barrier_passed=lambda conn:
+            ordered_capacity_admission_fleet_capable(connection=conn))
+        session.commit()
+        return epochs
 
 
 def promote_zero_cost_actuation_service(
