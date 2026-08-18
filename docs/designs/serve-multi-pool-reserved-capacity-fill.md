@@ -250,13 +250,15 @@ second scale-down or provider-cleanup path. Its contract is:
 - destructive admission requires a genuinely newer feed generation than the
   retirement's reversible selection generation. Under the established global
   SQL order, the transaction locks the zero-cost protocol singleton, then the
-  service row, then the exact replica row. The service row is the shared
-  service-local mutex with demand ingestion: if `N + 1` ingestion commits
-  first, the old token is rejected; if retirement holds the row first, its
-  commit is ordered before that report. No participant acquires the protocol
-  row after a service row, preserving the common
-  `protocol -> service -> replica` order used by admission, materialization,
-  handoff, takeover, and fill;
+  durable lifecycle fence, service row, and exact replica row. The lifecycle
+  fence precedes the service row exactly as it does during lifecycle takeover,
+  preventing a retirement/takeover lock inversion. The service row is the
+  shared service-local mutex with demand ingestion: if `N + 1` ingestion
+  commits first, the old token is rejected; if retirement holds the row first,
+  its commit is ordered before that report. No participant acquires the
+  protocol row after a lifecycle or service row, preserving the common
+  `protocol -> lifecycle -> service -> replica` order used by admission,
+  materialization, handoff, takeover, and fill;
 - while holding those locks, the commit revalidates the exact service and
   controller owner, source/feed/receipt tuple, route head and immutable digest,
   HA authority, selected fresh occupancy set, database-clock expiry, and
@@ -268,8 +270,12 @@ second scale-down or provider-cleanup path. Its contract is:
   failed commit call is `AMBIGUOUS`: the original worker is discarded and only
   an exact durable row readback may reconstruct cleanup. A committed row is
   detached into ordinary idempotent cleanup; an unchanged reversible row is
-  requeued behind the same later authority seam; malformed state remains
-  off-route for inspection; and
+  requeued behind the same later authority seam. If the controller crashes
+  before that process-local readback, startup recognizes the same exact
+  admission-precommit shape, re-fences it under fresh generation `N` as the
+  canonical strict-idle reversible precommit, and waits for genuine `N + 1`
+  plus fresh idle proof before requeue. Malformed state remains off-route for
+  inspection; and
 - a pre-commit-bit legacy ambiguous row is never grandfathered into teardown.
   Fresh durable generation `N` first normalizes it to a current-controller,
   `committed=false`, strict-idle reversible precommit and starts no worker. A
@@ -278,12 +284,14 @@ second scale-down or provider-cleanup path. Its contract is:
   PostgreSQL commit seam above.
 
 Real-PostgreSQL tests force the generation/read interleaving, assert the
-canonical protocol/service/replica SQL lock order, execute both report-first
-and retirement-first service-row orderings, and inject a commit-lost-ack.
-Manager tests prove the original worker never starts on ambiguity and that
-legacy normalization, including its lost-ack readback, still requires strict
-`N + 1`. The change requires no schema, Helm, Terragrunt, EFS, or alternate
-storage path.
+canonical protocol/lifecycle/service/replica SQL lock order, execute both
+report-first and retirement-first service-row orderings, force the former
+retirement/lifecycle-takeover lock-cycle interleaving, and inject a
+commit-lost-ack. Manager tests prove the original worker never starts on
+ambiguity, a restart recovers the exact admission-precommit row only behind
+fresh `N + 1`, and legacy normalization, including its lost-ack readback,
+still requires strict `N + 1`. The change requires no schema, Helm, Terragrunt,
+EFS, or alternate storage path.
 
 A read-only production audit at revision 432 found all seven live services
 still on `LEGACY_CONTROLLER` plus `DIRECT_REPLICA`, no live row matching the
@@ -3602,11 +3610,14 @@ legacy activation.
   #1506's controller-local `+ 1` generation hunk.
 - [x] Implement PR #1561's exact-head hardening: one read-only repeatable-read
   source snapshot, its unchanged bounded authority token, the canonical
-  protocol/service/replica lock order, a service-row-serialized PostgreSQL
-  logical-retirement commit, explicit rejected/ambiguous outcomes, and legacy
-  normalization through the same strict `N + 1` seam. Real-PostgreSQL races and
-  manager lost-ack tests pass; no schema, storage, Helm, Terragrunt, or provider
-  path is added.
+  protocol/lifecycle/service/replica lock order, a service-row-serialized
+  PostgreSQL logical-retirement commit, explicit rejected/ambiguous outcomes,
+  and legacy normalization through the same strict `N + 1` seam. Controller
+  startup also adopts an exact admission-precommit crash row as the canonical
+  strict-idle reversible precommit; it cannot reconstruct a worker until a
+  genuine `N + 1` and fresh idle proof. Real-PostgreSQL retirement/takeover
+  races, live-update handoff, restart recovery, and manager lost-ack tests pass;
+  no schema, storage, Helm, Terragrunt, or provider path is added.
 - [ ] Merge and deploy the bridge plus exact-head hardening before authority
   activation. Verify feed
   generation `N` publishes both logical target and manager evidence at `N`, a

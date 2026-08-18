@@ -5897,15 +5897,16 @@ def commit_logical_retirement(
 ) -> LogicalRetirementCommitResult:
     """Atomically authorize logical teardown against current durable demand.
 
-    The global zero-cost protocol row comes first, preserving the established
-    protocol -> service -> replica lock order shared by admissions,
-    materializations, handoff, takeover, and fill.  The service row is then the
-    first service-local SQL mutex, matching ``demand_state.ingest_report``.  A
-    report that commits first invalidates the token; a report blocked behind
-    this transaction is ordered after the retirement.  Only ``COMMITTED``
-    authorizes the caller to start a provider worker.  A commit-call failure is
-    deliberately ``AMBIGUOUS`` and requires fresh row readback before any
-    worker can be reconstructed.
+    The global zero-cost protocol row comes first, followed by the lifecycle
+    fence and service row, preserving the established
+    protocol -> lifecycle -> service -> replica lock order shared by
+    admissions, materializations, lifecycle takeover, and fill.  The service
+    row remains the first service-local SQL mutex shared with
+    ``demand_state.ingest_report``.  A report that commits first invalidates
+    the token; a report blocked behind this transaction is ordered after the
+    retirement.  Only ``COMMITTED`` authorizes the caller to start a provider
+    worker.  A commit-call failure is deliberately ``AMBIGUOUS`` and requires
+    fresh row readback before any worker can be reconstructed.
     """
     try:
         authority_valid_until = authority.valid_until
@@ -5931,6 +5932,15 @@ def commit_logical_retirement(
             raise RuntimeError('Logical retirement requires PostgreSQL.')
         _prelock_zero_cost_protocol_for_replica_write(
             session, engine, caller_infos, expected_replica_exists=True)
+        # Lifecycle acquisition advances the durable fence before updating
+        # the service row. Lock and validate that fence before taking the
+        # service mutex too; taking it later through the generic replica
+        # upsert would invert lifecycle takeover's lifecycle -> service order.
+        if not _lifecycle_epoch_matches_in_session(
+                session, service_name, authority.service_lifecycle_epoch):
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
         service = session.execute(
             sqlalchemy.select(services_table).where(
                 services_table.c.name ==

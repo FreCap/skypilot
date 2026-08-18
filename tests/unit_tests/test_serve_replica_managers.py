@@ -9552,20 +9552,24 @@ class TestLogicalCapacityPlanning:
                                         replica_id,
                                         width=1,
                                         confirmed_generation=None,
-                                        bounded_precommit=False):
+                                        bounded_precommit=False,
+                                        admission_precommit=False):
+        assert not (bounded_precommit and admission_precommit)
         info = self._ready_backend(replica_id, width)
         status = info.status_property
         status.is_scale_down = True
         status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
         status.drain_cap_seconds = 3900
         status.drain_started_at = replica_managers.time.time() - 100
-        status.wait_for_idle_before_termination = not bounded_precommit
+        status.wait_for_idle_before_termination = not (bounded_precommit or
+                                                       admission_precommit)
         status.logical_retirement_version = 2 if bounded_precommit else 1
         status.logical_retirement_controller_epoch = 'old-controller-epoch'
         status.logical_retirement_generation = 4
         status.logical_retirement_target_capacity = 1
         status.logical_retirement_confirmed_generation = (
-            4 if bounded_precommit else confirmed_generation)
+            4 if bounded_precommit or admission_precommit else
+            confirmed_generation)
         status.logical_retirement_bounded_deadline = bounded_precommit
         status.logical_retirement_committed = False
         return info
@@ -9812,11 +9816,17 @@ class TestLogicalCapacityPlanning:
         assert mgr._recovering_logical_retirement_ids == {1, 3}
         mgr._terminate_replica.assert_not_called()
 
-    @pytest.mark.parametrize('bounded_precommit', [False, True])
+    @pytest.mark.parametrize(('bounded_precommit', 'admission_precommit'), [
+        (False, False),
+        (True, False),
+        (False, True),
+    ])
     def test_recovery_pass_indexes_valid_uncommitted_retirement(
-            self, bounded_precommit):
+            self, bounded_precommit, admission_precommit):
         retiring = self._recoverable_logical_retirement(
-            1, bounded_precommit=bounded_precommit)
+            1,
+            bounded_precommit=bounded_precommit,
+            admission_precommit=admission_precommit)
         mgr = _make_manager()
         mgr._uses_logical_replicas = True
         mgr._is_pool = False
@@ -12457,8 +12467,9 @@ class TestLogicalCapacityPlanning:
         assert not retiring.status_property.logical_retirement_committed
         assert 9 in mgr._down_thread_pool
 
-    def test_recovery_aborts_valid_unadmitted_scheduled_logical_retirement(
+    def test_restart_recovers_ambiguous_admission_precommit_after_n_plus_one(
             self, tmp_path):
+        """A crash before process-local readback cannot lose worker requeue."""
         mgr, retiring, down_thread = self._recover_logical_teardown(
             tmp_path,
             common_utils.ProcessStatus.SCHEDULED,
@@ -12466,11 +12477,62 @@ class TestLogicalCapacityPlanning:
             committed=False)
 
         down_thread.start.assert_not_called()
-        assert not retiring.status_property.is_scale_down
-        assert retiring.status_property.sky_down_status is None
-        assert retiring.status_property.logical_retirement_version is None
-        assert not retiring.status_property.logical_retirement_committed
+        status = retiring.status_property
+        assert status.is_scale_down
+        assert status.sky_down_status == common_utils.ProcessStatus.SCHEDULED
+        assert status.logical_retirement_version == 10
+        assert (status.logical_retirement_controller_epoch ==
+                mgr._logical_controller_epoch)
+        assert status.logical_retirement_generation == 5
+        assert status.logical_retirement_confirmed_generation is None
+        assert not status.logical_retirement_bounded_deadline
+        assert status.wait_for_idle_before_termination
+        assert not status.logical_retirement_committed
+        assert mgr._recovering_logical_retirement_ids == {9}
         assert 9 not in mgr._down_thread_pool
+
+        # Adoption consumes generation N. Only a genuine N+1 releases the row
+        # to the ordinary idle-proof path, which reconstructs an unstarted
+        # worker rather than advertising the backend or invoking a provider
+        # directly from restart recovery.
+        survivor = self._ready_backend(10, 1)
+        survivor.version = 10
+        mgr._logical_reconcile_snapshot = dataclasses.replace(
+            mgr._logical_reconcile_snapshot, generation=6)
+        mgr._logical_target = (10, 6, 1)
+        with mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos',
+                               return_value=[retiring, survivor]):
+            mgr._reconcile_recovering_logical_retirements()
+        assert not mgr._recovering_logical_retirement_ids
+
+        mgr._wait_for_idle_trackers[9] = (mock.Mock(return_value=True),
+                                          replica_managers.time.monotonic() +
+                                          60)
+        mgr._terminate_replica = mock.Mock()
+        with mock.patch.object(replica_managers.paid_retirement,
+                               'list_for_service',
+                               return_value={}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_replica_infos_from_ids',
+                               return_value={9: retiring}), \
+             mock.patch.object(replica_managers.serve_state,
+                               'get_ready_replica_infos',
+                               return_value=[survivor]), \
+             mock.patch.object(
+                 replica_managers.global_user_state,
+                 'get_cluster_status_fields',
+                 return_value={retiring.cluster_name: ('UP', 1)}):
+            mgr._refresh_wait_for_idle()
+
+        mgr._terminate_replica.assert_called_once_with(
+            9,
+            sync_down_logs=False,
+            replica_drain_delay_seconds=0,
+            is_scale_down=True,
+            in_flight_drain_cap_seconds=0)
+        assert status.logical_retirement_confirmed_generation == 6
+        assert not status.logical_retirement_committed
 
     def test_recovery_adopts_legacy_ambiguous_as_reversible_precommit(
             self, tmp_path):

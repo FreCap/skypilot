@@ -476,10 +476,11 @@ def test_authority_deadline_includes_selected_occupancy_age(capacity_database):
 
 
 def test_logical_retirement_preserves_global_sql_lock_order(capacity_database):
-    """Retirement composes with the canonical protocol/service/replica order."""
+    """Retirement composes with the canonical global row-lock order."""
     info, authority, _ = _prepare_logical_retirement(capacity_database)
     ordered_locks: list[str] = []
-    relevant_tables = ('reserved_fill_protocol_state', 'services', 'replicas')
+    relevant_tables = ('reserved_fill_protocol_state',
+                       'service_lifecycle_fences', 'services', 'replicas')
 
     def _record_lock(_connection, _cursor, statement, _parameters, _context,
                      _executemany):
@@ -500,6 +501,106 @@ def test_logical_retirement_preserves_global_sql_lock_order(capacity_database):
 
     assert result.state is serve_state.LogicalRetirementCommitState.COMMITTED
     assert ordered_locks == list(relevant_tables)
+
+
+def _wait_for_blocked_postgres_backend(engine, backend_pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with engine.connect() as connection:
+            blocked = connection.execute(
+                sqlalchemy.text(
+                    'SELECT cardinality(pg_blocking_pids(:pid)) > 0'), {
+                        'pid': backend_pid
+                    }).scalar_one()
+        if blocked:
+            return
+        time.sleep(0.01)
+    pytest.fail(f'PostgreSQL backend {backend_pid} did not block as expected')
+
+
+def test_logical_retirement_serializes_with_lifecycle_takeover(
+        capacity_database):
+    """Retirement and takeover share lifecycle-before-service ordering."""
+    engine, _, _ = capacity_database
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    retirement_service_locked = threading.Event()
+    release_retirement = threading.Event()
+    retirement_results: list[serve_state.LogicalRetirementCommitResult] = []
+    lifecycle_epochs: list[int] = []
+    errors: list[BaseException] = []
+
+    raw_connection = engine.raw_connection()
+    cursor = raw_connection.cursor()
+    try:
+        cursor.execute('SELECT pg_backend_pid()')
+        lifecycle_backend_pid = int(cursor.fetchone()[0])
+    finally:
+        cursor.close()
+
+    def _pause_after_retirement_service(_connection, _cursor, statement,
+                                        _parameters, _context, _executemany):
+        if threading.current_thread().name != 'logical-retirement':
+            return
+        lowered = statement.lower()
+        if ('from services' in lowered and 'for update' in lowered and
+                not retirement_service_locked.is_set()):
+            retirement_service_locked.set()
+            assert release_retirement.wait(timeout=10)
+
+    def _retire():
+        try:
+            retirement_results.append(_commit_logical(info, authority))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    def _take_over():
+        try:
+            lifecycle_epochs.append(
+                serve_state.claim_service_lifecycle_epoch(
+                    'svc', raw_connection))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+        finally:
+            raw_connection.close()
+
+    sqlalchemy.event.listen(sqlalchemy.engine.Engine, 'after_cursor_execute',
+                            _pause_after_retirement_service)
+    retirement_thread = threading.Thread(target=_retire,
+                                         name='logical-retirement')
+    lifecycle_thread = threading.Thread(target=_take_over,
+                                        name='lifecycle-takeover')
+    try:
+        retirement_thread.start()
+        assert retirement_service_locked.wait(timeout=10)
+        lifecycle_thread.start()
+        # At this point takeover must be waiting on a row the retirement
+        # already owns. Under the old service-before-lifecycle order it owned
+        # the lifecycle row while waiting on the service, forming a cycle when
+        # retirement resumed and entered the generic replica upsert.
+        _wait_for_blocked_postgres_backend(engine, lifecycle_backend_pid)
+        release_retirement.set()
+        retirement_thread.join(timeout=10)
+        lifecycle_thread.join(timeout=10)
+    finally:
+        release_retirement.set()
+        if retirement_thread.is_alive():
+            retirement_thread.join(timeout=10)
+        if lifecycle_thread.is_alive():
+            lifecycle_thread.join(timeout=10)
+        sqlalchemy.event.remove(sqlalchemy.engine.Engine,
+                                'after_cursor_execute',
+                                _pause_after_retirement_service)
+        # ``close`` is idempotent and avoids leaking the connection when setup
+        # fails before the lifecycle thread starts.
+        raw_connection.close()
+
+    assert not retirement_thread.is_alive()
+    assert not lifecycle_thread.is_alive()
+    assert not errors
+    assert lifecycle_epochs == [4]
+    assert len(retirement_results) == 1
+    assert (retirement_results[0].state
+            is serve_state.LogicalRetirementCommitState.COMMITTED)
 
 
 @pytest.mark.parametrize('first', ['report', 'retirement'])

@@ -5893,7 +5893,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         waiting_replicas = [
             info for info in to_down_replicas
             if (not self._is_legacy_uncertain_logical_retirement(info) and
-                (self._is_recoverable_uncommitted_logical_retirement(info) or
+                (self._is_restart_recoverable_logical_retirement(info) or
                  info.status_property.wait_for_idle_before_termination is True))
         ]
         recovery_wait_urls: dict[int, str | None] = {}
@@ -6021,7 +6021,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'replacement capacity is confirmed.')
                     legacy_uncertain_ids.add(replica_info.replica_id)
                     continue
-                if self._is_recoverable_uncommitted_logical_retirement(
+                if self._is_restart_recoverable_logical_retirement(
                         replica_info):
                     # Register both strict idle waits and bounded precommit
                     # drains before rebuilding any teardown worker. The latter
@@ -10874,6 +10874,21 @@ class SkyPilotReplicaManager(ReplicaManager):
             selection_generation <= confirmed_generation and
             type(status.logical_retirement_bounded_deadline) is bool)
 
+    @classmethod
+    def _is_restart_recoverable_logical_retirement(cls,
+                                                   info: ReplicaInfo) -> bool:
+        """Whether controller-start recovery owns an exact precommit row.
+
+        Version-update handoff deliberately excludes ordinary queued
+        admission precommits so it can abort and reselect them in-process.
+        After a controller crash there is no process-local worker or
+        ambiguous-ID owner left, so startup must additionally adopt that
+        exact reversible shape behind fresh N+1 authority.
+        """
+        return bool(
+            cls._is_recoverable_uncommitted_logical_retirement(info) or
+            cls._is_uncommitted_logical_retirement_admission(info))
+
     @staticmethod
     def _is_legacy_uncertain_logical_retirement(info: ReplicaInfo) -> bool:
         """Whether a pre-commit-bit SCHEDULED retirement is ambiguous."""
@@ -11088,7 +11103,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._is_committed_logical_retirement(info):
                 recovering_ids.discard(replica_id)
                 continue
-            if not self._is_recoverable_uncommitted_logical_retirement(info):
+            if not self._is_restart_recoverable_logical_retirement(info):
                 # The normal refresh path retains authority over malformed or
                 # otherwise changed state; the recovery-only epoch gate must
                 # not hide it.
@@ -11250,6 +11265,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 bounded_precommit = (
                     status.wait_for_idle_before_termination is False and
                     status.logical_retirement_bounded_deadline is True)
+                admission_precommit = (
+                    self._is_uncommitted_logical_retirement_admission(info) and
+                    not self._is_recoverable_uncommitted_logical_retirement(
+                        info))
                 old_selection = (
                     status.logical_retirement_version,
                     status.logical_retirement_controller_epoch,
@@ -11257,6 +11276,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     status.logical_retirement_target_capacity,
                     status.logical_retirement_confirmed_generation,
                     status.logical_retirement_bounded_deadline,
+                    status.wait_for_idle_before_termination,
                     status.logical_retirement_committed,
                 )
                 status.logical_retirement_version = self.latest_version
@@ -11266,10 +11286,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 status.logical_retirement_target_capacity = current_target
                 # Adoption only refreshes the selection fence. Idle proof and
                 # the irreversible teardown commit remain in the existing
-                # _finish_logical_retirement path.
+                # _finish_logical_retirement path. Normalize a recovered
+                # admission precommit back to the canonical strict-idle shape;
+                # this confines recognition of that ambiguous crash shape to
+                # startup while making a genuine N+1 and fresh idle proof
+                # mandatory before worker requeue.
                 status.logical_retirement_confirmed_generation = (
                     snapshot.generation if bounded_precommit else None)
                 status.logical_retirement_bounded_deadline = bounded_precommit
+                if admission_precommit:
+                    status.wait_for_idle_before_termination = True
                 status.logical_retirement_committed = False
                 try:
                     self._persist_replica(info.replica_id, info)
@@ -11280,6 +11306,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                      status.logical_retirement_target_capacity,
                      status.logical_retirement_confirmed_generation,
                      status.logical_retirement_bounded_deadline,
+                     status.wait_for_idle_before_termination,
                      status.logical_retirement_committed) = old_selection
                     logger.warning(
                         f'Failed to re-fence recovered logical retirement '
