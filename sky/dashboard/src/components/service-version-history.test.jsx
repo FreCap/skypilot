@@ -15,6 +15,7 @@ import {
 import { getCurrentUserRole } from '@/data/connectors/client';
 import {
   electServiceVersion,
+  getServiceVersion,
   getServiceVersions,
 } from '@/data/connectors/services';
 
@@ -31,6 +32,7 @@ jest.mock('@/data/connectors/client', () => ({
 }));
 jest.mock('@/data/connectors/services', () => ({
   electServiceVersion: jest.fn(),
+  getServiceVersion: jest.fn(),
   getServiceVersions: jest.fn(),
 }));
 jest.mock('@/components/ui/yaml-code-block', () => ({
@@ -72,7 +74,37 @@ beforeEach(() => {
   jest.clearAllMocks();
   getCurrentUserRole.mockResolvedValue({ role: 'admin' });
   getServiceVersions.mockResolvedValue(history);
+  getServiceVersion.mockImplementation((_, version) =>
+    Promise.resolve(
+      history.versions.find((candidate) => candidate.version === version)
+    )
+  );
   electServiceVersion.mockResolvedValue([]);
+});
+
+it('loads YAML for only the selected metadata-only version', async () => {
+  getServiceVersions.mockResolvedValue({
+    ...history,
+    versions: history.versions.map((version) => ({
+      ...version,
+      submitted_yaml_content: null,
+      compiled_yaml_content: null,
+      yaml_included: false,
+    })),
+  });
+  render(<ServiceVersionHistory serviceName="svc" />);
+
+  await screen.findByText(/Elected 3/);
+  fireEvent.click(
+    screen.getByRole('button', { name: 'View YAML for version 1' })
+  );
+
+  expect(await screen.findByText('Version 1 YAML')).toBeInTheDocument();
+  expect(getServiceVersion).toHaveBeenCalledTimes(1);
+  expect(getServiceVersion).toHaveBeenCalledWith('svc', 1);
+  expect(screen.getByTestId('yaml-code-block')).toHaveTextContent(
+    'min_replicas: 1'
+  );
 });
 
 it('shows elected state and compares a stored version', async () => {

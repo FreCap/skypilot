@@ -7444,36 +7444,16 @@ def get_system_recovery_authorization_snapshot(
     }
 
 
-def get_version_records(service_name: str) -> list[dict[str, Any]]:
-    """Gets committed version contents and provenance in one query."""
-    engine = _db_manager.get_engine()
-    projection_columns_available = _placement_projection_columns_available(
-        engine)
-    with orm.Session(engine) as session:
-        rows = session.execute(
-            sqlalchemy.select(
-                version_specs_table.c.version,
-                version_specs_table.c.spec,
-                version_specs_table.c.yaml_content,
-                version_specs_table.c.submitted_yaml_content,
-                version_specs_table.c.created_at,
-                version_specs_table.c.created_by,
-                version_specs_table.c.quarantined_at,
-                version_specs_table.c.quarantine_reason,
-                *([
-                    version_specs_table.c.controller_job_projection,
-                    version_specs_table.c.controller_work_cache,
-                    version_specs_table.c.worker_placement_projections,
-                ] if projection_columns_available else []),
-            ).where(
-                version_specs_table.c.service_name == service_name,
-                version_specs_table.c.yaml_content.isnot(None),
-            ).order_by(version_specs_table.c.version)).fetchall()
-    return [{
+def _version_record_from_row(row: Any,
+                             projection_columns_available: bool,
+                             include_yaml: bool = True) -> dict[str, Any]:
+    """Decode one committed version row without changing its public shape."""
+    return {
         'version': row.version,
         'spec': pickle.loads(row.spec) if row.spec is not None else None,
-        'yaml_content': row.yaml_content,
-        'submitted_yaml_content': row.submitted_yaml_content,
+        'yaml_content': row.yaml_content if include_yaml else None,
+        'submitted_yaml_content':
+            (row.submitted_yaml_content if include_yaml else None),
         'created_at': row.created_at,
         'created_by': row.created_by,
         'quarantined_at': row.quarantined_at,
@@ -7486,7 +7466,71 @@ def get_version_records(service_name: str) -> list[dict[str, Any]]:
         'worker_placement_projections':
             (row.worker_placement_projections
              if projection_columns_available else None),
-    } for row in rows]
+    }
+
+
+def _version_record_columns(projection_columns_available: bool,
+                            include_yaml: bool = True) -> list[Any]:
+    columns = [
+        version_specs_table.c.version,
+        version_specs_table.c.spec,
+        version_specs_table.c.created_at,
+        version_specs_table.c.created_by,
+        version_specs_table.c.quarantined_at,
+        version_specs_table.c.quarantine_reason,
+    ]
+    if include_yaml:
+        columns.extend([
+            version_specs_table.c.yaml_content,
+            version_specs_table.c.submitted_yaml_content,
+        ])
+    if projection_columns_available:
+        columns.extend([
+            version_specs_table.c.controller_job_projection,
+            version_specs_table.c.controller_work_cache,
+            version_specs_table.c.worker_placement_projections,
+        ])
+    return columns
+
+
+def get_version_records(service_name: str,
+                        include_yaml: bool = True) -> list[dict[str, Any]]:
+    """Gets committed version contents and provenance in one query."""
+    engine = _db_manager.get_engine()
+    projection_columns_available = _placement_projection_columns_available(
+        engine)
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(*_version_record_columns(
+                projection_columns_available, include_yaml)).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.yaml_content.isnot(None),
+                ).order_by(version_specs_table.c.version)).fetchall()
+    return [
+        _version_record_from_row(row, projection_columns_available,
+                                 include_yaml) for row in rows
+    ]
+
+
+def get_version_record(service_name: str,
+                       version: int) -> dict[str, Any] | None:
+    """Gets one committed version without materializing all retained YAML."""
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ValueError('Version must be a positive integer.')
+    engine = _db_manager.get_engine()
+    projection_columns_available = _placement_projection_columns_available(
+        engine)
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(
+                *_version_record_columns(projection_columns_available)).where(
+                    version_specs_table.c.service_name == service_name,
+                    version_specs_table.c.version == version,
+                    version_specs_table.c.yaml_content.isnot(None),
+                )).fetchone()
+    if row is None:
+        return None
+    return _version_record_from_row(row, projection_columns_available)
 
 
 def mark_version_controller_applied(

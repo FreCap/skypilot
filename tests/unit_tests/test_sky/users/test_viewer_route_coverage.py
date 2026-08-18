@@ -86,6 +86,7 @@ _KNOWN_VIEWER_DENIED: set = {
     ('/serve/update', 'POST'),
     ('/serve/terminate-replica', 'POST'),
     ('/serve/{service_name}/versions', 'GET'),
+    ('/serve/{service_name}/versions/{version}', 'GET'),
     ('/serve/{service_name}/versions/elect', 'POST'),
     ('/serve/{service_name}/load-balancer/high-availability', 'POST'),
     ('/serve/_internal/{service_name}/ordinary-launch-binding', 'POST'),

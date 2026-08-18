@@ -18,6 +18,7 @@ import {
   getServiceReplicaSummaries,
   getServiceReplicas,
   getServicePlacement,
+  getServiceVersion,
   getServiceVersions,
   getServices,
   normalizeAcceleratorBreakdown,
@@ -1482,7 +1483,20 @@ describe('service version administration', () => {
     });
 
     await expect(getServiceVersions('boltz/l4')).resolves.toEqual(history);
-    expect(apiClient.get).toHaveBeenCalledWith('/serve/boltz%2Fl4/versions');
+    expect(apiClient.get).toHaveBeenCalledWith(
+      '/serve/boltz%2Fl4/versions?include_yaml=false'
+    );
+  });
+
+  it('fetches one immutable version with YAML on demand', async () => {
+    const version = { version: 3, compiled_yaml_content: 'service: {}' };
+    apiClient.get.mockResolvedValue({
+      ok: true,
+      json: async () => version,
+    });
+
+    await expect(getServiceVersion('boltz/l4', 3)).resolves.toEqual(version);
+    expect(apiClient.get).toHaveBeenCalledWith('/serve/boltz%2Fl4/versions/3');
   });
 
   it('elects a stored version through the queued update path', async () => {

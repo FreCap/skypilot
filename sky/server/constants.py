@@ -11,7 +11,7 @@ from sky.utils import controller_constants
 # based on version info is needed.
 # For more details and code guidelines, refer to:
 # https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
-API_VERSION = 89  # Grant-before-row reserved-fill actuation
+API_VERSION = 90  # Lazy SkyServe version YAML
 
 # The minimum peer API version that the code should still work with.
 # Notes (dev):
@@ -156,6 +156,7 @@ MIN_SERVE_PARTIAL_IN_FLIGHT_TELEMETRY_API_VERSION = 86
 MIN_EXECUTOR_TERMINATION_EVIDENCE_API_VERSION = 87
 MIN_SERVE_INCREMENTAL_ROUTE_LEASES_API_VERSION = 88
 MIN_SERVE_ZERO_COST_ACTUATION_API_VERSION = 89
+MIN_SERVE_LAZY_VERSION_YAML_API_VERSION = 90
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
 # Minimum API version whose Serve version-history response exposes immutable
