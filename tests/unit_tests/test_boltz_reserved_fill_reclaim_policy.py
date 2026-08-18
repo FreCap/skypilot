@@ -755,7 +755,21 @@ def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
 @pytest.mark.parametrize('already_frozen', [False, True])
 def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(
         monkeypatch, already_frozen):
-    frozen_credentials = object()
+    frozen_credentials = types.SimpleNamespace(access_key='access',
+                                               secret_key='secret',
+                                               token='token')
+    wrapper_call = {}
+
+    class WrappedCredentials:
+        """Captures reconstruction of an immutable signing provider."""
+
+        def __init__(self, **kwargs):
+            wrapper_call['kwargs'] = kwargs
+            wrapper_call['instance'] = self
+
+        @staticmethod
+        def get_frozen_credentials():
+            return frozen_credentials
 
     class Credentials:
         """Minimal frozen-credential provider for the signer test."""
@@ -799,6 +813,8 @@ def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(
 
     monkeypatch.setattr(kubernetes_attestation.botocore_signers,
                         'RequestSigner', Signer)
+    monkeypatch.setattr(kubernetes_attestation, 'botocore_credentials',
+                        types.SimpleNamespace(Credentials=WrappedCredentials))
 
     token = kubernetes_attestation._eks_bearer_token(
         AuditSession(),
@@ -807,7 +823,18 @@ def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(
         deadline_monotonic=time.monotonic() + 5,
         cancellation=threading.Event())
 
-    assert signer_call['args'][4] is frozen_credentials
+    if already_frozen:
+        wrapped = signer_call['args'][4]
+        assert wrapped is wrapper_call['instance']
+        assert wrapped.get_frozen_credentials() is frozen_credentials
+        assert wrapper_call['kwargs'] == {
+            'access_key': 'access',
+            'secret_key': 'secret',
+            'token': 'token',
+        }
+    else:
+        assert isinstance(signer_call['args'][4], Credentials)
+        assert not wrapper_call
     assert signer_call['request']['headers'] == {
         'x-k8s-aws-id': 'exact-cluster'
     }

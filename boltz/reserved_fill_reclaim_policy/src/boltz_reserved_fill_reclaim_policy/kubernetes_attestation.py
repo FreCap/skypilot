@@ -14,6 +14,7 @@ from sky.adaptors import common as adaptor_common
 from sky.adaptors import kubernetes as kubernetes_adaptor
 
 yaml = adaptor_common.LazyImport('yaml')
+botocore_credentials = adaptor_common.LazyImport('botocore.credentials')
 botocore_signers = adaptor_common.LazyImport('botocore.signers')
 
 _KUEUE_GROUP = 'kueue.x-k8s.io'
@@ -103,18 +104,34 @@ def _eks_bearer_token(audit_session: Any, *, region: str, cluster_name: str,
     if credentials is None:
         raise KubernetesAttestationError(
             'The audit role returned no signing credentials.')
-    # boto3 Sessions normally expose refreshable botocore Credentials, but
-    # the deployment's bounded assumed-role session deliberately exposes an
-    # already-frozen ReadOnlyCredentials value. RequestSigner accepts both;
-    # freeze only when the provider supports that operation.
+    # RequestSigner freezes its credential provider internally. boto3 Sessions
+    # normally expose a refreshable botocore Credentials object, but the
+    # deployment's bounded assumed-role session deliberately exposes an
+    # already-frozen ReadOnlyCredentials value. Reconstruct the latter as an
+    # immutable Credentials provider so the signer has its required interface
+    # without gaining a refresh path or another identity source.
     freeze = getattr(credentials, 'get_frozen_credentials', None)
-    frozen_credentials = freeze() if callable(freeze) else credentials
+    signing_credentials = credentials
+    if not callable(freeze):
+        access_key = getattr(credentials, 'access_key', None)
+        secret_key = getattr(credentials, 'secret_key', None)
+        token = getattr(credentials, 'token', None)
+        if (not isinstance(access_key, str) or not access_key or
+                not isinstance(secret_key, str) or not secret_key or
+            (token is not None and not isinstance(token, str))):
+            raise KubernetesAttestationError(
+                'The audit role returned invalid signing credentials.')
+        signing_credentials = botocore_credentials.Credentials(
+            access_key=access_key,
+            secret_key=secret_key,
+            token=token,
+        )
     signer = botocore_signers.RequestSigner(
         sts.meta.service_model.service_id,
         region,
         'sts',
         'v4',
-        frozen_credentials,
+        signing_credentials,
         sts.meta.events,
     )
     endpoint = sts.meta.endpoint_url

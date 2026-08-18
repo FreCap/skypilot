@@ -4,7 +4,7 @@ Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
-#1547, #1548, and #1549. Production Helm revision 426 / release `1.1.1333`
+#1547, #1548, and #1549. Production Helm revision 427 / release `1.1.1334`
 runs the exact 2 API / 2 controller / 2 executor split-role cohort on RWX
 storage. Service version 61 has `min_replicas: 0`, a zero fill floor, and a
 utilization gate, but its immutable PHX projection was committed before the
@@ -79,13 +79,22 @@ never caches provider observations or bearer tokens.
 
 Revision 426 deployed the isolated audit-role Kubernetes client and the exact
 east association is now absent. Its first two-context preflight failed closed
-without durable activation because the EKS signer treated the bounded audit
-session's already-immutable botocore `ReadOnlyCredentials` as refreshable and
-called `get_frozen_credentials()` a second time. Both AWS inventory/identity
-proofs passed; both Kubernetes domains stopped at that local credential-shape
-error before API reads. The fix-forward signer accepts either botocore shape,
-freezing refreshable credentials once and passing already-frozen credentials
-directly to `RequestSigner`; tests cover both paths.
+without durable activation because the bounded audit session exposes botocore
+`ReadOnlyCredentials`. Revision 427 avoided calling
+`get_frozen_credentials()` in policy code, but production traceback proved
+that `RequestSigner` itself requires and freezes a credential-provider object;
+passing the read-only tuple through therefore preserved the same failure. Both
+AWS inventory/identity proofs passed and no durable gate changed. The corrected
+fix-forward signer passes normal refreshable `Credentials` through unchanged
+and reconstructs an immutable `Credentials` provider from the bounded
+read-only tuple. It neither refreshes nor selects a new identity source, and
+tests cover both shapes at the exact signer seam.
+
+A read-only diagnostic wrapper reached the PHX Kubernetes validator and found
+that the live Kueue v0.19 configuration relies on the upstream default for
+`AssignQueueLabelsForPods`; the attested contract deliberately requires the
+gate to be explicit. The platform correction pins it `true` independently of
+TAS rather than weakening attestation or installing a second scheduler.
 
 At 2026-08-18 01:01 UTC the service had real demand (queue depth 325,
 confirmed in-flight 106, and 98 recent requests in 60 seconds). Paid Spot
@@ -3331,7 +3340,7 @@ legacy activation.
   `min_replicas: 0`. Production committed version 61, but its immutable PHX
   projection captured the retired scheduler and is not an activation
   candidate.
-- [ ] Deploy the audit-role credential-shape fix after revision 426's
+- [ ] Deploy the RequestSigner credential-provider fix after revision 427's
   fail-closed preflight, then obtain one fresh successful two-context preflight
   without widening the writer role. The isolated client is deployed and exact
   east Pod Identity association `a-rsvzwdtaesxvxorkh` is already absent.
