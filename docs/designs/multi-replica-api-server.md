@@ -1,29 +1,32 @@
 # Production-Grade Multi-Replica API Server
 
-Status: M0-M4 merged in PR #1070 and live-accepted on the isolated deployment;
-the split-role metrics-completeness correction is merged, Rainier's PostgreSQL
-request-store cutover is complete, and the typed RWX authority-fence verifier
-plus desired-scale role disruption budgets are implemented and statically
-accepted; the private durable HA-observer canary contract is specified but its
-implementation and independent acceptance remain pending; the Rainier RWX
-storage deployment, role-split HA, and live scrape acceptance are pending;
-production fleet rollout and M5 compatibility cleanup remain fleet-gated; the
-Review-29 operator-authorization correction is accepted and its implementation
-remains pending
+Status: PostgreSQL request authority and the 2/2/2 API/executor/controller
+split are live in production as of 2026-08-18. The private durable HA-observer
+canary and M5 compatibility cleanup remain gated. The RWX/EFS storage plan in
+this document is historical and non-executable.
 
-Last updated: 2026-08-13
+Last updated: 2026-08-18
 
-Canonical owner: this file. External plans and pull request descriptions must
-link here rather than restating a divergent contract.
+Canonical owner: this file owns the role split, PostgreSQL request delivery,
+controller leadership, execution fencing, and availability contract. External
+plans and pull request descriptions must link here rather than restating it.
+
+Storage supersession: every RWX/EFS storage phase, Helm value, rollback step,
+and completion claim below is retained only as implementation history. Current
+storage work is governed by
+`docs/designs/stateless-ha-control-plane-storage.md`: PostgreSQL structured
+authority, private server-owned S3 for immutable bytes, bounded pod-local
+`emptyDir`, and no control-plane PVC or EFS steady state.
 
 ## Summary
 
-SkyPilot currently supports an external PostgreSQL database and an experimental
-RollingUpdate API Deployment, but the API pod is not stateless. Each pod still
-owns a local request database, an in-process queue manager, request executors,
-background daemons, controller supervisors, request logs, and upload staging
-state. Running more than one replica therefore risks split ownership and does
-not provide production-grade availability.
+Production now runs the implemented role split: two stateless API replicas,
+two active-active PostgreSQL request executors, and two active-standby
+controller workers under PostgreSQL leadership and fencing. PostgreSQL is the
+request, queue, lease, and controller-ownership authority. The remaining
+storage dependency is one transitional EFS claim shared by all six role pods;
+its replacement is governed only by
+`docs/designs/stateless-ha-control-plane-storage.md`.
 
 This design separates three responsibilities:
 
@@ -34,11 +37,11 @@ This design separates three responsibilities:
 3. Active-standby controller workers supervise singleton managed-jobs and
    SkyServe control loops under PostgreSQL-backed leadership and fencing.
 
-PostgreSQL is authoritative for request state, queue delivery, ownership,
-leases, and schema compatibility. A ReadWriteMany filesystem is the first
-production artifact and log backend. The existing blob and log provider
-interfaces leave object storage as a future backend without coupling the HA
-control-plane migration to one cloud.
+The following RWX rollout, sizing, cost, rollback, and implementation material
+is retained as a historical record of how the live role split was reached. Its
+present-tense statements describe their recorded milestone, not current work;
+they cannot authorize a new EFS/RWX change. The storage design above supersedes
+all of them with PostgreSQL structured authority and exact-version S3 bytes.
 
 The test deployment targets Kubernetes context `boltz-test`, which is an alias
 of `boltz-platform-test-eks-cluster`. It uses a dedicated namespace and Helm
@@ -63,12 +66,13 @@ The pod explicitly uses PostgreSQL and the durable cutover gate, but still uses
 is unencrypted and had no snapshot at audit time.
 The cluster has three on-demand `m6i.8xlarge` nodes, one in each zone, and has
 no EFS filesystem, EFS CSI add-on, or EFS Pod Identity association.
-The request-store prerequisite and guarded rollout implementation are therefore
-complete; the RWX state migration, capacity expansion, role split, and live
-acceptance remain pending. Changing only the Deployment strategy remains
-invalid and the chart correctly rejects it.
+At that historical audit, the request-store prerequisite was complete while
+RWX migration, capacity expansion, the role split, and live acceptance were
+still pending. Those role-split milestones subsequently completed; only the
+old EFS storage dependency remains relevant, and its migration is outside this
+historical record.
 
-That preflight also records the operational reason to complete the migration.
+That historical preflight records the operational reason for the migration.
 One Recreate upgrade produced a 94-second interval with no Ready API pod, and a
 later redundant Recreate produced an 88-second interval. An atomic rollback to
 a pre-guarded SQLite revision also failed after that revision's regular
