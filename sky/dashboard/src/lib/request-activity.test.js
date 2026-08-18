@@ -7,11 +7,12 @@ import {
 
 describe('dashboard request activity', () => {
   let nowSpy;
+  const T0 = new Date('2026-07-12T12:01:00Z').getTime();
 
   beforeEach(() => {
     resetRequestActivityForTests();
     nowSpy = jest.spyOn(Date, 'now');
-    nowSpy.mockReturnValue(new Date('2026-07-12T12:01:00Z').getTime());
+    nowSpy.mockReturnValue(T0);
   });
 
   afterEach(() => {
@@ -63,7 +64,7 @@ describe('dashboard request activity', () => {
   });
 
   it('persists the bounded history without blocking requests', async () => {
-    jest.useFakeTimers();
+    jest.useFakeTimers({ now: T0 });
 
     await trackDashboardRequest(async () => 'done');
     expect(
