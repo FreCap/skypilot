@@ -458,6 +458,54 @@ class TestWorkspaceSchema(unittest.TestCase):
         jsonschema.validate(instance=valid_config,
                             schema=self.workspaces_schema)
 
+    def test_workspace_kubernetes_uses_canonical_region_properties(self):
+        """Workspace Kubernetes scopes accept every regional property."""
+        workspace_kubernetes_schema = (
+            self.workspaces_schema['additionalProperties']['properties']
+            ['kubernetes'])
+        workspace_properties = workspace_kubernetes_schema['properties']
+        context_properties = (workspace_properties['context_configs']
+                              ['additionalProperties']['properties'])
+
+        expected_properties = set(
+            self.config_schema['properties']['kubernetes']['properties']
+            ['context_configs']['additionalProperties']['properties'])
+        self.assertLessEqual(expected_properties, set(workspace_properties))
+        self.assertLessEqual(expected_properties, set(context_properties))
+
+    def test_workspace_kubernetes_accepts_worker_projection_fields(self):
+        """Worker pod and volume fields validate at both workspace scopes."""
+        worker_projection = {
+            'pod_config': {
+                'spec': {
+                    'schedulerName': 'gpu-binpack-scheduler',
+                },
+            },
+            'auto_mounts': [{
+                'volume_name': 'model-cache',
+                'mount_paths': ['/mnt/model-cache'],
+            }],
+            'serve_worker_cache': {
+                'kind': 'none',
+            },
+        }
+        configs = [{
+            'my-workspace': {
+                'kubernetes': worker_projection,
+            },
+        }, {
+            'my-workspace': {
+                'kubernetes': {
+                    'context_configs': {
+                        'shared-context': worker_projection,
+                    },
+                },
+            },
+        }]
+
+        for config in configs:
+            jsonschema.validate(instance=config, schema=self.workspaces_schema)
+
     def test_workspace_kubernetes_context_configs_preserves_kueue_quota(self):
         """Backward-compat: `kueue` and `quota` still validate alongside `namespace`."""
         valid_config = {
