@@ -2,13 +2,20 @@
 
 Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
-route, durable actuation-intent, and supply-aware paid-residual prerequisites
-are merged through PRs #1537, #1540, #1542, #1547, and #1548. Production Helm
-revision 423 / release `1.1.1331` now runs the exact 2 API / 2 controller / 2
-executor split-role cohort on RWX storage. Clean service version 61 is
-committed with `min_replicas: 0`, a zero fill floor, a utilization gate, and
-server-owned east/PHX worker projections. The reconciliation gate remains
-`LEGACY_ACTIVE`; no cleanup or final service activation is approved yet.
+route, durable actuation-intent, supply-aware paid-residual, successor-schema,
+and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
+#1547, #1548, and #1549. Production Helm revision 425 / release `1.1.1332`
+runs the exact 2 API / 2 controller / 2 executor split-role cohort on RWX
+storage. Service version 61 has `min_replicas: 0`, a zero fill floor, and a
+utilization gate, but its immutable PHX projection was committed before the
+server configuration converged and still names `gpu-binpack-scheduler`.
+It is therefore not an activation candidate. Production committed and elected
+successor version 62 on 2026-08-18. Exact database readback proves its PHX H200
+projection uses `default-scheduler`, `be`/`be-ls`, priority -1000/`Never`,
+`skypilot-pool-sa`, and no Pod Identity role; both east projections retain
+`gpu-binpack-scheduler`. Version 58 remains the only active version. The
+reconciliation gate remains `LEGACY_ACTIVE`; no cleanup or final service
+activation is approved yet.
 
 The first revision-423 activation attempt failed closed before durable
 mutation. The common typed reclaim view required non-null Kueue admission for
@@ -46,14 +53,29 @@ PHX to `default-scheduler` plus the exact Kueue v0.19 TAS feature-gate and
 ResourceFlavor topology contract; east retains its existing attested custom
 scheduler.
 
-The same audit found two real activation blockers. The exact per-spoke audit
-IAM roles named by the deployed fleet bundle do not exist and have no EKS
-access entries. They must be created from the already-pinned Terraform module
-using configuration-only spoke changes; no `boltz-platform` SkyPilot runtime
-pin changes. In addition, the server-owned `mt_hybrid` configuration has the
-correct east/PHX accelerator and Kueue identities but not the complete
-priority, reclaim, provision-timeout, cache/scratch, and scheduler projection
-contract needed to replace task-owned overrides.
+The exact per-spoke audit IAM roles, EKS access entries, and read-only RBAC are
+now deployed from the already-pinned Terraform module. A production preflight
+on 2026-08-18 proved that both AWS role assumptions work, but exposed two
+remaining real activation blockers. First, the policy uses the assumed audit
+session only for AWS inventory and still constructs Kubernetes clients from
+the ambient writer kubeconfig. The ambient writer is correctly forbidden from
+the audit-only Namespace, PriorityClass, and other cluster-scoped reads, so
+both Kubernetes proofs fail with HTTP 403. Second, the exact east inference
+namespace/service-account unexpectedly owns Pod Identity association
+`a-rsvzwdtaesxvxorkh` to `research-dropzone-irsa`, while the reviewed worker
+projection and bundle require an identity-free inference partition. The
+association is unnecessary for the model path, which uses explicit R2
+credentials, and must be removed rather than broadening the inference worker
+identity contract.
+
+The steady-state authentication correction uses the same short-lived assumed
+audit-role session for both EKS inventory and Kubernetes API reads. It obtains
+the exact active cluster endpoint and CA from EKS, signs one bounded EKS bearer
+token with the assumed credentials, constructs an isolated Kubernetes client
+from an in-memory kubeconfig document, verifies the `kube-system` UID before
+the object-read batch, and scrubs/closes that client after the proof. It never mutates the ambient
+kubeconfig, never grants audit reads to the ordinary writer identity, and
+never caches provider observations or bearer tokens.
 
 At 2026-08-18 01:01 UTC the service had real demand (queue depth 325,
 confirmed in-flight 106, and 98 recent requests in 60 seconds). Paid Spot
@@ -146,17 +168,17 @@ activation. The prior generation then fails closed.
 The remaining rollout is one SkyPilot fix-forward stack deployed through the
 existing single-`all` Recreate Helm topology:
 
-1. Merge and publish policy-bundle schema v4 together with tests that bind the
-   live PHX `be`/`skypilot-be`/`be-ls`, `skypilot-pool-sa`,
-   `default-scheduler`, Kueue v0.19 TAS feature gates, and H200
-   ResourceFlavor topology contract. East continues to bind its exact custom
-   scheduler. Create both exact per-spoke audit roles and EKS access/RBAC from
-   configuration against the existing Terraform module pin. Render a complete
-   direct Helm upgrade with the matching `mt_hybrid` context configuration,
-   use `--reuse-values`, and prove the API/LB image and ConfigMap are the
-   reviewed tuple. No service authority is promoted by this binary/config
-   deployment. The schema-v4 proof wire format is version 2; both successful
-   and failed preflight payloads use that version. The Boltz worker startup
+1. Schema-v4 PHX `be`/`skypilot-be`/`be-ls`, `skypilot-pool-sa`,
+   `default-scheduler`, Kueue v0.19 TAS, H200 ResourceFlavor topology, and the
+   exact per-spoke audit roles/RBAC are deployed. Merge and publish the
+   successor policy fix that uses those audit roles for Kubernetes as well as
+   AWS, remove the stale east inference Pod Identity association, and render a
+   complete direct Helm upgrade with the corrected `mt_hybrid` context
+   configuration. Use `--reuse-values`, and prove the API/LB image, ConfigMap,
+   and successful two-context preflight are the reviewed tuple. No service
+   authority is promoted by this binary/config deployment. The schema-v4 proof
+   wire format remains version 2; both successful and failed preflight payloads
+   use that version. The Boltz worker startup
    consumes the projected cache and scratch environment before any R2 access:
    it verifies exact mount target, anchored source, filesystem type, total and
    free byte/inode budgets, and `/tmp` as `tmpfs`. Merely projecting these
@@ -179,10 +201,10 @@ existing single-`all` Recreate Helm topology:
    schema-compatible Helm fix-forward if it fails after commit.
 
 The current exact production artifact is merge
-`f5cf1c74c`, release `1.1.1325`, image digest
-`sha256:e330fb8d0cdff9e153291173c513eb6aca34b0556d51ce435906ce82cce7fc49`,
+`3a385fbe1df41d676759e824e6a737a1796fb83d`, release `1.1.1332`, image digest
+`sha256:45cfeb87f0becc28f8f102420abea6cf452f5ff62b38630c6e83f800792f1c3f`,
 and chart package digest
-`sha256:586ee857f199713522432431291363a55ee7dcb930a13616d4229533df87d512`.
+`sha256:3e94613346f2d39118ef086e4e73235c822c05e2c268a9c304d4095f72731ed2`.
 It is compatibility evidence, not an activation candidate for version 58,
 because that version has null projections and legacy authority and its PHX
 policy bundle still names the retired scheduler. Releases
@@ -305,6 +327,14 @@ This decoupling changes neither ordinary workspace placement nor its
 credentials. The existing ordinary `wa` and `skypilot-wa` paths remain
 unchanged. A's module tests must prove both the Kueue-null staging state and the
 later exact-match rejection boundary.
+
+The deployment policy must consume that identity rather than merely attest
+that it exists. One role assumption supplies short-lived credentials to both
+provider domains: EKS APIs prove the cluster and Pod Identity inventory, and a
+separately constructed in-memory Kubernetes client proves the exact RBAC-bound
+objects. The ordinary writer kubeconfig is not a fallback. If role assumption,
+EKS endpoint/CA validation, token signing, physical UID validation, or any
+exact-name read fails, the complete proof fails before activation.
 
 Only frozen historical Alembic replay code remains after C; runtime code does
 not import it. There is no rollback branch, legacy publisher, topology
@@ -2099,13 +2129,15 @@ also has zero nominal H200 quota and a 512-GPU borrowing limit. Reclaim is
 therefore proved by the shared cohort, the research queue's
 `reclaimWithinCohort: Any`, and the exact priority ordering rather than by the
 superseded assumption that one research ClusterQueue owns all nominal quota.
-The inference service accounts have no
-IRSA annotation. East has one Pod Identity association,
-`a-rsvzwdtaesxvxorkh` to `research-dropzone-irsa`, but it belongs to the
-separate research namespace/service account; PHX has no association. The
-plugin filters and paginates by the exact projected inference namespace and
-service account, so the unrelated east research identity is preserved while
-the inference identity-free absence proof still requires zero exact matches.
+The inference service accounts have no IRSA annotation. PHX has no Pod
+Identity association. The 2026-08-18 production preflight corrected an earlier
+inventory mistake: east association `a-rsvzwdtaesxvxorkh` to
+`research-dropzone-irsa` belongs to the exact inference namespace and
+`skypilot-pool-sa`, not the separate research partition. The model path does
+not consume that identity; the canonical identity-free contract removes the
+stale association and continues to require zero exact matches. The plugin
+filters and paginates by the exact projected namespace and service account, so
+unrelated research identities remain outside this proof.
 
 HyperPod's live ResourceFlavors are provider-owned and intentionally omit GPU
 product labels. East exposes 8 non-deleting `ml.p4d.24xlarge` Nodes with 8
@@ -2136,11 +2168,12 @@ feature-gate set are the durable admission contract; node/flavor reads continue
 to prove physical capacity and accelerator identity. The `hyperpod` Topology
 levels are verified as a deployment preflight/readback. This keeps the
 existing Terraform module pin and avoids broadening ongoing controller RBAC.
-The current hub writer is forbidden from
-reading the required Namespace, ServiceAccount, queue, priority, flavor, Node,
-scheduler, controller, and admission objects in both spokes. These are exact
+The current hub writer is forbidden from reading the required Namespace,
+ServiceAccount, queue, priority, flavor, Node, scheduler, controller, and
+admission objects in both spokes. That is intentional. The deployment policy
+must read them through the exact audit role and EKS group instead. These remain
 platform IAM/RBAC and object gates; SkyPilot core does not duplicate their
-ownership.
+ownership or widen the writer role.
 
 ### Status actually exposed
 
@@ -2202,8 +2235,9 @@ either case.
 | 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Merged in PR #1492 and published as v1.1.1284; removable only after the v18 normalization receipt. Its rollout is `LEGACY_ACTIVE` only. |
 | 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed as direct Helm revision 407 / release 1.1.1310; all service authority modes remain legacy. |
 | 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
-| 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Required next; configuration uses the existing platform module pin and SkyPilot is deployed directly with Helm. |
-| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Blocked on 2a and exact source-YAML/config review. |
+| 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
+| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Required next. Remove the stale east inference association, publish/deploy the policy fix directly with Helm, and require a successful full two-context preflight. |
+| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.2. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
@@ -3283,9 +3317,17 @@ legacy activation.
   database or create a platform runtime pin. Exact cache/scratch, priority,
   timeout, identity, and hostPath inputs are committed and applied.
 - [x] Remove task-owned Kubernetes Pod config, identity, priority, scratch, and
-  provisioning overrides from the canonical service YAML, set
-  `min_replicas: 0`, and commit a new immutable version with non-null exact
-  east/PHX worker projections. Production committed clean version 61.
+  provisioning overrides from the canonical service YAML and set
+  `min_replicas: 0`. Production committed version 61, but its immutable PHX
+  projection captured the retired scheduler and is not an activation
+  candidate.
+- [ ] Deploy the isolated audit-role Kubernetes client, remove exact east Pod
+  Identity association `a-rsvzwdtaesxvxorkh`, and obtain one fresh successful
+  two-context preflight without widening the writer role.
+- [x] Commit and elect successor version 62 whose non-null immutable east and
+  PHX worker projections exactly match the corrected server configuration.
+  Version 58 remains the only active version until the remaining preflight and
+  authority gates pass.
 - [ ] Prove one zero-cost PHX H200 Pod is admitted through `be` ->
   `skypilot-be` with `be-ls`, the -1000/`Never` Pod priority,
   `skypilot-pool-sa`, `default-scheduler`, a Kueue TAS assignment, and exact
@@ -3294,10 +3336,9 @@ legacy activation.
   it dark. Under a held physical pool lane, require one bounded intent, zero
   replica/request rows, and sibling pool progress; production evidence remains
   part of activation qualification.
-- [ ] Resolve PR #1524 by semantic comparison, not by merging its conflicting
-  109-file branch. G1 recovery contracts already shipped through
-  #1519/#1526/#1527/#1528; close #1524 only after proving every still-unique
-  test or contract has a current equivalent.
+- [x] Resolve PR #1524 by semantic comparison rather than merging its
+  conflicting 109-file branch. G1 recovery contracts shipped through
+  #1519/#1526/#1527/#1528; #1524 is closed as superseded.
 - [ ] Commit and elect one clean service version, then promote ordinary
   binding, generic non-pool binding, route, demand, reserved reconciliation,
   `DURABLE_INTENT` actuation, and resource-action authority through their

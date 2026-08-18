@@ -1,6 +1,7 @@
 """Deployment-policy tests for Boltz reserved-capacity reclaim."""
 
 # pylint: disable=protected-access,wrong-import-position
+import base64
 import copy
 import dataclasses
 import datetime
@@ -9,6 +10,7 @@ import pathlib
 import sys
 import threading
 import time
+import types
 from unittest import mock
 
 import pytest
@@ -721,6 +723,194 @@ def test_provider_domains_and_contexts_start_concurrently(monkeypatch):
                                      time.monotonic() + 2)
 
     assert set(proofs) == set(policy._bundle.contexts)
+
+
+def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    context_name = 'phx_research_cluster_eks'
+    provider = policy._bundle.provider_context(context_name)
+    audit_session = object()
+    session_call = mock.Mock(return_value=audit_session)
+    monkeypatch.setattr(policy._aws_sessions, 'session', session_call)
+    expected_proof = object()
+    attest = mock.Mock(return_value=expected_proof)
+    monkeypatch.setattr(kubernetes_attestation, 'attest_context', attest)
+    deadline = time.monotonic() + 5
+    cancellation = threading.Event()
+
+    result = policy._provider_job(context_name, 'kubernetes', deadline,
+                                  cancellation)
+
+    assert result is expected_proof
+    session_call.assert_called_once_with(provider['eks']['audit_role_arn'],
+                                         provider['eks']['region'], deadline,
+                                         cancellation)
+    attest.assert_called_once_with(policy._bundle.fleet_context(context_name),
+                                   provider,
+                                   deadline_monotonic=deadline,
+                                   cancellation=cancellation,
+                                   audit_session=audit_session)
+
+
+def test_eks_bearer_token_is_signed_by_the_supplied_audit_session(monkeypatch):
+    frozen_credentials = object()
+
+    class Credentials:
+        """Minimal frozen-credential provider for the signer test."""
+
+        @staticmethod
+        def get_frozen_credentials():
+            return frozen_credentials
+
+    sts = types.SimpleNamespace(meta=types.SimpleNamespace(
+        service_model=types.SimpleNamespace(service_id='STS'),
+        events=object(),
+        endpoint_url='https://sts.us-west-2.amazonaws.com',
+    ))
+
+    class AuditSession:
+        """Minimal exact-session seam for the signer test."""
+
+        @staticmethod
+        def client(service, **kwargs):
+            assert service == 'sts'
+            assert kwargs['region_name'] == 'us-west-2'
+            return sts
+
+        @staticmethod
+        def get_credentials():
+            return Credentials()
+
+    signer_call = {}
+
+    class Signer:
+        """Captures the token-signing request without provider access."""
+
+        def __init__(self, *args):
+            signer_call['args'] = args
+
+        @staticmethod
+        def generate_presigned_url(request, **kwargs):
+            signer_call['request'] = request
+            signer_call['kwargs'] = kwargs
+            return 'https://signed.example/token'
+
+    monkeypatch.setattr(kubernetes_attestation.botocore_signers,
+                        'RequestSigner', Signer)
+
+    token = kubernetes_attestation._eks_bearer_token(
+        AuditSession(),
+        region='us-west-2',
+        cluster_name='exact-cluster',
+        deadline_monotonic=time.monotonic() + 5,
+        cancellation=threading.Event())
+
+    assert signer_call['args'][4] is frozen_credentials
+    assert signer_call['request']['headers'] == {
+        'x-k8s-aws-id': 'exact-cluster'
+    }
+    assert signer_call['kwargs'] == {
+        'region_name': 'us-west-2',
+        'expires_in': 60,
+        'operation_name': '',
+    }
+    encoded = token.removeprefix('k8s-aws-v1.')
+    encoded += '=' * (-len(encoded) % 4)
+    assert base64.urlsafe_b64decode(encoded).decode() == (
+        'https://signed.example/token')
+
+
+def test_audit_api_client_uses_exact_eks_connection_and_scrubs_credentials(
+        monkeypatch):
+    bundle = bundle_lib.load_embedded_bundle()
+    provider = bundle.provider_context('phx_research_cluster_eks')
+    contract = provider['eks']
+
+    class Eks:
+        """Returns the exact reviewed cluster connection."""
+
+        @staticmethod
+        def describe_cluster(name):
+            assert name == contract['cluster_name']
+            return {
+                'cluster': {
+                    'name': name,
+                    'arn': contract['cluster_arn'],
+                    'status': 'ACTIVE',
+                    'endpoint': 'https://exact.eks.example',
+                    'certificateAuthority': {
+                        'data': 'Y2E=',
+                    },
+                }
+            }
+
+    audit_session = mock.Mock()
+    audit_session.client.return_value = Eks()
+    token_call = mock.Mock(return_value='k8s-aws-v1.exact')
+    monkeypatch.setattr(kubernetes_attestation, '_eks_bearer_token', token_call)
+
+    captured = {}
+
+    class Configuration:
+        """Minimal isolated Kubernetes client configuration."""
+
+        def __init__(self):
+            self.api_key = {}
+            self.api_key_prefix = {}
+            self.refresh_api_key_hook = object()
+
+    class Loader:
+        """Captures and materializes the in-memory kubeconfig."""
+
+        def __init__(self, *, config_dict, active_context):
+            captured['document'] = config_dict
+            captured['active_context'] = active_context
+
+        @staticmethod
+        def load_and_set(configuration):
+            configuration.api_key['authorization'] = 'secret-token'
+            configuration.api_key_prefix['authorization'] = 'Bearer'
+
+    class ApiClient:
+        """Records deterministic client retirement."""
+
+        def __init__(self, *, configuration):
+            self.configuration = configuration
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    fake_kubernetes = types.SimpleNamespace(
+        client=types.SimpleNamespace(Configuration=Configuration,
+                                     ApiClient=ApiClient),
+        config=types.SimpleNamespace(kube_config=types.SimpleNamespace(
+            KubeConfigLoader=Loader)),
+    )
+    monkeypatch.setattr(kubernetes_attestation.kubernetes_adaptor, 'kubernetes',
+                        fake_kubernetes)
+
+    with kubernetes_attestation._audit_api_client(
+            provider,
+            audit_session,
+            deadline_monotonic=time.monotonic() + 5,
+            cancellation=threading.Event()) as client:
+        assert not client.closed
+        assert captured['document']['clusters'][0]['cluster'] == {
+            'server': 'https://exact.eks.example',
+            'certificate-authority-data': 'Y2E=',
+        }
+        assert captured['document']['users'][0]['user'] == {}
+        assert client.configuration.api_key == {'authorization': 'secret-token'}
+
+    assert client.closed
+    assert client.configuration.api_key == {}
+    assert client.configuration.api_key_prefix == {}
+    token_call.assert_called_once_with(audit_session,
+                                       region=contract['region'],
+                                       cluster_name=contract['cluster_name'],
+                                       deadline_monotonic=mock.ANY,
+                                       cancellation=mock.ANY)
 
 
 def test_positive_identity_absence_proof_is_explicit():

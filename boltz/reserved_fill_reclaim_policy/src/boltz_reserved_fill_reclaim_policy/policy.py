@@ -232,11 +232,16 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 cancellation=cancellation,
                 session_cache=self._aws_sessions)
         if domain == 'kubernetes':
+            eks_contract = provider_context['eks']
+            audit_session = self._aws_sessions.session(
+                eks_contract['audit_role_arn'], eks_contract['region'],
+                deadline_monotonic, cancellation)
             return kubernetes_attestation.attest_context(
                 fleet_context,
                 provider_context,
                 deadline_monotonic=deadline_monotonic,
-                cancellation=cancellation)
+                cancellation=cancellation,
+                audit_session=audit_session)
         raise AssertionError(f'Unknown provider domain: {domain}')
 
     def _attest_contexts(
