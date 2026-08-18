@@ -21,7 +21,7 @@ from sky.serve import reserved_fill_reclaim_attestation as reclaim
 logger = logging.getLogger(__name__)
 
 _IMAGE_DIGEST_RE = re.compile(r'^sha256:[0-9a-f]{64}$')
-_PROOF_SCHEMA_VERSION = 1
+PROOF_SCHEMA_VERSION = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -306,7 +306,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                 'kubernetes': dataclasses.asdict(proof.kubernetes),
             })
         return {
-            'schema_version': _PROOF_SCHEMA_VERSION,
+            'schema_version': PROOF_SCHEMA_VERSION,
             'operation': operation,
             'success': True,
             'contract': self.enforcement_contract().value,

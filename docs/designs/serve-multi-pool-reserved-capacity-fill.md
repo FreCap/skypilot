@@ -1,19 +1,22 @@
 # Multi-pool SkyServe reserved-capacity fill
 
 Status: the additive reserved-fill, exact worker-projection, generalized
-non-pool binding, demand, route, and executor-termination prerequisites are
-merged through PR #1528 and deployed directly with Helm as production revision
-407 / release `1.1.1310`. The migration heads are API-request 014 and Serve050.
-`boltz-l4-fleet` remains on legacy fill/binding/route/demand authority; no
-cleanup or final activation is approved.
+non-pool binding, demand, route, executor-termination, provider-independent
+route, durable actuation-intent, and supply-aware paid-residual prerequisites
+are merged through PRs #1537, #1540, and #1542 and deployed directly with Helm
+as production revision 418 / release `1.1.1325`. `boltz-l4-fleet` nevertheless
+remains elected on stored version 58 with legacy binding/route/demand authority
+and `DIRECT_REPLICA` fill actuation. That version has task-owned Kubernetes
+overrides, `min_replicas: 1`, a ten-replica fill floor, no utilization gate,
+and null worker projections. No cleanup or final activation is approved.
 
-Production qualification on 2026-08-17 found two remaining fill-boundary
-failures. First, attempts 53925--53933 created speculative H200 replica/request
-rows before the physical-pool actuation lane was owned; they later converged to
-`FAILED_PROVISION`, but the row-first boundary remains wrong. P2d in
-`skyserve-demand-capacity-convergence.md` supersedes that boundary with a
-durable grant-before-row actuation intent and per-physical-pool executor.
-Second, every Pod was rejected from
+Production qualification on 2026-08-17 found two fill-boundary failures.
+First, attempts 53925--53933 created speculative H200 replica/request rows
+before the physical-pool actuation lane was owned; they later converged to
+`FAILED_PROVISION`. P2d in `skyserve-demand-capacity-convergence.md` now
+supersedes that boundary with a durable grant-before-row actuation intent and
+per-physical-pool executor; it merged in PR #1537 and is deployed dark in
+revision 418. Second, every Pod was rejected from
 `rescluster-k8s-prod-east1-preemptible-inference` because the launch omitted its
 required Kueue queue label. The live PHX contract is LocalQueue `be`,
 ClusterQueue `skypilot-be`, `mt_hybrid` WorkloadPriorityClass `be-ls`, service
@@ -21,14 +24,34 @@ account `skypilot-pool-sa`, and Pod PriorityClass
 `rescluster-k8s-prod-east1-preemptible-inference-low`. Revision 407's embedded
 fleet bundle still contains the retired `default`,
 `skyserve-inference-borrowed`, `skyserve-inference-low`, and
-`skypilot-inference-sa` identities. That bundle and the direct-Helm server
-configuration must be corrected in one release contract before a new service
-version can become fill-capable. A follow-up read also proved that PHX's Kueue
-controller has two ready replicas, `be-ls` has value 12, and the expected
-`gpu-binpack-scheduler` Deployment is absent. The missing scheduler is an
-independent activation gate: the policy correction records the intended exact
-deployment but must remain dark until the provider-owned object exists and
-passes attestation.
+`skypilot-inference-sa` identities. Bundle schema v3 and the corrected
+queue/service-account identities merged in PR #1529 and are deployed, but
+their PHX scheduler contract is obsolete. A 2026-08-18 audit proved that PHX
+intentionally removed `gpu-binpack-scheduler` in platform PR #8527 after
+enabling Kueue topology-aware scheduling in #8524 and removing the custom
+scheduler pin in #8526. Reinstalling it would create a second placement
+authority and is explicitly rejected. The next policy schema instead binds
+PHX to `default-scheduler` plus the exact Kueue v0.19 TAS feature-gate and
+ResourceFlavor topology contract; east retains its existing attested custom
+scheduler.
+
+The same audit found two real activation blockers. The exact per-spoke audit
+IAM roles named by the deployed fleet bundle do not exist and have no EKS
+access entries. They must be created from the already-pinned Terraform module
+using configuration-only spoke changes; no `boltz-platform` SkyPilot runtime
+pin changes. In addition, the server-owned `mt_hybrid` configuration has the
+correct east/PHX accelerator and Kueue identities but not the complete
+priority, reclaim, provision-timeout, cache/scratch, and scheduler projection
+contract needed to replace task-owned overrides.
+
+At 2026-08-18 01:01 UTC the service had real demand (queue depth 325,
+confirmed in-flight 106, and 98 recent requests in 60 seconds). Paid Spot
+launches were therefore not phantom traffic: version 58's legacy controller
+computed a paid residual before any reserved PHX/east supply could be durably
+committed. The PR #1542 guard is deliberately narrower and cannot correct a
+service that has not committed projections and promoted the durable reserved
+path. The long-term correction is the one canonical sequenced path below, not
+a broader legacy heuristic.
 
 All platform-pin and Terragrunt deployment sequences retained later in this
 file are historical review records, not current gates or deployment authority.
@@ -36,7 +59,7 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-17 (revision-407 live fill and Kueue correction)
+Last updated: 2026-08-18 (schema-v4/proof-v2 and enforced worker projection)
 
 Canonical owner: this file
 
@@ -102,34 +125,47 @@ activation. The prior generation then fails closed.
 The remaining rollout is one SkyPilot fix-forward stack deployed through the
 existing single-`all` Recreate Helm topology:
 
-1. Merge and publish the exact policy-bundle correction together with tests
-   that bind the live PHX `be`/`skypilot-be`/`be-ls` and
-   `skypilot-pool-sa` contract. Render a complete direct Helm upgrade with the
-   matching `mt_hybrid` PHX context config, use `--reuse-values`, and prove the
-   API/LB image and ConfigMap are the reviewed tuple. No service authority is
-   promoted by this binary/config deployment.
+1. Merge and publish policy-bundle schema v4 together with tests that bind the
+   live PHX `be`/`skypilot-be`/`be-ls`, `skypilot-pool-sa`,
+   `default-scheduler`, Kueue v0.19 TAS feature gates, and H200
+   ResourceFlavor topology contract. East continues to bind its exact custom
+   scheduler. Create both exact per-spoke audit roles and EKS access/RBAC from
+   configuration against the existing Terraform module pin. Render a complete
+   direct Helm upgrade with the matching `mt_hybrid` context configuration,
+   use `--reuse-values`, and prove the API/LB image and ConfigMap are the
+   reviewed tuple. No service authority is promoted by this binary/config
+   deployment. The schema-v4 proof wire format is version 2; both successful
+   and failed preflight payloads use that version. The Boltz worker startup
+   consumes the projected cache and scratch environment before any R2 access:
+   it verifies exact mount target, anchored source, filesystem type, total and
+   free byte/inode budgets, and `/tmp` as `tmpfs`. Merely projecting these
+   fields is not qualification evidence.
 2. Commit a new immutable service version from the corrected effective config.
    Its worker projection must be non-null and exact before election. Prove one
    H200 Pod is Kueue-admitted with the expected queue, ClusterQueue, workload
-   priority, Pod priority, service account, scheduler, accelerator, and
+   priority, Pod priority, service account, default scheduler, TAS assignment,
+   accelerator, and
    physical cluster identity. Do not use paid compute for this gate.
-3. Merge/deploy P2d's grant-before-row actuation intent. Under a held PHX pool
-   lane, the broker may commit one bounded intent but must create zero replica
-   rows and zero API requests; another physical pool must continue. Pass every
-   pre/post-commit crash boundary and no-paid-spill accounting test.
+3. Verify the already-deployed P2d grant-before-row actuation path remains dark
+   before promotion, then activate it through the single generation-fenced
+   transaction. Under a held PHX pool lane, the broker may commit one bounded
+   intent but must create zero replica rows and zero API requests; another
+   physical pool must continue. Pass every pre/post-commit crash boundary and
+   no-paid-spill accounting test.
 4. Only after the transition horizon, merge the already-authored cleanup stack
    that removes speculative direct fill and legacy non-pool launch paths. The
    offline migration is forward-only and is repaired by another
    schema-compatible Helm fix-forward if it fails after commit.
 
 The current exact production artifact is merge
-`bf9e2907a39ef90a6e9f741be050da9b3fe662a5`, release `1.1.1310`, image digest
-`sha256:b25e0f61ecfc164b30044644f0d5140be320fe172dbed27b4ff754ed6fdf1bbf`,
+`f5cf1c74c`, release `1.1.1325`, image digest
+`sha256:e330fb8d0cdff9e153291173c513eb6aca34b0556d51ce435906ce82cce7fc49`,
 and chart package digest
-`sha256:a9f5579e46b496a3eea5ba9f74f0991cf8cd8289fa459c63ebc3db33ceda6165`.
-It is compatibility evidence, not an activation candidate, because its PHX
-policy bundle is stale and it still materializes replicas before pool-lane
-ownership. Releases 1.1.1273/1.1.1277 and the A/B/C/platform nomenclature below
+`sha256:586ee857f199713522432431291363a55ee7dcb930a13616d4229533df87d512`.
+It is compatibility evidence, not an activation candidate for version 58,
+because that version has null projections and legacy authority and its PHX
+policy bundle still names the retired scheduler. Releases
+1.1.1273/1.1.1277 and the A/B/C/platform nomenclature below
 are retained only to explain already-merged transition contracts; they do not
 authorize rollback, pinning, or another deployment path.
 
@@ -1168,7 +1204,7 @@ second scheduling path exists. The exact shared object contract is:
 | Pod Identity | absent | absent |
 | Kueue admission | absent; east remains ordinary Pod scheduling | LocalQueue `be` -> ClusterQueue `skypilot-be`, WorkloadPriorityClass `be-ls` for the `mt_hybrid` serving workspace |
 | Pod PriorityClass (spoke-module-owned) | `rescluster-k8s-prod-east1-preemptible-inference-low`, value -1000, `Never` | same |
-| Scheduler | `gpu-binpack-scheduler` | same |
+| Scheduler / topology authority | exact `gpu-binpack-scheduler` Deployment | Kubernetes `default-scheduler`; Kueue v0.19 TAS owns admission topology and no custom scheduler Deployment is permitted |
 | GPU resource | `nvidia.com/gpu` | `nvidia.com/gpu` |
 | Exact worker accelerator scheduling | `A100`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-40GB`, `nvidia.com/gpu`; `A100-80GB`: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB`, `nvidia.com/gpu` | `H200`: `nvidia.com/gpu.product=NVIDIA-H200`, `nvidia.com/gpu` |
 
@@ -1177,21 +1213,29 @@ The PHX best-effort ClusterQueue has zero nominal GPU quota in the same
 `borrowWithinCohort: Never`, `reclaimWithinCohort: LowerPriority`, and
 `withinClusterQueue: LowerPriority`; the research queue retains
 `reclaimWithinCohort: Any`. East has no Kueue admission pair and must not be
-forced through a nonexistent queue. Bundle schema v3 therefore carries one
-nullable `kueue_admission` object per fleet context instead of mandatory
-parallel queue strings, plus one matching nullable `kueue_enforcement` object
-per provider context. Both objects must be null or both non-null. Null proves
-that the namespace does not carry the code-owned managed label and makes the
-context ineligible for reclaim claims; it does not silently downgrade reclaim
-to Pod priority. The PHX pair binds `be`, `skypilot-be`, and `be-ls` together.
+forced through a nonexistent queue. Bundle schema v4 retains schema v3's one
+nullable `kueue_admission` object per fleet context and matching nullable
+`kueue_enforcement` object per provider context. Both objects must be null or
+both non-null. Null proves that the namespace does not carry the code-owned
+managed label and makes the context ineligible for reclaim claims; it does not
+silently downgrade reclaim to Pod priority. The PHX pair binds `be`,
+`skypilot-be`, and `be-ls` together. Schema v4 additionally makes the provider
+custom-scheduler Deployment nullable and adds exact Kueue TAS feature-gate and
+ResourceFlavor topology-name fields. Fleet `scheduler_name` remains a required
+string because it is part of the immutable worker projection; it is
+`default-scheduler` for PHX and the custom deployment name for east.
 The policy proves the exact LocalQueue target and current Active ClusterQueues
 when the pair is non-null, plus cohort, namespace selectors, GPU flavor quotas,
 preemption policies, provider-owned ResourceFlavor instance selectors,
-WorkloadPriorityClass name/value, Pod PriorityClass, immutable custom scheduler
-deployment, current Kueue controller, Pod
-integration,
-`AssignQueueLabelsForPods: true`, and the Deny queue-name admission-policy
-binding. It does not infer Pod admission from a webhook configuration name:
+WorkloadPriorityClass name/value, Pod PriorityClass, and the context's one
+scheduler/topology mode. For east it attests the immutable custom scheduler
+Deployment. For PHX it rejects a custom scheduler, requires projected
+`default-scheduler`, binds the H200 ResourceFlavor's `topologyName: hyperpod`,
+and attests the current Kueue controller, Pod integration,
+`AssignQueueLabelsForPods: true`, `TopologyAwareScheduling: true`, and the
+reviewed TAS replacement/multilayer feature gates, plus the Deny queue-name
+admission-policy binding. It does not infer Pod admission from a webhook
+configuration name:
 for both the mutating and validating configurations it requires exactly one
 named Pod webhook with the reviewed core/v1 Pod operations, Kueue service
 name/namespace/path/port, nonempty CA bundle, admission review version,
@@ -2045,9 +2089,25 @@ The queue-name Deny policy and binding are absent in east and present in PHX.
 Schema v3 therefore performs no Kueue controller, policy, or webhook reads for
 the unmanaged east context and instead proves that the namespace lacks the
 code-owned managed label. PHX must pass the complete code-owned v0.19 Kueue
-contract through deployment preflight before activation. The 2026-08-17 read
-found two ready Kueue controller replicas and no `gpu-binpack-scheduler`
-Deployment, so the intended custom-scheduler contract is not yet attestable.
+contract through deployment preflight before activation. The 2026-08-18 read
+found two ready Kueue controller replicas, the required Pod integration and TAS
+feature gates, a `hyperpod` topology on `ml.p5e.48xlarge`, and no
+`gpu-binpack-scheduler` Deployment. The absence is intentional: platform PRs
+#8524/#8526/#8527 made Kueue TAS plus the Kubernetes `default-scheduler` the
+single PHX admission and placement path. Schema v4 therefore allows no custom
+scheduler Deployment in a managed TAS context, binds the projected scheduler
+name to `default-scheduler`, binds the ResourceFlavor `topologyName`, and
+attests the required controller feature gates. It retains schema v3's exact
+custom-scheduler Deployment proof for unmanaged east. A managed context with a
+custom scheduler, or an unmanaged context without its configured scheduler,
+fails closed; dual placement paths are not supported.
+
+The audit role intentionally needs no read of the `Topology` object itself.
+The exact `ResourceFlavor.spec.topologyName` and the exact Kueue controller
+feature-gate set are the durable admission contract; node/flavor reads continue
+to prove physical capacity and accelerator identity. The `hyperpod` Topology
+levels are verified as a deployment preflight/readback. This keeps the
+existing Terraform module pin and avoids broadening ongoing controller RBAC.
 The current hub writer is forbidden from
 reading the required Namespace, ServiceAccount, queue, priority, flavor, Node,
 scheduler, controller, and admission objects in both spokes. These are exact
@@ -2113,10 +2173,11 @@ either case.
 | 1b | PR #1483 precursor: replica state v18 plus its one-shot normalizer | Merged and published as 1.1.1277, but activation-ineligible because it lacks A's pre-activation contracts. |
 | 1c | Exact-shape read bridge for the live v3/v6/v7/v12/v13/v14 JSON inventory | Merged in PR #1492 and published as v1.1.1284; removable only after the v18 normalization receipt. Its rollout is `LEGACY_ACTIVE` only. |
 | 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed as direct Helm revision 407 / release 1.1.1310; all service authority modes remain legacy. |
-| 2a | Policy-bundle schema v3 plus exact live PHX contract and PostgreSQL-backed server-config transaction | Required next; no platform pin. The old bundle and service config are proven stale. |
+| 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
+| 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Required next; configuration uses the existing platform module pin and SkyPilot is deployed directly with Helm. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Blocked on 2a and exact source-YAML/config review. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
-| 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Planned as one additive dark direct-Helm release; busy-lane/no-row and crash matrices are merge gates. |
+| 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -2130,7 +2191,7 @@ The current executable sequence is the four-step direct-Helm rollout in the
 Decision summary and phase table above. The A/B/C, split-topology, publisher,
 and platform-PR sequences retained in the subsections below are historical
 review evidence only. They must not be executed, used as merge gates, or
-treated as deployment authority after revision 407.
+treated as deployment authority after revision 418.
 
 ### Generalized binding prerequisite
 
@@ -3149,30 +3210,69 @@ legacy activation.
 ## Open gates
 
 - [x] Deploy and qualify the generalized binding, demand/route projections,
-  and G1S precursor as direct Helm revision 407 / release 1.1.1310 without
-  promoting service authority.
+  G1S precursor, provider-independent routes, P2d durable actuation intents,
+  and the supply-aware paid residual as direct Helm revision 418 / release
+  1.1.1325 without promoting service authority.
 - [x] Record exact terminal failure evidence for H200 attempts 53925--53933:
   every request failed closed on the missing PHX Kueue label and no attempt
   remains phantom capacity.
-- [ ] Implement bundle schema v3 with nullable per-context Kueue admission,
+- [x] Implement bundle schema v3 with nullable per-context Kueue admission,
   `skypilot-pool-sa`, unmanaged east, and the exact PHX
-  `be`/`skypilot-be`/`be-ls` contract. Re-run bundle, policy, live-snapshot,
-  digest, and negative-drift tests.
+  `be`/`skypilot-be`/`be-ls` contract in PR #1529.
+- [x] Dark-verify PR #1540: repeated zero-demand H200 broker rounds created no
+  legacy replica rows, launch threads, or `sky.launch` requests and introduced
+  no paid claims. Later paid launches coincided with authenticated nonzero
+  demand and therefore do not invalidate this gate.
+- [ ] Implement schema v4's single-path scheduler contract: east retains the
+  exact `gpu-binpack-scheduler` Deployment; PHX uses `default-scheduler` and
+  must attest Kueue TAS feature gates plus ResourceFlavor `topologyName`.
+  Re-run bundle, policy, live-snapshot, digest, and negative-drift tests. The
+  implementation and proof-schema-v2 tests exist on the convergence branch;
+  merge, release, deploy, and live proof remain open.
+- [ ] Create and apply the exact east and PHX audit IAM roles, EKS access
+  entries, and RBAC using the already-pinned Terraform module. The namespace
+  ServiceAccount read is already proven; the absent roles are the remaining
+  provider-policy identity blocker.
 - [ ] Snapshot/hash the PostgreSQL-backed API-server config and update it only
   through the audited workspace-config transaction. Add the complete
   server-owned `mt_hybrid` worker identity/projection inputs; do not patch the
-  database or create a platform runtime pin.
+  database or create a platform runtime pin. The platform branch now carries
+  exact cache/scratch/priority/timeout/identity context inputs, registered
+  hostPath volume descriptors, and fail-closed worker-startup attestation;
+  review, merge, configuration transaction, and live proof remain open.
 - [ ] Remove task-owned Kubernetes Pod config, identity, priority, scratch, and
   provisioning overrides from the canonical service YAML, set
   `min_replicas: 0`, and commit a new immutable version with non-null exact
   east/PHX worker projections before election.
 - [ ] Prove one zero-cost PHX H200 Pod is admitted through `be` ->
   `skypilot-be` with `be-ls`, the -1000/`Never` Pod priority,
-  `skypilot-pool-sa`, `gpu-binpack-scheduler`, and exact H200/cluster identity.
-  Do not launch paid compute for this gate.
-- [ ] Implement P2d Serve052 grant-before-row actuation. Under a held physical
-  pool lane, require one bounded intent, zero replica/request rows, and sibling
-  pool progress; pass every crash and accounting-transfer boundary.
+  `skypilot-pool-sa`, `default-scheduler`, a Kueue TAS assignment, and exact
+  H200/cluster identity. Do not launch paid compute for this gate.
+- [x] Implement P2d Serve052 grant-before-row actuation in PR #1537 and deploy
+  it dark. Under a held physical pool lane, require one bounded intent, zero
+  replica/request rows, and sibling pool progress; production evidence remains
+  part of activation qualification.
+- [ ] Resolve PR #1524 by semantic comparison, not by merging its conflicting
+  109-file branch. G1 recovery contracts already shipped through
+  #1519/#1526/#1527/#1528; close #1524 only after proving every still-unique
+  test or contract has a current equivalent.
+- [ ] Commit and elect one clean service version, then promote ordinary
+  binding, generic non-pool binding, route, demand, reserved reconciliation,
+  `DURABLE_INTENT` actuation, and resource-action authority through their
+  canonical generation-fenced transactions. Promotion is one way and
+  fix-forward only.
+- [ ] With authenticated live demand, prove 80--90 eligible H200 workloads are
+  durably submitted within a few minutes, multiple Pods initialize
+  concurrently, and a held pool lane does not block another pool.
+- [ ] Prove reserved supply is committed before the paid residual, no new Spot
+  launches occur while compatible reserved supply covers demand, existing Spot
+  drains, and `SHUTTING_DOWN` resources terminate and cease billing.
+- [ ] Adjudicate orphaned/ambiguous historical rows only from durable
+  quiescence and provider evidence. Keep historical failed rows out of current
+  capacity, placement, and UI totals without deleting evidence-bearing rows.
+- [ ] Expose fresh confirmed-processing, queued, in-flight, and completed
+  request counters independently of provider/controller stalls, with paid,
+  reserved, provisioning, shutting-down, and historical-failed replica classes.
 - [ ] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests.

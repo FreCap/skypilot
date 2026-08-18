@@ -8,6 +8,7 @@ import time
 
 from boltz_reserved_fill_reclaim_policy.policy import (
     BoltzReservedFillReclaimPolicy)
+from boltz_reserved_fill_reclaim_policy.policy import PROOF_SCHEMA_VERSION
 
 
 def main() -> int:
@@ -20,7 +21,7 @@ def main() -> int:
                 deadline_monotonic=time.monotonic() + 5.0, emit_log=False)
     except Exception:  # pylint: disable=broad-except
         payload = {
-            'schema_version': 1,
+            'schema_version': PROOF_SCHEMA_VERSION,
             'operation': 'preflight',
             'success': False,
             'error_code': 'ATTESTATION_FAILED',
