@@ -20,7 +20,9 @@ without admitted demand. The reconciliation gate remains `LEGACY_ACTIVE`; no
 cleanup or final service activation is approved yet. Adversarial review also
 found that the separately exposed demand and actuation promotions leave an
 observable intermediate authority pair; phase 2e closes that cutover race
-before activation.
+before activation. Phase 2e is implemented in PR #1555, with the exact
+post-horizon removal of both separate transition surfaces stacked as draft PR
+#1556.
 
 The first revision-423 activation attempt failed closed before durable
 mutation. The common typed reclaim view required non-null Kueue admission for
@@ -2335,7 +2337,7 @@ either case.
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.2. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
-| 2e | Atomic per-service durable-demand plus durable-actuation promotion | Required before activation. Replace the two promotion requests with one controller fence and one PostgreSQL transaction; deprecate the separate promotion surfaces and create their stacked removal. |
+| 2e | Atomic per-service durable-demand plus durable-actuation promotion | Implemented in PR #1555: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Neither PR is yet deployed. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -3478,3 +3480,7 @@ legacy activation.
   Merge them only after the complete capability, stale-writer, route, demand,
   and actuation horizon proves zero old-path use and zero unsettled unbound
   work.
+- [ ] Keep atomic-authority cleanup #1556 stacked on feature PR #1555 until
+  the immediate, +10 minute, +30 minute, and complete stale/quiescence horizon
+  proves no partial authority pair, paid spill, or ordinary-traffic regression;
+  then merge it before declaring phase 2e complete.

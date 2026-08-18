@@ -3934,7 +3934,7 @@ class SkyServeController:
 
     def _transition_demand_source(self, mode: str,
                                   expected_source_epoch: int) -> int:
-        """Move one service between explicit, mutually exclusive sources."""
+        """Deprecated separate demand transition retained until cleanup."""
         transition_generation = self._begin_actuation_transition()
         try:
             authority = self._ordinary_launch_binding_authority
@@ -3970,7 +3970,7 @@ class SkyServeController:
 
     def _promote_zero_cost_actuation(self,
                                      expected_actuation_epoch: int) -> int:
-        """Make grant-before-row the sole reserved-fill admission path."""
+        """Deprecated repair for a retained durable-demand partial state."""
         transition_generation = self._begin_actuation_transition()
         try:
             authority = self._ordinary_launch_binding_authority
@@ -6507,7 +6507,7 @@ class SkyServeController:
         def promote_zero_cost_actuation(
             request_data: dict[str,
                                Any] = fastapi.Body(...),) -> fastapi.Response:
-            """Promote the one-way grant-before-row authority switch."""
+            """Repair a deprecated durable-demand/direct-actuation state."""
             expected_service_hash = request_data.get('expected_service_hash')
             expected_epoch = request_data.get('expected_actuation_epoch')
             if (isinstance(expected_epoch, bool) or
@@ -6521,6 +6521,9 @@ class SkyServeController:
                 return responses.JSONResponse(
                     content={'message': 'Service incarnation changed.'},
                     status_code=409)
+            logger.warning(
+                'Using deprecated separate zero-cost actuation repair for %s.',
+                self._service_name)
             try:
                 epoch = self._promote_zero_cost_actuation(expected_epoch)
                 return responses.JSONResponse(
