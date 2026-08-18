@@ -18,7 +18,7 @@ _EXPECTED_AST_SHA256 = {
     'finish_lb_ha_migration': '69e01df36495034d050f767d77a94a2664ffcb22c8bd9e3fdbdb3b5117165624',
     'begin_lb_ha_rollback': '9670e422667eb9af9dec5babb7bc3a401c6d406a5c794f7c8feb43b426b3a444',
     'finish_lb_ha_rollback': '46754dc27c2442ecc9eb515db1a92fd25d2e396073c5eab132e40d0cc6fadad0',
-    'begin_lb_cutover': '08873c1e5316b09b95f84882a52325664e12b6102253226897e95f1b55faec54',
+    'begin_lb_cutover': 'aba05796484bc5d8ed747b8759aadaf707d4900d66331a69c8074361f463b550',
     'record_lb_active_demand_snapshot': '56c8b376cde149760ffaab445b75220a69614b1303948d5cdf0cde28f52f68a2',
     'get_lb_last_demand_snapshot': '591f0d5234686cd79010e20112bce5d8b0f0f9476eaf828b21eb2c201a5a43ea',
     'commit_lb_cutover': '419ec07ea661a3aaebce0e64f450c6dc51a000d89be2c682311def355be4926b',

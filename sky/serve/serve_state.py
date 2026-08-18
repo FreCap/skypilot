@@ -2299,12 +2299,12 @@ def get_service_controller_owner(
     ``require_version`` preserves callers whose old joined read treated an
     orphan/versionless service row as missing, using an indexed existence
     check without loading version metadata. ``include_lb_state`` adds the
-    cutover fields only for HA lifecycle callers, keeping the routing identity
-    contract small for all other hot paths.
+    cutover and exact durable-route owner fields only for HA lifecycle callers,
+    keeping the routing identity contract small for all other hot paths.
     """
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
-        query = sqlalchemy.select(
+        columns = [
             services_table.c.hash,
             services_table.c.status,
             services_table.c.controller_pid,
@@ -2313,13 +2313,26 @@ def get_service_controller_owner(
             services_table.c.lifecycle_epoch,
             services_table.c.pool,
             services_table.c.resource_scope,
-            services_table.c.lb_ha_enabled,
-            services_table.c.lb_active_slot,
-            services_table.c.lb_cutover_generation,
-            services_table.c.lb_pending_slot,
-            services_table.c.lb_cutover_phase,
-            services_table.c.lb_drain_started_at,
-        ).where(services_table.c.name == service_name)
+        ]
+        if include_lb_state:
+            columns.extend([
+                services_table.c.lb_ha_enabled,
+                services_table.c.lb_active_slot,
+                services_table.c.lb_cutover_generation,
+                services_table.c.lb_pending_slot,
+                services_table.c.lb_cutover_phase,
+                services_table.c.lb_drain_started_at,
+                services_table.c.current_version,
+                services_table.c.controller_incarnation,
+                services_table.c.controller_owner_epoch,
+                services_table.c.route_source_mode,
+                services_table.c.route_source_epoch,
+                services_table.c.route_projection_capable,
+                services_table.c.route_projection_controller_incarnation,
+                services_table.c.route_projection_protocol_version,
+            ])
+        query = sqlalchemy.select(*columns).where(
+            services_table.c.name == service_name)
         if require_version:
             query = query.where(sqlalchemy.exists().where(
                 version_specs_table.c.service_name == services_table.c.name))
@@ -2336,6 +2349,17 @@ def get_service_controller_owner(
             'lb_pending_slot': mapping['lb_pending_slot'],
             'lb_cutover_phase': mapping['lb_cutover_phase'],
             'lb_drain_started_at': mapping['lb_drain_started_at'],
+            'current_version': mapping['current_version'],
+            'controller_incarnation': mapping['controller_incarnation'],
+            'controller_owner_epoch': mapping['controller_owner_epoch'],
+            'route_source_mode': mapping['route_source_mode'],
+            'route_source_epoch': mapping['route_source_epoch'],
+            'route_projection_capable': bool(mapping['route_projection_capable']
+                                            ),
+            'route_projection_controller_incarnation':
+                mapping['route_projection_controller_incarnation'],
+            'route_projection_protocol_version':
+                mapping['route_projection_protocol_version'],
         })
     return record
 

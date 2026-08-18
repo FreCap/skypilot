@@ -273,6 +273,7 @@ class LbHaRuntimeStats:
                     'snapshot_parse_pods',
                     'kubernetes_pod_authority',
                     'postgresql_role_state_read',
+                    'postgresql_route_promotion_read',
                     'postgresql_fence_read',
                     'postgresql_cutover_state_read',
                     'kubernetes_service_routing_read',

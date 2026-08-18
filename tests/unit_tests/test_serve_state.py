@@ -3960,6 +3960,14 @@ class TestGetServiceControllerOwner:
         assert record['lb_pending_slot'] is None
         assert record['lb_cutover_phase'] == 'STABLE'
         assert record['lb_drain_started_at'] is None
+        assert record['current_version'] == 1
+        assert 'controller_incarnation' in record
+        assert 'controller_owner_epoch' in record
+        assert record['route_source_mode'] == 'LEGACY_PROXY'
+        assert record['route_source_epoch'] == 0
+        assert record['route_projection_capable'] is False
+        assert 'route_projection_controller_incarnation' in record
+        assert 'route_projection_protocol_version' in record
         assert counts['n'] == 1
 
     def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):
