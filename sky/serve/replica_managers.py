@@ -8690,6 +8690,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._reserved_fill_deferred_tail(
                             plan, 0, reason, detail),
                         authority_current=False)
+                controller_authority = (self._ordinary_launch_binding_authority)
+                if controller_authority is None:
+                    return self._reserved_fill_commit_result(
+                        plan, [],
+                        self._reserved_fill_deferred_tail(
+                            plan, 0,
+                            reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                            'durable controller authority is unavailable'),
+                        authority_current=False)
+                controller_incarnation = (
+                    controller_authority.controller_incarnation)
+                controller_owner_epoch = (
+                    controller_authority.controller_owner_epoch)
                 try:
                     maximum = self._reserved_fill_max_capacity_locked()
                 except Exception as error:  # pylint: disable=broad-except
@@ -8706,7 +8719,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         authority_current=False)
             try:
                 receipt = self._zero_cost_actuation_repository.grant_plan(
-                    self._service_name, plan, max_capacity=maximum)
+                    self._service_name,
+                    plan,
+                    max_capacity=maximum,
+                    expected_controller_incarnation=controller_incarnation,
+                    expected_controller_owner_epoch=controller_owner_epoch)
                 if receipt.accepted:
                     self._zero_cost_actuation_event.set()
                 return receipt
