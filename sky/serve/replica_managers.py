@@ -341,7 +341,7 @@ LogicalTargetState = (tuple[int, int, int] |
 
 @dataclasses.dataclass(frozen=True)
 class _LogicalReconcileState:
-    """One atomically published logical target/capacity observation."""
+    """One atomically observed logical target/capacity state."""
 
     target: LogicalTargetState | None
     snapshot: LogicalReconcileSnapshot | None
@@ -2777,9 +2777,22 @@ class ReplicaManager:
         in_flight_by_replica_id: dict[int, int],
         unknown_replica_ids: set[int],
     ) -> None:
-        """Atomically publish one complete logical-capacity observation."""
+        """Publish one advancing legacy logical-capacity observation."""
         with self._logical_state_lock:
             state = self._logical_reconcile_state
+            current_snapshot = state.snapshot
+            if (current_snapshot is not None and
+                    generation <= current_snapshot.generation):
+                # The legacy LB source increments its controller-local
+                # generation for every accepted report. A duplicate or older
+                # standalone half-publication is therefore impossible for a
+                # valid producer and could pair replayed capacity with a
+                # same-generation target computed from different inputs.
+                logger.warning(
+                    'Discarding non-advancing legacy logical capacity '
+                    f'snapshot generation {generation}; current generation is '
+                    f'{current_snapshot.generation}.')
+                return
             snapshot = LogicalReconcileSnapshot(
                 version=version,
                 generation=generation,
@@ -2798,7 +2811,7 @@ class ReplicaManager:
             target_capacity_by_accelerator: LogicalAcceleratorState = (),
             accelerator_shapes: LogicalAcceleratorState = (),
     ) -> None:
-        """Publish the target computed from an exact reconcile generation."""
+        """Publish one non-regressing legacy logical target."""
         with self._logical_state_lock:
             if self._update_recovery_required:
                 return
@@ -2815,13 +2828,21 @@ class ReplicaManager:
                 self._logical_reconcile_state = _LogicalReconcileState(
                     target=None, snapshot=state.snapshot)
                 return
+            current_components = _logical_target_state_components(state.target)
+            if (current_components is not None and
+                    generation < current_components[1]):
+                logger.warning(
+                    'Discarding regressed legacy logical target generation '
+                    f'{generation}; current generation is '
+                    f'{current_components[1]}.')
+                return
             self._logical_reconcile_state = _LogicalReconcileState(
                 target=candidate, snapshot=state.snapshot)
 
     def publish_logical_reconcile_state(
             self, target: LogicalTargetState,
             snapshot: LogicalReconcileSnapshot) -> bool:
-        """Atomically publish one coherent logical target/capacity pair."""
+        """Atomically publish one coherent durable target/capacity pair."""
         with self._logical_state_lock:
             if self._update_recovery_required:
                 return False
@@ -2847,9 +2868,10 @@ class ReplicaManager:
                 in_flight_by_replica_id=dict(snapshot.in_flight_by_replica_id),
                 unknown_replica_ids=frozenset(snapshot.unknown_replica_ids),
                 received_at=snapshot.received_at)
-            # One reference assignment is the publication boundary. Readers
-            # capture this immutable pair once, so a same-generation replay or
-            # generation regression cannot expose cross-publication halves.
+            # One reference assignment is this paired publication's boundary.
+            # Readers capture the immutable pair once, so a same-generation
+            # replay or generation regression cannot expose halves from two
+            # different paired publications.
             self._logical_reconcile_state = _LogicalReconcileState(
                 target=target, snapshot=published_snapshot)
             return True

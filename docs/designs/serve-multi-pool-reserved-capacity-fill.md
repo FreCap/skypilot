@@ -228,6 +228,19 @@ invariants:
 - this bridge publishes evidence only. It adds no scale-down, termination,
   provider, row-deletion, or alternate cleanup path.
 
+The single-operation coherence guarantee above is specifically the durable
+promotion bridge. Before promotion, legacy LB ingestion still publishes a
+capacity snapshot and the later reconcile publishes its target as two
+standalone operations. That path increments one process-local generation for
+every accepted report, so it cannot legitimately replay a capacity half at the
+same generation; `ReplicaManager` rejects duplicate/regressed standalone
+snapshots and regressed standalone targets. A target at generation `N` may
+still coexist intentionally with a newer legacy capacity snapshot `N + 1`:
+newer capacity is stronger evidence, and the next generation-fenced reconcile
+will replace the target. Each legacy operation also replaces one immutable
+state reference, so readers never tear a target or snapshot object while that
+intentional cross-generation state is visible.
+
 Draft cleanup PR #1506 contains a superficially similar hunk that derives
 `next_demand_generation = self._reconcile_generation + 1`. That is unsafe: the
 live durable feed was already at generation 68023 while a restarted controller
@@ -3519,8 +3532,10 @@ legacy activation.
   rejection, immutable target/snapshot publication during a forced
   same-generation interleaving, stale and plan-failure fail-closed behavior,
   publication-rejection and final-currentness actuation fences, and absence of
-  a new teardown path. This supersedes only #1506's controller-local `+ 1`
-  generation hunk.
+  a new teardown path. Legacy half-publication tests additionally reject a
+  duplicate/regressed capacity snapshot and a regressed target while retaining
+  the intentional newer-capacity/older-target contract. This supersedes only
+  #1506's controller-local `+ 1` generation hunk.
 - [ ] Merge and deploy that bridge before authority activation. Verify feed
   generation `N` publishes both logical target and manager evidence at `N`, a
   repeated `N` cannot release adopted retirements, and a fresh `N + 1` lets the

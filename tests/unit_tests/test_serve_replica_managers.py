@@ -8091,6 +8091,51 @@ class TestLogicalCapacityPlanning:
             10: 2
         }
 
+    def test_legacy_half_publishers_reject_nonadvancing_evidence(self):
+        mgr = _make_manager()
+        mgr._update_recovery_required = False
+        old_snapshot = replica_managers.LogicalReconcileSnapshot(
+            version=1,
+            generation=7,
+            observed_slots_by_replica_id={10: 1},
+            in_flight_by_replica_id={10: 0},
+            unknown_replica_ids=frozenset(),
+            received_at=replica_managers.time.monotonic())
+        mgr._logical_target = (1, 7, 1)
+        mgr._logical_reconcile_snapshot = old_snapshot
+        old_state = mgr._logical_reconcile_state
+
+        mgr.update_logical_reconcile_snapshot(
+            version=1,
+            generation=7,
+            observed_slots_by_replica_id={10: 2},
+            in_flight_by_replica_id={10: 1},
+            unknown_replica_ids=set())
+        assert mgr._logical_reconcile_state is old_state
+
+        mgr.update_logical_reconcile_snapshot(
+            version=1,
+            generation=6,
+            observed_slots_by_replica_id={10: 3},
+            in_flight_by_replica_id={10: 2},
+            unknown_replica_ids=set())
+        assert mgr._logical_reconcile_state is old_state
+
+        mgr.publish_logical_target(1, 6, 0)
+        assert mgr._logical_reconcile_state is old_state
+
+        mgr.update_logical_reconcile_snapshot(
+            version=1,
+            generation=8,
+            observed_slots_by_replica_id={10: 2},
+            in_flight_by_replica_id={10: 0},
+            unknown_replica_ids=set())
+        advanced_state = mgr._logical_reconcile_state
+        assert advanced_state is not old_state
+        assert advanced_state.target == (1, 7, 1)
+        assert advanced_state.snapshot is not None
+        assert advanced_state.snapshot.generation == 8
+
     def test_same_generation_replay_never_exposes_mixed_pair(self):
 
         class _BlockingMapping(collections.abc.Mapping):
