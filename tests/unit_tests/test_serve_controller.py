@@ -1209,6 +1209,131 @@ def _binding_authority(mode: str, epoch: int, *, generic: bool = False):
             binding.NON_POOL_RECEIPT_PROTOCOL_VERSION if generic else None))
 
 
+def _resident_placement_page():
+    return {
+        'available': True,
+        'enabled': True,
+        'pagination_version': 1,
+        'page_offset': 0,
+        'next_offset': None,
+        'total_locations': 1,
+        'locations': [{
+            'cloud': 'Kubernetes',
+            'region': 'research',
+        }],
+        'truncated': False,
+    }
+
+
+def test_placement_route_default_is_resident_only(monkeypatch):
+    ctrl = _make_update_controller()
+    placer = mock.Mock()
+    placer.placement_snapshot.return_value = _resident_placement_page()
+    ctrl._replica_manager.spot_placer = placer  # pylint: disable=protected-access
+    ctrl._replica_manager.workspace = 'workspace-a'  # pylint: disable=protected-access
+    get_replicas = mock.Mock()
+    build_budget = mock.Mock()
+    monkeypatch.setattr(controller.serve_state, 'get_replica_infos',
+                        get_replicas)
+    monkeypatch.setattr(controller.paid_capacity, 'build_launch_budget',
+                        build_budget)
+
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.get(constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+                          params={'limit': 100})
+
+    assert response.status_code == 200
+    assert response.json() == _resident_placement_page()
+    get_replicas.assert_not_called()
+    build_budget.assert_not_called()
+    placer.placement_snapshot.assert_called_once_with(
+        limit=100, offset=0, paid_admission_by_location=None)
+
+
+def test_placement_route_replica_read_failure_preserves_resident_page(
+        monkeypatch):
+    ctrl = _make_update_controller()
+    placer = mock.Mock()
+    placer.placement_snapshot.return_value = _resident_placement_page()
+    ctrl._replica_manager.spot_placer = placer  # pylint: disable=protected-access
+    ctrl._replica_manager.workspace = 'workspace-a'  # pylint: disable=protected-access
+    get_replicas = mock.Mock(side_effect=RuntimeError('database unavailable'))
+    build_budget = mock.Mock()
+    monkeypatch.setattr(controller.serve_state, 'get_replica_infos',
+                        get_replicas)
+    monkeypatch.setattr(controller.paid_capacity, 'build_launch_budget',
+                        build_budget)
+
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.get(constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+                          params={
+                              'limit': 100,
+                              'include_paid_admission': True,
+                          })
+
+    assert response.status_code == 200
+    assert response.json() == _resident_placement_page()
+    get_replicas.assert_called_once_with('svc')
+    build_budget.assert_not_called()
+    placer.placement_snapshot.assert_called_once_with(
+        limit=100, offset=0, paid_admission_by_location=None)
+
+
+def test_placement_route_opt_in_includes_paid_admission(monkeypatch):
+    ctrl = _make_update_controller()
+    admission = {'location-a': {'state': 'allowed'}}
+
+    def _placement_snapshot(*, limit, offset, paid_admission_by_location):
+        assert limit == 25
+        assert offset == 50
+        return {
+            **_resident_placement_page(),
+            'page_offset': offset,
+            'locations': [{
+                'cloud': 'Kubernetes',
+                'region': 'research',
+                'paid_admission': paid_admission_by_location['location-a'],
+            }],
+        }
+
+    placer = mock.Mock()
+    placer.placement_snapshot.side_effect = _placement_snapshot
+    ctrl._replica_manager.spot_placer = placer  # pylint: disable=protected-access
+    ctrl._replica_manager.workspace = 'workspace-a'  # pylint: disable=protected-access
+    replicas = [mock.sentinel.replica]
+    budget = mock.sentinel.budget
+    get_replicas = mock.Mock(return_value=replicas)
+    build_budget = mock.Mock(return_value=budget)
+    admission_snapshot = mock.Mock(return_value=admission)
+    monkeypatch.setattr(controller.serve_state, 'get_replica_infos',
+                        get_replicas)
+    monkeypatch.setattr(controller.paid_capacity, 'build_launch_budget',
+                        build_budget)
+    monkeypatch.setattr(controller.paid_capacity,
+                        'admission_snapshot_by_location', admission_snapshot)
+
+    client = _register_update_test_routes(ctrl, monkeypatch)
+    response = client.get(constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
+                          params={
+                              'limit': 25,
+                              'offset': 50,
+                              'include_paid_admission': True,
+                          })
+
+    assert response.status_code == 200
+    assert response.json()['locations'][0]['paid_admission'] == {
+        'state': 'allowed'
+    }
+    get_replicas.assert_called_once_with('svc')
+    build_budget.assert_called_once_with(placer,
+                                         workspace='workspace-a',
+                                         existing_replica_infos=replicas,
+                                         globally_managed=True,
+                                         service_name='svc',
+                                         service_hash='incarnation-a')
+    admission_snapshot.assert_called_once_with(budget)
+
+
 def test_binding_promotion_refreshes_controller_and_manager_in_transition_epoch(
         monkeypatch):
     ctrl = _make_update_controller()

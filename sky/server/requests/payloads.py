@@ -1386,6 +1386,11 @@ class ServePlacementBody(RequestBody):
     cursor: str | None = pydantic.Field(default=None,
                                         min_length=1,
                                         max_length=512)
+    # These bounds mirror the authenticated controller page contract. Keep
+    # literals here: importing sky.serve.constants while request payloads are
+    # initialized creates a sky.client <-> sky.serve package cycle.
+    location_limit: int = pydantic.Field(default=100, ge=1, le=100)
+    location_offset: int = pydantic.Field(default=0, ge=0, le=100_000)
 
 
 class RealtimeGpuAvailabilityRequestBody(RequestBody):

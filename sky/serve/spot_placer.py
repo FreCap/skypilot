@@ -18,6 +18,7 @@ from sky import sky_logging
 from sky import skypilot_config
 from sky.clouds import cloud as sky_cloud
 from sky.container_images import models as container_image_models
+from sky.serve import constants
 from sky.serve import placement_policy
 from sky.utils import registry
 from sky.utils import resources_utils
@@ -59,7 +60,6 @@ _PREEMPTION_RETRY_SECONDS_ENV_VAR = 'SKYPILOT_SPOT_PLACER_RETRY_SECONDS'
 # probe path rather than launching on a reading nobody has refreshed.
 _MEASURED_CAPACITY_TTL_SECONDS_DEFAULT = 180
 _MEASURED_CAPACITY_TTL_ENV_VAR = 'SKYPILOT_MEASURED_CAPACITY_TTL_SECONDS'
-_PLACEMENT_SNAPSHOT_MAX_LOCATIONS = 500
 _PLACEMENT_CATALOG_SCHEMA_VERSION = 1
 # Public reader contract for bounded consumers such as the dashboard.  The
 # placement JSON remains versioned independently of the API wire version.
@@ -1595,14 +1595,19 @@ class SpotPlacer:
 
     def placement_snapshot(
         self,
-        limit: int = _PLACEMENT_SNAPSHOT_MAX_LOCATIONS,
+        limit: int = constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+        offset: int = 0,
         paid_admission_by_location: dict[Location, dict[str, Any]] | None = None
     ) -> dict[str, Any]:
-        """Serialize already-resident retry state without provider calls."""
+        """Serialize one page of resident retry state without provider calls."""
         if (not isinstance(limit, int) or isinstance(limit, bool) or
-                limit < 1 or limit > _PLACEMENT_SNAPSHOT_MAX_LOCATIONS):
+                limit < 1 or limit > constants.PLACEMENT_STATE_MAX_PAGE_SIZE):
             raise ValueError(f'limit must be an integer from 1 to '
-                             f'{_PLACEMENT_SNAPSHOT_MAX_LOCATIONS}.')
+                             f'{constants.PLACEMENT_STATE_MAX_PAGE_SIZE}.')
+        if (not isinstance(offset, int) or isinstance(offset, bool) or
+                offset < 0 or offset > constants.PLACEMENT_STATE_MAX_OFFSET):
+            raise ValueError(f'offset must be an integer from 0 to '
+                             f'{constants.PLACEMENT_STATE_MAX_OFFSET}.')
         now = time.time()
         retry_seconds = _preemption_retry_seconds()
         eligible_locations = self._workspace_eligible_locations()
@@ -1610,7 +1615,8 @@ class SpotPlacer:
                             if location in eligible_locations),
                            key=lambda location: location.sort_key())
         entries = []
-        for location in locations[:limit]:
+        page_end = min(len(locations), offset + limit)
+        for location in locations[offset:page_end]:
             stored_status = self.location2status[location]
             benched_at = self.location2preempted_at.get(location)
             retry_reserved_at = self.location2retry_reserved_at.get(location)
@@ -1626,7 +1632,7 @@ class SpotPlacer:
             cached_cost = self.location2cost.get(location)
             if cached_cost is not None and not math.isfinite(cached_cost):
                 cached_cost = None
-            entries.append({
+            entry = {
                 'cloud': str(location.cloud),
                 'region': location.region,
                 'zone': location.zone,
@@ -1642,20 +1648,26 @@ class SpotPlacer:
                 'retry_reserved_at': retry_reserved_at,
                 'next_probe_at': next_probe_at,
                 'cached_hourly_cost': cached_cost,
-                'paid_admission':
-                    (None if paid_admission_by_location is None else
-                     paid_admission_by_location.get(location)),
-            })
+            }
+            if paid_admission_by_location is not None:
+                admission = paid_admission_by_location.get(location)
+                if admission is not None:
+                    entry['paid_admission'] = admission
+            entries.append(entry)
         return {
             'available': True,
             'enabled': True,
+            'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+            'page_offset': offset,
+            'next_offset': page_end if page_end < len(locations) else None,
+            'total_locations': len(locations),
             'retry_seconds': retry_seconds,
             'observed_at': now,
             'status_semantics':
                 ('Controller eligibility only; ACTIVE does not guarantee live '
                  'provider capacity.'),
             'locations': entries,
-            'truncated': len(locations) > limit,
+            'truncated': page_end < len(locations),
         }
 
     def is_active_location(self, location: Location) -> bool:

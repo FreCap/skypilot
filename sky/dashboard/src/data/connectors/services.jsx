@@ -1519,6 +1519,10 @@ export function normalizeServicePlacement(payload) {
       observedAt: finiteOrNull(placer.observed_at),
       statusSemantics: placer.status_semantics || null,
       truncated: placer.truncated === true,
+      paginationVersion: finiteOrNull(placer.pagination_version),
+      pageOffset: finiteOrNull(placer.page_offset) || 0,
+      nextOffset: finiteOrNull(placer.next_offset),
+      totalLocations: finiteOrNull(placer.total_locations),
       locations: Array.isArray(placer.locations)
         ? placer.locations.map((location) => ({
             cloud: location.cloud || 'Unknown',
@@ -1608,12 +1612,16 @@ export async function getServicePlacement({
   hours = 24,
   limit = 50,
   cursor = null,
+  locationLimit = 100,
+  locationOffset = 0,
 }) {
   const response = await apiClient.post('/serve/placement', {
     service_name: serviceName,
     hours,
     limit,
     cursor,
+    location_limit: locationLimit,
+    location_offset: locationOffset,
   });
   if (!response.ok) {
     const error = new Error(

@@ -6617,39 +6617,62 @@ class SkyServeController:
         @self._app.get(
             serve_constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
             dependencies=[admin_auth_dependency, controller_owner_dependency])
-        def get_placement_state() -> fastapi.Response:
+        def get_placement_state(
+            limit: int = fastapi.Query(
+                default=serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+                ge=1,
+                le=serve_constants.PLACEMENT_STATE_MAX_PAGE_SIZE),
+            offset: int = fastapi.Query(
+                default=0, ge=0, le=serve_constants.PLACEMENT_STATE_MAX_OFFSET),
+            include_paid_admission: bool = fastapi.Query(default=False),
+        ) -> fastapi.Response:
+            # Pre-pagination API processes call this route without query
+            # parameters and enforce a two-second read deadline. Keep that
+            # rolling-upgrade path resident-only; the current API explicitly
+            # opts into the advisory database snapshot with its ten-second
+            # transport budget.
             placer = self._replica_manager.spot_placer
+            content: dict[str, Any]
             if placer is None:
                 content = {
                     'available': True,
                     'enabled': False,
+                    'pagination_version':
+                        serve_constants.PLACEMENT_STATE_PAGINATION_VERSION,
+                    'page_offset': offset,
+                    'next_offset': None,
+                    'total_locations': 0,
                     'locations': [],
                     'truncated': False,
                 }
             else:
-                replica_infos = serve_state.get_replica_infos(
-                    self._service_name)
-                try:
-                    budget = paid_capacity.build_launch_budget(
-                        placer,
-                        workspace=self._replica_manager.workspace,
-                        existing_replica_infos=replica_infos,
-                        globally_managed=self._service_hash is not None,
-                        service_name=self._service_name,
-                        service_hash=self._service_hash)
-                    paid_admission = (
-                        paid_capacity.admission_snapshot_by_location(budget))
-                except Exception as e:  # pylint: disable=broad-except
-                    # Admission shown here is explicitly advisory. Keep exact
-                    # location and bench diagnostics available during a
-                    # database outage; the launch path still requires its
-                    # transactional claim and therefore remains fail closed.
-                    logger.warning(
-                        'Could not build advisory paid-capacity placement '
-                        'state: '
-                        f'{common_utils.format_exception(e)}')
-                    paid_admission = None
+                paid_admission = None
+                if include_paid_admission:
+                    try:
+                        replica_infos = serve_state.get_replica_infos(
+                            self._service_name)
+                        budget = paid_capacity.build_launch_budget(
+                            placer,
+                            workspace=self._replica_manager.workspace,
+                            existing_replica_infos=replica_infos,
+                            globally_managed=self._service_hash is not None,
+                            service_name=self._service_name,
+                            service_hash=self._service_hash)
+                        paid_admission = (
+                            paid_capacity.admission_snapshot_by_location(budget)
+                        )
+                    except Exception as e:  # pylint: disable=broad-except
+                        # Admission shown here is explicitly advisory. Keep
+                        # exact location and bench diagnostics available during
+                        # a database outage; the launch path still requires its
+                        # transactional claim and therefore remains fail closed.
+                        logger.warning(
+                            'Could not build advisory paid-capacity placement '
+                            'state: '
+                            f'{common_utils.format_exception(e)}')
                 content = placer.placement_snapshot(
+                    limit=limit,
+                    offset=offset,
                     paid_admission_by_location=paid_admission)
             return responses.JSONResponse(content=content, status_code=200)
 

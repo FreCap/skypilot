@@ -552,6 +552,14 @@ LB_CONTROLLER_PROXY_TIMEOUT_SECONDS = 55
 # and can exceed the parent's tight health-check timeout during launch storms.
 CONTROLLER_HEALTH_ENDPOINT_PATH = '/controller/health'
 CONTROLLER_PLACEMENT_ENDPOINT_PATH = '/controller/placement'
+# Placement state is resident controller observability, not provider
+# inventory.  Page it independently from the PostgreSQL placement-history
+# page so a large fallback catalog cannot monopolize the API worker or cross
+# the controller transport deadline.
+PLACEMENT_STATE_PAGINATION_VERSION = 1
+PLACEMENT_STATE_DEFAULT_PAGE_SIZE = 100
+PLACEMENT_STATE_MAX_PAGE_SIZE = 100
+PLACEMENT_STATE_MAX_OFFSET = 100_000
 CONTROLLER_UPDATE_CAPABILITIES_ENDPOINT_PATH = (
     '/controller/update_capabilities')
 CONTROLLER_CONFIG_UPDATE_ENDPOINT_PATH = (

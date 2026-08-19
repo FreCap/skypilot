@@ -8,6 +8,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.backends import backend_utils
 from sky.provision import capacity_cache
+from sky.serve import constants as serve_constants
 from sky.serve import maintenance
 from sky.serve import placement_history
 from sky.serve import serve_rpc_utils
@@ -312,10 +313,13 @@ def status(
 
 
 @usage_lib.entrypoint
-def placement(service_name: str,
-              hours: int = placement_history.RETENTION_HOURS,
-              limit: int = placement_history.DEFAULT_PAGE_SIZE,
-              cursor: str | None = None) -> dict[str, Any]:
+def placement(
+        service_name: str,
+        hours: int = placement_history.RETENTION_HOURS,
+        limit: int = placement_history.DEFAULT_PAGE_SIZE,
+        cursor: str | None = None,
+        location_limit: int = serve_constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+        location_offset: int = 0) -> dict[str, Any]:
     """Return bounded placement state for one exact service incarnation."""
     record = serve_state.get_service_from_name(service_name)
     if record is None or record.get('pool'):
@@ -331,7 +335,10 @@ def placement(service_name: str,
 
     try:
         placer_state = serve_utils.get_service_placement_state(
-            service_name, service_hash)
+            service_name,
+            service_hash,
+            limit=location_limit,
+            offset=location_offset)
     except Exception as e:  # pylint: disable=broad-except
         logger.debug('Placement-state read failed for %r: %s', service_name, e)
         placer_state = _unavailable_section('controller_unavailable')

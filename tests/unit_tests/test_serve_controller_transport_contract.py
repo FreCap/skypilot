@@ -124,7 +124,12 @@ def test_placement_state_contract_validates_response_object():
         'svc',
         'incarnation-a',
         constants.CONTROLLER_PLACEMENT_ENDPOINT_PATH,
-        timeout=(1.0, 2.0))
+        params={
+            'limit': constants.PLACEMENT_STATE_DEFAULT_PAGE_SIZE,
+            'offset': 0,
+            'include_paid_admission': True,
+        },
+        timeout=serve_utils._CONTROLLER_HTTP_TIMEOUT_SECONDS)
     response.raise_for_status.assert_called_once_with()
 
     response.json.return_value = []
@@ -134,3 +139,75 @@ def test_placement_state_contract_validates_response_object():
         with pytest.raises(ValueError,
                            match='Placement-state response must be an object'):
             serve_utils.get_service_placement_state('svc', 'incarnation-a')
+
+
+def test_placement_state_pages_a_legacy_controller_response():
+    response = mock.Mock()
+    response.json.return_value = {
+        'available': True,
+        'enabled': True,
+        'locations': [{
+            'region': str(index)
+        } for index in range(5)],
+        'truncated': False,
+    }
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        payload = serve_utils.get_service_placement_state('svc',
+                                                          'incarnation-a',
+                                                          limit=2,
+                                                          offset=2)
+
+    assert [entry['region'] for entry in payload['locations']] == ['2', '3']
+    assert payload['page_offset'] == 2
+    assert payload['next_offset'] == 4
+    assert payload['total_locations'] == 5
+    assert payload['truncated'] is True
+
+
+def test_placement_state_accepts_an_exact_bounded_controller_page():
+    response = mock.Mock()
+    expected = {
+        'available': True,
+        'enabled': True,
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'page_offset': 100,
+        'next_offset': None,
+        'total_locations': 101,
+        'locations': [{
+            'region': 'last'
+        }],
+        'truncated': False,
+    }
+    response.json.return_value = expected
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        actual = serve_utils.get_service_placement_state('svc',
+                                                         'incarnation-a',
+                                                         limit=1,
+                                                         offset=100)
+
+    assert actual is expected
+
+
+def test_placement_state_rejects_a_mismatched_controller_page():
+    response = mock.Mock()
+    response.json.return_value = {
+        'pagination_version': constants.PLACEMENT_STATE_PAGINATION_VERSION,
+        'page_offset': 0,
+        'next_offset': None,
+        'total_locations': 1,
+        'locations': [{
+            'region': 'wrong-page'
+        }],
+    }
+    with mock.patch.object(controller_transport,
+                           '_get_to_controller_with_retry',
+                           return_value=response):
+        with pytest.raises(ValueError, match='page offset'):
+            serve_utils.get_service_placement_state('svc',
+                                                    'incarnation-a',
+                                                    limit=1,
+                                                    offset=1)

@@ -294,7 +294,7 @@ function LocationList({ locations }) {
   );
 }
 
-function PlacerStateCard({ state }) {
+function PlacerStateCard({ state, loadingMore, requestPending, onLoadMore }) {
   const [filters, setFilters] = useState({
     provider: ALL_FILTER_VALUE,
     region: ALL_FILTER_VALUE,
@@ -483,11 +483,27 @@ function PlacerStateCard({ state }) {
           )}
         </>
       )}
-      {state.truncated && (
+      {state.nextOffset !== null && state.nextOffset !== undefined ? (
+        <div className="border-t p-3 text-center">
+          <button
+            type="button"
+            onClick={onLoadMore}
+            disabled={requestPending}
+            className="text-sm font-medium text-sky-blue hover:text-sky-blue-bright disabled:text-gray-400"
+          >
+            {loadingMore ? 'Loading…' : 'Load more locations'}
+          </button>
+          {Number.isFinite(state.totalLocations) && (
+            <div className="mt-1 text-xs text-gray-500">
+              Showing {state.locations.length} of {state.totalLocations}
+            </div>
+          )}
+        </div>
+      ) : state.truncated ? (
         <div className="border-t px-4 py-2 text-xs text-amber-700">
           Additional locations were omitted by the response limit.
         </div>
-      )}
+      ) : null}
     </Card>
   );
 }
@@ -690,30 +706,58 @@ export function ServicePlacement({ serviceName }) {
   const [error, setError] = useState(null);
   const requestVersionRef = useRef(0);
   const loading = pendingAction === 'refresh';
-  const loadingMore = pendingAction === 'append';
+  const loadingMoreHistory = pendingAction === 'append-history';
+  const loadingMoreLocations = pendingAction === 'append-locations';
   const requestPending = pendingAction !== null;
 
   const fetchData = useCallback(
-    async ({ cursor = null, append = false } = {}) => {
+    async ({ cursor = null, locationOffset = 0, append = null } = {}) => {
       if (!serviceName) return;
       const requestVersion = requestVersionRef.current + 1;
       requestVersionRef.current = requestVersion;
       const isCurrentRequest = () =>
         requestVersionRef.current === requestVersion;
-      setPendingAction(append ? 'append' : 'refresh');
+      setPendingAction(append || 'refresh');
       setError(null);
       try {
-        const next = await getServicePlacement({ serviceName, cursor });
+        const next = await getServicePlacement({
+          serviceName,
+          cursor,
+          locationOffset,
+        });
         if (!isCurrentRequest()) return;
+        if (append === 'append-locations' && !next.placerState.available) {
+          setError('Failed to load more placement locations.');
+          return;
+        }
+        if (append === 'append-history' && !next.history.available) {
+          setError('Failed to load more placement history.');
+          return;
+        }
         setData((current) => {
           if (!append || !current) return next;
-          return {
-            ...next,
-            history: {
-              ...next.history,
-              events: [...current.history.events, ...next.history.events],
-            },
-          };
+          if (append === 'append-history') {
+            return {
+              ...current,
+              history: {
+                ...next.history,
+                events: [...current.history.events, ...next.history.events],
+              },
+            };
+          }
+          if (append === 'append-locations') {
+            return {
+              ...current,
+              placerState: {
+                ...next.placerState,
+                locations: [
+                  ...current.placerState.locations,
+                  ...next.placerState.locations,
+                ],
+              },
+            };
+          }
+          return next;
         });
       } catch (requestError) {
         if (!isCurrentRequest()) return;
@@ -775,14 +819,27 @@ export function ServicePlacement({ serviceName }) {
         </button>
       </div>
       {error && <div className="text-sm text-red-700">{error}</div>}
-      <PlacerStateCard state={data.placerState} />
+      <PlacerStateCard
+        state={data.placerState}
+        loadingMore={loadingMoreLocations}
+        requestPending={requestPending}
+        onLoadMore={() =>
+          fetchData({
+            locationOffset: data.placerState.nextOffset,
+            append: 'append-locations',
+          })
+        }
+      />
       <CapacityHintsCard state={data.capacityHints} />
       <HistoryCard
         history={data.history}
-        loadingMore={loadingMore}
+        loadingMore={loadingMoreHistory}
         requestPending={requestPending}
         onLoadMore={() =>
-          fetchData({ cursor: data.history.nextCursor, append: true })
+          fetchData({
+            cursor: data.history.nextCursor,
+            append: 'append-history',
+          })
         }
       />
     </div>

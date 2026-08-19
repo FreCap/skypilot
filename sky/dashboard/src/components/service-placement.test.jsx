@@ -105,6 +105,8 @@ const placement = {
       },
     ],
     truncated: false,
+    nextOffset: null,
+    totalLocations: 4,
   },
   capacityHints: {
     available: true,
@@ -383,6 +385,157 @@ it('loads older decisions with the opaque cursor and appends them', async () => 
   expect(getServicePlacement).toHaveBeenLastCalledWith({
     serviceName: 'svc',
     cursor: 'older-cursor',
+    locationOffset: 0,
+  });
+});
+
+it('loads the next bounded location page and preserves the first page', async () => {
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        locations: [
+          {
+            ...placement.placerState.locations[0],
+            region: 'first-region',
+          },
+        ],
+        nextOffset: 1,
+        totalLocations: 2,
+        truncated: true,
+      },
+    })
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        locations: [
+          {
+            ...placement.placerState.locations[1],
+            region: 'second-region',
+          },
+        ],
+        pageOffset: 1,
+        nextOffset: null,
+        totalLocations: 2,
+        truncated: false,
+      },
+    });
+
+  render(<ServicePlacement serviceName="svc" />);
+  expect(
+    await screen.findByRole('cell', { name: /AWS first-region/ })
+  ).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Load more locations' }));
+
+  expect(
+    await screen.findByRole('cell', { name: /AWS second-region/ })
+  ).toBeTruthy();
+  expect(screen.getByRole('cell', { name: /AWS first-region/ })).toBeTruthy();
+  expect(getServicePlacement).toHaveBeenLastCalledWith({
+    serviceName: 'svc',
+    cursor: null,
+    locationOffset: 1,
+  });
+});
+
+it('preserves and retries a location page after a fail-soft response', async () => {
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      placerState: {
+        ...placement.placerState,
+        locations: [
+          {
+            ...placement.placerState.locations[0],
+            region: 'first-region',
+          },
+        ],
+        nextOffset: 1,
+        totalLocations: 2,
+        truncated: true,
+      },
+    })
+    .mockResolvedValue({
+      ...placement,
+      placerState: {
+        available: false,
+        reason: 'controller_unavailable',
+        locations: [],
+        nextOffset: null,
+      },
+    });
+
+  render(<ServicePlacement serviceName="svc" />);
+  expect(
+    await screen.findByRole('cell', { name: /AWS first-region/ })
+  ).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Load more locations' }));
+
+  expect(
+    await screen.findByText('Failed to load more placement locations.')
+  ).toBeTruthy();
+  expect(screen.getByRole('cell', { name: /AWS first-region/ })).toBeTruthy();
+  const retry = screen.getByRole('button', { name: 'Load more locations' });
+  expect(retry).toBeEnabled();
+
+  fireEvent.click(retry);
+  await waitFor(() => expect(getServicePlacement).toHaveBeenCalledTimes(3));
+  expect(getServicePlacement).toHaveBeenLastCalledWith({
+    serviceName: 'svc',
+    cursor: null,
+    locationOffset: 1,
+  });
+});
+
+it('preserves and retries history after a fail-soft response', async () => {
+  getServicePlacement
+    .mockResolvedValueOnce({
+      ...placement,
+      history: {
+        ...placement.history,
+        events: [
+          {
+            eventId: 'new-event',
+            clusterName: 'svc-new',
+            observedAt: 2000,
+            outcome: 'succeeded',
+          },
+        ],
+        nextCursor: 'older-cursor',
+      },
+    })
+    .mockResolvedValue({
+      ...placement,
+      history: {
+        available: false,
+        reason: 'database_unavailable',
+        events: [],
+        nextCursor: null,
+      },
+    });
+
+  render(<ServicePlacement serviceName="svc" />);
+  expect(await screen.findByText('svc-new')).toBeTruthy();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Load older decisions' }));
+
+  expect(
+    await screen.findByText('Failed to load more placement history.')
+  ).toBeTruthy();
+  expect(screen.getByText('svc-new')).toBeTruthy();
+  const retry = screen.getByRole('button', { name: 'Load older decisions' });
+  expect(retry).toBeEnabled();
+
+  fireEvent.click(retry);
+  await waitFor(() => expect(getServicePlacement).toHaveBeenCalledTimes(3));
+  expect(getServicePlacement).toHaveBeenLastCalledWith({
+    serviceName: 'svc',
+    cursor: 'older-cursor',
+    locationOffset: 0,
   });
 });
 
