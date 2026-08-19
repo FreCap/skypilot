@@ -519,6 +519,76 @@ class InternalServeControllerSyncAuthMiddleware(
 
 
 @middleware_utils.websocket_aware
+class InternalServeControllerApiAuthMiddleware(
+        starlette.middleware.base.BaseHTTPMiddleware):
+    """Authenticate only the controller's replica-launch API operations."""
+
+    async def dispatch(self, request: fastapi.Request, call_next):
+        dedicated_auth_requested = (request.headers.get(
+            server_constants.SERVE_CONTROLLER_API_AUTH_HEADER
+        ) == server_constants.SERVE_CONTROLLER_API_AUTH_HEADER_VALUE)
+        if (not dedicated_auth_requested or
+                not server_constants.is_serve_controller_api_request(
+                    request.method, request.url.path)):
+            return await call_next(request)
+
+        try:
+            auth_tokens = serve_utils.get_controller_admin_auth_tokens(
+                required=True)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Controller API authentication is unavailable: {e}')
+            return fastapi.responses.JSONResponse(
+                status_code=503,
+                content={
+                    'detail': 'Controller API authentication is unavailable.'
+                })
+
+        if not auth_tokens:
+            logger.error(
+                'Controller API authentication returned an empty token ring.')
+            return fastapi.responses.JSONResponse(
+                status_code=503,
+                content={
+                    'detail': 'Controller API authentication is unavailable.'
+                })
+
+        authorization = request.headers.get('authorization')
+        presented_token: str | None = None
+        if authorization is not None:
+            scheme, separator, token_value = authorization.partition(' ')
+            if (separator and scheme.lower() == 'bearer' and token_value and
+                    token_value == token_value.strip() and
+                    not any(character.isspace() for character in token_value)):
+                presented_token = token_value
+
+        authenticated = False
+        if presented_token is not None:
+            presented_bytes = presented_token.encode('utf-8')
+            for expected_token in auth_tokens:
+                if not isinstance(expected_token, str) or not expected_token:
+                    logger.error('Controller API authentication returned an '
+                                 'invalid token ring.')
+                    return fastapi.responses.JSONResponse(
+                        status_code=503,
+                        content={
+                            'detail': 'Controller API authentication is '
+                                      'unavailable.'
+                        })
+                authenticated |= hmac.compare_digest(
+                    presented_bytes, expected_token.encode('utf-8'))
+
+        if not authenticated:
+            return _bearer_auth_401_response(
+                {'detail': 'Invalid controller API bearer token.'})
+
+        request.state.auth_user = models.User(
+            id='skypilot-system-serve-controller',
+            name='SkyServe controller',
+            user_type=models.UserType.SYSTEM.value)
+        return await call_next(request)
+
+
+@middleware_utils.websocket_aware
 class AuthProxyMiddleware(starlette.middleware.base.BaseHTTPMiddleware):
     """Middleware to handle external auth proxy.
 
@@ -587,6 +657,7 @@ for _public_symbol in (
         BasicAuthMiddleware,
         BearerTokenMiddleware,
         InternalServeControllerSyncAuthMiddleware,
+        InternalServeControllerApiAuthMiddleware,
         AuthProxyMiddleware,
 ):
     _public_symbol.__module__ = 'sky.server.server'

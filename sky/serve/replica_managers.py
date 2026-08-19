@@ -94,6 +94,12 @@ ordinary_launch_binding = adaptors_common.LazyImport(
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
 requests = adaptors_common.LazyImport('requests')
 
+
+def _required_controller_admin_auth_tokens() -> tuple[str, ...]:
+    """Read the live token ring for controller-to-API launch operations."""
+    return serve_utils.get_controller_admin_auth_tokens(required=True)
+
+
 # Keep the established replica_managers import and pickle identities while the
 # versioned record implementation lives in its own low-state module.
 replica_info_lib.logger = logger
@@ -737,6 +743,7 @@ def _wait_for_bound_ordinary_launch(
     replica_to_launch_cancelled: thread_utils.ThreadSafeDict[int, bool],
     continue_guard: Callable[[], bool] | None = None,
     supersession_guard: Callable[[], bool | tuple[bool, str]] | None = None,
+    api_auth_token_provider: Callable[[], tuple[str, ...]] | None = None,
 ) -> None:
     """Adopt, quiesce, and reduce one exact durable request binding."""
     cancel_reason: str | None = None
@@ -986,7 +993,10 @@ def _wait_for_bound_ordinary_launch(
     parent_context = context.get()
 
     def _wait_exact_request() -> None:
-        with context.initialize(parent_context):
+        api_auth_context: contextlib.AbstractContextManager = (
+            server_common.serve_controller_api_auth(api_auth_token_provider) if
+            api_auth_token_provider is not None else contextlib.nullcontext())
+        with context.initialize(parent_context), api_auth_context:
             if stream_logs:
                 result_box.append(sdk.stream_and_get(launch_request_id))
             else:
@@ -1045,16 +1055,18 @@ def adopt_bound_ordinary_launch(
     ctx = context.get()
     assert ctx is not None, 'Context is not initialized'
     ctx.redirect_log(pathlib.Path(log_file))
-    _wait_for_bound_ordinary_launch(replica_id,
-                                    cluster_name,
-                                    request_id,
-                                    False,
-                                    launch_cloud,
-                                    reduce_exact,
-                                    cancel_exact,
-                                    replica_to_launch_cancelled,
-                                    continue_guard=continue_guard,
-                                    supersession_guard=supersession_guard)
+    _wait_for_bound_ordinary_launch(
+        replica_id,
+        cluster_name,
+        request_id,
+        False,
+        launch_cloud,
+        reduce_exact,
+        cancel_exact,
+        replica_to_launch_cancelled,
+        continue_guard=continue_guard,
+        supersession_guard=supersession_guard,
+        api_auth_token_provider=(_required_controller_admin_auth_tokens))
 
 
 # TODO(tian): Combine this with
@@ -1154,6 +1166,8 @@ def launch_cluster(
         reserved_capacity.ProtocolV2CleanupFence(
             kubernetes_context=protocol_v2_fence.kubernetes_context,
             physical_cluster_uid=protocol_v2_fence.physical_cluster_uid))
+    controller_api_auth_token_provider: Callable[[], tuple[str,
+                                                           ...]] | None = None
 
     def _emit_ordinary_launch_event(
         event_kind: ordinary_launch_handoff.EventKind,
@@ -1171,14 +1185,21 @@ def launch_cluster(
             logger.debug('Ordinary-launch telemetry callback failed: %s', error)
 
     def _lookup_terminal_status(request_id: str) -> str | None:
-        request_payloads = sdk.api_status(
-            request_ids=[request_id],
-            fields=['request_id', 'status'],
-            _exact_request_ids=True,
-            _use_body=True,
-            _request_timeout_seconds=(
-                ordinary_launch_handoff.TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
-            _retry_on_server_unavailable=False)
+        api_auth_context: contextlib.AbstractContextManager = (
+            server_common.serve_controller_api_auth(
+                controller_api_auth_token_provider)
+            if controller_api_auth_token_provider is not None else
+            contextlib.nullcontext())
+        with api_auth_context:
+            request_payloads = sdk.api_status(
+                request_ids=[request_id],
+                fields=['request_id', 'status'],
+                _exact_request_ids=True,
+                _use_body=True,
+                _request_timeout_seconds=(
+                    ordinary_launch_handoff.
+                    TERMINAL_STATUS_LOOKUP_TIMEOUT_SECONDS),
+                _retry_on_server_unavailable=False)
         exact_matches = [
             request for request in request_payloads
             if request.request_id == request_id
@@ -1476,11 +1497,14 @@ def launch_cluster(
             raise _BoundOrdinaryLaunchUnresolvedError(
                 'Bound ordinary launch requires complete context and exact '
                 'inspection, reduction, and cancellation authority.')
+        controller_api_auth_token_provider = (
+            _required_controller_admin_auth_tokens)
         bound_workspace_ctx: contextlib.AbstractContextManager = (
             skypilot_config.local_active_workspace_ctx(workspace)
             if workspace is not None else contextlib.nullcontext())
         usage_lib.messages.usage.set_internal()
-        with bound_workspace_ctx:
+        with bound_workspace_ctx, server_common.serve_controller_api_auth(
+                controller_api_auth_token_provider):
             # Freeze once. Every transport retry below submits these exact
             # bytes with the same controller-generated UUID.
             prepared_request = sdk.prepare_launch_request(
@@ -1506,7 +1530,9 @@ def launch_cluster(
             _assert_launch_authorized()
             try:
                 with (skypilot_config.local_active_workspace_ctx(workspace)
-                      if workspace is not None else contextlib.nullcontext()):
+                      if workspace is not None else contextlib.nullcontext()), \
+                     server_common.serve_controller_api_auth(
+                         controller_api_auth_token_provider):
                     if generic_profile_kind is None:
                         request_id = (
                             sdk.submit_prepared_ordinary_launch_request(
@@ -1587,7 +1613,8 @@ def launch_cluster(
                 cancel_bound_ordinary_launch,
                 replica_to_launch_cancelled,
                 continue_guard=continue_guard,
-                supersession_guard=supersession_guard)
+                supersession_guard=supersession_guard,
+                api_auth_token_provider=controller_api_auth_token_provider)
         except Exception:
             _observe_terminal_nonblocking(request_id)
             raise
