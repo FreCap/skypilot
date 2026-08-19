@@ -75,6 +75,63 @@ class IntentLease:
     expires_at: datetime.datetime
 
 
+@dataclasses.dataclass(frozen=True)
+class PendingPoolDebit:
+    """One exact-card physical-slot debit awaiting replica materialization."""
+
+    service_name: str
+    pool_key: str
+    accelerator: str
+    replica_slots: int
+
+
+def pending_pool_debits(
+    pool_key: str,
+    *,
+    engine: sqlalchemy.engine.Engine | None = None,
+) -> tuple[PendingPoolDebit, ...]:
+    """Return live durable intents that already spend physical pool slots.
+
+    The broker calls this while holding its global round lock.  Grant admission
+    takes the same lock, so an intent is either included in a round's debit
+    scan or admitted after that round publishes; it can never fall into the
+    scan-to-publish gap.  One intent represents one physical replica slot even
+    when that replica exposes multiple logical capacity units.
+    """
+    if not isinstance(pool_key, str) or not pool_key:
+        raise ValueError('Pending pool debits require a nonempty pool key.')
+    database = engine or serve_state_schema.get_database_engine()
+    if database.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        # Durable intents are PostgreSQL-only.  Keeping the provider-free read
+        # empty on local SQLite preserves legacy broker tests and controllers;
+        # protocol-v2 activation itself rejects that topology.
+        return ()
+    with database.connect() as connection:
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        rows = connection.execute(
+            sqlalchemy.select(_INTENTS.c.service_name, _INTENTS.c.pool_key,
+                              _INTENTS.c.accelerator).where(
+                                  _INTENTS.c.pool_key == pool_key,
+                                  _INTENTS.c.state.in_(tuple(_PENDING_STATES)),
+                                  _INTENTS.c.valid_until > now)).all()
+    counts: dict[tuple[str, str], int] = {}
+    for service_name, row_pool_key, accelerator in rows:
+        if (not isinstance(service_name, str) or not service_name or
+                row_pool_key != pool_key or not isinstance(accelerator, str) or
+                not accelerator):
+            raise ZeroCostActuationConflict(
+                'Pending physical-slot debit has malformed authority.')
+        key = (service_name, accelerator.casefold())
+        counts[key] = counts.get(key, 0) + 1
+    return tuple(
+        PendingPoolDebit(service_name=service_name,
+                         pool_key=pool_key,
+                         accelerator=accelerator,
+                         replica_slots=count)
+        for (service_name, accelerator), count in sorted(counts.items()))
+
+
 def unavailable_status_summary(reason: str) -> dict[str, Any]:
     """Return the stable public status shape when the ledger is unavailable."""
     return {

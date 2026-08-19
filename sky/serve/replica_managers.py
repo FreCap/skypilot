@@ -51,6 +51,7 @@ from sky.serve import replica_info as replica_info_lib
 from sky.serve import replica_tls
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker
+from sky.serve import reserved_fill_allocation
 from sky.serve import reserved_fill_planner
 from sky.serve import route_projection
 from sky.serve import serve_state
@@ -6770,7 +6771,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # round can still publish between it and the row persist,
                 # so the authoritative recheck runs atomically WITH the
                 # persist below (persist_fill_replica).
-                if fill_grant_epoch is not None and fill_pool_key is not None:
+                if (zero_cost_actuation_lease is None and
+                        fill_grant_epoch is not None and
+                        fill_pool_key is not None):
                     broker_epoch = reserved_capacity_broker.current_epoch(
                         fill_pool_key)
                     if (broker_epoch is not None and
@@ -8740,6 +8743,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                     controller_authority.controller_incarnation)
                 controller_owner_epoch = (
                     controller_authority.controller_owner_epoch)
+                service_hash = self._service_hash
+                controller_owner = self._controller_owner
+                assert isinstance(service_hash, str) and service_hash
+                assert controller_owner is not None
                 try:
                     maximum = self._reserved_fill_max_capacity_locked()
                 except Exception as error:  # pylint: disable=broad-except
@@ -8755,16 +8762,45 @@ class SkyPilotReplicaManager(ReplicaManager):
                             'the service ceiling could not be established'),
                         authority_current=False)
             try:
-                receipt = self._zero_cost_actuation_repository.grant_plan(
-                    self._service_name,
-                    plan,
-                    max_capacity=maximum,
-                    expected_controller_incarnation=controller_incarnation,
-                    expected_controller_owner_epoch=controller_owner_epoch)
+                # Durable intent insertion is the physical-slot admission
+                # boundary. Serialize it with broker debit scans so a new grant
+                # is either visible to the next round or lands after that round;
+                # it cannot disappear into the scan-to-publish window.
+                broker_lock = locks.get_lock(
+                    serve_constants.RESERVED_FILL_BROKER_LOCK_ID)
+                with broker_lock.acquire(blocking=True):
+                    current_allocation = (
+                        reserved_fill_allocation.
+                        ReservedFillAllocationRepository().read_current(
+                            self._service_name, service_hash, controller_owner))
+                    if (current_allocation is None or
+                            current_allocation.allocation_generation
+                            != plan.allocation_generation or
+                            current_allocation.allocation_input_sha256
+                            != plan.allocation_input_sha256 or
+                            current_allocation.allocation_claim_generation
+                            != plan.allocation_claim_generation):
+                        return self._reserved_fill_commit_result(
+                            plan, [],
+                            self._reserved_fill_deferred_tail(
+                                plan, 0, reserved_fill_planner.
+                                DeferredFillReason.CHANGED_EPOCH,
+                                'the authenticated allocation changed before '
+                                'durable grant admission'),
+                            authority_current=False)
+                    receipt = self._zero_cost_actuation_repository.grant_plan(
+                        self._service_name,
+                        plan,
+                        max_capacity=maximum,
+                        expected_controller_incarnation=(
+                            controller_incarnation),
+                        expected_controller_owner_epoch=controller_owner_epoch)
                 if receipt.accepted:
                     self._zero_cost_actuation_event.set()
                 return receipt
-            except zero_cost_actuation.ZeroCostActuationError as error:
+            except (zero_cost_actuation.ZeroCostActuationError,
+                    reserved_fill_allocation.ReservedFillAllocationError,
+                    ValueError) as error:
                 logger.warning('Durable reserved-fill grant failed closed: %s',
                                common_utils.format_exception(error))
                 return self._reserved_fill_commit_result(

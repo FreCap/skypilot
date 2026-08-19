@@ -51,6 +51,7 @@ import typing
 from typing import Any, TypeGuard
 
 from sky import sky_logging
+from sky.adaptors import common as adaptors_common
 from sky.adaptors import kubernetes
 from sky.serve import constants
 from sky.serve import pool_capacity_observation
@@ -65,6 +66,9 @@ from sky.utils.db import migration_utils
 if typing.TYPE_CHECKING:
     from sky.serve import replica_managers
     from sky.serve import zero_cost_actuation
+else:
+    zero_cost_actuation = adaptors_common.LazyImport(
+        'sky.serve.zero_cost_actuation')
 
 logger = sky_logging.init_logger(__name__)
 
@@ -3125,6 +3129,30 @@ def _occupying_debit(
                             feed_debit_by_accelerator.get(card, 0) + slots)
                 if post_snapshot:
                     entitlement_debit += occupancy.slots
+
+    if has_sequence_boundary:
+        try:
+            pending_debits = zero_cost_actuation.pending_pool_debits(pool_key)
+        except Exception as intent_error:  # pylint: disable=broad-except
+            raise IncompleteReplicaOccupancySnapshotError(
+                'Sequenced reserved-fill intent snapshot is incomplete: '
+                f'{common_utils.format_exception(intent_error)}'
+            ) from intent_error
+        for debit in pending_debits:
+            if (debit.pool_key != pool_key or debit.replica_slots < 1 or
+                    debit.accelerator not in identity.gpu_names):
+                raise IncompleteReplicaOccupancySnapshotError(
+                    'Sequenced reserved-fill intent has inconsistent physical '
+                    'pool attribution.')
+            occupancy = _ReplicaPoolOccupancy(
+                slots=debit.replica_slots,
+                by_accelerator=((debit.accelerator, debit.replica_slots),))
+            debit_occupancy(occupancy)
+            if debit.service_name in claimants:
+                live_fill[debit.service_name] = (
+                    live_fill.get(debit.service_name, 0) + debit.replica_slots)
+            else:
+                unclaimed_fill += debit.replica_slots
     return (feed_debit, entitlement_debit,
             dict(sorted(feed_debit_by_accelerator.items())), live_fill,
             unclaimed_fill)

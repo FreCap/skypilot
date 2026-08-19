@@ -4112,7 +4112,8 @@ class TestFillLaunchPath(unittest.TestCase):
                                return_value='8080'), \
              mock.patch.object(reserved_capacity_broker,
                                'current_epoch',
-                               return_value=3), \
+                               return_value=(3 if actuation_lease is None else
+                                             5)) as current_epoch, \
              mock.patch.object(
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
@@ -4144,6 +4145,10 @@ class TestFillLaunchPath(unittest.TestCase):
                                      actuation_lease=actuation_lease)
 
         self.assertTrue(result)
+        if actuation_lease is None:
+            current_epoch.assert_called_once_with(override[_POOL_KEY])
+        else:
+            current_epoch.assert_not_called()
         persist.assert_called_once()
         worker_ctor.assert_called_once()
         self.assertTrue(worker_ctor.call_args.kwargs['bound_ordinary_launch'])
