@@ -4201,10 +4201,7 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
          mock.patch.object(serve_state,
                            'get_latest_committed_versions', return_value={}), \
          mock.patch.object(serve_state,
-                           'get_service_mode_and_hashes',
-                           return_value={
-                               'svc': (False, 'placeholder-hash')
-                           }), \
+                           'get_service_mode_and_hashes') as identities, \
          mock.patch.object(
              serve_state,
              'mark_unrecoverable_service_for_cleanup',
@@ -4221,6 +4218,7 @@ def test_ha_recovery_retires_placeholder_without_committed_version(tmp_path):
                            'LocalProcessCommandRunner') as runner_cls:
         serve_utils.ha_recovery_for_consolidation_mode(pool=False)
 
+    identities.assert_not_called()
     retire.assert_called_once_with('svc', 'placeholder-hash', False)
     runner_cls.return_value.run.assert_not_called()
 
@@ -4272,7 +4270,7 @@ def test_ha_recovery_batches_placeholder_and_raw_identity_fallback_reads(
 
     committed_versions.assert_called_once_with(
         ['orphan-svc', 'placeholder-svc'])
-    identities.assert_called_once_with(['orphan-svc', 'placeholder-svc'])
+    identities.assert_called_once_with(['orphan-svc'])
     retire.assert_called_once_with('placeholder-svc', 'placeholder-hash', False)
     runner_cls.return_value.run.assert_not_called()
 
@@ -4298,10 +4296,8 @@ def test_ha_recovery_preserves_placeholder_with_committed_version(tmp_path):
              return_value={
                  'svc': 1
              }) as committed_versions, \
-         mock.patch.object(
-             serve_state,
-             'get_service_mode_and_hashes',
-             return_value={}) as identities, \
+         mock.patch.object(serve_state,
+                           'get_service_mode_and_hashes') as identities, \
          mock.patch.object(
              serve_state,
              'mark_unrecoverable_service_for_cleanup') as retire, \
@@ -4322,7 +4318,7 @@ def test_ha_recovery_preserves_placeholder_with_committed_version(tmp_path):
         serve_utils.ha_recovery_for_consolidation_mode(pool=True)
 
     committed_versions.assert_called_once_with(['svc'])
-    identities.assert_called_once_with([])
+    identities.assert_not_called()
     retire.assert_not_called()
     runner_cls.return_value.run.assert_called_once_with('recover',
                                                         require_outputs=True)
