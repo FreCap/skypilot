@@ -5801,6 +5801,31 @@ class SkyServeController:
                 replica_slots=count)
             for (pool_key, accelerator), count in sorted(counts.items()))
 
+    @staticmethod
+    def _coalesce_committed_reserved_fill_debits(
+        *debit_groups: tuple[reserved_fill_planner.CommittedFillDebit, ...],
+    ) -> tuple[reserved_fill_planner.CommittedFillDebit, ...]:
+        """Combine independently durable debits for one exact pool/card."""
+        counts: dict[tuple[int, str, int, str, str], int] = {}
+        for debits in debit_groups:
+            for debit in debits:
+                key = (debit.allocation_generation,
+                       debit.allocation_input_sha256,
+                       debit.allocation_claim_generation, debit.pool_key,
+                       debit.accelerator)
+                counts[key] = counts.get(key, 0) + debit.replica_slots
+        return tuple(
+            reserved_fill_planner.CommittedFillDebit(
+                allocation_generation=allocation_generation,
+                allocation_input_sha256=allocation_input_sha256,
+                allocation_claim_generation=allocation_claim_generation,
+                pool_key=pool_key,
+                accelerator=accelerator,
+                replica_slots=count)
+            for (allocation_generation, allocation_input_sha256,
+                 allocation_claim_generation, pool_key,
+                 accelerator), count in sorted(counts.items()))
+
     def _accept_sequenced_reserved_fill(
         self,
         allocation: reserved_fill_planner.AuthenticatedAllocationMap | None,
@@ -5835,6 +5860,8 @@ class SkyServeController:
                 'Reserved-fill pending-intent accounting failed closed: %s',
                 common_utils.format_exception(error))
             return False
+        all_committed_debits = self._coalesce_committed_reserved_fill_debits(
+            committed_debits, pending_debits)
         plan = reserved_fill_planner.ReservedFillPlanner.plan(
             policy_revision=decision_version,
             reconcile_generation=max(1, reconcile_generation + 1),
@@ -5847,7 +5874,7 @@ class SkyServeController:
                               reserved_fill_planned_capacity(replica_infos)),
             capacity_unit=capacity_unit,
             ordinary_demand_debits=ordinary_debits,
-            committed_fill_debits=(*committed_debits, *pending_debits),
+            committed_fill_debits=all_committed_debits,
             rotation_anchor=(
                 decision_autoscaler.reserved_fill_rotation_anchor()))
         if not plan.intents:
