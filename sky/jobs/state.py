@@ -1295,6 +1295,42 @@ def _merge_latest_task_status(info: dict[str, Any], task_id: int,
     info['_latest_task_has_nonterminal'] = True
 
 
+def _get_latest_task_status_from_status_check_info(
+        info: dict[str, Any]) -> ManagedJobStatus | None:
+    """Return the cancellation-driving status from one shared snapshot.
+
+    ``get_jobs_status_check_info()`` populates a cached latest-task status
+    during decode. Keep using that O(1) fast path in production. When callers
+    provide only the historical public ``tasks`` shape, derive the same status
+    from the already-fetched task rows instead of treating the job as missing.
+    """
+    cached_status = info.get('_latest_task_status')
+    if cached_status is not None:
+        return cast(ManagedJobStatus, cached_status)
+
+    tasks = cast(list[dict[str, Any]] | None, info.get('tasks'))
+    if not tasks:
+        return None
+
+    latest_task_info = {
+        '_latest_task_id': None,
+        '_latest_task_status': None,
+        '_latest_task_has_nonterminal': False,
+    }
+    for task in tasks:
+        status = cast(ManagedJobStatus, task['status'])
+        _merge_latest_task_status(latest_task_info, task['task_id'], status)
+
+    latest_status = cast(ManagedJobStatus | None,
+                         latest_task_info['_latest_task_status'])
+    if latest_status is not None:
+        info['_latest_task_id'] = latest_task_info['_latest_task_id']
+        info['_latest_task_status'] = latest_status
+        info['_latest_task_has_nonterminal'] = latest_task_info[
+            '_latest_task_has_nonterminal']
+    return latest_status
+
+
 def get_job_cancellation_states_from_status_check_info(
         jobs_info: dict[int, dict[str,
                                   Any]]) -> dict[int, JobCancellationState]:
@@ -1310,7 +1346,7 @@ def get_job_cancellation_states_from_status_check_info(
         schedule_state = info.get('schedule_state')
         if workspace is None or schedule_state is None:
             continue
-        status = info.get('_latest_task_status')
+        status = _get_latest_task_status_from_status_check_info(info)
         if status is None:
             continue
         snapshots[job_id] = JobCancellationState(status=status,

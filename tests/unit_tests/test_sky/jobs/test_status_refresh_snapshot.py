@@ -211,6 +211,32 @@ class TestGetJobsToCheckStatusInfo:
         assert derived == state.get_job_cancellation_states(
             list(_seed_test_jobs.values()))
 
+    def test_cancellation_snapshot_falls_back_to_public_task_rows(self):
+        info = {
+            7: {
+                'workspace': 'default',
+                'schedule_state': state.ManagedJobScheduleState.ALIVE,
+                'tasks': [{
+                    'task_id': 0,
+                    'status': state.ManagedJobStatus.SUCCEEDED,
+                }, {
+                    'task_id': 0,
+                    'status': state.ManagedJobStatus.FAILED,
+                }, {
+                    'task_id': 1,
+                    'status': state.ManagedJobStatus.RUNNING,
+                }],
+            }
+        }
+
+        derived = state.get_job_cancellation_states_from_status_check_info(info)
+
+        assert derived == {
+            7: state.JobCancellationState(status=state.ManagedJobStatus.RUNNING,
+                                          workspace='default')
+        }
+        assert info[7]['_latest_task_status'] == state.ManagedJobStatus.RUNNING
+
     def test_get_num_tasks_uses_one_count_select(self,
                                                  _mock_managed_jobs_db_conn,
                                                  _seed_multi_task_job,
