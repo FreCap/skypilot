@@ -51,6 +51,7 @@ from sky.serve import system_recovery_route_lease
 from sky.serve import system_recovery_state
 from sky.serve import system_recovery_state as recovery_state
 from sky.server.requests import postgres as request_postgres
+from sky.server.requests import requests as api_requests
 from sky.skylet import job_lib
 from sky.utils import common_utils
 from sky.utils import config_utils
@@ -15922,100 +15923,91 @@ class TestRecoveryRetryAndIsolation:
                 'svc', 1, 'incarnation-a'))
         _stamp_protocol_v2_fill(fill_row, generation=7)
         request_terminal = False
+        request_quiesced = False
         quiescence_polls = 0
         events = []
 
-        def _status(**kwargs):
-            nonlocal quiescence_polls
-            if 'request_ids' not in kwargs:
-                assert kwargs == {
-                    'all_status': True,
-                    'cluster_names': [fill_row.cluster_name],
-                    '_include_request_names': ['sky.launch'],
-                    '_execution_quiescence_candidates_only': True,
-                    'fields': [
+        def _request(status, *, quiesced_generation=None, quiesced_at=None):
+            return types.SimpleNamespace(
+                request_id='launch-request',
+                name='sky.launch',
+                cluster_name=fill_row.cluster_name,
+                execution_generation=7,
+                status=status,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=quiesced_generation,
+                execution_quiesced_at=quiesced_at)
+
+        def _query(req_filter):
+            nonlocal quiescence_polls, request_quiesced
+            if req_filter.request_ids is None:
+                assert req_filter == api_requests.RequestTaskFilter(
+                    cluster_names=[fill_row.cluster_name],
+                    include_request_names=['sky.launch'],
+                    execution_quiescence_candidates_only=True,
+                    fields=[
                         'request_id', 'name', 'cluster_name',
                         'execution_generation', 'status',
                         'execution_quiescence_required',
                         'execution_quiesced_generation', 'execution_quiesced_at'
                     ],
-                }
+                    sort=True)
                 events.append('discovery-status')
-                return [
-                    types.SimpleNamespace(
-                        request_id='launch-request',
-                        name='sky.launch',
-                        cluster_name=fill_row.cluster_name,
-                        execution_generation=7,
-                        status=('CANCELLED' if request_terminal else 'RUNNING'),
-                        execution_quiescence_required=True,
-                        execution_quiesced_generation=(7 if request_terminal
-                                                       else None),
-                        execution_quiesced_at=(1.0
-                                               if request_terminal else None),
-                    )
-                ]
-            assert kwargs == {
-                'request_ids': ['launch-request'],
-                'fields': [
+                if request_quiesced:
+                    return []
+                if request_terminal:
+                    return [_request(api_requests.RequestStatus.CANCELLED)]
+                return [_request(api_requests.RequestStatus.RUNNING)]
+            assert req_filter == api_requests.RequestTaskFilter(
+                request_ids=['launch-request'],
+                fields=[
                     'request_id', 'name', 'cluster_name', 'status',
                     'execution_generation', 'execution_quiescence_required',
                     'execution_quiesced_generation', 'execution_quiesced_at'
                 ],
-                '_exact_request_ids': True,
-                '_use_body': True,
-            }
+                sort=True)
             events.append('quiescence-status')
             quiescence_polls += 1
+            if quiescence_polls == 1:
+                return [_request(api_requests.RequestStatus.CANCELLED)]
+            request_quiesced = True
             return [
-                types.SimpleNamespace(
-                    request_id='launch-request',
-                    name='sky.launch',
-                    cluster_name=fill_row.cluster_name,
-                    status='CANCELLED',
-                    execution_generation=7,
-                    execution_quiescence_required=True,
-                    execution_quiesced_generation=(None if quiescence_polls == 1
-                                                   else 7),
-                    execution_quiesced_at=(None
-                                           if quiescence_polls == 1 else 1.0),
-                )
+                _request(api_requests.RequestStatus.CANCELLED,
+                         quiesced_generation=7,
+                         quiesced_at=1.0)
             ]
 
-        def _cancel(request_ids, *, all_users, silent):
-            assert request_ids == ['launch-request']
-            assert all_users and silent
-            events.append('cancel')
-            return 'cancel-request'
-
-        def _await(request_id):
+        def _cancel(request_ids, *, user_id):
             nonlocal request_terminal
-            assert request_id == 'cancel-request'
-            events.append('await')
+            assert request_ids == ['launch-request']
+            assert user_id is None
+            events.append('cancel')
             request_terminal = True
+            return request_ids
 
         def _terminate(*_args, **_kwargs):
-            assert request_terminal
+            assert request_quiesced
             events.append('terminate')
 
         with mock.patch.object(
                 replica_managers.serve_state,
                 'get_replica_infos',
                 return_value=[fill_row]), \
+             mock.patch.object(api_requests,
+                               'get_request_tasks',
+                               side_effect=_query), \
+             mock.patch.object(api_requests,
+                               'kill_requests_exact',
+                               side_effect=_cancel), \
+             mock.patch.object(
+                 request_postgres,
+                 'require_builtin_execution_quiescence_backends'), \
              mock.patch.object(replica_managers.serve_utils.sdk,
                                'api_status',
-                               side_effect=_status), \
+                               side_effect=AssertionError), \
              mock.patch.object(replica_managers.serve_utils.sdk,
                                'api_cancel',
-                               side_effect=_cancel), \
-             mock.patch.object(replica_managers.serve_utils.sdk,
-                               'stream_and_get',
-                               side_effect=_await), \
-             mock.patch.object(
-                 replica_managers.serve_utils.versions,
-                 'get_remote_api_version',
-                 return_value=replica_managers.serve_utils.server_constants.
-                 MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION), \
+                               side_effect=AssertionError), \
              mock.patch.object(
                  replica_managers.serve_utils,
                  '_LAUNCH_QUIESCE_POLL_SECONDS', 0), \
@@ -16028,7 +16020,7 @@ class TestRecoveryRetryAndIsolation:
             mgr._recover_replica_operations()
 
         assert events == [
-            'discovery-status', 'cancel', 'await', 'quiescence-status',
+            'discovery-status', 'cancel', 'quiescence-status',
             'quiescence-status', 'discovery-status', 'terminate'
         ]
 

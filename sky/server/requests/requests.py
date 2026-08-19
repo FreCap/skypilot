@@ -1472,7 +1472,7 @@ def kill_cluster_requests(cluster_name: str, exclude_request_name: str):
             cluster_names=[cluster_name],
             fields=['request_id']))
     ]
-    _kill_requests(request_ids)
+    kill_requests_exact(request_ids)
 
 
 def kill_requests(request_ids: list[str] | None = None,
@@ -1510,14 +1510,20 @@ def _should_kill_request(request_id: str,
     return True
 
 
+def kill_requests_exact(request_ids: list[str],
+                        user_id: str | None = None) -> list[str]:
+    """Kill exact SkyPilot API request IDs through the registered backend.
+
+    Unlike ``kill_requests``, request IDs are not interpreted as prefixes.
+    The registered backend handles local process killing and, for
+    multi-replica backends, durable cross-replica cancellation.
+    """
+    return _kill_requests(request_ids=request_ids, user_id=user_id)
+
+
 def _kill_requests(request_ids: list[str] | None = None,
                    user_id: str | None = None) -> list[str]:
-    """Kill SkyPilot API requests and set their status to cancelled.
-
-    Delegates to the registered request backend, which handles local
-    process killing and (for multi-replica backends) cross-replica
-    cancellation.
-    """
+    """Kill SkyPilot API requests through the registered backend."""
     return request_storage.get_request_backend().kill_requests(
         request_ids=request_ids, user_id=user_id)
 
