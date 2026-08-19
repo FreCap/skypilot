@@ -2,7 +2,8 @@
 
 Status: PostgreSQL request authority and the 2/2/2 API/executor/controller
 split are live in production and were revalidated after the 2026-08-19 direct
-Helm rollout. The private durable HA-observer canary and M5 compatibility
+Helm rollout at revision 436 / release 1.1.1349. Release 1.1.1350 is published
+but not deployed. The private durable HA-observer canary and M5 compatibility
 cleanup remain gated. The former executable RWX/EFS migration plan has been
 removed and is available only in Git history.
 

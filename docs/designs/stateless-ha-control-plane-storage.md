@@ -2,10 +2,12 @@
 
 Status: Proposed canonical design. Review 7 returned NO-GO on unsafe historical
 negative proof and incomplete restore mutation coverage. Review 8 incorporates
-the conservative corrections and awaits independent re-review plus Gate 1 owner
-approval. The production inventory is verified, but no application code,
-infrastructure, migration, or deployment has been performed from this design.
-Implementation starts only after Gate 1.
+the conservative corrections, and independent Review 9 returned GO on that
+exact correction diff. The production inventory is verified, but no application
+code, infrastructure, migration, or deployment has been performed from this
+design. This proposed design may be merged as the checked-in source of truth;
+Gate 1 owner approval authorizes implementation and destructive decommission,
+not recording the proposed design. Implementation starts only after Gate 1.
 
 Last updated: 2026-08-19
 
@@ -128,11 +130,13 @@ without a Terraform/Terragrunt or platform-pin change.
 ## Production baseline and gap
 
 Read-only evidence captured on 2026-08-18 and revalidated after the 2026-08-19
-direct Helm rollout shows:
+direct Helm rollouts shows:
 
-- Helm revision 434 runs SkyPilot 1.1.1343 from commit
-  `43124ca7645277493e7b27429301f4d121ff6985`, image digest
-  `sha256:4130adcdefccbb0c10e3fe1b2750d85b5fe24b1db8a52d2f5cad81eb5fead4ee`.
+- Helm revision 436 runs SkyPilot 1.1.1349 from commit
+  `b34661c43015c05d5bb2a6358b1d9335fbd465f1`, image digest
+  `sha256:07579af96b42de183b404d8cb23a6452598e59f22c7a9f29810694fbe2bf08d3`.
+  Release 1.1.1350 is published but not deployed and is not part of this live
+  baseline.
 - API, executor, and controller Deployments each have two Ready pods.
 - All six pods mount one claim, `skypilot-state-rwx`, at `/root/.sky`,
   `/root/.ssh`, and `/root/sky_logs`.
@@ -144,6 +148,12 @@ direct Helm rollout shows:
   23.82 GB). There is no second authority root.
 - PostgreSQL already owns requests, queue state, leases, controller ownership,
   and the operational cluster, Job, and Serve records.
+- At this snapshot, `boltz-l4-fleet` uses ordinary launch binding `BOUND` at
+  epoch 1 and route authority `DURABLE_PROJECTED` at epoch 1. The global
+  reconciliation gate remains `LEGACY_ACTIVE` at generation 0, demand remains
+  `LEGACY_CONTROLLER` at epoch 0, and zero-cost actuation remains
+  `DIRECT_REPLICA` at epoch 0. This storage design does not change or activate
+  any of those Serve authority modes.
 - `BlobStorage` exists, API 41+ already uses content-addressed `blob_id`, and
   active request and managed-Job rows already retain `file_mounts_blob_id`.
 - `LogProvider` abstracts request-log reads, but request, managed-Job, Serve,
@@ -1722,7 +1732,7 @@ Automated tests must cover:
   provision-log migration, UTF-8/partial lines, data payloads that imitate every
   display/frame marker, typed-frame corruption, legacy-raw incompleteness, and
   proof that provider actions are neither blocked nor replayed;
-- exact captured production stored values (revision 434 at this baseline,
+- exact captured production stored values (revision 436 at this baseline,
   refreshed immediately before implementation) through successive Helm
   `--reuse-values` renders, 2/2/2 RollingUpdate behavior, bounded ephemeral
   storage, and a final manifest with no PVC or EFS mount, plus server-side
@@ -1761,8 +1771,12 @@ object keys, paths, credentials, lease tokens, promotion IDs, or signed URLs.
 
 Open gates are:
 
-1. Storage, database, Serve/Jobs, and platform owners approve this exact
-   design and its review/cleanup boundaries.
+1. Before any implementation PR merges or any application, infrastructure,
+   migration, or decommission mutation runs, storage, database, Serve/Jobs, and
+   platform owners approve this exact design and its review/cleanup boundaries.
+   This approval is implementation and destructive-decommission authorization;
+   it is not a prerequisite for merging this proposed design as the canonical
+   checked-in record.
 2. A fresh audit reconfirms the single source handle, byte/file/inode
    inventory, exact infrastructure addresses and ownership, existing
    ServiceAccounts/IAM, maximum archive/member/expansion/materialization
@@ -1926,8 +1940,26 @@ The persisted deletion-origin enum remains exactly `DELETE_ELIGIBLE` or
 `ABANDONED_PREPARED`; immutable quarantine provenance supplies the narrow
 EFS-mode liveness rule without a third origin. This remains a PostgreSQL+S3
 design with no DynamoDB, EFS steady state, new service, Terraform expansion, or
-external commit oracle. Local exact-diff checks and an independent re-review
-are still required; no implementation or deployment is implied.
+external commit oracle. No implementation or deployment is implied.
+
+### Review 9: GO FOR CANONICAL DESIGN MERGE
+
+An independent adversarial re-review returned GO on the exact Review 8
+correction diff from `81463b717c4a0744eded4d92d0dc7c3074d604d6` to
+`058fc840a2280554c04703f56c2e4460d0daea25`, whose SHA-256 is
+`7d0f5d8df6ff853d57f48ad795ab302b50840a17b5da2a788d23a3ef7d68d123`.
+It found no blocking correctness issue in the corrected historical-negative-
+proof, complete restore-mutation coverage, exact-version quarantine/deletion,
+quota, or cutover-fencing contracts. That hash is deliberately the reviewed
+correction diff, not the whole pull-request diff. The later truth refresh
+updates only review status and the read-only production baseline; it does not
+change the reviewed storage behavior contract.
+
+Review 9 permits this proposed design to become the checked-in canonical
+record. It authorizes no application code, chart, infrastructure, migration,
+storage cutover, or EFS deletion. Gate 1 remains the independent owner
+authorization for implementation and every later destructive action remains
+blocked on its exact numbered gate.
 
 Completion means production runs 2/2/2 with PostgreSQL structured authority,
 exact-version SSE-KMS S3 blobs/logs, bounded `emptyDir`, a healthy restore-safe
