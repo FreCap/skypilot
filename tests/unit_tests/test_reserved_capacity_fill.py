@@ -15,6 +15,7 @@ import time
 import types
 import unittest
 from unittest import mock
+import uuid
 
 from spot_placer_test_utils import make_location
 from spot_placer_test_utils import make_placer as _make_placer
@@ -25,6 +26,7 @@ from sky import exceptions
 from sky.adaptors import kubernetes as kubernetes_adaptor
 from sky.serve import autoscalers
 from sky.serve import constants
+from sky.serve import ordinary_launch_binding
 from sky.serve import placement_policy
 from sky.serve import provider_phase
 from sky.serve import replica_managers
@@ -34,6 +36,7 @@ from sky.serve import serve_state
 from sky.serve import serve_utils
 from sky.serve import service_spec
 from sky.serve import spot_placer
+from sky.serve import zero_cost_actuation
 from sky.utils import locks
 
 _SCALE_UP = autoscalers.AutoscalerDecisionOperator.SCALE_UP
@@ -3472,6 +3475,34 @@ def _make_manager(placer):
     return manager
 
 
+def _promote_generic_binding(manager):
+    manager._ordinary_launch_binding_authority = (
+        ordinary_launch_binding.ControllerBindingAuthority(
+            service_name='svc',
+            service_hash='service-hash',
+            service_workspace='default',
+            service_lifecycle_epoch=1,
+            controller_pid=123,
+            controller_ip='10.0.0.1',
+            controller_incarnation=uuid.UUID(
+                '00000000-0000-4000-8000-000000000123'),
+            controller_owner_epoch=1,
+            capable=True,
+            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=2,
+            non_pool_capable=True,
+            non_pool_binding_protocol_version=(
+                ordinary_launch_binding.NON_POOL_BINDING_PROTOCOL_VERSION),
+            non_pool_profile_set_digest=(
+                ordinary_launch_binding.supported_non_pool_profile_set_digest()
+            ),
+            non_pool_capability_cohort_epoch=(
+                ordinary_launch_binding.NON_POOL_CAPABILITY_COHORT_EPOCH),
+            non_pool_receipt_protocol_version=(
+                ordinary_launch_binding.NON_POOL_RECEIPT_PROTOCOL_VERSION)))
+    assert manager._ordinary_launch_binding_authority.generic_launches_required
+
+
 class TestZeroCostSelection(unittest.TestCase):
     """select_next_zero_cost_location: zero-cost ACTIVE or nothing."""
 
@@ -3633,12 +3664,14 @@ class TestFillLaunchPath(unittest.TestCase):
         return override
 
     @staticmethod
-    def _launch_v2(manager, override):
+    def _launch_v2(manager, override, *, actuation_lease=None):
         with provider_phase.provider_phase(
                 provider_phase.ProviderPhaseMode.V2_FENCED) as admission:
-            return manager._launch_replica(7,
-                                           override,
-                                           provider_phase_admission=admission)
+            return manager._launch_replica(
+                7,
+                override,
+                provider_phase_admission=admission,
+                zero_cost_actuation_lease=(actuation_lease))
 
     def test_v2_batch_requires_typed_plan_before_lock_or_provider(self):
         manager = _make_manager(None)
@@ -4008,11 +4041,17 @@ class TestFillLaunchPath(unittest.TestCase):
                  kubernetes_adaptor,
                  'physical_cluster_uid_fence',
                  return_value=contextlib.nullcontext()), \
+             mock.patch.object(
+                 ordinary_launch_binding,
+                 'classify_uncommitted_protocol_v2_reserved_fill_profile',
+                 wraps=(ordinary_launch_binding.
+                        classify_uncommitted_protocol_v2_reserved_fill_profile)) as classify, \
              mock.patch.object(reserved_capacity_broker,
                                'persist_fill_replica',
                                return_value=True) as persist:
             self.assertTrue(self._launch_v2(manager, override))
         info = persist.call_args.args[2]
+        classify.assert_called_once_with(info, protocol_version=2)
         self.assertEqual(info.reserved_fill_pool_key, override[_POOL_KEY])
         self.assertEqual(info.reserved_fill_service_generation, 7)
         self.assertEqual(info.reserved_fill_physical_cluster_uid,
@@ -4039,6 +4078,86 @@ class TestFillLaunchPath(unittest.TestCase):
         self.assertEqual(
             persist.call_args.
             kwargs['expected_ordinary_zero_cost_admission_sequence'], 17)
+
+    def test_v2_durable_intent_freezes_promoted_profile_before_persist(self):
+        location = make_location('phx-context',
+                                 accelerators={'H200': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        placer = mock.Mock()
+        placer.active_locations.return_value = [location]
+        placer.select_next_zero_cost_location.return_value = location
+        manager = _make_manager(placer)
+        _promote_generic_binding(manager)
+        manager._reserved_fill_actuation_mode = (
+            zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+        override = self._v2_override(location,
+                                     exact_shape={'H200': 1},
+                                     attributed=True)
+        worker = mock.sentinel.launch_worker
+
+        def _persist(_service_name, _replica_id, info, **_kwargs):
+            self.assertIsNone(info.zero_cost_admission_sequence)
+            info.zero_cost_admission_sequence = 1
+            return True
+
+        bound_task = types.SimpleNamespace(
+            resources=[types.SimpleNamespace(cloud=clouds.Kubernetes())])
+        callbacks = (mock.Mock(), mock.Mock(), mock.Mock())
+        with mock.patch.object(replica_managers,
+                               '_should_use_spot',
+                               return_value=False), \
+             mock.patch.object(replica_managers,
+                               '_get_resources_ports',
+                               return_value='8080'), \
+             mock.patch.object(reserved_capacity_broker,
+                               'current_epoch',
+                               return_value=3), \
+             mock.patch.object(
+                 kubernetes_adaptor,
+                 'physical_cluster_uid_fence',
+                 return_value=contextlib.nullcontext()), \
+             mock.patch.object(replica_managers,
+                               '_build_replica_launch_task',
+                               return_value=bound_task), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_fence_context',
+                               return_value={'bound': True}), \
+             mock.patch.object(manager,
+                               '_bound_ordinary_launch_callbacks',
+                               return_value=callbacks), \
+             mock.patch.object(
+                 replica_managers.request_postgres,
+                 'stable_bound_ordinary_launch_submission_id',
+                 return_value=uuid.UUID(
+                     '00000000-0000-4000-8000-000000000456')), \
+             mock.patch.object(replica_managers,
+                               '_ReplicaLaunchThread',
+                               return_value=worker) as worker_ctor, \
+             mock.patch.object(reserved_capacity_broker,
+                               'persist_fill_replica',
+                               side_effect=_persist) as persist, \
+             mock.patch.object(replica_managers.paid_capacity,
+                               'build_launch_budget') as paid_budget:
+            result = self._launch_v2(manager,
+                                     override,
+                                     actuation_lease=mock.sentinel.intent_lease)
+
+        self.assertTrue(result)
+        persist.assert_called_once()
+        worker_ctor.assert_called_once()
+        self.assertTrue(worker_ctor.call_args.kwargs['bound_ordinary_launch'])
+        self.assertEqual(
+            worker_ctor.call_args.kwargs['kwargs']
+            ['non_pool_launch_profile_kind'], ordinary_launch_binding.
+            NonPoolLaunchProfileKind.RESERVED_FILL.value)
+        self.assertIs(manager._launch_thread_pool[7], worker)
+        info = persist.call_args.args[2]
+        self.assertEqual(
+            ordinary_launch_binding.classify_non_pool_launch_profile(info),
+            ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+        self.assertIsNone(info.zero_cost_materialization_sequence)
+        paid_budget.assert_not_called()
 
     def test_v2_partial_typed_attribution_fails_before_persistence(self):
         location = make_location('phx-context',

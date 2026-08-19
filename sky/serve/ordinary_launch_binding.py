@@ -1866,9 +1866,12 @@ _RESERVED_FILL_PROFILE_FIELDS = (
 )
 
 
-def classify_non_pool_launch_profile(
-        info: Any) -> NonPoolLaunchProfileKind | None:
-    """Classify a retained replica without granting launch authority.
+def _classify_non_pool_launch_profile(
+    info: Any,
+    *,
+    allow_uncommitted_reserved_fill: bool,
+) -> NonPoolLaunchProfileKind | None:
+    """Classify a replica or one exact pre-admission reserved-fill draft.
 
     Classification is intentionally strict. Missing, partial, contradictory,
     or malformed state returns ``None`` and cannot enter the generic binding.
@@ -1926,10 +1929,15 @@ def classify_non_pool_launch_profile(
            for value in zero_cost_sequences) and not is_zero_cost:
         return None
     if reserved_fill:
+        committed_sequence = (type(info.zero_cost_admission_sequence) is int and
+                              info.zero_cost_admission_sequence >= 1)
+        uncommitted_sequence = bool(
+            allow_uncommitted_reserved_fill and
+            info.zero_cost_admission_sequence is None and
+            info.zero_cost_materialization_sequence is None)
         if (not is_zero_cost or
                 any(value is None for value in reserved_values) or
-                type(info.zero_cost_admission_sequence) is not int or
-                info.zero_cost_admission_sequence < 1):
+                not (committed_sequence or uncommitted_sequence)):
             return None
         return NonPoolLaunchProfileKind.RESERVED_FILL
     if unknown_replacement:
@@ -1947,6 +1955,35 @@ def classify_non_pool_launch_profile(
     if replica_has_narrow_ordinary_profile(info):
         return NonPoolLaunchProfileKind.ORDINARY_PAID
     return None
+
+
+def classify_non_pool_launch_profile(
+        info: Any) -> NonPoolLaunchProfileKind | None:
+    """Classify only a fully persisted non-pool replica profile."""
+    return _classify_non_pool_launch_profile(
+        info, allow_uncommitted_reserved_fill=False)
+
+
+def classify_uncommitted_protocol_v2_reserved_fill_profile(
+        info: Any, *, protocol_version: int) -> NonPoolLaunchProfileKind | None:
+    """Classify only a typed v2 fill before its admission transaction.
+
+    Protocol-v2 fill deliberately freezes its launch thread before atomically
+    persisting the replica.  The transaction is the sole owner of the first
+    zero-cost admission sequence, so that one field must still be null while
+    the thread is constructed.  This classifier accepts only that transient
+    v2 shape; every durable reader continues to use the strict classifier.
+    """
+    if type(protocol_version) is not int or protocol_version != 2:
+        return None
+    kind = _classify_non_pool_launch_profile(
+        info, allow_uncommitted_reserved_fill=True)
+    if kind is not NonPoolLaunchProfileKind.RESERVED_FILL:
+        return None
+    if (info.zero_cost_admission_sequence is not None or
+            info.zero_cost_materialization_sequence is not None):
+        return None
+    return kind
 
 
 def _locked_replica_info(replica: Mapping[str, Any]) -> Any:

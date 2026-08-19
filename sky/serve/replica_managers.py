@@ -7228,6 +7228,16 @@ class SkyPilotReplicaManager(ReplicaManager):
             generic_profile_kind = (
                 None if self._is_pool else
                 ordinary_launch_binding.classify_non_pool_launch_profile(info))
+            if generic_profile_kind is None and protocol_v2_fill:
+                # A typed protocol-v2 fill owns every field except the
+                # global zero-cost admission sequence.  PostgreSQL allocates
+                # that sequence in persist_fill_replica() with the row.  The
+                # side-effect-free worker is frozen first and registered only
+                # after that transaction publishes the sequence back to info.
+                generic_profile_kind = (
+                    ordinary_launch_binding.
+                    classify_uncommitted_protocol_v2_reserved_fill_profile(
+                        info, protocol_version=fill_protocol_version))
             generic_launches_required = bool(
                 authority is not None and authority.generic_launches_required)
             if generic_launches_required and generic_profile_kind is None:

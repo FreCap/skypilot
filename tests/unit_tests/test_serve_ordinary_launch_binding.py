@@ -309,6 +309,24 @@ def test_classify_all_non_pool_launch_profiles() -> None:
     assert binding.classify_non_pool_launch_profile(reserved) == (
         binding.NonPoolLaunchProfileKind.RESERVED_FILL)
 
+    # A protocol-v2 fill freezes its launch thread before the PostgreSQL
+    # admission transaction assigns the first zero-cost sequence.  Only the
+    # launch-path classifier may recognize that exact transient shape.
+    reserved.zero_cost_admission_sequence = None
+    assert binding.classify_non_pool_launch_profile(reserved) is None
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved,
+        protocol_version=2) == (binding.NonPoolLaunchProfileKind.RESERVED_FILL)
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved, protocol_version=1) is None
+    reserved.zero_cost_materialization_sequence = 1
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved, protocol_version=2) is None
+    reserved.zero_cost_materialization_sequence = None
+    reserved.reserved_fill_worker_projection_sha256 = None
+    assert binding.classify_uncommitted_protocol_v2_reserved_fill_profile(
+        reserved, protocol_version=2) is None
+
     replacement = _profile_info()
     replacement.unknown_capacity_replacement = True
     assert binding.classify_non_pool_launch_profile(replacement) == (
