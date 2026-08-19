@@ -1,26 +1,36 @@
 # Multi-pool SkyServe reserved-capacity fill
 
+Last updated: 2026-08-19
+
 Status: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
 #1547, #1548, #1549, #1552, #1553, and #1555. Production Helm revision 436 /
-release `1.1.1349` runs the exact 2 API / 2 controller / 2 executor split-role
-cohort on RWX storage. Production committed and elected clean successor version
-63 on 2026-08-19, and the live controller has applied its configuration at
-lifecycle epoch 82. Exact database readback proves its three non-null worker
+release `1.1.1359` runs the exact 2 API / 2 controller / 2 executor split-role
+cohort on RWX storage. Production committed clean successor version 63 on
+2026-08-19, then platform PR #8652 committed version 64 with the same
+three worker projections and `utilization_gate: false`. Exact database readback
+proves its three non-null worker
 projections include a PHX H200 projection that uses
 `default-scheduler`, `be`/`be-ls`, priority -1000/`Never`,
 `skypilot-pool-sa`, and no Pod Identity role; both east projections retain
 `gpu-binpack-scheduler`. Version 63 has `min_replicas: 0`, a zero fill floor,
-`utilization_gate: true`, and the known-good `v3.682.2-boltz-2` image. It
+`utilization_gate: true`, and the known-good `v3.682.2-boltz-2` image. Version
+64 changes only that gate. It
 supersedes version 62, which proved the projection shape but remains ineligible
 because it pins the rejected `v5.44.1-boltz-2` image. At the 2026-08-19
-inspection PHX published 96 fresh free H200 GPUs but the service grant was
-exactly zero solely because version 63's gate bounded fill by zero current
-demand. Version 58 remains the only active version and the reconciliation gate
-remains `LEGACY_ACTIVE`; no cleanup or final service activation is approved
-yet. The clean demand-gated activation successor is complete. After
+inspection compatible pools published free A100, A100-80GB, and H200 GPUs but
+version 64 has not yet admitted them. The reconciliation gate is
+`SEQUENCED_ACTIVE` generation 1, authorized to the unchanged policy contract
+introduced in release `1.1.1358`; the release `1.1.1359` overlay incorrectly
+derived policy authority from its unrelated artifact version. That prevented
+the broker from refreshing version 63's claim to current version 64, while the
+canonical activation command correctly rejected the stale claim. The clean
+fix is to keep artifact versioning independent from the explicit policy
+contract revision, deploy the complete writer cohort, let the unchanged
+authorized policy refresh the current claim, and invoke the same generation-
+fenced activation command to bind the successor writer receipt. After
 durable intent activation, production intentionally changes only that clean
 successor's `utilization_gate` to `false`: the service backfills every fresh,
 authenticated, policy-compatible reclaimable zero-cost GPU granted to it even
@@ -1194,7 +1204,11 @@ same `activate` authorization command, and atomically replaces the receipt in
 a successor generation. The transaction clears every authenticated allocation
 map. Already durable rows remain conservative occupancy, while queued requests
 carrying the old generation fail the terminal provider fence. This is the one
-canonical fix-forward path.
+canonical fix-forward path. An unchanged policy contract retains its explicit
+policy revision across ordinary SkyPilot overlay releases, so its claim
+heartbeat can first bind a concurrently committed current service version.
+The activation still rotates and attests the complete writer cohort; no writer
+receipt is inferred from the policy revision.
 
 `reclaim_provider_inventory_sha256` fingerprints the immutable allowed fleet
 and enforcement inventory owned by the bundle. It must not hash live Pods, the
@@ -1670,8 +1684,12 @@ Boltz implements this interface in the separate
 entry-point-free. The Boltz overlay builds and installs the generic wheel and
 the deployment-policy wheel independently, then verifies that the combined
 image exposes exactly one `skypilot.reserved_fill_reclaim_policy` entry point.
-The overlay release version stamps the policy revision; any policy-code change
-therefore rotates durable policy identity even if the fleet JSON is unchanged.
+The overlay release stamps only the policy distribution's artifact version.
+The package owns an explicit, independently reviewed policy-contract revision,
+which advances only when executable authorization or enforcement semantics
+change. Ordinary SkyPilot changes therefore do not manufacture a new reclaim
+authority. Any policy-code change must advance that revision; fleet and
+provider-contract changes already rotate their domain-separated digests.
 
 The package embeds one strict JSON fleet bundle. Unknown or duplicate keys are
 rejected. Its normalized semantic sections are hashed independently with

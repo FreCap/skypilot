@@ -9,7 +9,7 @@ import json
 import re
 from typing import Any, Final
 
-from boltz_reserved_fill_reclaim_policy import __version__
+from boltz_reserved_fill_reclaim_policy import POLICY_REVISION
 
 _BUNDLE_RESOURCE: Final = 'fleet_bundle.json'
 _MAX_BUNDLE_BYTES: Final = 1024 * 1024
@@ -653,7 +653,7 @@ class FleetBundle:
 
     @property
     def policy_revision(self) -> str:
-        return f'boltz-reserved-fill-reclaim-policy/{__version__}'
+        return f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}'
 
     @property
     def contexts(self) -> tuple[str, ...]:

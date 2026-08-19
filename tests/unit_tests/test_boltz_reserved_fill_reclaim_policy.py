@@ -25,6 +25,7 @@ from boltz_reserved_fill_reclaim_policy import bundle as bundle_lib
 from boltz_reserved_fill_reclaim_policy import (  # noqa: E402
     kubernetes_attestation)
 from boltz_reserved_fill_reclaim_policy import policy as policy_lib
+from boltz_reserved_fill_reclaim_policy import POLICY_REVISION  # noqa: E402
 from boltz_reserved_fill_reclaim_policy import preflight  # noqa: E402
 
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
@@ -97,6 +98,9 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     assert phx['accelerators']['h200']['product_label_values'] == [
         'NVIDIA-H200'
     ]
+    assert bundle.policy_revision == (
+        f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
+    assert POLICY_REVISION == '1.1.1358'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
@@ -443,6 +447,39 @@ def test_two_arbitrary_services_share_one_canonical_claim_path(monkeypatch):
             deadline_monotonic=time.monotonic() + 5)
         assert authorization.scope == scope
         assert authorization.identity == identity
+
+
+def test_unchanged_policy_authorizes_current_service_version_refresh(
+        monkeypatch):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    monkeypatch.setattr(policy, '_attest_contexts', _fake_attest(policy))
+    monkeypatch.setattr(policy, '_emit_proof', mock.Mock())
+    context = policy._bundle.fleet_context('phx_research_cluster_eks')
+    identity = policy.policy_identity()
+    assert identity.policy_revision == (
+        'boltz-reserved-fill-reclaim-policy/1.1.1358')
+
+    authorizations = []
+    for service_version in (63, 64):
+        scope = reclaim.ReclaimClaimSetScope(
+            service_name='boltz-l4-fleet',
+            service_incarnation='current-incarnation',
+            service_version=service_version,
+            semantic_hash=f'semantic-v{service_version}',
+            edges=(_edge(context),))
+        authorizations.append(
+            policy.authorize_claim_set(scope,
+                                       expected_identity=identity,
+                                       expected_gate_generation=1,
+                                       deadline_monotonic=time.monotonic() + 5))
+
+    assert [
+        authorization.scope.service_version for authorization in authorizations
+    ] == [63, 64]
+    assert all(
+        authorization.identity == identity for authorization in authorizations)
+    assert all(
+        authorization.gate_generation == 1 for authorization in authorizations)
 
 
 def test_unmanaged_context_cannot_claim_with_forged_admission(monkeypatch):
