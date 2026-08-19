@@ -3558,6 +3558,38 @@ def _update_cluster_status(
         record['status_updated_at'] = written_at
         return record
 
+    def _summary_record_after_cluster_write(
+            written_status: status_lib.ClusterStatus) -> dict[str, Any]:
+        """Refresh the summary shape without a full-row reread."""
+        if not summary_response:
+            full_record = global_user_state.get_cluster_from_name(
+                cluster_name,
+                include_user_info=include_user_info,
+                summary_response=summary_response)
+            assert full_record is not None, cluster_name
+            return full_record
+
+        refresh_fields = global_user_state.get_cluster_refresh_fields(
+            cluster_name)
+        if refresh_fields is None:
+            full_record = global_user_state.get_cluster_from_name(
+                cluster_name,
+                include_user_info=include_user_info,
+                summary_response=summary_response)
+            assert full_record is not None, cluster_name
+            return full_record
+
+        record['status'] = written_status
+        record['status_updated_at'] = refresh_fields.status_updated_at
+        record['autostop'] = refresh_fields.autostop
+        record['to_down'] = refresh_fields.to_down
+        if refresh_fields.cluster_hash is not None:
+            record['cluster_hash'] = refresh_fields.cluster_hash
+        if written_status == status_lib.ClusterStatus.UP:
+            record['cluster_ever_up'] = True
+            record['launch_status_reason'] = None
+        return record
+
     if _maybe_reconcile_stalled_kubernetes_autodown(handle, record,
                                                     node_statuses,
                                                     _get_ray_config):
@@ -3613,10 +3645,7 @@ def _update_cluster_status(
             ready=True,
             is_launch=False,
             existing_cluster_hash=record['cluster_hash'])
-        return global_user_state.get_cluster_from_name(
-            cluster_name,
-            include_user_info=include_user_info,
-            summary_response=summary_response)
+        return _summary_record_after_cluster_write(status_lib.ClusterStatus.UP)
 
     # All cases below are transitioning the cluster to non-UP states.
     launched_resources = handle.launched_resources.assert_launchable()
@@ -3914,10 +3943,8 @@ def _update_cluster_status(
             ready=False,
             is_launch=False,
             existing_cluster_hash=record['cluster_hash'])
-        return global_user_state.get_cluster_from_name(
-            cluster_name,
-            include_user_info=include_user_info,
-            summary_response=summary_response)
+        return _summary_record_after_cluster_write(
+            status_lib.ClusterStatus.INIT)
     # Now either:
     # (1) is_abnormal is False: either node_statuses is empty or all nodes are
     #                           STOPPED
