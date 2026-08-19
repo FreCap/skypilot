@@ -61,9 +61,10 @@ mock_provider "kubernetes" {
 }
 
 variables {
-  aws_region          = "us-east-2"
-  eks_cluster_name    = "gpu-pool"
-  controller_role_arn = "arn:aws:iam::123456789012:role/skypilot-api"
+  aws_region                                = "us-east-2"
+  eks_cluster_name                          = "gpu-pool"
+  controller_role_arn                       = "arn:aws:iam::123456789012:role/skypilot-api"
+  allow_cluster_security_group_node_ingress = true
   cluster_api_ingress_cidrs = [
     "10.20.0.0/16",
     "10.30.0.0/16",
@@ -186,7 +187,7 @@ run "commercial_pool_preserves_partition_identity_shapes" {
       aws_security_group_rule.cluster_api_from_control_plane[0].security_group_id == "sg-0fedcba9876543210" &&
       aws_security_group_rule.cluster_api_from_control_plane[0].cidr_blocks == tolist(["10.20.0.0/16", "10.30.0.0/16"])
     )
-    error_message = "Private API ingress must target the EKS-managed cluster security group and preserve the reviewed CIDRs."
+    error_message = "Acknowledged private API ingress must target the EKS-managed cluster security group and preserve the reviewed CIDRs."
   }
 
   assert {

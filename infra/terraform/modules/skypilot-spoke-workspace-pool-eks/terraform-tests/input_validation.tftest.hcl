@@ -620,11 +620,31 @@ run "rejects_public_cluster_api_ingress" {
   expect_failures = [var.cluster_api_ingress_cidrs]
 }
 
+run "rejects_noncanonical_public_cluster_api_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["10.20.30.40/0"]
+  }
+
+  expect_failures = [var.cluster_api_ingress_cidrs]
+}
+
 run "rejects_invalid_cluster_api_ingress" {
   command = plan
 
   variables {
     cluster_api_ingress_cidrs = ["not-a-cidr"]
+  }
+
+  expect_failures = [var.cluster_api_ingress_cidrs]
+}
+
+run "rejects_ipv6_cluster_api_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["2001:db8::/64"]
   }
 
   expect_failures = [var.cluster_api_ingress_cidrs]
@@ -638,6 +658,35 @@ run "rejects_duplicate_cluster_api_ingress" {
   }
 
   expect_failures = [var.cluster_api_ingress_cidrs]
+}
+
+run "rejects_canonically_duplicate_cluster_api_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["10.0.0.0/8", "10.1.2.3/8"]
+  }
+
+  expect_failures = [var.cluster_api_ingress_cidrs]
+}
+
+run "rejects_unacknowledged_managed_node_https_ingress" {
+  command = plan
+
+  variables {
+    cluster_api_ingress_cidrs = ["10.30.0.0/16"]
+  }
+
+  expect_failures = [aws_security_group_rule.cluster_api_from_control_plane]
+}
+
+run "default_omits_cluster_api_ingress_without_acknowledgement" {
+  command = plan
+
+  assert {
+    condition     = length(aws_security_group_rule.cluster_api_from_control_plane) == 0
+    error_message = "The default must create no shared cluster security-group rule."
+  }
 }
 
 run "rejects_duplicate_claims_in_one_namespace" {
