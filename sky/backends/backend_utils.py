@@ -3562,18 +3562,22 @@ def _update_cluster_status(
             written_status: status_lib.ClusterStatus) -> dict[str, Any]:
         """Refresh the summary shape without a full-row reread."""
         if not summary_response:
-            return global_user_state.get_cluster_from_name(
+            full_record = global_user_state.get_cluster_from_name(
                 cluster_name,
                 include_user_info=include_user_info,
                 summary_response=summary_response)
+            assert full_record is not None, cluster_name
+            return full_record
 
         refresh_fields = global_user_state.get_cluster_refresh_fields(
             cluster_name)
         if refresh_fields is None:
-            return global_user_state.get_cluster_from_name(
+            full_record = global_user_state.get_cluster_from_name(
                 cluster_name,
                 include_user_info=include_user_info,
                 summary_response=summary_response)
+            assert full_record is not None, cluster_name
+            return full_record
 
         record['status'] = written_status
         record['status_updated_at'] = refresh_fields.status_updated_at
