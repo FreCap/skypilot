@@ -4079,7 +4079,8 @@ class TestFillLaunchPath(unittest.TestCase):
             persist.call_args.
             kwargs['expected_ordinary_zero_cost_admission_sequence'], 17)
 
-    def test_v2_durable_intent_freezes_promoted_profile_before_persist(self):
+    def _assert_v2_promoted_profile_before_persist(self, actuation_mode,
+                                                   actuation_lease):
         location = make_location('phx-context',
                                  accelerators={'H200': 1},
                                  cloud_name='Kubernetes',
@@ -4089,8 +4090,7 @@ class TestFillLaunchPath(unittest.TestCase):
         placer.select_next_zero_cost_location.return_value = location
         manager = _make_manager(placer)
         _promote_generic_binding(manager)
-        manager._reserved_fill_actuation_mode = (
-            zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+        manager._reserved_fill_actuation_mode = actuation_mode
         override = self._v2_override(location,
                                      exact_shape={'H200': 1},
                                      attributed=True)
@@ -4141,7 +4141,7 @@ class TestFillLaunchPath(unittest.TestCase):
                                'build_launch_budget') as paid_budget:
             result = self._launch_v2(manager,
                                      override,
-                                     actuation_lease=mock.sentinel.intent_lease)
+                                     actuation_lease=actuation_lease)
 
         self.assertTrue(result)
         persist.assert_called_once()
@@ -4158,6 +4158,17 @@ class TestFillLaunchPath(unittest.TestCase):
             ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL)
         self.assertIsNone(info.zero_cost_materialization_sequence)
         paid_budget.assert_not_called()
+
+    def test_v2_promoted_profile_is_frozen_before_persist_in_both_modes(self):
+        cases = (
+            (zero_cost_actuation.ActuationMode.DIRECT_REPLICA, None),
+            (zero_cost_actuation.ActuationMode.DURABLE_INTENT,
+             mock.sentinel.intent_lease),
+        )
+        for actuation_mode, actuation_lease in cases:
+            with self.subTest(actuation_mode=actuation_mode):
+                self._assert_v2_promoted_profile_before_persist(
+                    actuation_mode, actuation_lease)
 
     def test_v2_partial_typed_attribution_fails_before_persistence(self):
         location = make_location('phx-context',
