@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-17
+Last updated: 2026-08-19
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -1131,6 +1131,39 @@ by redelivering the durable reason, never by inventing a replacement reason.
 The row-lock reducer similarly never waits for that advisory guard: it cannot
 authorize cleanup from an unquiesced post-effect request, but it can durably
 expose ambiguity instead of deadlocking behind the opaque call.
+
+#### Internal request authority for teardown quiescence
+
+Backend-guarded central controller recovery and teardown read and cancel launch
+requests through the registered authoritative request storage backend in
+process. The public `/api/status` and `/api/cancel` routes, their OAuth
+middleware, response encoding, and client/server version discovery are not
+participants in this safety barrier. The server-owned execution-quiescence
+guard, not the controller-child consolidation override, selects this path.
+Every direct-store barrier requires the built-in PostgreSQL storage and queue
+backends before its first read. Protocol-v2 cleanup forces the direct path and
+never falls back to a remote API query.
+
+Every direct-store call discovers active and terminal-unproved candidates by
+the exact incarnation-scoped replica cluster names and launch handler, cancels
+exact request IDs, and then rereads each discovered request ID until its
+immutable execution generation is terminal with the matching durable
+quiescence receipt. A discovered request that disappears, changes identity or
+generation, uses an unavailable or unsupported backend, or lacks its required
+receipt fails closed and retains every replica and service cleanup row. Rows
+from before the receipt contract that are already terminal do not claim this
+proof and remain governed by the existing legacy adjudication contract.
+Absence from the SkyPilot cluster table or provider inventory is never
+substituted for a required request-executor receipt.
+
+This correction requires no schema or durable-state migration and is deployed
+fix-forward with the normal controller/API Helm cohort. The pre-existing SDK
+active-request scan remains only as a transitional compatibility path for
+legacy remote Serve controllers that lack the server-owned backend guard and
+do not own the central request backend in process. It cannot serve protocol-v2
+cleanup. Remove that branch when remote Serve controllers either retire or
+receive a narrowly authenticated internal request-store primitive; until then
+its active-only semantics do not weaken the guarded PostgreSQL contract above.
 
 A live controller retries an unresolved transport admission with the same
 stable submission UUID while its worker still owns the retained intent. After a
