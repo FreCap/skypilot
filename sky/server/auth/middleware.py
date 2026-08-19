@@ -581,8 +581,14 @@ class InternalServeControllerApiAuthMiddleware(
             return _bearer_auth_401_response(
                 {'detail': 'Invalid controller API bearer token.'})
 
+        # Request execution also uses ``User.id`` as the cloud resource-name
+        # suffix.  Keep this temporary bridge principal within the established
+        # eight-character user-hash budget; the descriptive 32-character ID
+        # leaves no room for a display-name hash under Kubernetes' 42-character
+        # cluster-name limit and makes every admitted launch fail before
+        # provider submission.
         request.state.auth_user = models.User(
-            id='skypilot-system-serve-controller',
+            id='skyserve',
             name='SkyServe controller',
             user_type=models.UserType.SYSTEM.value)
         return await call_next(request)
