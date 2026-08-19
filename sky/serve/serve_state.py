@@ -28,6 +28,7 @@ from sky import sky_logging
 from sky.adaptors import common as adaptors_common
 from sky.serve import capacity_admission
 from sky.serve import constants
+from sky.serve import demand_state_schema
 from sky.serve import ephemeral_storage_contract
 from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
@@ -42,6 +43,7 @@ from sky.serve import pool_capacity_observation_schema
 from sky.serve import reserved_fill_projection_authority
 from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import resource_action_m4_state_schema
+from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
 from sky.serve.lb_cutover_state import lb_cutover_kubernetes_guard as _lb_guard
 from sky.serve.serve_statuses import ReplicaStatus
@@ -59,6 +61,7 @@ from sky.utils.db import migration_utils
 if typing.TYPE_CHECKING:
     from sqlalchemy.engine import row
 
+    from sky.serve import demand_state
     from sky.serve import kubernetes_identity
     from sky.serve import paid_retirement
     from sky.serve import placement_contract_normalization
@@ -69,6 +72,7 @@ if typing.TYPE_CHECKING:
     from sky.serve import service_spec
     from sky.serve import zero_cost_actuation
 else:
+    demand_state = adaptors_common.LazyImport('sky.serve.demand_state')
     placement_contract_normalization = adaptors_common.LazyImport(
         'sky.serve.placement_contract_normalization')
     paid_retirement = adaptors_common.LazyImport('sky.serve.paid_retirement')
@@ -173,6 +177,22 @@ _PLACEMENT_PROJECTION_COLUMN_NAMES = frozenset({
     'controller_work_cache',
     'worker_placement_projections',
 })
+
+
+class LogicalRetirementCommitState(str, enum.Enum):
+    """Outcome of the durable logical-retirement commit boundary."""
+
+    COMMITTED = 'committed'
+    REJECTED = 'rejected'
+    AMBIGUOUS = 'ambiguous'
+
+
+@dataclasses.dataclass(frozen=True)
+class LogicalRetirementCommitResult:
+    """Typed destructive-commit result; ambiguity never authorizes a worker."""
+
+    state: LogicalRetirementCommitState
+    replica_info: Any | None = None
 
 
 def _placement_projection_columns_available(
@@ -5759,6 +5779,347 @@ def commit_paid_retirement(
         authority=authority,
         expected_service_hash=expected_service_hash,
         expected_controller_owner=expected_controller_owner) is True
+
+
+def _logical_retirement_receipt_watermark(
+        rows: list[Mapping[str, Any]]) -> tuple[tuple[str, int, str], ...]:
+    """Return the exact canonical receipt tuple used by a reconcile token."""
+    return tuple((str(row['reporter_session_id']), int(row['sequence']),
+                  str(row['payload_sha256'])) for row in rows)
+
+
+def _logical_retirement_reports_are_current(
+    rows: list[Mapping[str, Any]],
+    service: Mapping[str, Any],
+    authority: 'demand_state.DurableReconcileAuthority',
+    now: datetime.datetime,
+) -> bool:
+    """Revalidate exact LB and occupancy evidence at the database clock."""
+    if (not rows or _logical_retirement_receipt_watermark(rows)
+            != authority.receipt_watermark or
+            not demand_state.reports_match_current_lb_authority(rows, service)):
+        return False
+    complete = all(row['complete'] is True and row['protocol_version'] == 2
+                   for row in rows)
+    allow_zero = bool(authority.fresh_aggregate_zero and
+                      service['route_projection_protocol_version'] == 2 and
+                      demand_state.reports_prove_fresh_aggregate_zero(rows))
+    if not (complete or allow_zero):
+        return False
+
+    ledger = lb_ha.LbSessionLedger(constants.LB_DEMAND_REPORT_TTL_SECONDS,
+                                   constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS)
+    stream_owners: set[str] = set()
+    now_epoch = now.timestamp()
+    for row in rows:
+        payload = row['payload']
+        if (not isinstance(payload, Mapping) or
+                payload.get('protocol_version') != 2 or
+                payload.get('routing_version') != authority.service_version or
+                payload.get('route_projection_generation')
+                != authority.route_generation or
+                payload.get('route_projection_sha256') != authority.route_sha256
+                or payload.get('route_source_epoch')
+                != authority.route_source_epoch):
+            return False
+        try:
+            role = lb_ha.LbRole(payload.get('applied_role'))
+            sample_ages = payload['occupancy_sample_age_seconds']
+            if not isinstance(sample_ages, Mapping):
+                return False
+            ledger_payload = dict(payload)
+            elapsed = max(0.0, now_epoch - row['received_at'].timestamp())
+            ledger_payload['occupancy_sample_age_seconds'] = {
+                str(url): float(age) + elapsed
+                for url, age in sample_ages.items()
+            }
+            session_id = str(row['reporter_session_id'])
+            slot = lb_ha.parse_slot(row['lb_slot']) or lb_ha.LbSlot.A
+            if not ledger.update(session_id,
+                                 slot,
+                                 role,
+                                 int(payload['applied_generation']),
+                                 ledger_payload,
+                                 now=now_epoch):
+                return False
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False
+        if role in (lb_ha.LbRole.ACTIVE, lb_ha.LbRole.DRAINING):
+            stream_owners.add(session_id)
+    if not stream_owners:
+        return False
+    aggregate = ledger.aggregate(stream_owners, now=now_epoch)
+    return bool(aggregate.complete and tuple(aggregate.occupancy_sampled_urls)
+                == authority.occupancy_sampled_urls)
+
+
+def _logical_retirement_precommit_matches(
+    current: 'replica_managers.ReplicaInfo',
+    expected: 'replica_managers.ReplicaInfo',
+    authority: 'demand_state.DurableReconcileAuthority',
+    expected_logical_controller_epoch: str,
+) -> bool:
+    """Validate the exact, still-reversible replica state before teardown."""
+    current_status = current.status_property
+    expected_status = expected.status_property
+    fields = (
+        'sky_launch_status',
+        'sky_down_status',
+        'is_scale_down',
+        'preempted',
+        'purged',
+        'wait_for_idle_before_termination',
+        'logical_retirement_version',
+        'logical_retirement_controller_epoch',
+        'logical_retirement_generation',
+        'logical_retirement_target_capacity',
+        'logical_retirement_confirmed_generation',
+        'logical_retirement_bounded_deadline',
+        'logical_retirement_committed',
+    )
+    if (current.replica_id != expected.replica_id or
+            current.replica_record_id != expected.replica_record_id or
+            current.version != expected.version or any(
+                getattr(current_status, field) != getattr(
+                    expected_status, field) for field in fields)):
+        return False
+    selection_generation = current_status.logical_retirement_generation
+    selection_target = current_status.logical_retirement_target_capacity
+    confirmation = current_status.logical_retirement_confirmed_generation
+    retirement_version = current_status.logical_retirement_version
+    return bool(
+        current_status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED
+        and current_status.sky_down_status
+        == common_utils.ProcessStatus.SCHEDULED and
+        current_status.is_scale_down is True and
+        current_status.preempted is False and current_status.purged is False and
+        current_status.wait_for_idle_before_termination is False and
+        current_status.logical_retirement_committed is False and
+        current_status.logical_retirement_controller_epoch
+        == expected_logical_controller_epoch and
+        type(retirement_version) is int and  # pylint: disable=unidiomatic-typecheck
+        retirement_version == authority.service_version and type(
+            current.version) is int and current.version <= retirement_version
+        and type(selection_generation) is int and selection_generation >= 0
+        and selection_generation < authority.demand_feed_generation
+        and type(selection_target) is int and selection_target >= 0 and
+        (confirmation is None or (type(confirmation) is int and  # pylint: disable=unidiomatic-typecheck
+                                  selection_generation <= confirmation <=
+                                  authority.demand_feed_generation))
+        and type(current_status.logical_retirement_bounded_deadline) is bool)
+
+
+def commit_logical_retirement(
+    service_name: str,
+    replica_id: int,
+    replica_info: 'replica_managers.ReplicaInfo',
+    authority: 'demand_state.DurableReconcileAuthority',
+    *,
+    expected_service_hash: str,
+    expected_controller_owner: tuple[int | None, str | None],
+    expected_logical_controller_epoch: str,
+) -> LogicalRetirementCommitResult:
+    """Atomically authorize logical teardown against current durable demand.
+
+    The global zero-cost protocol row comes first, followed by the lifecycle
+    fence and service row, preserving the established
+    protocol -> lifecycle -> service -> replica lock order shared by
+    admissions, materializations, lifecycle takeover, and fill.  The service
+    row remains the first service-local SQL mutex shared with
+    ``demand_state.ingest_report``.  A report that commits first invalidates
+    the token; a report blocked behind this transaction is ordered after the
+    retirement.  Only ``COMMITTED`` authorizes the caller to start a provider
+    worker.  A commit-call failure is deliberately ``AMBIGUOUS`` and requires
+    fresh row readback before any worker can be reconstructed.
+    """
+    try:
+        authority_valid_until = authority.valid_until
+        if (not isinstance(authority_valid_until, datetime.datetime) or
+                authority_valid_until.tzinfo is None or
+                authority_valid_until.utcoffset() is None or
+                authority.service_name != service_name or
+                authority.service_hash != expected_service_hash or
+                authority.controller_pid != expected_controller_owner[0] or
+                authority.controller_ip != expected_controller_owner[1] or
+                not isinstance(expected_logical_controller_epoch, str) or
+                not expected_logical_controller_epoch):
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+    except (AttributeError, TypeError, ValueError):
+        return LogicalRetirementCommitResult(
+            LogicalRetirementCommitState.REJECTED)
+
+    caller_infos = [(replica_id, replica_info)]
+    with _replica_launch_authority_write_session(service_name) as (engine,
+                                                                   session):
+        if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+            raise RuntimeError('Logical retirement requires PostgreSQL.')
+        _prelock_zero_cost_protocol_for_replica_write(
+            session, engine, caller_infos, expected_replica_exists=True)
+        # Lifecycle acquisition advances the durable fence before updating
+        # the service row. Lock and validate that fence before taking the
+        # service mutex too; taking it later through the generic replica
+        # upsert would invert lifecycle takeover's lifecycle -> service order.
+        if not _lifecycle_epoch_matches_in_session(
+                session, service_name, authority.service_lifecycle_epoch):
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        service = session.execute(
+            sqlalchemy.select(services_table).where(
+                services_table.c.name ==
+                service_name).with_for_update()).mappings().one_or_none()
+        if service is None:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        try:
+            controller_incarnation = str(service['controller_incarnation'])
+            service_matches = bool(
+                service['hash'] == expected_service_hash and
+                service['pool'] == 0 and service['lifecycle_epoch']
+                == authority.service_lifecycle_epoch and
+                service['current_version'] == authority.service_version and
+                controller_incarnation == authority.controller_incarnation and
+                service['controller_owner_epoch']
+                == authority.controller_owner_epoch and
+                (service['controller_pid'],
+                 service['controller_ip']) == expected_controller_owner and
+                service['demand_source_mode'] == 'DURABLE_FEED' and
+                service['demand_source_epoch'] == authority.demand_source_epoch
+                and service['demand_authority_capable'] is True and
+                service['demand_authority_controller_incarnation']
+                == service['controller_incarnation'] and
+                service['demand_authority_protocol_version'] == 1 and
+                service['route_source_mode'] == 'DURABLE_PROJECTED' and
+                service['route_source_epoch'] == authority.route_source_epoch
+                and service['route_projection_capable'] is True and
+                service['route_projection_controller_incarnation']
+                == service['controller_incarnation'] and
+                service['route_projection_protocol_version'] in (1, 2) and
+                (service['lb_ha_enabled'] == 1) == authority.lb_ha_enabled and
+                service['lb_active_slot'] == authority.lb_active_slot and
+                service['lb_cutover_generation']
+                == authority.lb_cutover_generation)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            service_matches = False
+        now = session.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        if not service_matches or authority_valid_until <= now:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+
+        generations = demand_state_schema.serve_demand_feed_generations_table
+        reports = demand_state_schema.serve_lb_demand_reports_table
+        current_generation = session.execute(
+            sqlalchemy.select(generations.c.generation).where(
+                generations.c.service_name == service_name,
+                generations.c.service_hash ==
+                expected_service_hash).with_for_update()).scalar_one_or_none()
+        fresh_reports = session.execute(
+            sqlalchemy.select(reports).where(
+                reports.c.service_name == service_name,
+                reports.c.service_hash == expected_service_hash,
+                reports.c.valid_until
+                > now).order_by(reports.c.reporter_session_id).with_for_update(
+                )).mappings().all()
+        if (current_generation != authority.demand_feed_generation or
+                not _logical_retirement_reports_are_current(
+                    fresh_reports, service, authority, now)):
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+
+        route_heads = route_projection_schema.serve_route_heads_table
+        routes = route_projection_schema.serve_route_snapshots_table
+        route_head = session.execute(
+            sqlalchemy.select(route_heads).where(
+                route_heads.c.service_name ==
+                service_name).with_for_update()).mappings().one_or_none()
+        route = session.execute(
+            sqlalchemy.select(routes).where(
+                routes.c.service_name == service_name, routes.c.generation ==
+                authority.route_generation)).mappings().one_or_none()
+        if (route_head is None or route is None or
+                route_head['generation'] != authority.route_generation or
+                route_head['valid_until'] <= now or
+                route['content_sha256'] != authority.route_sha256 or
+                route['service_hash'] != expected_service_hash or
+                route['service_lifecycle_epoch']
+                != authority.service_lifecycle_epoch or
+                route['service_version'] != authority.service_version or
+                str(route['controller_incarnation'])
+                != authority.controller_incarnation or
+                route['controller_owner_epoch']
+                != authority.controller_owner_epoch or
+                route['protocol_version'] != 1 or
+                route['producer_protocol_version']
+                != service['route_projection_protocol_version']):
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        try:
+            route_projection.RouteProjectionRepository.validate_snapshot_row(
+                route)
+        except route_projection.RouteProjectionError:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        if not route_projection.snapshot_owner_matches(route, service):
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+
+        row = session.execute(
+            sqlalchemy.select(replicas_table.c.replica_state_version,
+                              replicas_table.c.replica_state).where(
+                                  replicas_table.c.service_name == service_name,
+                                  replicas_table.c.replica_id ==
+                                  replica_id).with_for_update()).one_or_none()
+        if row is None:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        current = _replica_from_state(row.replica_state_version,
+                                      row.replica_state)
+        if not _logical_retirement_precommit_matches(
+                current, replica_info, authority,
+                expected_logical_controller_epoch):
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+
+        current_status = current.status_property
+        current_status.logical_retirement_confirmed_generation = (
+            authority.demand_feed_generation)
+        current_status.logical_retirement_committed = True
+        current_status.sky_down_status = common_utils.ProcessStatus.RUNNING
+        current_status.wait_for_idle_before_termination = False
+        route_projection.revoke_replica_lease_in_session(
+            session, service_name, replica_id, current.replica_record_id,
+            'logical_retirement_committed')
+        persisted_infos = _upsert_replica_rows_in_session(
+            session,
+            engine,
+            service_name, [(replica_id, current)],
+            expected_replica_exists=True)
+        if persisted_infos is None:
+            session.rollback()
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.REJECTED)
+        try:
+            session.commit()
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Logical-retirement commit outcome is ambiguous for service '
+                f'{service_name!r}, replica {replica_id}: '
+                f'{common_utils.format_exception(error)}')
+            return LogicalRetirementCommitResult(
+                LogicalRetirementCommitState.AMBIGUOUS)
+    _publish_committed_zero_cost_sequences(caller_infos, persisted_infos)
+    return LogicalRetirementCommitResult(LogicalRetirementCommitState.COMMITTED,
+                                         persisted_infos[0][1])
 
 
 def cancel_paid_retirement(

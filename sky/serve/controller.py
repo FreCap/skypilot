@@ -5988,20 +5988,35 @@ class SkyServeController:
                     # A central-state read failure cannot silently revive the
                     # legacy autoscaler path after a durable promotion.
                     self._durable_demand_snapshot = None
+                    self._replica_manager.invalidate_logical_reconcile_state()
                     return
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
                 durable_snapshot = None
+                durable_logical_snapshot: (
+                    replica_managers.LogicalReconcileSnapshot | None) = None
                 fresh_aggregate_zero = False
                 if durable_demand_promoted:
-                    durable_snapshot = demand_state.get_autoscaling_snapshot(
-                        self._service_name, self._service_hash or '')
+                    try:
+                        durable_snapshot = demand_state.get_autoscaling_snapshot(
+                            self._service_name, self._service_hash or '')
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Revoking durable logical reconcile authority '
+                            'because its PostgreSQL snapshot is unavailable: '
+                            f'{common_utils.format_exception(error)}')
+                        self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
+                        return
                     if durable_snapshot is None:
                         # Stale or incomplete is unknown, never zero.  Do not
                         # reuse the last promoted snapshot for either free or
                         # paid capacity actuation.
                         self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
                         return
                     request_information = dict(
                         durable_snapshot.request_information)
@@ -6011,8 +6026,71 @@ class SkyServeController:
                                 actuation_generation, decision_autoscaler,
                                 decision_version):
                             return
+                        durable_reconcile_generation = None
+                        if decision_autoscaler.replica_unit == 'logical':
+                            if not isinstance(
+                                    decision_autoscaler,
+                                    autoscalers.ConcurrencyAutoscaler):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because its autoscaler does not expose '
+                                    'the logical reconcile generation.')
+                                return
+                            durable_reconcile_generation = (
+                                durable_snapshot.demand_feed_generation)
+                            request_reconcile_generation = (
+                                request_information.get('reconcile_generation'))
+                            if (type(durable_reconcile_generation) is not int or
+                                    type(request_reconcile_generation)
+                                    is not int or request_reconcile_generation
+                                    != durable_reconcile_generation):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because its request-information '
+                                    'generation does not match the durable '
+                                    'feed generation.')
+                                return
                         decision_autoscaler.collect_request_information(
                             request_information)
+                        if decision_autoscaler.replica_unit == 'logical':
+                            assert isinstance(decision_autoscaler,
+                                              autoscalers.ConcurrencyAutoscaler)
+                            assert durable_reconcile_generation is not None
+                            autoscaler_reconcile_generation = (
+                                decision_autoscaler.reconcile_generation)
+                            if (type(autoscaler_reconcile_generation) is not int
+                                    or autoscaler_reconcile_generation
+                                    != durable_reconcile_generation):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because the collected autoscaler '
+                                    'generation does not match the durable '
+                                    'feed generation.')
+                                return
+                            # Stage the capacity/occupancy half of the manager
+                            # fence without exposing it. Planning may block or
+                            # fail, and a newer snapshot paired with an older
+                            # lower target could otherwise release a recovered
+                            # retirement. A valid target and this snapshot are
+                            # installed atomically below.
+                            durable_logical_snapshot = (
+                                replica_managers.LogicalReconcileSnapshot(
+                                    version=decision_version,
+                                    generation=durable_reconcile_generation,
+                                    observed_slots_by_replica_id=dict(
+                                        request_information[
+                                            'observed_slots_by_replica_id']),
+                                    in_flight_by_replica_id=dict(
+                                        request_information[
+                                            'in_flight_by_replica_id']),
+                                    unknown_replica_ids=frozenset(
+                                        request_information[
+                                            'unknown_in_flight_replica_ids']),
+                                    received_at=(
+                                        durable_snapshot.reconcile_authority.
+                                        read_started_monotonic),
+                                    authority=(
+                                        durable_snapshot.reconcile_authority)))
                         self._reconcile_generation += 1
                         self._durable_demand_snapshot = durable_snapshot
                         fresh_aggregate_zero = (
@@ -6150,8 +6228,29 @@ class SkyServeController:
                         os._exit(1)  # pylint: disable=protected-access
                     return
                 if logical_target is not None:
-                    self._replica_manager.publish_logical_target(
-                        *logical_target)
+                    if durable_logical_snapshot is None:
+                        self._replica_manager.publish_logical_target(
+                            *logical_target)
+                    else:
+                        # Revalidate the exact demand/notification epoch under
+                        # the ingestion lock, then install one target/snapshot
+                        # immutable pair under ReplicaManager's logical-state
+                        # lock. Every manager reader captures that one pair, so
+                        # it cannot mix halves from concurrent publications.
+                        with self._routing_state_lock:
+                            if (not self._scale_actuation_is_current(
+                                    actuation_generation, decision_autoscaler,
+                                    decision_version) or
+                                    self._scale_reconcile_coordinator.generation
+                                    != notification_generation or
+                                    self._reconcile_generation
+                                    != demand_generation):
+                                return
+                            if not (self._replica_manager.
+                                    publish_logical_reconcile_state(
+                                        logical_target,
+                                        durable_logical_snapshot)):
+                                return
                 elif invalidate_logical_target:
                     # Exact-card retirement must fail closed while the LB
                     # compatibility report is incomplete. Explicitly revoke an
