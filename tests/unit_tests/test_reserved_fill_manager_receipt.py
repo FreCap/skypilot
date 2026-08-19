@@ -1223,6 +1223,69 @@ def test_same_allocation_drainer_is_debited_until_cleanup_proven() -> None:
         _plan((snapshot,), committed_fill_debits=released_debits).intents) == 1
 
 
+def test_committed_and_pending_fill_debits_are_coalesced() -> None:
+    snapshot = _snapshot('east-context', 'uid-east', 4)
+    allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=19,
+        ordinary_zero_cost_admission_sequence_high_water=(
+            snapshot.ordinary_zero_cost_admission_sequence),
+        reconciliation_gate_generation=_RECONCILIATION_GATE_GENERATION,
+        reclaim_fleet_bundle_sha256=_RECLAIM_FLEET_BUNDLE_SHA256,
+        reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
+        reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
+        pool_snapshots=(snapshot,))
+    committed = reserved_fill_planner.CommittedFillDebit(
+        allocation_generation=allocation.allocation_generation,
+        allocation_input_sha256=allocation.allocation_input_sha256,
+        allocation_claim_generation=allocation.allocation_claim_generation,
+        pool_key=snapshot.pool_key,
+        accelerator='A100',
+        replica_slots=1)
+    pending = dataclasses.replace(committed, replica_slots=2)
+
+    debits = (
+        controller.SkyServeController._coalesce_committed_reserved_fill_debits(
+            (committed,), (pending,)))
+
+    assert len(debits) == 1
+    assert debits[0].accelerator == 'a100'
+    assert debits[0].replica_slots == 3
+    assert len(_plan((snapshot,), committed_fill_debits=debits).intents) == 1
+
+
+def test_committed_fill_debits_do_not_coalesce_across_allocations() -> None:
+    snapshot = _snapshot('east-context', 'uid-east', 2)
+    allocation = reserved_fill_planner.AuthenticatedAllocationMap.create(
+        allocation_generation=5,
+        allocation_claim_generation=11,
+        service_version=19,
+        ordinary_zero_cost_admission_sequence_high_water=(
+            snapshot.ordinary_zero_cost_admission_sequence),
+        reconciliation_gate_generation=_RECONCILIATION_GATE_GENERATION,
+        reclaim_fleet_bundle_sha256=_RECLAIM_FLEET_BUNDLE_SHA256,
+        reclaim_policy_revision=_RECLAIM_POLICY_REVISION,
+        reclaim_provider_inventory_sha256=(_RECLAIM_PROVIDER_INVENTORY_SHA256),
+        pool_snapshots=(snapshot,))
+    current = reserved_fill_planner.CommittedFillDebit(
+        allocation_generation=allocation.allocation_generation,
+        allocation_input_sha256=allocation.allocation_input_sha256,
+        allocation_claim_generation=allocation.allocation_claim_generation,
+        pool_key=snapshot.pool_key,
+        accelerator='a100',
+        replica_slots=1)
+    stale = dataclasses.replace(current, allocation_generation=6)
+
+    debits = (
+        controller.SkyServeController._coalesce_committed_reserved_fill_debits(
+            (current,), (stale,)))
+
+    assert len(debits) == 2
+    with pytest.raises(ValueError, match='different authenticated'):
+        _plan((snapshot,), committed_fill_debits=debits)
+
+
 def test_stale_observation_is_locally_deferred_after_parallel_preflight(
 ) -> None:
     manager = _manager()
