@@ -1,12 +1,14 @@
 # Stateless HA control-plane storage
 
 Status: Proposed canonical design, awaiting independent re-review. Review 12
-is NO-GO on the superseded source-registry design. Review 13 replaces that
-machinery with the bounded restore-age proof below. No application code,
-infrastructure, migration, or deployment has been performed from this design.
-This design may merge only after an independent review returns GO on its exact
-diff. Gate 1 separately authorizes implementation and destructive decommission;
-it is not a design-merge gate.
+is NO-GO on the superseded source-registry design. Review 13 replaced that
+machinery with a bounded restore-age proof, but exact-head review found five
+remaining contract defects. Review 14 incorporates their narrow corrections
+below without restoring a provider registry or a second storage path. No
+application code, infrastructure, migration, or deployment has been performed
+from this design. This design may merge only after an independent review returns
+GO on its exact diff. Gate 1 separately authorizes implementation and
+destructive decommission; it is not a design-merge gate.
 
 Last updated: 2026-08-19
 
@@ -61,12 +63,13 @@ Version 1 fixes these immutable constants:
 | `BLOB_DELETE_DELAY_V1` | 336 hours after tombstone | Earliest physical deletion of a retained blob version |
 | `BLOB_TOMBSTONE_COMPACTION_DELAY_V1` | 336 hours after exact absence | Earliest removal of the compact tombstone and detailed deletion rows |
 | `OLD_INCARNATION_SWEEP_DELAY_V1` | 336 hours after retirement | Earliest deletion of an unreferenced old-incarnation version |
-| `CONTROL_PLANE_LOG_BYTE_RETENTION_V1` | 30 days from S3 version creation | Fixed log-byte lifetime; later reads return a typed expiry gap |
+| `CONTROL_PLANE_LOG_READABILITY_RETENTION_V1` | 30 days from S3 version creation | Fixed readable lifetime; later reads return a typed expiry gap while physical lifecycle cleanup may finish later |
 
 `BLOB_DELETE_DELAY_V1` is two full promotion windows. The second full delay
-before tombstone compaction is deliberately conservative. No runtime setting,
-Helm value, Aurora retention change, snapshot copy, or operator waiver may
-change these constants.
+before tombstone compaction is deliberately conservative. Log readability ends
+at its exact database-computed boundary; asynchronous S3 deletion is not a
+second product-retention clock. No runtime setting, Helm value, Aurora retention
+change, snapshot copy, or operator waiver may change these constants.
 
 Let `t0` be the database-clock commit time of a blob tombstone. Physical delete
 cannot begin before `t0 + 336h`. At that instant a promotable database must
@@ -127,8 +130,14 @@ configuration change can never retroactively broaden the restore window.
 - This does not update a `boltz-platform` SkyPilot pin or justify a broad
   Terraform/Terragrunt refactor. SkyPilot fixes merge forward and deploy with
   direct Helm.
-- Copy-on-write Aurora clones and logical dump/import databases are never
-  production promotion sources and never receive SkyPilot S3 writer authority.
+- Version 1 promotion sources are limited to Aurora physical PITR/automated
+  backup restores, direct/manual physical DB-cluster snapshots, physical
+  snapshot copies or RAM shares, and AWS Backup physical restores. Copy-on-write
+  Aurora clones, Aurora Global Database members, Blue/Green deployments,
+  logical replication, and logical dump/import databases are non-promotable and
+  never receive SkyPilot S3 writer authority. Supporting any excluded source
+  requires a new protocol review; provider resource age or apparent replication
+  health cannot waive that boundary.
 
 ## Production evidence and scope
 
@@ -167,6 +176,30 @@ API, executor, and controller pod carries the same immutable storage protocol,
 generation, S3 fingerprint, and database incarnation. A role is not Ready and
 cannot perform a durable mutation when any value differs from PostgreSQL.
 
+`S3_V1` fingerprints one canonical JSON document. It contains the protocol and
+all fixed constants; AWS partition, account, region, expected bucket owner and
+bucket ARN; every exact root; versioning state `Enabled`;
+`BucketOwnerEnforced`; all four Public Access Block values; default SSE-KMS key
+ARN and encryption-context schema; canonical bucket-policy, KMS-key-policy and
+KMS-grant digests; lifecycle-rule digest; and the complete access-bearing
+principal set, including the exact runtime, migration, promotion/config-
+verifier, staging-cleanup, and GC principal ARNs. IAM/policy documents are
+normalized by parsed statement identity and canonical JSON rather than provider
+response ordering. No image digest, Helm revision, or mutable application value
+is part of this static storage fingerprint.
+
+Before generation commit, every database promotion, and every application or
+fence rollout, a schema-owned verifier reads those exact S3/KMS controls,
+recomputes the fingerprint, and stores a database-clock receipt. Its provider
+configuration permissions are read-only; one disjoint capability may only
+conditionally create, read/checksum, and exact-version delete a random staging
+sentinel. Each role independently refreshes the same bounded configuration
+check at least every five minutes and fails readiness or durable mutation when
+its last successful receipt is older than ten minutes. A mismatch cannot be
+accepted by copying PostgreSQL's expected digest, and the sentinel never
+exercises authoritative deletion. Runtime, Helm, migration, staging-cleanup,
+and GC identities cannot change any fingerprint input.
+
 The public upload/download, request, Job, Serve, cluster, and log APIs retain
 their existing shapes. Callers never choose an S3 key/version and never receive
 bucket credentials. API 41+ keeps the existing content-addressed upload flow.
@@ -200,14 +233,19 @@ overwritten. Every authoritative `PutObject` or multipart completion uses
 conditional creation; a conflict is reconciled against the one expected
 attempt and never creates a replacement version under the same key.
 
-Bucket policy requires TLS, BucketOwnerEnforced ownership, Public Access Block,
-the exact SSE-KMS key, and the expected encryption context. Runtime identities
-cannot call `DeleteObject` or `DeleteObjectVersion` under authoritative blob or
-legacy roots. Only the digest-pinned blob-GC Job can delete an exact version
-claimed from PostgreSQL. Lifecycle may expire staging and the exact log root;
-it can never expire authoritative blob or legacy versions. The generation
-fingerprint binds the complete lifecycle-rule digest, and runtime, Helm,
-migration, and GC identities cannot change it.
+Bucket controls require TLS, BucketOwnerEnforced ownership, Public Access
+Block, the exact SSE-KMS key, and the expected encryption context. Explicit
+resource-policy denies prevent runtime, migration, Helm, and staging-cleanup
+identities from calling `DeleteObject` or `DeleteObjectVersion` under any
+authoritative blob, legacy, or log root. The digest-pinned storage-GC Job may
+delete only an exact version claimed through its schema-owned PostgreSQL
+function: a tombstoned blob/legacy version or an old-incarnation complement. It
+cannot issue bare deletes. Current-incarnation log versions have one physical
+cleanup path: the fingerprinted lifecycle below. Lifecycle may expire staging
+and the exact log root; it can never expire authoritative blob or legacy
+versions. The complete lifecycle and resource-policy digests are fingerprint
+inputs, and runtime, Helm, migration, staging-cleanup, and GC identities cannot
+change them.
 
 An upload transaction reserves owner/deployment byte, object, and row quota and
 records its immutable key, expected size/digest, incarnation, lifecycle epoch,
@@ -260,32 +298,53 @@ that a copied open-gate value is current authority. A restored, copied,
 detached, or candidate database cannot advance its heartbeat while fenced.
 
 Every candidate starts network-isolated from application roles. Its only
-credential can execute the schema-owned promotion verifier. Before any
-endpoint, Secret, DNS, or security-group switch, that verifier computes:
+database credential can execute the schema-owned promotion verifier. The
+separate promotion identity first records one immutable candidate receipt that
+binds the restore operation family, candidate/source ARNs and resource IDs,
+account/region, engine/version, original physical recovery point or PITR target,
+copy/share provenance, provider request IDs, and terminal provider status. It
+then proves the operation is one of the physical Version 1 families above and
+that the candidate is not a clone-group member, Global Database member,
+Blue/Green source or target, logical replica, or logical import. Missing,
+ambiguous, changing, or unsupported provenance rejects and destroys or leaves
+the candidate isolated. This per-attempt classification receipt is not a
+provider-source registry, is never consulted by blob GC, and cannot make a
+source younger.
 
-`effective_source_data_time = min(last_canonical_heartbeat,
-verified_provider_data_cutoff_time_if_older)`
+The database-resident `last_canonical_heartbeat` is the sole source-data age.
+Provider resource creation, snapshot-copy, AWS Backup copy, restore-job, and
+cluster-rename times are never substituted for it. Where the physical restore
+operation exposes a semantic maximum data cutoff, such as a requested PITR
+target, a stored heartbeat later than that cutoff is an integrity failure, not
+an instruction to take the minimum. Before any endpoint, Secret, DNS, or
+security-group switch, promotion requires all of the following:
 
-Provider resource creation time, snapshot-copy time, AWS Backup copy time, and
-cluster rename time are never inputs. Missing or ambiguous provenance cannot
-make the value newer, and the stored heartbeat may not be later than the
-candidate database clock or a verified older provider cutoff such as a PITR
-target or original static-snapshot capture time. A continuously replicated
-source is aged by the heartbeat actually present in its pages, not by the time
-its container resource was first created. Promotion requires all of the
-following:
-
-- effective source data time is no older than the current database clock minus
-  168 hours;
+- the canonical heartbeat is no older than the current database clock minus
+  168 hours, is not in the future, and passes the sequence/incarnation checks;
 - deployment UUID, storage generation/fingerprint, KMS identity, and schema
   protocol match exactly;
-- the source is not a copy-on-write clone or logical import;
-- every committed PostgreSQL S3 reference exists at its exact version with the
-  expected size, digest metadata, and KMS identity;
+- the provider candidate receipt identifies one allowed physical source and
+  passes every exclusion above;
+- every `READY` or `RETIRED` blob/legacy object and every unexpired committed
+  log segment exists at its exact version with expected size, content digest,
+  metadata and KMS identity;
+- a `TOMBSTONED`, `DELETING`, or `DELETED` blob/legacy version is never made
+  readable: presence is retained and charged, while absence is accepted only
+  when the append-only tombstone/sequence is valid and its fixed 336-hour delete
+  boundary has passed (or the selected database already contains the exact per-
+  version receipt proving an authorized deletion at or after that boundary and
+  provider-confirmed absence); an earlier or unclassified absence rejects
+  promotion;
+- an expired log segment is projected as `EXPIRED_BY_POLICY` from its original
+  S3 creation time whether its exact version remains present or lifecycle has
+  removed it; an unexpired absence rejects promotion;
+- restored nonterminal upload, materialization, and log-writer attempts are
+  classified for invalidation and old-incarnation accounting, never replayed or
+  treated as readable references;
 - a complete S3 version/MPU inventory fits the deployment physical-capacity
   budget; unknown old-incarnation bytes count conservatively until swept; and
-- all current production writers, leases, provider actions, and blob-GC permits
-  are fenced and quiescent.
+- all current production writers, leases, provider actions, and storage-GC
+  permits are fenced and quiescent.
 
 While writers are closed, promotion stores the complete inventory byte/object
 totals as a conservative deployment physical-usage floor. New reservations add
@@ -296,27 +355,29 @@ them. A restore therefore cannot manufacture quota by omitting newer rows.
 
 The promotion transaction creates a random new incarnation UUID, invalidates
 all restored nonterminal upload/materialization/log writer state, records the
-old incarnation as pending retirement, and keeps writers closed. All later
-attempts, leases, multipart IDs, log segments, and S3 keys are fresh. After
-exact reference verification and endpoint isolation readback, a final
-transaction opens writers and the deployment rolls to the new incarnation. No
-restored attempt is replayed or adopted.
+state-aware present/absent/expired projection above, records the old incarnation
+as pending retirement, and keeps writers closed. It does not release quota from
+an inventory omission; the ordinary exact-absence transaction does that later.
+All later attempts, leases, multipart IDs, log segments, and S3 keys are fresh.
+After state-aware reference verification and endpoint isolation readback, a
+final transaction opens writers and the deployment rolls to the new
+incarnation. No restored attempt is replayed or adopted.
 
 `retired_at` is recorded only after the old application identities, writer
 leases, provider-action handlers, multipart workers, and GC permits have a
 durable quiescence receipt. Any late old-incarnation effect invalidates that
 retirement time and blocks its sweep; elapsed wall time alone cannot repair it.
 
-PITR, a retained automated backup, a direct/manual snapshot, a copied or
-RAM-shared snapshot, AWS Backup, Global Database, or Blue/Green can supply
-candidate bytes only when this content-based age and identity proof passes. A
-copy or share does not refresh age. A source that ages past 168 hours is
-permanently archival for this protocol even if the provider still allows
-restore. Provider creation therefore does not race blob GC and requires no
-source registry. Raw provider restore authority is separate from production
-promotion authority; ordinary runtime/Helm roles cannot switch the database
-endpoint or open the writer gate. Break-glass use is an audited incident and
-does not waive the verifier.
+Physical PITR/automated backup, direct/manual snapshot, copied or RAM-shared
+snapshot, and AWS Backup sources may supply candidate bytes only when this
+content-based age, state-aware reference, and identity proof passes. A copy or
+share does not refresh age. Once a static source's stored heartbeat ages past
+168 hours it is permanently archival for this protocol even if the provider
+still allows restore. Provider creation therefore does not race blob GC and
+requires no source registry. Raw provider restore authority is separate from
+production promotion authority; ordinary runtime/Helm roles cannot switch the
+database endpoint or open the writer gate. Break-glass use is an audited
+incident and does not waive the verifier or admit an excluded source family.
 
 ## Exact-version blob GC and old-incarnation sweep
 
@@ -391,11 +452,22 @@ Log bytes use one fixed policy instead of blob tombstones. The exact S3 version
 creation time determines `expires_at = created_at + 30d`. Before that instant a
 reader requires the exact version. At or after it, the API returns the typed
 `EXPIRED_BY_POLICY` interval even if provider lifecycle has not yet removed the
-bytes. Bucket lifecycle applies only to `authoritative/logs/` current and
-noncurrent versions and may reclaim them after the same boundary. A restored
-database computes expiry from the original version creation time; restore or
-copy time never refreshes it. Log metadata may compact only after expiry plus
-336 hours, preserving the stream-level typed gap.
+bytes. A restored database computes expiry from the original version creation
+time; restore or copy time never refreshes it.
+
+The fingerprinted `authoritative/logs/` lifecycle uses `Expiration.Days = 30`
+for current versions, `NoncurrentVersionExpiration.NoncurrentDays = 1` for the
+version made noncurrent by the lifecycle-created successor/delete marker, and a
+separate expired-delete-marker cleanup rule. S3 day rounding and asynchronous
+execution mean physical bytes normally outlive the exact 30-day API boundary
+and have no protocol upper-bound deletion instant. That lag never makes them
+readable again. Lingering versions and delete markers remain in the deployment
+physical-usage floor and cost telemetry until exact inventory proves absence; a
+lifecycle delay cannot manufacture quota. No lifecycle rule outside the exact
+log and staging roots may delete a version. Log metadata may compact only after
+expiry plus 336 hours, preserving the stream-level typed gap. These physical
+semantics follow AWS's documented [versioned-bucket lifecycle
+rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html).
 
 This deliberately allows early segments of a long-lived job to age out after
 30 days. A longer product log promise requires a new fixed protocol value and
@@ -485,8 +557,12 @@ reconstructs request/Job/Serve/cluster state without EFS, and proves
 maintenance path, including backup/restore, import, `SEALED`, generation commit,
 EFS cleanup/unmount, provider client fence, `S3_ONLY`, primary and prebuilt
 fix-forward rollouts, 2/2/2 readiness, historical-revision denial, PVC/PV
-unbind, and maintenance reopening. The owner approves one immutable RTO and
-component deadlines from that evidence.
+unbind, and maintenance reopening. Every rehearsal restore uses a new isolated
+filesystem and ends by deleting its access points, mount targets, filesystem,
+and disposable recovery directory, with provider `NotFound`, a terminal restore-
+job receipt, and no automatic-backup selection or retained recovery point for
+the temporary resource. The owner approves one immutable RTO and component
+deadlines from that evidence.
 
 Production cutover is one ordered operation under a PostgreSQL database-clock
 lease and random fencing token:
@@ -498,13 +574,22 @@ lease and random fencing token:
    six role pods to zero. Prove no unclassified writer remains.
 3. Run the exact importer with a read-only mount and finish the one-root import.
 4. Capture the final manifest, create a new EFS backup after zero-writer proof,
-   restore it in isolation, and require exact manifest equality. Verify every
-   retained PostgreSQL reference resolves to an exact S3 version or typed gap.
+   restore it to one newly created network-isolated temporary filesystem, and
+   require exact manifest equality. Verify every retained PostgreSQL reference
+   resolves according to its state to an exact S3 version or typed gap. Delete
+   the temporary restore's access points, mount targets, filesystem, restore
+   directory; require provider `NotFound`, a terminal restore-job receipt, no
+   automatic backup enrollment, and an exact zero-resource receipt. The source
+   recovery point remains sealed only through the observation horizon: no
+   SkyPilot or ordinary deploy identity may restore it, copy it, or create
+   another EFS resource, and a vault lock/retention date beyond the planned
+   terminal cleanup blocks cutover.
 5. Install/read back `SEALED`, run all negative admission probes, and commit
    `S3_V1` only while the lease, deadline, manifests, quotas, backup, and both
-   prebuilt fix-forward artifacts remain current. A lost response is read from
-   PostgreSQL. Before this commit only, failure may restore the exact
-   `TRANSITION` revision and unchanged EFS generation.
+   prebuilt fix-forward artifacts remain current and the isolated restore has
+   the terminal cleanup receipt above. A lost response is read from PostgreSQL.
+   Before this commit only, failure may restore the exact `TRANSITION` revision
+   and unchanged EFS generation.
 6. Keep every application identity fenced. Require Aurora's latest restorable
    time to pass the `S3_V1` commit and a post-commit manual snapshot to become
    available. Bind both provider receipts to the committed generation,
@@ -520,10 +605,12 @@ lease and random fencing token:
    probes, then deploy the no-PVC chart. If the primary rollout misses its
    deadline, deploy the already-built S3-only fix-forward artifact; EFS is never
    restored.
-9. Require 2/2/2 readiness, exact-reference checks, one-pod-per-role and total-
-   blackout recovery, no EFS mounts, and denial of every retained historical
-   revision. Delete the unbound PVC/PV under their verified `Retain` contract,
-   reopen maintenance, and release the lease.
+9. Require 2/2/2 readiness, the state-aware reference/absence checks above, one-
+   pod-per-role and total-blackout recovery, no EFS mounts, and denial of every
+   retained historical revision. Delete the unbound PVC/PV under their verified
+   `Retain` contract, revoke EFS backup/restore and new-filesystem authority,
+   prove the sealed final recovery point is non-operational, reopen maintenance,
+   and release the lease.
 
 Every phase has an absolute database-clock deadline. A missed post-commit
 deadline is an incident and fix-forward outage, not permission to weaken the
@@ -550,19 +637,25 @@ last cleanup/unmount but before the clock:
   while preserving enumerated non-SkyPilot clients. If neither proof is safe,
   the clock cannot start.
 - In both cases revoke runtime/CSI/deploy authority to recreate the client path
-  or weaken the fence, and apply only the target-limited desired-state change so
-  Helm, CSI, Terraform, and Terragrunt cannot recreate it. The immutable receipt
-  binds filesystem/access-point IDs, mount targets, SG and filesystem-policy
-  digests, principal set, cleanup receipt, admission-fence digest, and empty
-  post-apply plan.
+  or weaken the fence. Also revoke their `StartRestoreJob`, EFS create,
+  access-point create, mount-target create, backup-copy and backup-selection
+  authority; enumerate terminal restore jobs and prove no temporary restored
+  filesystem remains. Apply only the target-limited desired-state change so
+  Helm, CSI, Terraform, Terragrunt, and AWS Backup cannot recreate a SkyPilot
+  client or filesystem. The immutable receipt binds filesystem/access-point
+  IDs, mount targets, SG and filesystem-policy digests, principal set, cleanup
+  and isolated-restore-cleanup receipts, the sealed final recovery-point ARN and
+  deletion eligibility, admission-fence digest, and empty post-apply plan.
 
 Cutover ships one suspended five-minute `EfsDecommissionObserverV1` CronJob in
 the fence release. It has read-only Kubernetes/AWS/database access and cannot
 mount or mutate EFS. After the EFS application-code/config cleanup release is
 deployed and read back, activation sets `stable_since` to the first UTC minute
 not earlier than application cleanup, last cleanup unmount, last mount-pod
-termination, and provider-fence readback. Every sample re-reads the exact fence,
-namespace PodSpecs, release/admission receipts, and database incarnation.
+termination, isolated-restore cleanup, backup/restore-authority revocation, and
+provider-fence readback. Every sample re-reads the exact fence, namespace
+PodSpecs, EFS/restore-job inventory, release/admission receipts, and database
+incarnation.
 
 On the exclusive branch, `EFS_CW_PERIOD_V1 = 60s` and
 `EFS_CW_FINALIZATION_LAG_V1 = 60m`. The observer queries exact `AWS/EFS`/
@@ -588,22 +681,30 @@ provider-fence/namespace/desired-state samples five minutes apart; its
 filesystem metrics remain non-authoritative. Any forbidden PodSpec, mount, late
 positive exclusive sample, observation gap over ten minutes, fence or desired-
 state drift, release/image/fingerprint/incarnation change, database restore, or
-receipt mismatch invalidates the epoch. A required remount creates a new
-approved fence epoch and fresh 168-hour clock; no cleanup or remount occurs
-during or after an accepted horizon.
+receipt mismatch invalidates the epoch. `S3_V1` never permits a remount, EFS
+restore, new SkyPilot filesystem, or new access point: an attempt is an incident
+and resets observation, but cannot open a new approved fence epoch. Returning to
+EFS would require a new design and forward protocol; no EFS reactivation,
+restore, or remount occurs during or after an accepted horizon.
 
-After acceptance, the exclusive branch deletes the filesystem, security group,
-remaining CSI/IAM/StorageClass edges, and exact saved Terraform objects, then
-requires provider `NotFound` and an empty plan. The shared branch deletes no
-shared data, filesystem, mount target, security group, or post-horizon path; its
-SkyPilot directory and access point were already removed before the clock. The
-observer and temporary identity are removed only after the branch-specific
-final receipt.
+After acceptance, both branches delete the sealed final EFS recovery point,
+exact SkyPilot backup selection/automatic-backup policy and restore authority,
+then require recovery-point `NotFound`, no active SkyPilot restore job, no
+restored temporary EFS resource, and an empty target-limited plan. Historical
+terminal restore-job records are receipts, not resources to delete. The
+exclusive branch also deletes the filesystem, security group, remaining CSI/
+IAM/StorageClass edges, and exact saved Terraform objects, then requires
+provider `NotFound`. The shared branch deletes no shared data, filesystem, mount
+target, security group, backup plan used by other resources, or post-horizon
+path; its SkyPilot directory and access point were already removed before the
+clock. The observer and temporary identity are removed only after the branch-
+specific final receipt.
 
 These metric/fence semantics follow the AWS documentation for
 [EFS CloudWatch publication](https://docs.aws.amazon.com/efs/latest/ug/monitoring-cloudwatch.html),
 [EFS metrics](https://docs.aws.amazon.com/efs/latest/ug/efs-metrics.html),
 [`GetMetricData`](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_GetMetricData.html),
+[AWS Backup EFS restore](https://docs.aws.amazon.com/aws-backup/latest/devguide/restoring-efs.html),
 [access-point deletion](https://docs.aws.amazon.com/efs/latest/ug/delete-access-point.html),
 [mount-target deletion](https://docs.aws.amazon.com/efs/latest/APIReference/API_DeleteMountTarget.html),
 and [EFS network/IAM authorization](https://docs.aws.amazon.com/efs/latest/ug/iam-access-control-nfs-efs.html).
@@ -617,13 +718,13 @@ temporary code is not left as a TODO.
 | # | Scope | Required result / merge gate |
 | --- | --- | --- |
 | 1 | Canonical design | This file and removal of the executable-looking EFS plan from the role-split design; merge only after exact independent GO |
-| 2 | Surgical static infrastructure | Reuse a suitable private versioned bucket or add only minimum S3/KMS/IAM, conditional-create, authoritative-blob lifecycle deny, log lifecycle, GC identity, quotas/alarms, and fence RBAC; no live EFS mutation, broad Terragrunt change, mutable image allowlist, or SkyPilot pin |
+| 2 | Surgical static infrastructure | Reuse a suitable private versioned bucket or add only minimum S3/KMS/IAM, the complete fingerprint/readback contract, conditional-create, all-authoritative-root ordinary-delete denies, exact log lifecycle, GC identity, quotas/alarms, and fence RBAC; no live EFS mutation, broad Terragrunt change, mutable image allowlist, or SkyPilot pin |
 | 3 | Blob path | Upload/reference/quota schema, immutable exact-version S3 backend, API 41+ behavior, bounded API 24--40 adapter, Serve refs, legacy import, and scoped materialization |
-| 4 | Common logs | One typed prepare/publish/commit/index/read path for request, Job, Serve, cluster, and role logs; fixed 30-day lifecycle and `EXPIRED_BY_POLICY` gaps |
-| 5 | Promotion and GC | Canonical heartbeat, 168-hour promotion limit, one incarnation fence, fresh keys, exact-reference verification, 336-hour blob tombstone GC, and one old-incarnation sweep; no provider-source registry or restore farm |
-| 6 | Cutover and observer | Generation/fingerprint, exact importer/verifier and retryable cleanup workloads, no-PVC chart, self-contained admission policy with exhaustive floor, one cutover lease, post-commit provider fence, and suspended observer |
+| 4 | Common logs | One typed prepare/publish/commit/index/read path for request, Job, Serve, cluster, and role logs; fixed 30-day readability, explicit eventual current/noncurrent/delete-marker lifecycle, and `EXPIRED_BY_POLICY` gaps |
+| 5 | Promotion and GC | Canonical heartbeat, physical-source allowlist, 168-hour promotion limit, one incarnation fence, fresh keys, state-aware exact-reference/absence verification, 336-hour blob tombstone GC, and one old-incarnation sweep; no provider-source registry or restore farm |
+| 6 | Cutover and observer | Generation/fingerprint, exact importer/verifier, isolated EFS-restore cleanup and retryable cleanup workloads, no-PVC chart, self-contained admission policy with exhaustive floor, one cutover lease, post-commit provider/backup-restore fence, and suspended observer |
 | 7 | EFS application cleanup / observer activation | Remove EFS code, values, mounts, importer, and migration identity after S3-only acceptance; retain generic non-HA PVC support and the independently gated client adapter; activate the 168-hour observer |
-| 8 | Exact infrastructure decommission | Exclusive: delete only remaining SkyPilot EFS objects after the horizon. Shared: remove only SkyPilot declarations/authority and prove shared resources unchanged |
+| 8 | Exact infrastructure decommission | Both: delete the sealed final recovery point and SkyPilot backup/restore authority after the horizon. Exclusive: also delete only remaining SkyPilot EFS objects. Shared: remove only SkyPilot declarations/authority and prove shared resources unchanged |
 | 9 | Transition cleanup | Remove observer/fence transition states/metrics/tests after final receipts; remove API 24--40 adapter separately only after its compatibility gate |
 
 The unmerged RWX stacks in boltz-platform PRs #7824 and #7829--#7833 and draft
@@ -638,15 +739,23 @@ Automated fault and adversarial tests must prove:
 
 - upload prepare/publish/commit ordering, conditional-create conflicts, lost
   responses, multipart cleanup, exact-version reads, owner/reference/retirement
-  races, transactional quota oversubscription, and no authoritative blob
-  lifecycle or ordinary-principal deletion;
-- every database source class uses the database-resident heartbeat and any
-  older provider data cutoff; snapshot/AWS Backup copies do not refresh
-  age; 167h59m passes, 168h plus one tick fails; the 2026-08-08 snapshot fails;
-  clones and logical imports always fail; an increase to `H` fails closed;
+  races, transactional quota oversubscription, and no authoritative blob/
+  legacy lifecycle or ordinary-principal deletion under any authoritative root;
+- the canonical fingerprint changes for every bucket owner/ARN/region/root,
+  versioning, ownership, Public Access Block, KMS/encryption-context,
+  policy/grant, lifecycle or principal change; provider response reordering does
+  not change it; stale/mismatched readback fails role readiness and mutation;
+- every allowed physical database source uses the database-resident heartbeat;
+  snapshot/AWS Backup copies do not refresh age; 167h59m passes, 168h plus one
+  tick fails; the 2026-08-08 snapshot fails; clone, Global Database, Blue/Green,
+  logical-replication and logical-import candidates always fail; an increase to
+  `H` fails closed;
 - candidate network isolation, old-writer/lease/GC quiescence, lost promotion
-  responses, fresh incarnation IDs/keys/leases, exact-reference failure, and
-  total role blackout recovery without replaying a provider effect;
+  responses, fresh incarnation IDs/keys/leases, live-reference failure, and
+  total role blackout recovery without replaying a provider effect; a restore
+  taken at `tombstone + 200h` passes at `tombstone + 350h` after lawful exact
+  deletion, while an absent live/retired/unexpired reference and an absent
+  tombstoned version before its 336-hour boundary fail;
 - blob tombstone/delete/absence/compaction boundaries at 335h59m and 336h,
   per-version permit loss, promotion racing each delete, partial multi-object
   deletion, stale worker rejection, exact quota release, and no reactivation or
@@ -656,9 +765,11 @@ Automated fault and adversarial tests must prove:
   the complement after 336 hours, and aborts on missing/changing pages or a new
   promotion;
 - all log-producing domains use the common path; typed frames cannot be spoofed
-  by payload; hard pod loss creates `UNKNOWN_TAIL`; fixed 30-day expiry returns
-  `EXPIRED_BY_POLICY` before/after lifecycle deletion and never blocks or
-  replays the underlying provider action;
+  by payload; hard pod loss creates `UNKNOWN_TAIL`; fixed 30-day readability
+  returns `EXPIRED_BY_POLICY` before/after lifecycle deletion and never blocks
+  or replays the underlying provider action; current expiration creates a
+  delete marker, noncurrent physical deletion may be delayed, lingering bytes
+  remain charged, and ordinary principals cannot delete an unexpired segment;
 - API 41+ compatibility, API 24--40 per-user isolation/expiry, Serve reference
   lifetimes, legacy manifest determinism, safe extraction, and every byte,
   object, row, inode, expansion, spool, and concurrency bound;
@@ -671,22 +782,24 @@ Automated fault and adversarial tests must prove:
   and every `hostPath`;
 - stored-value Helm renders, direct `--reuse-values`, fence/application mutual
   exclusion, killed operators at each phase, primary/fix-forward rollout,
-  post-commit PITR/snapshot checkpoint, 2/2/2 readiness, historical-revision
-  denial, and a full no-EFS `boltz-l4-fleet` recovery rehearsal within the
-  measured RTO; and
+  isolated EFS restore and exact terminal resource cleanup, post-commit PITR/
+  snapshot checkpoint, 2/2/2 readiness, historical-revision denial, and a full
+  no-EFS `boltz-l4-fleet` recovery rehearsal within the measured RTO; and
 - last-client cleanup before the provider fence; exclusive and shared fence
-  branches; denied recreation authority; exact CloudWatch period/stat/lag/
-  pagination/sparse-silence semantics; every reset; denial at 167h59m; final
-  double read; no shared-resource mutation; provider NotFound/empty plan; and
-  observer removal only afterward.
+  branches; denied mount/filesystem/backup-restore recreation authority; exact
+  CloudWatch period/stat/lag/pagination/sparse-silence semantics; every reset;
+  remount always forbidden after `S3_V1`; denial at 167h59m; final double read;
+  final recovery-point deletion; no shared-resource mutation; provider
+  NotFound/empty plan; and observer removal only afterward.
 
 Production telemetry reports storage generation/fingerprint/incarnation,
-canonical-heartbeat age, rejected promotion reason/source age, S3 physical
-inventory floor, blob/upload/reference/tombstone/GC ages and quotas, retired-
-incarnation sweep age/bytes, log spool/expiry/gap counts, S3/KMS errors, cutover
-phase/deadlines, and EFS client-fence/observer/reset/sparse/positive/unknown
-state. It contains no keys, paths, credentials, operation tokens, or signed
-URLs.
+fingerprint-receipt age and mismatch state, canonical-heartbeat age, rejected
+promotion reason/source age, S3 physical inventory floor, blob/upload/reference/
+tombstone/GC ages and quotas, retired-incarnation sweep age/bytes, log spool/
+expiry/gap counts and physically pending expired bytes, S3/KMS errors, cutover
+phase/deadlines, and EFS client-fence/observer/reset/sparse/positive/unknown,
+restore-job, temporary-filesystem, and recovery-point state. It contains no
+keys, paths, credentials, operation tokens, or signed URLs.
 
 ## Open gates
 
@@ -697,33 +810,39 @@ URLs.
 2. A fresh audit reconfirms the single EFS source, 23.8 GB tree, Aurora size,
    seven-day PITR, all retained/manual/copied/RAM-shared/AWS Backup/clone/
    global/Blue-Green sources, database endpoint/Secret/network promotion
+   authority, EFS backup selections/recovery points/vault retention and restore
    authority, existing IAM/RBAC, and every exact infrastructure address. Every
-   source older than `H` is marked archival/non-promotable in the recovery
-   runbook.
+   source older than `H` and every non-physical or excluded source family is
+   marked non-promotable in the recovery runbook.
 3. Owners approve the immutable 168h/336h/336h/30d constants, maximum upload and
    archive/materialization dimensions, permanent owner/deployment quota, S3
    physical-capacity floor, and log-expiry product behavior.
-4. S3/KMS positive/negative probes pass without EFS change. Runtime, migration,
-   Helm, and staging identities cannot delete authoritative blob/legacy
-   versions; lifecycle touches only staging/log roots; GC cannot upload, copy,
-   bare-delete, or mutate bucket/KMS policy.
+4. S3/KMS positive/negative probes pass without EFS change. The complete
+   canonical fingerprint and bounded readback receipt pass. Runtime, migration,
+   Helm, and staging identities cannot delete authoritative blob, legacy, or
+   log versions; lifecycle touches only staging/log roots; GC cannot upload,
+   copy, bare-delete, or mutate bucket/KMS policy.
 5. Promotion and GC tests prove the bounded-age theorem at every boundary and
-   with every source/copy class, exact old-writer/delete-permit quiescence, and
-   the single old-incarnation sweep. No provider-source registry, isolated-
-   restore receipt, backup join, WAL/LSN, or possible-commit scan is introduced.
+   with every allowed and excluded source/copy class, state-aware live/
+   tombstoned/deleted/expired reference behavior, exact old-writer/delete-permit
+   quiescence, and the single old-incarnation sweep. No provider-source registry,
+   per-source isolated database restore, backup join, WAL/LSN, or possible-
+   commit scan is introduced.
 6. Blob/log/API/materialization integrations pass real PostgreSQL/S3 crash
    tests and total-blackout recovery. No foreground provider action waits on log
    shipping after its action row commits.
-7. Stored-value rendering, importer, final EFS backup/restore equality,
-   exhaustive live-SA admission probes, measured RTO, immutable primary/fix-
-   forward artifacts, post-commit Aurora recovery checkpoint, cleanup, provider
-   client fence, no-PVC rollout, 2/2/2 readiness, and historical-revision denial
-   all pass before maintenance opens.
+7. Stored-value rendering, importer, final EFS backup/restore equality, exact
+   isolated-restore resource cleanup, exhaustive live-SA admission probes,
+   measured RTO, immutable primary/fix-forward artifacts, post-commit Aurora
+   recovery checkpoint, cleanup, provider client/backup-restore fence, no-PVC
+   rollout, 2/2/2 readiness, and historical-revision denial all pass before
+   maintenance opens.
 8. After EFS application cleanup, the observer proves the exact reset-free
    168-hour branch-specific horizon. Exclusive deletion requires terminal
-   CloudWatch/fence receipts, provider NotFound, and an empty plan. Shared
-   completion requires access-point/client-path absence and a plan proving no
-   shared resource or data mutation.
+   CloudWatch/fence receipts, provider NotFound, final recovery-point deletion,
+   and an empty plan. Shared completion requires final recovery-point deletion,
+   access-point/client-path absence, and a plan proving no shared resource or
+   data mutation. Neither branch permits a post-`S3_V1` remount or restore.
 
 ## Adversarial review record
 
@@ -750,7 +869,7 @@ source-creation/GC race; lossy aggregate tombstone compaction; a non-exhaustive
 volume floor; ambiguous VAP parameters; an unsafe sparse-metric EFS clock; and a
 design-merge/Gate-1 contradiction. It did not revive the WAL/LSN issue.
 
-### Review 13: READY FOR INDEPENDENT RE-REVIEW
+### Review 13: NO-GO
 
 The simplification audit found a stronger and smaller invariant in the live
 seven-day PITR contract. This revision proves restore safety from content age,
@@ -762,12 +881,36 @@ old-incarnation sweep; gives logs fixed lifecycle with typed expiry; makes the
 VAP self-contained and its volume floor exhaustive; and makes the provider EFS
 fence—not sparse CloudWatch absence—the no-client authority.
 
+Independent review evaluated exact head
+`8e42ccf26b1e7cb2f7534e2c208cfc0a04b305b5` against base
+`512281d3eccb8c2c7315c90bd82cb126832d5740` (whole-diff SHA-256
+`9b8ec30bb46cdff189f142ee11f36ccc5999235628dadbaf6432594d0646a1f5`).
+It found five blockers: an all-reference-exists promotion check contradicted
+lawful tombstone/log absence; Blue/Green contradicted clone/logical-source
+exclusion; the S3 fingerprint and authoritative-log delete deny were incomplete;
+the production EFS restore/recovery point lacked terminal cleanup and the
+observer still permitted remount; and a fixed 30-day physical log-byte lifetime
+did not match versioned S3 lifecycle semantics.
+
+### Review 14: READY FOR INDEPENDENT RE-REVIEW
+
+This revision keeps the bounded-age theorem and corrects only those five
+contracts. Promotion now verifies references by durable state; Version 1 admits
+only enumerated physical restore families; one complete S3/KMS fingerprint and
+all-authoritative-root delete policy are explicit; every temporary EFS restore
+and final recovery point has terminal cleanup while post-`S3_V1` remount remains
+forbidden; and logs have an exact 30-day readability boundary with explicit
+eventual current/noncurrent/delete-marker lifecycle. It adds no source registry,
+restore farm, backup join, WAL/LSN dependency, database product, control-plane
+PVC, or alternate EFS path.
+
 This exact diff awaits independent review. It authorizes no code, chart,
 infrastructure, migration, deployment, merge, cutover, or EFS deletion.
 
 Completion means production runs 2/2/2 with PostgreSQL structured authority,
-exact-version SSE-KMS S3 blobs, fixed-retention S3 logs, bounded `emptyDir`, a
+exact-version SSE-KMS S3 blobs, fixed-readability S3 logs, bounded `emptyDir`, a
 healthy seven-day promotion gate and exact-version GC, zero unreconciled current
-attempts, and no SkyPilot PVC, access point, filesystem mount, path fallback, or
-guarded-HA EFS code. All transition/removal PRs and branch-specific EFS cleanup
-are complete while unrelated generic storage remains unchanged.
+attempts, and no SkyPilot PVC, access point, filesystem mount, backup recovery
+point created for cutover, restore authority, path fallback, or guarded-HA EFS
+code. All transition/removal PRs and branch-specific EFS cleanup are complete
+while unrelated generic storage remains unchanged.
