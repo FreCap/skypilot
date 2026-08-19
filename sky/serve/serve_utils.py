@@ -959,10 +959,15 @@ def ha_recovery_for_consolidation_mode(pool: bool,
         ]
         latest_committed_versions = serve_state.get_latest_committed_versions(
             committed_version_candidates)
-        raw_identities = serve_state.get_service_mode_and_hashes([
+        raw_identity_candidates = [
             service_name for service_name in committed_version_candidates
-            if service_name not in latest_committed_versions
-        ])
+            if (service_name not in latest_committed_versions and
+                liveness_snapshots.get(service_name) is None)
+        ]
+        raw_identities = {}
+        if raw_identity_candidates:
+            raw_identities = serve_state.get_service_mode_and_hashes(
+                raw_identity_candidates)
         for service_name in service_names:
             svc = liveness_snapshots.get(service_name)
             # A row with no version_specs row is invisible to the joined
@@ -977,13 +982,20 @@ def ha_recovery_for_consolidation_mode(pool: bool,
             if needs_committed_version_check:
                 committed_version = latest_committed_versions.get(service_name)
                 if committed_version is None:
-                    raw_identity = raw_identities.get(service_name)
-                    if (raw_identity is not None and raw_identity[0] == pool and
-                            isinstance(raw_identity[1], str) and
-                            raw_identity[1]):
+                    expected_service_hash = None
+                    if svc is None:
+                        raw_identity = raw_identities.get(service_name)
+                        if (raw_identity is not None and
+                                raw_identity[0] == pool and
+                                isinstance(raw_identity[1], str) and
+                                raw_identity[1]):
+                            expected_service_hash = raw_identity[1]
+                    elif isinstance(svc.get('hash'), str) and svc['hash']:
+                        expected_service_hash = svc['hash']
+                    if expected_service_hash is not None:
                         retired = (
                             serve_state.mark_unrecoverable_service_for_cleanup(
-                                service_name, raw_identity[1], pool))
+                                service_name, expected_service_hash, pool))
                         if retired:
                             f.write(
                                 f'{capnoun} {service_name} has no committed '
