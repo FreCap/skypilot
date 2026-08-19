@@ -2,6 +2,7 @@
 # pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
 import dataclasses
+import threading
 import time
 import uuid
 
@@ -17,9 +18,12 @@ from sky.serve import capacity_admission_schema
 from sky.serve import constants
 from sky.serve import demand_state
 from sky.serve import ordinary_launch_binding
+from sky.serve import replica_managers
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
+from sky.serve import serve_state
 from sky.serve import serve_state_schema
+from sky.utils import common_utils
 from sky.utils.db import migration_utils
 
 pytestmark = pytest.mark.xdist_group(
@@ -69,7 +73,8 @@ def _demand_report(now: float,
                    route_receipt: route_projection.RoutePublicationReceipt,
                    *,
                    sequence: int = 1,
-                   request_count: int = 1) -> dict:
+                   request_count: int = 1,
+                   occupancy_sample_age_seconds: float = 0.1) -> dict:
     bucket_seconds = constants.LB_DEMAND_WINDOW_BUCKET_SECONDS
     profiles = ([{
         'priority': 50,
@@ -98,7 +103,7 @@ def _demand_report(now: float,
             _URL: sequence,
         },
         'occupancy_sample_age_seconds': {
-            _URL: 0.1,
+            _URL: occupancy_sample_age_seconds,
         },
         'occupancy_sampled_urls': [_URL],
         'total_slots_by_url': {
@@ -313,6 +318,65 @@ def _insert_claim(engine, authority, replica_id: int) -> dict:
     return claim
 
 
+def _route_record_id(engine) -> str:
+    with engine.connect() as connection:
+        identity_payload = connection.execute(
+            sqlalchemy.select(
+                route_projection_schema.serve_route_snapshots_table.c.
+                identity_payload).where(
+                    route_projection_schema.serve_route_snapshots_table.c.
+                    service_name == 'svc')).scalar_one()
+    return str(identity_payload[_URL]['replica_record_id'])
+
+
+def _prepare_logical_retirement(capacity_database):
+    engine, _, route_receipt = capacity_database
+    info = replica_managers.ReplicaInfo(
+        replica_id=1,
+        cluster_name='svc-1',
+        replica_port='8000',
+        is_spot=True,
+        location=None,
+        version=1,
+        resources_override={'accelerators': {
+            'L4': 1,
+        }})
+    info.replica_record_id = _route_record_id(engine)
+    status = info.status_property
+    status.sky_launch_status = common_utils.ProcessStatus.SUCCEEDED
+    status.service_ready_now = True
+    status.first_ready_time = time.time()
+    status.is_scale_down = True
+    status.sky_down_status = common_utils.ProcessStatus.SCHEDULED
+    status.wait_for_idle_before_termination = False
+    status.logical_retirement_version = 1
+    status.logical_retirement_controller_epoch = 'logical-controller-a'
+    status.logical_retirement_generation = 1
+    status.logical_retirement_target_capacity = 0
+    status.logical_retirement_confirmed_generation = None
+    status.logical_retirement_bounded_deadline = False
+    status.logical_retirement_committed = False
+    assert serve_state.add_or_update_replica('svc', 1, info)
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(), route_receipt, sequence=2, request_count=0))
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert snapshot is not None
+    assert snapshot.demand_feed_generation == 2
+    return info, snapshot.reconcile_authority, route_receipt
+
+
+def _commit_logical(info, authority):
+    return serve_state.commit_logical_retirement(
+        'svc',
+        1,
+        info,
+        authority,
+        expected_service_hash='svc-hash',
+        expected_controller_owner=(123, '10.0.0.5'),
+        expected_logical_controller_epoch='logical-controller-a')
+
+
 def test_serve050_schema_and_promotion_are_explicit(capacity_database):
     engine, incarnation, _ = capacity_database
     inspector = sqlalchemy.inspect(engine)
@@ -334,6 +398,309 @@ def test_serve050_schema_and_promotion_are_explicit(capacity_database):
                 serve_state_schema.services_table.c.
                 demand_authority_controller_incarnation)).one()
     assert service == ('DURABLE_FEED', 1, incarnation)
+
+
+def test_autoscaling_snapshot_is_one_repeatable_read_generation(
+        capacity_database):
+    """A generation-N read cannot synthesize report rows from N+1."""
+    _, _, route_receipt = capacity_database
+    generation_read = threading.Event()
+    writer_done = threading.Event()
+    reader_ident: list[int] = []
+    result: list[demand_state.DurableAutoscalingSnapshot | None] = []
+    errors: list[BaseException] = []
+
+    def _pause_after_generation(_connection, _cursor, statement, _parameters,
+                                _context, _executemany):
+        if (reader_ident and threading.get_ident() == reader_ident[0] and
+                'serve_demand_feed_generations' in statement and
+                statement.lstrip().upper().startswith('SELECT')):
+            generation_read.set()
+            assert writer_done.wait(timeout=10)
+
+    sqlalchemy.event.listen(sqlalchemy.engine.Engine, 'after_cursor_execute',
+                            _pause_after_generation)
+    try:
+
+        def _read():
+            reader_ident.append(threading.get_ident())
+            try:
+                result.append(
+                    demand_state.get_autoscaling_snapshot('svc', 'svc-hash'))
+            except BaseException as error:  # pylint: disable=broad-except
+                errors.append(error)
+
+        reader = threading.Thread(target=_read)
+        reader.start()
+        assert generation_read.wait(timeout=10)
+        demand_state.ingest_report(
+            'svc', 'svc-hash',
+            _demand_report(time.time(),
+                           route_receipt,
+                           sequence=2,
+                           request_count=0))
+        writer_done.set()
+        reader.join(timeout=10)
+    finally:
+        writer_done.set()
+        sqlalchemy.event.remove(sqlalchemy.engine.Engine,
+                                'after_cursor_execute', _pause_after_generation)
+    assert not reader.is_alive()
+    assert not errors
+    assert result[0] is not None
+    assert result[0].demand_feed_generation == 1
+    assert result[0].receipt_watermark[0]['sequence'] == 1
+    current = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+    assert current is not None
+    assert current.demand_feed_generation == 2
+    assert current.receipt_watermark[0]['sequence'] == 2
+
+
+def test_authority_deadline_includes_selected_occupancy_age(capacity_database):
+    _, _, route_receipt = capacity_database
+    max_age = constants.LB_OCCUPANCY_PROBE_MAX_AGE_SECONDS
+    demand_state.ingest_report(
+        'svc', 'svc-hash',
+        _demand_report(time.time(),
+                       route_receipt,
+                       sequence=2,
+                       request_count=0,
+                       occupancy_sample_age_seconds=max_age - 1))
+
+    snapshot = demand_state.get_autoscaling_snapshot('svc', 'svc-hash')
+
+    assert snapshot is not None
+    authority = snapshot.reconcile_authority
+    assert 0 < (authority.deadline_monotonic -
+                authority.read_started_monotonic) <= 1
+
+
+def test_logical_retirement_preserves_global_sql_lock_order(capacity_database):
+    """Retirement composes with the canonical global row-lock order."""
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    ordered_locks: list[str] = []
+    relevant_tables = ('reserved_fill_protocol_state',
+                       'service_lifecycle_fences', 'services', 'replicas')
+
+    def _record_lock(_connection, _cursor, statement, _parameters, _context,
+                     _executemany):
+        lowered = statement.lower()
+        if 'for update' not in lowered:
+            return
+        for table in relevant_tables:
+            if table in lowered and table not in ordered_locks:
+                ordered_locks.append(table)
+
+    sqlalchemy.event.listen(sqlalchemy.engine.Engine, 'after_cursor_execute',
+                            _record_lock)
+    try:
+        result = _commit_logical(info, authority)
+    finally:
+        sqlalchemy.event.remove(sqlalchemy.engine.Engine,
+                                'after_cursor_execute', _record_lock)
+
+    assert result.state is serve_state.LogicalRetirementCommitState.COMMITTED
+    assert ordered_locks == list(relevant_tables)
+
+
+def _wait_for_blocked_postgres_backend(engine, backend_pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with engine.connect() as connection:
+            blocked = connection.execute(
+                sqlalchemy.text(
+                    'SELECT cardinality(pg_blocking_pids(:pid)) > 0'), {
+                        'pid': backend_pid
+                    }).scalar_one()
+        if blocked:
+            return
+        time.sleep(0.01)
+    pytest.fail(f'PostgreSQL backend {backend_pid} did not block as expected')
+
+
+def test_logical_retirement_serializes_with_lifecycle_takeover(
+        capacity_database):
+    """Retirement and takeover share lifecycle-before-service ordering."""
+    engine, _, _ = capacity_database
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    retirement_service_locked = threading.Event()
+    release_retirement = threading.Event()
+    retirement_results: list[serve_state.LogicalRetirementCommitResult] = []
+    lifecycle_epochs: list[int] = []
+    errors: list[BaseException] = []
+
+    raw_connection = engine.raw_connection()
+    cursor = raw_connection.cursor()
+    try:
+        cursor.execute('SELECT pg_backend_pid()')
+        lifecycle_backend_pid = int(cursor.fetchone()[0])
+    finally:
+        cursor.close()
+
+    def _pause_after_retirement_service(_connection, _cursor, statement,
+                                        _parameters, _context, _executemany):
+        if threading.current_thread().name != 'logical-retirement':
+            return
+        lowered = statement.lower()
+        if ('from services' in lowered and 'for update' in lowered and
+                not retirement_service_locked.is_set()):
+            retirement_service_locked.set()
+            assert release_retirement.wait(timeout=10)
+
+    def _retire():
+        try:
+            retirement_results.append(_commit_logical(info, authority))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    def _take_over():
+        try:
+            lifecycle_epochs.append(
+                serve_state.claim_service_lifecycle_epoch(
+                    'svc', raw_connection))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+        finally:
+            raw_connection.close()
+
+    sqlalchemy.event.listen(sqlalchemy.engine.Engine, 'after_cursor_execute',
+                            _pause_after_retirement_service)
+    retirement_thread = threading.Thread(target=_retire,
+                                         name='logical-retirement')
+    lifecycle_thread = threading.Thread(target=_take_over,
+                                        name='lifecycle-takeover')
+    try:
+        retirement_thread.start()
+        assert retirement_service_locked.wait(timeout=10)
+        lifecycle_thread.start()
+        # At this point takeover must be waiting on a row the retirement
+        # already owns. Under the old service-before-lifecycle order it owned
+        # the lifecycle row while waiting on the service, forming a cycle when
+        # retirement resumed and entered the generic replica upsert.
+        _wait_for_blocked_postgres_backend(engine, lifecycle_backend_pid)
+        release_retirement.set()
+        retirement_thread.join(timeout=10)
+        lifecycle_thread.join(timeout=10)
+    finally:
+        release_retirement.set()
+        if retirement_thread.is_alive():
+            retirement_thread.join(timeout=10)
+        if lifecycle_thread.is_alive():
+            lifecycle_thread.join(timeout=10)
+        sqlalchemy.event.remove(sqlalchemy.engine.Engine,
+                                'after_cursor_execute',
+                                _pause_after_retirement_service)
+        # ``close`` is idempotent and avoids leaking the connection when setup
+        # fails before the lifecycle thread starts.
+        raw_connection.close()
+
+    assert not retirement_thread.is_alive()
+    assert not lifecycle_thread.is_alive()
+    assert not errors
+    assert lifecycle_epochs == [4]
+    assert len(retirement_results) == 1
+    assert (retirement_results[0].state
+            is serve_state.LogicalRetirementCommitState.COMMITTED)
+
+
+@pytest.mark.parametrize('first', ['report', 'retirement'])
+def test_logical_retirement_serializes_with_next_report(capacity_database,
+                                                        first):
+    """The shared service lock gives both N+1 orderings one outcome."""
+    info, authority, route_receipt = _prepare_logical_retirement(
+        capacity_database)
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    results: list[serve_state.LogicalRetirementCommitResult] = []
+    errors: list[BaseException] = []
+    blocker_name = f'{first}-first'
+
+    def _pause_after_service_lock(_connection, _cursor, statement, _parameters,
+                                  _context, _executemany):
+        if (threading.current_thread().name == blocker_name and
+                'FROM services' in statement and 'FOR UPDATE' in statement):
+            lock_acquired.set()
+            assert release_lock.wait(timeout=10)
+
+    def _commit():
+        try:
+            results.append(_commit_logical(info, authority))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    def _report():
+        try:
+            demand_state.ingest_report(
+                'svc', 'svc-hash',
+                _demand_report(time.time(),
+                               route_receipt,
+                               sequence=3,
+                               request_count=0))
+        except BaseException as error:  # pylint: disable=broad-except
+            errors.append(error)
+
+    sqlalchemy.event.listen(sqlalchemy.engine.Engine, 'after_cursor_execute',
+                            _pause_after_service_lock)
+    first_target = _report if first == 'report' else _commit
+    second_target = _commit if first == 'report' else _report
+    first_thread = threading.Thread(target=first_target, name=blocker_name)
+    second_thread = threading.Thread(target=second_target, name='second')
+    try:
+        first_thread.start()
+        assert lock_acquired.wait(timeout=10)
+        second_thread.start()
+        release_lock.set()
+        first_thread.join(timeout=10)
+        second_thread.join(timeout=10)
+    finally:
+        release_lock.set()
+        sqlalchemy.event.remove(sqlalchemy.engine.Engine,
+                                'after_cursor_execute',
+                                _pause_after_service_lock)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not errors
+    assert len(results) == 1
+    expected = (serve_state.LogicalRetirementCommitState.REJECTED
+                if first == 'report' else
+                serve_state.LogicalRetirementCommitState.COMMITTED)
+    assert results[0].state is expected
+    durable = serve_state.get_replica_info_from_id('svc', 1)
+    assert durable is not None
+    if first == 'report':
+        assert durable.status_property.logical_retirement_committed is False
+        assert (durable.status_property.sky_down_status ==
+                common_utils.ProcessStatus.SCHEDULED)
+    else:
+        assert durable.status_property.logical_retirement_committed is True
+        assert (durable.status_property.sky_down_status ==
+                common_utils.ProcessStatus.RUNNING)
+
+
+def test_logical_retirement_commit_lost_ack_is_ambiguous(
+        capacity_database, monkeypatch):
+    info, authority, _ = _prepare_logical_retirement(capacity_database)
+    original_commit = sqlalchemy.orm.Session.commit
+    injected = False
+
+    def _commit_then_lose_ack(session):
+        nonlocal injected
+        original_commit(session)
+        if not injected:
+            injected = True
+            raise sqlalchemy.exc.OperationalError('COMMIT', {},
+                                                  RuntimeError('lost ack'))
+
+    monkeypatch.setattr(sqlalchemy.orm.Session, 'commit', _commit_then_lose_ack)
+
+    result = _commit_logical(info, authority)
+
+    assert result.state is serve_state.LogicalRetirementCommitState.AMBIGUOUS
+    durable = serve_state.get_replica_info_from_id('svc', 1)
+    assert durable is not None
+    assert durable.status_property.logical_retirement_committed is True
+    assert (durable.status_property.sky_down_status ==
+            common_utils.ProcessStatus.RUNNING)
 
 
 def test_heartbeat_refresh_keeps_plan_and_bounded_claims(capacity_database):
