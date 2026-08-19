@@ -357,9 +357,9 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (revision-432 read-only authority audit, PR #1561
-durable logical-retirement contract, and #1562 controller-takeover
-capacity-authority/grant fencing)
+Last updated: 2026-08-19 (identity-bound KubeRay child admission contract,
+revision-432 read-only authority audit, PR #1561 durable logical-retirement
+contract, and #1562 controller-takeover capacity-authority/grant fencing)
 
 Canonical owner: this file
 
@@ -1418,6 +1418,21 @@ inference context that:
   the Kueue scheduling gate; and
 - the deployment's fail-closed admission policy prevents an unmanaged direct
   inference Pod from bypassing that path.
+
+PHX's queue-name policy has exactly one exception to the ordinary nonempty
+queue-label validation. It admits only a `batch/v1` Job created in one of the
+two governed namespaces by the authenticated
+`system:serviceaccount:kuberay-system:kuberay-operator` identity. The Job must
+carry KubeRay's exact RayJob provenance labels, one singleton controller and
+block-owner-deletion `ray.io/v1` RayJob owner reference whose name equals the
+Job name, and a nonempty queue label on the verbatim submitter Pod template.
+The policy has no `matchConditions`; the exception is one validation-local
+variable and the complete nine-rule workload scope remains exact. Labels and
+owner references alone are caller-controlled data and never establish this
+exception. HPTO, StatefulSet controllers, generic child controllers, older
+RayJob API versions, other namespaces, and any additional variable or rule
+remain fail closed. Supporting another controller requires a separately
+authenticated design rather than widening this exception.
 
 The evidence and enforcement boundary is one
 `ReservedFillReclaimPolicy`. It is a code-owned, typed deployment extension,
@@ -2603,12 +2618,13 @@ either case.
 | 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed. Route authority is live at `DURABLE_PROJECTED` epoch 1; ordinary binding and demand remain legacy. |
 | 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
 | 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
-| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. The PHX `AssignQueueLabelsForPods=true` platform pin is merged but still requires its zero-replacement production apply and a successful full two-context preflight. |
+| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
-| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.2. |
+| 2a.4 | Identity-bound KubeRay child admission and exact SkyPilot attestation | Platform PR #8649 is the surgical four-file policy change and still requires human Platform approval, deployment, and the deny/admit probe matrix. The paired SkyPilot attester requires zero policy `matchConditions`, one exact authenticated KubeRay-controller variable including the submitter-template queue label, one exact validation, the complete nine-rule resource scope, and no HPTO or generic-controller exception. Activation remains closed until both halves deploy and a fresh full preflight passes. |
+| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.4. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
-| 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.2 and 2a.3. |
+| 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
 | 2f | Promoted capacity-authority controller takeover | The fix-forward implementation is merged in PR #1562: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. Deployment and child/Pod takeover qualification remain activation prerequisites. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
