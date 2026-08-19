@@ -902,10 +902,31 @@ generation; bounded aliases remain snapshot history only.
 
 Every projected response adds the snapshot generation, digest, and route-source
 epoch. The LB records those fields only after it atomically applies that same
-routing spec and ready set, then echoes them in its durable demand report.
+routing spec and ready set, then echoes them in its HA role and durable demand
+reports. Standby promotion reconstructs its expected route/occupancy contract
+from that exact durable snapshot and rechecks the same fresh head in the
+STABLE-to-PREPARING transaction; controller restart never substitutes an empty
+process-local cache for this contract. Occupancy probes capture the LB's
+applied-route observation epoch at dispatch. Any change to service version,
+projection generation/digest, or route-source epoch advances that observation
+epoch and clears exported proof before the new route fence becomes visible;
+only a probe that starts and finishes under the new epoch can repopulate it.
+Thus a successor replica that reuses a URL cannot inherit either local capacity
+or controller-facing idle proof from the prior immutable projection. An
+identical head renewal does not advance the epoch or discard a current sample.
 Future demand authority can therefore translate URL-keyed occupancy through
 the exact immutable snapshot the reporter observed; a current URL is never
 guessed to represent an older report.
+
+The promotion reader takes a fail-fast shared lock on the service owner, then
+copies the database clock, current head, and exact immutable snapshot with one
+indexed join before releasing the lock and decoding. STABLE-to-PREPARING
+revalidates the same head under the exclusive service lock. The one-way route
+promotion uses that lock too and, for an HA service, rejects every non-STABLE
+phase. Therefore either route promotion wins while HA is STABLE and the next
+legacy cutover CAS fails its mode check, or cutover wins and route promotion
+waits then fails closed; PREPARING and MIGRATING cannot act on stale legacy
+evidence.
 
 Composition locks the service row; reads use one PostgreSQL transaction and
 exact-match the service hash, lifecycle epoch, controller

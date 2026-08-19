@@ -11,6 +11,7 @@ import sqlalchemy
 from sqlalchemy import orm
 
 from sky.serve import lb_ha
+from sky.serve import route_projection
 from sky.serve import serve_state_schema
 from sky.utils.db import db_utils
 
@@ -245,37 +246,83 @@ def begin_lb_cutover(
     expected_generation: int,
     target_slot: lb_ha.LbSlot,
     demand_snapshot: lb_ha.DemandSnapshot | None = None,
+    route_promotion_contract: route_projection.RoutePromotionContract |
+    None = None,
 ) -> lb_ha.LbCutoverState | None:
-    """CAS STABLE N to PREPARING N+1 for the opposite slot."""
+    """CAS STABLE N to PREPARING N+1 for the opposite slot.
+
+    The service row is locked before the projected-route head is read, matching
+    route publication's lock order.  A durable route source must still point to
+    the exact immutable contract checked from the reporting target; a semantic
+    head advance simply rejects this attempt and lets the next role round retry.
+    """
     if target_slot is not expected_active_slot.other:
         raise ValueError('LB cutover target must be the opposite slot.')
     engine = _db_manager.get_engine()
     _require_postgresql_lb_cutover(engine)
     next_generation = expected_generation + 1
-    predicates = _lb_cutover_owner_predicates(service_name,
-                                              expected_service_hash,
-                                              expected_controller_owner,
-                                              expected_lifecycle_epoch)
-    predicates.extend([
-        services_table.c.lb_active_slot == expected_active_slot.value,
-        services_table.c.lb_cutover_generation == expected_generation,
-        services_table.c.lb_pending_slot.is_(None),
-        services_table.c.lb_cutover_phase == lb_ha.LbCutoverPhase.STABLE.value,
-    ])
-    with orm.Session(engine) as session:
+    with orm.Session(engine) as session, session.begin():
+        owner = session.execute(
+            sqlalchemy.select(
+                services_table.c.name,
+                services_table.c.hash,
+                services_table.c.pool,
+                services_table.c.current_version,
+                services_table.c.controller_pid,
+                services_table.c.controller_ip,
+                services_table.c.controller_incarnation,
+                services_table.c.controller_owner_epoch,
+                services_table.c.lifecycle_epoch,
+                services_table.c.route_source_mode,
+                services_table.c.route_source_epoch,
+                services_table.c.route_projection_capable,
+                services_table.c.route_projection_controller_incarnation,
+                services_table.c.route_projection_protocol_version,
+                services_table.c.lb_ha_enabled,
+                services_table.c.lb_active_slot,
+                services_table.c.lb_cutover_generation,
+                services_table.c.lb_pending_slot,
+                services_table.c.lb_cutover_phase,
+            ).where(services_table.c.name ==
+                    service_name).with_for_update()).mappings().one_or_none()
+        if owner is None:
+            return None
+        owner_matches = (
+            owner['hash'] == expected_service_hash and
+            owner['controller_pid'] == expected_controller_owner[0] and
+            owner['controller_ip'] == expected_controller_owner[1] and
+            owner['lifecycle_epoch'] == expected_lifecycle_epoch and
+            owner['lb_ha_enabled'] in (1, True) and
+            owner['lb_active_slot'] == expected_active_slot.value and
+            owner['lb_cutover_generation'] == expected_generation and
+            owner['lb_pending_slot'] is None and
+            owner['lb_cutover_phase'] == lb_ha.LbCutoverPhase.STABLE.value)
+        if not owner_matches:
+            return None
+        try:
+            route_mode = route_projection.RouteSourceMode(
+                owner['route_source_mode'])
+        except (TypeError, ValueError):
+            return None
+        if route_mode == route_projection.RouteSourceMode.LEGACY_PROXY:
+            if route_promotion_contract is not None:
+                return None
+        elif not route_projection.current_promotion_contract_matches_in_session(
+                session, owner, route_promotion_contract):
+            return None
         serialized_snapshot = (json.dumps(demand_snapshot.to_dict())
                                if demand_snapshot is not None else
                                services_table.c.lb_last_demand_snapshot)
         row = session.execute(
-            sqlalchemy.update(services_table).where(*predicates).values(
-                lb_pending_slot=target_slot.value,
-                lb_cutover_generation=next_generation,
-                lb_cutover_phase=lb_ha.LbCutoverPhase.PREPARING.value,
-                lb_demand_handoff_generation=next_generation,
-                lb_demand_handoff_snapshot=serialized_snapshot,
-                lb_demand_handoff_complete_at=None).returning(
-                    services_table.c.lifecycle_epoch)).fetchone()
-        session.commit()
+            sqlalchemy.update(services_table).where(
+                services_table.c.name == service_name).values(
+                    lb_pending_slot=target_slot.value,
+                    lb_cutover_generation=next_generation,
+                    lb_cutover_phase=lb_ha.LbCutoverPhase.PREPARING.value,
+                    lb_demand_handoff_generation=next_generation,
+                    lb_demand_handoff_snapshot=serialized_snapshot,
+                    lb_demand_handoff_complete_at=None).returning(
+                        services_table.c.lifecycle_epoch)).fetchone()
     if row is None:
         return None
     return lb_ha.LbCutoverState(enabled=True,

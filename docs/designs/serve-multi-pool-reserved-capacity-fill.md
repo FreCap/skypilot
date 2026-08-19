@@ -1479,13 +1479,48 @@ and record identity; stale evidence cannot affect a successor. Raw URLs remain
 only in the existing identity-validated drain report. URL-to-replica caches are
 deleted.
 
-The route read is one indexed PostgreSQL head/generation join plus bounded
-canonical decoding. Tests instrument provider/Kubernetes adapters and require
-zero calls, complete owner replacement, exact successor isolation, and one
-poisoned launch association among hundreds without blocking fresh route
-publication for healthy rows. The generous regression ceilings are one cold
-840-route read within ten seconds and 100 subsequent reads with p99 below one
-second; they are not permission to add another in-process cache.
+The HA role channel uses that same immutable projection as promotion authority.
+The LB applies routing URLs, service version, route-source epoch, projection
+generation, digest, and the removed-client drain overlay under one lock, then
+echoes the coherent fence in both role and durable-demand reports. A replacement
+controller never relies on its empty process-local occupancy cache: on every
+candidate heartbeat it reads the current route source and exact fresh immutable
+snapshot in one PostgreSQL transaction, derives the expected asynchronous URLs
+from the snapshot, exact-matches the LB's reported routing URL set, and requires
+a fresh generation-valid sample for every expected asynchronous URL. Extra
+coherent samples for off-ready draining URLs are permitted; omission of a
+currently routed URL is not. Legacy route mode alone retains the transitional
+process-local contract. The LB treats `(service version, route generation,
+route digest, route-source epoch)` as part of its occupancy observation
+context. Any change advances the existing sample epoch and clears exported
+proof before the new route fence is visible; a probe crossing that transition
+is rejected at completion. Pending reservations remain conservative, an
+identical head renewal preserves current proof, and a successor record reusing
+the same URL cannot inherit old local capacity or idle evidence.
+
+Promotion is fail closed without disturbing the healthy selected slot. Missing,
+malformed, stale, corrupt, or owner-mismatched route evidence returns a normal
+role heartbeat with `promotable=false`; it does not move the Service selector.
+The STABLE-to-PREPARING transaction locks the service row before rechecking that
+the same generation/digest is still the fresh route head. A semantic head
+advance rejects the CAS and the next LB sync/role round retries; an unchanged
+head renewal is accepted. The one-way route-source promotion takes the same
+service-row lock and, for HA services, is permitted only in STABLE; it cannot
+race a legacy decision into PREPARING or MIGRATING. Bounded rollout telemetry
+exposes only the promotion
+reason enum, route mode/version/epoch/generation, expected/reported/fresh/missing
+backend counts, planned-upgrade decision, transition-attempted bit, and CAS
+result. It never exports URLs, route digests, tokens, Pod IDs, or request IDs.
+
+The promotion read is one fail-fast shared owner-lock statement plus one indexed
+PostgreSQL head/generation join. It copies the immutable row and releases the
+lock before bounded canonical decoding; the cutover CAS revalidates the exact
+head. Tests pin that two-statement shape and instrument provider/Kubernetes
+adapters to require zero calls, complete owner replacement, exact successor
+isolation, and one poisoned launch association among hundreds without blocking
+fresh route publication for healthy rows. The generous regression ceilings are
+one cold 840-route read within ten seconds and 100 subsequent reads with p99
+below one second; they are not permission to add another in-process cache.
 
 ### 7a. Controller takeover of promoted capacity authority
 
@@ -3708,15 +3743,21 @@ legacy activation.
   and pre-row intents cannot actuate, a fresh complete report bound to the
   replacement route restores planning, stale persisted demand ownership is
   repaired without epoch changes, and a concurrent loser changes nothing.
-- [ ] Deploy the bridge, PR #1561 exact-head hardening, and #1562 takeover fix
-  before authority activation. Verify feed generation `N` publishes both
+- [ ] Merge and deploy the durable-route HA promotion fix with the bridge,
+  PR #1561 exact-head hardening, and #1562 takeover fix before authority
+  activation. Verify feed generation `N` publishes both
   logical target and manager evidence at `N`, a repeated `N` cannot release
   adopted retirements, and a fresh `N + 1` lets the existing manager path
   commit through the exact database seam and resume normal evidence-backed
-  convergence. Confirm stale/unavailable reads revoke the full manager pair,
-  no ambiguous outcome starts its original worker, and one controller-child
-  restart plus one controller-Pod takeover preserve bound planning before the
-  cleanup horizon opens.
+  convergence. Confirm stale/unavailable reads revoke the full manager pair
+  and no ambiguous outcome starts its original worker. Then exercise one
+  controller-child restart and one controller-Pod takeover after promotion.
+  Each replacement must preserve bound planning and reconstruct HA
+  promotability from the exact durable route generation with no
+  controller-sync side effect; a mismatched generation or routing URL set must
+  leave the selected slot healthy, and bounded role telemetry must record the
+  closed/open gate and cutover CAS result. These production failover exercises
+  remain required before the cleanup horizon opens.
 - [ ] Activate reserved reconciliation, promote ordinary binding and generic
   non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
   through one canonical generation-fenced transaction. No reconciliation tick

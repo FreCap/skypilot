@@ -1,5 +1,5 @@
 """PostgreSQL contracts for durable provider-free SkyServe routes."""
-# pylint: disable=not-callable,redefined-outer-name,unused-import
+# pylint: disable=not-callable,protected-access,redefined-outer-name,unused-import
 
 import concurrent.futures
 import datetime
@@ -15,8 +15,11 @@ from test_serve_resource_actions_pg import empty_postgres
 from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky.serve import demand_state_schema
+from sky.serve import lb_cutover_state
+from sky.serve import lb_ha
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
+from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
@@ -47,6 +50,21 @@ def route_database(empty_postgres):
     return empty_postgres, incarnation
 
 
+def _wait_until_blocked_by(engine, blocked_pid, blocker_pid):
+    deadline = time.monotonic() + 10
+    while True:
+        with engine.connect() as connection:
+            blocking_pids = connection.execute(
+                sqlalchemy.select(sqlalchemy.func.pg_blocking_pids(
+                    blocked_pid))).scalar_one()
+        if blocker_pid in blocking_pids:
+            return
+        if time.monotonic() >= deadline:
+            pytest.fail(f'backend {blocked_pid} did not block on '
+                        f'backend {blocker_pid}')
+        threading.Event().wait(timeout=0.01)
+
+
 def _identity(incarnation):
     return route_projection.RoutePublisherIdentity(
         service_name='svc',
@@ -56,6 +74,25 @@ def _identity(incarnation):
         controller_owner_epoch=4,
         controller_pid=123,
         controller_ip='10.0.0.5')
+
+
+def test_route_promotion_owner_reads_exact_postgres_state(
+        route_database, monkeypatch):
+    engine, incarnation = route_database
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+
+    owner = serve_state.get_service_controller_owner(
+        'svc', include_lb_state=True, include_route_owner_state=True)
+
+    assert owner is not None
+    assert owner['current_version'] == 1
+    assert owner['controller_incarnation'] == incarnation
+    assert owner['controller_owner_epoch'] == 4
+    assert owner['route_source_mode'] == 'LEGACY_PROXY'
+    assert owner['route_source_epoch'] == 0
+    assert owner['route_projection_capable'] is False
+    assert owner['route_projection_controller_incarnation'] is None
+    assert owner['route_projection_protocol_version'] is None
 
 
 def _insert_replica(engine,
@@ -158,6 +195,30 @@ def _compose_empty_incremental(repository, incarnation):
         lambda _infos, _translation, _logical_versions:
         {'replica_unit': 'physical_backend'},
         ttl_seconds=60)
+
+
+def _enable_projected_contract(route_database, *, response=None):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    projected_response = response or _response()
+    record_id = str(uuid.uuid4())
+    route_url = next(iter(projected_response['replica_info']))
+    receipt = repository.publish(_identity(incarnation),
+                                 1,
+                                 projected_response,
+                                 _identity_payload(record_id, route_url),
+                                 {record_id},
+                                 ttl_seconds=60)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    route_source_mode='DURABLE_PROJECTED',
+                    route_source_epoch=1,
+                    route_projection_capable=True,
+                    route_projection_controller_incarnation=incarnation,
+                    route_projection_protocol_version=1))
+    return repository, incarnation, projected_response, receipt
 
 
 def test_revocation_hooks_noop_before_serve051(empty_postgres):
@@ -610,6 +671,382 @@ def test_publish_refresh_promote_and_provider_free_read(route_database):
     assert projected.response['route_source_epoch'] == 1
     assert set(projected.response['replica_info']) == {'http://10.0.0.1:8000'}
     assert projected.response['capacity_hint']['decoded'] == 1
+
+
+def test_route_promotion_waits_for_and_rejects_nonstable_ha_cutover(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    _compose_empty_incremental(repository, incarnation)
+    blocker = engine.connect()
+    transaction = blocker.begin()
+    promotion_thread_ids = set()
+    promotion_lock_attempted = threading.Event()
+    promotion_backend_pid = {}
+
+    def _record_promotion_statement(_connection, cursor, statement, *_args):
+        if (threading.get_ident() in promotion_thread_ids and
+                'FROM services' in statement and 'FOR UPDATE' in statement):
+            promotion_backend_pid['value'] = cursor.connection.get_backend_pid()
+            promotion_lock_attempted.set()
+
+    def _promote():
+        promotion_thread_ids.add(threading.get_ident())
+        return repository.promote('svc', 'svc-hash')
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _record_promotion_statement)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        blocker_pid = blocker.execute(
+            sqlalchemy.select(sqlalchemy.func.pg_backend_pid())).scalar_one()
+        blocker.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=1,
+                    lb_active_slot=lb_ha.LbSlot.A.value,
+                    lb_cutover_generation=2,
+                    lb_pending_slot=lb_ha.LbSlot.B.value,
+                    lb_cutover_phase=lb_ha.LbCutoverPhase.PREPARING.value))
+        promotion = executor.submit(_promote)
+        assert promotion_lock_attempted.wait(timeout=5)
+        _wait_until_blocked_by(engine, promotion_backend_pid['value'],
+                               blocker_pid)
+        assert not promotion.done()
+
+        transaction.commit()
+        with pytest.raises(route_projection.RouteProjectionUnavailable,
+                           match='stable HA cutover'):
+            promotion.result(timeout=5)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        executor.shutdown(wait=True)
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _record_promotion_statement)
+        blocker.close()
+
+    with engine.connect() as connection:
+        mode = connection.execute(
+            sqlalchemy.select(
+                serve_state_schema.services_table.c.route_source_mode).where(
+                    serve_state_schema.services_table.c.name ==
+                    'svc')).scalar_one()
+    assert mode == route_projection.RouteSourceMode.LEGACY_PROXY.value
+
+
+def test_route_promotion_rejects_malformed_ha_enablement(route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    _compose_empty_incremental(repository, incarnation)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=2))
+
+    with pytest.raises(route_projection.RouteProjectionCorruption,
+                       match='HA enablement'):
+        repository.promote('svc', 'svc-hash')
+
+
+def test_promotion_contract_reads_exact_fresh_snapshot(route_database):
+    response = _response()
+    route_url = next(iter(response['replica_info']))
+    response['replica_info'][route_url]['async_occupancy'] = 'true'
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database, response=response)
+
+    statements = []
+
+    def _record_statement(_connection, _cursor, statement, *_args):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(route_database[0], 'before_cursor_execute',
+                            _record_statement)
+    try:
+        decision = repository.resolve_promotion_contract(
+            _identity(incarnation), 1, 1, receipt.generation,
+            receipt.content_sha256)
+    finally:
+        sqlalchemy.event.remove(route_database[0], 'before_cursor_execute',
+                                _record_statement)
+
+    assert decision.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED
+    assert decision.contract == route_projection.RoutePromotionContract(
+        service_version=1,
+        route_source_epoch=1,
+        generation=receipt.generation,
+        content_sha256=receipt.content_sha256,
+        routing_urls=frozenset({route_url}),
+        async_occupancy_urls=frozenset({route_url}))
+    assert len(statements) == 2
+    assert 'JOIN serve_route_snapshots' in statements[1]
+
+
+def test_legacy_promotion_allows_committed_version_ahead_of_applied(
+        route_database):
+    engine, incarnation = route_database
+    repository = route_projection.RouteProjectionRepository(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    current_version=2))
+
+    statements = []
+
+    def _record_statement(_connection, _cursor, statement, *_args):
+        statements.append(statement)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute', _record_statement)
+    try:
+        decision = repository.resolve_promotion_contract(
+            _identity(incarnation), 1, None, None, None)
+    finally:
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _record_statement)
+
+    assert decision == route_projection.RoutePromotionDecision(
+        mode=route_projection.RouteSourceMode.LEGACY_PROXY)
+    assert len(statements) == 1
+
+
+def test_promotion_contract_shared_lock_is_scoped_to_multi_read(route_database):
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database)
+    engine, _ = route_database
+    blocker = engine.connect()
+    transaction = blocker.begin()
+    resolver_thread_ids = set()
+    publisher_thread_ids = set()
+    reader_reached_head = threading.Event()
+    release_reader = threading.Event()
+    publisher_lock_attempted = threading.Event()
+    resolver_backend_pid = {}
+    publisher_backend_pid = {}
+
+    def _coordinate_statements(_connection, cursor, statement, *_args):
+        thread_id = threading.get_ident()
+        if (thread_id in resolver_thread_ids and
+                'FROM serve_route_heads' in statement and
+                not reader_reached_head.is_set()):
+            resolver_backend_pid['value'] = cursor.connection.get_backend_pid()
+            reader_reached_head.set()
+            assert release_reader.wait(timeout=10)
+        if (thread_id in publisher_thread_ids and
+                'FROM services' in statement and 'FOR UPDATE' in statement):
+            publisher_backend_pid['value'] = cursor.connection.get_backend_pid()
+            publisher_lock_attempted.set()
+
+    def _resolve():
+        resolver_thread_ids.add(threading.get_ident())
+        return repository.resolve_promotion_contract(_identity(incarnation), 1,
+                                                     1, receipt.generation,
+                                                     receipt.content_sha256)
+
+    next_url = 'http://10.0.0.2:8000'
+    next_record_id = str(uuid.uuid4())
+
+    def _publish():
+        publisher_thread_ids.add(threading.get_ident())
+        return repository.publish(_identity(incarnation),
+                                  1,
+                                  _response(next_url),
+                                  _identity_payload(next_record_id, next_url),
+                                  {next_record_id},
+                                  ttl_seconds=60)
+
+    sqlalchemy.event.listen(engine, 'before_cursor_execute',
+                            _coordinate_statements)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    try:
+        blocker.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).scalar_one()
+
+        # Producer selection is only an owner read, so an unrelated writer
+        # must not block it under PostgreSQL MVCC.
+        producer = executor.submit(
+            repository.current_owner_uses_incremental_producer,
+            _identity(incarnation))
+        assert producer.result(timeout=5) is False
+        transaction.commit()
+
+        resolution = executor.submit(_resolve)
+        assert reader_reached_head.wait(timeout=5)
+        publication = executor.submit(_publish)
+        assert publisher_lock_attempted.wait(timeout=5)
+        _wait_until_blocked_by(engine, publisher_backend_pid['value'],
+                               resolver_backend_pid['value'])
+        assert not publication.done()
+
+        release_reader.set()
+        decision = resolution.result(timeout=5)
+        assert decision.mode == route_projection.RouteSourceMode.DURABLE_PROJECTED
+        assert decision.contract is not None
+        assert decision.contract.generation == receipt.generation
+        assert decision.contract.content_sha256 == receipt.content_sha256
+
+        published = publication.result(timeout=5)
+        assert published.generation == receipt.generation + 1
+        next_decision = repository.resolve_promotion_contract(
+            _identity(incarnation), 1, 1, published.generation,
+            published.content_sha256)
+        assert next_decision.contract is not None
+        assert next_decision.contract.generation == published.generation
+        assert next_decision.contract.content_sha256 == published.content_sha256
+        assert next_decision.contract.routing_urls == frozenset({next_url})
+    finally:
+        release_reader.set()
+        if transaction.is_active:
+            transaction.rollback()
+        executor.shutdown(wait=True)
+        sqlalchemy.event.remove(engine, 'before_cursor_execute',
+                                _coordinate_statements)
+        blocker.close()
+
+
+def test_promotion_contract_fails_fast_on_owner_lock_contention(route_database):
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database)
+    engine, _ = route_database
+    blocker = engine.connect()
+    transaction = blocker.begin()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        blocker.execute(
+            sqlalchemy.select(serve_state_schema.services_table.c.name).where(
+                serve_state_schema.services_table.c.name ==
+                'svc').with_for_update()).scalar_one()
+        resolution = executor.submit(repository.resolve_promotion_contract,
+                                     _identity(incarnation), 1, 1,
+                                     receipt.generation, receipt.content_sha256)
+        with pytest.raises(route_projection.RouteProjectionUnavailable,
+                           match='promotion-contract read'):
+            resolution.result(timeout=1)
+    finally:
+        if transaction.is_active:
+            transaction.rollback()
+        executor.shutdown(wait=True)
+        blocker.close()
+
+
+@pytest.mark.parametrize(
+    ('version', 'epoch', 'generation', 'digest', 'error'), [
+        (2, 1, 1, 'a' * 64, route_projection.RouteProjectionConflict),
+        (1, 2, 1, 'a' * 64, route_projection.RouteProjectionConflict),
+        (1, 1, 2, 'a' * 64, route_projection.RouteProjectionConflict),
+        (1, 1, 1, 'b' * 64, route_projection.RouteProjectionConflict),
+        (1, 1, 1, None, route_projection.RouteProjectionValidationError),
+    ])
+def test_promotion_contract_rejects_every_reported_fence_mismatch(
+        route_database, version, epoch, generation, digest, error):
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database)
+    generation = receipt.generation if generation == 1 else generation
+    digest = receipt.content_sha256 if digest == 'a' * 64 else digest
+
+    with pytest.raises(error):
+        repository.resolve_promotion_contract(_identity(incarnation), version,
+                                              epoch, generation, digest)
+
+
+def test_promotion_contract_rejects_invalid_async_marker(route_database):
+    response = _response()
+    route_url = next(iter(response['replica_info']))
+    response['replica_info'][route_url]['async_occupancy'] = 'TRUE'
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database, response=response)
+
+    with pytest.raises(route_projection.RouteProjectionCorruption,
+                       match='async-occupancy'):
+        repository.resolve_promotion_contract(_identity(incarnation), 1, 1,
+                                              receipt.generation,
+                                              receipt.content_sha256)
+
+
+@pytest.mark.parametrize('missing', [True, False])
+def test_promotion_contract_rejects_missing_or_expired_head(
+        route_database, missing):
+    repository, incarnation, _, receipt = _enable_projected_contract(
+        route_database)
+    engine, _ = route_database
+    head = route_projection_schema.serve_route_heads_table
+    with engine.begin() as connection:
+        if missing:
+            connection.execute(
+                sqlalchemy.delete(head).where(head.c.service_name == 'svc'))
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            connection.execute(
+                sqlalchemy.update(head).where(
+                    head.c.service_name == 'svc').values(
+                        refreshed_at=now - datetime.timedelta(seconds=2),
+                        valid_until=now - datetime.timedelta(seconds=1)))
+
+    with pytest.raises(route_projection.RouteProjectionUnavailable,
+                       match='missing or stale'):
+        repository.resolve_promotion_contract(_identity(incarnation), 1, 1,
+                                              receipt.generation,
+                                              receipt.content_sha256)
+
+
+def test_cutover_cas_revalidates_current_route_head(route_database,
+                                                    monkeypatch):
+    repository, incarnation, _, first = _enable_projected_contract(
+        route_database)
+    engine, _ = route_database
+    monkeypatch.setattr(serve_state_schema._db_manager, '_engine', engine)
+    with engine.begin() as connection:
+        connection.execute(
+            sqlalchemy.update(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name == 'svc').values(
+                    lb_ha_enabled=1,
+                    lb_active_slot=lb_ha.LbSlot.A.value,
+                    lb_cutover_generation=1,
+                    lb_pending_slot=None,
+                    lb_cutover_phase=lb_ha.LbCutoverPhase.STABLE.value))
+    first_decision = repository.resolve_promotion_contract(
+        _identity(incarnation), 1, 1, first.generation, first.content_sha256)
+    assert first_decision.contract is not None
+
+    next_url = 'http://10.0.0.2:8000'
+    next_record_id = str(uuid.uuid4())
+    second = repository.publish(_identity(incarnation),
+                                1,
+                                _response(next_url),
+                                _identity_payload(next_record_id, next_url),
+                                {next_record_id},
+                                ttl_seconds=60)
+    assert second.generation == first.generation + 1
+    owner = (123, '10.0.0.5')
+    assert lb_cutover_state.begin_lb_cutover(
+        'svc',
+        'svc-hash',
+        owner,
+        3,
+        lb_ha.LbSlot.A,
+        1,
+        lb_ha.LbSlot.B,
+        route_promotion_contract=first_decision.contract) is None
+    assert lb_cutover_state.get_lb_cutover_state(
+        'svc').phase == lb_ha.LbCutoverPhase.STABLE
+
+    second_decision = repository.resolve_promotion_contract(
+        _identity(incarnation), 1, 1, second.generation, second.content_sha256)
+    preparing = lb_cutover_state.begin_lb_cutover(
+        'svc',
+        'svc-hash',
+        owner,
+        3,
+        lb_ha.LbSlot.A,
+        1,
+        lb_ha.LbSlot.B,
+        route_promotion_contract=second_decision.contract)
+    assert preparing is not None
+    assert preparing.phase == lb_ha.LbCutoverPhase.PREPARING
 
 
 def _prepare_incremental_replica(route_database):

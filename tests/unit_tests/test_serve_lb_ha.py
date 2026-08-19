@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from unittest import mock
+import uuid
 
 import pytest
 
@@ -13,6 +14,7 @@ from sky.serve import constants as serve_constants
 from sky.serve import controller
 from sky.serve import lb_ha
 from sky.serve import lb_k8s
+from sky.serve import route_projection
 from sky.serve import serve_utils
 
 _REAL_GET_LB_ROLE_SNAPSHOT = lb_k8s.get_lb_role_snapshot
@@ -599,6 +601,16 @@ def _role_owner_record(
         'controller_pid': fence[1][0],
         'controller_ip': fence[1][1],
         'lifecycle_epoch': fence[2],
+        'pool': False,
+        'current_version': 1,
+        'controller_incarnation': uuid.UUID(int=1),
+        'controller_owner_epoch': 4,
+        'route_source_mode':
+            route_projection.RouteSourceMode.LEGACY_PROXY.value,
+        'route_source_epoch': 0,
+        'route_projection_capable': False,
+        'route_projection_controller_incarnation': None,
+        'route_projection_protocol_version': None,
         'resource_scope': None,
         'lb_ha_enabled': state.enabled,
         'lb_active_slot':
@@ -648,6 +660,7 @@ def _role_controller() -> controller.SkyServeController:
         if state is None:
             return None
         owner = _role_owner_record(fence, state)
+        owner.update(getattr(ctrl, '_test_role_owner_overrides', {}))
         return controller._LbRoleDatabaseSnapshot(fence, state, owner)
 
     ctrl._lb_role_database_snapshot = mock.Mock(side_effect=database_snapshot)
@@ -682,6 +695,11 @@ def _adapt_existing_role_handler_mocks(monkeypatch):
 
     monkeypatch.setattr(controller.lb_k8s, 'get_lb_role_snapshot',
                         read_snapshot)
+    monkeypatch.setattr(
+        route_projection.RouteProjectionRepository,
+        'resolve_promotion_contract', lambda _repository, _identity, _version,
+        _epoch, _generation, _digest: route_projection.RoutePromotionDecision(
+            route_projection.RouteSourceMode.LEGACY_PROXY))
 
 
 def _configure_sync_controller(ctrl: controller.SkyServeController,
@@ -764,7 +782,8 @@ def test_role_cutover_captures_sync_head_snapshot_while_tail_is_blocked():
     assert role_response.status_code == 200
     assert sync_response.status_code == 200
     assert json.loads(role_response.body)['role'] == 'ARMED'
-    assert begin.call_args.args[-1] is snapshot
+    assert begin.call_args.args[-2] is snapshot
+    assert begin.call_args.args[-1] is None
 
 
 def test_ordinary_role_heartbeat_does_not_wait_for_sync_demand_head():
@@ -1805,7 +1824,9 @@ def test_role_database_snapshot_reads_owner_and_complete_state_once():
         ('incarnation', (123, '10.0.0.1'), 7),
         lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
                              lb_ha.LbCutoverPhase.STABLE, 7, 123.5), owner)
-    owner_read.assert_called_once_with('service', include_lb_state=True)
+    owner_read.assert_called_once_with('service',
+                                       include_lb_state=True,
+                                       include_route_owner_state=True)
 
 
 @pytest.mark.parametrize(('field', 'changed'),
@@ -1909,14 +1930,212 @@ def _authority(*, target_ready: bool = True) -> lb_k8s.LbPodAuthority:
 
 def _role_request(session_id: str,
                   slot: lb_ha.LbSlot,
-                  armed_generation: int | None = None) -> dict:
-    return {
+                  armed_generation: int | None = None,
+                  **override) -> dict:
+    request = {
         'lb_session_id': session_id,
         'lb_slot': slot.value,
         'routing_version': 1,
         'armed_generation': armed_generation,
         **_report({}, {}, {}, {}, routing_urls=[]),
     }
+    request.update(override)
+    return request
+
+
+def _durable_contract(
+    *,
+    routing_urls: frozenset[str] = frozenset({'http://replica:8080'}),
+    async_urls: frozenset[str] = frozenset(),
+) -> route_projection.RoutePromotionContract:
+    return route_projection.RoutePromotionContract(
+        service_version=1,
+        route_source_epoch=3,
+        generation=11,
+        content_sha256='a' * 64,
+        routing_urls=routing_urls,
+        async_occupancy_urls=async_urls)
+
+
+def _enable_durable_route_owner(ctrl: controller.SkyServeController) -> None:
+    ctrl._test_role_owner_overrides = {
+        'route_source_mode':
+            route_projection.RouteSourceMode.DURABLE_PROJECTED.value,
+        'route_source_epoch': 3,
+        'route_projection_capable': True,
+        'route_projection_controller_incarnation': uuid.UUID(int=1),
+        'route_projection_protocol_version': 2,
+    }
+
+
+def _durable_role_request(session_id: str,
+                          slot: lb_ha.LbSlot,
+                          contract: route_projection.RoutePromotionContract,
+                          *,
+                          sample_age: float = 1.0) -> dict:
+    asynchronous = {url: 0 for url in contract.async_occupancy_urls}
+    generations = {url: 1 for url in contract.async_occupancy_urls}
+    ages = {url: sample_age for url in contract.async_occupancy_urls}
+    return _role_request(session_id,
+                         slot,
+                         route_projection_generation=contract.generation,
+                         route_projection_sha256=contract.content_sha256,
+                         route_source_epoch=contract.route_source_epoch,
+                         **_report({},
+                                   asynchronous,
+                                   generations,
+                                   ages,
+                                   routing_urls=sorted(contract.routing_urls)))
+
+
+def test_empty_process_cache_reconstructs_durable_contract_and_arms_upgrade():
+    ctrl = _role_controller()
+    ctrl._lb_occupancy_contract_known = False
+    _enable_durable_route_owner(ctrl)
+    contract = _durable_contract()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    preparing = _state(lb_ha.LbCutoverPhase.PREPARING,
+                       pending=lb_ha.LbSlot.B,
+                       generation=2)
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1', 'runtime-new')
+    decision = route_projection.RoutePromotionDecision(
+        route_projection.RouteSourceMode.DURABLE_PROJECTED, contract)
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_pod_authority',
+            return_value=_authority()), mock.patch.object(
+                controller.lb_k8s,
+                'get_lb_service_routing',
+                return_value=routing), mock.patch.object(
+                    controller.serve_state,
+                    'get_lb_cutover_state',
+                    return_value=stable), mock.patch.object(
+                        route_projection.RouteProjectionRepository,
+                        'resolve_promotion_contract',
+                        return_value=decision), mock.patch.object(
+                            controller.serve_state,
+                            'begin_lb_cutover',
+                            return_value=preparing) as begin:
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _durable_role_request('standby', lb_ha.LbSlot.B, contract)))
+
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body['role'] == lb_ha.LbRole.ARMED.value
+    assert body['promotable'] is True
+    gate = body['ha_rollout']['promotion_gate']
+    assert gate == {
+        'eligible': True,
+        'reason': 'eligible',
+        'route_mode': 'DURABLE_PROJECTED',
+        'routing_version': 1,
+        'route_source_epoch': 3,
+        'route_generation': 11,
+        'expected_routing_backend_count': 1,
+        'reported_routing_backend_count': 1,
+        'expected_async_backend_count': 0,
+        'reported_async_backend_count': 0,
+        'fresh_async_backend_count': 0,
+        'missing_async_backend_count': 0,
+        'stale_async_backend_count': 0,
+    }
+    assert body['ha_rollout']['planned_upgrade'] is True
+    assert body['ha_rollout']['transition_attempted'] is True
+    assert body['ha_rollout']['transition_cas_result'] is True
+    assert contract.content_sha256 not in json.dumps(body['ha_rollout'])
+    assert 'http://replica:8080' not in json.dumps(body['ha_rollout'])
+    assert begin.call_args.args[-1] is contract
+
+
+@pytest.mark.parametrize(('request_mutation', 'reason'), [
+    ({
+        'routing_urls': ['http://different:8080']
+    }, 'routing_urls_mismatch'),
+    ({
+        'occupancy_sample_age_seconds': {
+            'http://replica:8080':
+                serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS + 1,
+        }
+    }, 'occupancy_sample_stale'),
+])
+def test_durable_promotion_gate_fails_closed_with_bounded_reason(
+        request_mutation, reason):
+    ctrl = _role_controller()
+    ctrl._lb_occupancy_contract_known = False
+    _enable_durable_route_owner(ctrl)
+    contract = _durable_contract(async_urls=frozenset({'http://replica:8080'}))
+    request = _durable_role_request('standby', lb_ha.LbSlot.B, contract)
+    request.update(request_mutation)
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1', 'runtime-new')
+    decision = route_projection.RoutePromotionDecision(
+        route_projection.RouteSourceMode.DURABLE_PROJECTED, contract)
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_pod_authority',
+            return_value=_authority()), mock.patch.object(
+                controller.lb_k8s,
+                'get_lb_service_routing',
+                return_value=routing), mock.patch.object(
+                    controller.serve_state,
+                    'get_lb_cutover_state',
+                    return_value=stable), mock.patch.object(
+                        route_projection.RouteProjectionRepository,
+                        'resolve_promotion_contract',
+                        return_value=decision), mock.patch.object(
+                            controller.serve_state,
+                            'begin_lb_cutover') as begin:
+        response = asyncio.run(ctrl._handle_load_balancer_role(request))
+
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body['role'] == lb_ha.LbRole.STANDBY.value
+    assert body['promotable'] is False
+    assert body['ha_rollout']['promotion_gate']['reason'] == reason
+    assert body['ha_rollout']['transition_attempted'] is False
+    assert body['ha_rollout']['transition_cas_result'] is None
+    begin.assert_not_called()
+
+
+def test_durable_contract_unavailable_keeps_active_healthy_and_blocks_cutover():
+    ctrl = _role_controller()
+    _enable_durable_route_owner(ctrl)
+    contract = _durable_contract()
+    stable = _state(lb_ha.LbCutoverPhase.STABLE)
+    routing = lb_k8s.LbServiceRouting(lb_ha.LbSlot.A, 1, 'rv-1', 'runtime-new')
+
+    with mock.patch.object(
+            controller.lb_k8s, 'get_lb_pod_authority',
+            return_value=_authority()), mock.patch.object(
+                controller.lb_k8s,
+                'get_lb_service_routing',
+                return_value=routing), mock.patch.object(
+                    controller.serve_state,
+                    'get_lb_cutover_state',
+                    return_value=stable), mock.patch.object(
+                        route_projection.RouteProjectionRepository,
+                        'resolve_promotion_contract',
+                        side_effect=route_projection.RouteProjectionUnavailable(
+                            'stale head')), mock.patch.object(
+                                controller.lb_k8s,
+                                'patch_lb_service_active_slot'
+                            ) as patch, mock.patch.object(
+                                controller.serve_state,
+                                'begin_lb_cutover') as begin:
+        response = asyncio.run(
+            ctrl._handle_load_balancer_role(
+                _durable_role_request('standby', lb_ha.LbSlot.B, contract)))
+
+    body = json.loads(response.body)
+    assert response.status_code == 200
+    assert body['outcome'] == 'success'
+    assert body['role'] == lb_ha.LbRole.STANDBY.value
+    assert body['selected_slot'] == lb_ha.LbSlot.A.value
+    assert body['ha_rollout']['promotion_gate']['reason'] == (
+        'route_contract_unavailable')
+    patch.assert_not_called()
+    begin.assert_not_called()
 
 
 def test_role_saga_arms_then_patches_and_commits_selected_standby():

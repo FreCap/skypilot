@@ -27,6 +27,7 @@ from sqlalchemy.dialects import postgresql
 
 from sky.serve import constants
 from sky.serve import demand_state_schema
+from sky.serve import lb_ha
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
@@ -345,6 +346,57 @@ class RouteSyncDecision:
 
     mode: RouteSourceMode
     response: dict[str, Any] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RoutePromotionContract:
+    """Exact immutable route view one load balancer may promote with."""
+
+    service_version: int
+    route_source_epoch: int
+    generation: int
+    content_sha256: str
+    routing_urls: frozenset[str]
+    async_occupancy_urls: frozenset[str]
+
+    def __post_init__(self) -> None:
+        _positive_int(self.service_version, 'service_version')
+        _positive_int(self.route_source_epoch, 'route_source_epoch')
+        _positive_int(self.generation, 'generation')
+        if (not isinstance(self.content_sha256, str) or
+                _SHA256_RE.fullmatch(self.content_sha256) is None):
+            raise RouteProjectionValidationError(
+                'Route promotion digest is invalid.')
+        for field, urls in (('routing_urls', self.routing_urls),
+                            ('async_occupancy_urls',
+                             self.async_occupancy_urls)):
+            if (not isinstance(urls, frozenset) or
+                    len(urls) > MAX_ROUTE_IDENTITIES):
+                raise RouteProjectionValidationError(
+                    f'{field} must be a bounded frozen URL set.')
+            if any(_normalize_url(url) != url for url in urls):
+                raise RouteProjectionValidationError(
+                    f'{field} contains an invalid URL.')
+        if not self.async_occupancy_urls.issubset(self.routing_urls):
+            raise RouteProjectionValidationError(
+                'Async promotion URLs must be routable.')
+
+
+@dataclasses.dataclass(frozen=True)
+class RoutePromotionDecision:
+    """Current durable route owner and its optional promotion contract."""
+
+    mode: RouteSourceMode
+    contract: RoutePromotionContract | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, RouteSourceMode):
+            raise RouteProjectionValidationError(
+                'Route promotion mode is invalid.')
+        if ((self.mode == RouteSourceMode.DURABLE_PROJECTED)
+                != isinstance(self.contract, RoutePromotionContract)):
+            raise RouteProjectionValidationError(
+                'Durable route promotion requires exactly one contract.')
 
 
 def publisher_identity_from_authority(authority: Any) -> RoutePublisherIdentity:
@@ -984,6 +1036,8 @@ def _owner_columns() -> tuple[Any, ...]:
         _SERVICES.c.route_projection_capable,
         _SERVICES.c.route_projection_controller_incarnation,
         _SERVICES.c.route_projection_protocol_version,
+        _SERVICES.c.lb_ha_enabled,
+        _SERVICES.c.lb_cutover_phase,
     )
 
 
@@ -1323,6 +1377,54 @@ def snapshot_owner_matches(snapshot: Mapping[str, Any],
             snapshot.get('controller_pid') == owner.get('controller_pid') and
             snapshot.get('controller_ip') == owner.get('controller_ip') and
             snapshot.get('service_version') == owner.get('current_version'))
+
+
+def current_promotion_contract_matches_in_session(
+    session: orm.Session,
+    owner: Mapping[str, Any],
+    contract: RoutePromotionContract | None,
+) -> bool:
+    """Revalidate one already-decoded contract after locking its owner row.
+
+    Snapshot generations are immutable and content-addressed.  The expensive
+    payload validation therefore happens in ``resolve_promotion_contract``;
+    the cutover CAS only needs to prove that the same fresh immutable row is
+    still the current head under the service-row lock.
+    """
+    if not isinstance(contract, RoutePromotionContract):
+        return False
+    try:
+        mode = RouteSourceMode(owner.get('route_source_mode'))
+    except (TypeError, ValueError):
+        return False
+    if (mode != RouteSourceMode.DURABLE_PROJECTED or
+            owner.get('pool') not in (0, False) or
+            owner.get('current_version') != contract.service_version or
+            owner.get('route_source_epoch') != contract.route_source_epoch or
+            owner.get('route_projection_capable') is not True or
+            owner.get('route_projection_controller_incarnation')
+            != owner.get('controller_incarnation') or
+            owner.get('route_projection_protocol_version')
+            not in (PROTOCOL_VERSION, INCREMENTAL_PRODUCER_PROTOCOL_VERSION)):
+        return False
+    now = session.execute(sqlalchemy.select(
+        sqlalchemy.func.clock_timestamp())).scalar_one()
+    head = session.execute(
+        sqlalchemy.select(_HEADS).where(_HEADS.c.service_name == owner.get(
+            'name'))).mappings().one_or_none()
+    if (head is None or head['valid_until'] <= now or
+            head['generation'] != contract.generation):
+        return False
+    snapshot = session.execute(
+        sqlalchemy.select(_SNAPSHOTS).where(
+            _SNAPSHOTS.c.service_name == owner.get('name'),
+            _SNAPSHOTS.c.generation ==
+            contract.generation)).mappings().one_or_none()
+    return bool(snapshot is not None and
+                snapshot['content_sha256'] == contract.content_sha256 and
+                snapshot_owner_matches(snapshot, owner) and
+                snapshot['producer_protocol_version']
+                == owner.get('route_projection_protocol_version'))
 
 
 def _merge_aliases(current: dict[str, dict[str, Any]],
@@ -2365,6 +2467,138 @@ class RouteProjectionRepository:
             raise RouteProjectionUnavailable(
                 'PostgreSQL route read failed.') from error
 
+    def resolve_promotion_contract(
+        self,
+        identity: RoutePublisherIdentity,
+        service_version: object,
+        route_source_epoch: object,
+        generation: object,
+        content_sha256: object,
+    ) -> RoutePromotionDecision:
+        """Read the exact current route source and promotion fence once.
+
+        Legacy route ownership has no durable projection contract.  Durable
+        ownership exact-matches the load balancer's atomically reported
+        version, epoch, generation, and digest against one fresh immutable
+        snapshot copied from the same PostgreSQL transaction.  The controller
+        chooses the legacy or durable promotion rule only from this result, so
+        a concurrent one-way route-source promotion cannot race a stale legacy
+        decision.
+        """
+        if not isinstance(identity, RoutePublisherIdentity):
+            raise RouteProjectionValidationError(
+                'Route publisher identity is invalid.')
+        reported_version = _positive_int(service_version, 'service_version')
+        try:
+            with orm.Session(self.engine) as session, session.begin():
+                # Every route publisher locks this row FOR UPDATE before it
+                # advances the head.  A shared lock therefore gives the owner
+                # and indexed head/snapshot join one coherent view while still
+                # allowing both LB slots to report concurrently.  Contention
+                # is advisory: fail fast and retry on the next role heartbeat.
+                owner = session.execute(
+                    self._owner_query(identity.service_name).with_for_update(
+                        read=True, nowait=True)).mappings().one_or_none()
+                if owner is None or not _owner_matches(identity, owner):
+                    raise RouteProjectionConflict(
+                        'Route promotion reader no longer owns this service.')
+                try:
+                    mode = RouteSourceMode(owner['route_source_mode'])
+                except (TypeError, ValueError) as error:
+                    raise RouteProjectionCorruption(
+                        'Service route source mode is invalid.') from error
+                if mode == RouteSourceMode.LEGACY_PROXY:
+                    return RoutePromotionDecision(mode=mode)
+                if owner['current_version'] != reported_version:
+                    raise RouteProjectionConflict(
+                        'Load-balancer service version is stale.')
+
+                reported_epoch = _positive_int(route_source_epoch,
+                                               'route_source_epoch')
+                reported_generation = _positive_int(generation, 'generation')
+                if (not isinstance(content_sha256, str) or
+                        _SHA256_RE.fullmatch(content_sha256) is None):
+                    raise RouteProjectionValidationError(
+                        'Route projection digest is invalid.')
+                if (owner['route_projection_capable'] is not True or
+                        owner['route_projection_controller_incarnation']
+                        != owner['controller_incarnation'] or
+                        owner['route_projection_protocol_version']
+                        not in (PROTOCOL_VERSION,
+                                INCREMENTAL_PRODUCER_PROTOCOL_VERSION)):
+                    raise RouteProjectionUnavailable(
+                        'Current controller route capability is unavailable.')
+                if owner['route_source_epoch'] != reported_epoch:
+                    raise RouteProjectionConflict(
+                        'Load-balancer route source epoch is stale.')
+
+                head_snapshot = session.execute(
+                    sqlalchemy.select(
+                        sqlalchemy.func.clock_timestamp().label(
+                            '_database_now'),
+                        _HEADS.c.generation.label('_head_generation'),
+                        _HEADS.c.valid_until.label('_head_valid_until'),
+                        *_SNAPSHOTS.c,
+                    ).select_from(
+                        _HEADS.outerjoin(
+                            _SNAPSHOTS,
+                            sqlalchemy.and_(
+                                _SNAPSHOTS.c.service_name ==
+                                _HEADS.c.service_name,
+                                _SNAPSHOTS.c.generation == _HEADS.c.generation))
+                    ).where(_HEADS.c.service_name ==
+                            identity.service_name)).mappings().one_or_none()
+                if (head_snapshot is None or head_snapshot['_head_valid_until']
+                        <= head_snapshot['_database_now']):
+                    raise RouteProjectionUnavailable(
+                        'Route projection is missing or stale.')
+                if head_snapshot['_head_generation'] != reported_generation:
+                    raise RouteProjectionConflict(
+                        'Load-balancer route projection generation is stale.')
+                if head_snapshot['service_name'] is None:
+                    raise RouteProjectionCorruption(
+                        'Route head references no snapshot.')
+                snapshot = {
+                    column.name: head_snapshot[column.name]
+                    for column in _SNAPSHOTS.c
+                }
+                if snapshot['content_sha256'] != content_sha256:
+                    raise RouteProjectionConflict(
+                        'Load-balancer route projection digest is stale.')
+                if (not snapshot_owner_matches(snapshot, owner) or
+                        snapshot['producer_protocol_version']
+                        != owner['route_projection_protocol_version']):
+                    raise RouteProjectionUnavailable(
+                        'Route projection owner, version, or producer is stale.'
+                    )
+
+                # `snapshot` is now a plain immutable-value copy.  Canonical
+                # decoding is bounded but need not delay publishers; the
+                # STABLE-to-PREPARING CAS revalidates this exact head.
+            response, _ = self.validate_snapshot_row(snapshot)
+            routing_urls = frozenset(
+                url for url, info in response['replica_info'].items()
+                if constants.SYSTEM_RECOVERY_ROUTE_FENCE_KEY not in info)
+            async_urls: set[str] = set()
+            for url in routing_urls:
+                marker = response['replica_info'][url].get('async_occupancy')
+                if marker not in (None, 'true', 'false'):
+                    raise RouteProjectionCorruption(
+                        'Route snapshot async-occupancy marker is invalid.')
+                if marker == 'true':
+                    async_urls.add(url)
+            contract = RoutePromotionContract(
+                service_version=reported_version,
+                route_source_epoch=reported_epoch,
+                generation=reported_generation,
+                content_sha256=content_sha256,
+                routing_urls=routing_urls,
+                async_occupancy_urls=frozenset(async_urls))
+            return RoutePromotionDecision(mode=mode, contract=contract)
+        except sqlalchemy.exc.SQLAlchemyError as error:
+            raise RouteProjectionUnavailable(
+                'PostgreSQL route promotion-contract read failed.') from error
+
     def promote(self, service_name: str, service_hash: str) -> int:
         """Switch one fresh capable service to projected response ownership."""
         _nonempty(service_name, 'service_name')
@@ -2381,6 +2615,20 @@ class RouteProjectionRepository:
                 mode = RouteSourceMode(owner['route_source_mode'])
                 if mode == RouteSourceMode.DURABLE_PROJECTED:
                     return int(owner['route_source_epoch'])
+                ha_enabled = owner['lb_ha_enabled']
+                if type(ha_enabled) is not int or ha_enabled not in (0, 1):
+                    raise RouteProjectionCorruption(
+                        'HA enablement state is invalid.')
+                if ha_enabled == 1:
+                    try:
+                        cutover_phase = lb_ha.LbCutoverPhase(
+                            owner['lb_cutover_phase'])
+                    except (TypeError, ValueError) as error:
+                        raise RouteProjectionCorruption(
+                            'HA cutover phase is invalid.') from error
+                    if cutover_phase is not lb_ha.LbCutoverPhase.STABLE:
+                        raise RouteProjectionUnavailable(
+                            'Route promotion requires a stable HA cutover.')
                 if (owner['pool'] not in (0, False) or
                         owner['route_projection_capable'] is not True or
                         owner['route_projection_controller_incarnation']

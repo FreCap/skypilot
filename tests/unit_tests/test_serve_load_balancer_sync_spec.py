@@ -8,6 +8,8 @@ active, its target-qps map, the stored stream timeout) -- not on any logging.
 """
 # pylint: disable=invalid-name,protected-access
 import asyncio
+import threading
+import time
 import types
 from unittest import mock
 
@@ -445,10 +447,14 @@ def test_projected_route_fence_advances_only_after_full_route_apply(
     with mock.patch.object(lb,
                            '_get_lb_session_id',
                            return_value='test-pod-uid'):
+        role_report = lb._ha_role_payload()
         report, _, _, _ = lb._build_demand_report()
-    assert report['route_projection_generation'] == 11
-    assert report['route_projection_sha256'] == digest
-    assert report['route_source_epoch'] == 3
+    for payload in (role_report, report):
+        assert payload['routing_version'] == 7
+        assert payload['routing_urls'] == ['http://replica:8080']
+        assert payload['route_projection_generation'] == 11
+        assert payload['route_projection_sha256'] == digest
+        assert payload['route_source_epoch'] == 3
 
     # A complete but temporarily unresolvable next generation retains both
     # the already-applied routes and the exact acknowledgement fence.
@@ -469,6 +475,74 @@ def test_projected_route_fence_advances_only_after_full_route_apply(
     assert lb._route_projection_sha256 == digest
 
 
+def test_projected_route_fence_change_invalidates_same_url_occupancy(
+        monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    lb = _make_lb()
+    url = 'http://replica:8080'
+
+    def _sync_body(generation, digest):
+        return {
+            'replica_info': {
+                url: {
+                    'gpu_type': 'L4',
+                    'gpu_count': '1',
+                    'async_occupancy': 'true',
+                }
+            },
+            'num_ready_replicas': 1,
+            'routing_spec': {
+                'load_balancing_policy_name': 'least_load',
+            },
+            'service_version': 7,
+            'route_projection_generation': generation,
+            'route_projection_sha256': digest,
+            'route_source_epoch': 3,
+        }
+
+    _run_one_sync(lb, _sync_body(11, 'a' * 64))
+    with lb._client_pool_lock:
+        sample_epoch = lb._occupancy_role_epoch
+        lb._occupancy_dispatch_generation[url] = 4
+        lb._occupancy_sample_generation[url] = 4
+        lb._occupancy_sample_time[url] = time.monotonic()
+        lb._occupancy_sample_role_epoch[url] = sample_epoch
+        lb._occupancy_current_round_sampled_urls = {url}
+        lb._replica_occupancy[url] = 0
+        lb._replica_total_slots[url] = 1
+        lb._replica_free_slots[url] = 1
+        lb._occupancy_pending_reservations[url] = 1
+        lb._load_balancing_policy.set_occupancy({url: 0})
+
+    _run_one_sync(lb, _sync_body(12, 'b' * 64))
+
+    role_report = lb._ha_role_payload()
+    assert role_report['route_projection_generation'] == 12
+    assert role_report['route_projection_sha256'] == 'b' * 64
+    assert role_report['occupancy_sampled_urls'] == []
+    assert role_report['async_occupancy'] == {}
+    assert role_report['occupancy_sample_generation'] == {}
+    assert role_report['occupancy_sample_age_seconds'] == {}
+    assert role_report['unknown_in_flight_urls'] == [url]
+    with lb._client_pool_lock:
+        assert lb._effective_replica_free_slots_locked() == {}
+        assert lb._occupancy_pending_reservations == {url: 1}
+
+    # An identical head renewal keeps evidence collected under generation 12.
+    with lb._client_pool_lock:
+        current_epoch = lb._occupancy_role_epoch
+        lb._occupancy_sample_generation[url] = 4
+        lb._occupancy_sample_time[url] = time.monotonic()
+        lb._occupancy_sample_role_epoch[url] = current_epoch
+        lb._occupancy_current_round_sampled_urls = {url}
+        lb._replica_occupancy[url] = 0
+        lb._replica_total_slots[url] = 1
+        lb._replica_free_slots[url] = 1
+    _run_one_sync(lb, _sync_body(12, 'b' * 64))
+    assert lb._occupancy_role_epoch == current_epoch
+    assert lb._ha_role_payload()['occupancy_sampled_urls'] == [url]
+
+
 def test_partial_projected_route_fence_is_rejected_without_advancing():
     lb = _make_lb()
 
@@ -486,6 +560,43 @@ def test_partial_projected_route_fence_is_rejected_without_advancing():
 
     assert lb._routing_version is None
     assert lb._route_projection_generation is None
+
+
+def test_role_route_and_projection_fence_are_one_locked_snapshot(monkeypatch):
+    monkeypatch.setenv(constants.LB_POD_UID_ENV_VAR, 'lb-pod-uid-a')
+    lb = _make_lb('least_load')
+    started = threading.Event()
+    result = {}
+
+    def build_role_report():
+        started.set()
+        result.update(lb._ha_role_payload())
+
+    with lb._client_pool_lock:
+        lb._load_balancing_policy.set_ready_replicas(['http://old:8080'])
+        lb._routing_version = 1
+        lb._route_projection_generation = 10
+        lb._route_projection_sha256 = 'a' * 64
+        lb._route_source_epoch = 2
+        thread = threading.Thread(target=build_role_report)
+        thread.start()
+        assert started.wait(timeout=1)
+        # Publish the entire next applied view while the role report is waiting
+        # on the same lock. It may observe old or new in production, never a
+        # crossed route/fence pair; this schedule deterministically yields new.
+        lb._load_balancing_policy.set_ready_replicas(['http://new:8080'])
+        lb._routing_version = 2
+        lb._route_projection_generation = 11
+        lb._route_projection_sha256 = 'b' * 64
+        lb._route_source_epoch = 3
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert result['routing_urls'] == ['http://new:8080']
+    assert result['routing_version'] == 2
+    assert result['route_projection_generation'] == 11
+    assert result['route_projection_sha256'] == 'b' * 64
+    assert result['route_source_epoch'] == 3
 
 
 def test_request_routing_does_not_emit_per_attempt_logs():

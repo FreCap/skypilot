@@ -290,6 +290,54 @@ class TestProbeRound(unittest.TestCase):
         self.assertEqual(balancer._replica_free_slots, {})
         self.assertEqual(balancer._occupancy_current_round_sampled_urls, set())
 
+    def test_probe_crossing_route_projection_cannot_republish_sample(self):
+        policy = lb_policies.LeastLoadPolicy()
+        policy.set_ready_replicas([A])
+        balancer = _make_balancer(policy)
+        with balancer._client_pool_lock:
+            balancer._routing_version = 1
+            balancer._route_projection_generation = 10
+            balancer._route_projection_sha256 = 'a' * 64
+            balancer._route_source_epoch = 2
+
+        async def _run():
+            probe_started = asyncio.Event()
+            finish_probe = asyncio.Event()
+
+            async def _fetch(session, url):
+                del session, url
+                probe_started.set()
+                await finish_probe.wait()
+                return (0, 4, 4)
+
+            balancer._fetch_replica_occupancy = _fetch
+            probe = asyncio.create_task(
+                balancer._probe_replica_occupancy_once())
+            await probe_started.wait()
+            with balancer._client_pool_lock:
+                balancer._routing_version = 1
+                balancer._route_projection_generation = 11
+                balancer._route_projection_sha256 = 'b' * 64
+                balancer._route_source_epoch = 2
+                balancer._occupancy_role_epoch += 1
+                balancer._occupancy_current_round_sampled_urls = set()
+                balancer._occupancy_sampled_off_ready = set()
+            finish_probe.set()
+            await probe
+
+            self.assertEqual(balancer._replica_occupancy, {})
+            self.assertEqual(balancer._replica_free_slots, {})
+            self.assertEqual(balancer._occupancy_current_round_sampled_urls,
+                             set())
+
+            await balancer._probe_replica_occupancy_once()
+
+        asyncio.run(_run())
+
+        self.assertEqual(balancer._replica_occupancy, {A: 0})
+        self.assertEqual(balancer._replica_free_slots, {A: 4})
+        self.assertEqual(balancer._occupancy_current_round_sampled_urls, {A})
+
     def test_large_partial_probe_round_keeps_bounded_local_inventory(self):
         urls = [f'http://worker-{index}:8080' for index in range(342)]
         policy = lb_policies.LeastLoadPolicy()
