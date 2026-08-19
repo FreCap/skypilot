@@ -546,6 +546,8 @@ def update_managed_jobs_statuses(job_ids: list[int] | None = None,
             'controller_generation': snapshot.get('controller_generation'),
             'controller_slot_id': snapshot.get('controller_slot_id'),
             'controller_slot_attempt': snapshot.get('controller_slot_attempt'),
+            'controller_slot_quiescing':
+                snapshot.get('controller_slot_quiescing'),
         }
 
     def _snapshot_is_unchanged(info: dict[str, Any],

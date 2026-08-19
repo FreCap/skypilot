@@ -8,6 +8,7 @@ import filelock
 import pytest
 import sqlalchemy
 from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from sky.jobs import state
@@ -84,6 +85,10 @@ def _forbid_task_row_materialization(monkeypatch):
         return result
 
     monkeypatch.setattr(state.orm.Session, 'execute', _wrap_if_task_select)
+
+
+def _record_owner(observed_owners, owner):
+    observed_owners.append(owner)
 
 
 class TestManagedJobControllerOwnership:
@@ -381,7 +386,7 @@ class TestManagedJobControllerOwnership:
             lambda _session, owner: observed_owners.append(owner))
         monkeypatch.setattr(state.api_requests,
                             'quiesce_stale_managed_job_requests',
-                            lambda owner: observed_owners.append(owner))
+                            lambda owner: _record_owner(observed_owners, owner))
 
         assert state.reset_stale_jobs_for_current_controller() == 1
 
@@ -642,6 +647,7 @@ class TestManagedJobControllerOwnership:
             'controller_generation': owner[1],
             'controller_slot_id': _SLOT_ID,
             'controller_slot_attempt': _SLOT_ATTEMPT,
+            'controller_slot_quiescing': False,
         }
 
         assert (state.set_failed_controller_if_current_snapshot(
@@ -704,6 +710,19 @@ class TestManagedJobControllerOwnership:
         monkeypatch.setattr(state, '_lock_current_controller_owner',
                             lambda _session, _owner: None)
         _forbid_task_row_materialization(monkeypatch)
+        statements = {'select': 0, 'update': 0}
+
+        def _before_cursor_execute(conn, cursor, statement, parameters, context,
+                                   executemany):
+            del conn, cursor, parameters, context, executemany
+            sql = statement.lstrip().upper()
+            if sql.startswith('SELECT'):
+                statements['select'] += 1
+            elif sql.startswith('UPDATE'):
+                statements['update'] += 1
+
+        event.listen(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                     _before_cursor_execute)
         snapshot = {
             'schedule_state': state.ManagedJobScheduleState.ALIVE,
             'controller_pid': 111,
@@ -712,11 +731,15 @@ class TestManagedJobControllerOwnership:
             'controller_generation': owner[1],
             'controller_slot_id': _SLOT_ID,
             'controller_slot_attempt': _SLOT_ATTEMPT,
+            'controller_slot_quiescing': False,
         }
-
-        assert (state.set_failed_controller_if_current_snapshot(
-            job_id, **snapshot, failure_reason='controller died') ==
-                state.ControllerFailureDecision.TERMINALIZED)
+        try:
+            assert (state.set_failed_controller_if_current_snapshot(
+                job_id, **snapshot, failure_reason='controller died') ==
+                    state.ControllerFailureDecision.TERMINALIZED)
+        finally:
+            event.remove(_mock_managed_jobs_db_conn, 'before_cursor_execute',
+                         _before_cursor_execute)
         with state.orm.Session(_mock_managed_jobs_db_conn) as session:
             row = session.execute(
                 sqlalchemy.select(
@@ -727,6 +750,10 @@ class TestManagedJobControllerOwnership:
         assert row.status == state.ManagedJobStatus.FAILED_CONTROLLER.value
         assert row.failure_reason == (
             'controller died. Previously: older failure')
+        assert statements == {
+            'select': 2,
+            'update': 1,
+        }
 
     def test_failure_recheck_reports_already_terminal_without_rewrite(
             self, _mock_managed_jobs_db_conn, monkeypatch):
@@ -761,6 +788,7 @@ class TestManagedJobControllerOwnership:
             'controller_generation': owner[1],
             'controller_slot_id': _SLOT_ID,
             'controller_slot_attempt': _SLOT_ATTEMPT,
+            'controller_slot_quiescing': False,
         }
 
         assert (state.set_failed_controller_if_current_snapshot(
@@ -774,3 +802,57 @@ class TestManagedJobControllerOwnership:
                         state.spot_table.c.spot_job_id == job_id)).one()
         assert row.status == state.ManagedJobStatus.SUCCEEDED.value
         assert row.failure_reason is None
+
+    def test_failure_recheck_rejects_quiesced_snapshot(
+            self, _mock_managed_jobs_db_conn, monkeypatch):
+        job_id = self._seed_waiting_job()
+        owner = ('96d9d1f6-8ba4-402b-85f5-27db321fd504', 22)
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    schedule_state=state.ManagedJobScheduleState.ALIVE.value,
+                    controller_pid=111,
+                    controller_pid_started_at=1.0,
+                    controller_instance_id=owner[0],
+                    controller_generation=owner[1],
+                    controller_slot_id=_SLOT_ID,
+                    controller_slot_attempt=_SLOT_ATTEMPT))
+            session.execute(state.spot_table.update().where(
+                state.spot_table.c.spot_job_id == job_id).values(
+                    status=state.ManagedJobStatus.RUNNING.value))
+            session.commit()
+
+        monkeypatch.setattr(state, 'get_current_controller_owner',
+                            lambda: owner)
+        monkeypatch.setattr(state, '_lock_current_controller_owner',
+                            lambda _session, _owner: None)
+        _forbid_task_row_materialization(monkeypatch)
+        snapshot = {
+            'schedule_state': state.ManagedJobScheduleState.ALIVE,
+            'controller_pid': 111,
+            'controller_pid_started_at': 1.0,
+            'controller_instance_id': owner[0],
+            'controller_generation': owner[1],
+            'controller_slot_id': _SLOT_ID,
+            'controller_slot_attempt': _SLOT_ATTEMPT,
+            'controller_slot_quiescing': False,
+        }
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            session.execute(state.job_info_table.update().where(
+                state.job_info_table.c.spot_job_id == job_id).values(
+                    controller_slot_quiescing=True))
+            session.commit()
+
+        assert (state.set_failed_controller_if_current_snapshot(
+            job_id, **snapshot, failure_reason='controller died') ==
+                state.ControllerFailureDecision.STALE)
+        with state.orm.Session(_mock_managed_jobs_db_conn) as session:
+            row = session.execute(
+                sqlalchemy.select(
+                    state.spot_table.c.status,
+                    state.job_info_table.c.controller_slot_quiescing).join(
+                        state.job_info_table, state.spot_table.c.spot_job_id ==
+                        state.job_info_table.c.spot_job_id).where(
+                            state.spot_table.c.spot_job_id == job_id)).one()
+        assert row.status == state.ManagedJobStatus.RUNNING.value
+        assert row.controller_slot_quiescing is True

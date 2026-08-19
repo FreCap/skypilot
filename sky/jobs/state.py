@@ -1429,6 +1429,7 @@ def _controller_snapshot_conditions(
     controller_generation: int | None,
     controller_slot_id: int | None,
     controller_slot_attempt: str | None,
+    controller_slot_quiescing: bool | None,
 ) -> list[sqlalchemy.ColumnElement[bool]]:
     """Build the exact job-info snapshot used by destructive refresh writes."""
     return [
@@ -1440,6 +1441,7 @@ def _controller_snapshot_conditions(
         job_info_table.c.controller_generation == controller_generation,
         job_info_table.c.controller_slot_id == controller_slot_id,
         job_info_table.c.controller_slot_attempt == controller_slot_attempt,
+        job_info_table.c.controller_slot_quiescing == controller_slot_quiescing,
     ]
 
 
@@ -1484,6 +1486,7 @@ def set_failed_controller_if_current_snapshot(
     controller_generation: int | None,
     controller_slot_id: int | None,
     controller_slot_attempt: str | None,
+    controller_slot_quiescing: bool | None,
     failure_reason: str,
 ) -> ControllerFailureDecision:
     """Terminalize an exact dead-controller snapshot before provider cleanup.
@@ -1508,7 +1511,7 @@ def set_failed_controller_if_current_snapshot(
         conditions = _controller_snapshot_conditions(
             job_id, schedule_state, controller_pid, controller_pid_started_at,
             controller_instance_id, controller_generation, controller_slot_id,
-            controller_slot_attempt)
+            controller_slot_attempt, controller_slot_quiescing)
         job_row = session.execute(
             sqlalchemy.select(job_info_table.c.spot_job_id).where(
                 sqlalchemy.and_(*conditions)).with_for_update()).first()
