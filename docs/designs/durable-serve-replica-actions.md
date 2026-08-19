@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-17
+Last updated: 2026-08-19
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -142,6 +142,36 @@ identity, recorded `LEGACY_EFFECT_AMBIGUOUS`, observed the provider effect as
 physical-UID-fenced `ABSENT` observation. The row and cluster are absent; the
 request remains cancelled without a synthetic receipt, and no paid claim
 exists.
+
+### 2026-08-19 projected-tombstone drain correction
+
+Production verification found that the ordinary-binding promotion barrier
+still required a request-quiescence receipt from every historical legacy
+request. That condition contradicts the legacy reconciliation contract above:
+replica 52689 was deliberately resolved without fabricating such a receipt,
+and its append-only `PROJECTED` tombstone therefore could never release the
+global per-service transition barrier.
+
+The canonical drain invariant is **no uncontained legacy execution effect**,
+not “every historical executor published a current-protocol receipt.” A
+legacy request is drained by either of two proofs:
+
+1. its terminal request row has the exact execution-generation quiescence
+   receipt and no queue row; or
+2. its terminal request row has no queue row and an exact legacy `PROJECTED`
+   tombstone matching the historical service hash, request ID, cluster,
+   replica ID/version/record UUID, terminal status/generation, and any provider
+   context/physical UID retained in the request.
+
+The second proof is containment evidence, not request quiescence. Promotion
+must not update the request, add an association, or manufacture a receipt. A
+nonterminal request, queue row, ambiguous/cleanup-authorized ledger head,
+mismatched identity, provider `PRESENT`/`UNKNOWN`/`REPLACED`, or an unprojected
+cleanup still fails closed. Serve047's append-only constraints remain the sole
+authority for executor termination, later provider `ABSENT`, and cleanup
+completion. The historical service hash is matched to the request, not to the
+current service row, so a completed tombstone remains drained across later
+controller lifecycles and service updates.
 
 The recovery loop then cleared the prior intents from nonterminal `PENDING`
 state and admitted replicas 52688 and 52690 to ordinary typed cleanup. The live
@@ -1131,6 +1161,39 @@ by redelivering the durable reason, never by inventing a replacement reason.
 The row-lock reducer similarly never waits for that advisory guard: it cannot
 authorize cleanup from an unquiesced post-effect request, but it can durably
 expose ambiguity instead of deadlocking behind the opaque call.
+
+#### Internal request authority for teardown quiescence
+
+Backend-guarded central controller recovery and teardown read and cancel launch
+requests through the registered authoritative request storage backend in
+process. The public `/api/status` and `/api/cancel` routes, their OAuth
+middleware, response encoding, and client/server version discovery are not
+participants in this safety barrier. The server-owned execution-quiescence
+guard, not the controller-child consolidation override, selects this path.
+Every direct-store barrier requires the built-in PostgreSQL storage and queue
+backends before its first read. Protocol-v2 cleanup forces the direct path and
+never falls back to a remote API query.
+
+Every direct-store call discovers active and terminal-unproved candidates by
+the exact incarnation-scoped replica cluster names and launch handler, cancels
+exact request IDs, and then rereads each discovered request ID until its
+immutable execution generation is terminal with the matching durable
+quiescence receipt. A discovered request that disappears, changes identity or
+generation, uses an unavailable or unsupported backend, or lacks its required
+receipt fails closed and retains every replica and service cleanup row. Rows
+from before the receipt contract that are already terminal do not claim this
+proof and remain governed by the existing legacy adjudication contract.
+Absence from the SkyPilot cluster table or provider inventory is never
+substituted for a required request-executor receipt.
+
+This correction requires no schema or durable-state migration and is deployed
+fix-forward with the normal controller/API Helm cohort. The pre-existing SDK
+active-request scan remains only as a transitional compatibility path for
+legacy remote Serve controllers that lack the server-owned backend guard and
+do not own the central request backend in process. It cannot serve protocol-v2
+cleanup. Remove that branch when remote Serve controllers either retire or
+receive a narrowly authenticated internal request-store primitive; until then
+its active-only semantics do not weaken the guarded PostgreSQL contract above.
 
 A live controller retries an unresolved transport admission with the same
 stable submission UUID while its worker still owns the retained intent. After a
@@ -2807,6 +2870,9 @@ approved canary:
   provider, and cluster-incarnation evidence through the G1 legacy ledger.
   Preserve the real old-executor effect and original cancelled request; record
   no fabricated quiescence receipt or synthetic association.
+- [ ] Merge and deploy the projected-tombstone drain consumer, then prove the
+  exact 52689 request releases ordinary promotion while its request receipt
+  remains null. Incomplete or mismatched ledger evidence must still block.
 - [ ] Deploy the reviewed Serve049/050 authority lineage and verify ordinary
   typed cleanup converges replicas 52688 and 52690 without manual deletion.
 - [ ] Converge every API acceptor, request backend, queue executor, GC

@@ -934,12 +934,18 @@ def test_promotion_contract_fails_fast_on_owner_lock_contention(route_database):
 
 
 @pytest.mark.parametrize(
-    ('version', 'epoch', 'generation', 'digest', 'error'), [
+    ('version', 'epoch', 'generation', 'digest', 'error'),
+    [
         (2, 1, 1, 'a' * 64, route_projection.RouteProjectionConflict),
         (1, 2, 1, 'a' * 64, route_projection.RouteProjectionConflict),
         (1, 1, 2, 'a' * 64, route_projection.RouteProjectionConflict),
         (1, 1, 1, 'b' * 64, route_projection.RouteProjectionConflict),
         (1, 1, 1, None, route_projection.RouteProjectionValidationError),
+        # A report that omits the fence entirely (every field absent) must be
+        # rejected as malformed rather than read as a wildcard match.
+        (1, None, 1, 'a' * 64, route_projection.RouteProjectionValidationError),
+        (1, 1, None, 'a' * 64, route_projection.RouteProjectionValidationError),
+        (1, None, None, None, route_projection.RouteProjectionValidationError),
     ])
 def test_promotion_contract_rejects_every_reported_fence_mismatch(
         route_database, version, epoch, generation, digest, error):

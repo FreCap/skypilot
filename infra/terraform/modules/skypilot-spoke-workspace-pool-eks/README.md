@@ -56,7 +56,8 @@ module "spoke_workspace_pool" {
   eks_cluster_name    = "gpu-pool"
   controller_role_arn = "arn:aws:iam::123456789012:role/skypilot-api"
 
-  cluster_api_ingress_cidrs = ["10.20.0.0/16"]
+  allow_cluster_security_group_node_ingress = true
+  cluster_api_ingress_cidrs                 = ["10.20.0.0/16"]
 
   partitions = [
     {
@@ -242,9 +243,13 @@ Each FSx entry creates a static `Retain` PV and a namespaced PVC. Lustre uses
 `<filesystem-id>.fsx.<region>.<AWS partition DNS suffix>`.
 
 `cluster_api_ingress_cidrs` adds TCP/443 ingress to the EKS-managed cluster
-security group used by private endpoint interfaces. It rejects public `/0`
-sources. Configure routing and private DNS separately; this rule alone does not
-make a private endpoint reachable.
+security group used by private endpoint interfaces. EKS also attaches that
+group to managed-node interfaces by default, so the same rule can reach
+TCP/443 listeners on those nodes. The rule fails closed unless
+`allow_cluster_security_group_node_ingress = true` explicitly accepts that
+shared exposure. It rejects public `/0` sources. Configure routing and private
+DNS separately; this rule alone does not make a private endpoint reachable.
+CIDRs that AWS canonicalizes to the same network are rejected before apply.
 
 `serve_probe_ingress` mutates a caller-owned security group. It grants TCP
 ports from one IPv4 CIDR and rejects `0.0.0.0/0` unless
@@ -335,9 +340,10 @@ replacement, deletion, namespace recreation, or PV recreation.
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
+| <a name="input_allow_cluster_security_group_node_ingress"></a> [allow\_cluster\_security\_group\_node\_ingress](#input\_allow\_cluster\_security\_group\_node\_ingress) | Explicitly allow cluster\_api\_ingress\_cidrs to add TCP/443 ingress to the<br/>EKS-managed cluster security group. EKS also attaches that security group<br/>to managed-node interfaces by default, so this opt-in acknowledges that<br/>the same source CIDRs can reach TCP/443 listeners on those nodes. The<br/>default fails closed whenever cluster\_api\_ingress\_cidrs is nonempty. | `bool` | `false` | no |
 | <a name="input_aws_profile"></a> [aws\_profile](#input\_aws\_profile) | Optional AWS CLI profile exposed through local.exec\_env for Terragrunt<br/>callers that generate an aws eks get-token Kubernetes provider in the<br/>downloaded module directory. Ordinary Terraform callers may leave this<br/>null and pass their own configured providers. | `string` | `null` | no |
 | <a name="input_aws_region"></a> [aws\_region](#input\_aws\_region) | Region of the existing EKS cluster. | `string` | n/a | yes |
-| <a name="input_cluster_api_ingress_cidrs"></a> [cluster\_api\_ingress\_cidrs](#input\_cluster\_api\_ingress\_cidrs) | IPv4 CIDRs from which the SkyPilot control plane may reach the existing<br/>EKS cluster's private API endpoint. The module adds one TCP/443 rule to the<br/>EKS-managed cluster security group. The default creates no rule, and public<br/>/0 sources are rejected. | `list(string)` | `[]` | no |
+| <a name="input_cluster_api_ingress_cidrs"></a> [cluster\_api\_ingress\_cidrs](#input\_cluster\_api\_ingress\_cidrs) | IPv4 CIDRs from which the SkyPilot control plane may reach the existing<br/>EKS cluster's private API endpoint. The module adds one TCP/443 rule to the<br/>EKS-managed cluster security group. EKS attaches that group to managed-node<br/>interfaces by default, so allow\_cluster\_security\_group\_node\_ingress must be<br/>true before the rule can plan. The default creates no rule. Public /0<br/>sources and CIDRs that become duplicates after AWS canonicalization are<br/>rejected. | `list(string)` | `[]` | no |
 | <a name="input_controller_role_arn"></a> [controller\_role\_arn](#input\_controller\_role\_arn) | IAM role ARN used by the SkyPilot control plane. The module maps this<br/>principal to every partition's RBAC group through one EKS access entry.<br/>Cross-account roles are supported within the active AWS partition. | `string` | n/a | yes |
 | <a name="input_eks_cluster_name"></a> [eks\_cluster\_name](#input\_eks\_cluster\_name) | Name of the existing EKS cluster to register as a SkyPilot pool. | `string` | n/a | yes |
 | <a name="input_partitions"></a> [partitions](#input\_partitions) | Workload partitions to register. Each item creates namespaced RBAC and can<br/>optionally create a Pod Identity association, an exact-priority admission<br/>policy, a Kueue LocalQueue, and static FSx PV/PVC pairs.<br/><br/>A partition is a workload credential and storage partition, not an<br/>independent tenant boundary. The same controller principal receives every<br/>configured group. Pin each SkyPilot workspace to its intended namespace and<br/>audit pre-existing service-account associations and namespaced resources.<br/><br/>Durable identity keys are namespace, group, priority-class name, Kueue<br/>LocalQueue and ClusterQueue names, FSx claim name, and the derived RBAC<br/>resource names. Change them only with a reviewed Terraform state and<br/>workload migration.<br/><br/>Each Kueue ClusterQueue name must be one DNS-1123 label of at most 63<br/>characters. Strict SkyPilot admission requires Kueue's<br/>AssignQueueLabelsForPods feature to publish that name on admitted Pods;<br/>dotted DNS subdomains and other non-label names cannot be published. | <pre>list(object({<br/>    namespace                    = string<br/>    group                        = optional(string)<br/>    manage_namespace             = optional(bool, true)<br/>    pod_identity_role_arn        = optional(string, "")<br/>    pod_identity_service_account = optional(string, "skypilot-pool-sa")<br/><br/>    priority_class = optional(object({<br/>      value = number<br/>      name  = optional(string)<br/>    }))<br/><br/>    kueue = optional(object({<br/>      local_queue_name   = optional(string, "default")<br/>      cluster_queue_name = string<br/>    }))<br/><br/>    fsx_volumes = optional(list(object({<br/>      claim_name    = string<br/>      volume_handle = string<br/>      storage_class = string<br/>      capacity      = string<br/>      driver        = optional(string, "fsx.csi.aws.com")<br/>      mountname     = optional(string)<br/>    })), [])<br/>  }))</pre> | n/a | yes |

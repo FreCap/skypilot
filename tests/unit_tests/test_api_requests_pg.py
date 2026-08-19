@@ -3436,6 +3436,121 @@ def test_legacy_drain_does_not_deadlock_queue_claimant_lock_upgrade(
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def test_legacy_drain_accepts_only_exact_projected_cleanup_tombstone(
+        bound_request_database):
+    engine, backend = bound_request_database
+    request = _legacy_serve_launch_request('legacy-projected-cleanup')
+    context = request.request_body.extra_launch_context
+    context.update({
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY: 3,
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY:
+            str(_GC_REPLICA_RECORD_ID),
+        serve_constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY: 'kubernetes-context-a',
+        serve_constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY: 'cluster-uid-a',
+    })
+    assert asyncio.run(backend.create_if_not_exists_async(request))
+
+    identity = _gc_legacy_identity(request.request_id)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    with engine.begin() as connection:
+        scope_id = (ordinary_launch_binding.
+                    create_legacy_reconciliation_scope_in_connection(
+                        connection, [identity],
+                        reviewed_by='operator@example.com',
+                        review_reason='Exact mixed-version request review.'))
+        connection.execute(
+            sqlalchemy.update(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id == request.request_id).
+            values(
+                status=requests.RequestStatus.CANCELLED.value,
+                terminal_cause=(
+                    event_api_models.EventCause.EXECUTION_LEASE_EXPIRED.value),
+                execution_generation=1,
+                execution_quiescence_required=True,
+                execution_quiesced_generation=None,
+                execution_quiesced_at=None,
+                finished_at=now))
+        connection.execute(
+            sqlalchemy.delete(request_postgres.QUEUE).where(
+                request_postgres.QUEUE.c.request_id == request.request_id))
+
+    terminated_at = now - datetime.timedelta(minutes=2)
+    evidence = request_postgres.read_legacy_launch_request_evidence(
+        identity,
+        executor_terminated_at=terminated_at,
+        executor_termination_evidence={
+            'kind': 'kubernetes_container_terminated',
+            'pod_uid': 'old-executor-pod-uid',
+        })
+    with engine.begin() as connection:
+        ordinary_launch_binding.append_legacy_reconciliation_in_connection(
+            connection,
+            scope_id,
+            identity,
+            ordinary_launch_binding.LegacyReconciliationResolution.
+            EFFECT_AMBIGUOUS,
+            evidence,
+            actor='reconciler',
+            reason='The old executor published no request receipt.')
+
+    provider_at = evidence.observed_request_at
+    absent = dataclasses.replace(
+        evidence,
+        provider_evidence=ordinary_launch_binding.ProviderEvidence.ABSENT,
+        provider_evidence_observed_at=provider_at,
+        provider_evidence_payload={
+            'cluster_name': identity.cluster_name,
+            'kubernetes_context': identity.provider_context,
+            'physical_cluster_uid': identity.provider_physical_resource_uid,
+            'result': 'ABSENT',
+        })
+    with engine.begin() as connection:
+        ordinary_launch_binding.append_legacy_reconciliation_in_connection(
+            connection,
+            scope_id,
+            identity,
+            ordinary_launch_binding.LegacyReconciliationResolution.
+            CLEANUP_AUTHORIZED,
+            absent,
+            actor='reconciler',
+            reason='Provider UID is absent after executor exit.')
+        # Provider absence authorizes cleanup but does not yet prove that the
+        # possible effect has been projected out of Serve state.
+        assert not (request_postgres.
+                    _legacy_ordinary_launch_requests_drained_in_transaction(
+                        connection, 'gc-service'))
+        assert (ordinary_launch_binding.
+                project_legacy_replica_cleanup_in_connection(
+                    connection,
+                    scope_id,
+                    identity,
+                    actor='reconciler',
+                    reason='Project the exact legacy replica tombstone.',
+                    cleanup_completion_evidence={
+                        'deleted_replica_record_id': str(_GC_REPLICA_RECORD_ID),
+                        'operation': 'database-projection',
+                    }))
+
+    with engine.begin() as connection:
+        stored = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                request.request_id)).mappings().one()
+        wrong_context = dict(context)
+        wrong_context[
+            serve_constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY] = (
+                'different-cluster-uid')
+        assert not (request_postgres.
+                    _legacy_projected_cleanup_drains_request_in_transaction(
+                        connection, stored, wrong_context, 'gc-service'))
+        assert (request_postgres.
+                _legacy_ordinary_launch_requests_drained_in_transaction(
+                    connection, 'gc-service'))
+    assert stored['execution_quiescence_required'] is True
+    assert stored['execution_quiesced_generation'] is None
+    assert stored['execution_quiesced_at'] is None
+
+
 def test_bound_cancel_intent_does_not_wait_for_shared_provider_guard(
         bound_request_database):
     engine, _ = bound_request_database

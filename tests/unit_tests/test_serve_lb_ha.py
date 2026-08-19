@@ -2098,7 +2098,27 @@ def test_durable_promotion_gate_fails_closed_with_bounded_reason(
     begin.assert_not_called()
 
 
-def test_durable_contract_unavailable_keeps_active_healthy_and_blocks_cutover():
+@pytest.mark.parametrize(('read_error', 'reason'), [
+    (route_projection.RouteProjectionValidationError('malformed fence'),
+     'route_fence_malformed'),
+    (route_projection.RouteProjectionConflict('stale fence'),
+     'route_fence_not_current'),
+    (route_projection.RouteProjectionUnavailable('stale head'),
+     'route_contract_unavailable'),
+    (route_projection.RouteProjectionCorruption('corrupt snapshot'),
+     'route_contract_unavailable'),
+])
+def test_durable_contract_read_failure_keeps_active_healthy_and_blocks_cutover(
+        read_error, reason):
+    """Every durable route-read failure fails closed with a bounded reason.
+
+    The gate distinguishes these outcomes only through the exception
+    hierarchy, so a reordered ``except`` chain or a re-parented
+    ``RouteProjection*`` class would silently mis-classify a promotion
+    decision -- or, if a type stopped deriving from ``RouteProjectionError``,
+    escape the gate and fail the whole role heartbeat instead of one
+    promotion.
+    """
     ctrl = _role_controller()
     _enable_durable_route_owner(ctrl)
     contract = _durable_contract()
@@ -2116,13 +2136,11 @@ def test_durable_contract_unavailable_keeps_active_healthy_and_blocks_cutover():
                     return_value=stable), mock.patch.object(
                         route_projection.RouteProjectionRepository,
                         'resolve_promotion_contract',
-                        side_effect=route_projection.RouteProjectionUnavailable(
-                            'stale head')), mock.patch.object(
-                                controller.lb_k8s,
-                                'patch_lb_service_active_slot'
-                            ) as patch, mock.patch.object(
-                                controller.serve_state,
-                                'begin_lb_cutover') as begin:
+                        side_effect=read_error), mock.patch.object(
+                            controller.lb_k8s, 'patch_lb_service_active_slot'
+                        ) as patch, mock.patch.object(
+                            controller.serve_state,
+                            'begin_lb_cutover') as begin:
         response = asyncio.run(
             ctrl._handle_load_balancer_role(
                 _durable_role_request('standby', lb_ha.LbSlot.B, contract)))
@@ -2132,8 +2150,9 @@ def test_durable_contract_unavailable_keeps_active_healthy_and_blocks_cutover():
     assert body['outcome'] == 'success'
     assert body['role'] == lb_ha.LbRole.STANDBY.value
     assert body['selected_slot'] == lb_ha.LbSlot.A.value
-    assert body['ha_rollout']['promotion_gate']['reason'] == (
-        'route_contract_unavailable')
+    assert body['promotable'] is False
+    assert body['ha_rollout']['promotion_gate']['reason'] == reason
+    assert body['ha_rollout']['transition_attempted'] is False
     patch.assert_not_called()
     begin.assert_not_called()
 
