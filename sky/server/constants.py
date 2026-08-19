@@ -159,6 +159,29 @@ MIN_SERVE_ZERO_COST_ACTUATION_API_VERSION = 89
 MIN_SERVE_LAZY_VERSION_YAML_API_VERSION = 90
 NON_POOL_LAUNCH_BINDING_PATH = '/internal/serve/non-pool-launch'
 
+# The split-role SkyServe controller uses its existing controller-admin token
+# only for the API calls needed to submit and observe a replica launch. Keep
+# this method-sensitive: possession of that token must not grant access to the
+# rest of the user-facing API.
+SERVE_CONTROLLER_API_AUTH_REQUESTS = frozenset({
+    ('GET', '/api/health'),
+    ('POST', '/validate'),
+    ('POST', ORDINARY_LAUNCH_BINDING_PATH),
+    ('POST', NON_POOL_LAUNCH_BINDING_PATH),
+    ('GET', '/api/stream'),
+    ('GET', '/api/get'),
+    ('POST', '/api/status/query'),
+    ('POST', '/api/cancel'),
+})
+SERVE_CONTROLLER_API_AUTH_HEADER = 'X-SkyPilot-Serve-Controller-Auth'
+SERVE_CONTROLLER_API_AUTH_HEADER_VALUE = 'token'
+
+
+def is_serve_controller_api_request(method: str, path: str) -> bool:
+    """Return whether controller-admin auth may reach this API operation."""
+    return (method.upper(), path) in SERVE_CONTROLLER_API_AUTH_REQUESTS
+
+
 # Minimum API version whose Serve version-history response exposes immutable
 # cross-context placement with Kubernetes/Kueue admission. Consumers must also
 # require the exact advertised placement_projection_protocol_version; API 79

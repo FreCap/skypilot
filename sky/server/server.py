@@ -272,6 +272,8 @@ BasicAuthMiddleware = auth_middleware.BasicAuthMiddleware
 BearerTokenMiddleware = auth_middleware.BearerTokenMiddleware
 InternalServeControllerSyncAuthMiddleware = (
     auth_middleware.InternalServeControllerSyncAuthMiddleware)
+InternalServeControllerApiAuthMiddleware = (
+    auth_middleware.InternalServeControllerApiAuthMiddleware)
 AuthProxyMiddleware = auth_middleware.AuthProxyMiddleware
 # pylint: enable=protected-access
 
@@ -514,6 +516,10 @@ app.add_middleware(BearerTokenMiddleware)
 # initializes request.state.auth_user first). A valid dedicated sync token can
 # then bypass Basic/OAuth; an invalid token never reaches them or the handler.
 app.add_middleware(InternalServeControllerSyncAuthMiddleware)
+# The split-role Serve controller uses the already isolated admin token for an
+# exact replica-launch lifecycle allowlist. It must wrap normal authentication
+# just like the dedicated external-LB sync middleware above.
+app.add_middleware(InternalServeControllerApiAuthMiddleware)
 # InitializeRequestAuthUserMiddleware must be the last added middleware so that
 # request.state.auth_user is always set, but can be overridden by the auth
 # middleware above.

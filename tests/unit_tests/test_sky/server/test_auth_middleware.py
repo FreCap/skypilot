@@ -35,6 +35,7 @@ def test_server_preserves_auth_middleware_import_surface():
         'BasicAuthMiddleware',
         'BearerTokenMiddleware',
         'InternalServeControllerSyncAuthMiddleware',
+        'InternalServeControllerApiAuthMiddleware',
         'AuthProxyMiddleware',
     )
 

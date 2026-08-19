@@ -4015,6 +4015,8 @@ class TestLaunchClusterRetry:
         launch.assert_not_called()
         assert request_ids[1] == 'request-id'
         wait.assert_called_once()
+        assert (wait.call_args.kwargs['api_auth_token_provider']
+                is replica_managers._required_controller_admin_auth_tokens)
 
     def test_reserved_fill_profile_requires_exact_physical_fence(
             self, tmp_path):
