@@ -6,25 +6,25 @@ route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
 #1547, #1548, #1549, #1552, #1553, and #1555. Production Helm revision 436 /
 release `1.1.1349` runs the exact 2 API / 2 controller / 2 executor split-role
-cohort on RWX storage. Production committed and elected successor version 62
-on 2026-08-18, and the live controller has applied its configuration. Exact
-database readback proves its PHX H200 projection uses
+cohort on RWX storage. Production committed and elected clean successor version
+63 on 2026-08-19, and the live controller has applied its configuration at
+lifecycle epoch 82. Exact database readback proves its three non-null worker
+projections include a PHX H200 projection that uses
 `default-scheduler`, `be`/`be-ls`, priority -1000/`Never`,
 `skypilot-pool-sa`, and no Pod Identity role; both east projections retain
-`gpu-binpack-scheduler`. Version 62 has `min_replicas: 0`, a zero fill floor,
-and `utilization_gate: true`, but it pins model image `v5.44.1-boltz-2`.
-Platform PR #8635 intentionally restored the known-good production image
-`v3.682.2-boltz-2` after structured-inference failures, so version 62 is not an
-activation candidate despite its correct projections. At the 2026-08-19
+`gpu-binpack-scheduler`. Version 63 has `min_replicas: 0`, a zero fill floor,
+`utilization_gate: true`, and the known-good `v3.682.2-boltz-2` image. It
+supersedes version 62, which proved the projection shape but remains ineligible
+because it pins the rejected `v5.44.1-boltz-2` image. At the 2026-08-19
 inspection PHX published 96 fresh free H200 GPUs but the service grant was
-exactly zero solely because version 62's gate bounded fill by zero current
-demand. Version 58 remains the only active version on the known-good image and
-the reconciliation gate remains `LEGACY_ACTIVE`; no cleanup or final service
-activation is approved yet. A clean demand-gated successor must first combine
-the known-good image with version 62's corrected config/projections. After
+exactly zero solely because version 63's gate bounded fill by zero current
+demand. Version 58 remains the only active version and the reconciliation gate
+remains `LEGACY_ACTIVE`; no cleanup or final service activation is approved
+yet. The clean demand-gated activation successor is complete. After
 durable intent activation, production intentionally changes only that clean
-successor's `utilization_gate` to `false`: the service backfills all healthy
-reclaimable zero-cost GPUs even while traffic is idle, while
+successor's `utilization_gate` to `false`: the service backfills every fresh,
+authenticated, policy-compatible reclaimable zero-cost GPU granted to it even
+while traffic is idle, while
 `min_replicas: 0`, `floor_replicas: 0`, and the zero-cost-only intent contract
 continue to forbid a paid floor. Test remains utilization-gated. Platform PR
 #8652 records and validates that production/test distinction without changing
@@ -182,10 +182,11 @@ because the service still selects `LEGACY_CONTROLLER` demand. Route ownership
 is already `DURABLE_PROJECTED` at epoch 1; it is not a remaining promotion.
 This exact split explains the dashboard gap and makes an artificial
 pre-promotion H200 replica the wrong gate. The clean order is: apply and attest
-the worker contract, activate sequenced reconciliation, promote bound then
-generic launch authority, atomically promote the durable demand report and
-durable grant-before-row actuation, and prove the first real-demand H200
-admission on that final path. A temporary replica floor or direct-fill canary
+the worker contract, promote bound launch authority to generic, activate
+sequenced reconciliation, atomically promote the durable demand report and
+durable grant-before-row actuation, apply the gate-false successor, and prove
+the first automatically generated zero-demand H200 backfill admission on that
+final path. A temporary replica floor or direct-fill canary
 would test the path being removed. Permanent production reserved backfill is
 instead an explicit service policy applied only after durable intent authority
 is active; it must never be approximated with `min_replicas`, a positive fill
@@ -455,21 +456,23 @@ existing direct-Helm split-role topology:
    it verifies exact mount target, anchored source, filesystem type, total and
    free byte/inode budgets, and `/tmp` as `tmpfs`. Merely projecting these
    fields is not qualification evidence.
-2. Commit a clean demand-gated successor from the reviewed current source: it
-   retains the active known-good `v3.682.2-boltz-2` image and version 62's
-   corrected effective config, `min_replicas: 0`, and exact non-null worker
-   projections, but does not inherit version 62's rejected `v5.44.1` pin.
-   With zero demand and `utilization_gate: true`, verify the deployed P2d path
-   remains dark and every activation barrier is fresh. Promote bound launch
-   authority to generic, activate sequenced reconciliation, and atomically
-   promote durable demand plus durable intent actuation. No configuration
-   change may enable full backfill while legacy direct launch owns actuation.
+2. Version 63 is the committed, elected, and controller-applied clean
+   demand-gated successor. It retains the active known-good
+   `v3.682.2-boltz-2` image and version 62's corrected effective config,
+   `min_replicas: 0`, and exact non-null worker projections, but does not
+   inherit version 62's rejected `v5.44.1` pin. With zero demand and
+   `utilization_gate: true`, verify the deployed P2d path remains dark and every
+   activation barrier is fresh. Promote bound launch authority to generic,
+   activate sequenced reconciliation, and atomically promote durable demand
+   plus durable intent actuation. No configuration change may enable full
+   backfill while legacy direct launch owns actuation.
 3. Commit one more immutable service version by changing only production
    `reserved_capacity_fill.utilization_gate` from `true` to `false` relative
    to that clean successor. Preserve its exact model/runtime image and
-   non-null worker projections. Fresh per-pool observations must automatically
-   produce zero-cost intents and correctly admitted Pods without synthetic
-   traffic. Prove the expected queue, ClusterQueue, workload priority, Pod
+   non-null worker projections. Fresh authenticated allocation grants derived
+   from policy-compatible per-pool observations must automatically produce
+   zero-cost intents and correctly admitted Pods without synthetic traffic.
+   Prove the expected queue, ClusterQueue, workload priority, Pod
    priority, service account, default scheduler, TAS assignment, accelerator,
    and physical cluster identity; no paid compute may satisfy this gate.
 4. Only after the transition horizon, merge the already-authored cleanup stack
@@ -765,8 +768,9 @@ required for this fix-forward rollout.
 
 ## Goals
 
-- Fill idle, zero-cost Kubernetes GPU capacity from every eligible physical
-  pool of one service without multiplying its service-wide policy.
+- Fill every service-granted slot of idle, policy-compatible zero-cost
+  Kubernetes GPU capacity in its exact accelerator width without multiplying
+  the service-wide policy.
 - Preserve the conservative 180-second capacity-authority horizon.
 - Query independent Kubernetes contexts concurrently and outside slow
   actuation locks.
@@ -860,12 +864,12 @@ service:
 ```
 
 This is full zero-cost backfill, not an always-paid minimum. A false utilization
-gate allows the broker to grant observed reclaimable supply independently of
-traffic, but a reserved-fill intent remains pinned to its exact zero-cost pool
-and cannot fall through to Spot or on-demand capacity. Research retains the
-deployment-owned higher priority and may reclaim these Pods. The test fleet
-overrides the same field to `true` so it relinquishes borrowed capacity when
-idle.
+gate removes traffic as a cap on the service's authenticated grant from fresh,
+policy-compatible reclaimable supply, but a reserved-fill intent remains pinned
+to its exact zero-cost pool and cannot fall through to Spot or on-demand
+capacity. Research retains the deployment-owned higher priority and may reclaim
+these Pods. The test fleet overrides the same field to `true` so it relinquishes
+borrowed capacity when idle.
 
 Zero-cost Kubernetes candidates are grouped by physical pool. The steady-state
 atomic identity is one physical Kubernetes cluster UID plus one exact
@@ -896,9 +900,10 @@ The existing service-wide meanings remain authoritative:
   both services' floors, weights, holdings, and caps; setting both weights to
   `1000` is equivalent to setting both to `1`.
 - `utilization_gate: true` measures service demand once and bounds the same
-  global fill budget. `false` makes observed zero-cost supply the fill budget;
-  it does not create ordinary paid demand or weaken any pool, service, or
-  admission ceiling.
+  global fill budget. `false` removes demand as a utilization cap; the
+  service's authenticated grant from fresh observed zero-cost supply becomes
+  its fill budget. It does not create ordinary paid demand or weaken any pool,
+  service, or admission ceiling.
 - `max_replicas` is a hard service-wide ceiling across versions and pools.
 - Ordinary demand has priority in the service headroom calculation and in the
   allocation-local pool/card debits.
@@ -2670,7 +2675,7 @@ either case.
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Identity-bound KubeRay child admission and exact SkyPilot attestation | Platform PR #8649 is the surgical four-file policy change and still requires human Platform approval, deployment, and the deny/admit probe matrix. The paired SkyPilot attester requires zero policy `matchConditions`, one exact authenticated KubeRay-controller variable including the submitter-template queue label, one exact validation, the complete nine-rule resource scope, and no HPTO or generic-controller exception. Activation remains closed until both halves deploy and a fresh full preflight passes. |
-| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 proves the east/PHX projection contract but pins rejected image `v5.44.1-boltz-2` and is not an activation candidate after Platform PR #8635. Commit a clean demand-gated successor on the active known-good `v3.682.2-boltz-2` image before activation. |
+| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
@@ -3121,7 +3126,9 @@ reserved-capacity underfill, not duplicate fill or paid spill.
 
 ## Manual verification after activation
 
-No step below creates compute.
+The verification steps do not directly launch compute or manufacture demand.
+After the gate-false successor is applied, the canonical controller is expected
+to create zero-cost compute automatically; observing that effect is required.
 
 1. Confirm the transition status reports protocol 2,
    `SEQUENCED_ACTIVE`, the deployed binary's current Serve/API-request heads
@@ -3154,6 +3161,10 @@ No step below creates compute.
    allocation generation/hash/claim generation, and one exact-provenance pool
    record per authenticated edge. Confirm the same nested object is propagated
    through service status when target replica counts are requested.
+   At zero authenticated demand, reconcile each pool/card in its exact width:
+   the grant equals attributed nonterminal holdings plus admitted
+   unmaterialized intents plus a typed residual. Count a materialized intent
+   only as a holding.
 7. For an existing service already spanning two reserved contexts, confirm
    observations for both contexts overlap in wall time and new rows remain
    pinned to their authorizing context/physical UID. Do not deploy a synthetic
@@ -3274,6 +3285,12 @@ explicitly disabled (`-n 0`); parallel schema migration fixtures can otherwise
 exhaust a small server's shared lock table without exercising feature
 correctness. Formatting, typing, lint, and diff integrity must also pass for
 every changed file.
+
+The regression set must include one cross-layer contract with
+`min_replicas: 0`, `floor_replicas: 0`, `utilization_gate: false`, zero demand,
+and a fresh authenticated grant of `N`: reconciliation emits exactly `N`
+width-adjusted sequenced intents and publishes no paid residual or Spot launch
+authority. The paired `utilization_gate: true` case emits zero idle fill.
 
 The replica-record contract tests must instantiate all eight exact pre-v17
 top-level/status census shapes, including all three v13 identity variants.
@@ -3774,13 +3791,15 @@ legacy activation.
   `v5.44.1-boltz-2` model image was intentionally rolled back by Platform PR
   #8635. Version 58 remains the only active version on known-good
   `v3.682.2-boltz-2`.
-- [ ] Commit and elect a clean demand-gated activation successor that combines
-  the reviewed current `v3.682.2-boltz-2` source with the corrected config and
-  exact non-null projections. Structurally prove it differs from version 62
-  only by the intentional model rollback and from the final backfill version
-  only by `utilization_gate`.
-- [ ] After the sequenced, bound/generic, durable-demand, and durable-actuation
-  promotions below, apply the full-backfill policy and prove one automatically
+- [x] Commit and elect clean demand-gated activation successor version 63 on
+  the reviewed `v3.682.2-boltz-2` source with the corrected config and exact
+  three non-null projections. Exact readback proves `min_replicas: 0`, fill
+  floor 0, `utilization_gate: true`, and controller-applied lifecycle epoch 82.
+  It differs from version 62 by the intentional model rollback and from the
+  final backfill version only by `utilization_gate`.
+- [ ] After the generic-binding, sequenced, durable-demand, and
+  durable-actuation promotions below, apply the full-backfill policy and prove
+  one automatically
   generated zero-cost PHX H200 Pod is admitted
   through `be` -> `skypilot-be` with `be-ls`, the -1000/`Never` Pod priority,
   `skypilot-pool-sa`, `default-scheduler`, a Kueue TAS assignment, and exact
@@ -3833,12 +3852,13 @@ legacy activation.
   leave the selected slot healthy, and bounded role telemetry must record the
   closed/open gate and cutover CAS result. These production failover exercises
   remain required before the cleanup horizon opens.
-- [ ] Activate reserved reconciliation, promote ordinary binding and generic
-  non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
-  through one canonical generation-fenced transaction. No reconciliation tick
-  may observe the intermediate `DURABLE_FEED`/`DIRECT_REPLICA` pair. The clean
-  demand-gated successor must be committed, elected, and controller-applied;
-  route authority is already
+- [ ] Promote ordinary bound launch authority to generic non-pool binding,
+  activate reserved reconciliation, then promote durable demand plus
+  `DURABLE_INTENT` actuation through one canonical generation-fenced
+  transaction. No reconciliation tick
+  may observe the intermediate `DURABLE_FEED`/`DIRECT_REPLICA` pair. Clean
+  demand-gated successor version 63 is already committed, elected, and
+  controller-applied; route authority is already
   `DURABLE_PROJECTED` at epoch 1 and must be verified rather than promoted.
   Resource-action authority remains gated by its separate shadow horizon.
   Promotion is one way and fix-forward only.
@@ -3847,12 +3867,13 @@ legacy activation.
   changing only `reserved_capacity_fill.utilization_gate` to `false`. Prove
   the known-good model image, secrets, worker projections, endpoint, and every
   other service field are unchanged. Test remains demand-gated.
-- [ ] With zero authenticated demand, prove every fresh policy-compatible free
-  GPU becomes a durable zero-cost intent and then a correctly attributed
-  replica, subject only to bounded initialization. Reconcile the count from
-  physical free GPUs through broker grants, intents, Kueue reservations, Pods,
-  and ready replicas. Any residual must carry one typed fresh reason; ordinary
-  paid claims and new Spot launches must remain zero.
+- [ ] With zero authenticated demand, prove every fresh, authenticated,
+  policy-compatible reclaimable zero-cost slot granted to this service is
+  covered by a durable intent or a correctly attributed admitted,
+  provisioning, or ready replica in the exact accelerator-width unit. Reconcile
+  the count from physical observations through broker grants, intents, Kueue
+  reservations, Pods, and ready replicas. Every residual must carry one typed
+  fresh reason; ordinary paid claims and new Spot launches must remain zero.
 - [ ] With authenticated live demand, prove 80--90 eligible H200 workloads are
   durably submitted within a few minutes, multiple Pods initialize
   concurrently, and a held pool lane does not block another pool.

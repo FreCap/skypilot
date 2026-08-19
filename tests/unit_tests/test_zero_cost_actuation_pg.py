@@ -14,6 +14,8 @@ from test_serve_resource_actions_pg import postgres_engine  # noqa: F401
 
 from sky import clouds
 from sky.serve import capacity_admission
+from sky.serve import constants as serve_constants
+from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
@@ -21,6 +23,7 @@ from sky.serve import reserved_fill_planner
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_utils
+from sky.serve import service_spec
 from sky.serve import spot_placer
 from sky.serve import zero_cost_actuation
 from sky.serve import zero_cost_actuation_schema
@@ -42,6 +45,7 @@ _OWNER = serve_utils.make_controller_owner_fingerprint(_SERVICE_HASH,
 def _plan(
     *,
     free_slots: int = 2,
+    accelerator_count: int = 1,
     context: str = 'context-a',
     physical_uid: str = 'uid-a',
     valid_until: float | None = None,
@@ -51,7 +55,7 @@ def _plan(
     location = spot_placer.Location(cloud=clouds.Kubernetes(),
                                     region=context,
                                     zone=None,
-                                    accelerators={'L4': 1},
+                                    accelerators={'L4': accelerator_count},
                                     use_spot=False)
     pool_key = reserved_capacity_broker.make_pool_key(
         context,
@@ -67,13 +71,13 @@ def _plan(
             'l4': 'e' * 64,
         },
         'edge_cap': free_slots,
-        'broker_slot_width': 1,
+        'broker_slot_width': accelerator_count,
         'free_slots': free_slots,
         'free_slots_by_accelerator': {
             'l4': free_slots,
         },
         'grant': free_slots,
-        'grant_epoch': 23,
+        'grant_epoch': 23 if free_slots else None,
         'observation_generation': 13,
         'observation_sequence': 17,
         'ordinary_zero_cost_admission_sequence': 17,
@@ -374,6 +378,111 @@ def test_pending_grants_enforce_headroom_and_debit_paid_residual(
                                              {'l4': 0}) == {
                                                  'l4': 1
                                              }
+
+
+@pytest.mark.parametrize(('utilization_gate', 'expected_intents'), [(False, 2),
+                                                                    (True, 0)],
+                         ids=('full-backfill', 'idle-gated'))
+def test_idle_gate_controls_width_adjusted_durable_intents_without_paid_spill(
+        actuation_database, monkeypatch, utilization_gate: bool,
+        expected_intents: int) -> None:
+    spec = service_spec.SkyServiceSpec(readiness_path='/health',
+                                       initial_delay_seconds=0,
+                                       readiness_timeout_seconds=5,
+                                       endpoint_probe_interval_seconds=1,
+                                       lb_stream_timeout_seconds=10,
+                                       min_replicas=0,
+                                       max_replicas=16,
+                                       target_concurrency_per_replica=1,
+                                       reserved_capacity_fill={
+                                           'floor_replicas': 0,
+                                           'weight': 100,
+                                           'utilization_gate': utilization_gate,
+                                       })
+    rendered_spec = spec.to_yaml_config()
+    assert rendered_spec['replica_policy']['min_replicas'] == 0
+    assert rendered_spec['replica_policy']['reserved_capacity_fill'] == {
+        'weight': 100.0,
+        'utilization_gate': utilization_gate,
+    }
+    spec = service_spec.SkyServiceSpec.from_yaml_config(rendered_spec)
+    assert spec.min_replicas == 0
+    assert spec.reserved_fill_floor_replicas == 0
+    assert spec.reserved_fill_utilization_gate is utilization_gate
+
+    raw_capacity = pool_capacity_observation.PoolCapacitySuccess.from_counts(
+        16, {'L4': 16})
+    slots_by_accelerator = dict(raw_capacity.slot_counts(8))
+    assert slots_by_accelerator == {'l4': 2}
+    available_slots = sum(slots_by_accelerator.values())
+
+    claims = {
+        'svc': reserved_capacity_broker.ClaimInput(
+            floor=spec.reserved_fill_floor_replicas,
+            weight=spec.reserved_fill_weight,
+            holdings_fill=0,
+            launchable=True,
+            effective_cap=available_slots)
+    }
+    monkeypatch.delenv(serve_constants.RESERVED_FILL_UTILIZATION_GATE_ENV_VAR,
+                       raising=False)
+    gated_claims, _ = reserved_capacity_broker._apply_utilization_gate(
+        claims, {
+            'svc': reserved_capacity_broker.ActivityInput(
+                armed=spec.reserved_fill_utilization_gate,
+                demonstrated_need=0,
+                boot_hold=False,
+                blind=not spec.reserved_fill_utilization_gate)
+        }, {}, 1000.0)
+    entitlement = reserved_capacity_broker.compute_entitlements(
+        available_slots, gated_claims)['svc']
+    assert entitlement == expected_intents
+
+    plan = _plan(free_slots=entitlement, accelerator_count=8)
+    assert len(plan.intents) == expected_intents
+    assert all(intent.accelerator_count == 8 for intent in plan.intents)
+    assert all(
+        location.cloud.casefold() == 'kubernetes' and not location.use_spot
+        for intent in plan.intents
+        for location in intent.allowed_locations)
+
+    repository = zero_cost_actuation.ZeroCostActuationRepository(
+        actuation_database)
+    receipt = _grant_plan(repository, plan, max_capacity=2)
+    assert len(receipt.accepted) == expected_intents
+    assert not receipt.deferred
+
+    intents = zero_cost_actuation_schema.serve_zero_cost_actuation_intents_table
+    with actuation_database.begin() as connection:
+        intent_rows = connection.execute(
+            sqlalchemy.select(intents)).mappings().all()
+        replica_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.replicas_table)).scalar_one()
+        paid_claim_count = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.count()).select_from(
+                serve_state_schema.paid_capacity_claims_table)).scalar_one()
+        now = connection.execute(
+            sqlalchemy.select(sqlalchemy.func.clock_timestamp())).scalar_one()
+        pending = capacity_admission._locked_pending_zero_cost_inventory(
+            connection,
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            service_version=19,
+            accounting_cards={'l4'},
+            now=now)
+
+    assert len(intent_rows) == expected_intents
+    assert {row['state'] for row in intent_rows
+           } == ({'GRANTED'} if expected_intents else set())
+    assert replica_count == 0
+    assert paid_claim_count == 0
+    assert pending == {'l4': expected_intents}
+    assert capacity_admission._paid_residual({'l4': expected_intents},
+                                             {'l4': 0}, pending,
+                                             {'l4': 0}) == {}
+    assert capacity_admission._paid_residual({'l4': 0}, {'l4': 0}, pending,
+                                             {'l4': 0}) == {}
 
 
 def test_pool_leases_are_independent_and_retryable(actuation_database) -> None:
