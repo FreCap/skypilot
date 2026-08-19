@@ -198,14 +198,10 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         # its process and could mark the job FAILED_CONTROLLER. The signal
         # file makes update_managed_jobs_statuses and the scheduler's
         # controller-start path early-return until recovery completes.
-        # NOTE: the acquire is deliberately NOT inside the try/finally that
-        # wraps recovery below. The finally unlinks the signal file, but the
-        # lock-loss step-down path (_suicide_on_lock_loss) re-touches it to
-        # keep controllers gated through the shutdown drain — so that path must
-        # not be followed by an unlink. Scoping the finally to recovery only
-        # keeps those two concerns from fighting. It also means a raise from
-        # acquire() leaves the gate file in place while run() retries, which is
-        # what we want (controller starts stay gated until we hold the lock).
+        # The gate is removed only after recovery succeeds below. Acquire or
+        # recovery failures leave it in place while run() retries, and the
+        # lock-loss step-down path keeps it through the shutdown drain. This
+        # prevents controller starts from observing partially recovered state.
         signal_file = _touch_recovery_signal_file()
 
         if self._stop_event.is_set():
@@ -243,10 +239,8 @@ class ManagedJobRefreshDaemonThread(threading.Thread):
         if self._stop_event.is_set():
             return
 
-        try:
-            managed_job_utils.ha_recovery_for_consolidation_mode()
-        finally:
-            signal_file.unlink(missing_ok=True)
+        managed_job_utils.ha_recovery_for_consolidation_mode()
+        signal_file.unlink(missing_ok=True)
         # Runtime admits fixed slots only after stale/null-slot ownership has
         # been recovered under this still-held inner lock.
         self._cutover_ready.set()

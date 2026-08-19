@@ -7,11 +7,13 @@ import threading
 import time
 from types import SimpleNamespace
 from unittest import mock
+import uuid
 
 import pytest
 
 from sky import clouds
 from sky.serve import controller
+from sky.serve import ordinary_launch_binding
 from sky.serve import replica_managers
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
@@ -25,6 +27,8 @@ _SERVICE_HASH = 'service-incarnation'
 _CONTROLLER_PID = 41
 _CONTROLLER_IP = '10.0.0.7'
 _CONTROLLER_PORT = 8123
+_CONTROLLER_INCARNATION = uuid.UUID('7d1f78d1-27f2-4b6c-913f-49ad42e444b0')
+_CONTROLLER_OWNER_EPOCH = 4
 _RECONCILIATION_GATE_GENERATION = 29
 _RECLAIM_FLEET_BUNDLE_SHA256 = 'c' * 64
 _RECLAIM_POLICY_REVISION = 'kueue-reclaim-v1'
@@ -128,6 +132,19 @@ def _manager(*,
     manager._version_specs = {  # pylint: disable=protected-access
         19: SimpleNamespace(max_replicas=maximum, min_replicas=0)
     }
+    manager._ordinary_launch_binding_authority = (  # pylint: disable=protected-access
+        ordinary_launch_binding.ControllerBindingAuthority(
+            service_name='svc',
+            service_hash=_SERVICE_HASH,
+            service_workspace='default',
+            service_lifecycle_epoch=3,
+            controller_pid=_CONTROLLER_PID,
+            controller_ip=_CONTROLLER_IP,
+            controller_incarnation=_CONTROLLER_INCARNATION,
+            controller_owner_epoch=_CONTROLLER_OWNER_EPOCH,
+            capable=True,
+            binding_mode=ordinary_launch_binding.BindingMode.BOUND,
+            binding_epoch=1))
     return manager
 
 
@@ -287,9 +304,38 @@ def test_durable_accept_publishes_grants_without_provider_or_replica_io(
         actual = manager.accept_reserved_fill(plan)
 
     assert actual == receipt
-    repository.grant_plan.assert_called_once_with('svc', plan, max_capacity=7)
+    repository.grant_plan.assert_called_once_with(
+        'svc',
+        plan,
+        max_capacity=7,
+        expected_controller_incarnation=_CONTROLLER_INCARNATION,
+        expected_controller_owner_epoch=_CONTROLLER_OWNER_EPOCH)
     provider_admission.assert_not_called()
     replica_read.assert_not_called()
+
+
+def test_durable_accept_without_controller_authority_fails_closed() -> None:
+    manager = _manager(maximum=7)
+    manager._reserved_fill_actuation_mode = (  # pylint: disable=protected-access
+        zero_cost_actuation.ActuationMode.DURABLE_INTENT)
+    manager._ordinary_launch_binding_authority = None  # pylint: disable=protected-access
+    plan = _plan((_snapshot('east-context', 'uid-east', 1),))
+    repository = mock.Mock()
+    manager._zero_cost_actuation_repository = repository  # pylint: disable=protected-access
+
+    with mock.patch.object(replica_managers.serve_state,
+                           'get_service_controller_owner',
+                           return_value=_owner_record()):
+        receipt = manager.accept_reserved_fill(plan)
+
+    assert not receipt.accepted
+    assert receipt.authority_current is False
+    assert len(receipt.deferred) == 1
+    assert receipt.deferred[0].reason is (
+        reserved_fill_planner.DeferredFillReason.LOST_OWNER)
+    assert receipt.deferred[0].detail == (
+        'durable controller authority is unavailable')
+    repository.grant_plan.assert_not_called()
 
 
 def test_durable_pool_executor_does_not_serialize_independent_pools() -> None:

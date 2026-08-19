@@ -53,7 +53,6 @@ from sky.serve import serve_state
 from sky.serve import serve_status_formatter
 from sky.serve import spot_placer
 from sky.server import constants as server_constants
-from sky.server import versions
 from sky.server.requests import request_names
 from sky.skylet import constants as skylet_constants
 from sky.skylet import job_lib
@@ -4043,21 +4042,32 @@ def quiesce_service_replica_launch_requests(
 ) -> bool:
     """Cancel and execution-quiesce launches backed by replica inventory.
 
-    ``sdk.api_cancel`` publishes ``CANCELLED`` before a remote executor has
+    Cancellation publishes ``CANCELLED`` before a remote executor has
     necessarily stopped its handler. Teardown may remove replica/service rows
     only after every retained target request proves that its exact execution
-    generation is quiescent. The caller must first stop the controller child
-    (or receive its teardown acknowledgement), so no producer can enqueue a
-    new launch after this barrier begins.
+    generation is quiescent. Backend-guarded central controllers use the
+    authoritative in-process request backend directly; public API
+    authentication and response encoding are not part of this safety barrier.
+    The caller must first stop the controller child (or receive its teardown
+    acknowledgement), so no producer can enqueue a new launch after this
+    barrier begins.
 
-    ``include_terminal_history`` uses one server-side cluster-name batch to
-    discover already-terminal but unproven requests. Protocol-v2 interrupted
-    fill recovery requires it; compatibility teardown leaves it disabled while
-    pre-v70 request history ages out.
+    Every backend-guarded central call uses one server-side cluster-name batch
+    to discover active and already-terminal unproven requests. The
+    ``include_terminal_history`` bit additionally requires that central path;
+    protocol-v2 interrupted fill recovery uses it so it can never fall back to
+    a remote compatibility query.
 
     Returns False on any transport/status/identity/ownership uncertainty.
     Callers then retain all durable service and replica rows for a later retry.
     """
+    # Local to avoid requests -> decoders -> Serve state/spec -> serve_utils
+    # during ``import sky``. The quiescence barrier runs only after startup.
+    # pylint: disable=import-outside-toplevel
+    from sky.server.requests import postgres as request_postgres
+    from sky.server.requests import requests as api_requests
+
+    # pylint: enable=import-outside-toplevel
 
     def _guard_allows() -> bool:
         if continue_guard is None:
@@ -4073,6 +4083,14 @@ def quiesce_service_replica_launch_requests(
     launch_request_name = (server_constants.REQUEST_NAME_PREFIX +
                            request_names.RequestName.CLUSTER_LAUNCH.value)
     cluster_names = {info.cluster_name for info in replica_infos}
+    # The server-owned backend guard is the topology/capability witness. A
+    # controller-child override is deliberately not: every Serve controller
+    # child sets it, including legacy remote controllers. Protocol-v2 is
+    # central-PostgreSQL-only and forces this path so it cannot silently
+    # downgrade to a public API query.
+    use_authoritative_request_store = (
+        include_terminal_history or
+        request_postgres.execution_quiescence_backend_guard_enabled())
 
     def _discover_launch_requests() -> tuple[dict[str, int], dict[str, int]]:
         if not cluster_names:
@@ -4080,33 +4098,27 @@ def quiesce_service_replica_launch_requests(
         # The caller has stopped the launch producer (and generic teardown has
         # already durably terminalized the service). A launch request racing
         # this snapshot is caught by the next cancellation round. The
-        # protocol-v2 recovery path asks PostgreSQL for all statuses of the
-        # whole incarnation-scoped cluster-name set in one bounded query;
-        # compatibility teardown scans only the active queue.
+        # guarded central path asks PostgreSQL for active and terminal-unproved
+        # rows across the whole incarnation-scoped cluster-name set in one
+        # bounded query; only remote compatibility teardown scans active rows.
         fields = ['request_id', 'name', 'cluster_name']
-        if include_terminal_history:
+        if use_authoritative_request_store:
             fields.extend([
                 'execution_generation', 'status',
                 'execution_quiescence_required',
                 'execution_quiesced_generation', 'execution_quiesced_at'
             ])
-            requests = sdk.api_status(
-                all_status=True,
+        if use_authoritative_request_store:
+            request_filter = api_requests.RequestTaskFilter(
                 cluster_names=sorted(cluster_names),
-                _include_request_names=[launch_request_name],
+                include_request_names=[launch_request_name],
+                execution_quiescence_candidates_only=True,
                 fields=fields,
-                _execution_quiescence_candidates_only=(True))
+                sort=True)
+            requests = api_requests.get_request_tasks(request_filter)
         else:
+            assert not include_terminal_history
             requests = sdk.api_status(all_status=False, fields=fields)
-
-        if include_terminal_history:
-            remote_api_version = versions.get_remote_api_version()
-            if (remote_api_version is None or
-                    remote_api_version < server_constants.
-                    MIN_REQUEST_EXECUTION_QUIESCENCE_API_VERSION):
-                raise RuntimeError(
-                    'API server cannot expose exact request execution '
-                    'quiescence; finish the server rollout first.')
 
         active: dict[str, int] = {}
         terminal_unproven: dict[str, int] = {}
@@ -4114,7 +4126,7 @@ def quiesce_service_replica_launch_requests(
             if (request.name != launch_request_name or
                     request.cluster_name not in cluster_names):
                 continue
-            if not include_terminal_history:
+            if not use_authoritative_request_store:
                 active[request.request_id] = 0
                 continue
             execution_generation = request.execution_generation
@@ -4123,7 +4135,10 @@ def quiesce_service_replica_launch_requests(
                 raise RuntimeError(
                     'API server did not return an execution generation for '
                     f'launch request {request.request_id}.')
-            if request.status in ('CANCELLED', 'SUCCEEDED', 'FAILED'):
+            status = request.status
+            if isinstance(status, str):
+                status = api_requests.RequestStatus(status)
+            if status in api_requests.RequestStatus.finished_status():
                 if request.execution_quiescence_required is not True:
                     # Pre-v70 terminal history has no completion-receipt
                     # contract. Protocol v2 cannot create those rows, and
@@ -4146,16 +4161,22 @@ def quiesce_service_replica_launch_requests(
         while True:
             if not _guard_allows():
                 return False
-            requests = sdk.api_status(request_ids=sorted(request_ids),
-                                      fields=[
-                                          'request_id', 'name', 'cluster_name',
-                                          'status', 'execution_generation',
-                                          'execution_quiescence_required',
-                                          'execution_quiesced_generation',
-                                          'execution_quiesced_at'
-                                      ],
-                                      _exact_request_ids=True,
-                                      _use_body=True)
+            fields = [
+                'request_id', 'name', 'cluster_name', 'status',
+                'execution_generation', 'execution_quiescence_required',
+                'execution_quiesced_generation', 'execution_quiesced_at'
+            ]
+            if use_authoritative_request_store:
+                requests = api_requests.get_request_tasks(
+                    api_requests.RequestTaskFilter(
+                        request_ids=sorted(request_ids),
+                        fields=fields,
+                        sort=True))
+            else:
+                requests = sdk.api_status(request_ids=sorted(request_ids),
+                                          fields=fields,
+                                          _exact_request_ids=True,
+                                          _use_body=True)
             exact_requests = {
                 request.request_id: request
                 for request in requests
@@ -4184,7 +4205,10 @@ def quiesce_service_replica_launch_requests(
                         f'({request.execution_generation} != '
                         f'{expected_generation})')
                     return False
-                if request.status not in ('CANCELLED', 'SUCCEEDED', 'FAILED'):
+                status = request.status
+                if isinstance(status, str):
+                    status = api_requests.RequestStatus(status)
+                if status not in api_requests.RequestStatus.finished_status():
                     logger.error(
                         'Launch request did not reach a terminal state while '
                         f'quiescing {service_name!r}: {request_id} '
@@ -4206,6 +4230,11 @@ def quiesce_service_replica_launch_requests(
             time.sleep(_LAUNCH_QUIESCE_POLL_SECONDS)
 
     try:
+        if use_authoritative_request_store:
+            # The direct barrier is safe only when the configured store and
+            # queue resolve to the exact built-in durable implementations.
+            request_postgres.require_builtin_execution_quiescence_backends(
+                required=True)
         # The caller has already stopped the producer (and generic service
         # teardown has published SHUTTING_DOWN). Both the scheduler
         # precondition and persisted execution entrypoint reject a launch row
@@ -4223,15 +4252,19 @@ def quiesce_service_replica_launch_requests(
                         f'cancellation for {service_name!r}: '
                         f'{sorted(active_requests)}')
                     return False
-                cancel_request_id = sdk.api_cancel(sorted(active_requests),
-                                                   all_users=True,
-                                                   silent=True)
-                sdk.stream_and_get(cancel_request_id)
+                if use_authoritative_request_store:
+                    api_requests.kill_requests_exact(sorted(active_requests),
+                                                     user_id=None)
+                else:
+                    cancel_request_id = sdk.api_cancel(sorted(active_requests),
+                                                       all_users=True,
+                                                       silent=True)
+                    sdk.stream_and_get(cancel_request_id)
                 cancel_rounds += 1
-                if not include_terminal_history:
-                    # Compatibility path for local/SQLite and pre-v70
-                    # deployments. Protocol-v2 fill recovery always enables
-                    # the generation-stamped PostgreSQL history barrier.
+                if not use_authoritative_request_store:
+                    # Transitional active-only compatibility is restricted to
+                    # legacy remote controllers. Every guarded central caller
+                    # waits for the exact generation receipt below.
                     continue
 
             targets = dict(terminal_unproven)

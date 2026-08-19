@@ -321,9 +321,145 @@ class TestBecomeLeaderOrdering:
 
         # Recovery runs only after the lock is acquired AND after the wait.
         assert order == ['acquire', 'sleep', 'sleep', 'sleep', 'recovery']
-        # The finally block removes the gate file even when recovery fails.
+        # Recovery has not completed, so controller starts must remain gated
+        # while the outer loop prepares to retry.
+        assert signal_file.exists()
+
+    def test_recovery_failure_keeps_gate_until_successful_retry(
+            self, tmp_path, monkeypatch):
+        """A transient recovery failure must not expose partial state.
+
+        The same leader retries recovery after a short sleep. Controller
+        starts must stay gated throughout that sleep; only the successful
+        retry may remove the gate before steady-state refresh begins.
+        """
+        signal_file = tmp_path / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+        monkeypatch.setattr(mjrt.managed_job_state,
+                            'has_jobs_requiring_recovery_grace_wait',
+                            lambda: False)
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        # First attempt acquires the lock. The exception handler and retry
+        # then observe the same live ownership and must not acquire again.
+        lock.is_locked.side_effect = [False, True, True]
+        lock.is_session_alive.return_value = True
+
+        retry_sleeps = []
+        real_unlink = mjrt.pathlib.Path.unlink
+
+        def record_retry_sleep(seconds):
+            assert signal_file.exists()
+            retry_sleeps.append(seconds)
+
+        def record_gate_unlink(path, *, missing_ok=False):
+            assert path == signal_file
+            return real_unlink(path, missing_ok=missing_ok)
+
+        with mock.patch('sky.utils.locks.get_lock', return_value=lock), \
+                mock.patch.object(
+                    mjrt,
+                    '_touch_recovery_signal_file',
+                    wraps=mjrt._touch_recovery_signal_file) as touch_gate, \
+                mock.patch.object(
+                    mjrt.pathlib.Path,
+                    'unlink',
+                    autospec=True,
+                    side_effect=record_gate_unlink) as unlink_gate, \
+                mock.patch.object(
+                    mjrt.managed_job_utils,
+                    'ha_recovery_for_consolidation_mode',
+                    side_effect=[RuntimeError('transient recovery failure'),
+                                 None]) as recovery, \
+                mock.patch.object(thread,
+                                  '_wait_or_stopping',
+                                  side_effect=record_retry_sleep), \
+                mock.patch.object(
+                    mjrt.events.ManagedJobEvent,
+                    'run',
+                    side_effect=SystemExit('stop after successful recovery')):
+            with pytest.raises(SystemExit,
+                               match='stop after successful recovery'):
+                thread.run()
+
+        assert retry_sleeps == [mjrt._ACQUIRE_RETRY_INTERVAL_SECONDS]
+        assert recovery.call_count == 2
+        assert touch_gate.call_count == 2
+        unlink_gate.assert_called_once_with(signal_file, missing_ok=True)
+        lock.acquire.assert_called_once_with(blocking=False)
+        # One probe before each recovery plus the exception-path ownership
+        # check before sleeping.
+        assert lock.is_session_alive.call_count == 3
         assert not signal_file.exists()
         assert signal_file.parent.exists()
+
+    def test_acquire_failure_keeps_gate(self, tmp_path, monkeypatch):
+        """A failed lock acquisition must leave controller starts gated."""
+        signal_file = tmp_path / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        lock.is_locked.return_value = False
+        lock.acquire.side_effect = OSError('transient acquire failure')
+        thread._lock = lock
+
+        with mock.patch.object(
+                mjrt.managed_job_utils,
+                'ha_recovery_for_consolidation_mode') as recovery:
+            with pytest.raises(OSError, match='transient acquire failure'):
+                thread._become_leader_and_run()
+
+        assert signal_file.exists()
+        recovery.assert_not_called()
+
+    def test_recovery_failure_with_lock_loss_keeps_gate(self, tmp_path,
+                                                        monkeypatch):
+        """A failed recovery stays gated while a stale leader steps down."""
+        signal_file = tmp_path / 'restart_signal'
+        monkeypatch.setattr(mjrt.constants,
+                            'PERSISTENT_RUN_RESTARTING_SIGNAL_FILE',
+                            str(signal_file))
+        monkeypatch.setattr(mjrt.managed_job_state,
+                            'has_jobs_requiring_recovery_grace_wait',
+                            lambda: False)
+
+        thread = mjrt.ManagedJobRefreshDaemonThread()
+        lock = mock.create_autospec(locks.PostgresLock,
+                                    instance=True,
+                                    spec_set=True)
+        lock.is_locked.side_effect = [False, True]
+        lock.is_session_alive.side_effect = [True, False]
+
+        with mock.patch('sky.utils.locks.get_lock', return_value=lock), \
+                mock.patch.object(
+                    mjrt.managed_job_utils,
+                    'ha_recovery_for_consolidation_mode',
+                    side_effect=RuntimeError('recovery lost its session')) as \
+                recovery, \
+                mock.patch.object(
+                    mjrt.ManagedJobRefreshDaemonThread,
+                    '_suicide_on_lock_loss') as suicide, \
+                mock.patch.object(thread,
+                                  '_wait_or_stopping',
+                                  return_value=False) as wait:
+            thread.run()
+
+        assert signal_file.exists()
+        lock.acquire.assert_called_once_with(blocking=False)
+        assert lock.is_session_alive.call_count == 2
+        recovery.assert_called_once_with()
+        suicide.assert_called_once_with()
+        wait.assert_not_called()
 
     def test_run_missing_signal_parent_avoids_retry_backoff(
             self, tmp_path, monkeypatch):
@@ -401,9 +537,9 @@ class TestBecomeLeaderOrdering:
         lock.is_locked.return_value = True
         thread._lock = lock
 
-        sleep_calls = []
-        event_runs = []
-        suicides = []
+        sleep_calls: list[float] = []
+        event_runs: list[bool] = []
+        suicides: list[bool] = []
 
         with mock.patch.object(
                 mjrt.managed_job_utils,
@@ -453,8 +589,8 @@ class TestBecomeLeaderOrdering:
         lock.is_session_alive.return_value = True
         thread._lock = lock
 
-        slept = []
-        order = []
+        slept: list[float] = []
+        order: list[str] = []
 
         def on_acquire(*_args, **_kwargs):
             assert signal_file.exists()
@@ -465,9 +601,8 @@ class TestBecomeLeaderOrdering:
         def on_sleep(seconds, *_args, **_kwargs):
             slept.append(seconds)
 
-        def recovery_and_stop():
+        def recovery():
             order.append('recovery')
-            raise RuntimeError('stop before event loop')
 
         with mock.patch.object(thread,
                                '_wait_or_stopping',
@@ -475,8 +610,13 @@ class TestBecomeLeaderOrdering:
                 mock.patch.object(
                     mjrt.managed_job_utils,
                     'ha_recovery_for_consolidation_mode',
-                    side_effect=recovery_and_stop):
-            with pytest.raises(RuntimeError, match='stop before event loop'):
+                    side_effect=recovery), \
+                mock.patch.object(
+                    mjrt.events.ManagedJobEvent,
+                    'run',
+                    side_effect=SystemExit('stop after successful recovery')):
+            with pytest.raises(SystemExit,
+                               match='stop after successful recovery'):
                 thread._become_leader_and_run()
 
         assert not slept
@@ -506,7 +646,7 @@ class TestBecomeLeaderOrdering:
         lock.is_session_alive.return_value = True
         thread._lock = lock
 
-        slept = []
+        slept: list[float] = []
 
         def on_sleep(seconds, *_args, **_kwargs):
             # The gate file must still be in place during the wait.
@@ -547,7 +687,7 @@ class TestBecomeLeaderOrdering:
         lock.is_locked.return_value = False
         lock.is_session_alive.return_value = False
         thread._lock = lock
-        slept = []
+        slept: list[float] = []
 
         with mock.patch.object(
                 thread, '_wait_or_stopping', side_effect=slept.append), \
@@ -583,7 +723,7 @@ class TestBecomeLeaderOrdering:
         lock.is_locked.return_value = False
         lock.is_session_alive.side_effect = [True, False]
         thread._lock = lock
-        slept = []
+        slept: list[float] = []
 
         with mock.patch.object(
                 thread, '_wait_or_stopping', side_effect=slept.append), \
@@ -606,12 +746,17 @@ class TestBecomeLeaderOrdering:
 
 def test_recovery_only_fences_stale_jobs(tmp_path, monkeypatch):
     """The refresh owner recovers rows; runtime owns slot startup."""
-    order = []
+    order: list[str] = []
     monkeypatch.setattr(mjrt.constants, 'HA_PERSISTENT_RECOVERY_LOG_PATH',
                         str(tmp_path / '{}recovery.log'))
+
+    def reset_stale_jobs_for_current_controller() -> int:
+        order.append('reset-stale')
+        return 1
+
     monkeypatch.setattr(mjrt.managed_job_state,
                         'reset_stale_jobs_for_current_controller',
-                        lambda: order.append('reset-stale') or 1)
+                        reset_stale_jobs_for_current_controller)
     monkeypatch.setattr(mjrt.managed_job_state, 'get_managed_jobs_with_filters',
                         lambda fields: ([], None))
     mjrt.managed_job_utils.ha_recovery_for_consolidation_mode()
@@ -661,20 +806,21 @@ class TestShutdown:
             assert allow_effect_to_finish.wait(timeout=5)
             order.append('effect-finished')
 
-        thread._become_leader_and_run = mock.Mock(side_effect=run_effect)
         lock.release.side_effect = lambda: order.append('lock-released')
+        with mock.patch.object(thread,
+                               '_become_leader_and_run',
+                               side_effect=run_effect):
+            thread.start()
+            assert effect_started.wait(timeout=5)
+            thread.request_shutdown()
+            lock.release.assert_not_called()
+            allow_effect_to_finish.set()
+            thread.wait_for_shutdown()
 
-        thread.start()
-        assert effect_started.wait(timeout=5)
-        thread.request_shutdown()
-        lock.release.assert_not_called()
-        allow_effect_to_finish.set()
-        thread.wait_for_shutdown()
-
-        assert order == ['effect-finished']
-        assert thread.is_alive()
-        lock.release.assert_not_called()
-        thread.release_ownership()
+            assert order == ['effect-finished']
+            assert thread.is_alive()
+            lock.release.assert_not_called()
+            thread.release_ownership()
 
         assert order == ['effect-finished', 'lock-released']
         assert not thread.is_alive()
@@ -685,14 +831,13 @@ class TestShutdown:
                                     instance=True,
                                     spec_set=True)
         thread._lock = lock
-        thread._become_leader_and_run = mock.Mock()
         lock.release.side_effect = RuntimeError('release failed')
-
-        thread.start()
-        thread.request_shutdown()
-        thread.wait_for_shutdown()
-        with pytest.raises(RuntimeError, match='ownership did not release'):
-            thread.release_ownership()
+        with mock.patch.object(thread, '_become_leader_and_run'):
+            thread.start()
+            thread.request_shutdown()
+            thread.wait_for_shutdown()
+            with pytest.raises(RuntimeError, match='ownership did not release'):
+                thread.release_ownership()
 
         assert thread.is_alive()
         lock.release.side_effect = None

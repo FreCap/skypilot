@@ -3945,6 +3945,12 @@ class TestGetServiceControllerOwner:
     def test_missing_row_returns_none(self, _mock_serve_db):
         assert serve_state.get_service_controller_owner('missing') is None
 
+    def test_route_owner_state_requires_lb_state(self):
+        with pytest.raises(ValueError,
+                           match='include_route_owner_state requires'):
+            serve_state.get_service_controller_owner(
+                'svc-owner', include_route_owner_state=True)
+
     def test_lb_state_extension_includes_complete_cutover_row_in_one_query(
             self, _mock_serve_db):
         _add_minimal_service('svc-role-state', controller_ip='10.4.10.8')

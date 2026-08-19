@@ -698,6 +698,7 @@ def test_postgres_controller_failure_terminalizes_for_slot_adoption(
         'controller_generation': generation,
         'controller_slot_id': None,
         'controller_slot_attempt': None,
+        'controller_slot_quiescing': False,
     }
     try:
         with _live_controller_generation(postgres_engine, instance_id,

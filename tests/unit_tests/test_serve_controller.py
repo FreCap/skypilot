@@ -3927,12 +3927,22 @@ class TestNumReadyReplicas:
 class TestAutoscalerRuntimeSnapshot:
 
     @staticmethod
-    def _durable_snapshot(*, fresh_aggregate_zero=False):
+    def _durable_snapshot(*,
+                          generation=3,
+                          request_generation=None,
+                          observed_slots=None,
+                          in_flight=None,
+                          unknown_replica_ids=None,
+                          fresh_aggregate_zero=False):
+        observed_slots = dict(observed_slots or {})
+        in_flight = dict(in_flight or {})
+        unknown_replica_ids = set(unknown_replica_ids or ())
+        read_started_monotonic = time.monotonic()
         return types.SimpleNamespace(
             service_name='svc',
             service_hash='svc-hash',
             demand_source_epoch=1,
-            demand_feed_generation=3,
+            demand_feed_generation=generation,
             route_generation=4,
             route_sha256='a' * 64,
             route_source_epoch=2,
@@ -3941,11 +3951,24 @@ class TestAutoscalerRuntimeSnapshot:
                 'sequence': 5,
                 'payload_sha256': 'b' * 64,
             }],
-            request_information={'request_aggregator': {
-                'timestamps': []
-            }},
+            request_information={
+                'timestamps': [],
+                'compatibility_demand_complete': True,
+                'in_flight_by_replica_id': in_flight,
+                'unknown_in_flight_replica_ids': sorted(unknown_replica_ids),
+                'observed_slots_by_replica_id': observed_slots,
+                'unknown_capacity_replica_ids': sorted(unknown_replica_ids),
+                'reconcile_generation': (generation if request_generation
+                                         is None else request_generation),
+                'queue_depth': 0,
+                'rejected_in_window': 0,
+                'rejected_in_recent_window': 0,
+            },
             normalized_demand={'queue_depth': 0},
-            fresh_aggregate_zero=fresh_aggregate_zero)
+            fresh_aggregate_zero=fresh_aggregate_zero,
+            reconcile_authority=types.SimpleNamespace(
+                read_started_monotonic=read_started_monotonic,
+                deadline_monotonic=read_started_monotonic + 60))
 
     @staticmethod
     def _durable_autoscaler(target=1):
@@ -3966,6 +3989,87 @@ class TestAutoscalerRuntimeSnapshot:
             }
         }
         return scaler
+
+    @staticmethod
+    def _logical_durable_autoscaler(target=0, *, emit_scale_up=False):
+        scaler = mock.Mock(spec=autoscalers.ConcurrencyAutoscaler)
+        scaler.latest_version = 1
+        scaler.replica_unit = 'logical'
+        scaler.reserved_capacity_fill = False
+        scaler.has_recomputed_with_fresh_data.return_value = True
+        scaler.get_final_target_num_replicas.return_value = target
+        scaler.unrecoverable_rollout_failure = None
+        scaler.current_launch_priority.return_value = 50
+        scaler.configured_accelerator_shapes = {'L4': 1}
+        scaler.capacity_target_by_accelerator = {'L4': target}
+        scaler.capacity_target_complete = True
+        scaler.target_num_replicas_by_accelerator = {'L4': target}
+        scaler.warm_retention_target_by_accelerator = {}
+        scaler.cold_launch_authority_by_accelerator = {}
+        scaler.reconcile_generation = 0
+        scaler.logical_target_state = None
+        scaler.info.return_value = {
+            'demand_target_by_accelerator': {
+                'L4': target
+            }
+        }
+
+        def _collect(report):
+            scaler.reconcile_generation = report['reconcile_generation']
+
+        def _generate(_replica_infos, _active_versions):
+            if not emit_scale_up:
+                scaler.logical_target_state = (scaler.latest_version,
+                                               scaler.reconcile_generation,
+                                               target)
+                return []
+            target_by_accelerator = (('L4', target),)
+            accelerator_shapes = (('L4', 1),)
+            scaler.logical_target_state = (scaler.latest_version,
+                                           scaler.reconcile_generation, target,
+                                           target_by_accelerator,
+                                           accelerator_shapes)
+            return [
+                autoscalers.AutoscalerDecision(
+                    autoscalers.AutoscalerDecisionOperator.SCALE_UP,
+                    autoscalers.LogicalScaleTarget(
+                        version=scaler.latest_version,
+                        reconcile_generation=scaler.reconcile_generation,
+                        target_capacity=target,
+                        target_capacity_by_accelerator=(target_by_accelerator),
+                        accelerator_shapes=accelerator_shapes,
+                        cold_launch_authority_by_accelerator=()))
+            ]
+
+        scaler.collect_request_information.side_effect = _collect
+        scaler.generate_scaling_decisions.side_effect = _generate
+        return scaler
+
+    @staticmethod
+    def _run_promoted_reconciles(ctrl, snapshots):
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               side_effect=list(snapshots)), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos',
+                               return_value=[]), \
+             mock.patch.object(
+                 controller.serve_state,
+                 'get_service_runtime_snapshot',
+                 return_value={'active_versions': [1]}), \
+             mock.patch.object(ctrl,
+                               '_persist_cost_rebalance_state',
+                               return_value=True), \
+             mock.patch.object(ctrl,
+                               '_publish_ordered_paid_authority',
+                               return_value=object()):
+            for _ in snapshots:
+                ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
 
     def test_ordered_target_uses_supply_aware_cross_card_allocation(self):
         scaler = self._durable_autoscaler(65)
@@ -3997,7 +4101,7 @@ class TestAutoscalerRuntimeSnapshot:
     def test_promoted_durable_demand_unavailable_suppresses_all_actuation(self):
         ctrl = _make_controller()
         ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
-        ctrl._autoscaler = self._durable_autoscaler()  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
         ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
 
         with mock.patch.object(
@@ -4014,8 +4118,267 @@ class TestAutoscalerRuntimeSnapshot:
 
         get_replicas.assert_not_called()
         ctrl._autoscaler.collect_request_information.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
+
+    def test_promoted_durable_snapshot_read_error_revokes_manager_authority(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._durable_demand_snapshot = object()  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+
+        with mock.patch.object(
+                controller.capacity_admission,
+                'get_service_source_mode',
+                return_value=(controller.capacity_admission.DemandSourceMode.
+                              DURABLE_FEED, 1)), \
+             mock.patch.object(controller.demand_state,
+                               'get_autoscaling_snapshot',
+                               side_effect=RuntimeError('database unavailable')), \
+             mock.patch.object(controller.serve_state,
+                               'get_replica_infos') as get_replicas:
+            ctrl._reconcile_scale_once(0)  # pylint: disable=protected-access
+
+        get_replicas.assert_not_called()
+        assert ctrl._durable_demand_snapshot is None  # pylint: disable=protected-access
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
+
+    def test_promoted_logical_request_generation_mismatch_fails_closed(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=2)
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+
+        self._run_promoted_reconciles(ctrl, [
+            self._durable_snapshot(generation=68023, request_generation=68022)
+        ])
+
+        scaler.collect_request_information.assert_not_called()
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        assert ctrl._reconcile_generation == 0  # pylint: disable=protected-access
+
+    def test_promoted_logical_autoscaler_generation_echo_mismatch_fails_closed(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=2)
+
+        def _collect_with_wrong_echo(report):
+            scaler.reconcile_generation = report['reconcile_generation'] + 1
+
+        scaler.collect_request_information.side_effect = (
+            _collect_with_wrong_echo)
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+
+        self._run_promoted_reconciles(
+            ctrl, [self._durable_snapshot(generation=68023)])
+
+        scaler.collect_request_information.assert_called_once()
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        assert ctrl._reconcile_generation == 0  # pylint: disable=protected-access
+
+    def test_promoted_logical_snapshot_uses_exact_feed_and_target_generation(
+            self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        scaler = self._logical_durable_autoscaler(target=2)
+        ctrl._autoscaler = scaler  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        published = []
+
+        def _capture_state(target, snapshot):
+            assert ctrl._routing_state_lock._is_owned()  # pylint: disable=protected-access
+            published.append((target, snapshot))
+            return True
+
+        ctrl._replica_manager.publish_logical_reconcile_state.side_effect = (  # pylint: disable=line-too-long,protected-access
+            _capture_state)
+        snapshot = self._durable_snapshot(generation=68023,
+                                          observed_slots={
+                                              11: 2,
+                                              12: 1
+                                          },
+                                          in_flight={
+                                              11: 1,
+                                              12: 0
+                                          },
+                                          unknown_replica_ids={13})
+
+        self._run_promoted_reconciles(ctrl, [snapshot])
+
+        assert scaler.reconcile_generation == 68023
+        assert len(published) == 1
+        target, manager_snapshot = published[0]
+        assert target == (1, 68023, 2)
+        assert manager_snapshot.version == 1
+        assert manager_snapshot.generation == 68023
+        assert manager_snapshot.observed_slots_by_replica_id == {
+            11: 2,
+            12: 1,
+        }
+        assert manager_snapshot.in_flight_by_replica_id == {
+            11: 1,
+            12: 0,
+        }
+        assert manager_snapshot.unknown_replica_ids == frozenset({13})
+        ctrl._replica_manager.publish_logical_target.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
+        # The process-local race fence advances independently and must never
+        # stamp manager evidence.
+        assert ctrl._reconcile_generation == 1  # pylint: disable=protected-access
+
+    def test_promoted_logical_snapshot_replay_cannot_look_newer(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        first = self._durable_snapshot(generation=68023)
+        newer = self._durable_snapshot(generation=68024)
+
+        self._run_promoted_reconciles(ctrl, [first, first, newer])
+
+        state_calls = ctrl._replica_manager.publish_logical_reconcile_state.call_args_list  # pylint: disable=line-too-long
+        snapshot_generations = [call.args[1].generation for call in state_calls]
+        target_generations = [call.args[0][1] for call in state_calls]
+        assert snapshot_generations == [68023, 68023, 68024]
+        assert target_generations == [68023, 68023, 68024]
+        assert ctrl._reconcile_generation == 3  # pylint: disable=protected-access
+
+    def test_promoted_logical_snapshot_bridge_adds_no_teardown_path(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+
+        self._run_promoted_reconciles(
+            ctrl, [self._durable_snapshot(generation=68023)])
+
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_called_once()  # pylint: disable=line-too-long
+        ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_logical_target.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.reconcile_fresh_zero_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.cancel_uncommitted_paid_retirements.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down.assert_not_called()
+        ctrl._replica_manager._terminate_replica.assert_not_called()  # pylint: disable=protected-access
+
+    def test_promoted_logical_planning_failure_keeps_snapshot_private(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler()  # pylint: disable=protected-access
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+
+        def _fail_planning(*_args, **_kwargs):
+            ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
+            ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
+            return None
+
+        with mock.patch.object(ctrl,
+                               '_plan_scale_reconciliation',
+                               side_effect=_fail_planning):
+            self._run_promoted_reconciles(
+                ctrl, [self._durable_snapshot(generation=68024)])
+
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.update_logical_reconcile_snapshot.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.publish_logical_target.assert_not_called()  # pylint: disable=line-too-long
+
+    def test_promoted_logical_publish_rejection_stops_later_actuation(self):
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler(  # pylint: disable=protected-access
+            target=2, emit_scale_up=True)
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+        ctrl._replica_manager.publish_logical_reconcile_state.return_value = (
+            False)
+
+        self._run_promoted_reconciles(
+            ctrl, [self._durable_snapshot(generation=68023)])
+
+        ctrl._replica_manager.publish_target_num_replicas.assert_called_once_with(  # pylint: disable=line-too-long
+            2, expected_version=1)
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_called_once()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down.assert_not_called()
+
+    def test_promoted_logical_final_currentness_race_stops_publication(self):
+
+        class _RaceOnArmedEnter:
+
+            def __init__(self, callback):
+                self._lock = threading.RLock()
+                self._callback = callback
+                self._armed = False
+                self.fired = False
+
+            def arm(self):
+                self._armed = True
+
+            def __enter__(self):
+                if self._armed and not self.fired:
+                    self.fired = True
+                    self._callback()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                del exc_type, exc_value, traceback
+                self._lock.release()
+
+        ctrl = _make_controller()
+        ctrl._service_hash = 'svc-hash'  # pylint: disable=protected-access
+        ctrl._autoscaler = self._logical_durable_autoscaler(  # pylint: disable=protected-access
+            target=2, emit_scale_up=True)
+        ctrl._replica_manager = mock.Mock()  # pylint: disable=protected-access
+        ctrl._replica_manager.spot_placer = None
+
+        def _advance_actuation_epoch():
+            with ctrl._actuation_epoch_lock:  # pylint: disable=protected-access
+                ctrl._actuation_generation += 1  # pylint: disable=protected-access
+
+        routing_lock = _RaceOnArmedEnter(_advance_actuation_epoch)
+        ctrl._routing_state_lock = routing_lock  # pylint: disable=protected-access
+
+        def _arm_final_race(*_args, **_kwargs):
+            routing_lock.arm()
+            return True
+
+        ctrl._replica_manager.publish_target_num_replicas.side_effect = (
+            _arm_final_race)
+
+        self._run_promoted_reconciles(
+            ctrl, [self._durable_snapshot(generation=68023)])
+
+        assert routing_lock.fired
+        ctrl._replica_manager.publish_logical_reconcile_state.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.scale_up_to_logical_capacity.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down_logically_batch.assert_not_called()  # pylint: disable=line-too-long
+        ctrl._replica_manager.scale_down.assert_not_called()
 
     def test_unknown_central_demand_mode_never_revives_legacy_actuation(self):
         ctrl = _make_controller()
@@ -4033,6 +4396,7 @@ class TestAutoscalerRuntimeSnapshot:
         get_replicas.assert_not_called()
         ctrl._replica_manager.publish_target_num_replicas.assert_not_called()  # pylint: disable=line-too-long
         ctrl._replica_manager.scale_up_batch.assert_not_called()
+        ctrl._replica_manager.invalidate_logical_reconcile_state.assert_called_once_with()  # pylint: disable=line-too-long
 
     def test_promoted_zero_cost_commit_forces_replan_before_paid_plan(self):
         ctrl = _make_controller()

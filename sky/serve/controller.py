@@ -9,6 +9,7 @@ import contextlib
 import contextvars
 import copy
 import dataclasses
+import enum
 import functools
 import hashlib
 import hmac
@@ -104,6 +105,63 @@ class _LbRoleDatabaseSnapshot(NamedTuple):
     fence: tuple[str, tuple[int | None, str | None], int]
     state: lb_ha.LbCutoverState
     owner: dict[str, Any]
+
+
+class _LbPromotionReason(str, enum.Enum):
+    """Bounded, non-authoritative reason for one promotion decision."""
+
+    ELIGIBLE = 'eligible'
+    LEGACY_CONTRACT_UNKNOWN = 'legacy_contract_unknown'
+    ROUTING_VERSION_MISMATCH = 'routing_version_mismatch'
+    ROUTE_FENCE_MALFORMED = 'route_fence_malformed'
+    ROUTE_CONTRACT_UNAVAILABLE = 'route_contract_unavailable'
+    ROUTE_FENCE_NOT_CURRENT = 'route_fence_not_current'
+    ROUTING_URLS_MALFORMED = 'routing_urls_malformed'
+    ROUTING_URLS_MISMATCH = 'routing_urls_mismatch'
+    OCCUPANCY_REPORT_MALFORMED = 'occupancy_report_malformed'
+    OCCUPANCY_SAMPLE_MISSING = 'occupancy_sample_missing'
+    OCCUPANCY_SAMPLE_STALE = 'occupancy_sample_stale'
+
+
+@dataclasses.dataclass(frozen=True)
+class _LbPromotionGate:
+    """Promotion authority plus bounded diagnostics for one role report."""
+
+    eligible: bool
+    reason: _LbPromotionReason
+    route_mode: str
+    routing_version: int | None = None
+    route_source_epoch: int | None = None
+    route_generation: int | None = None
+    expected_routing_backend_count: int | None = None
+    reported_routing_backend_count: int | None = None
+    expected_async_backend_count: int | None = None
+    reported_async_backend_count: int | None = None
+    fresh_async_backend_count: int | None = None
+    missing_async_backend_count: int | None = None
+    stale_async_backend_count: int | None = None
+    route_contract: route_projection.RoutePromotionContract | None = (
+        dataclasses.field(default=None, repr=False))
+
+    def observability(self) -> dict[str, Any]:
+        """Return only bounded counts/enums, never URLs, digests, or IDs."""
+        return {
+            'eligible': self.eligible,
+            'reason': self.reason.value,
+            'route_mode': self.route_mode,
+            'routing_version': self.routing_version,
+            'route_source_epoch': self.route_source_epoch,
+            'route_generation': self.route_generation,
+            'expected_routing_backend_count':
+                self.expected_routing_backend_count,
+            'reported_routing_backend_count':
+                self.reported_routing_backend_count,
+            'expected_async_backend_count': self.expected_async_backend_count,
+            'reported_async_backend_count': self.reported_async_backend_count,
+            'fresh_async_backend_count': self.fresh_async_backend_count,
+            'missing_async_backend_count': self.missing_async_backend_count,
+            'stale_async_backend_count': self.stale_async_backend_count,
+        }
 
 
 def _catalog_missing_task_contexts(
@@ -1891,8 +1949,10 @@ class SkyServeController:
 
     def _lb_role_database_snapshot(self) -> _LbRoleDatabaseSnapshot | None:
         """Read the complete role owner/fence/cutover record once."""
-        owner = serve_state.get_service_controller_owner(self._service_name,
-                                                         include_lb_state=True)
+        owner = serve_state.get_service_controller_owner(
+            self._service_name,
+            include_lb_state=True,
+            include_route_owner_state=True)
         if (owner is None or not owner.get('lb_ha_enabled') or
                 not owner.get('hash') or owner.get('lifecycle_epoch') is None):
             return None
@@ -1914,23 +1974,209 @@ class SkyServeController:
         state = lb_cutover_state.parse_lb_cutover_state_record(owner)
         return _LbRoleDatabaseSnapshot(fence, state, owner)
 
-    def _lb_promotion_report_is_current(self, request_data: dict[str,
-                                                                 Any]) -> bool:
-        if not self._lb_occupancy_contract_known:
-            return False
+    def _lb_legacy_promotion_gate(
+            self, request_data: dict[str, Any]) -> _LbPromotionGate:
+        """Evaluate the transient contract used only by the legacy proxy."""
         routing_version = request_data.get('routing_version')
-        if (not isinstance(routing_version, int) or
-                isinstance(routing_version, bool) or
+        normalized_version = (routing_version
+                              if type(routing_version) is int else None)
+        if not self._lb_occupancy_contract_known:
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.LEGACY_CONTRACT_UNKNOWN,
+                route_projection.RouteSourceMode.LEGACY_PROXY.value,
+                routing_version=normalized_version)
+        if (type(routing_version) is not int or
                 routing_version != self._applied_version):
-            return False
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.ROUTING_VERSION_MISMATCH,
+                route_projection.RouteSourceMode.LEGACY_PROXY.value,
+                routing_version=normalized_version)
         sample_generations = request_data.get('occupancy_sample_generation', {})
         sample_ages = request_data.get('occupancy_sample_age_seconds', {})
         if not isinstance(sample_generations, dict) or not isinstance(
                 sample_ages, dict):
-            return False
-        return lb_ha.occupancy_samples_are_promotable(
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.OCCUPANCY_REPORT_MALFORMED,
+                route_projection.RouteSourceMode.LEGACY_PROXY.value,
+                routing_version=routing_version)
+        eligible = lb_ha.occupancy_samples_are_promotable(
             self._lb_expected_occupancy_urls, sample_generations, sample_ages,
             serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS)
+        return _LbPromotionGate(
+            eligible, (_LbPromotionReason.ELIGIBLE if eligible else
+                       _LbPromotionReason.OCCUPANCY_SAMPLE_MISSING),
+            route_projection.RouteSourceMode.LEGACY_PROXY.value,
+            routing_version=routing_version,
+            expected_async_backend_count=len(self._lb_expected_occupancy_urls))
+
+    def _lb_promotion_report_is_current(self, request_data: dict[str,
+                                                                 Any]) -> bool:
+        """Compatibility facade for the legacy process-local route contract."""
+        return self._lb_legacy_promotion_gate(request_data).eligible
+
+    def _lb_route_publisher_identity(
+        self,
+        owner: dict[str,
+                    Any]) -> route_projection.RoutePublisherIdentity | None:
+        """Copy one already-fenced role owner into the narrow route identity."""
+        try:
+            controller_incarnation = owner['controller_incarnation']
+            if not isinstance(controller_incarnation, uuid.UUID):
+                controller_incarnation = uuid.UUID(str(controller_incarnation))
+            return route_projection.RoutePublisherIdentity(
+                service_name=self._service_name,
+                service_hash=owner['hash'],
+                service_lifecycle_epoch=owner['lifecycle_epoch'],
+                controller_incarnation=controller_incarnation,
+                controller_owner_epoch=owner['controller_owner_epoch'],
+                controller_pid=owner['controller_pid'],
+                controller_ip=owner['controller_ip'])
+        except (KeyError, TypeError, ValueError,
+                route_projection.RouteProjectionValidationError):
+            return None
+
+    def _lb_promotion_gate(self, request_data: dict[str, Any],
+                           owner: dict[str, Any]) -> _LbPromotionGate:
+        """Resolve current route authority and evaluate one target report."""
+        mode_hint = owner.get('route_source_mode')
+        if mode_hint not in tuple(
+                mode.value for mode in route_projection.RouteSourceMode):
+            mode_hint = 'UNKNOWN'
+        routing_version = request_data.get('routing_version')
+        normalized_version = (routing_version
+                              if type(routing_version) is int else None)
+        if (type(routing_version) is not int or
+                routing_version != self._applied_version):
+            return _LbPromotionGate(False,
+                                    _LbPromotionReason.ROUTING_VERSION_MISMATCH,
+                                    mode_hint,
+                                    routing_version=normalized_version)
+        identity = self._lb_route_publisher_identity(owner)
+        if identity is None:
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.ROUTE_CONTRACT_UNAVAILABLE,
+                mode_hint,
+                routing_version=routing_version)
+        repository = route_projection.RouteProjectionRepository()
+        try:
+            decision = repository.resolve_promotion_contract(
+                identity, routing_version,
+                request_data.get('route_source_epoch'),
+                request_data.get('route_projection_generation'),
+                request_data.get('route_projection_sha256'))
+        except route_projection.RouteProjectionValidationError:
+            return _LbPromotionGate(False,
+                                    _LbPromotionReason.ROUTE_FENCE_MALFORMED,
+                                    mode_hint,
+                                    routing_version=routing_version)
+        except route_projection.RouteProjectionConflict:
+            return _LbPromotionGate(False,
+                                    _LbPromotionReason.ROUTE_FENCE_NOT_CURRENT,
+                                    mode_hint,
+                                    routing_version=routing_version)
+        except route_projection.RouteProjectionError:
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.ROUTE_CONTRACT_UNAVAILABLE,
+                mode_hint,
+                routing_version=routing_version)
+        if decision.mode == route_projection.RouteSourceMode.LEGACY_PROXY:
+            return self._lb_legacy_promotion_gate(request_data)
+        contract = decision.contract
+        assert contract is not None
+
+        raw_routing_urls = request_data.get('routing_urls')
+        if (not isinstance(raw_routing_urls, list) or
+                any(not isinstance(url, str) for url in raw_routing_urls) or
+                len(raw_routing_urls) != len(set(raw_routing_urls))):
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.ROUTING_URLS_MALFORMED,
+                decision.mode.value,
+                routing_version=routing_version,
+                route_source_epoch=contract.route_source_epoch,
+                route_generation=contract.generation,
+                expected_routing_backend_count=len(contract.routing_urls))
+        reported_routing_urls = set(raw_routing_urls)
+        if reported_routing_urls != contract.routing_urls:
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.ROUTING_URLS_MISMATCH,
+                decision.mode.value,
+                routing_version=routing_version,
+                route_source_epoch=contract.route_source_epoch,
+                route_generation=contract.generation,
+                expected_routing_backend_count=len(contract.routing_urls),
+                reported_routing_backend_count=len(reported_routing_urls))
+
+        async_occupancy = request_data.get('async_occupancy')
+        sample_generations = request_data.get('occupancy_sample_generation')
+        sample_ages = request_data.get('occupancy_sample_age_seconds')
+        if (not isinstance(async_occupancy, dict) or
+                not isinstance(sample_generations, dict) or
+                not isinstance(sample_ages, dict) or
+                set(async_occupancy) != set(sample_generations) or
+                set(async_occupancy) != set(sample_ages) or
+                any(not isinstance(url, str) or type(count) is not int or
+                    count < 0 for url, count in async_occupancy.items()) or
+                any(not isinstance(url, str) or type(generation) is not int or
+                    generation < 0
+                    for url, generation in sample_generations.items()) or
+                any(not isinstance(url, str) or
+                    not isinstance(age, (int, float)) or
+                    isinstance(age, bool) or not math.isfinite(age) or age < 0
+                    for url, age in sample_ages.items())):
+            return _LbPromotionGate(
+                False,
+                _LbPromotionReason.OCCUPANCY_REPORT_MALFORMED,
+                decision.mode.value,
+                routing_version=routing_version,
+                route_source_epoch=contract.route_source_epoch,
+                route_generation=contract.generation,
+                expected_routing_backend_count=len(contract.routing_urls),
+                reported_routing_backend_count=len(reported_routing_urls),
+                expected_async_backend_count=len(contract.async_occupancy_urls))
+
+        # Extra samples are legitimate bounded evidence for off-ready/draining
+        # URLs.  They must be internally coherent above, while every URL in the
+        # immutable current route contract must be present and fresh.
+        expected_async = contract.async_occupancy_urls
+        reported_async = set(async_occupancy)
+        missing_async = expected_async - reported_async
+        stale_async = {
+            url for url in expected_async & reported_async if sample_ages[url] >
+            serve_constants.LB_PROMOTION_OCCUPANCY_MAX_AGE_SECONDS
+        }
+        fresh_async = expected_async - missing_async - stale_async
+        gate_fields: dict[str, Any] = {
+            'routing_version': routing_version,
+            'route_source_epoch': contract.route_source_epoch,
+            'route_generation': contract.generation,
+            'expected_routing_backend_count': len(contract.routing_urls),
+            'reported_routing_backend_count': len(reported_routing_urls),
+            'expected_async_backend_count': len(expected_async),
+            'reported_async_backend_count': len(reported_async),
+            'fresh_async_backend_count': len(fresh_async),
+            'missing_async_backend_count': len(missing_async),
+            'stale_async_backend_count': len(stale_async),
+        }
+        if missing_async:
+            return _LbPromotionGate(False,
+                                    _LbPromotionReason.OCCUPANCY_SAMPLE_MISSING,
+                                    decision.mode.value, **gate_fields)
+        if stale_async:
+            return _LbPromotionGate(False,
+                                    _LbPromotionReason.OCCUPANCY_SAMPLE_STALE,
+                                    decision.mode.value, **gate_fields)
+        return _LbPromotionGate(True,
+                                _LbPromotionReason.ELIGIBLE,
+                                decision.mode.value,
+                                route_contract=contract,
+                                **gate_fields)
 
     @staticmethod
     def _lb_demand_report_is_complete(request_data: dict[str, Any]) -> bool:
@@ -2176,8 +2422,12 @@ class SkyServeController:
 
     @staticmethod
     def _lb_ha_rollout_evidence(
-            authority: lb_k8s.LbPodAuthority, state: lb_ha.LbCutoverState,
-            desired_runtime_revision: str | None) -> dict[str, Any]:
+        authority: lb_k8s.LbPodAuthority,
+        state: lb_ha.LbCutoverState,
+        desired_runtime_revision: str | None,
+        promotion_gate: _LbPromotionGate | None = None,
+        transition_decision: dict[str, bool | None] | None = None
+    ) -> dict[str, Any]:
         """Return role-channel evidence that both slots share one revision."""
         revisions = authority.revision_by_uid or {}
         slot_by_uid = authority.slot_by_uid or {}
@@ -2210,6 +2460,14 @@ class SkyServeController:
             'desired_revision': desired_runtime_revision,
             'slots': slots,
             'slots_converged': converged,
+            'promotion_gate': (promotion_gate.observability()
+                               if promotion_gate is not None else None),
+            'planned_upgrade': ((transition_decision or
+                                 {}).get('planned_upgrade')),
+            'transition_attempted': ((transition_decision or
+                                      {}).get('transition_attempted')),
+            'transition_cas_result': ((transition_decision or
+                                       {}).get('transition_cas_result')),
         }
 
     async def _get_shared_stable_lb_role_snapshot(
@@ -2466,7 +2724,15 @@ class SkyServeController:
                     authority.slot_by_uid.get(session_id) is not slot):
                 return role_response(
                     lb_ha_obs.LbRoleOutcome.POD_NOT_AUTHORITATIVE, 503)
-            promotable = self._lb_promotion_report_is_current(request_data)
+            promotion_gate = await trace.run_in_executor(
+                loop, 'postgresql_route_promotion_read',
+                self._lb_promotion_gate, request_data, database_snapshot.owner)
+            promotable = promotion_gate.eligible
+            transition_decision: dict[str, bool | None] = {
+                'planned_upgrade': False,
+                'transition_attempted': False,
+                'transition_cas_result': None,
+            }
             role = state.role_for(slot)
             ledger = self._lb_session_ledger
             if ledger is None or not ledger.update(
@@ -2608,8 +2874,10 @@ class SkyServeController:
                     planned_upgrade = (desired_revision is not None and
                                        target_revision == desired_revision and
                                        desired_revision not in active_revisions)
+                transition_decision['planned_upgrade'] = planned_upgrade
                 if (slot is target and target_ready and promotable and
                     (not selected_ready or planned_upgrade)):
+                    transition_decision['transition_attempted'] = True
                     async with demand_lock:
                         invalidate_demand_transition(state)
                         demand_snapshot = self._lb_last_demand_snapshot
@@ -2618,7 +2886,9 @@ class SkyServeController:
                             serve_state.begin_lb_cutover, self._service_name,
                             service_hash, expected_owner, lifecycle_epoch,
                             stable_active_slot, state.generation, target,
-                            demand_snapshot)
+                            demand_snapshot, promotion_gate.route_contract)
+                        transition_decision['transition_cas_result'] = (
+                            next_state is not None)
                         if next_state is not None:
                             self._lb_demand_handoff.begin(
                                 next_state.generation, demand_snapshot)
@@ -2782,7 +3052,8 @@ class SkyServeController:
                     'promotable': promotable,
                     'phase': state.phase.value,
                     'ha_rollout': self._lb_ha_rollout_evidence(
-                        authority, state, routing.desired_runtime_revision),
+                        authority, state, routing.desired_runtime_revision,
+                        promotion_gate, transition_decision),
                 })
 
     async def _handle_load_balancer_request_history_sync(
@@ -5719,20 +5990,35 @@ class SkyServeController:
                     # A central-state read failure cannot silently revive the
                     # legacy autoscaler path after a durable promotion.
                     self._durable_demand_snapshot = None
+                    self._replica_manager.invalidate_logical_reconcile_state()
                     return
                 durable_demand_promoted = (
                     demand_source is not None and demand_source[0]
                     is capacity_admission.DemandSourceMode.DURABLE_FEED)
                 durable_snapshot = None
+                durable_logical_snapshot: (
+                    replica_managers.LogicalReconcileSnapshot | None) = None
                 fresh_aggregate_zero = False
                 if durable_demand_promoted:
-                    durable_snapshot = demand_state.get_autoscaling_snapshot(
-                        self._service_name, self._service_hash or '')
+                    try:
+                        durable_snapshot = demand_state.get_autoscaling_snapshot(
+                            self._service_name, self._service_hash or '')
+                    except Exception as error:  # pylint: disable=broad-except
+                        logger.warning(
+                            'Revoking durable logical reconcile authority '
+                            'because its PostgreSQL snapshot is unavailable: '
+                            f'{common_utils.format_exception(error)}')
+                        self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
+                        return
                     if durable_snapshot is None:
                         # Stale or incomplete is unknown, never zero.  Do not
                         # reuse the last promoted snapshot for either free or
                         # paid capacity actuation.
                         self._durable_demand_snapshot = None
+                        self._replica_manager.invalidate_logical_reconcile_state(
+                        )
                         return
                     request_information = dict(
                         durable_snapshot.request_information)
@@ -5742,8 +6028,71 @@ class SkyServeController:
                                 actuation_generation, decision_autoscaler,
                                 decision_version):
                             return
+                        durable_reconcile_generation = None
+                        if decision_autoscaler.replica_unit == 'logical':
+                            if not isinstance(
+                                    decision_autoscaler,
+                                    autoscalers.ConcurrencyAutoscaler):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because its autoscaler does not expose '
+                                    'the logical reconcile generation.')
+                                return
+                            durable_reconcile_generation = (
+                                durable_snapshot.demand_feed_generation)
+                            request_reconcile_generation = (
+                                request_information.get('reconcile_generation'))
+                            if (type(durable_reconcile_generation) is not int or
+                                    type(request_reconcile_generation)
+                                    is not int or request_reconcile_generation
+                                    != durable_reconcile_generation):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because its request-information '
+                                    'generation does not match the durable '
+                                    'feed generation.')
+                                return
                         decision_autoscaler.collect_request_information(
                             request_information)
+                        if decision_autoscaler.replica_unit == 'logical':
+                            assert isinstance(decision_autoscaler,
+                                              autoscalers.ConcurrencyAutoscaler)
+                            assert durable_reconcile_generation is not None
+                            autoscaler_reconcile_generation = (
+                                decision_autoscaler.reconcile_generation)
+                            if (type(autoscaler_reconcile_generation) is not int
+                                    or autoscaler_reconcile_generation
+                                    != durable_reconcile_generation):
+                                logger.warning(
+                                    'Suppressing durable logical demand '
+                                    'because the collected autoscaler '
+                                    'generation does not match the durable '
+                                    'feed generation.')
+                                return
+                            # Stage the capacity/occupancy half of the manager
+                            # fence without exposing it. Planning may block or
+                            # fail, and a newer snapshot paired with an older
+                            # lower target could otherwise release a recovered
+                            # retirement. A valid target and this snapshot are
+                            # installed atomically below.
+                            durable_logical_snapshot = (
+                                replica_managers.LogicalReconcileSnapshot(
+                                    version=decision_version,
+                                    generation=durable_reconcile_generation,
+                                    observed_slots_by_replica_id=dict(
+                                        request_information[
+                                            'observed_slots_by_replica_id']),
+                                    in_flight_by_replica_id=dict(
+                                        request_information[
+                                            'in_flight_by_replica_id']),
+                                    unknown_replica_ids=frozenset(
+                                        request_information[
+                                            'unknown_in_flight_replica_ids']),
+                                    received_at=(
+                                        durable_snapshot.reconcile_authority.
+                                        read_started_monotonic),
+                                    authority=(
+                                        durable_snapshot.reconcile_authority)))
                         self._reconcile_generation += 1
                         self._durable_demand_snapshot = durable_snapshot
                         fresh_aggregate_zero = (
@@ -5881,8 +6230,29 @@ class SkyServeController:
                         os._exit(1)  # pylint: disable=protected-access
                     return
                 if logical_target is not None:
-                    self._replica_manager.publish_logical_target(
-                        *logical_target)
+                    if durable_logical_snapshot is None:
+                        self._replica_manager.publish_logical_target(
+                            *logical_target)
+                    else:
+                        # Revalidate the exact demand/notification epoch under
+                        # the ingestion lock, then install one target/snapshot
+                        # immutable pair under ReplicaManager's logical-state
+                        # lock. Every manager reader captures that one pair, so
+                        # it cannot mix halves from concurrent publications.
+                        with self._routing_state_lock:
+                            if (not self._scale_actuation_is_current(
+                                    actuation_generation, decision_autoscaler,
+                                    decision_version) or
+                                    self._scale_reconcile_coordinator.generation
+                                    != notification_generation or
+                                    self._reconcile_generation
+                                    != demand_generation):
+                                return
+                            if not (self._replica_manager.
+                                    publish_logical_reconcile_state(
+                                        logical_target,
+                                        durable_logical_snapshot)):
+                                return
                 elif invalidate_logical_target:
                     # Exact-card retirement must fail closed while the LB
                     # compatibility report is incomplete. Explicitly revoke an

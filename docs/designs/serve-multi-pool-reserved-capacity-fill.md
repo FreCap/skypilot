@@ -24,6 +24,25 @@ one atomic transition and is deployed dark in revision 431. The exact
 post-horizon removal of both separate transition surfaces remains stacked as
 draft PR #1556.
 
+Post-deployment takeover review found one remaining ownership gap in that
+atomic pair. A replacement controller incarnation already adopts generalized
+launch authority, revokes route leases, and later re-advertises zero-cost
+actuation, but the promoted `demand_authority_controller_incarnation` remained
+bound to the predecessor. A `DURABLE_FEED` service consequently failed closed
+forever after any child or pod takeover. The fix-forward correction makes the
+existing fenced service-owner transfer also rebind the demand and zero-cost
+capability advertisements in the same PostgreSQL transaction, without changing
+either one-way mode or epoch. It terminalizes only unmaterialized
+grant-before-row intents from the predecessor; committed intents and their
+replica rows remain durable. Route authority is intentionally left cold, so no
+demand, reserved-fill, or paid actuation resumes until the replacement publishes
+its own route generation and the load balancer replaces the stale report with a
+fresh complete report naming that generation and digest.
+Grant admission additionally requires the calling manager's exact durable
+controller incarnation and owner epoch under the same locked service-row
+transaction. This fences predecessor in-memory plans even if the operating
+system reuses the same PID/IP/port transport fingerprint.
+
 Revision 431's first atomic-activation preflight found one unrelated retained
 claimant, `opendde-10c200s-v4`, whose old version 4 carried null worker
 projections. A normal service update committed version 6, removed its two
@@ -196,6 +215,132 @@ Provider absence, not row deletion or cached SkyPilot status, is the completion
 proof. If the promoted feed does not produce that snapshot, fix the canonical
 durable snapshot/recovery path before any manual cleanup.
 
+The 2026-08-18 follow-up code audit found exactly that promotion blocker in
+the current durable path. `_reconcile_scale_once()` collects the complete
+PostgreSQL demand report into `ConcurrencyAutoscaler`, but only the legacy LB
+sync path publishes the matching capacity/occupancy snapshot to
+`ReplicaManager`. Durable promotion by itself would therefore leave logical
+retirement recovery without its second fence. The canonical bridge has these
+invariants:
+
+- under the same `_routing_state_lock` that ingests a validated durable report,
+  treat `DurableAutoscalingSnapshot.demand_feed_generation` as the authority,
+  require the embedded request-information generation and the autoscaler's
+  collected-generation echo to equal it, and stage (but do not expose) a
+  snapshot at that exact generation `N` with the observed-slot, in-flight, and
+  unknown-replica maps;
+- only after planning returns a valid logical target, rollout failure is
+  excluded, and the actuation, notification, and demand generations are still
+  current may the controller reacquire that routing lock and publish. One
+  `ReplicaManager` operation installs target `N` and snapshot `N` through a
+  single immutable reconcile-state reference under `_logical_state_lock`.
+  Every manager fence captures that reference once, including scale-up's
+  initial and per-launch checks, so readers see the complete old publication or
+  the complete new publication even for a same-generation replay or generation
+  regression;
+- plan failure, target invalidation, rollout failure, or generation mismatch
+  publishes neither half. The controller-local `_reconcile_generation` remains
+  only an optimistic in-process race fence and never stamps durable evidence;
+- replay of feed generation `N` republishes `N`, never synthetic `N + 1`.
+  Recovery may adopt/re-fence an old-controller retirement at `N`, but only a
+  genuinely newer durable report can provide the strict `N + 1` release.
+
+The initial bridge published evidence only. Exact-head review of the existing
+logical-retirement consumer then found that process-local freshness and the
+ordinary replica-row write boundary were insufficient for irreversible
+teardown: a generation could advance after the controller read its evidence but
+before the queued worker was admitted. PR #1561 therefore narrows the existing
+logical teardown admission to one PostgreSQL commit seam; it does not add a
+second scale-down or provider-cleanup path. Its contract is:
+
+- `get_autoscaling_snapshot()` reads the service, demand generation, exact
+  report rows, route head, and immutable route snapshot in one explicit
+  PostgreSQL `REPEATABLE READ`, `READ ONLY` transaction. A generation-`N` read
+  can never be paired with report rows from `N + 1`;
+- that read mints one immutable authority token containing the exact service
+  lifecycle/version and controller owner, demand source epoch/generation and
+  receipt watermark, route source/head/digest, HA slot/cutover authority,
+  fresh-zero bit, and selected occupancy-sample URLs. Its deadline is computed
+  once at read start as the minimum remaining route-head TTL, report TTL, and
+  selected occupancy-sample lifetime after the reporters' supplied sample
+  ages. The controller and manager carry that same deadline; no receive,
+  publication, or retry timestamp refreshes it. A stale, incomplete, missing,
+  or failed PostgreSQL read revokes both the manager target and snapshot;
+- destructive admission requires a genuinely newer feed generation than the
+  retirement's reversible selection generation. Under the established global
+  SQL order, the transaction locks the zero-cost protocol singleton, then the
+  durable lifecycle fence, service row, and exact replica row. The lifecycle
+  fence precedes the service row exactly as it does during lifecycle takeover,
+  preventing a retirement/takeover lock inversion. The service row is the
+  shared service-local mutex with demand ingestion: if `N + 1` ingestion
+  commits first, the old token is rejected; if retirement holds the row first,
+  its commit is ordered before that report. No participant acquires the
+  protocol row after a lifecycle or service row, preserving the common
+  `protocol -> lifecycle -> service -> replica` order used by admission,
+  materialization, handoff, takeover, and fill;
+- while holding those locks, the commit revalidates the exact service and
+  controller owner, source/feed/receipt tuple, route head and immutable digest,
+  HA authority, selected fresh occupancy set, database-clock expiry, and
+  replica record/precommit fence. It atomically records the confirmed
+  generation, `logical_retirement_committed=true`, `sky_down_status=RUNNING`,
+  and exact route-lease revocation. Only an unambiguous commit result may start
+  the already-queued worker;
+- a rejected transaction revokes manager authority and starts no worker. A
+  failed commit call is `AMBIGUOUS`: the original worker is discarded and only
+  an exact durable row readback may reconstruct cleanup. A committed row is
+  detached into ordinary idempotent cleanup; an unchanged reversible row is
+  requeued behind the same later authority seam. If the controller crashes
+  before that process-local readback, startup recognizes the same exact
+  admission-precommit shape, re-fences it under fresh generation `N` as the
+  canonical strict-idle reversible precommit, and waits for genuine `N + 1`
+  plus fresh idle proof before requeue. Malformed state remains off-route for
+  inspection; and
+- a pre-commit-bit legacy ambiguous row is never grandfathered into teardown.
+  Fresh durable generation `N` first normalizes it to a current-controller,
+  `committed=false`, strict-idle reversible precommit and starts no worker. A
+  lost normalization acknowledgement is resolved by exact readback of that
+  same reversible shape. Only a genuine `N + 1` can then traverse the normal
+  PostgreSQL commit seam above.
+
+Real-PostgreSQL tests force the generation/read interleaving, assert the
+canonical protocol/lifecycle/service/replica SQL lock order, execute both
+report-first and retirement-first service-row orderings, force the former
+retirement/lifecycle-takeover lock-cycle interleaving, and inject a
+commit-lost-ack. Manager tests prove the original worker never starts on
+ambiguity, a restart recovers the exact admission-precommit row only behind
+fresh `N + 1`, and legacy normalization, including its lost-ack readback,
+still requires strict `N + 1`. The change requires no schema, Helm, Terragrunt,
+EFS, or alternate storage path.
+
+A read-only production audit at revision 432 found all seven live services
+still on `LEGACY_CONTROLLER` plus `DIRECT_REPLICA`, no live row matching the
+legacy ambiguous precommit shape, and all 151 `boltz-l4-fleet` logical
+retirement rows explicitly uncommitted. The exact-head code is therefore dark
+until the documented one-way authority promotion; it is generic migration and
+restart safety, not authorization for manual row deletion or immediate
+provider teardown.
+
+The single-operation coherence guarantee above is specifically the durable
+promotion bridge. Before promotion, legacy LB ingestion still publishes a
+capacity snapshot and the later reconcile publishes its target as two
+standalone operations. That path increments one process-local generation for
+every accepted report, so it cannot legitimately replay a capacity half at the
+same generation; `ReplicaManager` rejects duplicate/regressed standalone
+snapshots and regressed standalone targets. A target at generation `N` may
+still coexist intentionally with a newer legacy capacity snapshot `N + 1`:
+newer capacity is stronger evidence, and the next generation-fenced reconcile
+will replace the target. Each legacy operation also replaces one immutable
+state reference, so readers never tear a target or snapshot object while that
+intentional cross-generation state is visible.
+
+Draft cleanup PR #1506 contains a superficially similar hunk that derives
+`next_demand_generation = self._reconcile_generation + 1`. That is unsafe: the
+live durable feed was already at generation 68023 while a restarted controller
+counter begins at zero, and replay would manufacture false new evidence. This
+focused fix supersedes only that controller-local-generation hunk. The rest of
+#1506 remains draft, blocked, and governed by its existing production removal
+gates.
+
 An activation preflight on 2026-08-18 also found that the mechanical
 transition still required the historical *exact* Serve047/API011 revisions,
 so it rejected the valid deployed Serve052/API015 successor heads. The same
@@ -212,8 +357,9 @@ The live Helm release is authoritative. Merged SkyPilot artifacts are deployed
 directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
-Last updated: 2026-08-18 (revision-431 atomic-transition deployment,
-cross-service claim preflight, and canonical promotion/admission order)
+Last updated: 2026-08-19 (identity-bound KubeRay child admission contract,
+revision-432 read-only authority audit, PR #1561 durable logical-retirement
+contract, and #1562 controller-takeover capacity-authority/grant fencing)
 
 Canonical owner: this file
 
@@ -1273,6 +1419,21 @@ inference context that:
 - the deployment's fail-closed admission policy prevents an unmanaged direct
   inference Pod from bypassing that path.
 
+PHX's queue-name policy has exactly one exception to the ordinary nonempty
+queue-label validation. It admits only a `batch/v1` Job created in one of the
+two governed namespaces by the authenticated
+`system:serviceaccount:kuberay-system:kuberay-operator` identity. The Job must
+carry KubeRay's exact RayJob provenance labels, one singleton controller and
+block-owner-deletion `ray.io/v1` RayJob owner reference whose name equals the
+Job name, and a nonempty queue label on the verbatim submitter Pod template.
+The policy has no `matchConditions`; the exception is one validation-local
+variable and the complete nine-rule workload scope remains exact. Labels and
+owner references alone are caller-controlled data and never establish this
+exception. HPTO, StatefulSet controllers, generic child controllers, older
+RayJob API versions, other namespaces, and any additional variable or rule
+remain fail closed. Supporting another controller requires a separately
+authenticated design rather than widening this exception.
+
 The evidence and enforcement boundary is one
 `ReservedFillReclaimPolicy`. It is a code-owned, typed deployment extension,
 not an environment variable, operator boolean, or JSON assertion. Python
@@ -1333,13 +1494,111 @@ and record identity; stale evidence cannot affect a successor. Raw URLs remain
 only in the existing identity-validated drain report. URL-to-replica caches are
 deleted.
 
-The route read is one indexed PostgreSQL head/generation join plus bounded
-canonical decoding. Tests instrument provider/Kubernetes adapters and require
-zero calls, complete owner replacement, exact successor isolation, and one
-poisoned launch association among hundreds without blocking fresh route
-publication for healthy rows. The generous regression ceilings are one cold
-840-route read within ten seconds and 100 subsequent reads with p99 below one
-second; they are not permission to add another in-process cache.
+The HA role channel uses that same immutable projection as promotion authority.
+The LB applies routing URLs, service version, route-source epoch, projection
+generation, digest, and the removed-client drain overlay under one lock, then
+echoes the coherent fence in both role and durable-demand reports. A replacement
+controller never relies on its empty process-local occupancy cache: on every
+candidate heartbeat it reads the current route source and exact fresh immutable
+snapshot in one PostgreSQL transaction, derives the expected asynchronous URLs
+from the snapshot, exact-matches the LB's reported routing URL set, and requires
+a fresh generation-valid sample for every expected asynchronous URL. Extra
+coherent samples for off-ready draining URLs are permitted; omission of a
+currently routed URL is not. Legacy route mode alone retains the transitional
+process-local contract. The LB treats `(service version, route generation,
+route digest, route-source epoch)` as part of its occupancy observation
+context. Any change advances the existing sample epoch and clears exported
+proof before the new route fence is visible; a probe crossing that transition
+is rejected at completion. Pending reservations remain conservative, an
+identical head renewal preserves current proof, and a successor record reusing
+the same URL cannot inherit old local capacity or idle evidence.
+
+Promotion is fail closed without disturbing the healthy selected slot. Missing,
+malformed, stale, corrupt, or owner-mismatched route evidence returns a normal
+role heartbeat with `promotable=false`; it does not move the Service selector.
+The STABLE-to-PREPARING transaction locks the service row before rechecking that
+the same generation/digest is still the fresh route head. A semantic head
+advance rejects the CAS and the next LB sync/role round retries; an unchanged
+head renewal is accepted. The one-way route-source promotion takes the same
+service-row lock and, for HA services, is permitted only in STABLE; it cannot
+race a legacy decision into PREPARING or MIGRATING. Bounded rollout telemetry
+exposes only the promotion
+reason enum, route mode/version/epoch/generation, expected/reported/fresh/missing
+backend counts, planned-upgrade decision, transition-attempted bit, and CAS
+result. It never exports URLs, route digests, tokens, Pod IDs, or request IDs.
+
+The promotion read is one fail-fast shared owner-lock statement plus one indexed
+PostgreSQL head/generation join. It copies the immutable row and releases the
+lock before bounded canonical decoding; the cutover CAS revalidates the exact
+head. Tests pin that two-statement shape and instrument provider/Kubernetes
+adapters to require zero calls, complete owner replacement, exact successor
+isolation, and one poisoned launch association among hundreds without blocking
+fresh route publication for healthy rows. The generous regression ceilings are
+one cold 840-route read within ten seconds and 100 subsequent reads with p99
+below one second; they are not permission to add another in-process cache.
+
+### 7a. Controller takeover of promoted capacity authority
+
+Controller incarnation is part of the durable demand, route, and zero-cost
+capability fences, not process metadata. The one canonical takeover transaction
+therefore locks the lifecycle and service rows, compare-and-swaps the exact
+previous controller incarnation and owner epoch, and installs the replacement
+incarnation on generalized launch authority. If demand is already
+`DURABLE_FEED`, that same transaction re-advertises both demand and zero-cost
+capability under the replacement incarnation. It does not change
+`demand_source_mode`, `demand_source_epoch`,
+`reserved_fill_actuation_mode`, or `reserved_fill_actuation_epoch`; takeover is
+neither a second promotion nor a demotion. Takeover accepts only the complete
+`LEGACY_CONTROLLER`/`DIRECT_REPLICA` or
+`DURABLE_FEED`/`DURABLE_INTENT` pair. Either asymmetric state is rejected and
+the owner transfer rolls back. The deprecated live repair surface may finish a
+`DURABLE_FEED`/`DIRECT_REPLICA` transition only while the current controller
+authority is still intact; a replacement controller never adopts or
+re-advertises that partial state.
+
+Immediately before a Helm upgrade containing this takeover contract, the
+operator must read every non-pool service row in the deployment database and
+prove that the count of either asymmetric pair is zero. An earlier audit is not
+sufficient while the deprecated separate promotion surfaces remain deployed.
+If `DURABLE_FEED`/`DIRECT_REPLICA` is found and its current controller authority
+is intact, finish the existing atomic fix-forward promotion before the upgrade.
+If current authority cannot be proven, recover the old binary/controller first.
+Do not repair an asymmetric pair with manual row mutation. The Helm apply is
+blocked until a fresh deployment-wide read proves only complete legacy or
+complete durable pairs.
+
+The takeover also marks predecessor `GRANTED`, `ACTUATING`, and `RETRYABLE`
+zero-cost intents terminal before commit. Those grants have no materialized
+replica row and cannot be adopted safely because their existing controller
+fingerprint does not include the UUID incarnation and a PID/IP/port can be
+reused. `COMMITTED` intents are not changed: their exact replica rows and any
+generalized launch associations remain under the existing recovery contract.
+An unpersisted predecessor plan has no row to terminalize, so durable grant
+admission also supplies the calling manager's immutable controller incarnation
+and owner epoch and compares both with the already locked service row. A
+replacement that happens to reuse the complete transport fingerprint therefore
+cannot make an old manager's in-memory plan authoritative.
+Provider effects covered by the service launch-authority guard continue to
+exclude takeover. An uncommitted intent-to-replica handoff separately orders on
+the locked service row: if takeover wins, the intent becomes terminal and the
+blocked handoff fails its authority check, rolling back the replica insert.
+
+Route capability is deliberately not rebound by owner transfer. Existing route
+leases are revoked in the same transaction, and the replacement must publish a
+new owner-bound immutable route generation. Still-fresh predecessor reports
+name the previous route generation/digest and remain display-only. The durable
+demand reader, capacity-plan publisher, paid-claim validator, and zero-cost
+planner all fail closed until a current authoritative LB session publishes a
+fresh complete protocol-v2 report naming the replacement route generation,
+digest, and unchanged route-source epoch. Thus the safe recovery interval is
+underfill: neither paid nor zero-cost provider actuation can use stale demand.
+
+The owner-incarnation/owner-epoch compare-and-swap decides concurrent takeover.
+The winner rebinds the complete capability pair and revokes the old route in one
+commit; a blocked or concurrent loser observes the advanced owner fence and
+changes nothing. A later supervised restart repeats the same transaction with a
+new incarnation and repairs a demand capability left stale by an older binary,
+again without advancing either source epoch.
 
 ### Boltz deployment policy bundle
 
@@ -2359,12 +2618,14 @@ either case.
 | 1d | Generalized binding, demand/route projection, and G1S execution-termination evidence through API014/Serve050 | Merged and deployed. Route authority is live at `DURABLE_PROJECTED` epoch 1; ordinary binding and demand remain legacy. |
 | 2a | Policy-bundle schema v3 plus exact live PHX queue/service-account contract | Merged in PR #1529 and deployed in revision 418; superseded in place by schema v4 because PHX intentionally replaced its custom scheduler with Kueue TAS. |
 | 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
-| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. The PHX `AssignQueueLabelsForPods=true` platform pin is merged but still requires its zero-replacement production apply and a successful full two-context preflight. |
+| 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
-| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.2. |
+| 2a.4 | Identity-bound KubeRay child admission and exact SkyPilot attestation | Platform PR #8649 is the surgical four-file policy change and still requires human Platform approval, deployment, and the deny/admit probe matrix. The paired SkyPilot attester requires zero policy `matchConditions`, one exact authenticated KubeRay-controller variable including the submitter-template queue label, one exact validation, the complete nine-rule resource scope, and no HPTO or generic-controller exception. Activation remains closed until both halves deploy and a fresh full preflight passes. |
+| 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 62 is committed/elected and its exact east/PHX projection readback passes. It remains inactive and activation is blocked on 2a.4. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
-| 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.2 and 2a.3. |
+| 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
+| 2f | Promoted capacity-authority controller takeover | The fix-forward implementation is merged in PR #1562: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. Deployment and child/Pod takeover qualification remain activation prerequisites. |
 | 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
@@ -2885,6 +3146,7 @@ terraform -chdir=infra/terraform/modules/skypilot-spoke-workspace-pool-eks \
 
 # Existing reserved-fill protocol regression set.
 uv run --no-sync pytest -q \
+  tests/unit_tests/test_serve_capacity_takeover_pg.py \
   tests/unit_tests/test_pool_capacity_observation.py \
   tests/unit_tests/test_pool_capacity_observer.py \
   tests/unit_tests/test_reserved_fill_planner.py \
@@ -3472,6 +3734,46 @@ legacy activation.
 - [x] Resolve PR #1524 by semantic comparison rather than merging its
   conflicting 109-file branch. G1 recovery contracts shipped through
   #1519/#1526/#1527/#1528; #1524 is closed as superseded.
+- [x] Implement the surgical durable logical-snapshot bridge without schema,
+  Helm or Terragrunt changes. Focused tests prove exact feed/target
+  generation equality under both locks, feed/request/autoscaler mismatch
+  rejection, immutable target/snapshot publication during a forced
+  same-generation interleaving, stale and plan-failure fail-closed behavior,
+  publication-rejection and final-currentness actuation fences, and absence of
+  a new teardown path. Legacy half-publication tests additionally reject a
+  duplicate/regressed capacity snapshot and a regressed target while retaining
+  the intentional newer-capacity/older-target contract. This supersedes only
+  #1506's controller-local `+ 1` generation hunk.
+- [x] Implement PR #1561's exact-head hardening: one read-only repeatable-read
+  source snapshot, its unchanged bounded authority token, the canonical
+  protocol/lifecycle/service/replica lock order, a service-row-serialized
+  PostgreSQL logical-retirement commit, explicit rejected/ambiguous outcomes,
+  and legacy normalization through the same strict `N + 1` seam. Controller
+  startup also adopts an exact admission-precommit crash row as the canonical
+  strict-idle reversible precommit; it cannot reconstruct a worker until a
+  genuine `N + 1` and fresh idle proof. Real-PostgreSQL retirement/takeover
+  races, live-update handoff, restart recovery, and manager lost-ack tests pass;
+  no schema, storage, Helm, Terragrunt, or provider path is added.
+- [x] Merge the capacity-authority takeover fix in PR #1562. PostgreSQL tests
+  prove stale predecessor reports
+  and pre-row intents cannot actuate, a fresh complete report bound to the
+  replacement route restores planning, stale persisted demand ownership is
+  repaired without epoch changes, and a concurrent loser changes nothing.
+- [ ] Merge and deploy the durable-route HA promotion fix with the bridge,
+  PR #1561 exact-head hardening, and #1562 takeover fix before authority
+  activation. Verify feed generation `N` publishes both
+  logical target and manager evidence at `N`, a repeated `N` cannot release
+  adopted retirements, and a fresh `N + 1` lets the existing manager path
+  commit through the exact database seam and resume normal evidence-backed
+  convergence. Confirm stale/unavailable reads revoke the full manager pair
+  and no ambiguous outcome starts its original worker. Then exercise one
+  controller-child restart and one controller-Pod takeover after promotion.
+  Each replacement must preserve bound planning and reconstruct HA
+  promotability from the exact durable route generation with no
+  controller-sync side effect; a mismatched generation or routing URL set must
+  leave the selected slot healthy, and bounded role telemetry must record the
+  closed/open gate and cutover CAS result. These production failover exercises
+  remain required before the cleanup horizon opens.
 - [ ] Activate reserved reconciliation, promote ordinary binding and generic
   non-pool binding, then promote durable demand plus `DURABLE_INTENT` actuation
   through one canonical generation-fenced transaction. No reconciliation tick

@@ -229,9 +229,10 @@ class SkyServeLoadBalancer:
     # idle proof. The longer-lived maps above may retain a last-good sample for
     # bounded LB-local admission, but must never cross this boundary.
     _occupancy_current_round_sampled_urls: set[str]
-    # Local admission epoch under which each sample was taken. It advances on
-    # every transition into a changed ARMED/ACTIVE role, including role changes
-    # that reuse one controller cutover generation.
+    # Local observation-context epoch under which each sample was taken. It
+    # advances on every changed ARMED/ACTIVE role and every changed applied
+    # route projection, including transitions that reuse a URL or controller
+    # cutover generation.
     _occupancy_role_epoch: int
     _occupancy_sample_role_epoch: dict[str, int]
     _occupancy_probe_lock: asyncio.Lock
@@ -2074,7 +2075,7 @@ class SkyServeLoadBalancer:
         del request  # Unused; liveness is independent of controller sync.
         return fastapi.responses.Response(status_code=200)
 
-    def _in_flight_with_draining(
+    def _in_flight_with_draining_locked(
         self,) -> tuple[dict[str, int] | None, list[str], list[str], list[str]]:
         """Per-url busyness snapshot: envelopes, occupancy, and draining.
 
@@ -2099,26 +2100,25 @@ class SkyServeLoadBalancer:
           tracks its fresh requests in the load_map while the OLD
           draining client only carries the pre-blip streams -- distinct
           requests.
+        Must be called while holding ``_client_pool_lock``.
         """
-        with self._client_pool_lock:
-            in_flight = self._load_balancing_policy.snapshot_in_flight()
-            proof_urls = self._controller_occupancy_proof_urls_locked()
-            occupancy = {
-                url: count
-                for url, count in self._replica_occupancy.items()
-                if url in proof_urls
-            }
-            sampled_off_ready = set(self._occupancy_sampled_off_ready)
-            capable = set(self._occupancy_capable)
-            dispatch_generation = dict(self._occupancy_dispatch_generation)
-            sample_generation = dict(self._occupancy_sample_generation)
-            # Sampled under the same lock as the gauge: the controller's
-            # retirement drain uses this to prove the gauge was taken
-            # against a routing view that already excluded the retiring
-            # replica (the gauge is sampled BEFORE this sync's response
-            # re-applies the ready set, so the gauge alone cannot prove
-            # it).
-            routing_urls = sorted(self._routable_ready_urls_locked())
+        in_flight = self._load_balancing_policy.snapshot_in_flight()
+        proof_urls = self._controller_occupancy_proof_urls_locked()
+        occupancy = {
+            url: count
+            for url, count in self._replica_occupancy.items()
+            if url in proof_urls
+        }
+        sampled_off_ready = set(self._occupancy_sampled_off_ready)
+        capable = set(self._occupancy_capable)
+        dispatch_generation = dict(self._occupancy_dispatch_generation)
+        sample_generation = dict(self._occupancy_sample_generation)
+        # Sampled under the same lock as the gauge: the controller's retirement
+        # drain uses this to prove the gauge was taken against a routing view
+        # that already excluded the retiring replica (the gauge is sampled
+        # BEFORE this sync's response re-applies the ready set, so the gauge
+        # alone cannot prove it).
+        routing_urls = sorted(self._routable_ready_urls_locked())
         # An occupancy sample taken while the url was still routed cannot
         # prove post-retirement idleness (work may have arrived after the
         # sample but before the url left routing): for off-ready urls,
@@ -2175,6 +2175,12 @@ class SkyServeLoadBalancer:
                 # answer this round) and keep waiting on the latter.
                 unknown_urls.append(url)
         return in_flight, routing_urls, unknown_urls, sampled_urls
+
+    def _in_flight_with_draining(
+        self,) -> tuple[dict[str, int] | None, list[str], list[str], list[str]]:
+        """Return one busyness snapshot under the routing-state lock."""
+        with self._client_pool_lock:
+            return self._in_flight_with_draining_locked()
 
     @staticmethod
     def _reject_entry_seen(entry: Any) -> float:
@@ -3690,6 +3696,31 @@ class SkyServeLoadBalancer:
                     self._last_sync_time = time.monotonic()
                     return
                 with self._client_pool_lock:
+                    next_occupancy_context = (
+                        service_version,
+                        route_projection_generation,
+                        route_projection_sha256,
+                        route_source_epoch,
+                    )
+                    current_occupancy_context = (
+                        self._routing_version,
+                        self._route_projection_generation,
+                        self._route_projection_sha256,
+                        self._route_source_epoch,
+                    )
+                    if next_occupancy_context != current_occupancy_context:
+                        # Occupancy evidence belongs to the exact applied
+                        # route observation context under which its probe ran.
+                        # A successor record may reuse the same URL, so URL
+                        # equality cannot carry old proof across this fence.
+                        # Advancing the existing epoch rejects both retained
+                        # samples and probes that cross this sync, while
+                        # preserving conservative pending-work reservations.
+                        self._occupancy_role_epoch += 1
+                        self._occupancy_current_round_sampled_urls = set()
+                        self._occupancy_sampled_off_ready = set()
+                        self._load_balancing_policy.set_occupancy(
+                            self._effective_occupancy_locked())
                     # Apply the fetched routing spec BEFORE (re)setting the
                     # ready replicas: if the policy object was swapped, the
                     # set_ready_replicas below re-populates the fresh policy
@@ -3798,32 +3829,36 @@ class SkyServeLoadBalancer:
                     urls_to_close = set(self._client_pool.keys()) - client_urls
                     client_to_close = []
                     for replica_url in urls_to_close:
-                        client_to_close.append(
-                            (replica_url, self._client_pool.pop(replica_url)))
+                        client = self._client_pool.pop(replica_url)
+                        client_to_close.append((replica_url, client))
                         self._client_pool_generations.pop(replica_url, None)
+                        # Publish the draining overlay in the same critical
+                        # section as the new route view.  A role report can
+                        # therefore never observe the removed route without its
+                        # still-live old client.
+                        self._draining_clients.setdefault(replica_url,
+                                                          []).append(client)
+                    # Echo a version and durable projection fence only after
+                    # atomically applying that same response's routing spec,
+                    # route set, and drain overlay.  Role and demand reports
+                    # capture all of these fields under this lock too.
+                    self._routing_version = service_version
+                    self._route_projection_generation = (
+                        route_projection_generation)
+                    self._route_projection_sha256 = route_projection_sha256
+                    self._route_source_epoch = route_source_epoch
                 for replica_url, client in client_to_close:
                     # Fire-and-forget: a drain can legitimately take as long
                     # as the longest in-flight prediction; the sync loop must
                     # never wait on it. Strong refs held in the task set (a
                     # bare create_task result can be garbage collected).
-                    # Registered in _draining_clients first so the demand
-                    # feed keeps attributing the still-running work to the
-                    # pruned url (see _in_flight_with_draining).
-                    self._draining_clients.setdefault(replica_url,
-                                                      []).append(client)
+                    # The client was registered in _draining_clients before the
+                    # routing lock was released, so every report continues to
+                    # attribute its still-running work to the pruned URL.
                     task = asyncio.create_task(
                         self._drain_and_close_client(replica_url, client))
                     self._client_close_tasks.add(task)
                     task.add_done_callback(self._client_close_tasks.discard)
-                # Echo a version only after applying that same response's
-                # routing spec and route/catalog snapshot.  In particular, a
-                # spurious-empty response retains the previous coherent state
-                # and must not advance this fence.
-                self._routing_version = service_version
-                self._route_projection_generation = (
-                    route_projection_generation)
-                self._route_projection_sha256 = route_projection_sha256
-                self._route_source_epoch = route_source_epoch
                 # Cache the controller's capacity hint for /_lb/capacity.
                 # Absence (older controller) resets to None rather than
                 # keeping a stale previous value: readers must see
@@ -4007,9 +4042,6 @@ class SkyServeLoadBalancer:
                                             ()),
             'request_accelerator_compatibility_version':
                 self._request_accelerator_compatibility_version,
-            'route_projection_generation': self._route_projection_generation,
-            'route_projection_sha256': self._route_projection_sha256,
-            'route_source_epoch': self._route_source_epoch,
             'queue_depth': self._queue_depth,
             'queued_requests_by_compatibility': self._request_queue_profiles(),
             'rejected_requests_by_compatibility':
@@ -4177,9 +4209,9 @@ class SkyServeLoadBalancer:
 
     def _ha_role_payload(self) -> dict[str, Any]:
         """Build a non-additive occupancy and additive HTTP role report."""
-        _, routing_urls, unknown_urls, sampled_urls = (
-            self._in_flight_with_draining())
         with self._client_pool_lock:
+            _, routing_urls, unknown_urls, sampled_urls = (
+                self._in_flight_with_draining_locked())
             http_in_flight = self._load_balancing_policy.snapshot_in_flight()
             if http_in_flight is None:
                 http_in_flight = {}
@@ -4212,6 +4244,11 @@ class SkyServeLoadBalancer:
                 for url, slots in self._replica_total_slots.items()
                 if url in sampled_set
             }
+            routing_version = self._routing_version
+            route_projection_generation = self._route_projection_generation
+            route_projection_sha256 = self._route_projection_sha256
+            route_source_epoch = self._route_source_epoch
+            draining_urls = list(self._draining_clients)
         # Fail closed if a live observation has generation evidence but no
         # per-url sample timestamp. The controller rejects unequal key sets.
         reported_urls = (set(async_occupancy) | set(sample_generations) |
@@ -4228,7 +4265,10 @@ class SkyServeLoadBalancer:
             'lb_session_id': self._get_lb_session_id(),
             'lb_slot': self._lb_slot.value
                        if self._lb_slot is not None else None,
-            'routing_version': self._routing_version,
+            'routing_version': routing_version,
+            'route_projection_generation': route_projection_generation,
+            'route_projection_sha256': route_projection_sha256,
+            'route_source_epoch': route_source_epoch,
             'armed_generation': self._armed_generation,
             # Echo only the role response already applied locally. The
             # controller uses this acknowledgement to prove that a former
@@ -4252,7 +4292,7 @@ class SkyServeLoadBalancer:
             },
             'routing_urls': routing_urls,
             'unknown_in_flight_urls': unknown_urls,
-            'draining_urls': list(self._draining_clients),
+            'draining_urls': draining_urls,
         }
 
     async def _sync_role_with_controller_once(self) -> None:

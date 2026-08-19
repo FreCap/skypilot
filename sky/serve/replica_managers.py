@@ -78,6 +78,7 @@ from sky.utils import yaml_utils
 
 if typing.TYPE_CHECKING:
 
+    from sky.serve import demand_state
     from sky.serve import service_spec
     from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
     from sky.serve.replica_info import ReplicaInfo
@@ -331,12 +332,21 @@ class LogicalReconcileSnapshot:
     in_flight_by_replica_id: dict[int, int]
     unknown_replica_ids: frozenset[int]
     received_at: float
+    authority: 'demand_state.DurableReconcileAuthority | None' = None
 
 
 LogicalAcceleratorState = tuple[tuple[str, int], ...]
 LogicalTargetState = (tuple[int, int, int] |
                       tuple[int, int, int, LogicalAcceleratorState,
                             LogicalAcceleratorState])
+
+
+@dataclasses.dataclass(frozen=True)
+class _LogicalReconcileState:
+    """One atomically observed logical target/capacity state."""
+
+    target: LogicalTargetState | None
+    snapshot: LogicalReconcileSnapshot | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2579,12 +2589,11 @@ class ReplicaManager:
         self._lb_in_flight_report: tuple[float, dict[str, int], set[str] | None,
                                          set[str], set[str],
                                          str | None] | None = None
-        self._logical_reconcile_snapshot: LogicalReconcileSnapshot | None = (
-            None)
         self._logical_state_lock = threading.RLock()
+        self._logical_reconcile_state = _LogicalReconcileState(target=None,
+                                                               snapshot=None)
         self._logical_controller_epoch = uuid.uuid4().hex
         self._unknown_capacity_replacement_ids: set[int] = set()
-        self._logical_target: LogicalTargetState | None = None
         self._superseded_prune_pending = True
         self._target_num_replicas_lock = threading.Lock()
         self._target_num_replicas: int | None = None
@@ -2736,6 +2745,32 @@ class ReplicaManager:
                                          ()), set(draining_urls or
                                                   ()), lb_session_id)
 
+    @property
+    def _logical_target(self) -> LogicalTargetState | None:
+        """Compatibility view of the atomically published logical state."""
+        return self._logical_reconcile_state.target
+
+    @_logical_target.setter
+    def _logical_target(self, target: LogicalTargetState | None) -> None:
+        # Focused manager tests and recovery fixtures historically construct
+        # the two inputs independently. Each assignment still publishes one
+        # immutable pair; production readers capture the pair exactly once.
+        state = self._logical_reconcile_state
+        self._logical_reconcile_state = _LogicalReconcileState(
+            target=target, snapshot=state.snapshot)
+
+    @property
+    def _logical_reconcile_snapshot(self) -> LogicalReconcileSnapshot | None:
+        """Compatibility view of the atomically published logical state."""
+        return self._logical_reconcile_state.snapshot
+
+    @_logical_reconcile_snapshot.setter
+    def _logical_reconcile_snapshot(
+            self, snapshot: LogicalReconcileSnapshot | None) -> None:
+        state = self._logical_reconcile_state
+        self._logical_reconcile_state = _LogicalReconcileState(
+            target=state.target, snapshot=snapshot)
+
     def update_logical_reconcile_snapshot(
         self,
         version: int,
@@ -2744,15 +2779,31 @@ class ReplicaManager:
         in_flight_by_replica_id: dict[int, int],
         unknown_replica_ids: set[int],
     ) -> None:
-        """Atomically publish one complete logical-capacity observation."""
+        """Publish one advancing legacy logical-capacity observation."""
         with self._logical_state_lock:
-            self._logical_reconcile_snapshot = LogicalReconcileSnapshot(
+            state = self._logical_reconcile_state
+            current_snapshot = state.snapshot
+            if (current_snapshot is not None and
+                    generation <= current_snapshot.generation):
+                # The legacy LB source increments its controller-local
+                # generation for every accepted report. A duplicate or older
+                # standalone half-publication is therefore impossible for a
+                # valid producer and could pair replayed capacity with a
+                # same-generation target computed from different inputs.
+                logger.warning(
+                    'Discarding non-advancing legacy logical capacity '
+                    f'snapshot generation {generation}; current generation is '
+                    f'{current_snapshot.generation}.')
+                return
+            snapshot = LogicalReconcileSnapshot(
                 version=version,
                 generation=generation,
                 observed_slots_by_replica_id=dict(observed_slots_by_replica_id),
                 in_flight_by_replica_id=dict(in_flight_by_replica_id),
                 unknown_replica_ids=frozenset(unknown_replica_ids),
                 received_at=time.monotonic())
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=state.target, snapshot=snapshot)
 
     def publish_logical_target(
             self,
@@ -2762,10 +2813,11 @@ class ReplicaManager:
             target_capacity_by_accelerator: LogicalAcceleratorState = (),
             accelerator_shapes: LogicalAcceleratorState = (),
     ) -> None:
-        """Publish the target computed from an exact reconcile generation."""
+        """Publish one non-regressing legacy logical target."""
         with self._logical_state_lock:
             if self._update_recovery_required:
                 return
+            state = self._logical_reconcile_state
             candidate: LogicalTargetState
             if target_capacity_by_accelerator or accelerator_shapes:
                 candidate = (version, generation, target_capacity,
@@ -2775,16 +2827,77 @@ class ReplicaManager:
             if _logical_target_state_components(candidate) is None:
                 logger.warning('Discarding malformed published logical target '
                                f'{candidate!r}.')
-                self._logical_target = None
+                self._logical_reconcile_state = _LogicalReconcileState(
+                    target=None, snapshot=state.snapshot)
                 return
-            self._logical_target = candidate
+            current_components = _logical_target_state_components(state.target)
+            if (current_components is not None and
+                    generation < current_components[1]):
+                logger.warning(
+                    'Discarding regressed legacy logical target generation '
+                    f'{generation}; current generation is '
+                    f'{current_components[1]}.')
+                return
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=candidate, snapshot=state.snapshot)
+
+    def publish_logical_reconcile_state(
+            self, target: LogicalTargetState,
+            snapshot: LogicalReconcileSnapshot) -> bool:
+        """Atomically publish one coherent durable target/capacity pair."""
+        with self._logical_state_lock:
+            if self._update_recovery_required:
+                return False
+            components = _logical_target_state_components(target)
+            if components is None:
+                logger.warning('Discarding malformed logical reconcile target '
+                               f'{target!r}.')
+                return False
+            target_version, target_generation, _, _, _ = components
+            if (snapshot.version, snapshot.generation) != (target_version,
+                                                           target_generation):
+                logger.warning(
+                    'Discarding incoherent logical reconcile state: target '
+                    f'version/generation={(target_version, target_generation)!r}, '
+                    'snapshot version/generation='
+                    f'{(snapshot.version, snapshot.generation)!r}.')
+                return False
+            published_snapshot = LogicalReconcileSnapshot(
+                version=snapshot.version,
+                generation=snapshot.generation,
+                observed_slots_by_replica_id=dict(
+                    snapshot.observed_slots_by_replica_id),
+                in_flight_by_replica_id=dict(snapshot.in_flight_by_replica_id),
+                unknown_replica_ids=frozenset(snapshot.unknown_replica_ids),
+                received_at=snapshot.received_at,
+                authority=snapshot.authority)
+            if not self._logical_snapshot_is_fresh(published_snapshot):
+                logger.warning(
+                    'Discarding expired logical reconcile authority for '
+                    f'generation {snapshot.generation}.')
+                return False
+            # One reference assignment is this paired publication's boundary.
+            # Readers capture the immutable pair once, so a same-generation
+            # replay or generation regression cannot expose halves from two
+            # different paired publications.
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=target, snapshot=published_snapshot)
+            return True
 
     def invalidate_logical_target(self) -> None:
         """Revoke authority for pending logical-capacity retirements."""
         with self._logical_state_lock:
             if self._update_recovery_required:
                 return
-            self._logical_target = None
+            state = self._logical_reconcile_state
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=None, snapshot=state.snapshot)
+
+    def invalidate_logical_reconcile_state(self) -> None:
+        """Revoke both halves of durable logical reconcile authority."""
+        with self._logical_state_lock:
+            self._logical_reconcile_state = _LogicalReconcileState(
+                target=None, snapshot=None)
 
     def _logical_target_fence_holds(
             self,
@@ -2794,7 +2907,8 @@ class ReplicaManager:
             target_capacity_by_accelerator: LogicalAcceleratorState |
         None = None,
             accelerator_shapes: LogicalAcceleratorState | None = None,
-            require_exact_generation: bool = False) -> bool:
+            require_exact_generation: bool = False,
+            logical_state: _LogicalReconcileState | None = None) -> bool:
         """Whether a logical target intent is still authorized.
 
         Capacity reports may advance while the autoscaler waits for the
@@ -2804,8 +2918,10 @@ class ReplicaManager:
         the authority that invalidates the intent when the autoscaler takes a
         newer decision tick.
         """
-        snapshot = self._logical_reconcile_snapshot
-        target_state = _logical_target_state_components(self._logical_target)
+        if logical_state is None:
+            logical_state = self._logical_reconcile_state
+        snapshot = logical_state.snapshot
+        target_state = _logical_target_state_components(logical_state.target)
         if target_state is None:
             return False
         (target_version, target_generation, current_target,
@@ -2837,6 +2953,7 @@ class ReplicaManager:
         fence: LogicalTargetState,
         *,
         require_exact_generation: bool = False,
+        logical_state: _LogicalReconcileState | None = None,
     ) -> bool:
         components = _logical_target_state_components(fence)
         if components is None:
@@ -2849,10 +2966,13 @@ class ReplicaManager:
             target,
             target_by_card if exact else None,
             shapes if exact else None,
-            require_exact_generation=require_exact_generation)
+            require_exact_generation=require_exact_generation,
+            logical_state=logical_state)
 
     @staticmethod
     def _logical_snapshot_is_fresh(snapshot: LogicalReconcileSnapshot) -> bool:
+        if snapshot.authority is not None:
+            return time.monotonic() < snapshot.authority.deadline_monotonic
         return (time.monotonic() - snapshot.received_at
                 <= 3 * serve_constants.LB_CONTROLLER_SYNC_INTERVAL_SECONDS)
 
@@ -3215,6 +3335,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                                            tuple[_ReplicaDrainTracker | None,
                                                  float]] = {}
         self._legacy_uncertain_logical_retirement_ids: set[int] = set()
+        self._ambiguous_logical_retirement_commit_ids: set[int] = set()
         self._recovering_logical_retirement_ids: set[int] = set()
         self._logical_retirement_recovery_deadline: float | None = None
         self._logical_retirement_reactivation_generation: int | None = None
@@ -5772,7 +5893,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         waiting_replicas = [
             info for info in to_down_replicas
             if (not self._is_legacy_uncertain_logical_retirement(info) and
-                (self._is_recoverable_uncommitted_logical_retirement(info) or
+                (self._is_restart_recoverable_logical_retirement(info) or
                  info.status_property.wait_for_idle_before_termination is True))
         ]
         recovery_wait_urls: dict[int, str | None] = {}
@@ -5900,7 +6021,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                         'replacement capacity is confirmed.')
                     legacy_uncertain_ids.add(replica_info.replica_id)
                     continue
-                if self._is_recoverable_uncommitted_logical_retirement(
+                if self._is_restart_recoverable_logical_retirement(
                         replica_info):
                     # Register both strict idle waits and bounded precommit
                     # drains before rebuilding any teardown worker. The latter
@@ -8569,6 +8690,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                         self._reserved_fill_deferred_tail(
                             plan, 0, reason, detail),
                         authority_current=False)
+                controller_authority = (self._ordinary_launch_binding_authority)
+                if controller_authority is None:
+                    return self._reserved_fill_commit_result(
+                        plan, [],
+                        self._reserved_fill_deferred_tail(
+                            plan, 0,
+                            reserved_fill_planner.DeferredFillReason.LOST_OWNER,
+                            'durable controller authority is unavailable'),
+                        authority_current=False)
+                controller_incarnation = (
+                    controller_authority.controller_incarnation)
+                controller_owner_epoch = (
+                    controller_authority.controller_owner_epoch)
                 try:
                     maximum = self._reserved_fill_max_capacity_locked()
                 except Exception as error:  # pylint: disable=broad-except
@@ -8585,7 +8719,11 @@ class SkyPilotReplicaManager(ReplicaManager):
                         authority_current=False)
             try:
                 receipt = self._zero_cost_actuation_repository.grant_plan(
-                    self._service_name, plan, max_capacity=maximum)
+                    self._service_name,
+                    plan,
+                    max_capacity=maximum,
+                    expected_controller_incarnation=controller_incarnation,
+                    expected_controller_owner_epoch=controller_owner_epoch)
                 if receipt.accepted:
                     self._zero_cost_actuation_event.set()
                 return receipt
@@ -9200,9 +9338,13 @@ class SkyPilotReplicaManager(ReplicaManager):
             (str(card), int(value))
             for card, value in accelerator_shapes.items())
                                    if accelerator_shapes is not None else None)
-        if not self._logical_target_fence_holds(
-                version, reconcile_generation, target_capacity,
-                target_by_accelerator_state, accelerator_shape_state):
+        logical_state = self._logical_reconcile_state
+        if not self._logical_target_fence_holds(version,
+                                                reconcile_generation,
+                                                target_capacity,
+                                                target_by_accelerator_state,
+                                                accelerator_shape_state,
+                                                logical_state=logical_state):
             logger.info('Discarding stale logical scale-up intent for '
                         f'version {version}, generation '
                         f'{reconcile_generation}.')
@@ -9215,7 +9357,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             logger.info('Deferring logical scale-up until the current launch '
                         'wave has remaining authority.')
             return []
-        snapshot = self._logical_reconcile_snapshot
+        snapshot = logical_state.snapshot
         assert snapshot is not None
         # An unknown backend may have recovered while this decision waited for
         # the manager lock. A newer snapshot can safely narrow the bounded
@@ -9464,17 +9606,19 @@ class SkyPilotReplicaManager(ReplicaManager):
         launched_capacity = 0
         accepted: list[_ReplicaLaunchResult] = []
         while True:
+            logical_state = self._logical_reconcile_state
             if not self._logical_target_fence_holds(
                     version,
                     reconcile_generation,
                     target_capacity,
                     card_target_state,
                     shape_state,
-                    require_exact_generation=bool(replace_unknown_replica_ids)):
+                    require_exact_generation=bool(replace_unknown_replica_ids),
+                    logical_state=logical_state):
                 logger.info('Stopping logical scale-up batch after its '
                             'reconciliation fence advanced.')
                 break
-            current_snapshot = self._logical_reconcile_snapshot
+            current_snapshot = logical_state.snapshot
             assert current_snapshot is not None
             committed = _committed_capacity(current_snapshot)
             committed_by_card = _committed_by_card(current_snapshot)
@@ -10447,9 +10591,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             return 'abort'
         if controller_epoch != self._logical_controller_epoch:
             return 'abort'
-        snapshot = self._logical_reconcile_snapshot
-        target_state = _logical_target_state_components(self._logical_target)
-        if (snapshot is None or snapshot.generation < selection_generation or
+        logical_state = self._logical_reconcile_state
+        snapshot = logical_state.snapshot
+        target_state = _logical_target_state_components(logical_state.target)
+        if (snapshot is None or snapshot.generation <= selection_generation or
                 target_state is None):
             return 'wait'
         if not self._logical_snapshot_is_fresh(snapshot):
@@ -10714,6 +10859,54 @@ class SkyPilotReplicaManager(ReplicaManager):
             selection_target >= 0 and type(bounded_deadline) is bool)
 
     @staticmethod
+    def _is_uncommitted_logical_retirement_admission(info: ReplicaInfo) -> bool:
+        """Whether exact readback proves a destructive commit did not land.
+
+        The ordinary idle path clears the durable wait bit when it constructs
+        an unstarted down worker.  If the later PostgreSQL commit call loses
+        its acknowledgement *before* committing, readback therefore sees this
+        narrower admission-precommit shape rather than the earlier strict-wait
+        shape.  It is reversible and may be requeued, but it still needs fresh
+        N+1 authority and ``commit_logical_retirement`` before worker start.
+        """
+        status = info.status_property
+        retirement_version = status.logical_retirement_version
+        controller_epoch = status.logical_retirement_controller_epoch
+        selection_generation = status.logical_retirement_generation
+        selection_target = status.logical_retirement_target_capacity
+        confirmed_generation = status.logical_retirement_confirmed_generation
+        return bool(
+            status.sky_launch_status == common_utils.ProcessStatus.SUCCEEDED and
+            status.sky_down_status == common_utils.ProcessStatus.SCHEDULED and
+            status.is_scale_down is True and status.preempted is False and
+            status.purged is False and
+            status.wait_for_idle_before_termination is False and
+            status.logical_retirement_committed is False and
+            type(info.version) is int and type(retirement_version) is int and
+            info.version <= retirement_version and
+            isinstance(controller_epoch, str) and bool(controller_epoch) and
+            type(selection_generation) is int and selection_generation >= 0 and
+            type(selection_target) is int and selection_target >= 0 and
+            type(confirmed_generation) is int and
+            selection_generation <= confirmed_generation and
+            type(status.logical_retirement_bounded_deadline) is bool)
+
+    @classmethod
+    def _is_restart_recoverable_logical_retirement(cls,
+                                                   info: ReplicaInfo) -> bool:
+        """Whether controller-start recovery owns an exact precommit row.
+
+        Version-update handoff deliberately excludes ordinary queued
+        admission precommits so it can abort and reselect them in-process.
+        After a controller crash there is no process-local worker or
+        ambiguous-ID owner left, so startup must additionally adopt that
+        exact reversible shape behind fresh N+1 authority.
+        """
+        return bool(
+            cls._is_recoverable_uncommitted_logical_retirement(info) or
+            cls._is_uncommitted_logical_retirement_admission(info))
+
+    @staticmethod
     def _is_legacy_uncertain_logical_retirement(info: ReplicaInfo) -> bool:
         """Whether a pre-commit-bit SCHEDULED retirement is ambiguous."""
         status = info.status_property
@@ -10739,7 +10932,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 type(bounded_deadline) is bool)
 
     def _reconcile_legacy_uncertain_logical_retirements(self) -> None:
-        """Safely adopt and re-drive ambiguous pre-commit-bit retirements."""
+        """Adopt legacy rows as reversible precommits for a later N+1."""
         uncertain_ids = self._legacy_uncertain_logical_retirement_ids
         if not uncertain_ids:
             return
@@ -10765,6 +10958,19 @@ class SkyPilotReplicaManager(ReplicaManager):
                     continue
                 uncertain_ids.discard(replica_id)
                 continue
+            if (self._is_recoverable_uncommitted_logical_retirement(info) and
+                    info.status_property.logical_retirement_version
+                    == self.latest_version and
+                    info.status_property.logical_retirement_controller_epoch
+                    == self._logical_controller_epoch):
+                # The normalization write may have committed even if its
+                # acknowledgement was lost.  Exact durable readback of the
+                # current-format reversible row is sufficient to adopt the
+                # wait; it still needs a strict later N+1 and the PostgreSQL
+                # destructive commit seam before any worker can start.
+                self._register_wait_for_idle(info, replica_url=None)
+                uncertain_ids.discard(replica_id)
+                continue
             if not self._is_legacy_uncertain_logical_retirement(info):
                 # Once classified as ambiguous, never reactivate the backend
                 # merely because its durable state becomes malformed. Keep the
@@ -10772,12 +10978,15 @@ class SkyPilotReplicaManager(ReplicaManager):
                 continue
 
             with self._logical_state_lock:
-                snapshot = self._logical_reconcile_snapshot
+                logical_state = self._logical_reconcile_state
+                snapshot = logical_state.snapshot
                 target_state = _logical_target_state_components(
-                    self._logical_target)
+                    logical_state.target)
                 if (snapshot is None or target_state is None or
                         not self._logical_snapshot_is_fresh(snapshot) or
-                        snapshot.version != self.latest_version):
+                        snapshot.authority is None or
+                        snapshot.version != self.latest_version or
+                        snapshot.generation <= 0):
                     continue
                 (target_version, target_generation, current_target, _,
                  _) = target_state
@@ -10797,49 +11006,77 @@ class SkyPilotReplicaManager(ReplicaManager):
                     status.logical_retirement_target_capacity,
                     status.logical_retirement_confirmed_generation,
                     status.logical_retirement_bounded_deadline,
+                    status.wait_for_idle_before_termination,
+                    status.logical_retirement_committed,
                 )
                 status.logical_retirement_version = self.latest_version
                 status.logical_retirement_controller_epoch = (
                     self._logical_controller_epoch)
                 status.logical_retirement_generation = snapshot.generation
                 status.logical_retirement_target_capacity = current_target
-                status.logical_retirement_confirmed_generation = (
-                    snapshot.generation)
+                status.logical_retirement_confirmed_generation = None
                 status.logical_retirement_bounded_deadline = False
-                if self._logical_retirement_state(
-                        info, require_victim_idle=False) != 'safe':
+                status.wait_for_idle_before_termination = True
+                status.logical_retirement_committed = False
+                try:
+                    self._persist_replica(replica_id, info)
+                except Exception as e:  # pylint: disable=broad-except
                     (status.logical_retirement_version,
                      status.logical_retirement_controller_epoch,
                      status.logical_retirement_generation,
                      status.logical_retirement_target_capacity,
                      status.logical_retirement_confirmed_generation,
-                     status.logical_retirement_bounded_deadline) = old_selection
-                    continue
-
-                status.logical_retirement_committed = True
-                try:
-                    self._persist_replica(replica_id, info)
-                except Exception as e:  # pylint: disable=broad-except
-                    # The write may have committed server-side. A fresh read on
-                    # the next tick distinguishes committed from still-legacy
-                    # state without ever advertising the backend again.
+                     status.logical_retirement_bounded_deadline,
+                     status.wait_for_idle_before_termination,
+                     status.logical_retirement_committed) = old_selection
                     logger.warning(
-                        f'Failed to confirm adoption of legacy logical '
+                        f'Failed to persist adoption of legacy logical '
                         f'retirement for replica {replica_id}: '
                         f'{common_utils.format_exception(e)}')
                     continue
-                try:
-                    self._terminate_replica(replica_id,
-                                            sync_down_logs=False,
-                                            replica_drain_delay_seconds=0,
-                                            is_scale_down=True,
-                                            in_flight_drain_cap_seconds=0)
-                except Exception as e:  # pylint: disable=broad-except
-                    logger.warning(f'Failed to schedule adopted legacy logical '
-                                   f'retirement for replica {replica_id}: '
-                                   f'{common_utils.format_exception(e)}')
-                    continue
+                # Generation N only establishes a current-format reversible
+                # precommit. The normal idle path must observe N+1 and then
+                # use commit_logical_retirement before any worker can start.
+                self._register_wait_for_idle(info, replica_url=None)
                 uncertain_ids.discard(replica_id)
+
+    def _reconcile_ambiguous_logical_retirement_commits(self) -> None:
+        """Read back a lost commit acknowledgement before reconstructing."""
+        ambiguous_ids = self._ambiguous_logical_retirement_commit_ids
+        if not ambiguous_ids:
+            return
+        try:
+            infos = serve_state.get_replica_infos_from_ids(
+                self._service_name, sorted(ambiguous_ids))
+        except Exception as error:  # pylint: disable=broad-except
+            logger.warning(
+                'Unable to read back ambiguous logical-retirement commits: '
+                f'{common_utils.format_exception(error)}')
+            return
+        for replica_id in sorted(list(ambiguous_ids)):
+            info = infos.get(replica_id)
+            if info is None:
+                ambiguous_ids.discard(replica_id)
+                continue
+            if (not self._is_committed_logical_retirement(info) and
+                    not self._is_uncommitted_logical_retirement_admission(info)
+               ):
+                # A malformed or externally changed row is not evidence that
+                # the commit failed. Keep it off-route for inspection.
+                continue
+            try:
+                self._terminate_replica(replica_id,
+                                        sync_down_logs=False,
+                                        replica_drain_delay_seconds=0,
+                                        is_scale_down=True,
+                                        in_flight_drain_cap_seconds=0)
+            except Exception as error:  # pylint: disable=broad-except
+                logger.warning(
+                    'Failed to reconstruct logical retirement after commit '
+                    f'readback for replica {replica_id}: '
+                    f'{common_utils.format_exception(error)}')
+                continue
+            ambiguous_ids.discard(replica_id)
 
     def _logical_retirement_recovery_timed_out(self) -> bool:
         deadline = self._logical_retirement_recovery_deadline
@@ -10883,7 +11120,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             if self._is_committed_logical_retirement(info):
                 recovering_ids.discard(replica_id)
                 continue
-            if not self._is_recoverable_uncommitted_logical_retirement(info):
+            if not self._is_restart_recoverable_logical_retirement(info):
                 # The normal refresh path retains authority over malformed or
                 # otherwise changed state; the recovery-only epoch gate must
                 # not hide it.
@@ -10896,9 +11133,10 @@ class SkyPilotReplicaManager(ReplicaManager):
             return
 
         with self._logical_state_lock:
-            snapshot = self._logical_reconcile_snapshot
+            logical_state = self._logical_reconcile_state
+            snapshot = logical_state.snapshot
             target_state = _logical_target_state_components(
-                self._logical_target)
+                logical_state.target)
             if (snapshot is None or target_state is None or
                     not self._logical_snapshot_is_fresh(snapshot) or
                     snapshot.version != self.latest_version):
@@ -11044,6 +11282,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 bounded_precommit = (
                     status.wait_for_idle_before_termination is False and
                     status.logical_retirement_bounded_deadline is True)
+                admission_precommit = (
+                    self._is_uncommitted_logical_retirement_admission(info) and
+                    not self._is_recoverable_uncommitted_logical_retirement(
+                        info))
                 old_selection = (
                     status.logical_retirement_version,
                     status.logical_retirement_controller_epoch,
@@ -11051,6 +11293,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     status.logical_retirement_target_capacity,
                     status.logical_retirement_confirmed_generation,
                     status.logical_retirement_bounded_deadline,
+                    status.wait_for_idle_before_termination,
                     status.logical_retirement_committed,
                 )
                 status.logical_retirement_version = self.latest_version
@@ -11060,10 +11303,16 @@ class SkyPilotReplicaManager(ReplicaManager):
                 status.logical_retirement_target_capacity = current_target
                 # Adoption only refreshes the selection fence. Idle proof and
                 # the irreversible teardown commit remain in the existing
-                # _finish_logical_retirement path.
+                # _finish_logical_retirement path. Normalize a recovered
+                # admission precommit back to the canonical strict-idle shape;
+                # this confines recognition of that ambiguous crash shape to
+                # startup while making a genuine N+1 and fresh idle proof
+                # mandatory before worker requeue.
                 status.logical_retirement_confirmed_generation = (
                     snapshot.generation if bounded_precommit else None)
                 status.logical_retirement_bounded_deadline = bounded_precommit
+                if admission_precommit:
+                    status.wait_for_idle_before_termination = True
                 status.logical_retirement_committed = False
                 try:
                     self._persist_replica(info.replica_id, info)
@@ -11074,6 +11323,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                      status.logical_retirement_target_capacity,
                      status.logical_retirement_confirmed_generation,
                      status.logical_retirement_bounded_deadline,
+                     status.wait_for_idle_before_termination,
                      status.logical_retirement_committed) = old_selection
                     logger.warning(
                         f'Failed to re-fence recovered logical retirement '
@@ -11160,7 +11410,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                 self._abort_logical_retirement(
                     info, 'the current target or coverage fence changed')
                 return
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = self._logical_reconcile_state.snapshot
             assert snapshot is not None
             info.status_property.logical_retirement_confirmed_generation = (
                 snapshot.generation)
@@ -11517,7 +11767,7 @@ class SkyPilotReplicaManager(ReplicaManager):
         if not replacement_ids:
             return
         with self._logical_state_lock:
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = self._logical_reconcile_state.snapshot
             if snapshot is None or not self._logical_snapshot_is_fresh(
                     snapshot):
                 return
@@ -11710,15 +11960,20 @@ class SkyPilotReplicaManager(ReplicaManager):
             raise RuntimeError('Logical scale-down sent to a physical '
                                'replica service.')
         with self._logical_state_lock:
+            logical_state = self._logical_reconcile_state
             if not self._logical_target_fence_holds(
-                    version, reconcile_generation, target_capacity,
-                    target_capacity_by_accelerator, accelerator_shapes):
+                    version,
+                    reconcile_generation,
+                    target_capacity,
+                    target_capacity_by_accelerator,
+                    accelerator_shapes,
+                    logical_state=logical_state):
                 logger.info(
                     'Discarding stale logical scale-down batch for version '
                     f'{version}, generation {reconcile_generation}, target '
                     f'{target_capacity} with {len(replica_ids)} victim(s).')
                 return
-            snapshot = self._logical_reconcile_snapshot
+            snapshot = logical_state.snapshot
             assert snapshot is not None
 
             # This is the only fleet read for the whole wave. Resolve victims
@@ -12207,7 +12462,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                                                   reason='not-applicable')
 
         with self._logical_state_lock:
-            target_fence = self._logical_target
+            logical_state = self._logical_reconcile_state
+            target_fence = logical_state.target
             target_state = _logical_target_state_components(target_fence)
             if (target_state is None or target_fence is None or
                     len(target_fence) != 5):
@@ -12217,8 +12473,9 @@ class SkyPilotReplicaManager(ReplicaManager):
                     authorized_ids=frozenset(),
                     reason='target-missing-or-malformed',
                     details=f'target={target_fence!r}')
-            if not self._logical_reconcile_fence_holds(target_fence):
-                snapshot = self._logical_reconcile_snapshot
+            if not self._logical_reconcile_fence_holds(
+                    target_fence, logical_state=logical_state):
+                snapshot = logical_state.snapshot
                 snapshot_summary = (None if snapshot is None else
                                     (snapshot.version, snapshot.generation,
                                      round(
@@ -12312,15 +12569,17 @@ class SkyPilotReplicaManager(ReplicaManager):
         # A newer autoscaler tick may publish while the fleet read above is in
         # flight. Never let an authorization set cross that target boundary.
         with self._logical_state_lock:
-            if (self._logical_target != target_fence or
-                    not self._logical_reconcile_fence_holds(target_fence)):
+            current_state = self._logical_reconcile_state
+            if (current_state.target != target_fence or
+                    not self._logical_reconcile_fence_holds(
+                        target_fence, logical_state=current_state)):
                 return _LogicalPendingLaunchAdmission(
                     applicable=True,
                     target_fence=None,
                     authorized_ids=frozenset(),
                     reason='target-changed-during-replica-read',
                     details=(f'previous_target={target_fence!r}, '
-                             f'current_target={self._logical_target!r}'))
+                             f'current_target={current_state.target!r}'))
         candidate_ids_first_16 = {
             card: [info.replica_id for info in card_candidates[:16]]
             for card, card_candidates in candidates.items()
@@ -12454,6 +12713,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # This remains the current launch/down completion owner.  It is not
         # deprecated by the retired action-authority proposal.
         legacy_runtime = self._legacy_mutation_runtime_state()
+        # A lost PostgreSQL commit acknowledgement is resolved from the exact
+        # row before any replacement worker is constructed.
+        self._reconcile_ambiguous_logical_retirement_commits()
         # A pre-field SCHEDULED retirement stays off-route across an upgrade
         # until current replacement capacity proves it can be re-driven.
         self._reconcile_legacy_uncertain_logical_retirements()
@@ -13106,6 +13368,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     logical_state_guard = (self._logical_state_lock
                                            if logical_retirement else
                                            contextlib.nullcontext())
+                    snapshot: LogicalReconcileSnapshot | None = None
                     with logical_state_guard:
                         if logical_retirement:
                             recovering_ids: set[
@@ -13145,21 +13408,82 @@ class SkyPilotReplicaManager(ReplicaManager):
                                 self._abort_logical_retirement(
                                     info, 'shutdown admission fence changed')
                                 continue
-                            snapshot = self._logical_reconcile_snapshot
+                            snapshot = self._logical_reconcile_state.snapshot
                             assert snapshot is not None
-                            info.status_property.logical_retirement_confirmed_generation = (
-                                snapshot.generation)
-                            # The RUNNING write below is the durable admission
-                            # boundary. After it, a crash may happen before
-                            # t.start(), so recovery must finish cleanup.
-                            # Before it, a budget-delayed SCHEDULED retirement
-                            # remains safe to abort and reselect.
-                            info.status_property.logical_retirement_committed = (
-                                True)
-                        info.status_property.sky_down_status = (
-                            common_utils.ProcessStatus.RUNNING)
+                            authority = snapshot.authority
+                            if authority is not None:
+                                if (self._service_hash is None or
+                                        self._controller_owner is None):
+                                    self.invalidate_logical_reconcile_state()
+                                    continue
+                                try:
+                                    commit_result = (
+                                        serve_state.commit_logical_retirement(
+                                            self._service_name,
+                                            replica_id,
+                                            info,
+                                            authority,
+                                            expected_service_hash=(
+                                                self._service_hash),
+                                            expected_controller_owner=(
+                                                self._controller_owner),
+                                            expected_logical_controller_epoch=(
+                                                self._logical_controller_epoch))
+                                    )
+                                except Exception as error:  # pylint: disable=broad-except
+                                    logger.warning(
+                                        'Revoking logical-retirement '
+                                        'authority because its commit could '
+                                        'not be evaluated: '
+                                        f'{common_utils.format_exception(error)}'
+                                    )
+                                    self.invalidate_logical_reconcile_state()
+                                    continue
+                                if commit_result.state is (
+                                        serve_state.
+                                        LogicalRetirementCommitState.REJECTED):
+                                    self.invalidate_logical_reconcile_state()
+                                    continue
+                                if commit_result.state is (
+                                        serve_state.
+                                        LogicalRetirementCommitState.AMBIGUOUS):
+                                    # The original worker has never started.
+                                    # Only exact readback may reconstruct it.
+                                    legacy_runtime.down_thread_pool.pop(
+                                        replica_id)
+                                    (self.
+                                     _ambiguous_logical_retirement_commit_ids.
+                                     add(replica_id))
+                                    self.invalidate_logical_reconcile_state()
+                                    continue
+                                if commit_result.state is not (
+                                        serve_state.
+                                        LogicalRetirementCommitState.COMMITTED):
+                                    logger.error(
+                                        'Revoking logical-retirement '
+                                        'authority after an unknown commit '
+                                        f'outcome: {commit_result.state!r}')
+                                    self.invalidate_logical_reconcile_state()
+                                    continue
+                                assert commit_result.replica_info is not None
+                                info = commit_result.replica_info
+                            else:
+                                # Transitional direct-source services keep the
+                                # established local admission boundary. The
+                                # durable path above is the steady-state path.
+                                info.status_property.logical_retirement_confirmed_generation = (
+                                    snapshot.generation)
+                                info.status_property.logical_retirement_committed = (
+                                    True)
+                        durable_commit = bool(logical_retirement and
+                                              snapshot is not None and
+                                              snapshot.authority is not None)
+                        if not durable_commit:
+                            info.status_property.sky_down_status = (
+                                common_utils.ProcessStatus.RUNNING)
                         try:
-                            self._persist_replica(replica_id, info)
+                            if not durable_commit:
+                                self._persist_replica(replica_id, info)
                         except Exception:
                             # The database may have committed RUNNING even if
                             # the client observed an error. Remove the never-
