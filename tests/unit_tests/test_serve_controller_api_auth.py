@@ -9,6 +9,7 @@ import pytest
 from sky.server import common as server_common
 from sky.server import constants as server_constants
 from sky.server import server
+from sky.utils import common_utils
 
 
 def _request(path: str,
@@ -147,8 +148,12 @@ def test_middleware_accepts_admin_overlap_ring(monkeypatch, token):
     assert response.status_code == 204
     assert reads == [True]
     assert len(users) == 1
-    assert users[0].id == 'skypilot-system-serve-controller'
+    assert users[0].id == 'skyserve'
     assert users[0].user_type == 'system'
+    cluster_name = common_utils.make_cluster_name_on_cloud_for_user(
+        'boltz-l4-fleet-54883-0698237f22', max_length=42, user_hash=users[0].id)
+    assert len(cluster_name) <= 42
+    assert cluster_name.endswith('-skyserve')
 
 
 @pytest.mark.parametrize('authorization',
