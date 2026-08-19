@@ -1949,8 +1949,10 @@ class SkyServeController:
 
     def _lb_role_database_snapshot(self) -> _LbRoleDatabaseSnapshot | None:
         """Read the complete role owner/fence/cutover record once."""
-        owner = serve_state.get_service_controller_owner(self._service_name,
-                                                         include_lb_state=True)
+        owner = serve_state.get_service_controller_owner(
+            self._service_name,
+            include_lb_state=True,
+            include_route_owner_state=True)
         if (owner is None or not owner.get('lb_ha_enabled') or
                 not owner.get('hash') or owner.get('lifecycle_epoch') is None):
             return None

@@ -3945,6 +3945,12 @@ class TestGetServiceControllerOwner:
     def test_missing_row_returns_none(self, _mock_serve_db):
         assert serve_state.get_service_controller_owner('missing') is None
 
+    def test_route_owner_state_requires_lb_state(self):
+        with pytest.raises(ValueError,
+                           match='include_route_owner_state requires'):
+            serve_state.get_service_controller_owner(
+                'svc-owner', include_route_owner_state=True)
+
     def test_lb_state_extension_includes_complete_cutover_row_in_one_query(
             self, _mock_serve_db):
         _add_minimal_service('svc-role-state', controller_ip='10.4.10.8')
@@ -3960,14 +3966,6 @@ class TestGetServiceControllerOwner:
         assert record['lb_pending_slot'] is None
         assert record['lb_cutover_phase'] == 'STABLE'
         assert record['lb_drain_started_at'] is None
-        assert record['current_version'] == 1
-        assert 'controller_incarnation' in record
-        assert 'controller_owner_epoch' in record
-        assert record['route_source_mode'] == 'LEGACY_PROXY'
-        assert record['route_source_epoch'] == 0
-        assert record['route_projection_capable'] is False
-        assert 'route_projection_controller_incarnation' in record
-        assert 'route_projection_protocol_version' in record
         assert counts['n'] == 1
 
     def test_require_version_rejects_orphan_service_row(self, _mock_serve_db):

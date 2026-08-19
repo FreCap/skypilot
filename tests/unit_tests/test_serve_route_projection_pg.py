@@ -19,6 +19,7 @@ from sky.serve import lb_cutover_state
 from sky.serve import lb_ha
 from sky.serve import route_projection
 from sky.serve import route_projection_schema
+from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.utils.db import migration_utils
 
@@ -73,6 +74,25 @@ def _identity(incarnation):
         controller_owner_epoch=4,
         controller_pid=123,
         controller_ip='10.0.0.5')
+
+
+def test_route_promotion_owner_reads_exact_postgres_state(
+        route_database, monkeypatch):
+    engine, incarnation = route_database
+    monkeypatch.setattr(serve_state._db_manager, '_engine', engine)
+
+    owner = serve_state.get_service_controller_owner(
+        'svc', include_lb_state=True, include_route_owner_state=True)
+
+    assert owner is not None
+    assert owner['current_version'] == 1
+    assert owner['controller_incarnation'] == incarnation
+    assert owner['controller_owner_epoch'] == 4
+    assert owner['route_source_mode'] == 'LEGACY_PROXY'
+    assert owner['route_source_epoch'] == 0
+    assert owner['route_projection_capable'] is False
+    assert owner['route_projection_controller_incarnation'] is None
+    assert owner['route_projection_protocol_version'] is None
 
 
 def _insert_replica(engine,

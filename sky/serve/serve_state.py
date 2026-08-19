@@ -2309,7 +2309,8 @@ def _controller_owner_record(mapping: Any) -> dict[str, Any]:
 def get_service_controller_owner(
         service_name: str,
         require_version: bool = False,
-        include_lb_state: bool = False) -> dict[str, Any] | None:
+        include_lb_state: bool = False,
+        include_route_owner_state: bool = False) -> dict[str, Any] | None:
     """Get only the fields needed to route to a service controller.
 
     Unlike :func:`get_service_from_name`, this hot-path lookup does not join
@@ -2319,9 +2320,13 @@ def get_service_controller_owner(
     ``require_version`` preserves callers whose old joined read treated an
     orphan/versionless service row as missing, using an indexed existence
     check without loading version metadata. ``include_lb_state`` adds the
-    cutover and exact durable-route owner fields only for HA lifecycle callers,
-    keeping the routing identity contract small for all other hot paths.
+    cutover fields only for HA lifecycle callers. The promotion path may also
+    request ``include_route_owner_state`` for the exact durable-route owner;
+    keeping that opt-in separate preserves the original narrow HA contract for
+    cleanup and ordinary lifecycle reads.
     """
+    if include_route_owner_state and not include_lb_state:
+        raise ValueError('include_route_owner_state requires include_lb_state')
     engine = _db_manager.get_engine()
     with orm.Session(engine) as session:
         columns = [
@@ -2342,6 +2347,9 @@ def get_service_controller_owner(
                 services_table.c.lb_pending_slot,
                 services_table.c.lb_cutover_phase,
                 services_table.c.lb_drain_started_at,
+            ])
+        if include_route_owner_state:
+            columns.extend([
                 services_table.c.current_version,
                 services_table.c.controller_incarnation,
                 services_table.c.controller_owner_epoch,
@@ -2369,6 +2377,9 @@ def get_service_controller_owner(
             'lb_pending_slot': mapping['lb_pending_slot'],
             'lb_cutover_phase': mapping['lb_cutover_phase'],
             'lb_drain_started_at': mapping['lb_drain_started_at'],
+        })
+    if include_route_owner_state:
+        record.update({
             'current_version': mapping['current_version'],
             'controller_incarnation': mapping['controller_incarnation'],
             'controller_owner_epoch': mapping['controller_owner_epoch'],

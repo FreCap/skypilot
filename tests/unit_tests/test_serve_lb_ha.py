@@ -1824,7 +1824,9 @@ def test_role_database_snapshot_reads_owner_and_complete_state_once():
         ('incarnation', (123, '10.0.0.1'), 7),
         lb_ha.LbCutoverState(True, lb_ha.LbSlot.A, 3, None,
                              lb_ha.LbCutoverPhase.STABLE, 7, 123.5), owner)
-    owner_read.assert_called_once_with('service', include_lb_state=True)
+    owner_read.assert_called_once_with('service',
+                                       include_lb_state=True,
+                                       include_route_owner_state=True)
 
 
 @pytest.mark.parametrize(('field', 'changed'),
