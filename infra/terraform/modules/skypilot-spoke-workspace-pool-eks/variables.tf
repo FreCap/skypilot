@@ -364,12 +364,27 @@ variable "tags" {
   default     = {}
 }
 
+variable "allow_cluster_security_group_node_ingress" {
+  description = <<-EOT
+    Explicitly allow cluster_api_ingress_cidrs to add TCP/443 ingress to the
+    EKS-managed cluster security group. EKS also attaches that security group
+    to managed-node interfaces by default, so this opt-in acknowledges that
+    the same source CIDRs can reach TCP/443 listeners on those nodes. The
+    default fails closed whenever cluster_api_ingress_cidrs is nonempty.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "cluster_api_ingress_cidrs" {
   description = <<-EOT
     IPv4 CIDRs from which the SkyPilot control plane may reach the existing
     EKS cluster's private API endpoint. The module adds one TCP/443 rule to the
-    EKS-managed cluster security group. The default creates no rule, and public
-    /0 sources are rejected.
+    EKS-managed cluster security group. EKS attaches that group to managed-node
+    interfaces by default, so allow_cluster_security_group_node_ingress must be
+    true before the rule can plan. The default creates no rule. Public /0
+    sources and CIDRs that become duplicates after AWS canonicalization are
+    rejected.
   EOT
   type        = list(string)
   default     = []
@@ -377,14 +392,17 @@ variable "cluster_api_ingress_cidrs" {
   validation {
     condition = (
       length(var.cluster_api_ingress_cidrs) ==
-      length(distinct(var.cluster_api_ingress_cidrs)) &&
+      length(distinct([
+        for cidr in var.cluster_api_ingress_cidrs :
+        try(cidrsubnet(cidr, 0, 0), cidr)
+      ])) &&
       alltrue([
         for cidr in var.cluster_api_ingress_cidrs :
         can(cidrnetmask(cidr)) &&
         try(tonumber(split("/", cidr)[1]) > 0, false)
       ])
     )
-    error_message = "cluster_api_ingress_cidrs must contain unique, valid IPv4 CIDRs and must not contain a /0 source."
+    error_message = "cluster_api_ingress_cidrs must contain canonically unique, valid IPv4 CIDRs and must not contain a /0 source."
   }
 }
 
