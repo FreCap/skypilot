@@ -143,6 +143,36 @@ physical-UID-fenced `ABSENT` observation. The row and cluster are absent; the
 request remains cancelled without a synthetic receipt, and no paid claim
 exists.
 
+### 2026-08-19 projected-tombstone drain correction
+
+Production verification found that the ordinary-binding promotion barrier
+still required a request-quiescence receipt from every historical legacy
+request. That condition contradicts the legacy reconciliation contract above:
+replica 52689 was deliberately resolved without fabricating such a receipt,
+and its append-only `PROJECTED` tombstone therefore could never release the
+global per-service transition barrier.
+
+The canonical drain invariant is **no uncontained legacy execution effect**,
+not “every historical executor published a current-protocol receipt.” A
+legacy request is drained by either of two proofs:
+
+1. its terminal request row has the exact execution-generation quiescence
+   receipt and no queue row; or
+2. its terminal request row has no queue row and an exact legacy `PROJECTED`
+   tombstone matching the historical service hash, request ID, cluster,
+   replica ID/version/record UUID, terminal status/generation, and any provider
+   context/physical UID retained in the request.
+
+The second proof is containment evidence, not request quiescence. Promotion
+must not update the request, add an association, or manufacture a receipt. A
+nonterminal request, queue row, ambiguous/cleanup-authorized ledger head,
+mismatched identity, provider `PRESENT`/`UNKNOWN`/`REPLACED`, or an unprojected
+cleanup still fails closed. Serve047's append-only constraints remain the sole
+authority for executor termination, later provider `ABSENT`, and cleanup
+completion. The historical service hash is matched to the request, not to the
+current service row, so a completed tombstone remains drained across later
+controller lifecycles and service updates.
+
 The recovery loop then cleared the prior intents from nonterminal `PENDING`
 state and admitted replicas 52688 and 52690 to ordinary typed cleanup. The live
 Serve048 runtime exposed a separate migration-lineage omission: revision-040
@@ -2840,6 +2870,9 @@ approved canary:
   provider, and cluster-incarnation evidence through the G1 legacy ledger.
   Preserve the real old-executor effect and original cancelled request; record
   no fabricated quiescence receipt or synthetic association.
+- [ ] Merge and deploy the projected-tombstone drain consumer, then prove the
+  exact 52689 request releases ordinary promotion while its request receipt
+  remains null. Incomplete or mismatched ledger evidence must still block.
 - [ ] Deploy the reviewed Serve049/050 authority lineage and verify ordinary
   typed cleanup converges replicas 52688 and 52690 without manual deletion.
 - [ ] Converge every API acceptor, request backend, queue executor, GC

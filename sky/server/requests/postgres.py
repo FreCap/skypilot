@@ -4000,6 +4000,66 @@ def request_bound_ordinary_launch_cancel(
             connection, context)
 
 
+def _legacy_projected_cleanup_drains_request_in_transaction(
+    connection: sqlalchemy.engine.Connection,
+    row: Mapping[str, Any],
+    context: Mapping[str, Any],
+    service_name: str,
+) -> bool:
+    """Return whether an exact Serve047 tombstone contains this request."""
+    service_hash = context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_HASH_KEY)
+    replica_version = context.get(
+        serve_constants.REPLICA_LAUNCH_FENCE_SERVICE_VERSION_KEY)
+    replica_id = context.get(
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_ID_KEY)
+    replica_record_id = context.get(
+        serve_constants.ORDINARY_LAUNCH_BINDING_EXCLUDED_REPLICA_RECORD_ID_KEY)
+    if replica_id is None:
+        replica_id = context.get(ordinary_launch_binding.REPLICA_ID_KEY)
+    if replica_record_id is None:
+        replica_record_id = context.get(
+            ordinary_launch_binding.REPLICA_RECORD_ID_KEY)
+    try:
+        replica_record_uuid = uuid.UUID(str(replica_record_id))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if (not isinstance(service_hash, str) or not service_hash or
+            type(replica_version) is not int or replica_version < 1 or
+            type(replica_id) is not int or replica_id < 1):
+        return False
+
+    ledger = ordinary_launch_binding.legacy_reconciliations_table
+    predicates = [
+        ledger.c.service_name == service_name,
+        ledger.c.service_hash == service_hash,
+        ledger.c.replica_id == replica_id,
+        ledger.c.replica_record_id == replica_record_uuid,
+        ledger.c.replica_version == replica_version,
+        ledger.c.cluster_name == row['cluster_name'],
+        ledger.c.request_id == row['request_id'],
+        ledger.c.observed_request_status == str(row['status']),
+        ledger.c.observed_request_execution_generation ==
+        row['execution_generation'],
+        ledger.c.observed_request_queue_present.is_(False),
+        ledger.c.resolution ==
+        ordinary_launch_binding.LegacyReconciliationResolution.PROJECTED.value,
+    ]
+    provider_context = context.get(
+        serve_constants.RESERVED_FILL_LAUNCH_KUBERNETES_CONTEXT_KEY)
+    physical_uid = context.get(
+        serve_constants.RESERVED_FILL_LAUNCH_PHYSICAL_CLUSTER_UID_KEY)
+    if provider_context is not None:
+        predicates.append(ledger.c.provider_context == provider_context)
+    if physical_uid is not None:
+        predicates.append(
+            ledger.c.provider_physical_resource_uid == physical_uid)
+    return bool(
+        connection.execute(
+            sqlalchemy.select(
+                sqlalchemy.exists().where(*predicates))).scalar_one())
+
+
 def _legacy_ordinary_launch_requests_drained_in_transaction(
     connection: sqlalchemy.engine.Connection,
     service_name: str,
@@ -4037,18 +4097,21 @@ def _legacy_ordinary_launch_requests_drained_in_transaction(
         status = requests_lib.RequestStatus(str(row['status']))
         if status not in requests_lib.RequestStatus.finished_status():
             return False
-        if (row['execution_quiescence_required'] is not True or
-                row['execution_generation'] is None or
-                row['execution_quiesced_generation']
-                != row['execution_generation'] or
-                row['execution_quiesced_at'] is None):
-            return False
         queue_exists = connection.execute(
             sqlalchemy.select(sqlalchemy.literal(True)).where(
                 sqlalchemy.exists().where(
                     QUEUE.c.request_id ==
                     row['request_id']))).scalar_one_or_none()
         if queue_exists:
+            return False
+        has_request_receipt = (row['execution_quiescence_required'] is True and
+                               row['execution_generation'] is not None and
+                               row['execution_quiesced_generation']
+                               == row['execution_generation'] and
+                               row['execution_quiesced_at'] is not None)
+        if (not has_request_receipt and
+                not _legacy_projected_cleanup_drains_request_in_transaction(
+                    connection, row, context, service_name)):
             return False
     return True
 
