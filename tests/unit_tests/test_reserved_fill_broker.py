@@ -723,6 +723,37 @@ class TestProtocolV2ReplicaPoolProvenance:
         # occupants; only the former claimant is unclaimed.
         assert result == (0, 0, {}, {'svc-a': 1}, 1)
 
+    def test_pending_intents_are_physical_holdings_and_exact_card_debits(
+            self, monkeypatch):
+        monkeypatch.setattr(serve_state, 'get_replica_infos_grouped',
+                            mock.Mock(return_value={}))
+        monkeypatch.setattr(
+            broker.zero_cost_actuation, 'pending_pool_debits',
+            mock.Mock(return_value=(
+                broker.zero_cost_actuation.PendingPoolDebit(
+                    service_name='svc-a',
+                    pool_key=self._POOL,
+                    accelerator='h200',
+                    replica_slots=2),
+                broker.zero_cost_actuation.PendingPoolDebit(
+                    service_name='svc-gone',
+                    pool_key=self._POOL,
+                    accelerator='h200',
+                    replica_slots=1),
+            )))
+
+        result = broker._occupying_debit(['svc-a'],
+                                         self._POOL,
+                                         10.0,
+                                         access_contexts=('phx-context',),
+                                         physical_cluster_uid='phx-cluster',
+                                         claim_generations={'svc-a': 5},
+                                         pool_gpus_per_replica=1,
+                                         observation_admission_sequence=7,
+                                         observation_materialization_sequence=7)
+
+        assert result == (3, 3, {'h200': 3}, {'svc-a': 2}, 1)
+
     def test_materialized_during_observation_drainer_is_still_debited(
             self, monkeypatch):
         drainer = self._explicit_row()

@@ -11329,6 +11329,7 @@ def add_replica_if_round_epoch(
                              'direct mode forbids a lease.')
     elif actuation_lease is not None:
         raise ValueError('An actuation lease requires an expected mode.')
+    durable_intent_handoff = actuation_lease is not None
     engine = _db_manager.get_engine()
     if engine.dialect.name != db_utils.SQLAlchemyDialect.SQLITE.value:
         # A PostgreSQL fill persist is safe only when its caller minted the
@@ -11437,8 +11438,9 @@ def add_replica_if_round_epoch(
                         reserved_fill_rounds_table.c.pool_key ==
                         pool_key).with_for_update(read=True)).fetchone()
             if (row is not None and
-                (int(row.epoch) != expected_epoch or bool(row.fence_pending) or
-                 int(row.protocol_version) != expected_protocol_version)):
+                ((not durable_intent_handoff and
+                  int(row.epoch) != expected_epoch) or bool(row.fence_pending)
+                 or int(row.protocol_version) != expected_protocol_version)):
                 session.rollback()
                 return False
             if expected_protocol_version == RESERVED_FILL_PROTOCOL_V1:
@@ -11454,21 +11456,24 @@ def add_replica_if_round_epoch(
                     session.rollback()
                     return False
             else:
-                if (row is None or expected_service_generation is None or
+                if ((row is None and not durable_intent_handoff) or
+                        expected_service_generation is None or
                         expected_service_generation <= 0 or
                         not expected_physical_cluster_uid):
                     session.rollback()
                     return False
-                try:
-                    round_generations = json.loads(row.claim_generations or
-                                                   '{}')
-                except (TypeError, ValueError):
-                    session.rollback()
-                    return False
-                if (round_generations.get(service_name)
-                        != expected_service_generation):
-                    session.rollback()
-                    return False
+                if not durable_intent_handoff:
+                    assert row is not None
+                    try:
+                        round_generations = json.loads(row.claim_generations or
+                                                       '{}')
+                    except (TypeError, ValueError):
+                        session.rollback()
+                        return False
+                    if (round_generations.get(service_name)
+                            != expected_service_generation):
+                        session.rollback()
+                        return False
                 set_row = session.execute(
                     sqlalchemy.select(reserved_fill_service_claim_sets_table).
                     where(reserved_fill_service_claim_sets_table.c.service_name
@@ -11486,16 +11491,20 @@ def add_replica_if_round_epoch(
                 transaction_accelerator = (
                     None if transaction_location is None else
                     transaction_location.accelerator.casefold())
-                if (set_row is None or set_row.claim_set_state
+                if set_row is None:
+                    session.rollback()
+                    return False
+                current_service_generation = int(set_row.generation)
+                if (set_row.claim_set_state
                         != RESERVED_FILL_CLAIM_SET_AUTHORITATIVE_V2 or
-                        int(set_row.generation) != expected_service_generation
-                        or int(set_row.generation) > int(
+                    (not durable_intent_handoff and
+                     current_service_generation != expected_service_generation)
+                        or current_service_generation > int(
                             protocol.claim_generation) or
                         len(edge_rows) != int(set_row.edge_count) or any(
                             int(edge.service_generation) !=
-                            expected_service_generation
-                            for edge in edge_rows) or matching is None or
-                        matching.physical_cluster_uid
+                            current_service_generation for edge in edge_rows) or
+                        matching is None or matching.physical_cluster_uid
                         != expected_physical_cluster_uid or
                         transaction_replica_info.
                         reserved_fill_service_generation
@@ -11589,21 +11598,7 @@ def add_replica_if_round_epoch(
                                          intent_idempotency_key) is None):
                         session.rollback()
                         return False
-                    allocation_table = (pool_capacity_observation_schema.
-                                        reserved_fill_service_allocation_table)
-                    allocation_row = session.execute(
-                        sqlalchemy.select(allocation_table).where(
-                            allocation_table.c.service_name ==
-                            service_name)).mappings().one_or_none()
-                    if (allocation_row is None or
-                            allocation_row['allocation_generation']
-                            != allocation_generation or
-                            allocation_row['allocation_input_sha256']
-                            != allocation_sha256 or
-                            allocation_row['allocation_claim_generation']
-                            != allocation_claim_generation or
-                            allocation_row['allocation_gate_generation']
-                            != gate_generation or gate_generation
+                    if (gate_generation
                             != sequence_row['reconciliation_gate_generation'] or
                             reclaim_fleet_bundle_sha256
                             != sequence_row['reclaim_fleet_bundle_sha256'] or
@@ -11611,6 +11606,24 @@ def add_replica_if_round_epoch(
                             != sequence_row['reclaim_policy_revision'] or
                             reclaim_provider_inventory_sha256 !=
                             sequence_row['reclaim_provider_inventory_sha256']):
+                        session.rollback()
+                        return False
+                    allocation_table = (pool_capacity_observation_schema.
+                                        reserved_fill_service_allocation_table)
+                    allocation_row = session.execute(
+                        sqlalchemy.select(allocation_table).where(
+                            allocation_table.c.service_name ==
+                            service_name)).mappings().one_or_none()
+                    if (allocation_row is None or
+                        (not durable_intent_handoff and
+                         (allocation_row['allocation_generation']
+                          != allocation_generation or
+                          allocation_row['allocation_input_sha256']
+                          != allocation_sha256 or
+                          allocation_row['allocation_claim_generation']
+                          != allocation_claim_generation)) or
+                            allocation_row['allocation_gate_generation']
+                            != gate_generation):
                         session.rollback()
                         return False
                     allocation_map = allocation_row['allocation_map']
@@ -11633,11 +11646,12 @@ def add_replica_if_round_epoch(
                         sqlalchemy.select(provenance_table).where(
                             provenance_table.c.pool_key ==
                             pool_key)).mappings().one_or_none()
-                    if (provenance is None or
-                            provenance['observation_generation']
-                            != observation_generation or
-                            provenance['observation_sequence']
-                            != observation_sequence):
+                    if (not durable_intent_handoff and
+                        (provenance is None or
+                         provenance['observation_generation']
+                         != observation_generation or
+                         provenance['observation_sequence']
+                         != observation_sequence)):
                         session.rollback()
                         return False
                     observation_table = (pool_capacity_observation_schema.
@@ -11657,13 +11671,14 @@ def add_replica_if_round_epoch(
                             pool_capacity_observation_schema.SUCCESS,
                             observation_table.c.valid_until >= database_epoch,
                         ).with_for_update(read=True)).mappings().one_or_none()
-                    if (exact_observation is None or
-                            exact_observation['payload_sha256']
-                            != provenance['observation_payload_sha256'] or
-                            exact_observation['materialization_sequence'] !=
-                            provenance['observation_materialization_sequence']
-                            or exact_observation['ordinary_admission_sequence']
-                            != expected_ordinary_zero_cost_admission_sequence):
+                    if (not durable_intent_handoff and
+                        (exact_observation is None or provenance is None or
+                         exact_observation['payload_sha256']
+                         != provenance['observation_payload_sha256'] or
+                         exact_observation['materialization_sequence']
+                         != provenance['observation_materialization_sequence']
+                         or exact_observation['ordinary_admission_sequence']
+                         != expected_ordinary_zero_cost_admission_sequence)):
                         session.rollback()
                         return False
 
@@ -11684,23 +11699,25 @@ def add_replica_if_round_epoch(
                         return False
                     assert spec_blob is not None
                     assert logical_replica_semantics is not None
-                    if not _reserved_fill_v2_capacity_ledger_allows(
-                            session,
-                            service_name,
-                            replica_id,
-                            transaction_replica_info,
-                            allocation_map,
-                            pool_key=pool_key,
-                            expected_epoch=expected_epoch,
-                            expected_service_generation=(
-                                expected_service_generation),
-                            expected_physical_cluster_uid=(
-                                expected_physical_cluster_uid),
-                            expected_ordinary_zero_cost_admission_sequence=(
-                                expected_ordinary_zero_cost_admission_sequence),
-                            logical_replica_semantics=(
-                                logical_replica_semantics),
-                            spec_blob=spec_blob):
+                    if (not durable_intent_handoff and
+                            not _reserved_fill_v2_capacity_ledger_allows(
+                                session,
+                                service_name,
+                                replica_id,
+                                transaction_replica_info,
+                                allocation_map,
+                                pool_key=pool_key,
+                                expected_epoch=expected_epoch,
+                                expected_service_generation=(
+                                    expected_service_generation),
+                                expected_physical_cluster_uid=(
+                                    expected_physical_cluster_uid),
+                                expected_ordinary_zero_cost_admission_sequence=
+                                (expected_ordinary_zero_cost_admission_sequence
+                                ),
+                                logical_replica_semantics=(
+                                    logical_replica_semantics),
+                                spec_blob=spec_blob)):
                         session.rollback()
                         return False
                     admission_sequence = current_sequence + 1
