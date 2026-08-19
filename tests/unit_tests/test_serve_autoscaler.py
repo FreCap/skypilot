@@ -1984,16 +1984,17 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     def test_benched_cheapest_card_is_not_replaced_by_costlier_cold_card(self):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
         # L4 is currently benched, but it remains the nominal cheapest cold
         # card. Warm A100 stays compatible; its availability is not permission
         # to cold-launch an A100 for flexible demand.
         placer.active_locations.return_value = [a100_location]
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: 1.0
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: 1.0,
+            a100_location: 2.0,
+        }
         autoscaler.set_spot_placer(placer)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         autoscaler._compatibility_demand_complete = True
@@ -2004,12 +2005,13 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
                          {'L4': 1})
 
     def test_zero_cost_only_card_does_not_precede_paid_fallback(self):
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [a100_location, l4_location]
-        placer.cost_per_hour.side_effect = (
-            lambda location: 0.0 if location is a100_location else 1.0)
+        placer.known_location_costs.return_value = {
+            a100_location: 0.0,
+            l4_location: 1.0,
+        }
 
         flexible = self._autoscaler(max_replicas=1)
         flexible.set_configured_accelerator_shapes({'A100': 1, 'L4': 1})
@@ -2034,12 +2036,13 @@ class TestCompatibilityAwareAutoscaling(unittest.TestCase):
     def test_partial_nominal_prices_preserve_service_order(self):
         autoscaler = self._autoscaler(max_replicas=1)
         autoscaler.set_configured_accelerator_shapes({'L4': 1, 'A100': 1})
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: float('inf')
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: float('inf'),
+            a100_location: 2.0,
+        }
         autoscaler.set_spot_placer(placer)
         autoscaler.compatibility_profiles = self._profiles(50, ['L4', 'A100'])
         autoscaler._compatibility_demand_complete = True

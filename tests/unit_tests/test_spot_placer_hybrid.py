@@ -171,6 +171,30 @@ run: echo hi
         assert placer._min_cost_location([paid, reserved]) == reserved
         resources.copy.assert_not_called()
 
+    def test_bulk_cost_view_is_immutable_and_evaluates_policy_once(self):
+        reserved = make_location('research-ctx',
+                                 accelerators={'A100': 1},
+                                 cloud_name='Kubernetes',
+                                 use_spot=False)
+        paid = make_location('us-east-1',
+                             accelerators={'L4': 1},
+                             cloud_name='AWS',
+                             instance_type='g6.xlarge')
+        placer = make_placer({reserved: 0.0, paid: 0.2})
+
+        with mock.patch.object(
+                placer,
+                '_workspace_eligible_locations',
+                wraps=placer._workspace_eligible_locations) as eligibility:
+            costs = placer.known_location_costs()
+
+        assert dict(costs) == {reserved: 0.0, paid: 0.2}
+        eligibility.assert_called_once_with()
+        with pytest.raises(TypeError):
+            costs[paid] = 9.0
+        placer.location2cost[paid] = 9.0
+        assert costs[paid] == 0.2
+
     def test_explicit_workspace_disallowed_cloud_is_not_enumerated(
             self, monkeypatch):
         # pylint: disable=import-outside-toplevel
@@ -865,6 +889,75 @@ run: echo hi
         per_gpu = _make_per_gpu_placer(costs)
         assert per_gpu.select_next_location() == four_gpu
         assert per_gpu.ranked_active_locations() == [four_gpu, one_gpu]
+
+    def test_ranked_active_locations_matches_selection_and_stabilizes_ties(
+            self, monkeypatch):
+        first_tie = make_location('first-tie',
+                                  accelerators={'L4': 1},
+                                  cloud_name='AWS')
+        cheapest = make_location('cheapest',
+                                 accelerators={'L4': 2},
+                                 cloud_name='AWS')
+        second_tie = make_location('second-tie',
+                                   accelerators={'L4': 4},
+                                   cloud_name='AWS')
+        benched = make_location('benched',
+                                accelerators={'L4': 1},
+                                cloud_name='AWS')
+        workspace_excluded = make_location('workspace-excluded',
+                                           accelerators={'L4': 1},
+                                           cloud_name='AWS')
+        placer = _make_per_gpu_placer({
+            first_tie: 0.2,
+            cheapest: 0.2,
+            second_tie: 0.8,
+            benched: 0.01,
+            workspace_excluded: 0.001,
+        })
+        monkeypatch.setattr(spot_placer.time, 'time', lambda: 1000.0)
+        monkeypatch.setattr(spot_placer, '_preemption_retry_seconds',
+                            lambda: 600.0)
+        placer.set_preemptive(benched)
+        workspace_eligible = {first_tie, cheapest, second_tie, benched}
+
+        with mock.patch.object(placer,
+                               '_workspace_eligible_locations',
+                               return_value=workspace_eligible):
+            remaining = placer.active_locations()
+            repeated_selection_order = []
+            while remaining:
+                selected = placer._min_cost_location(remaining)
+                repeated_selection_order.append(selected)
+                remaining.remove(selected)
+            ranked = placer.ranked_active_locations()
+
+        assert ranked == repeated_selection_order
+        assert ranked == [cheapest, first_tie, second_tie]
+
+    def test_ranked_active_locations_evaluates_each_cost_key_once(self):
+        locations = [
+            make_location(f'region-{index}',
+                          accelerators={'L4': 1},
+                          cloud_name='AWS') for index in range(64)
+        ]
+        placer = make_placer({
+            location: float(len(locations) - index)
+            for index, location in enumerate(locations)
+        })
+
+        with mock.patch.object(
+                placer,
+                '_normalized_location_cost',
+                wraps=placer._normalized_location_cost) as normalized_cost:
+            with mock.patch.object(
+                    placer,
+                    '_min_cost_location',
+                    side_effect=AssertionError(
+                        'ranking must not repeat minimum scans')):
+                ranked = placer.ranked_active_locations()
+
+        assert ranked == list(reversed(locations))
+        assert normalized_cost.call_count == len(locations)
 
     def test_fractional_gpu_shape_uses_exact_configured_count(self):
         half_gpu = make_location('half', accelerators={'L4': 0.5})

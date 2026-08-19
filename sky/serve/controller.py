@@ -3682,10 +3682,10 @@ class SkyServeController:
             paid_costs: dict[str, float] = {}
             unpriced_cards: set[str] = set()
             try:
-                known_locations = placer.known_locations()
+                known_location_costs = placer.known_location_costs()
             except Exception:  # pylint: disable=broad-except
-                known_locations = []
-            for location in known_locations:
+                known_location_costs = {}
+            for location, raw_cost in known_location_costs.items():
                 accelerators = location.accelerators or {}
                 if len(accelerators) != 1:
                     continue
@@ -3694,7 +3694,7 @@ class SkyServeController:
                 if card is None:
                     continue
                 try:
-                    hourly_cost = float(placer.cost_per_hour(location))
+                    hourly_cost = float(raw_cost)
                 except Exception:  # pylint: disable=broad-except
                     unpriced_cards.add(card)
                     continue

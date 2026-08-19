@@ -791,13 +791,14 @@ class TestGetRoutingSpec:
 
     def test_configured_catalog_uses_nominal_cost_order_when_card_benched(self):
         ctrl = _make_controller()
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
         placer.active_locations.return_value = [a100_location]
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: 1.0
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: 1.0,
+            a100_location: 2.0,
+        }
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -817,15 +818,18 @@ class TestGetRoutingSpec:
                 spec)
 
         assert configured == ['L4', 'A100']
+        placer.known_location_costs.assert_called_once_with()
+        placer.cost_per_hour.assert_not_called()
 
     def test_configured_catalog_preserves_order_when_price_is_unknown(self):
         ctrl = _make_controller()
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.side_effect = (lambda location: float('inf')
-                                            if location is l4_location else 2.0)
+        placer.known_location_costs.return_value = {
+            l4_location: float('inf'),
+            a100_location: 2.0,
+        }
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -849,17 +853,16 @@ class TestGetRoutingSpec:
     def test_configured_catalog_preserves_order_when_one_location_is_uncached(
             self):
         ctrl = _make_controller()
-        l4_paid = types.SimpleNamespace(accelerators={'L4': 1})
-        l4_uncached = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_paid = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_paid = mock.Mock(accelerators={'L4': 1})
+        l4_uncached = mock.Mock(accelerators={'L4': 1})
+        a100_paid = mock.Mock(accelerators={'A100': 1})
         costs = {
-            id(l4_paid): 2.0,
-            id(l4_uncached): float('inf'),
-            id(a100_paid): 1.0,
+            l4_paid: 2.0,
+            l4_uncached: float('inf'),
+            a100_paid: 1.0,
         }
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_paid, l4_uncached, a100_paid]
-        placer.cost_per_hour.side_effect = lambda location: costs[id(location)]
+        placer.known_location_costs.return_value = costs
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -879,16 +882,19 @@ class TestGetRoutingSpec:
                 spec)
 
         assert configured == ['L4', 'A100']
-        assert placer.cost_per_hour.call_count == 3
+        placer.known_location_costs.assert_called_once_with()
+        placer.cost_per_hour.assert_not_called()
 
     def test_prebind_accelerator_configuration_never_resolves_provider_cost(
             self):
         ctrl = _make_controller()
-        l4_location = types.SimpleNamespace(accelerators={'L4': 1})
-        a100_location = types.SimpleNamespace(accelerators={'A100': 1})
+        l4_location = mock.Mock(accelerators={'L4': 1})
+        a100_location = mock.Mock(accelerators={'A100': 1})
         placer = mock.Mock()
-        placer.known_locations.return_value = [l4_location, a100_location]
-        placer.cost_per_hour.return_value = float('inf')
+        placer.known_location_costs.return_value = {
+            l4_location: float('inf'),
+            a100_location: float('inf'),
+        }
         ctrl._replica_manager = types.SimpleNamespace(  # pylint: disable=protected-access
             yaml_content='service: {}',
             spot_placer=placer)
@@ -911,7 +917,8 @@ class TestGetRoutingSpec:
             routing_spec = ctrl._build_routing_spec(spec)  # pylint: disable=protected-access
 
         assert routing_spec['configured_accelerators'] == ['L4', 'A100']
-        assert placer.cost_per_hour.call_count == 4
+        assert placer.known_location_costs.call_count == 2
+        placer.cost_per_hour.assert_not_called()
 
     def test_routing_spec_none_when_uninitialized(self):
         ctrl = _make_controller()

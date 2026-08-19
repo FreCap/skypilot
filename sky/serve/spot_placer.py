@@ -8,6 +8,7 @@ import math
 import os
 import re
 import time
+import types
 import typing
 from typing import Any, Optional
 
@@ -1191,20 +1192,16 @@ class SpotPlacer:
         """Return active candidates in the placer's actual cost order.
 
         This is an observation-only counterpart to repeated
-        select_next_location calls over paid candidates. It deliberately
-        delegates every rank to the same _min_cost_location path used for
-        launches, preserving both machine-hour and logical per-GPU pricing.
+        select_next_location calls over paid candidates. A stable sort uses
+        the exact normalized-cost key used by launch selection, preserving
+        catalog insertion order for ties while avoiding repeated minimum
+        scans of a large catalog.
         """
-        remaining = [
+        active_locations = [
             location for location in self.active_locations()
             if allowed_locations is None or location in allowed_locations
         ]
-        ranked = []
-        while remaining:
-            selected = self._min_cost_location(remaining)
-            ranked.append(selected)
-            remaining.remove(selected)
-        return ranked
+        return sorted(active_locations, key=self._normalized_location_cost)
 
     def resolve_location(
             self,
@@ -1443,12 +1440,14 @@ class SpotPlacer:
         slots = sum((location.accelerators or {}).values())
         return float(slots) if slots > 0 else 1.0
 
+    def _normalized_location_cost(self, location: Location) -> float:
+        """Return the canonical placement-order key for one location."""
+        return self.placement_contract.normalize_hourly_cost(
+            self.location2cost.get(location, float('inf')),
+            self._accelerator_slots(location))
+
     def _min_cost_location(self, locations: list[Location]) -> Location:
-        return min(
-            locations,
-            key=lambda location: self.placement_contract.normalize_hourly_cost(
-                self.location2cost.get(location, float('inf')),
-                self._accelerator_slots(location)))
+        return min(locations, key=self._normalized_location_cost)
 
     def _effective_status(self, location: Location) -> LocationStatus:
         """Status with TTL decay: an expired PREEMPTED mark counts ACTIVE.
@@ -1576,8 +1575,18 @@ class SpotPlacer:
             self.location2retry_reserved_at.pop(resolved, None)
             self._retry_state_dirty = True
 
-    def active_locations(self) -> list[Location]:
-        return self._location_with_status(LocationStatus.ACTIVE)
+    def active_locations(
+        self,
+        known_location_costs: Mapping[Location, float] | None = None,
+    ) -> list[Location]:
+        """Return active locations under current or snapshotted eligibility."""
+        if known_location_costs is None:
+            return self._location_with_status(LocationStatus.ACTIVE)
+        return [
+            location for location in self.location2status
+            if location in known_location_costs and
+            self._effective_status(location) == LocationStatus.ACTIVE
+        ]
 
     def known_locations(self) -> list[Location]:
         """Return every configured location, regardless of retry status.
@@ -1592,6 +1601,24 @@ class SpotPlacer:
             location for location in self.location2status
             if location in eligible_locations
         ]
+
+    def known_location_costs(self) -> Mapping[Location, float]:
+        """Return one immutable workspace-eligible catalog cost snapshot.
+
+        Ordering a large catalog location-by-location through cost_per_hour()
+        would re-evaluate the O(N) workspace policy for every entry. This bulk
+        view evaluates that mutable policy exactly once, then snapshots the
+        centralized catalog costs without provider calls. Callers acquire a
+        new view for each placement decision tick so later policy changes
+        still take effect.
+        """
+        eligible_locations = self._workspace_eligible_locations()
+        costs = {
+            location: self.location2cost.get(location, float('inf'))
+            for location in self.location2status
+            if location in eligible_locations
+        }
+        return types.MappingProxyType(costs)
 
     def placement_snapshot(
         self,

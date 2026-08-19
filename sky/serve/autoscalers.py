@@ -1,6 +1,7 @@
 """Autoscalers: perform autoscaling by monitoring metrics."""
 import bisect
 from collections.abc import Iterable
+from collections.abc import Mapping
 from collections.abc import Sequence
 import contextlib
 import copy
@@ -239,6 +240,7 @@ def _order_cold_paid_cards(
     configured_gpu_count: typing.Callable[[str], int],
     location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
                                                                       int]],
+    known_location_costs: Mapping[spot_placer.Location, float] | None = None,
 ) -> list[str]:
     """Order paid-capable cold cards from the centralized catalog."""
     if placer is None:
@@ -247,17 +249,18 @@ def _order_cold_paid_cards(
     paid_costs: dict[str, float] = {}
     zero_cost_cards: set[str] = set()
     unpriced_cards: set[str] = set()
-    try:
-        known_locations = placer.known_locations()
-    except Exception:  # pylint: disable=broad-except
-        return list(configured_cards)
-    for location in known_locations:
+    if known_location_costs is None:
+        try:
+            known_location_costs = placer.known_location_costs()
+        except Exception:  # pylint: disable=broad-except
+            return list(configured_cards)
+    for location, raw_cost in known_location_costs.items():
         raw_card, gpu_count = location_gpu_shape(location)
         card = canonical_by_name.get(raw_card.casefold())
         if card is None or gpu_count != configured_gpu_count(card):
             continue
         try:
-            hourly_cost = float(placer.cost_per_hour(location))
+            hourly_cost = float(raw_cost)
         except Exception:  # pylint: disable=broad-except
             unpriced_cards.add(card)
             continue
@@ -536,6 +539,12 @@ class Autoscaler:
         self.cost_rebalance_stabilization_seconds: float = float(
             spec.cost_rebalance_stabilization_seconds)
         self._cost_rebalance_spot_placer: spot_placer.SpotPlacer | None = None
+        # One immutable bulk catalog view is shared by every ordering and
+        # rebalance pass in a decision tick. None in an active scope means the
+        # snapshot failed and every economic decision must fail closed.
+        self._cold_paid_costs_tick_active = False
+        self._cold_paid_location_costs_for_tick: (Mapping[spot_placer.Location,
+                                                          float] | None) = None
         self._cost_rebalance_candidate_since: dict[tuple[int,
                                                          spot_placer.Location],
                                                    float] = {}
@@ -994,6 +1003,64 @@ class Autoscaler:
     def set_spot_placer(self, placer: spot_placer.SpotPlacer | None) -> None:
         """Publish ReplicaManager's live placement/bench state for this tick."""
         self._cost_rebalance_spot_placer = placer
+
+    @contextlib.contextmanager
+    def _cold_paid_cost_snapshot_for_tick(self) -> typing.Iterator[None]:
+        """Share one workspace-policy/cost view across a decision tick.
+
+        This is planning state only. SpotPlacer launch admission still
+        revalidates the live workspace policy before provisioning.
+        """
+        previous_active = self._cold_paid_costs_tick_active
+        previous_costs = self._cold_paid_location_costs_for_tick
+        self._cold_paid_costs_tick_active = True
+        placer = self._cost_rebalance_spot_placer
+        try:
+            if placer is None:
+                self._cold_paid_location_costs_for_tick = None
+            else:
+                try:
+                    self._cold_paid_location_costs_for_tick = (
+                        placer.known_location_costs())
+                except Exception:  # pylint: disable=broad-except
+                    self._cold_paid_location_costs_for_tick = None
+            yield
+        finally:
+            self._cold_paid_costs_tick_active = previous_active
+            self._cold_paid_location_costs_for_tick = previous_costs
+
+    def _known_location_costs_for_current_tick(
+            self) -> Mapping[spot_placer.Location, float] | None:
+        """Return the tick snapshot, or acquire one for a non-shape scaler."""
+        if self._cold_paid_costs_tick_active:
+            return self._cold_paid_location_costs_for_tick
+        placer = self._cost_rebalance_spot_placer
+        if placer is None:
+            return None
+        try:
+            return placer.known_location_costs()
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def _order_cold_paid_cards_for_tick(
+        self,
+        configured_cards: list[str],
+        configured_gpu_count: typing.Callable[[str], int],
+        location_gpu_shape: typing.Callable[[spot_placer.Location], tuple[str,
+                                                                          int]],
+    ) -> list[str]:
+        """Order cards from the decision tick's immutable bulk cost view."""
+        if self._cold_paid_costs_tick_active:
+            known_costs = self._cold_paid_location_costs_for_tick
+            if known_costs is None:
+                return list(configured_cards)
+            return _order_cold_paid_cards(configured_cards,
+                                          self._cost_rebalance_spot_placer,
+                                          configured_gpu_count,
+                                          location_gpu_shape, known_costs)
+        return _order_cold_paid_cards(configured_cards,
+                                      self._cost_rebalance_spot_placer,
+                                      configured_gpu_count, location_gpu_shape)
 
     def _clear_cost_rebalance_candidates(self) -> None:
         if self._cost_rebalance_candidate_since:
@@ -3118,6 +3185,7 @@ class Autoscaler:
         incumbent: 'replica_managers.ReplicaInfo',
         active_locations: list[spot_placer.Location],
         location_load: dict[spot_placer.Location, int],
+        known_location_costs: Mapping[spot_placer.Location, float],
     ) -> spot_placer.Location | None:
         placer = self._cost_rebalance_spot_placer
         if placer is None:
@@ -3152,10 +3220,7 @@ class Autoscaler:
                 location)
             if candidate_capacity + 1e-9 < incumbent_capacity:
                 continue
-            # This method can run while the concurrency autoscaler holds its
-            # logical-state lock. cost_per_hour() is a pure lookup over the
-            # complete centralized catalog and cannot resolve providers.
-            candidate_cost = placer.cost_per_hour(location)
+            candidate_cost = known_location_costs.get(location, float('inf'))
             if not math.isfinite(candidate_cost) or candidate_cost < 0:
                 continue
             if self.reserved_capacity_fill and candidate_cost == 0:
@@ -3243,7 +3308,12 @@ class Autoscaler:
                                       if not info.is_terminal)
             if location is not None
         ]
-        active_locations = self._cost_rebalance_spot_placer.active_locations()
+        known_location_costs = self._known_location_costs_for_current_tick()
+        if known_location_costs is None:
+            self._clear_cost_rebalance_candidates()
+            return decisions
+        active_locations = self._cost_rebalance_spot_placer.active_locations(
+            known_location_costs)
         # This load is shared by every incumbent evaluated in the tick.  On a
         # large fleet, rebuilding it inside `_best_cost_rebalance_candidate`
         # turns one placement scan into a redundant scan per replica.
@@ -3257,7 +3327,8 @@ class Autoscaler:
         current_candidate_keys: set[tuple[int, spot_placer.Location]] = set()
         for incumbent in candidates:
             location = self._best_cost_rebalance_candidate(
-                incumbent, active_locations, location_load)
+                incumbent, active_locations, location_load,
+                known_location_costs)
             if location is None:
                 continue
             key = (incumbent.replica_id, location)
@@ -4496,12 +4567,13 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
                 if value is not None:
                     assert isinstance(value, dict)
                     self._qps_dict_by_version[version] = value
-            try:
-                return self._generate_scaling_decisions_locked(
-                    replica_infos, active_versions)
-            finally:
-                self._qps_dict_unavailable_versions_for_tick = None
-                self._gpu_shape_handles_for_tick = None
+            with self._cold_paid_cost_snapshot_for_tick():
+                try:
+                    return self._generate_scaling_decisions_locked(
+                        replica_infos, active_versions)
+                finally:
+                    self._qps_dict_unavailable_versions_for_tick = None
+                    self._gpu_shape_handles_for_tick = None
 
     def _generate_scaling_decisions_locked(
         self,
@@ -4720,10 +4792,9 @@ class InstanceAwareRequestRateAutoscaler(_GpuShapeResolverMixin,
 
     def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
         """Order cold cards by nominal paid cost, independent of availability."""
-        return _order_cold_paid_cards(configured_cards,
-                                      self._cost_rebalance_spot_placer,
-                                      self._configured_gpu_count,
-                                      self._location_gpu_shape)
+        return self._order_cold_paid_cards_for_tick(configured_cards,
+                                                    self._configured_gpu_count,
+                                                    self._location_gpu_shape)
 
     def _configured_gpu_count(self, card: str) -> int:
         """Return the service's unique configured GPU count for a card."""
@@ -5698,10 +5769,9 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
 
     def _cold_paid_card_order(self, configured_cards: list[str]) -> list[str]:
         """Order cold cards by nominal paid cost, independent of availability."""
-        return _order_cold_paid_cards(configured_cards,
-                                      self._cost_rebalance_spot_placer,
-                                      self._configured_gpu_count,
-                                      self._location_gpu_shape)
+        return self._order_cold_paid_cards_for_tick(configured_cards,
+                                                    self._configured_gpu_count,
+                                                    self._location_gpu_shape)
 
     def _staleness_threshold_seconds(self) -> float:
         """Age beyond which a demand report no longer counts as fresh.
@@ -8123,12 +8193,13 @@ class ConcurrencyAutoscaler(_GpuShapeResolverMixin, _AutoscalerWithHysteresis):
                 if value is not None:
                     assert isinstance(value, (int, float))
                     self._knob_by_version[version] = float(value)
-            try:
-                return self._generate_scaling_decisions_locked(
-                    replica_infos, active_versions)
-            finally:
-                self._knob_unavailable_versions_for_tick = None
-                self._gpu_shape_handles_for_tick = None
+            with self._cold_paid_cost_snapshot_for_tick():
+                try:
+                    return self._generate_scaling_decisions_locked(
+                        replica_infos, active_versions)
+                finally:
+                    self._knob_unavailable_versions_for_tick = None
+                    self._gpu_shape_handles_for_tick = None
 
     def _generate_scaling_decisions_locked(
         self,
