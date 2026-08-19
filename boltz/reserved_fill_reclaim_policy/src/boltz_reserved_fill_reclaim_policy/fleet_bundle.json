@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "fleet": {
     "contexts": [
       {
@@ -296,12 +296,6 @@
         },
         "kubernetes_context": "phx_research_cluster_eks",
         "kueue_enforcement": {
-          "admission_policy": {
-            "binding_name": "kueue-queue-name-required.boltz.bio",
-            "name": "kueue-queue-name-required.boltz.bio",
-            "namespace_label_key": "boltz.bio/kueue-managed",
-            "namespace_label_value": "true"
-          },
           "controller": {
             "config_map": "kueue-manager-config",
             "deployment": "kueue-controller-manager",

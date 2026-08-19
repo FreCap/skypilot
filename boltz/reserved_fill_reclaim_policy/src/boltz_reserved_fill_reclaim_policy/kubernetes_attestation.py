@@ -20,73 +20,8 @@ botocore_signers = adaptor_common.LazyImport('botocore.signers')
 _KUEUE_GROUP = 'kueue.x-k8s.io'
 _KUEUE_API_VERSIONS = ('v1beta2', 'v1beta1')
 _IRSA_ANNOTATION = 'eks.amazonaws.com/role-arn'
-_KUEUE_MANAGED_LABEL = 'boltz.bio/kueue-managed'
 _EKS_TOKEN_PREFIX = 'k8s-aws-v1.'
 _EKS_TOKEN_TTL_SECONDS = 60
-_KUBERAY_GENERATED_JOB_VARIABLE = (
-    'object.kind == "Job" && '
-    'request.namespace in '
-    '["hyperpod-ns-research","boltz-research"] && '
-    'request.resource.group == "batch" && '
-    'request.resource.version == "v1" && '
-    'request.resource.resource == "jobs" && '
-    'request.userInfo.username == '
-    '"system:serviceaccount:kuberay-system:kuberay-operator" && '
-    'has(object.metadata.labels) && '
-    "'ray.io/originated-from-cr-name' in object.metadata.labels && "
-    "object.metadata.labels['ray.io/originated-from-cr-name'] == "
-    'object.metadata.name && '
-    "'ray.io/originated-from-crd' in object.metadata.labels && "
-    "object.metadata.labels['ray.io/originated-from-crd'] == \"RayJob\" && "
-    "'app.kubernetes.io/created-by' in object.metadata.labels && "
-    "object.metadata.labels['app.kubernetes.io/created-by'] == "
-    '"kuberay-operator" && '
-    'has(object.spec.template.metadata.labels) && '
-    "'kueue.x-k8s.io/queue-name' in "
-    'object.spec.template.metadata.labels && '
-    "object.spec.template.metadata.labels['kueue.x-k8s.io/queue-name'] "
-    "!= '' && "
-    'has(object.metadata.ownerReferences) && '
-    'object.metadata.ownerReferences.size() == 1 && '
-    'object.metadata.ownerReferences.exists(ref, '
-    'ref.kind == "RayJob" && '
-    'ref.apiVersion == "ray.io/v1" && '
-    'ref.name == object.metadata.name && '
-    'has(ref.controller) && ref.controller && '
-    'has(ref.blockOwnerDeletion) && ref.blockOwnerDeletion)')
-_QUEUE_NAME_VARIABLES = {
-    'isKubeRayOperatorGeneratedJob': _KUBERAY_GENERATED_JOB_VARIABLE,
-}
-_QUEUE_NAME_VALIDATION = (
-    'variables.isKubeRayOperatorGeneratedJob || '
-    "(has(object.metadata.labels) && 'kueue.x-k8s.io/queue-name' in "
-    'object.metadata.labels && '
-    "object.metadata.labels['kueue.x-k8s.io/queue-name'] != '')")
-_QUEUE_NAME_VALIDATION_MESSAGE = (
-    "The label 'kueue.x-k8s.io/queue-name' is either missing or does not "
-    'have a value set.')
-
-_ResourceRuleSignature = tuple[tuple[str, ...], tuple[str, ...],
-                               tuple[str, ...], tuple[str, ...], str]
-_QUEUE_NAME_RESOURCE_RULES: frozenset[_ResourceRuleSignature] = frozenset({
-    (('batch',), ('v1',), ('CREATE', 'UPDATE'), ('jobs',), '*'),
-    (('kubeflow.org',), ('v1', 'v1beta1'), ('CREATE', 'UPDATE'),
-     ('jaxjobs', 'mpijobs', 'paddlejobs', 'pytorchjobs', 'tfjobs',
-      'xgboostjobs'), '*'),
-    (('ray.io',), ('v1', 'v1alpha1'), ('CREATE', 'UPDATE'), ('rayclusters',
-                                                             'rayjobs'), '*'),
-    (('jobset.x-k8s.io',), ('v1alpha2',), ('CREATE', 'UPDATE'), ('jobsets',),
-     '*'),
-    (('workload.codeflare.dev',), ('v1alpha1',), ('CREATE', 'UPDATE'),
-     ('appwrappers',), '*'),
-    (('',), ('v1',), ('CREATE', 'UPDATE'), ('pods',), '*'),
-    (('apps',), ('v1',), ('CREATE', 'UPDATE'), ('deployments', 'statefulsets'),
-     '*'),
-    (('leaderworkerset.x-k8s.io',), ('v1alpha1',), ('CREATE', 'UPDATE'),
-     ('leaderworkersets',), '*'),
-    (('sagemaker.amazonaws.com',), ('v1',), ('CREATE', 'UPDATE'),
-     ('hyperpodpytorchjobs',), '*'),
-})
 
 
 class KubernetesAttestationError(RuntimeError):
@@ -551,145 +486,6 @@ def _manager_config(config_map: Mapping[str, Any]) -> Mapping[str, Any]:
     return candidates[0]
 
 
-def _normalized_cel(value: object, path: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise KubernetesAttestationError(
-            f'Kubernetes returned invalid {path} data.')
-    return ' '.join(value.split())
-
-
-def _resource_rule_values(value: object,
-                          path: str,
-                          *,
-                          allow_empty_string: bool = False) -> tuple[str, ...]:
-    items = _list(value, path)
-    if (not items or any(
-            not isinstance(item, str) or (not allow_empty_string and not item)
-            for item in items) or len(set(items)) != len(items)):
-        raise KubernetesAttestationError(
-            'The queue-name admission policy resource rules are not exact.')
-    return tuple(sorted(items))
-
-
-def _resource_rule_signature(value: object,
-                             path: str) -> _ResourceRuleSignature:
-    rule = _dict(value, path)
-    if set(rule) != {
-            'apiGroups', 'apiVersions', 'operations', 'resources', 'scope'
-    }:
-        raise KubernetesAttestationError(
-            'The queue-name admission policy resource rules are not exact.')
-    scope = rule.get('scope')
-    if not isinstance(scope, str) or not scope:
-        raise KubernetesAttestationError(
-            'The queue-name admission policy resource rules are not exact.')
-    return (
-        _resource_rule_values(rule.get('apiGroups'),
-                              f'{path} apiGroups',
-                              allow_empty_string=True),
-        _resource_rule_values(rule.get('apiVersions'), f'{path} apiVersions'),
-        _resource_rule_values(rule.get('operations'), f'{path} operations'),
-        _resource_rule_values(rule.get('resources'), f'{path} resources'),
-        scope,
-    )
-
-
-def _validate_admission_policy(policy: Mapping[str, Any], binding: Mapping[str,
-                                                                           Any],
-                               *, name: str, binding_name: str, label_key: str,
-                               label_value: str) -> None:
-    _metadata(policy, name=name)
-    policy_spec = _dict(policy.get('spec'), f'{name} policy spec')
-    if 'matchConditions' in policy_spec:
-        _list(policy_spec.get('matchConditions'), f'{name} match conditions')
-        raise KubernetesAttestationError(
-            'The queue-name admission policy must define no match conditions.')
-    if set(policy_spec) != {
-            'failurePolicy', 'variables', 'matchConstraints', 'validations'
-    }:
-        raise KubernetesAttestationError(
-            'The queue-name admission policy schema is not exact.')
-    constraints = _dict(policy_spec.get('matchConstraints'),
-                        f'{name} match constraints')
-    if (set(constraints) != {
-            'matchPolicy', 'namespaceSelector', 'objectSelector',
-            'resourceRules'
-    } or constraints.get('matchPolicy') != 'Equivalent' or
-            constraints.get('namespaceSelector') != {} or
-            constraints.get('objectSelector') != {}):
-        raise KubernetesAttestationError(
-            'The queue-name admission policy match scope is not exact.')
-    rules = _list(constraints.get('resourceRules'), f'{name} resource rules')
-    observed_rules = {
-        _resource_rule_signature(rule, f'{name} resource rule {index}')
-        for index, rule in enumerate(rules)
-    }
-    if (len(observed_rules) != len(rules) or
-            observed_rules != _QUEUE_NAME_RESOURCE_RULES):
-        raise KubernetesAttestationError(
-            'The queue-name admission policy resource rules are not exact.')
-
-    variables = _list(policy_spec.get('variables'), f'{name} variables')
-    observed_variables: dict[str, str] = {}
-    for index, raw_variable in enumerate(variables):
-        variable = _dict(raw_variable, f'{name} variable {index}')
-        variable_name = variable.get('name')
-        if (set(variable) != {'name', 'expression'} or
-                not isinstance(variable_name, str) or not variable_name or
-                variable_name in observed_variables):
-            raise KubernetesAttestationError(
-                'The queue-name admission policy variables are not exact.')
-        observed_variables[variable_name] = _normalized_cel(
-            variable.get('expression'), f'{name} {variable_name} expression')
-    reviewed_variables = {
-        variable_name:
-            _normalized_cel(expression, f'{name} reviewed {variable_name}')
-        for variable_name, expression in _QUEUE_NAME_VARIABLES.items()
-    }
-    if observed_variables != reviewed_variables:
-        raise KubernetesAttestationError(
-            'The queue-name admission policy variables are not exact.')
-
-    validations = _list(policy_spec.get('validations'), f'{name} validations')
-    if len(validations) != 1:
-        raise KubernetesAttestationError(
-            'The queue-name admission policy validation is not exact.')
-    validation = _dict(validations[0], f'{name} validation')
-    if (set(validation) != {'expression', 'message'} or _normalized_cel(
-            validation.get('expression'),
-            f'{name} validation expression') != _normalized_cel(
-                _QUEUE_NAME_VALIDATION, f'{name} reviewed validation') or
-            _normalized_cel(validation.get('message'),
-                            f'{name} validation message') != _normalized_cel(
-                                _QUEUE_NAME_VALIDATION_MESSAGE,
-                                f'{name} reviewed validation message') or
-            policy_spec.get('failurePolicy') != 'Fail'):
-        raise KubernetesAttestationError(
-            'The queue-name admission policy validation is not exact and '
-            'fail closed.')
-
-    _metadata(binding, name=binding_name)
-    binding_spec = _dict(binding.get('spec'), f'{binding_name} binding spec')
-    match_resources = _dict(binding_spec.get('matchResources'),
-                            f'{binding_name} match resources')
-    selector = _dict(match_resources.get('namespaceSelector'),
-                     f'{binding_name} namespace selector')
-    if (set(binding_spec)
-            != {'policyName', 'validationActions', 'matchResources'} or
-            set(match_resources)
-            != {'matchPolicy', 'namespaceSelector', 'objectSelector'} or
-            binding_spec.get('policyName') != name or
-            binding_spec.get('validationActions') != ['Deny'] or
-            match_resources.get('matchPolicy') != 'Equivalent' or
-            match_resources.get('objectSelector') != {} or selector != {
-                'matchLabels': {
-                    label_key: label_value
-                }
-            }):
-        raise KubernetesAttestationError(
-            'The queue-name admission-policy binding is not exact and Deny.')
-
-
 def _validate_webhook(value: Mapping[str, Any], *, contract: Mapping[str, Any],
                       service_name: str, service_port: int, namespace: str,
                       mutating: bool) -> None:
@@ -878,16 +674,6 @@ def _validate_kueue_snapshot(fleet_context: Mapping[str, Any],
         raise KubernetesAttestationError(
             'Kueue Pod integration or a required feature gate is disabled.')
 
-    admission_policy = _dict(enforcement['admission_policy'],
-                             'admission policy contract')
-    _validate_admission_policy(
-        _dict(snapshot.get('admission_policy'), 'admission policy'),
-        _dict(snapshot.get('admission_policy_binding'),
-              'admission policy binding'),
-        name=admission_policy['name'],
-        binding_name=admission_policy['binding_name'],
-        label_key=admission_policy['namespace_label_key'],
-        label_value=admission_policy['namespace_label_value'])
     webhooks = _dict(enforcement['webhooks'], 'Kueue webhook contract')
     _validate_webhook(_dict(snapshot.get('validating_webhook'),
                             'validating webhook'),
@@ -919,24 +705,11 @@ def validate_snapshot(fleet_context: Mapping[str, Any],
     if managed != (kueue_enforcement is not None):
         raise KubernetesAttestationError(
             'Kueue admission and enforcement contracts disagree.')
-    labels = _dict(namespace_metadata.get('labels', {}), 'Namespace labels')
     if (namespace_metadata.get('uid') != provider_context['namespace_uid'] or
             _dict(namespace.get('status'),
                   'Namespace status').get('phase') != 'Active'):
         raise KubernetesAttestationError(
             'The inference Namespace identity is invalid.')
-    if managed:
-        enforcement = _dict(kueue_enforcement, 'Kueue enforcement contract')
-        admission_contract = _dict(enforcement['admission_policy'],
-                                   'Kueue admission policy contract')
-        if labels.get(admission_contract['namespace_label_key']) != (
-                admission_contract['namespace_label_value']):
-            raise KubernetesAttestationError(
-                'The inference Namespace managed admission label is invalid.')
-    elif _KUEUE_MANAGED_LABEL in labels:
-        raise KubernetesAttestationError(
-            'The unmanaged inference Namespace carries the managed Kueue '
-            'label.')
 
     service_account = _dict(snapshot.get('service_account'), 'ServiceAccount')
     service_account_metadata = _metadata(
@@ -1121,8 +894,6 @@ def attest_context(fleet_context: Mapping[str,
                                     'Kueue enforcement contract')
                 controller = _dict(enforcement['controller'],
                                    'Kueue controller contract')
-                policy = _dict(enforcement['admission_policy'],
-                               'Kueue admission policy contract')
                 webhooks = _dict(enforcement['webhooks'],
                                  'Kueue webhook contract')
                 admission_api = (kubernetes_adaptor.kubernetes.client.
@@ -1156,16 +927,6 @@ def attest_context(fleet_context: Mapping[str,
                         core.read_namespaced_config_map(
                             controller['config_map'],
                             controller['namespace'],
-                            _request_timeout=kubernetes_adaptor.API_TIMEOUT)),
-                    'admission_policy': _serialized(
-                        client,
-                        admission_api.read_validating_admission_policy(
-                            policy['name'],
-                            _request_timeout=kubernetes_adaptor.API_TIMEOUT)),
-                    'admission_policy_binding': _serialized(
-                        client,
-                        admission_api.read_validating_admission_policy_binding(
-                            policy['binding_name'],
                             _request_timeout=kubernetes_adaptor.API_TIMEOUT)),
                     'validating_webhook': _serialized(
                         client,

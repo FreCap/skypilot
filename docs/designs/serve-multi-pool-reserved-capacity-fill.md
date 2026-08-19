@@ -373,9 +373,9 @@ directly with `--reuse-values`; no `boltz-platform` runtime pin is created or
 updated.
 
 Last updated: 2026-08-19 (production full reserved-backfill policy,
-identity-bound KubeRay child admission contract, release-1.1.1349 authority
-audit, PR #1561 durable logical-retirement contract, and #1562
-controller-takeover capacity-authority/grant fencing)
+policy-bundle schema v5 and strict direct-Pod lifecycle authority,
+release-1.1.1355 authority audit, PR #1561 durable logical-retirement
+contract, and #1562 controller-takeover capacity-authority/grant fencing)
 
 Canonical owner: this file
 
@@ -1470,23 +1470,31 @@ inference context that:
 - SkyPilot's strict plain-Pod path can read the queue objects and fails closed
   unless the admission response attests `managed=true`, the exact queue, and
   the Kueue scheduling gate; and
-- the deployment's fail-closed admission policy prevents an unmanaged direct
-  inference Pod from bypassing that path.
+- the final Pod boundary strips caller-supplied Kueue state, reasserts the
+  server-owned queue and priority, and installs the admission scheduling gate
+  before `CREATE`, so a missing or bypassed Kueue mutation leaves the Pod
+  unschedulable and causes synchronous rejection and cleanup.
 
-PHX's queue-name policy has exactly one exception to the ordinary nonempty
-queue-label validation. It admits only a `batch/v1` Job created in one of the
-two governed namespaces by the authenticated
-`system:serviceaccount:kuberay-system:kuberay-operator` identity. The Job must
-carry KubeRay's exact RayJob provenance labels, one singleton controller and
-block-owner-deletion `ray.io/v1` RayJob owner reference whose name equals the
-Job name, and a nonempty queue label on the verbatim submitter Pod template.
-The policy has no `matchConditions`; the exception is one validation-local
-variable and the complete nine-rule workload scope remains exact. Labels and
-owner references alone are caller-controlled data and never establish this
-exception. HPTO, StatefulSet controllers, generic child controllers, older
-RayJob API versions, other namespaces, and any additional variable or rule
-remain fail closed. Supporting another controller requires a separately
-authenticated design rather than widening this exception.
+PHX's shared queue-name policy and its partition Pod policy remain
+platform-owned defense for legacy and non-SkyPilot clients. They are not
+reserved-fill launch authority. The strict SkyPilot path already proves the
+stronger contract on the exact Pod: it checks the create response inside the
+provider mutation epoch, then fresh-reads the same UID after admission and
+requires the exact queue outputs, managed finalizer, PodSet, scheduler, bound
+Node, and accelerator identity before publishing provisioning success. A
+ValidatingAdmissionPolicy read is an earlier, weaker snapshot and cannot
+strengthen that proof; making it mandatory only lets unrelated policy or RBAC
+drift stop otherwise safe fill.
+
+Policy-bundle schema v5 therefore removes admission-policy and binding names
+from `kueue_enforcement`, performs no ValidatingAdmissionPolicy reads, and
+retains the exact LocalQueue/ClusterQueue, controller/config, Pod webhooks, TAS
+feature gates, priority, flavor, immutable projection, and per-Pod lifecycle
+proofs. Because this changes provider-inventory semantics, v5 advances that
+section's hash domain from `provider/v3` to `provider/v4`; the unchanged fleet
+section remains on `fleet/v4`. `boltz-l4-fleet` creates direct core/v1 Pods and
+has no KubeRay, HPTO, or shared research-policy runtime dependency. Platform
+may evolve those defenses independently without changing fleet authority.
 
 The evidence and enforcement boundary is one
 `ReservedFillReclaimPolicy`. It is a code-owned, typed deployment extension,
@@ -1695,23 +1703,25 @@ The PHX best-effort ClusterQueue has zero nominal GPU quota in the same
 `borrowWithinCohort: Never`, `reclaimWithinCohort: LowerPriority`, and
 `withinClusterQueue: LowerPriority`; the research queue retains
 `reclaimWithinCohort: Any`. East has no Kueue admission pair and must not be
-forced through a nonexistent queue. Bundle schema v4 retains schema v3's one
+forced through a nonexistent queue. Bundle schema v5 retains schema v4's one
 nullable `kueue_admission` object per fleet context and matching nullable
 `kueue_enforcement` object per provider context. Both objects must be null or
-both non-null. Null proves that the namespace does not carry the code-owned
-managed label and selects the exact custom-scheduler reclaim authority; the
-typed projection must also carry `KUBERNETES_SCHEDULER`, null queue identities,
-and the reviewed scheduler name. It does not silently downgrade reclaim to Pod
-priority. The PHX pair binds `be`,
-`skypilot-be`, and `be-ls` together. Schema v4 additionally makes the provider
-custom-scheduler Deployment nullable and adds exact Kueue TAS feature-gate and
-ResourceFlavor topology-name fields. Fleet `scheduler_name` remains a required
-string because it is part of the immutable worker projection; it is
+both non-null. Null selects the exact custom-scheduler reclaim authority and
+performs no Kueue reads; the typed projection must also carry
+`KUBERNETES_SCHEDULER`, null queue identities, and the reviewed scheduler name.
+It does not silently downgrade reclaim to Pod priority. The PHX pair binds
+`be`, `skypilot-be`, and `be-ls` together. Schema v5 also retains schema v4's
+nullable provider custom-scheduler Deployment, exact Kueue TAS feature gates,
+and ResourceFlavor topology-name fields. Fleet `scheduler_name` remains a
+required string because it is part of the immutable worker projection; it is
 `default-scheduler` for PHX and the custom deployment name for east.
 `ResourceFlavor.spec.topologyName` is exact provider inventory, not an
 authority discriminator: a provider-owned flavor may retain that field while
 an inference namespace remains outside Kueue. The nullable admission and
 enforcement pair plus the scheduler contract select the sole placement path.
+Schema v5 removes the redundant ValidatingAdmissionPolicy snapshot from that
+enforcement object; strict Pod preparation and synchronous/fresh lifecycle
+attestation remain the sole per-Pod runtime admission proof.
 The policy proves the exact LocalQueue target and current Active ClusterQueues
 when the pair is non-null, plus cohort, namespace selectors, GPU flavor quotas,
 preemption policies, provider-owned ResourceFlavor instance selectors,
@@ -1724,9 +1734,8 @@ requires projected `default-scheduler`, binds the H200 ResourceFlavor's
 `topologyName: hyperpod`,
 and attests the current Kueue controller, Pod integration,
 `AssignQueueLabelsForPods: true`, `TopologyAwareScheduling: true`, and the
-reviewed TAS replacement/multilayer feature gates, plus the Deny queue-name
-admission-policy binding. It does not infer Pod admission from a webhook
-configuration name:
+reviewed TAS replacement/multilayer feature gates. It does not infer Pod
+admission from a webhook configuration name:
 for both the mutating and validating configurations it requires exactly one
 named Pod webhook with the reviewed core/v1 Pod operations, Kueue service
 name/namespace/path/port, nonempty CA bundle, admission review version,
@@ -1794,9 +1803,9 @@ reviewed product/capacity. Failed CLI preflight returns exit 1 and only
 fail closed with `ReclaimAttestationError`.
 
 Rollout is fix-forward. Apply and attest the IAM, namespace/service-account,
-queue, priority, admission-policy, Kueue configuration, and server projection
-first; remove the east unmanaged inference Pods and its drifted Pod Identity
-association before activation. Then build one immutable two-wheel Boltz image,
+queue, priority, Kueue configuration, and server projection first; remove the
+east unmanaged inference Pods and its drifted Pod Identity association before
+activation. Then build one immutable two-wheel Boltz image,
 deploy it to the complete writer fleet, run the JSON preflight, and invoke the
 normal activation command. A correction ships a successor bundle/image and
 uses the same reauthorization command to advance the generation; it does not
@@ -2580,22 +2589,25 @@ ResourceFlavor selectors are the live beta/stable/HyperPod labels for p4d and
 beta/HyperPod labels for p4de, and both east flavors carry
 `topologyName: hyperpod`; PHX has beta/stable/HyperPod labels for p5e with the
 same topology name.
-The queue-name Deny policy and binding are absent in east and present in PHX.
-Schema v3 therefore performs no Kueue controller, policy, or webhook reads for
-the unmanaged east context and instead proves that the namespace lacks the
-code-owned managed label. PHX must pass the complete code-owned v0.19 Kueue
-contract through deployment preflight before activation. The 2026-08-18 read
+The queue-name and partition Pod policies remain deployed platform defenses in
+PHX but are outside fleet authority. Schema v5 performs no admission-policy
+reads in either context. The unmanaged east context performs no Kueue
+controller or webhook reads; its null admission/enforcement pair selects the
+independently attested custom-scheduler path. PHX must pass the complete
+code-owned v0.19 Kueue controller/webhook contract through deployment preflight
+before activation.
+The 2026-08-18 read
 found two ready Kueue controller replicas, the required Pod integration and TAS
 feature gates, a `hyperpod` topology on `ml.p5e.48xlarge`, and no
 `gpu-binpack-scheduler` Deployment. The absence is intentional: platform PRs
 #8524/#8526/#8527 made Kueue TAS plus the Kubernetes `default-scheduler` the
-single PHX admission and placement path. Schema v4 therefore allows no custom
-scheduler Deployment in a managed TAS context, binds the projected scheduler
-name to `default-scheduler`, binds the ResourceFlavor `topologyName`, and
-attests the required controller feature gates. It retains schema v3's exact
-custom-scheduler Deployment proof for unmanaged east. A managed context with a
-custom scheduler, or an unmanaged context without its configured scheduler,
-fails closed; dual placement paths are not supported.
+single PHX admission and placement path. Schema v5 retains schema v4's
+prohibition on a custom scheduler Deployment in a managed TAS context, binds
+the projected scheduler name to `default-scheduler`, binds the ResourceFlavor
+`topologyName`, and attests the required controller feature gates. It retains
+schema v3's exact custom-scheduler Deployment proof for unmanaged east. A
+managed context with a custom scheduler, or an unmanaged context without its
+configured scheduler, fails closed; dual placement paths are not supported.
 
 The audit role intentionally needs no read of the `Topology` object itself.
 The exact `ResourceFlavor.spec.topologyName` in every context and the exact PHX
@@ -2606,10 +2618,10 @@ levels are verified as a deployment preflight/readback. This keeps the
 existing Terraform module pin and avoids broadening ongoing controller RBAC.
 The current hub writer is forbidden from reading the required Namespace,
 ServiceAccount, queue, priority, flavor, Node, scheduler, controller, and
-admission objects in both spokes. That is intentional. The deployment policy
-must read them through the exact audit role and EKS group instead. These remain
-platform IAM/RBAC and object gates; SkyPilot core does not duplicate their
-ownership or widen the writer role.
+Kueue config/webhook objects in both spokes. That is intentional. The
+deployment policy must read them through the exact audit role and EKS group
+instead. These remain platform IAM/RBAC and object gates; SkyPilot core does
+not duplicate their ownership or widen the writer role.
 
 ### Status actually exposed
 
@@ -2674,7 +2686,7 @@ either case.
 | 2a.1 | Policy-bundle schema v4, PHX Kueue TAS/default-scheduler contract, exact spoke audit roles, and PostgreSQL-backed server-config transaction | Merged and deployed through release 1.1.1332 / platform configuration; server config is corrected, but version 61 retained the pre-correction PHX scheduler projection. |
 | 2a.2 | Isolated audit-role Kubernetes authentication and exact east identity-free inventory | Merged and deployed through revision 429 / release 1.1.1336. East passes. PHX now explicitly enables `AssignQueueLabelsForPods=true`; a clean current platform plan is empty. The successful full two-context preflight remains gated by 2a.4. |
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
-| 2a.4 | Identity-bound KubeRay child admission and exact SkyPilot attestation | Platform PR #8649 is the surgical four-file policy change and still requires human Platform approval, deployment, and the deny/admit probe matrix. The paired SkyPilot attester requires zero policy `matchConditions`, one exact authenticated KubeRay-controller variable including the submitter-template queue label, one exact validation, the complete nine-rule resource scope, and no HPTO or generic-controller exception. Activation remains closed until both halves deploy and a fresh full preflight passes. |
+| 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
 | 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
@@ -2831,8 +2843,9 @@ fix-forward from the verified RWX copy.
 The separately owned Kueue contract is a different deployment change. It may
 proceed through its own reviewed authority only after the east and Phoenix
 inference partitions, exact RBAC, server queue configuration, fail-closed
-admission, and the code-owned policy plugin are implemented and reviewed. It
-is not smuggled into the runtime-image Helm upgrade and does not block
+strict Pod lifecycle admission, and the code-owned policy plugin are
+implemented and reviewed. It is not smuggled into the runtime-image Helm
+upgrade and does not block
 deploying the combined image safely at `LEGACY_ACTIVE`; it does block
 activation.
 
@@ -3173,10 +3186,11 @@ to create zero-cost compute automatically; observing that effect is required.
    and no ordinary paid cloud request was created by the fill path.
 9. Passively inspect the inference LocalQueue, its active ClusterQueue and
    namespace selector, shared BCL/research preemption policy, effective
-   workload priorities, managed inference Workload evidence, and fail-closed
-   admission policy; confirm this rollout did not mutate them. Verify from
-   logs/metrics that the unique policy authorized each new sequenced claim and
-   launch under the same identity, without launching a synthetic workload.
+   workload priorities, managed inference Workload evidence, and platform
+   admission policies; confirm this rollout did not mutate them. Verify from
+   logs/metrics that the unique reclaim policy authorized each new sequenced
+   claim and launch under the same identity, without launching a synthetic
+   workload.
 10. Confirm service version convergence and ordinary request handling remain
     healthy. A missing map should stop only new fill, not fail the service.
 
@@ -3779,12 +3793,12 @@ legacy activation.
   fail-closed preflight without widening the writer role. Revision 428 proves
   both AWS and Kubernetes reads use the exact assumed audit sessions; exact
   east Pod Identity association `a-rsvzwdtaesxvxorkh` is absent.
-- [ ] Obtain the required human Platform approval for surgical PR #8649, merge
-  its exact four-file admission-policy change, deploy it with Helm
-  `--reuse-values`, and pass the deny/admit probe matrix. Then deploy the
-  identity-bound SkyPilot attester and obtain one fresh successful two-context
-  preflight. No Terragrunt, runtime pin, Kueue release, or second scheduler is
-  part of this gate.
+- [x] Close superseded Platform PR #8649 without deploying it; the shared and
+  partition admission policies remain unchanged.
+- [ ] Deploy the schema-v5 SkyPilot attester that removes admission-policy and
+  binding reads and obtain one fresh successful two-context preflight. No
+  Terraform, platform Helm change, runtime pin, Kueue release, or second
+  scheduler is part of this gate.
 - [x] Commit and elect version 62 whose non-null immutable east and PHX worker
   projections exactly match the corrected server configuration. It proves the
   projection generator but is not an activation candidate because its
