@@ -1494,8 +1494,12 @@ def test_generic_binding_atomically_commits_exact_profile_request_queue_and_pin(
                 'paid profiles must fail before replica projection'))
 
 
+@pytest.mark.parametrize('effect_phase', [
+    ordinary_launch_binding.EffectPhase.NOT_STARTED,
+    ordinary_launch_binding.EffectPhase.PROVIDER_IO
+])
 def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
-        bound_request_database, monkeypatch) -> None:
+        bound_request_database, monkeypatch, effect_phase) -> None:
     engine, _ = bound_request_database
     info = _gc_reserved_fill_info()
     with engine.begin() as connection:
@@ -1570,8 +1574,7 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
                 ordinary_launch_binding.ordinary_launch_associations_table).
             where(ordinary_launch_binding.ordinary_launch_associations_table.c.
                   association_id == identity.association_id).values(
-                      effect_phase=ordinary_launch_binding.EffectPhase.
-                      PROVIDER_IO.value,
+                      effect_phase=effect_phase.value,
                       effect_phase_changed_at=sqlalchemy.func.clock_timestamp(),
                       owner_revision=2,
                       updated_at=sqlalchemy.func.clock_timestamp()))
@@ -1607,6 +1610,8 @@ def test_reserved_fill_provider_absence_projects_replica_and_pin_atomically(
     assert request_postgres.record_bound_non_pool_provider_evidence(
         context, authority, ordinary_launch_binding.ProviderEvidence.ABSENT,
         provider_payload)
+    assert request_postgres.bound_non_pool_provider_absence_is_recorded(
+        context, authority)
 
     with pytest.raises(ordinary_launch_binding.OrdinaryLaunchBindingConflict,
                        match='replica projection'):

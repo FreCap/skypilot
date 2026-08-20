@@ -118,6 +118,19 @@ def reconcile(
         raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
             'Provider reconciliation is waiting for exact request '
             'quiescence.')
+    if request_postgres.bound_non_pool_provider_absence_is_recorded(
+            context, authority):
+        # ABSENT is immutable exact evidence. Project it before another
+        # provider read: a later transient UNKNOWN observation must not strand
+        # a row whose absence was already proven after executor quiescence.
+        request_postgres.project_bound_non_pool_provider_absence(
+            context, authority, project_replica_result=project_replica_result)
+        return ProviderObservation(
+            ordinary_launch_binding.ProviderEvidence.ABSENT, {
+                'result':
+                    reserved_capacity.PhysicalReplicaPresence.ABSENT.value,
+                'source': 'durable-provider-evidence',
+            })
     observation = observe_provider(context, replica_info)
     request_postgres.record_bound_non_pool_provider_evidence(
         context, authority, observation.evidence, observation.payload)
