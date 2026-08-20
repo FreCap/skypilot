@@ -588,7 +588,7 @@ class InternalServeControllerApiAuthMiddleware(
         # cluster-name limit and makes every admitted launch fail before
         # provider submission.
         request.state.auth_user = models.User(
-            id='skyserve',
+            id=constants.SKYPILOT_SERVE_CONTROLLER_SYSTEM_USER_ID,
             name='SkyServe controller',
             user_type=models.UserType.SYSTEM.value)
         return await call_next(request)
