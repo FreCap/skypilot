@@ -204,8 +204,8 @@ A receipt inside that bounded entry budget is single-flight refreshed before it
 is returned; there is no generic authority retry and no provider effect on an
 expired or indeterminate proof.
 
-That freshness correction exposed a separate successor-edge race at the same
-terminal boundary. A launch fenced and atomically committed under service
+PR #1622's freshness correction exposed a separate successor-edge race at the
+same terminal boundary. A launch fenced and atomically committed under service
 generation G could reach the provider guard after the broker had published
 G+1. The guard correctly required the current claim set to be an authoritative,
 monotonic successor, but it also required G+1's mutable edge set to contain and
@@ -226,8 +226,9 @@ idempotency field. Both branches continue to require the current service
 incarnation and elected version, an authoritative claim set whose generation
 is bounded by the global protocol sequence, the exact sequenced gate and
 reclaim-policy identity, the immutable version projection, the exact typed
-scope/ticket, and a fresh exact provider-proof reference. This changes no
-timeout, retry, schema, provider, or cost fallback.
+scope/ticket, and a fresh exact provider-proof reference. PR #1623 isolates
+this correction; it is not yet merged or deployed and changes no timeout,
+retry, schema, provider, or cost fallback.
 
 Historical rollout record: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
