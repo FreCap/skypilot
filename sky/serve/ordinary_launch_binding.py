@@ -2275,6 +2275,8 @@ def _reserved_fill_payload(
     connection: sqlalchemy.engine.Connection,
     service: Mapping[str, Any],
     info: Any,
+    *,
+    freeze_reconciliation_gate: bool = False,
 ) -> dict[str, Any]:
     """Resolve one fill intent against its allocation and observation rows."""
     if (service.get('reserved_fill_actuation_mode') ==
@@ -2304,6 +2306,9 @@ def _reserved_fill_payload(
                 'Durable reserved-fill profile lost its committed '
                 'observation evidence.')
         sequence = _zero_cost_sequence_payload(connection, info)
+        if freeze_reconciliation_gate:
+            sequence = _freeze_reserved_fill_sequence_gate(
+                info, sequence, committed_intent=intent)
         return {
             'allocation_input_sha256': intent.allocation_input_sha256,
             'claim_generation': intent.allocation_claim_generation,
@@ -2437,6 +2442,8 @@ def _reserved_fill_payload(
         info,
         require_current_ordinary_high_water=(
             allocation.ordinary_zero_cost_admission_sequence_high_water))
+    if freeze_reconciliation_gate:
+        sequence = _freeze_reserved_fill_sequence_gate(info, sequence)
     return {
         'allocation_input_sha256': allocation.allocation_input_sha256,
         'claim_generation': allocation.allocation_claim_generation,
@@ -2450,6 +2457,40 @@ def _reserved_fill_payload(
             allocation.reclaim_provider_inventory_sha256,
         'sequence': sequence,
         'worker_projection_sha256': info.reserved_fill_worker_projection_sha256,
+    }
+
+
+def _freeze_reserved_fill_sequence_gate(
+    info: Any,
+    sequence: Mapping[str, Any],
+    *,
+    committed_intent: Any | None = None,
+) -> dict[str, Any]:
+    """Project the admission-time gate without weakening live sequencing."""
+    frozen_gate = info.reserved_fill_reconciliation_gate_generation
+    frozen_protocol = sequence.get('protocol_version')
+    if committed_intent is not None:
+        if (getattr(committed_intent, 'reconciliation_gate_generation',
+                    None) != frozen_gate or
+                getattr(committed_intent, 'idempotency_key',
+                        None) != info.reserved_fill_intent_idempotency_key):
+            raise OrdinaryLaunchBindingConflict(
+                'Reserved-fill cleanup intent lost its frozen gate identity.')
+        frozen_protocol = getattr(committed_intent, 'protocol_version', None)
+        frozen_gate = getattr(committed_intent,
+                              'reconciliation_gate_generation', None)
+    current_gate = sequence.get('reconciliation_gate_generation')
+    current_protocol = sequence.get('protocol_version')
+    if (type(frozen_gate) is not int or frozen_gate < 1 or
+            type(frozen_protocol) is not int or frozen_protocol < 1 or
+            type(current_gate) is not int or current_gate < frozen_gate or
+            type(current_protocol) is not int or current_protocol < 1):
+        raise OrdinaryLaunchBindingConflict(
+            'Reserved-fill cleanup lost its monotonic gate history.')
+    return {
+        **sequence,
+        'protocol_version': frozen_protocol,
+        'reconciliation_gate_generation': frozen_gate,
     }
 
 
@@ -3090,6 +3131,39 @@ def _validate_profile_authority_in_connection(
     if actual != expected:
         raise OrdinaryLaunchBindingConflict(
             'Non-pool planner authorization changed before provider effect.')
+
+
+def _validate_reserved_fill_cleanup_profile_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service: Mapping[str, Any],
+    replica: Mapping[str, Any],
+    expected: NonPoolLaunchProfile,
+) -> None:
+    """Match cleanup to the immutable admission authority, not today's plan."""
+    info = _locked_replica_info(replica)
+    kind = classify_non_pool_launch_profile(info)
+    _, paid_claim = _paid_claim_payload(connection, service, replica, info)
+    if (service.get('reserved_fill_actuation_mode')
+            != zero_cost_actuation.ActuationMode.DURABLE_INTENT.value or
+            kind is not NonPoolLaunchProfileKind.RESERVED_FILL or
+            paid_claim is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup lost its durable reserved zero-cost '
+            'profile.')
+    payload = _reserved_fill_payload(connection,
+                                     service,
+                                     info,
+                                     freeze_reconciliation_gate=True)
+    actual = NonPoolLaunchProfile.create(
+        NonPoolLaunchProfileKind.RESERVED_FILL,
+        authorization_reference=(
+            f'reserved-fill:{info.reserved_fill_intent_idempotency_key}'),
+        authorization_generation=info.reserved_fill_allocation_generation,
+        authorization_payload=payload)
+    if actual != expected:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup no longer matches its frozen admission '
+            'authority.')
 
 
 def _validate_profile_execution_context(
@@ -5658,8 +5732,13 @@ def provider_presence_cleanup_authority_in_connection(
         raise OrdinaryLaunchBindingConflict(
             'Provider-present cleanup requires an unmaterialized zero-cost '
             'replica with no service job or paid-capacity identity.')
-    _validate_profile_authority_in_connection(connection, service, replica,
-                                              context.profile)
+    # The provider effect has already happened.  Current allocation and gate
+    # generations may advance while its exact physical object is being
+    # reconciled, so cleanup must revalidate the immutable committed intent
+    # and admission-time profile instead of asking today's planner to
+    # re-authorize yesterday's launch.
+    _validate_reserved_fill_cleanup_profile_in_connection(
+        connection, service, replica, context.profile)
     expected_payload, expected_digest = _reserved_fill_provider_evidence(
         association, info, ProviderEvidence.PRESENT)
     if association['provider_evidence_payload'] != expected_payload:

@@ -2,18 +2,20 @@
 
 Last updated: 2026-08-20
 
-Status: source integration and production qualification are in progress. PRs
-#1607, #1608, and #1609 are merged in release candidate `1.1.1385`: Kueue
-admission waits are passive and deadline-safe, fresh provider-present ambiguous
-launches have one exact generation/UID-fenced adjudication path, and apply
-updates preserve the active lifecycle epoch. The last durable production
-evidence recorded below proves route authority `DURABLE_PROJECTED` at epoch 1
-and reconciliation `SEQUENCED_ACTIVE` at generation 1. It does not prove that
-ordinary binding, demand, or actuation authority is currently promoted; those
-states and the current paid-claim/replica inventory require fresh live
-readback. Platform PR #8652 is merged; after the controller rollout its clean
-`min_replicas: 0`, zero-fill-floor, full-backfill service update will be
-reapplied without a platform runtime pin.
+Status: source integration is complete through PR #1613 and production
+qualification is in progress. PRs #1604 and #1607--#1613 are merged. Production
+Helm revision 465 runs release `1.1.1390` on the exact six-writer image digest
+`sha256:8560dafc8be27460fec4d6b4905cdea7579ce0b82ff006f68f6a97117a848091`;
+two API, two controller, and two executor Pods are Ready with zero restarts.
+Reconciliation is `SEQUENCED_ACTIVE` at generation 6 and the service uses
+`DURABLE_INTENT`. Fresh broker rounds observe 163 free PHX H200s, 18 free East
+A100-80GBs, and two free East A100s. They currently publish new-work feeds of
+160, 12, and two because nine exact provider-present associations still debit
+three H200 and six A100-80GB slots. The service is therefore `FAILED` with
+0/43 routable replicas even though Kueue and both physical pools are healthy.
+This change supplies the narrowly fenced reconciliation needed to settle those
+nine rows; it is not yet merged or deployed. Platform PR #8652 is merged and
+does not pin the SkyPilot runtime.
 
 ## Convergence goal and remaining work
 
@@ -44,51 +46,47 @@ The completed system has these invariants:
 - the active service has `min_replicas: 0`, zero fill floor, immutable
   server-owned worker projections, and no task-owned Kubernetes overrides.
 
-Already implemented and merged are the PostgreSQL-backed generic non-pool
-binding, durable demand/route/actuation authorities, grant-before-row intent
-repository, sequenced pool observations, paid-residual accounting, takeover
-fences, and the provider-proof single-flight receipt. The provider-proof code
-is merged as PR #1604 at
-`5d473147dfbaecead6b1501f923f47abf58adfe5`; its source/CI gate is complete but
-its direct-Helm deployment and cross-Pod production proof are not. The older
-prerequisites through the revision-436 cutoff are deployed dark in production
-revision 436 / `1.1.1359`, but fresh readback is required before relying on
-their present authority state. That deployment statement explicitly excludes
-the later #1562 fix-forward, #1604, and this atomic candidate.
-Platform PR #8652 is merged and supplies the clean service-update workflow;
-it does not pin the SkyPilot runtime.
+Already implemented, merged, and deployed are the PostgreSQL-backed generic
+non-pool binding, atomic replica/association/request/queue/pin/intent admission,
+durable demand/route/actuation authorities, sequenced pool observations,
+paid-residual accounting, takeover fences, and the provider-proof
+single-flight receipt. PR #1610 owns atomic admission, #1611 the durable-owner
+execution boundary, #1612 passive preflight, and #1613 receipt renewal across
+launch waves. Production readback, not source state, establishes the live
+authority facts above.
 
-This atomic feature branch supplies the final pre-provider admission seam. It
-removes protocol-v2 standalone replica persistence and the reserved-fill HTTP
-entrypoint, makes ordinary `/launch` reject protocol-v2 reserved-fill fences,
-admits the complete replica/association/request/pin/intent suffix in one
-PostgreSQL transaction, preserves exact lost-ACK and operator-signal semantics,
-and makes reserved-fill adoption database-only. Feature PR: **TBD until
-opened**. Its required dependent Serve056 cleanup PR will make both durable
-service-owner fields `NOT NULL`, retain the permanent tuple-immutability SQL
-guard, and remove the transition-only application branch after production
-proof. Cleanup PR: **TBD until opened**. Both links must replace these markers
-before the feature PR is mergeable.
+This recovery change is intentionally smaller than another state migration. It
+reconstructs the exact frozen committed-intent profile for cleanup and accepts
+only the enumerated historical HTTP digest representation. Feature PR:
+**TBD until opened**. Its dependent **historical-digest verifier cleanup PR**
+removes only that verifier and its transition-only tests after all nine
+associations settle and one complete stale/quiescence horizon remains at zero.
+Historical-digest cleanup PR: **TBD until opened**. Both links replace these
+markers before the feature PR is merged. This stack is distinct from the
+pre-existing Serve056 owner-column cleanup described below.
 
 Remaining work, in exact order:
 
-1. Freeze this feature commit; pass the pinned atomic PostgreSQL, manager,
-   server, migration, and affected regression suites; complete adversarial
-   review; then open the feature PR.
-2. Author the real dependent Serve056 cleanup branch immediately, verify both
-   NULL preflight rejection and direct SQL non-null tuple A-to-B mutation
-   rejection, open it as a blocked draft, and cross-link both PRs here.
-3. Merge the feature only after review/CI, then direct-Helm deploy a cohort
-   containing #1604 and this feature. Do not update a `boltz-platform` pin.
-4. Read back the exact running images, capability cohort, service owner,
-   ordinary binding, demand, route, actuation, reconciliation, paid claims,
-   replicas, and request metrics. Any mixed or stale authority is a no-go.
-5. Reapply the merged #8652 production-only update to `boltz-l4-fleet`, then
-   perform the documented one-way generic-binding and atomic demand/actuation
-   promotions. Fresh-verify the last-recorded `SEQUENCED_ACTIVE` state and use
-   its generation-fenced reauthorization only if current readback requires it;
-   do not unconditionally repeat activation.
-6. Prove automatic backfill across every compatible free pool and a typed paid
+1. Freeze and open this provider-present recovery PR, then immediately author
+   its blocked dependent historical-digest verifier cleanup PR and cross-link
+   both here.
+2. Merge the recovery fix and direct-Helm deploy its immutable image/chart with
+   `--reuse-values`; do not update a `boltz-platform` pin.
+3. Prove all nine provider-present rows enter UID-fenced teardown, reach fresh
+   provider `ABSENT`, release their pins/debits, and disappear from live
+   replica totals. The broker's debit gap must fall from three H200 and six
+   A100-80GB slots to zero.
+4. Observe the first post-cleanup H200 Workloads and East Pods. Kueue admission
+   must remain immediate; classify any later failure as scheduling, bootstrap,
+   readiness, or application health from exact Pod evidence.
+5. Deploy the protocol-v4 projected-worker readiness boundary before declaring
+   convergence production-proven: provider success requires the same Pod UID
+   to be Ready after SSH/environment/SkyPilot/Ray bootstrap, while old binaries
+   reject v4 before provider I/O.
+6. Reapply the merged #8652 production-only service update, retaining
+   `min_replicas: 0`, full zero-cost backfill, server-owned Kubernetes
+   projection, and no runtime pin.
+7. Prove automatic backfill across every compatible free pool and a typed paid
    residual for every uncovered slot. The production performance gate is
    80--90 H200 workloads submitted within a few minutes with concurrent
    initialization and cross-pool independence. Also prove no new paid launch
@@ -96,9 +94,8 @@ Remaining work, in exact order:
    totals, and no phantom historical capacity immediately, at +10, at +30, and
    through the full 180-second stale/quiescence horizon, including child and
    Pod takeover.
-7. Only after a capable cohort, zero NULL owner tuples, no old writers,
-   verified backups, and the full HA/staleness horizon may Serve056 merge and
-   its transition-only code/tests be removed.
+8. Only after the full horizon may the dependent cleanup merge and remove its
+   transition-only code/tests.
 
 Explicit exclusions: EFS/RWX is neither authority nor a correctness fallback;
 KubeRay is not part of this Serve path; no Terraform or Terragrunt expansion is
@@ -936,15 +933,56 @@ fallback for the other.
 Provider-present cleanup parses the bound context from the locked request and
 requires it to equal the locked association/context, in addition to the exact
 profile, terminal generation, quiescence, queue/pin, provider evidence,
-service-job, replica, and paid-claim checks. For historical authenticated HTTP
-profiles it does not recompute the pre-normalization submission digest from the
-normalized durable request: those representations are intentionally different.
-For atomically admitted `RESERVED_FILL`, the server-local prepared body already
-contains the durable identity and API metadata, so the admission digest must
-equal the executable-body digest and provider-present cleanup rechecks that
-equality under the same locked context. This conditional fence detects any
-post-admission reserved-fill payload mutation without changing the established
-HTTP identity contract.
+service-job, replica, and paid-claim checks. It also independently requires
+`requests.user_id == body.USER_ID == association.tenant_scope` and both the
+request-row and body cluster names to equal the association cluster. The bound
+context omits those fields, so a digest match never replaces the relational
+checks.
+
+There are temporarily two closed digest modes for this cleanup transaction:
+
+- `EXECUTABLE_EXACT` is the permanent atomic mode. The locked durable-body
+  digest equals `input_digest`, and the body owner ID/name and association
+  tenant equal the immutable locked service-owner tuple.
+- `LEGACY_HTTP_NORMALIZED` is a cleanup-only transition for pre-atomic HTTP
+  admissions. On a deep copy, the validator replaces only `USER_ID`,
+  `USER_NAME`, and `client_api_version` with the locked service-owner ID/name
+  and `None`, respectively. The reconstructed digest must equal
+  `input_digest`; the durable request is never rewritten. Every other body,
+  context, tenant, cluster, profile, or authority change fails closed.
+
+The legacy mode grants only entry into exact provider-present fenced teardown;
+it cannot authorize launch, adoption, cancellation, paid capacity, or result
+projection. The 2026-08-20 production census found exactly nine unsettled
+`RESERVED_FILL` associations, all nine matched this reconstruction, and zero
+had an unexplained mismatch. Once they settle and one complete
+stale/quiescence horizon observes zero unsettled legacy rows, the stacked
+cleanup removes this branch and its transition-only tests. No schema mode is
+added for a verifier whose entire population is already enumerated and whose
+steady state is direct-digest-only.
+
+Atomically admitted `RESERVED_FILL` requires the server-local prepared body and
+durable executable body to have the same digest at admission, lost-ack
+hydration, and cleanup. This preserves exact corruption containment without
+making an obsolete normalized representation current again.
+
+Terminal request errors also retain their existing public source type/message
+metadata. A non-builtin, non-SkyPilot source exception is deliberately encoded
+as a client-safe `CloudError`; the reducer accepts that second representation
+only when the decoded wrapper's nonempty provider, source type, single source
+message argument, and rendered message are mutually exact. The production
+census found four of the nine rows in this canonical
+`concurrent.futures.CancelledError` wrapper shape. Type, message, extra-field,
+or wrapper-attribute drift remains malformed and cannot authorize cleanup.
+
+The current planner is similarly pre-effect authority, not teardown authority.
+Allocation, observation, and reconciliation-gate generations may advance after
+an exact launch. Provider-present cleanup reconstructs the admitted profile
+from the immutable committed intent, original observation, and replica's
+admission-time sequence and gate generation. The live sequencer must remain a
+monotonic successor of those frozen values, but today's gate is never
+substituted into yesterday's profile digest. This keeps cleanup exact without
+requiring an obsolete grant to become current again.
 
 ### Atomic reserved-fill replica and request admission
 
@@ -1054,15 +1092,15 @@ ordinary, or caller-crafted requests fall through to ordinary owner RBAC, and
 the final provider guard still revalidates the binding before provider I/O.
 The request body is only a query-scope hint and never authorization authority.
 
-The required stacked removal branch is planned as
+Separately, the pre-existing Serve056 owner-column cleanup branch is planned as
 `fix/serve-atomic-fill-admission-cleanup`, but has not yet been authored or
-opened; a cross-linked draft is a feature-merge gate, not completed work. Its
-only steady-state change is Serve056: after the transition gates below, make
-both owner columns `NOT NULL`, remove the application `NULL`-attestation
-controller branch, and retire its transition-only observability/tests. The
-database must retain the existing owner-immutability trigger or atomically
-replace it with a simpler permanent trigger that rejects every non-null tuple
-mutation.
+opened. It is not the historical-digest verifier cleanup stack introduced
+above. Its only steady-state change is Serve056: after the transition gates
+below, make both owner columns `NOT NULL`, remove the application
+`NULL`-attestation controller branch, and retire its transition-only
+observability/tests. The database must retain the existing owner-immutability
+trigger or atomically replace it with a simpler permanent trigger that rejects
+every non-null tuple mutation.
 It does not revive closed PRs #1506/#1510 or remove generalized non-pool
 machinery used by other profiles.
 

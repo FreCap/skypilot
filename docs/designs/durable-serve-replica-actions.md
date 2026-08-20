@@ -234,6 +234,22 @@ cleanup worker, not a new execution topology or a broader meaning for
    settled association plus removable row; controller restart re-enters the
    same path without inventing a request result.
 
+The digest check has two deliberately closed modes during this recovery. The
+permanent `EXECUTABLE_EXACT` mode requires the locked durable body to hash to
+the association input digest and requires its tenant/name tuple to equal the
+immutable service owner. The cleanup-only `LEGACY_HTTP_NORMALIZED` mode
+reconstructs the pre-normalization submission on a deep copy by restoring only
+the immutable service-owner ID/name and `client_api_version = None`; that copy
+must hash exactly to the association digest. Both modes independently require
+the locked request/body tenant and cluster tuple to equal the association.
+Neither mode mutates durable state. Production census on 2026-08-20 found nine
+unsettled `RESERVED_FILL` associations: all nine matched the exact legacy
+reconstruction and zero were unexplained. The transitional verifier grants
+only entry into this provider-present teardown. It is removed by the stacked
+cleanup after those rows settle and one full stale/quiescence horizon remains
+at zero; launch/adoption/cancellation and all paid authority remain on the
+single current path throughout.
+
 The settled crash boundary is authorized from history, not from the now-cleared
 replica pointer. Before removing that row, restart recovery re-locks the exact
 service/replica record and its sole protocol-v2 association tombstone. It

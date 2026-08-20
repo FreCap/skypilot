@@ -93,6 +93,7 @@ logger = sky_logging.init_logger(__name__)
 ordinary_launch_binding = adaptors_common.LazyImport(
     'sky.serve.ordinary_launch_binding')
 request_postgres = adaptors_common.LazyImport('sky.server.requests.postgres')
+api_requests = adaptors_common.LazyImport('sky.server.requests.requests')
 reserved_fill_admission = adaptors_common.LazyImport(
     'sky.server.requests.reserved_fill_admission')
 requests = adaptors_common.LazyImport('requests')
@@ -722,16 +723,10 @@ def _decoded_bound_request_error(error: Any) -> BaseException | None:
     """Extract the exception from the exact durable request error shape."""
     if isinstance(error, BaseException):
         return error
-    if not isinstance(error, dict):
+    if not api_requests.decoded_error_is_valid(error):
         return None
-    error_object = error.get('object')
-    error_type = error.get('type')
-    error_message = error.get('message')
-    if (set(error) != {'object', 'type', 'message'} or
-            not isinstance(error_object, BaseException) or
-            error_type != type(error_object).__name__ or
-            error_message != str(error_object)):
-        return None
+    error_object = error['object']
+    assert isinstance(error_object, BaseException)
     return error_object
 
 

@@ -239,11 +239,57 @@ def _build_error_dict(error: BaseException) -> dict[str, Any]:
     # TODO(zhwu): pickle.dump does not work well with custom exceptions if
     # it has more than 1 arguments.
     serialized = exceptions.serialize_exception(error)
+    # Preserve the source type/message metadata exposed by existing clients.
+    # ``serialize_exception`` independently replaces an unsafe source object
+    # with CloudError; ``decoded_error_is_valid`` owns validation of that exact
+    # safe-wrapper shape as well as the ordinary direct shape.
     return {
         'object': encoders.pickle_and_encode(serialized),
         'type': type(error).__name__,
         'message': str(error),
     }
+
+
+def decoded_error_is_valid(error: Any) -> bool:
+    """Validate one decoded request error, including safe wrapped sources.
+
+    Request error metadata intentionally describes the source exception for
+    API compatibility.  The serialized object normally has that same type and
+    message, but ``exceptions.serialize_exception`` projects a non-SkyPilot,
+    non-builtin source exception into an exact ``CloudError`` so clients never
+    need provider or standard-library implementation modules to decode it.
+    Accept only those two closed representations.
+    """
+    if not isinstance(error, dict) or set(error) != {
+            'object', 'type', 'message'
+    }:
+        return False
+    error_object = error.get('object')
+    error_type = error.get('type')
+    error_message = error.get('message')
+    if (not isinstance(error_object, BaseException) or
+            not isinstance(error_type, str) or
+            not isinstance(error_message, str)):
+        return False
+    try:
+        rendered_error = str(error_object)
+    except Exception:  # pylint: disable=broad-except
+        return False
+    if (error_type == type(error_object).__name__ and
+            error_message == rendered_error):
+        return True
+    if not isinstance(error_object, exceptions.CloudError):
+        return False
+    cloud_provider = getattr(error_object, 'cloud_provider', None)
+    source_type = getattr(error_object, 'error_type', None)
+    source_args = error_object.args
+    return bool(
+        isinstance(cloud_provider, str) and cloud_provider and
+        isinstance(source_type, str) and source_type and
+        error_type == source_type and len(source_args) == 1 and
+        isinstance(source_args[0], str) and error_message == source_args[0] and
+        rendered_error
+        == f'{cloud_provider} error ({source_type}): {error_message}')
 
 
 def sanitize_request_error(

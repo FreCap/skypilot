@@ -1,5 +1,6 @@
 """Unit tests for sky.server.requests.requests module."""
 import asyncio
+import concurrent.futures
 import logging
 import pathlib
 import time
@@ -11,6 +12,7 @@ import filelock
 import pytest
 
 from sky import core
+from sky import exceptions
 from sky.server import constants as server_constants
 from sky.server.requests import payloads
 from sky.server.requests import requests
@@ -22,6 +24,34 @@ from sky.server.requests.serializers import encoders
 
 def dummy():
     return None
+
+
+def test_unsafe_error_has_exact_safe_wrapper_metadata_shape() -> None:
+    """Source metadata and the client-safe CloudError stay coherent."""
+    request = requests.Request(request_id='wrapped-error',
+                               name='test-request',
+                               entrypoint=dummy,
+                               request_body=payloads.RequestBody(),
+                               status=RequestStatus.FAILED,
+                               created_at=0.0,
+                               user_id='test-user')
+    request.set_error(concurrent.futures.CancelledError())
+
+    assert request.error is not None
+    assert request.error['type'] == 'CancelledError'
+    assert request.error['message'] == ''
+    decoded = request.get_error()
+    assert decoded is not None
+    assert type(decoded['object']) is exceptions.CloudError
+    assert decoded['object'].cloud_provider == 'concurrent'
+    assert decoded['object'].error_type == 'CancelledError'
+    assert requests.decoded_error_is_valid(decoded)
+
+    for field, value in (('type', 'OtherError'), ('message', 'tampered')):
+        tampered = dict(decoded)
+        tampered[field] = value
+        assert not requests.decoded_error_is_valid(tampered)
+    assert not requests.decoded_error_is_valid({**decoded, 'extra': True})
 
 
 def _managed_request(

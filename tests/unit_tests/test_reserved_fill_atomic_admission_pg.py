@@ -34,6 +34,7 @@ from sky.serve import ordinary_launch_binding
 from sky.serve import pool_capacity_observation
 from sky.serve import reserved_capacity_broker
 from sky.serve import reserved_fill_planner
+from sky.serve import reserved_fill_reclaim_attestation
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import zero_cost_actuation
@@ -906,6 +907,79 @@ def test_outer_commit_publishes_sequences_and_hydrates_exact_request(
         receipt.request_id, 'different-owner', _WORKSPACE)
     assert not ordinary_launch_binding.reserved_fill_binding_authorizes_workspace(
         receipt.request_id, _CREATOR_ID, 'different-workspace')
+
+
+def test_provider_cleanup_uses_committed_intent_gate_after_gate_advances(
+        atomic_database) -> None:
+    """Post-effect teardown validates frozen admission, not today's plan."""
+    spec = _atomic_spec(atomic_database)
+    _, receipt = reserved_fill_admission._transaction(spec,
+                                                      7,
+                                                      require_existing=False)
+    repository = pool_capacity_observation.PoolCapacityObservationRepository(
+        atomic_database)
+    before = repository.read_reconciliation_gate()
+    assert before.reclaim_policy_identity is not None
+    rotated_identity = dataclasses.replace(
+        before.reclaim_policy_identity,
+        policy_revision=before.reclaim_policy_identity.policy_revision +
+        '-rotated')
+    evidence = reserved_fill_reclaim_attestation.ReclaimEnforcementEvidence(
+        contract=(reserved_fill_reclaim_attestation.ReclaimEnforcementContract.
+                  GLOBAL_FLEET_CLAIM_ADMISSION_AND_LAUNCH_FENCES_V2),
+        fleet_bundle_sha256=rotated_identity.fleet_bundle_sha256,
+        policy_revision=rotated_identity.policy_revision,
+        provider_inventory_sha256=(rotated_identity.provider_inventory_sha256),
+        claimed_contexts=repository.read_activation_claim_scope(),
+        completed_monotonic=time.monotonic())
+    rotated_receipt = reserved_fill_reclaim_attestation.activation_receipt(
+        evidence,
+        writer_image_digest='sha256:' + 'f' * 64,
+        writer_deployment_generation='rotated',
+        writer_deployment_uid='rotated-deployment-uid',
+        writer_pod_inventory_count=1,
+        writer_pod_inventory_sha256='9' * 64)
+    rotated = repository.authorize_sequenced_reconciliation(
+        expected_generation=before.generation, receipt=rotated_receipt)
+    assert rotated.changed
+    assert rotated.gate.generation == before.generation + 1
+
+    with atomic_database.begin() as connection:
+        request_row = connection.execute(
+            sqlalchemy.select(request_postgres.REQUESTS).where(
+                request_postgres.REQUESTS.c.request_id ==
+                receipt.request_id)).mappings().one()
+        request = request_postgres.request_from_mapping(request_row)
+        context = ordinary_launch_binding.parse_bound_non_pool_launch_context(
+            request.request_body.extra_launch_context)
+        service = connection.execute(
+            sqlalchemy.select(serve_state_schema.services_table).where(
+                serve_state_schema.services_table.c.name ==
+                _SERVICE)).mappings().one()
+        replica = connection.execute(
+            sqlalchemy.select(serve_state_schema.replicas_table).where(
+                serve_state_schema.replicas_table.c.service_name == _SERVICE,
+                serve_state_schema.replicas_table.c.replica_id ==
+                receipt.replica_id)).mappings().one()
+        ordinary_launch_binding._validate_reserved_fill_cleanup_profile_in_connection(
+            connection, service, replica, context.profile)
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='planner authorization changed'):
+            ordinary_launch_binding._validate_profile_authority_in_connection(
+                connection, service, replica, context.profile)
+        connection.execute(
+            sqlalchemy.delete(zero_cost_actuation_schema.
+                              serve_zero_cost_actuation_intents_table).
+            where(
+                zero_cost_actuation_schema.
+                serve_zero_cost_actuation_intents_table.c.intent_idempotency_key
+                == spec.replica_info.reserved_fill_intent_idempotency_key))
+        with pytest.raises(
+                ordinary_launch_binding.OrdinaryLaunchBindingConflict,
+                match='lost its exact committed intent'):
+            ordinary_launch_binding._validate_reserved_fill_cleanup_profile_in_connection(
+                connection, service, replica, context.profile)
 
 
 def test_workspace_authority_requires_durable_intent(atomic_database) -> None:
