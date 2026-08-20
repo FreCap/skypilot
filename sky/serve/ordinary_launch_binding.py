@@ -38,6 +38,7 @@ from sky.serve import route_projection
 from sky.serve import serve_state
 from sky.serve import serve_state_schema
 from sky.serve import serve_statuses
+from sky.utils import common_utils
 from sky.utils import locks
 from sky.utils.db import db_utils
 from sky.utils.db import migration_utils
@@ -5456,30 +5457,251 @@ def provider_absence_projection_authority_in_connection(
             observed_at < terminal_evidence.quiesced_at):
         raise OrdinaryLaunchBindingConflict(
             'Provider absence predates exact executor quiescence.')
-    payload = association['provider_evidence_payload']
     info = _locked_replica_info(replica)
-    expected_payload = {
-        'association_id': str(context.association_id),
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.ABSENT)
+    if association['provider_evidence_payload'] != expected_payload:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence does not name the exact physical replica.')
+    if association['provider_evidence_digest'] != expected_digest:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider absence evidence digest is not canonical.')
+    return dict(association), info
+
+
+def _reserved_fill_provider_evidence(
+    association: Mapping[str, Any],
+    info: Any,
+    evidence: ProviderEvidence,
+) -> tuple[dict[str, Any], str]:
+    """Build the single canonical physical-replica observation envelope."""
+    payload = {
+        'association_id': str(association['association_id']),
         'cluster_name': info.cluster_name,
         'kubernetes_context': info.reserved_fill_kubernetes_context,
         'physical_cluster_uid': info.reserved_fill_physical_cluster_uid,
         'probe_contract': 'kubernetes-physical-replica-presence-v1',
         'profile_kind': NonPoolLaunchProfileKind.RESERVED_FILL.value,
-        'replica_record_id': str(context.replica_record_id),
-        'result': 'ABSENT',
+        'replica_record_id': str(association['replica_record_id']),
+        'result': evidence.value,
     }
-    if payload != expected_payload:
-        raise OrdinaryLaunchBindingConflict(
-            'Provider absence does not name the exact physical replica.')
-    expected_digest = _canonical_sha256({
-        'association_id': str(context.association_id),
-        'evidence': ProviderEvidence.ABSENT.value,
-        'payload': expected_payload,
-        'profile_digest': context.profile.digest,
+    digest = _canonical_sha256({
+        'association_id': str(association['association_id']),
+        'evidence': evidence.value,
+        'payload': payload,
+        'profile_digest': association['profile_digest'],
     })
+    return payload, digest
+
+
+def replica_has_provider_present_cleanup_marker(
+    replica_info: Any,
+    *,
+    require_scheduled: bool = False,
+) -> bool:
+    """Whether one ReplicaInfo is the closed immediate-cleanup marker."""
+    status = getattr(replica_info, 'status_property', None)
+    if status is None:
+        return False
+    allowed_down_statuses = ({common_utils.ProcessStatus.SCHEDULED}
+                             if require_scheduled else {
+                                 common_utils.ProcessStatus.SCHEDULED,
+                                 common_utils.ProcessStatus.RUNNING,
+                                 common_utils.ProcessStatus.FAILED,
+                             })
+    return bool(
+        getattr(replica_info, 'reserved_fill', None) is True and
+        getattr(replica_info, 'is_zero_cost', None) is True and
+        getattr(replica_info, 'service_job_id', None) is None and
+        getattr(replica_info, 'paid_capacity_pool_key', None) is None and
+        getattr(replica_info, 'zero_cost_materialization_sequence',
+                None) is None and
+        status.sky_launch_status == common_utils.ProcessStatus.INTERRUPTED and
+        status.sky_down_status in allowed_down_statuses and
+        status.service_ready_now is False and status.is_scale_down is True and
+        status.preempted is False and status.purged is False and
+        status.failed_spot_availability is False and
+        status.wait_for_idle_before_termination is False and
+        status.drain_cap_seconds == 0 and status.drain_started_at is None and
+        status.logical_retirement_version is None and
+        status.logical_retirement_controller_epoch is None and
+        status.logical_retirement_generation is None and
+        status.logical_retirement_target_capacity is None and
+        status.logical_retirement_confirmed_generation is None and
+        status.logical_retirement_bounded_deadline is False and
+        status.logical_retirement_committed is False)
+
+
+def provider_presence_cleanup_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    context: BoundNonPoolLaunchContext,
+    terminal_evidence: TerminalEvidence,
+) -> tuple[dict[str, Any], Any]:
+    """Validate exact PRESENT evidence before reserved-fill teardown.
+
+    PRESENT is not settlement evidence: the association, retention pin, and
+    replica pointer remain intact while the existing fenced down worker owns
+    cleanup.  This validator therefore grants only the request layer's atomic
+    transition into that durable cleanup shape.
+    """
+    if not isinstance(context, BoundNonPoolLaunchContext):
+        raise TypeError('context must be a BoundNonPoolLaunchContext.')
+    values = _terminal_values(terminal_evidence)
+    lifecycle, service, replica, association = _lock_effect_rows(
+        connection, context, require_paid_claim=False)
+    _validate_effect_rows(lifecycle,
+                          service,
+                          replica,
+                          association,
+                          context,
+                          allowed_resolutions=frozenset({Resolution.AMBIGUOUS}))
+    if (context.profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.POST_EFFECT_AMBIGUOUS.value or
+            association['provider_evidence'] != ProviderEvidence.PRESENT.value
+            or association['effect_phase']
+            not in (EffectPhase.PROVIDER_IO.value,
+                    EffectPhase.SERVICE_JOB_IO.value) or
+            association['service_job_id'] is not None or
+            association['paid_capacity_pool_key'] is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence cannot authorize cleanup for this launch '
+            'profile or phase.')
+    existing_terminal = association['terminal_status']
+    if existing_terminal is None or any(
+            association[key] != value for key, value in values.items()):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence lacks the exact copied terminal evidence.')
+
+    observed_at = association['provider_evidence_observed_at']
+    if (observed_at is None or terminal_evidence.quiesced_at is None or
+            observed_at < terminal_evidence.quiesced_at):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence predates exact executor quiescence.')
+    info = _locked_replica_info(replica)
+    if (info.service_job_id is not None or
+            info.paid_capacity_pool_key is not None or
+            info.is_zero_cost is not True or
+            info.zero_cost_materialization_sequence is not None):
+        raise OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup requires an unmaterialized zero-cost '
+            'replica with no service job or paid-capacity identity.')
+    _validate_profile_authority_in_connection(connection, service, replica,
+                                              context.profile)
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.PRESENT)
+    if association['provider_evidence_payload'] != expected_payload:
+        raise OrdinaryLaunchBindingConflict(
+            'Provider presence does not name the exact physical replica.')
     if association['provider_evidence_digest'] != expected_digest:
         raise OrdinaryLaunchBindingConflict(
-            'Provider absence evidence digest is not canonical.')
+            'Provider presence evidence digest is not canonical.')
+    return dict(association), info
+
+
+def projected_provider_absence_cleanup_authority_in_connection(
+    connection: sqlalchemy.engine.Connection,
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> tuple[dict[str, Any], Any]:
+    """Validate restart-safe removal after exact ABSENT already committed.
+
+    The association is settled and its replica pointer is deliberately gone,
+    so the live reduction validator cannot address it.  This history readback
+    accepts only the one protocol-v2 reserved-fill tombstone whose canonical
+    provider ABSENT proof postdates executor quiescence.  It grants replica-row
+    removal only; no provider operation can be authorized from this state.
+    """
+    _require_postgres(connection)
+    service_name = _nonempty(service_name, 'service_name')
+    replica_id = _positive_int(replica_id, 'replica_id')
+    record_uuid = _canonical_uuid(replica_record_id, 'replica_record_id')
+    lifecycle = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.service_lifecycle_fences_table).where(
+                serve_state_schema.service_lifecycle_fences_table.c.name ==
+                service_name).with_for_update()).mappings().one_or_none()
+    service = connection.execute(
+        sqlalchemy.select(serve_state_schema.services_table).where(
+            serve_state_schema.services_table.c.name ==
+            service_name).with_for_update()).mappings().one_or_none()
+    replica = connection.execute(
+        sqlalchemy.select(serve_state_schema.replicas_table).where(
+            serve_state_schema.replicas_table.c.service_name == service_name,
+            serve_state_schema.replicas_table.c.replica_id ==
+            replica_id).with_for_update()).mappings().one_or_none()
+    claim_rows = connection.execute(
+        sqlalchemy.select(
+            serve_state_schema.paid_capacity_claims_table.c.pool_key).where(
+                serve_state_schema.paid_capacity_claims_table.c.service_name ==
+                service_name,
+                serve_state_schema.paid_capacity_claims_table.c.replica_id ==
+                replica_id).with_for_update()).all()
+    associations = list(
+        connection.execute(
+            sqlalchemy.select(ordinary_launch_associations_table).where(
+                ordinary_launch_associations_table.c.service_name ==
+                service_name,
+                ordinary_launch_associations_table.c.replica_id == replica_id,
+                ordinary_launch_associations_table.c.replica_record_id ==
+                record_uuid,
+                ordinary_launch_associations_table.c.binding_protocol_version ==
+                NON_POOL_BINDING_PROTOCOL_VERSION).order_by(
+                    ordinary_launch_associations_table.c.launch_generation).
+            with_for_update()).mappings())
+    if (lifecycle is None or service is None or replica is None or
+            len(associations) != 1 or claim_rows):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence lost its exact service, replica, '
+            'association, or zero-paid shape.')
+    association = associations[0]
+    profile = _association_profile(association)
+    current_epoch = service['lifecycle_epoch']
+    origin_epoch = association['service_lifecycle_epoch']
+    if (type(current_epoch) is not int or type(origin_epoch) is not int or
+            lifecycle['epoch'] != current_epoch or
+            origin_epoch != current_epoch or
+            service['hash'] != association['service_hash'] or
+            service['workspace'] != association['service_workspace'] or
+            replica['ordinary_launch_association_id'] is not None or
+            association['resolution'] != Resolution.PROJECTED.value or
+            association['reconciliation_outcome']
+            != ReconciliationOutcome.PROJECTED.value or
+            association['provider_evidence'] != ProviderEvidence.ABSENT.value or
+            association['effect_phase'] not in (
+                EffectPhase.NOT_STARTED.value, EffectPhase.PROVIDER_IO.value,
+                EffectPhase.SERVICE_JOB_IO.value) or
+            association['service_job_id'] is not None or
+            association['paid_capacity_pool_key'] is not None or
+            association['terminal_status'] is None or
+            type(association['terminal_execution_generation']) is not int or
+            association['terminal_execution_generation'] < 1 or
+            association['execution_quiescence_required'] is not True or
+            association['execution_quiesced_generation']
+            != association['terminal_execution_generation'] or
+            association['execution_quiesced_at'] is None or
+            association['provider_evidence_observed_at'] is None or
+            association['provider_evidence_observed_at']
+            < association['execution_quiesced_at'] or
+            association['projected_at'] is None or
+            association['pin_released_at'] is None or
+            association['tombstone_not_before'] is None or profile is None or
+            profile.kind != NonPoolLaunchProfileKind.RESERVED_FILL or
+            not _replica_snapshot_matches_association(
+                replica, association, require_launch_authorized=False)):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence history is not exact and complete.')
+    info = _locked_replica_info(replica)
+    if not replica_has_provider_present_cleanup_marker(info):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence lost its durable cleanup marker.')
+    expected_payload, expected_digest = _reserved_fill_provider_evidence(
+        association, info, ProviderEvidence.ABSENT)
+    if (association['provider_evidence_payload'] != expected_payload or
+            association['provider_evidence_digest'] != expected_digest):
+        raise OrdinaryLaunchBindingConflict(
+            'Projected provider absence evidence is not canonical.')
     return dict(association), info
 
 

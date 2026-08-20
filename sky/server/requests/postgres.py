@@ -3803,6 +3803,140 @@ def record_bound_non_pool_provider_evidence(
             _request_terminal_evidence)
 
 
+def _lock_bound_non_pool_provider_present_cleanup(
+    connection: sqlalchemy.engine.Connection,
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> tuple[Mapping[str, Any], BoundOrdinaryLaunchRequestFacts,
+           replica_managers.ReplicaInfo]:
+    """Lock and validate the complete provider-present cleanup authority."""
+    # The ReplicaInfo projector touches zero-cost sequencing.  Preserve its
+    # global lock order before locking lifecycle/service/replica/association.
+    serve_state.lock_zero_cost_protocol_for_bound_launch_projection(connection)
+    association = ordinary_launch_binding.lock_reduction_authority_in_connection(
+        connection, context)
+    if not _controller_authority_matches_reduction(association, authority):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup writer no longer owns this '
+            'association.')
+    facts, request_row, queue_row, _ = _lock_bound_request_evidence(
+        connection, context)
+    if (request_row is None or not facts.exists or
+            facts.status not in requests_lib.RequestStatus.finished_status() or
+            facts.terminal_cause is None or
+            facts.execution_generation is None or
+            facts.execution_generation < 1 or
+            facts.execution_quiescence_required is not True or
+            facts.execution_quiesced_generation != facts.execution_generation or
+            facts.execution_quiesced_at is None or not facts.quiescent or
+            queue_row is not None or not facts.retention_pin_active or
+            facts.error_decode_failed or facts.return_value is not None):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup requires one exact terminal request '
+            'generation, quiescence receipt, and active retention pin.')
+    try:
+        request = _request_from_mapping(
+            typing.cast(sqlalchemy.engine.RowMapping, request_row))
+        parsed_context = (
+            ordinary_launch_binding.parse_bound_non_pool_launch_context(
+                request.request_body.extra_launch_context))
+        request_input_digest = ordinary_launch_binding.canonical_launch_digest(
+            request.request_body)
+        request_service_job_id = _request_service_job_id(
+            request_row, str(association['cluster_name']))
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        raise
+    except Exception as error:  # pylint: disable=broad-except
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup could not decode the exact bound '
+            'request payload.') from error
+    if (parsed_context != context or
+            request_input_digest != context.input_digest or
+            request_service_job_id is not None or
+            association['service_job_id'] is not None):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup request identity, profile, digest, or '
+            'service-job result is inconsistent.')
+    terminal_evidence = _terminal_evidence(facts)
+    checked_association, locked_replica_info = (
+        ordinary_launch_binding.
+        provider_presence_cleanup_authority_in_connection(
+            connection, context, terminal_evidence))
+    if not _paid_capacity_claim_is_exact(connection, checked_association):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Provider-present cleanup found unexpected paid capacity.')
+    return checked_association, facts, locked_replica_info
+
+
+def authorize_bound_non_pool_provider_present_cleanup(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+    *,
+    project_replica_result: BoundOrdinaryLaunchReplicaProjector,
+) -> bool:
+    """Atomically enter fenced teardown for one exact PRESENT allocation."""
+    if not callable(project_replica_result):
+        raise TypeError('project_replica_result must be callable.')
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        raise ordinary_launch_binding.OrdinaryLaunchBindingUnavailable(
+            'Generic provider reconciliation requires PostgreSQL.')
+    with engine.begin() as connection:
+        association, facts, locked_replica_info = (
+            _lock_bound_non_pool_provider_present_cleanup(
+                connection, context, authority))
+        if ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                locked_replica_info):
+            return True
+        projection = BoundOrdinaryLaunchProjectionInput(
+            context=context,
+            request=facts,
+            locked_replica_info=locked_replica_info,
+            status=typing.cast(requests_lib.RequestStatus, facts.status),
+            cause=typing.cast(event_api_models.EventCause,
+                              facts.terminal_cause),
+            service_job_id=None,
+            pre_effect_terminal=False,
+            cancel_reason=association.get('cancel_reason'),
+            paid_capacity_pool_key=None,
+            provider_evidence=ordinary_launch_binding.ProviderEvidence.PRESENT)
+        if project_replica_result(connection, projection) is not True:
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup persistence lost its exact row.')
+        persisted = (
+            serve_state.read_replica_for_bound_ordinary_launch_in_transaction(
+                connection, context.service_name, context.replica_id,
+                str(context.replica_record_id), context.association_id))
+        if not ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                persisted, require_scheduled=True):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup projector did not persist the '
+                'closed immediate-cleanup marker.')
+        if not _paid_capacity_claim_is_exact(connection, association):
+            raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+                'Provider-present cleanup changed paid-capacity identity.')
+    return True
+
+
+def bound_non_pool_provider_present_cleanup_is_authorized(
+    context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
+    authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
+) -> bool:
+    """Revalidate a durable PRESENT cleanup marker without provider I/O."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    try:
+        with engine.begin() as connection:
+            _, _, locked_replica_info = (
+                _lock_bound_non_pool_provider_present_cleanup(
+                    connection, context, authority))
+            return ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+                locked_replica_info)
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        return False
+
+
 def project_bound_non_pool_provider_absence(
     context: ordinary_launch_binding_lib.BoundNonPoolLaunchContext,
     authority: ordinary_launch_binding_lib.ControllerBindingAuthority,
@@ -3874,6 +4008,49 @@ def project_bound_non_pool_provider_absence(
             raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
                 'Provider absence could not close paid-capacity authority.')
     return True
+
+
+def bound_non_pool_projected_provider_absence_is_authorized(
+    service_name: str,
+    replica_id: int,
+    replica_record_id: str,
+) -> bool:
+    """Authorize only replica-row removal after committed exact ABSENT."""
+    engine = initialize_and_get_db()
+    if engine.dialect.name != db_utils.SQLAlchemyDialect.POSTGRESQL.value:
+        return False
+    try:
+        with engine.begin() as connection:
+            association, _ = (
+                ordinary_launch_binding.
+                projected_provider_absence_cleanup_authority_in_connection(
+                    connection, service_name, replica_id, replica_record_id))
+            context = _bound_context_from_association(association)
+            facts, _, queue_row, pin_row = _lock_bound_request_evidence(
+                connection, context)
+            if (queue_row is not None or pin_row is not None or
+                    facts.retention_pin_active or
+                    not _paid_capacity_claim_is_exact(connection, association)):
+                return False
+            if facts.exists:
+                if (facts.status
+                        not in requests_lib.RequestStatus.finished_status() or
+                        facts.terminal_cause is None or
+                        facts.status.value != association['terminal_status'] or
+                        facts.terminal_cause.value
+                        != association['terminal_cause'] or
+                        facts.execution_generation
+                        != association['terminal_execution_generation'] or
+                        facts.execution_quiescence_required is not True or
+                        facts.execution_quiesced_generation
+                        != association['execution_quiesced_generation'] or
+                        facts.execution_quiesced_at
+                        != association['execution_quiesced_at'] or
+                        not facts.quiescent):
+                    return False
+            return True
+    except ordinary_launch_binding.OrdinaryLaunchBindingConflict:
+        return False
 
 
 def bound_non_pool_provider_reconciliation_ready(

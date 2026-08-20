@@ -1,6 +1,6 @@
 # Durable SkyServe Replica Actions
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 Status: the dedicated resource-action authority proposal is retired before
 activation. PRs #1112, #1239, #1240, #1336, #1338, and #1343 are closed. PR
@@ -185,6 +185,106 @@ admission failure caused by a missing server-owned Kueue queue label. Those
 rows remain ordinary typed-recovery work after the lineage fix; the label
 defect is owned by workspace/provider admission configuration, not this action
 protocol.
+
+### 2026-08-20 exact provider-present cleanup adjudication
+
+Production protocol-v2 reserved-fill recovery exposed a second closed outcome
+that the absence projector alone cannot initiate. A launch request can be
+terminal and exactly execution-quiesced with no recorded service job while its
+immutable Kubernetes Pod is still `PRESENT`. Such a Pod is not an adoptable
+Serve replica: transport success and provider presence do not supply the
+missing service-job result. It is also not absent, so neither the request
+reducer nor the provider-absence projector may release its association. Keeping
+the row ambiguous forever, however, pins a committed zero-cost allocation and
+prevents a clean successor from using the same free capacity.
+
+The accepted adjudication is a two-phase reduction through the existing
+cleanup worker, not a new execution topology or a broader meaning for
+`PROJECTED`:
+
+1. A fresh provider read outside all manager and database locks reports exact
+   `PRESENT`. One PostgreSQL transaction then re-locks the lifecycle fence,
+   current service hash and owner, replica record and association, terminal
+   request generation, queue and retention pin. It revalidates the canonical
+   request-body digest, the complete protocol-v2 `RESERVED_FILL` profile and
+   its committed intent, the exact Kubernetes context and physical cluster
+   UID, provider-evidence payload and digest, exact required quiescence, a null
+   service-job ID, and absence of both a replica paid-pool key and every paid
+   claim. The association must already have crossed the durable provider-effect
+   boundary (`PROVIDER_IO` or `SERVICE_JOB_IO`); `PRESENT` while still
+   `NOT_STARTED` is not attributable to this action and remains quarantined.
+   Only then may it persist the existing durable cleanup shape:
+   `sky_launch_status = INTERRUPTED`, `sky_down_status = SCHEDULED`,
+   `is_scale_down = true`, no idle wait, a zero-second drain cap, and no
+   logical-retirement metadata. The association, replica pointer, and request
+   pin remain unsettled. Replaying the same transaction is idempotent. Once
+   admitted, `RUNNING` and `FAILED` are recognized as later states of this same
+   exact authorization; neither requires a second provider-present write.
+2. The ordinary restart-recoverable down scheduler consumes that durable
+   `SHUTTING_DOWN` shape and runs the existing record- and physical-UID-fenced
+   teardown. In the same down worker, after teardown returns, it performs a
+   new provider read. The worker may report successful cleanup only when that
+   read is exact `ABSENT` and the existing absence projector atomically clears
+   the association pointer, changes the association to `PROJECTED`, releases
+   the retention pin, and proves there is still no paid claim. Normal down
+   completion can then remove the scale-down row. A crash at any boundary
+   leaves either the unsettled association plus durable cleanup intent, or the
+   settled association plus removable row; controller restart re-enters the
+   same path without inventing a request result.
+
+The settled crash boundary is authorized from history, not from the now-cleared
+replica pointer. Before removing that row, restart recovery re-locks the exact
+service/replica record and its sole protocol-v2 association tombstone. It
+requires canonical post-quiescence `ABSENT` evidence, `PROJECTED`, a released
+and actually absent request pin, a null replica pointer, the unchanged
+zero-paid cleanup marker, and no paid claim. This readback authorizes only the
+existing record-fenced row removal and never another provider operation. It
+requires the association lifecycle epoch to exactly equal the current agreeing
+lifecycle/service fence. A stale tombstone cannot acquire authority from a
+later lifecycle even after provider absence has been proven.
+
+No schema or migration is added. The initial `SCHEDULED` transition is the
+atomic authorization receipt and the existing down status is its
+restart-recovery state machine. A finished local launch worker consumes that
+receipt instead of retaining itself indefinitely. An unowned recovered row is
+consumed by the existing failed/committed cleanup reconciler; a live down
+worker excludes the background provider observer so that its own post-down
+read is the sole completion read. If the exact SkyPilot cluster record has
+already disappeared, the row remains pinned while the background observer
+classifies the immutable physical Pod. Exact `ABSENT` projects the association
+and is handed to the normal successful-down completion path; `PRESENT`,
+`UNKNOWN`, or `REPLACED` leaves the row quarantined.
+
+`UNKNOWN`, `REPLACED`, `NOT_QUERIED`, a stale or contradictory `PRESENT`, a
+missing/mismatched request payload, profile, committed intent, context, UID,
+replica record, terminal generation, quiescence receipt, or pin, any recorded
+service-job ID, and any paid-capacity evidence remain quarantined. Autoscaler
+teardown never bypasses this adjudication: an ambiguous association without
+the exact durable provider-present cleanup shape continues to reject
+cancellation and provider cleanup. The lifecycle epoch stored on the
+association remains immutable controller identity; both phases require exact
+equality with the current service operation fence and require the current
+lifecycle and service fence rows to agree.
+
+Authored verification covers the real PostgreSQL transaction from terminal
+generation-one quiescence through `PRESENT` authorization, idempotent replay,
+retained association/pointer/pin, and later `ABSENT` projection/release. Manager
+tests cover the closed evidence dispatch, forced post-down provider reread,
+ambiguous-cancel bypass only for a revalidated marker, exact zero-drain status
+projection, normal down-result completion after asynchronous absence, and a
+restart at the committed-`ABSENT`/pre-row-removal boundary. A PostgreSQL
+negative gate proves `NOT_STARTED` plus `PRESENT` cannot authorize teardown.
+
+Merged PR #1606 prevents controller-preserving `update`, election, and
+external-LB operations from advancing the lifecycle epoch. Production
+inspection on 2026-08-20 proved that all five eligible ambiguous rows (55334,
+55337, 55363, 55371, and 55425) already carry lifecycle epoch 83, owner epoch
+335, and the current service incarnation; all six Serve042 guard/consistency
+triggers are enabled. This adjudication therefore retains exact lifecycle and
+owner equality throughout. Serve054/PR #1603 is not a dependency and its
+historical-origin relaxation is intentionally excluded. PR #1609 closes the
+independent `apply` recurrence gap without changing recovery authority for
+these existing rows.
 
 ## Decision record
 
@@ -2900,6 +3000,19 @@ approved canary:
   owner-fenced, and per-row isolated; activation remains closed until exact
   `ABSENT` can atomically project the replica, association, request pin, and
   capacity claim without weakening the Serve042 transition invariants.
+- [x] Author the no-migration provider-`PRESENT` adjudication on top of the
+  existing absence projector: exact PostgreSQL revalidation, durable immediate
+  cleanup marker, existing UID-fenced down worker, and forced post-down
+  `ABSENT` projection. Focused PostgreSQL and manager tests pass locally.
+- [x] Rebase the provider-`PRESENT` adjudication above merged PRs #1600 and
+  #1606. Prove all five production candidates have the exact current lifecycle
+  epoch, owner epoch, and incarnation with every Serve042 trigger enabled;
+  exclude PR #1603 and historical-origin authority from this recovery.
+- [ ] Complete adversarial review, merge and deploy the provider-`PRESENT`
+  adjudication. Production completion requires all eligible exact `PRESENT`
+  rows to converge through fenced teardown and later `ABSENT`; every `UNKNOWN`
+  or `REPLACED` row must remain pinned and visible. Merge and deploy PR #1609
+  independently to prevent `apply` from creating a future epoch mismatch.
 - [ ] Pass reserved-fill conservation, no-paid-spill, exact binding receipt,
   provider-free route projection, bounded manager-lock, and poisoned-row
   progress tests.

@@ -81,6 +81,7 @@ if typing.TYPE_CHECKING:
 
     from sky.serve import demand_state
     from sky.serve import service_spec
+    from sky.serve.ordinary_launch_binding import BoundNonPoolLaunchContext
     from sky.serve.ordinary_launch_binding import ControllerBindingAuthority
     from sky.serve.replica_info import ReplicaInfo
     from sky.serve.replica_info import ReplicaStatusProperty
@@ -2250,6 +2251,32 @@ def terminate_cluster(
             time.sleep(gap_seconds)
 
 
+def terminate_bound_non_pool_provider_present_cluster(
+    binding_context: 'BoundNonPoolLaunchContext',
+    replica_info: ReplicaInfo,
+    authority: 'ControllerBindingAuthority',
+    project_replica_result: Callable[..., bool],
+    cluster_name: str,
+    log_file: str,
+    replica_drain_delay_seconds: int = 0,
+    **terminate_kwargs: Any,
+) -> None:
+    """Down one exact PRESENT allocation, then project fresh ABSENT proof."""
+    terminate_cluster(cluster_name, log_file, replica_drain_delay_seconds,
+                      **terminate_kwargs)
+    observation = non_pool_launch_reconciliation.reconcile(
+        binding_context,
+        replica_info,
+        authority,
+        project_replica_result,
+        force_provider_read=True)
+    if (observation.evidence
+            != ordinary_launch_binding.ProviderEvidence.ABSENT):
+        raise ordinary_launch_binding.OrdinaryLaunchBindingConflict(
+            'Fenced provider cleanup completed without fresh exact ABSENT '
+            'evidence for the reserved-fill allocation.')
+
+
 def _get_resources_ports(
     yaml_content: str,
     service_spec: 'service_spec.SkyServiceSpec | None' = None,
@@ -3947,6 +3974,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         provider_absent = (getattr(
             projection, 'provider_evidence',
             None) == ordinary_launch_binding.ProviderEvidence.ABSENT)
+        provider_present_cleanup = (getattr(
+            projection, 'provider_evidence',
+            None) == ordinary_launch_binding.ProviderEvidence.PRESENT)
         if provider_absent:
             absence_context = projection.context
             if (not isinstance(
@@ -3958,6 +3988,41 @@ class SkyPilotReplicaManager(ReplicaManager):
                     projection.service_job_id is not None or
                     projection.paid_capacity_pool_key is not None):
                 return False
+        if provider_present_cleanup:
+            cleanup_context = projection.context
+            if (not isinstance(
+                    cleanup_context,
+                    ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                    cleanup_context.profile.kind != ordinary_launch_binding.
+                    NonPoolLaunchProfileKind.RESERVED_FILL or
+                    projection.pre_effect_terminal or
+                    projection.service_job_id is not None or
+                    projection.paid_capacity_pool_key is not None or
+                    info.service_job_id is not None or
+                    info.paid_capacity_pool_key is not None or
+                    info.is_zero_cost is not True or
+                    info.zero_cost_materialization_sequence is not None):
+                return False
+            status_property = info.status_property
+            status_property.sky_launch_status = (
+                common_utils.ProcessStatus.INTERRUPTED)
+            status_property.sky_down_status = (
+                common_utils.ProcessStatus.SCHEDULED)
+            status_property.service_ready_now = False
+            status_property.is_scale_down = True
+            status_property.preempted = False
+            status_property.purged = False
+            status_property.failed_spot_availability = False
+            status_property.drain_cap_seconds = 0
+            status_property.drain_started_at = None
+            status_property.wait_for_idle_before_termination = False
+            status_property.logical_retirement_version = None
+            status_property.logical_retirement_controller_epoch = None
+            status_property.logical_retirement_generation = None
+            status_property.logical_retirement_target_capacity = None
+            status_property.logical_retirement_confirmed_generation = None
+            status_property.logical_retirement_bounded_deadline = False
+            status_property.logical_retirement_committed = False
         paid_outcome: paid_capacity.LaunchOutcome | None
         if projection.pre_effect_terminal:
             # No provider or service-job effect occurred.  Leave this exact
@@ -3986,6 +4051,12 @@ class SkyPilotReplicaManager(ReplicaManager):
                     != common_utils.ProcessStatus.INTERRUPTED):
                 info.status_property.sky_launch_status = (
                     common_utils.ProcessStatus.FAILED)
+            paid_outcome = None
+        elif provider_present_cleanup:
+            # PRESENT proves the exact physical allocation exists, not that
+            # launch succeeded.  Preserve the association and request pin;
+            # the existing UID-fenced down worker must obtain fresh ABSENT
+            # evidence before either can be settled.
             paid_outcome = None
         elif status == 'SUCCEEDED':
             # Teardown writes INTERRUPTED before exact cancellation.  A request
@@ -4061,6 +4132,7 @@ class SkyPilotReplicaManager(ReplicaManager):
             info,
             provider_launch_succeeded=(not projection.pre_effect_terminal and
                                        not provider_absent and
+                                       not provider_present_cleanup and
                                        status == 'SUCCEEDED'),
             paid_capacity_pool_key=projection.paid_capacity_pool_key,
             paid_capacity_outcome=paid_outcome)
@@ -4173,6 +4245,29 @@ class SkyPilotReplicaManager(ReplicaManager):
         self._non_pool_reconciliation_threads[replica_id] = worker
         worker.start()
 
+    def _finalize_projected_provider_absence_cleanup(self,
+                                                     replica_id: int) -> bool:
+        """Remove an immediate-cleanup row after exact ABSENT projected."""
+        runtime = self._legacy_mutation_runtime_state()
+        if (replica_id in runtime.launch_thread_pool or
+                replica_id in runtime.down_thread_pool):
+            return False
+        info = serve_state.get_replica_info_from_id(self._service_name,
+                                                    replica_id)
+        if (info is None or
+                not self._provider_present_cleanup_marker_shape(info)):
+            return False
+        if not (request_postgres.
+                bound_non_pool_projected_provider_absence_is_authorized(
+                    self._service_name, replica_id, info.replica_record_id)):
+            return False
+        # Complete the same durable down-result path a successful local worker
+        # would have used. The authorization above independently proves the
+        # settled association history, canonical ABSENT evidence, released
+        # pin, null pointer, and zero-paid marker after any process restart.
+        self._handle_sky_down_finish(info, format_exc=None)
+        return True
+
     def _reconcile_unowned_bound_non_pool_launches(
             self, replica_infos: list[ReplicaInfo]) -> None:
         """Schedule provider evidence even when no launch worker survived."""
@@ -4196,13 +4291,26 @@ class SkyPilotReplicaManager(ReplicaManager):
             for info in replica_infos
         }
         for binding_context in contexts:
-            if binding_context.replica_id in runtime.launch_thread_pool:
+            if (binding_context.replica_id in runtime.launch_thread_pool or
+                    binding_context.replica_id in runtime.down_thread_pool):
                 # Finished launch workers already own the established
                 # scheduling path, including its retry and logging behavior.
                 continue
             info = infos.get((binding_context.replica_id,
                               str(binding_context.replica_record_id)))
             if info is None:
+                continue
+            if (self._provider_present_cleanup_marker_shape(info) and
+                    global_user_state.cluster_with_name_exists(
+                        info.cluster_name) and not request_postgres.
+                    bound_non_pool_provider_absence_is_recorded(
+                        binding_context, authority)):
+                # The existing committed-cleanup reconciler consumes this
+                # restart shape below.  Do not race its down worker with an
+                # independent provider read while evidence is still PRESENT.
+                # A crash after ABSENT was recorded but before its projection
+                # must instead consume that immutable evidence immediately,
+                # even if a stale SkyPilot cluster record still exists.
                 continue
             self._schedule_non_pool_provider_reconciliation(
                 info, binding_context)
@@ -4267,18 +4375,60 @@ class SkyPilotReplicaManager(ReplicaManager):
                     info.paid_capacity_pool_key, str) else None))
         return result is not None
 
-    def _settle_bound_ordinary_launch_for_teardown(self,
-                                                   info: ReplicaInfo) -> None:
+    def _bound_non_pool_provider_present_cleanup_context(
+        self,
+        info: ReplicaInfo,
+        target: Any = None,
+    ) -> 'BoundNonPoolLaunchContext | None':
+        """Return one fully revalidated durable PRESENT cleanup marker."""
+        authority = self._ordinary_launch_binding_authority
+        if (authority is None or authority.capable is not True or
+                authority.binding_mode
+                != ordinary_launch_binding.BindingMode.BOUND or
+                not authority.generic_launches_required):
+            return None
+        if target is None:
+            target = request_postgres.lookup_bound_ordinary_launch_cancel_target(
+                self._service_name, info.replica_id, info.replica_record_id)
+        if target is None:
+            return None
+        binding_context = target.context
+        if (not isinstance(binding_context,
+                           ordinary_launch_binding.BoundNonPoolLaunchContext) or
+                binding_context.profile.kind !=
+                ordinary_launch_binding.NonPoolLaunchProfileKind.RESERVED_FILL):
+            return None
+        if not (request_postgres.
+                bound_non_pool_provider_present_cleanup_is_authorized(
+                    binding_context, authority)):
+            return None
+        return binding_context
+
+    @staticmethod
+    def _provider_present_cleanup_marker_shape(info: ReplicaInfo) -> bool:
+        """Match the durable marker through its down-worker lifecycle."""
+        return ordinary_launch_binding.replica_has_provider_present_cleanup_marker(
+            info)
+
+    def _settle_bound_ordinary_launch_for_teardown(
+        self,
+        info: ReplicaInfo,
+    ) -> 'BoundNonPoolLaunchContext | None':
         """Cancel, quiesce, and project an exact request before provider down."""
         authority = self._ordinary_launch_binding_authority
         if (authority is None or authority.capable is not True or
                 authority.binding_mode
                 != ordinary_launch_binding.BindingMode.BOUND):
-            return
+            return None
         initial = request_postgres.lookup_bound_ordinary_launch_cancel_target(
             self._service_name, info.replica_id, info.replica_record_id)
         if initial is None:
-            return
+            return None
+        provider_present_cleanup = (
+            self._bound_non_pool_provider_present_cleanup_context(
+                info, initial))
+        if provider_present_cleanup is not None:
+            return provider_present_cleanup
         _, reduce_exact, cancel_exact = (self._bound_ordinary_launch_callbacks(
             info, None, initial_reduction=initial))
         durable_reason = getattr(initial, 'cancel_reason', None)
@@ -4300,7 +4450,7 @@ class SkyPilotReplicaManager(ReplicaManager):
                     'durably ambiguous; refusing provider cleanup.')
             if (getattr(projection, 'projected', False) or classification
                     in ('PROJECTED', 'PRE_EFFECT_TERMINAL', 'SETTLED')):
-                return
+                return None
             if classification not in ('ADOPT_ACTIVE', 'WAIT_QUIESCENCE',
                                       'REDUCE_TERMINAL',
                                       'PRE_EFFECT_TERMINALIZE'):
@@ -10071,6 +10221,9 @@ class SkyPilotReplicaManager(ReplicaManager):
         # This is the current down scheduler.  The bounded ordinary-launch
         # request-binding design does not replace it.
         legacy_runtime = self._legacy_mutation_runtime_state()
+        provider_present_cleanup_context: BoundNonPoolLaunchContext | None = (
+            None)
+        projected_provider_absence_info: ReplicaInfo | None = None
         left_in_record = not (is_scale_down or purge)
         if left_in_record:
             assert sync_down_logs, (
@@ -10082,6 +10235,15 @@ class SkyPilotReplicaManager(ReplicaManager):
             info = serve_state.get_replica_info_from_id(self._service_name,
                                                         replica_id)
             assert info is not None
+            if self._provider_present_cleanup_marker_shape(info):
+                provider_present_cleanup_context = (
+                    self._bound_non_pool_provider_present_cleanup_context(info))
+            if provider_present_cleanup_context is not None:
+                sync_down_logs = False
+                replica_drain_delay_seconds = 0
+                is_scale_down = True
+                purge = False
+                in_flight_drain_cap_seconds = 0
             info.status_property.sky_launch_status = (
                 common_utils.ProcessStatus.INTERRUPTED)
             # Persist the teardown flags in the SAME write as INTERRUPTED:
@@ -10155,7 +10317,8 @@ class SkyPilotReplicaManager(ReplicaManager):
                               _ReplicaLaunchOwnershipLostError):
                     raise launch_thread.exception
                 if isinstance(launch_thread.exception,
-                              _BoundOrdinaryLaunchUnresolvedError):
+                              _BoundOrdinaryLaunchUnresolvedError) and (
+                                  provider_present_cleanup_context is None):
                     raise launch_thread.exception
                 # Handles a controller crash after the local worker completed
                 # but before its caller observed projection, and is a no-op
@@ -10165,7 +10328,10 @@ class SkyPilotReplicaManager(ReplicaManager):
                 if fresh_info is None:
                     raise _BoundOrdinaryLaunchUnresolvedError(
                         f'Bound teardown lost replica row {replica_id}.')
-                self._settle_bound_ordinary_launch_for_teardown(fresh_info)
+                settled_cleanup = (
+                    self._settle_bound_ordinary_launch_for_teardown(fresh_info))
+                if settled_cleanup is not None:
+                    provider_present_cleanup_context = settled_cleanup
             legacy_runtime.launch_thread_pool.pop(replica_id)
             legacy_runtime.replica_to_request_id.pop(replica_id)
             legacy_runtime.replica_to_logical_launch_fence.pop(replica_id)
@@ -10180,12 +10346,40 @@ class SkyPilotReplicaManager(ReplicaManager):
             bound_teardown_info = serve_state.get_replica_info_from_id(
                 self._service_name, replica_id)
             if bound_teardown_info is not None:
-                self._settle_bound_ordinary_launch_for_teardown(
-                    bound_teardown_info)
+                if self._provider_present_cleanup_marker_shape(
+                        bound_teardown_info):
+                    provider_present_cleanup_context = (
+                        self._bound_non_pool_provider_present_cleanup_context(
+                            bound_teardown_info))
+                if provider_present_cleanup_context is not None:
+                    sync_down_logs = False
+                    replica_drain_delay_seconds = 0
+                    is_scale_down = True
+                    purge = False
+                    in_flight_drain_cap_seconds = 0
+                elif (request_postgres.
+                      bound_non_pool_projected_provider_absence_is_authorized(
+                          self._service_name, replica_id,
+                          bound_teardown_info.replica_record_id)):
+                    projected_provider_absence_info = bound_teardown_info
+                settled_cleanup = (
+                    self._settle_bound_ordinary_launch_for_teardown(
+                        bound_teardown_info))
+                if settled_cleanup is not None:
+                    provider_present_cleanup_context = settled_cleanup
 
         if replica_id in legacy_runtime.down_thread_pool:
             logger.warning(f'Terminate thread for replica {replica_id} '
                            'already exists. Skipping.')
+            return
+
+        if projected_provider_absence_info is not None:
+            # Provider ABSENT and the released association/pin were committed
+            # before a prior controller died. No provider call remains: route
+            # this restart shape directly through the exact record-fenced
+            # down-result remover.
+            self._handle_sky_down_finish(projected_provider_absence_info,
+                                         format_exc=None)
             return
 
         log_file_name = serve_utils.generate_replica_log_file_name(
@@ -10374,6 +10568,13 @@ class SkyPilotReplicaManager(ReplicaManager):
         # controller resources.
         if not global_user_state.cluster_with_name_exists(info.cluster_name):
             if cleanup_fence is not None:
+                if provider_present_cleanup_context is not None:
+                    # The durable record disappeared after exact PRESENT was
+                    # authorized.  Only a fresh provider ABSENT read may now
+                    # settle the association and remove the replica.
+                    self._schedule_non_pool_provider_reconciliation(
+                        info, provider_present_cleanup_context)
+                    return
                 self._record_cleanup_uncertain(
                     info, 'the durable cluster record is absent, so cleanup '
                     'of partial resources cannot be proven')
@@ -10433,18 +10634,31 @@ class SkyPilotReplicaManager(ReplicaManager):
                 # the plain bounded sleep semantics via a None predicate.
                 drain_complete = _ReplicaDrainTracker(self, replica_url,
                                                       drain_started)
-        t = thread_utils.SafeThread(
-            target=terminate_cluster,
-            args=(info.cluster_name, log_file_name,
-                  replica_drain_delay_seconds),
-            kwargs={
-                'drain_deadline': drain_deadline,
-                'drain_complete': drain_complete,
-                'expected_cluster_record_uuid': expected_cluster_record_uuid,
-                'cleanup_fence': cleanup_fence,
-                'continue_guard': self._service_is_cleanup_authorized,
-            },
-        )
+        terminate_kwargs = {
+            'drain_deadline': drain_deadline,
+            'drain_complete': drain_complete,
+            'expected_cluster_record_uuid': expected_cluster_record_uuid,
+            'cleanup_fence': cleanup_fence,
+            'continue_guard': self._service_is_cleanup_authorized,
+        }
+        target: Callable[..., None]
+        target_args: tuple[Any, ...]
+        if provider_present_cleanup_context is None:
+            target = terminate_cluster
+            target_args = (info.cluster_name, log_file_name,
+                           replica_drain_delay_seconds)
+        else:
+            assert binding_authority is not None
+            target = terminate_bound_non_pool_provider_present_cluster
+            target_args = (provider_present_cleanup_context, info,
+                           binding_authority,
+                           functools.partial(
+                               self._project_bound_ordinary_launch,
+                               None), info.cluster_name, log_file_name,
+                           replica_drain_delay_seconds)
+        t = thread_utils.SafeThread(target=target,
+                                    args=target_args,
+                                    kwargs=terminate_kwargs)
         legacy_runtime.down_thread_pool[replica_id] = t
 
     def _reconcile_failed_cleanup(self,
@@ -10456,6 +10670,33 @@ class SkyPilotReplicaManager(ReplicaManager):
         now = time.monotonic()
         _, retry_at_by_replica = self._failed_cleanup_retry_state()
         for info in sorted(replica_infos, key=_provider_cleanup_phase_order):
+            # A crash after the ABSENT transaction but before local down-result
+            # handling loses every process-local worker. Consume that exact
+            # durable history before process-local worker status.  The
+            # transaction below still requires the association's exact
+            # current lifecycle, owner, incarnation, request, and provider
+            # identity; no historical lifecycle is cleanup authority.
+            if self._provider_present_cleanup_marker_shape(info):
+                try:
+                    if self._finalize_projected_provider_absence_cleanup(
+                            info.replica_id):
+                        reconciliation_threads = getattr(
+                            self, '_non_pool_reconciliation_threads', None)
+                        if reconciliation_threads is not None:
+                            try:
+                                reconciliation_threads.pop(info.replica_id)
+                            except KeyError:
+                                pass
+                        getattr(self, '_non_pool_reconciliation_attempts',
+                                {}).pop(info.replica_id, None)
+                        getattr(self, '_non_pool_reconciliation_retry_at',
+                                {}).pop(info.replica_id, None)
+                        continue
+                except Exception as error:  # pylint: disable=broad-except
+                    logger.warning(
+                        'Unable to finalize projected provider absence for '
+                        'replica %s: %s', info.replica_id,
+                        common_utils.format_exception(error))
             down_status = info.status_property.sky_down_status
             # Exact retirement owns successful teardown tombstones.  Ignore
             # even a stale process-local retry deadline left by an earlier
@@ -13050,6 +13291,29 @@ class SkyPilotReplicaManager(ReplicaManager):
                     if (remaining is not None and
                             _bound_projection_classification(remaining)
                             == 'AMBIGUOUS'):
+                        cleanup_context = (
+                            self.
+                            _bound_non_pool_provider_present_cleanup_context(
+                                info, remaining))
+                        if cleanup_context is not None:
+                            logger.info(
+                                'Scheduling exact immediate cleanup for '
+                                'provider-present reserved-fill replica %s.',
+                                replica_id)
+                            try:
+                                self._terminate_replica(
+                                    replica_id,
+                                    sync_down_logs=False,
+                                    replica_drain_delay_seconds=0,
+                                    is_scale_down=True,
+                                    in_flight_drain_cap_seconds=0)
+                            except Exception as error:  # pylint: disable=broad-except
+                                logger.warning(
+                                    'Could not schedule provider-present '
+                                    'cleanup for replica %s: %s', replica_id,
+                                    common_utils.format_exception(error))
+                                self._schedule_failed_cleanup_retry(replica_id)
+                            continue
                         self._schedule_non_pool_provider_reconciliation(
                             info, remaining.context)
                         logger.error(
