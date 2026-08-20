@@ -3767,21 +3767,34 @@ class TestReplicaIdSeededOnRecovery:
             mgr._recover_replica_operations()
         assert mgr._next_replica_id == 1
 
-    def test_durable_intent_history_seeds_past_cleaned_replica_rows(self):
+    @pytest.mark.parametrize(
+        ('existing_replica_ids', 'intent_replica_id_high_water',
+         'expected_next_replica_id'), [
+             pytest.param([], 0, 1, id='empty-service'),
+             pytest.param([], 9, 10, id='ledger-only'),
+             pytest.param([2, 5], 0, 6, id='current-rows-only'),
+             pytest.param([2, 5], 9, 10, id='max-of-ledger-and-current'),
+         ])
+    def test_durable_intent_seed_includes_ledger_and_current_rows(
+            self, existing_replica_ids, intent_replica_id_high_water,
+            expected_next_replica_id):
         mgr = _make_manager(next_replica_id=1)
         mgr._reserved_fill_actuation_mode = (
             replica_managers.zero_cost_actuation.ActuationMode.DURABLE_INTENT)
         mgr._zero_cost_actuation_repository = mock.Mock()
         high_water = (
             mgr._zero_cost_actuation_repository.committed_replica_id_high_water)
-        high_water.return_value = 9
+        high_water.return_value = intent_replica_id_high_water
 
         with mock.patch(
                 'sky.serve.replica_managers.serve_state.get_replica_infos',
-                return_value=[_fake_replica_info(5)]):
+                return_value=[
+                    _fake_replica_info(replica_id)
+                    for replica_id in existing_replica_ids
+                ]):
             mgr._recover_replica_operations()
 
-        assert mgr._next_replica_id == 10
+        assert mgr._next_replica_id == expected_next_replica_id
         high_water.assert_called_once_with('svc')
 
 
