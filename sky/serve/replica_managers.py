@@ -5443,8 +5443,8 @@ class SkyPilotReplicaManager(ReplicaManager):
             intent_replica_id_high_water = (self._zero_cost_actuation_repository
                                             .committed_replica_id_high_water(
                                                 self._service_name))
-        self._next_replica_id = max(intent_replica_id_high_water, *
-                                    existing_replica_ids) + 1
+        self._next_replica_id = max(
+            [intent_replica_id_high_water, *existing_replica_ids]) + 1
 
         # There is a FIFO queue with capacity _MAX_NUM_LAUNCH for
         # _launch_replica.
