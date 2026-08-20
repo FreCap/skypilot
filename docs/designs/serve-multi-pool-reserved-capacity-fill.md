@@ -58,19 +58,19 @@ authority facts above.
 This recovery change is intentionally smaller than another state migration. It
 reconstructs the exact frozen committed-intent profile for cleanup and accepts
 only the enumerated historical HTTP digest representation. Feature PR:
-**TBD until opened**. Its dependent **historical-digest verifier cleanup PR**
-removes only that verifier and its transition-only tests after all nine
-associations settle and one complete stale/quiescence horizon remains at zero.
-Historical-digest cleanup PR: **TBD until opened**. Both links replace these
-markers before the feature PR is merged. This stack is distinct from the
-pre-existing Serve056 owner-column cleanup described below.
+[#1614](https://github.com/boltz-bio/skypilot/pull/1614). Its dependent
+**historical-digest verifier cleanup PR**
+[#1615](https://github.com/boltz-bio/skypilot/pull/1615) removes only that
+verifier and its transition-only tests after all nine associations settle and
+one complete stale/quiescence horizon remains at zero. The cleanup stays draft
+until that gate is captured. This stack is distinct from the pre-existing
+Serve056 owner-column cleanup described below.
 
 Remaining work, in exact order:
 
-1. Freeze and open this provider-present recovery PR, then immediately author
-   its blocked dependent historical-digest verifier cleanup PR and cross-link
-   both here.
-2. Merge the recovery fix and direct-Helm deploy its immutable image/chart with
+1. Merge provider-present recovery PR #1614 while retaining its blocked draft
+   cleanup PR #1615.
+2. Direct-Helm deploy the recovery fix's immutable image/chart with
    `--reuse-values`; do not update a `boltz-platform` pin.
 3. Prove all nine provider-present rows enter UID-fenced teardown, reach fresh
    provider `ABSENT`, release their pins/debits, and disappear from live
