@@ -375,6 +375,40 @@ class TestGetEngine:
                            match='lock connections require PostgreSQL'):
             db_utils.get_postgres_lock_connection(engine)
 
+    def test_postgres_nullpool_factory_instruments_every_open(self):
+        ordinary_engine = mock.MagicMock()
+        ordinary_engine.dialect.name = (
+            db_utils.SQLAlchemyDialect.POSTGRESQL.value)
+        ordinary_engine.url = sqlalchemy.engine.make_url(
+            'postgresql://user:pass@localhost/db')
+        derived_engine = mock.MagicMock()
+        connect_args = {
+            'connect_timeout': 1,
+            'application_name': 'skypilot-reclaim-proof',
+        }
+
+        with mock.patch(
+                'sqlalchemy.create_engine',
+                return_value=derived_engine) as create_engine, mock.patch(
+                    'sky.utils.db.db_utils.'
+                    '_install_postgres_connection_metrics_listener'
+                ) as install_metrics:
+            result = db_utils.create_postgres_nullpool_engine(
+                ordinary_engine,
+                connect_args=connect_args,
+                engine_namespace='reserved-fill-reclaim-proof',
+                pool_reset_on_return=None)
+
+        assert result is derived_engine
+        create_engine.assert_called_once_with(ordinary_engine.url,
+                                              poolclass=sqlalchemy.NullPool,
+                                              connect_args=connect_args,
+                                              pool_reset_on_return=None)
+        install_metrics.assert_called_once_with(
+            derived_engine,
+            engine_namespace='reserved-fill-reclaim-proof',
+            mode='sync')
+
     def test_max_connections_must_be_non_negative(self):
         with pytest.raises(ValueError,
                            match='max_connections must be non-negative'):
@@ -550,12 +584,14 @@ class TestGetEngine:
             expected_dir = runtime_dir / '.sky'
             assert expected_dir.exists()
 
-    @pytest.mark.parametrize(('namespace', 'expected'),
-                             [(None, 'shared'), ('', 'shared'),
-                              ('api-requests-control', 'api-requests-control'),
-                              ('advisory-lock', 'advisory-lock'),
-                              ('physical-capacity-evidence', 'other'),
-                              ('caller-controlled-value', 'other')])
+    @pytest.mark.parametrize(
+        ('namespace', 'expected'),
+        [(None, 'shared'), ('', 'shared'),
+         ('api-requests-control', 'api-requests-control'),
+         ('advisory-lock', 'advisory-lock'),
+         ('reserved-fill-reclaim-proof', 'reserved-fill-reclaim-proof'),
+         ('physical-capacity-evidence', 'other'),
+         ('caller-controlled-value', 'other')])
     def test_postgres_connection_metric_namespace_is_bounded(
             self, namespace, expected):
         assert (db_utils._postgres_connection_metrics_engine_namespace(
@@ -583,13 +619,14 @@ class TestGetEngine:
                 'shared',
                 'api-requests-control',
                 'advisory-lock',
+                'reserved-fill-reclaim-proof',
                 'other',
             }))
         assert db_utils._POSTGRES_CONNECTION_METRIC_MODES == frozenset(
             {'sync', 'async'})
         assert (len(db_utils._POSTGRES_CONNECTION_METRIC_PROCESS_ROLES) *
                 len(db_utils._POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES) *
-                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 56)
+                len(db_utils._POSTGRES_CONNECTION_METRIC_MODES) == 70)
 
     def test_postgres_connection_metric_process_role_is_write_once(
             self, monkeypatch):

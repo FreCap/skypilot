@@ -104,6 +104,82 @@ def _claim(context: str = 'research') -> attestation.ReservedContextClaim:
     )
 
 
+def _launch_scope(context: str = 'research') -> attestation.ReclaimLaunchScope:
+    return attestation.ReclaimLaunchScope(
+        service_name='svc',
+        service_version=4,
+        pool_key='["v2","uid",["a100-80gb"]]',
+        service_generation=3,
+        physical_cluster_uid='uid',
+        kubernetes_context=context,
+        accelerator='a100-80gb',
+        accelerator_count=1,
+        projected_admission=_admission(context),
+    )
+
+
+def test_launch_authorization_binds_exact_provider_proof_reference() -> None:
+    identity = attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256='a' * 64,
+        policy_revision='bundle-policy-v1',
+        provider_inventory_sha256='b' * 64)
+    reference = attestation.ReclaimProviderProofReference(
+        receipt_nonce='c' * 64,
+        proof_sha256='d' * 64,
+        identity=identity,
+        gate_generation=7,
+        kubernetes_context='research',
+        completed_monotonic=10.0)
+
+    authorization = attestation.ReclaimLaunchAuthorization(
+        identity=identity,
+        gate_generation=7,
+        scope=_launch_scope(),
+        provider_proof_reference=reference,
+        completed_monotonic=10.0)
+
+    assert authorization.provider_proof_reference == reference
+
+
+@pytest.mark.parametrize('mismatch',
+                         ('identity', 'gate', 'context', 'completion'))
+def test_launch_authorization_rejects_provider_proof_reference_mismatch(
+        mismatch: str) -> None:
+    identity = attestation.ReclaimPolicyIdentity(
+        fleet_bundle_sha256='a' * 64,
+        policy_revision='bundle-policy-v1',
+        provider_inventory_sha256='b' * 64)
+    reference = attestation.ReclaimProviderProofReference(
+        receipt_nonce='c' * 64,
+        proof_sha256='d' * 64,
+        identity=identity,
+        gate_generation=7,
+        kubernetes_context='research',
+        completed_monotonic=10.0)
+    authorization_identity = identity
+    authorization_gate = 7
+    scope = _launch_scope()
+    completed_monotonic = 10.0
+    if mismatch == 'identity':
+        authorization_identity = dataclasses.replace(
+            identity, provider_inventory_sha256='e' * 64)
+    elif mismatch == 'gate':
+        authorization_gate = 8
+    elif mismatch == 'context':
+        scope = _launch_scope('secondary')
+    else:
+        assert mismatch == 'completion'
+        completed_monotonic = 10.1
+
+    with pytest.raises(ValueError, match='reference|completion'):
+        attestation.ReclaimLaunchAuthorization(
+            identity=authorization_identity,
+            gate_generation=authorization_gate,
+            scope=scope,
+            provider_proof_reference=reference,
+            completed_monotonic=completed_monotonic)
+
+
 def test_projected_admission_rejects_invalid_pod_identity_role() -> None:
     with pytest.raises(ValueError, match='AWS IAM role ARN'):
         dataclasses.replace(_admission(), pod_identity_role_arn='not-an-arn')

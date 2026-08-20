@@ -301,13 +301,15 @@ coverage. This proves the release stayed economically dark while also proving
 why the UI must display confirmed processing and unknown coverage separately.
 
 The exact post-#1503 P2b2 review scope was 42 files with 4,298 insertions and
-241 deletions relative to `improvements`. Draft removals #1506 and #1510 are
-implemented and tested, but production disproved one of their prerequisites.
-They remain unmerged and undeployed. P2c and P2d below are now required first;
-after their two additive Serve revisions, #1506 must be restacked as
-API016/Serve053 and #1510 immediately above it as API017/Serve054.
+241 deletions relative to `improvements`. Production disproved a prerequisite
+of the historical cleanup drafts #1506 and #1510; both are now closed and
+superseded. They reserve no API or Serve heads and must not be restacked. Any
+later deletion-only cleanup is re-derived from current old-path-use evidence
+after P2c/P2d and receives a migration number only if its concrete diff needs
+one. Serve054 belongs solely to the reserved-fill provider-proof receipt in
+`serve-multi-pool-reserved-capacity-fill.md`.
 
-Last updated: 2026-08-17
+Last updated: 2026-08-20
 
 Canonical owner: this file for request telemetry ingestion, paid-capacity
 admission, and the user-visible demand/capacity contract. Durable non-pool
@@ -788,7 +790,8 @@ participant to advertise API-request-015 ordered-capacity protocol 2, proving
 that paid admission debits pending intents during a rolling deployment. After
 promotion, a missing or unavailable
 intent repository fails closed; it never falls back to direct replica
-materialization. This is the single transition boundary removed by #1506.
+materialization. This is the single transition boundary a later, re-derived
+deletion-only cleanup must remove after current production evidence permits.
 
 The per-pool executor leases one intent with PostgreSQL fencing, then acquires
 the process provider phase and physical-cluster identity fence before it may
@@ -1331,10 +1334,11 @@ route-projection, incremental-worker, request-aggregator, migration utility,
 and real-PostgreSQL suites. `format.sh` passed mypy over 953 source files,
 changed-file pylint at 10.00/10, dashboard ESLint, and dashboard formatting.
 
-The additive PR must link to draft #1506 as its stacked removal. #1506 is
-expanded and restacked to delete the protocol-1 all-fleet publisher, old route
-mode, transition capability/metrics, and transition tests only after one
-complete production stale horizon with protocol 2 as the sole selected writer.
+The historical additive stack linked draft #1506 as its removal. That draft is
+now closed and superseded and reserves no schema head. After one complete
+production stale horizon with protocol 2 as the sole selected writer, re-derive
+the smallest deletion-only cleanup from current source and old-path-use
+evidence.
 
 ### P2d: grant-before-row zero-cost actuation
 
@@ -1377,11 +1381,11 @@ west-pool intent materializes independently. All 145 API-request PostgreSQL
 tests and all 31 capacity-admission/refill tests pass against the new schema
 heads as well.
 
-#1506 is also the stacked removal for P2d: after every non-pool service uses the
-intent executor and the direct-path usage counter remains zero for the
-documented horizon, it removes direct broker-to-replica materialization and
-the transition branch/tests. The feature and removal PR descriptions must name
-the same exact production evidence gate.
+After every non-pool service uses the intent executor and the direct-path usage
+counter remains zero for the documented horizon, a new deletion-only cleanup
+must remove direct broker-to-replica materialization and the transition
+branch/tests. It must be derived from then-current source and name the same
+exact production evidence gate; closed #1506 is not revived.
 
 The post-revision-416 fix-forward closes the remaining untyped protocol-v2
 batch bypass. `accept_reserved_fill(FillPlan)` is the only public manager
@@ -1403,10 +1407,10 @@ files, pylint at 10.00/10, dashboard ESLint, and dashboard formatting.
 
 ### P3: blocked steady-state cleanup
 
-Restack the first cleanup (#1506) onto P2d as API016/Serve053 and keep it draft
-and blocked; API013/API014 remain owned by G1Sb/G1Se executor-termination
-evidence. Restack the second cleanup (#1510) immediately above it as
-API017/Serve054. After the documented rollout gates, the two cleanup PRs remove
+Closed PRs #1506/#1510 are superseded and reserve no schema heads;
+API013/API014 remain owned by G1Sb/G1Se executor-termination evidence. After
+the documented rollout gates, re-derive and adversarially review one smallest
+current-source deletion stack to remove
 controller-coupled telemetry ingestion, the protocol-1 all-fleet route
 publisher, direct broker-to-replica fill, unbound non-pool admission/recovery,
 the ordinary-only handler alias, global startup recovery waiting,
@@ -1714,14 +1718,16 @@ dark deployment gate.
   demand-authority, or placement promotion (2026-08-16: single-`all`
   `Recreate`, forward Serve047/API-request-011 heads, service resource-action
   and binding modes legacy, non-pool capability false).
-- [x] Merge P1, P2a, and P2b1 as PRs #1498, #1499, and #1503; publish P2b2 as
-  PR #1504 and the blocked P3 removals as draft PRs #1506/#1510.
-- [x] Complete the first G1S restack of draft #1506 as API015/Serve051 and run
-  its full remote CI; complete the local API016/Serve052 #1510 restack and its
-  real-PostgreSQL API-request suite. Both remain draft and undeployed.
-- [ ] After P2d, restack #1506 as API016/Serve053 and #1510 immediately
-  above it as API017/Serve054, expand #1506 with both transition removals, and
-  adversarially re-review the exact diffs before either is eligible to merge.
+- [x] Historical rollout: merge P1, P2a, and P2b1 as PRs #1498, #1499, and
+  #1503; publish P2b2 as PR #1504; and prepare then-draft cleanup PRs
+  #1506/#1510. Those cleanup drafts were later closed and superseded.
+- [x] Historical rollout: complete the then-current G1S cleanup diff and its
+  remote CI plus the paired local real-PostgreSQL suite. The old #1506/#1510
+  drafts are closed, reserve no heads, and are not deployment candidates.
+- [ ] After P2d and the production horizon, re-derive and adversarially review
+  the smallest deletion-only cleanup from current old-path-use evidence. Do
+  not revive closed/superseded #1506/#1510 or reserve schema heads
+  speculatively.
 - [x] Pass the complete G1S precursor crash/mixed-version/provider-evidence
   qualification and record it in merged PR #1528.
 - [x] Inventory exact retained legacy rows and unsettled requests immediately
@@ -1742,10 +1748,11 @@ dark deployment gate.
   receipts before closing this gate because absence alone is not evidence.
 - [x] Run P3a's provider-stall route gate on revision 407. It failed: the
   60-second dark route head remained stale for at least 148 seconds while
-  demand stayed fresh. Keep #1506 draft and undeployed.
+  demand stayed fresh. The historical #1506 draft remained undeployed and was
+  later closed/superseded.
 - [x] Merge P2c API88/Serve051 after remote real-PostgreSQL CI and final exact
-  diff review, update its simultaneously maintained #1506 removal diff, and
-  deploy it dark as direct Helm revision 409 / v1.1.1313.
+  diff review, update the then-maintained historical cleanup diff, and deploy
+  it dark as direct Helm revision 409 / v1.1.1313.
 - [x] Merge and deploy PR #1532's exact-owner route-producer bootstrap
   fix-forward as direct Helm revision 410 / v1.1.1314. The owner selected
   protocol 2 and wrote 149 exact material rows, but the first head expired and

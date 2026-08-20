@@ -9,10 +9,10 @@ import threading
 import time
 from typing import Any, Iterator
 
-from sky.adaptors import aws as aws_adaptor
 from sky.adaptors import common as adaptor_common
-from sky.adaptors import kubernetes as kubernetes_adaptor
 
+aws_adaptor = adaptor_common.LazyImport('sky.adaptors.aws')
+kubernetes_adaptor = adaptor_common.LazyImport('sky.adaptors.kubernetes')
 yaml = adaptor_common.LazyImport('yaml')
 botocore_credentials = adaptor_common.LazyImport('botocore.credentials')
 botocore_signers = adaptor_common.LazyImport('botocore.signers')

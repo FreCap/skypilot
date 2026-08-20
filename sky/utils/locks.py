@@ -6,7 +6,6 @@ either local file locks or database-based distributed locks.
 import abc
 from collections.abc import Callable
 import contextlib
-import hashlib
 import logging
 import os
 import time
@@ -20,6 +19,7 @@ from sky import global_user_state
 from sky.skylet import runtime_utils
 from sky.utils import common_utils
 from sky.utils.db import db_utils
+from sky.utils.db import postgres_lock
 from sky.utils.db import retries as db_retries
 
 logger = logging.getLogger(__name__)
@@ -32,10 +32,7 @@ SKY_LOCKS_DIR = runtime_utils.get_runtime_dir_path('.sky/locks')
 
 def postgres_lock_key(lock_id: str) -> int:
     """Convert a stable string ID to PostgreSQL's positive int8 key space."""
-    hash_digest = hashlib.sha256(lock_id.encode('utf-8')).digest()
-    # Take the first 8 bytes and reserve the sign bit so psycopg and
-    # PostgreSQL agree on the bigint representation on every platform.
-    return int.from_bytes(hash_digest[:8], 'big') & ((1 << 63) - 1)
+    return postgres_lock.postgres_lock_key(lock_id)
 
 
 class LockTimeout(RuntimeError):

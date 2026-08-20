@@ -17,6 +17,7 @@ from sky.serve import pool_capacity_observation
 from sky.serve import reserved_capacity
 from sky.serve import reserved_capacity_broker as broker
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
+from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import serve_state
 
 _FLEET_DIGEST = 'a' * 64
@@ -100,6 +101,9 @@ def _valid_reclaim_gate_guard(monkeypatch):
                         lambda _: True)
     monkeypatch.setattr(serve_state, 'service_replica_launch_fence_snapshot',
                         _launch_snapshot)
+    monkeypatch.setattr(reserved_fill_reclaim_proofs,
+                        'provider_proof_reference_holds_in_connection',
+                        lambda *_args, **_kwargs: True)
 
 
 def _identity(
@@ -247,12 +251,22 @@ def _launch_authorization(
     gate_generation: int = _GATE_GENERATION,
     completed_monotonic: float | None = None,
 ) -> reclaim.ReclaimLaunchAuthorization:
+    effective_identity = identity or _identity()
+    effective_completed = (time.monotonic() if completed_monotonic is None else
+                           completed_monotonic)
+    reference = reclaim.ReclaimProviderProofReference(
+        receipt_nonce='a' * 64,
+        proof_sha256='8' * 64,
+        identity=effective_identity,
+        gate_generation=gate_generation,
+        kubernetes_context=scope.kubernetes_context,
+        completed_monotonic=effective_completed)
     return reclaim.ReclaimLaunchAuthorization(
-        identity=identity or _identity(),
+        identity=effective_identity,
         gate_generation=gate_generation,
         scope=scope,
-        completed_monotonic=(time.monotonic() if completed_monotonic is None
-                             else completed_monotonic))
+        provider_proof_reference=reference,
+        completed_monotonic=effective_completed)
 
 
 def _activation_receipt(
@@ -954,6 +968,40 @@ def test_tampered_fence_identity_fails_locked_gate_recheck_before_provider(
             provider_ran = True
 
     assert not provider_ran
+    owner_guard.assert_called_once_with()
+
+
+def test_missing_terminal_provider_receipt_fails_before_provider(monkeypatch):
+    context = _launch_context()
+    provisioner = _provisioner(context)
+
+    def _authorize(scope, **_kwargs):
+        return _launch_authorization(scope)
+
+    monkeypatch.setattr(reclaim, 'require_unique_policy',
+                        lambda: _Policy(_authorize))
+    monkeypatch.setattr(
+        serve_state, 'reserved_fill_reclaim_gate_authority_guard',
+        lambda *, shared: contextlib.nullcontext() if shared else None)
+    owner_guard = mock.Mock(
+        return_value=contextlib.nullcontext(_launch_snapshot(context)))
+    monkeypatch.setattr(provisioner,
+                        '_service_replica_launch_provider_owner_guard',
+                        owner_guard)
+    _install_gate(monkeypatch, _gate(sequenced=True))
+    receipt_guard = mock.Mock(return_value=False)
+    monkeypatch.setattr(reserved_fill_reclaim_proofs,
+                        'provider_proof_reference_holds_in_connection',
+                        receipt_guard)
+    provider_ran = False
+
+    with pytest.raises(exceptions.ReservedFillLaunchFenceError,
+                       match='authority'):
+        with provisioner._service_replica_launch_provider_guard():
+            provider_ran = True
+
+    assert not provider_ran
+    receipt_guard.assert_called_once()
     owner_guard.assert_called_once_with()
 
 

@@ -31,10 +31,12 @@ revision 407 / release `1.1.1310` at API-request 014/Serve050. Live
 qualification disproved the first cleanup's route-freshness prerequisite and
 also confirmed row-before-pool-lane reserved-fill actuation. P2c Serve051 and
 P2d Serve052 in `skyserve-demand-capacity-convergence.md` must land first. The
-G2 authority cleanup in draft PR #1506 is then restacked as API016/Serve053,
-and final generic non-pool cleanup #1510 immediately above it as
-API017/Serve054. Both cleanup PRs remain draft and undeployed until their
-operational and adversarial-review gates pass.
+Historical cleanup PRs #1506 and #1510 are closed and superseded. They reserve
+no API or Serve revisions and must not be restacked. Any later deletion-only
+cleanup is re-derived from current old-path-use evidence and receives a schema
+head only if its concrete implementation needs one; Serve054 belongs to the
+reserved-fill provider-proof receipt owned by
+`serve-multi-pool-reserved-capacity-fill.md`.
 No service was promoted through the proposed authority path, no authority
 worker claimed a request, and no provider effect ran through that path. Source
 cleanup is merged and deployed, but operational closeout remains open: the
@@ -281,8 +283,9 @@ inspection on 2026-08-20 proved that all five eligible ambiguous rows (55334,
 55337, 55363, 55371, and 55425) already carry lifecycle epoch 83, owner epoch
 335, and the current service incarnation; all six Serve042 guard/consistency
 triggers are enabled. This adjudication therefore retains exact lifecycle and
-owner equality throughout. Serve054/PR #1603 is not a dependency and its
-historical-origin relaxation is intentionally excluded. PR #1609 closes the
+owner equality throughout. Closed PR #1603 is not a dependency, reserves no
+Serve revision, and its historical-origin relaxation is intentionally
+excluded. PR #1609 closes the
 independent `apply` recurrence gap without changing recovery authority for
 these existing rows.
 
@@ -731,12 +734,13 @@ The forward schema contract is:
 - API012/Serve048 add the controller-independent demand feed, ordered
   zero-cost-before-paid admission, and provider-free route projections owned by
   `skyserve-demand-capacity-convergence.md`.
-- API016/Serve053 are the first blocked cleanup heads, and API017/Serve054 are
-  the immediately stacked final non-pool cleanup heads. They remove protocol-
-  v1/new-admission compatibility, API013 evidence participant-version 1, and
-  transition columns/constraints only after G2's gates; they preserve immutable
-  V1 evidence rows as diagnostic tombstones, typed profiles, current cohort,
-  route history needed by live clients, and permanent reserved authorization.
+- Closed cleanup PRs #1506/#1510 reserve no API or Serve heads. A future
+  deletion-only cleanup may remove protocol-v1/new-admission compatibility,
+  API013 evidence participant-version 1, and transition columns/constraints
+  only after G2's gates and only from a newly reviewed current-source diff. It
+  must preserve immutable V1 evidence rows as diagnostic tombstones, typed
+  profiles, current cohort, route history needed by live clients, and permanent
+  reserved authorization.
 
 An active correlated bound request without its queue row is invariant
 corruption, not an activation state. Startup locks and types the correlated
@@ -1389,15 +1393,11 @@ disposition is unknown.
 
 ### G2: blocked steady-state cleanup
 
-G2 is authored with G1 and the demand-convergence P2 change and remains
-draft/blocked until every gate below is recorded. Its first migration-bearing
-cleanup must be restacked onto forward-only API-request revision 015 and Serve
-revision 051; its immediately stacked final non-pool cleanup must move to
-API-request revision 016 and Serve revision 052. API012 and Serve048--050 are
-already published by demand, route, and ordered-admission convergence; API013
-is G1Sb's executor-termination evidence and API014 is G1Se's correction of its
-invalid cross-clock constraint. Any cleanup draft using API013 or API014 is
-stale and must not merge. Migration numbers are globally unique and
+G2 is re-derived only after every gate below is recorded. Closed historical
+cleanup PRs #1506/#1510 reserve no API or Serve revision and must not be
+restacked. The future deletion-only diff is based on then-current source and
+old-path-use evidence; it receives a migration only if its concrete schema
+change requires one. Migration numbers are globally unique and
 already-published revisions are immutable.
 
 G2 removes every unbound non-pool admission and recovery branch, the ordinary-
@@ -1456,9 +1456,9 @@ G1Sd merged as PR #1526 at
 continuity and exposed the independent clock-domain defect described below.
 G1Se merged as PR #1527 at
 `bf9e2907a39ef90a6e9f741be050da9b3fe662a5`; the exact `boltz-test`
-qualification below passed. G1S is complete. G2 remains blocked on its
-API016/Serve053 and API017/Serve054 restack plus the independent operational
-and adversarial-review gates below.
+qualification below passed. G1S is complete. G2 remains blocked on the
+independent operational and adversarial-review gates below. Closed PRs
+#1506/#1510 are superseded and own no reserved migration heads.
 The steady-state winner is the marker-driven runtime protocol with the
 three-part budget. The old runtime that waits for Kubernetes' post-`preStop`
 SIGTERM is transition-only.
@@ -1731,10 +1731,11 @@ event type, successful terminal phase, exit outcome, and resource version are
 part of the canonical digest. The migration precedes new writers. Old observers
 may emit only diagnostic V1 rows during overlap, and an application rollback
 may read the broader retained table without issuing V2 evidence.
-The API014 instance-version allowance is isolated rollout code. The already
-blocked G2/P3a cleanup PR #1506 must remove participant protocol 1 after the
-complete stale-writer/quiescence horizon while retaining immutable V1 evidence
-rows under the closed source constraint.
+The API014 instance-version allowance is isolated rollout code. A future
+re-derived G2/P3a deletion-only cleanup must remove participant protocol 1
+after the complete stale-writer/quiescence horizon while retaining immutable
+V1 evidence rows under the closed source constraint; closed #1506 is not that
+change.
 G1Se passed all 31 exact-head CI checks and merged as PR #1527 at
 `bf9e2907a39ef90a6e9f741be050da9b3fe662a5`. Release `1.1.1310` records that
 exact revision. The source and copied `boltz-test` images share digest
@@ -2966,11 +2967,11 @@ approved canary:
   (API012/Serve048--050).
 - [x] Merge G1Sa as PR #1519 and G1Sb executor-termination evidence on API013
   as PR #1522; author G1Sc as draft PR #1523 with its exact merge gate.
-- [ ] Land P2c Serve051 and P2d Serve052, then restack blocked G2 PR #1506
-  onto API016/Serve053.
-- [ ] Restack PR #1510 immediately above #1506 onto API017/Serve054.
-- [ ] Complete adversarial re-review of both cleanup diffs. Neither cleanup
-  may merge until that review and the operational gates are complete.
+- [ ] After P2c/P2d and the operational horizon, re-derive the smallest
+  deletion-only cleanup from current old-path-use evidence. Do not revive
+  closed/superseded PRs #1506/#1510 or reserve schema heads speculatively.
+- [ ] Complete adversarial review of that exact future cleanup diff. It may
+  merge only after the operational gates are complete.
 - [ ] Prove each schema
   lineage has one forward-only head and no historical migration changed.
 - [x] Inventory the historical seven incident rows and prove that IDs

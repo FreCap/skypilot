@@ -29,6 +29,7 @@ _AWS_ROLE_ARN_RE: Final = re.compile(
     r'role/[A-Za-z0-9+=,.@_/-]+$')
 POLICY_ENTRY_POINT_GROUP: Final = 'skypilot.reserved_fill_reclaim_policy'
 POLICY_REVISION_MAX_BYTES: Final = 1024
+RECLAIM_PROVIDER_CONTEXT_MAX_BYTES: Final = 1024
 AUTHORIZATION_MAX_AGE_SECONDS: Final = 5.0
 POLICY_OPERATION_TIMEOUT_SECONDS: Final = 5.0
 
@@ -92,6 +93,31 @@ class ReclaimPolicyIdentity:
                               POLICY_REVISION_MAX_BYTES)
         _require_sha256(self.provider_inventory_sha256,
                         'provider_inventory_sha256')
+
+
+def reclaim_provider_proof_lock_id(
+    identity: ReclaimPolicyIdentity,
+    gate_generation: int,
+    kubernetes_context: str,
+) -> str:
+    """Hash the exact context-wide provider-proof advisory-lock authority."""
+    if not isinstance(identity, ReclaimPolicyIdentity):
+        raise ValueError('identity must be ReclaimPolicyIdentity.')
+    _require_positive_int(gate_generation, 'gate_generation')
+    _require_bounded_text(kubernetes_context, 'kubernetes_context',
+                          RECLAIM_PROVIDER_CONTEXT_MAX_BYTES)
+    material = (
+        gate_generation,
+        identity.fleet_bundle_sha256,
+        identity.policy_revision,
+        identity.provider_inventory_sha256,
+        kubernetes_context,
+    )
+    encoded = json.dumps(material,
+                         separators=(',', ':'),
+                         ensure_ascii=False,
+                         allow_nan=False).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -430,12 +456,35 @@ class ReclaimClaimAuthorization:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReclaimProviderProofReference:
+    """Immutable reference to one completed context-wide provider proof."""
+
+    receipt_nonce: str
+    proof_sha256: str
+    identity: ReclaimPolicyIdentity
+    gate_generation: int
+    kubernetes_context: str
+    completed_monotonic: float
+
+    def __post_init__(self) -> None:
+        _require_sha256(self.receipt_nonce, 'receipt_nonce')
+        _require_sha256(self.proof_sha256, 'proof_sha256')
+        if not isinstance(self.identity, ReclaimPolicyIdentity):
+            raise ValueError('identity must be ReclaimPolicyIdentity.')
+        _require_positive_int(self.gate_generation, 'gate_generation')
+        _require_bounded_text(self.kubernetes_context, 'kubernetes_context',
+                              RECLAIM_PROVIDER_CONTEXT_MAX_BYTES)
+        _require_monotonic(self.completed_monotonic, 'completed_monotonic')
+
+
+@dataclasses.dataclass(frozen=True)
 class ReclaimLaunchAuthorization:
     """Fresh exact-scope authorization for one terminal provider effect."""
 
     identity: ReclaimPolicyIdentity
     gate_generation: int
     scope: ReclaimLaunchScope
+    provider_proof_reference: ReclaimProviderProofReference
     completed_monotonic: float
 
     def __post_init__(self) -> None:
@@ -444,7 +493,20 @@ class ReclaimLaunchAuthorization:
         _require_positive_int(self.gate_generation, 'gate_generation')
         if not isinstance(self.scope, ReclaimLaunchScope):
             raise ValueError('scope must be ReclaimLaunchScope.')
-        _require_monotonic(self.completed_monotonic, 'completed_monotonic')
+        completed = _require_monotonic(self.completed_monotonic,
+                                       'completed_monotonic')
+        reference = self.provider_proof_reference
+        if not isinstance(reference, ReclaimProviderProofReference):
+            raise ValueError('Launch authorization must carry one typed '
+                             'provider-proof reference.')
+        if (reference.identity != self.identity or
+                reference.gate_generation != self.gate_generation or
+                reference.kubernetes_context != self.scope.kubernetes_context):
+            raise ValueError('Launch provider-proof reference does not match '
+                             'the authorization scope.')
+        if completed != reference.completed_monotonic:
+            raise ValueError('Launch completion must equal the context-wide '
+                             'provider-proof completion.')
 
 
 @dataclasses.dataclass(frozen=True)

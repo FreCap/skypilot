@@ -17,6 +17,7 @@ from boltz_reserved_fill_reclaim_policy import bundle as bundle_lib
 from boltz_reserved_fill_reclaim_policy import kubernetes_attestation
 
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
+from sky.serve import reserved_fill_reclaim_proofs
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +260,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         self,
         context_names: Sequence[str],
         deadline_monotonic: float,
-    ) -> dict[str, _ContextProof]:
+    ) -> tuple[dict[str, _ContextProof], dict[str, float]]:
         self._require_deadline(deadline_monotonic)
         canonical_contexts = tuple(sorted(set(context_names)))
         if not canonical_contexts:
@@ -275,13 +276,21 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=len(canonical_contexts) * 2,
             thread_name_prefix='boltz-reclaim-attest')
-        futures: dict[tuple[str, str], concurrent.futures.Future[object]] = {}
+        futures: dict[tuple[str, str],
+                      concurrent.futures.Future[tuple[object, float]]] = {}
+
+        def _timed_provider(context_name: str,
+                            domain: str) -> tuple[object, float]:
+            value = self._provider_job(context_name, domain, deadline_monotonic,
+                                       cancellation)
+            return value, time.monotonic()
+
         try:
             for context_name in canonical_contexts:
                 for domain in ('aws', 'kubernetes'):
-                    futures[(context_name, domain)] = executor.submit(
-                        self._provider_job, context_name, domain,
-                        deadline_monotonic, cancellation)
+                    futures[(context_name,
+                             domain)] = executor.submit(_timed_provider,
+                                                        context_name, domain)
             remaining = deadline_monotonic - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
@@ -303,9 +312,11 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
         proofs: dict[str, _ContextProof] = {}
+        oldest_completions: dict[str, float] = {}
         for context_name in canonical_contexts:
-            aws_proof = values[(context_name, 'aws')]
-            kubernetes_proof = values[(context_name, 'kubernetes')]
+            aws_proof, aws_completed = values[(context_name, 'aws')]
+            kubernetes_proof, kubernetes_completed = values[(context_name,
+                                                             'kubernetes')]
             if (not isinstance(aws_proof, aws_attestation.PodIdentityProof) or
                     not isinstance(
                         kubernetes_proof,
@@ -314,7 +325,242 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                     'A deployment attestation returned an untyped proof.')
             proofs[context_name] = _ContextProof(aws=aws_proof,
                                                  kubernetes=kubernetes_proof)
-        return proofs
+            oldest_completions[context_name] = min(aws_completed,
+                                                   kubernetes_completed)
+        return proofs, oldest_completions
+
+    def _decode_aws_proof_summary(
+        self,
+        summary: Mapping[str, Any],
+        *,
+        context_name: str,
+    ) -> aws_attestation.PodIdentityProof:
+        fleet_context = self._bundle.fleet_context(context_name)
+        provider_context = self._bundle.provider_context(context_name)
+        try:
+            proof = aws_attestation.PodIdentityProof(**summary)
+            normalized, _ = (
+                reserved_fill_reclaim_proofs.canonical_proof_payload)(
+                    dataclasses.asdict(proof))
+            expected, _ = (
+                reserved_fill_reclaim_proofs.canonical_proof_payload)(summary)
+        except (TypeError, ValueError,
+                reserved_fill_reclaim_proofs.ReclaimProviderProofError
+               ) as error:
+            raise reclaim.ReclaimAttestationError(
+                'The cached AWS provider proof is malformed.') from error
+        if normalized != expected:
+            raise reclaim.ReclaimAttestationError(
+                'The cached AWS provider proof is not exact.')
+        expected_role = fleet_context['pod_identity_role_arn']
+        expected_count = 0 if expected_role is None else 1
+        expected_absence = expected_role is None
+        if (type(proof.kubernetes_context) is not str or
+                proof.kubernetes_context != context_name or
+                type(proof.cluster_arn) is not str or
+                proof.cluster_arn != provider_context['eks']['cluster_arn'] or
+                type(proof.namespace) is not str or
+                proof.namespace != fleet_context['namespace'] or
+                type(proof.service_account_name) is not str or
+                proof.service_account_name
+                != fleet_context['service_account_name'] or
+                proof.expected_role_arn != expected_role or
+                type(proof.association_count) is not int or
+                proof.association_count != expected_count or
+                type(proof.identity_absence_proven) is not bool or
+                proof.identity_absence_proven is not expected_absence):
+            raise reclaim.ReclaimAttestationError(
+                'The cached AWS provider proof does not match the exact '
+                'reviewed context.')
+        return proof
+
+    def _decode_kubernetes_proof_summary(
+        self,
+        summary: Mapping[str, Any],
+        *,
+        context_name: str,
+    ) -> kubernetes_attestation.KubernetesContextProof:
+        fleet_context = self._bundle.fleet_context(context_name)
+        provider_context = self._bundle.provider_context(context_name)
+        try:
+            values = dict(summary)
+            raw_topologies = values['resource_flavor_topology_names']
+            if type(raw_topologies) is not list:
+                raise TypeError
+            values['resource_flavor_topology_names'] = tuple(
+                tuple(item) for item in raw_topologies)
+            raw_nodes = values['node_flavors']
+            if type(raw_nodes) is not list:
+                raise TypeError
+            values['node_flavors'] = tuple(
+                kubernetes_attestation.NodeFlavorProof(**item)
+                for item in raw_nodes)
+            proof = kubernetes_attestation.KubernetesContextProof(**values)
+            normalized, _ = (
+                reserved_fill_reclaim_proofs.canonical_proof_payload)(
+                    dataclasses.asdict(proof))
+            expected, _ = (
+                reserved_fill_reclaim_proofs.canonical_proof_payload)(summary)
+        except (KeyError, TypeError, ValueError,
+                reserved_fill_reclaim_proofs.ReclaimProviderProofError
+               ) as error:
+            raise reclaim.ReclaimAttestationError(
+                'The cached Kubernetes provider proof is malformed.') from error
+        if normalized != expected:
+            raise reclaim.ReclaimAttestationError(
+                'The cached Kubernetes provider proof is not exact.')
+        admission = fleet_context['kueue_admission']
+        managed = admission is not None
+        expected_local_queue = (None if admission is None else
+                                admission['local_queue_name'])
+        expected_cluster_queue = (
+            None if admission is None else
+            admission['queues']['inference_cluster_queue'])
+        expected_topologies = tuple(
+            sorted((flavor['name'], flavor['topology_name'])
+                   for flavor in provider_context['resource_flavors']))
+        expected_nodes = {
+            node['flavor']: node for node in provider_context['node_inventory']
+        }
+        if (type(proof.kubernetes_context) is not str or
+                proof.kubernetes_context != context_name or
+                type(proof.physical_cluster_uid) is not str or
+                proof.physical_cluster_uid
+                != fleet_context['physical_cluster_uid'] or
+                type(proof.namespace_uid) is not str or
+                proof.namespace_uid != provider_context['namespace_uid'] or
+                type(proof.kueue_managed) is not bool or
+                proof.kueue_managed is not managed or
+                proof.local_queue_name != expected_local_queue or
+                proof.cluster_queue_name != expected_cluster_queue or
+                type(proof.pod_identity_irsa_annotation_absent) is not bool or
+                not proof.pod_identity_irsa_annotation_absent or
+                proof.assign_queue_labels_for_pods
+                != (True if managed else None) or
+            (proof.assign_queue_labels_for_pods is not None and
+             type(proof.assign_queue_labels_for_pods) is not bool) or
+                proof.topology_aware_scheduling != (True if managed else None)
+                or (proof.topology_aware_scheduling is not None and
+                    type(proof.topology_aware_scheduling) is not bool) or
+                type(proof.custom_scheduler_deployment_proven) is not bool or
+                proof.custom_scheduler_deployment_proven
+                is not (provider_context['scheduler'] is not None) or
+                proof.resource_flavor_topology_names != expected_topologies or
+                tuple(node.flavor for node in proof.node_flavors) != tuple(
+                    sorted(expected_nodes))):
+            raise reclaim.ReclaimAttestationError(
+                'The cached Kubernetes provider proof does not match the '
+                'exact reviewed context.')
+        for node in proof.node_flavors:
+            expected_node = expected_nodes[node.flavor]
+            if (type(node.flavor) is not str or
+                    type(node.non_deleting_node_count) is not int or
+                    node.non_deleting_node_count <= 0 or
+                    type(node.product_label_value) is not str or
+                    node.product_label_value
+                    != expected_node['product_label_value'] or
+                    type(node.resource_name) is not str or
+                    node.resource_name != expected_node['resource_name'] or
+                    type(node.capacity_per_node) is not int or
+                    node.capacity_per_node
+                    != expected_node['capacity_per_node']):
+                raise reclaim.ReclaimAttestationError(
+                    'The cached Kubernetes provider proof has an invalid '
+                    'reviewed Node flavor.')
+        return proof
+
+    def _decode_context_proof_summary(
+        self,
+        summary: Mapping[str, Any],
+        *,
+        context_name: str,
+    ) -> _ContextProof:
+        if (type(summary) is not dict or
+                set(summary) != {'aws', 'kubernetes'} or
+                type(summary['aws']) is not dict or
+                type(summary['kubernetes']) is not dict):
+            raise reclaim.ReclaimAttestationError(
+                'The cached context-wide provider proof is malformed.')
+        return _ContextProof(aws=self._decode_aws_proof_summary(
+            summary['aws'], context_name=context_name),
+                             kubernetes=self._decode_kubernetes_proof_summary(
+                                 summary['kubernetes'],
+                                 context_name=context_name))
+
+    def _attest_launch_context(
+        self,
+        context_name: str,
+        identity: reclaim.ReclaimPolicyIdentity,
+        gate_generation: int,
+        deadline_monotonic: float,
+    ) -> tuple[_ContextProof, reclaim.ReclaimProviderProofReference]:
+        """Share one complete context fact through a PostgreSQL receipt."""
+        self._require_deadline(deadline_monotonic)
+        provider_deadline = (reserved_fill_reclaim_proofs.
+                             provider_proof_deadline(deadline_monotonic))
+
+        def _authorization_job(
+        ) -> reserved_fill_reclaim_proofs.ReclaimProviderProofReceipt:
+            # Default construction may lazily initialize or migrate the Serve
+            # database. Keep that network-capable work off the handler's main
+            # thread, but construct only one receipt engine per authorization.
+            repository = (
+                reserved_fill_reclaim_proofs.ReclaimProviderProofRepository)()
+
+            def _prove(
+            ) -> (reserved_fill_reclaim_proofs.ReclaimProviderProofCandidate):
+                proofs, oldest_completions = self._attest_contexts(
+                    (context_name,), provider_deadline)
+                proof = proofs[context_name]
+                return (
+                    reserved_fill_reclaim_proofs.ReclaimProviderProofCandidate)(
+                        proof_payload={
+                            'aws': dataclasses.asdict(proof.aws),
+                            'kubernetes': dataclasses.asdict(proof.kubernetes),
+                        },
+                        oldest_completed_monotonic=(
+                            oldest_completions[context_name]))
+
+            def _validate(summary: Mapping[str, Any]) -> bool:
+                try:
+                    self._decode_context_proof_summary(
+                        summary, context_name=context_name)
+                except reclaim.ReclaimAttestationError:
+                    return False
+                return True
+
+            return repository.get_or_prove(
+                identity=identity,
+                gate_generation=gate_generation,
+                kubernetes_context=context_name,
+                deadline_monotonic=deadline_monotonic,
+                prove=_prove,
+                validate=_validate)
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='boltz-reclaim-launch')
+        future = executor.submit(_authorization_job)
+        try:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            receipt = future.result(timeout=remaining)
+            self._require_deadline(deadline_monotonic)
+        except Exception:
+            future.cancel()
+            raise reclaim.ReclaimAttestationError(
+                'The Boltz deployment could not prove the exact reclaim '
+                'launch inventory before its deadline.') from None
+        finally:
+            # Do not join a client-library call that cannot be mathematically
+            # bounded (for example synchronous DNS). The enclosing canonical
+            # DisposableExecutor handler reports failure; its inner warden
+            # then kills and proves absence of the exact invocation family.
+            executor.shutdown(wait=False, cancel_futures=True)
+        self._require_deadline(deadline_monotonic)
+        proof = self._decode_context_proof_summary(receipt.proof_payload,
+                                                   context_name=context_name)
+        return proof, receipt.reference
 
     def _proof_payload(self, operation: str, proofs: Mapping[str,
                                                              _ContextProof],
@@ -354,8 +600,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                   deadline_monotonic: float,
                   emit_log: bool = True) -> dict[str, Any]:
         """Run the full-fleet proof and return its stable JSON-ready record."""
-        proofs = self._attest_contexts(self._bundle.contexts,
-                                       deadline_monotonic)
+        proofs, _ = self._attest_contexts(self._bundle.contexts,
+                                          deadline_monotonic)
         completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         payload = self._proof_payload('preflight', proofs, completed)
@@ -380,8 +626,8 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
         self._require_activation_claims(claimed_contexts)
         # Activation always proves the whole static fleet, including contexts
         # with no current claim, so the one-way gate authorizes future claims.
-        proofs = self._attest_contexts(self._bundle.contexts,
-                                       deadline_monotonic)
+        proofs, _ = self._attest_contexts(self._bundle.contexts,
+                                          deadline_monotonic)
         completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         evidence = reclaim.ReclaimEnforcementEvidence(
@@ -413,7 +659,7 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
             raise reclaim.ReclaimAttestationError(
                 'The claim authorization scope is not typed.')
         context_names = self._require_claim_edges(scope.edges)
-        proofs = self._attest_contexts(context_names, deadline_monotonic)
+        proofs, _ = self._attest_contexts(context_names, deadline_monotonic)
         completed = time.monotonic()
         self._require_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimClaimAuthorization(
@@ -453,17 +699,19 @@ class BoltzReservedFillReclaimPolicy(reclaim.ReservedFillReclaimPolicy):
                                       scope.physical_cluster_uid,
                                       scope.accelerator,
                                       set(context['accelerators']))
-        proofs = self._attest_contexts((scope.kubernetes_context,),
-                                       deadline_monotonic)
-        completed = time.monotonic()
+        proof, reference = self._attest_launch_context(
+            scope.kubernetes_context, expected_identity,
+            expected_gate_generation, deadline_monotonic)
+        completed = reference.completed_monotonic
         self._require_deadline(deadline_monotonic)
         authorization = reclaim.ReclaimLaunchAuthorization(
             identity=self.policy_identity(),
             gate_generation=expected_gate_generation,
             scope=scope,
+            provider_proof_reference=reference,
             completed_monotonic=completed)
         payload = self._proof_payload('launch',
-                                      proofs,
+                                      {scope.kubernetes_context: proof},
                                       completed,
                                       gate_generation=expected_gate_generation,
                                       service_name=scope.service_name,

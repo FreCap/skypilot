@@ -42,6 +42,7 @@ from sky.serve import pool_capacity_observation
 from sky.serve import pool_capacity_observation_schema
 from sky.serve import reserved_fill_projection_authority
 from sky.serve import reserved_fill_reclaim_attestation
+from sky.serve import reserved_fill_reclaim_proofs
 from sky.serve import resource_action_m4_state_schema
 from sky.serve import route_projection_schema
 from sky.serve import serve_state_schema
@@ -2939,6 +2940,13 @@ def reserved_fill_reclaim_launch_authority_holds(
                  expected_identity=identity,
                  expected_gate_generation=gate_generation,
                  expected_scope=scope)
+            if not (reserved_fill_reclaim_proofs.
+                    provider_proof_reference_holds_in_connection)(
+                        connection,
+                        authorization.provider_proof_reference,
+                        expected_physical_cluster_uid=(
+                            scope.physical_cluster_uid)):
+                return False
     except (reserved_fill_reclaim_attestation.ReclaimAttestationError, KeyError,
             TypeError, ValueError):
         return False

@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import contextlib
 import enum
 import functools
+import logging
 import os
 import pathlib
 import sqlite3
@@ -19,12 +20,12 @@ import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy.ext import asyncio as sqlalchemy_async
 
-from sky import sky_logging
 from sky.adaptors import common as adaptors_common
-from sky.skylet import constants
-from sky.skylet import runtime_utils
 
-logger = sky_logging.init_logger(__name__)
+constants = adaptors_common.LazyImport('sky.skylet.constants')
+runtime_utils = adaptors_common.LazyImport('sky.skylet.runtime_utils')
+
+logger = logging.getLogger(__name__)
 metrics_utils = adaptors_common.LazyImport('sky.metrics.utils')
 if typing.TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -65,6 +66,7 @@ _POSTGRES_LOCK_APPLICATION_NAME = 'skypilot-advisory-lock'
 # another connection from its process-local budget.
 _POSTGRES_POOL_TIMEOUT_SECONDS = 15
 _API_SERVER_ROLE_ENV_VAR = 'SKYPILOT_API_SERVER_ROLE'
+_POSTGRES_METRICS_ENABLED_ENV_VAR = 'SKY_API_SERVER_METRICS_ENABLED'
 _POSTGRES_CONNECTION_METRIC_PROCESS_ROLES = frozenset({
     'all',
     'api',
@@ -84,6 +86,7 @@ _POSTGRES_CONNECTION_METRIC_ENGINE_NAMESPACES = frozenset({
     'shared',
     'api-requests-control',
     'advisory-lock',
+    'reserved-fill-reclaim-proof',
     'other',
 })
 _POSTGRES_CONNECTION_METRIC_MODES = frozenset({'sync', 'async'})
@@ -694,7 +697,7 @@ def _postgres_connection_metrics_engine_namespace(
 
 
 def _postgres_connection_metrics_enabled() -> bool:
-    return os.environ.get(constants.ENV_VAR_SERVER_METRICS_ENABLED,
+    return os.environ.get(_POSTGRES_METRICS_ENABLED_ENV_VAR,
                           'false').lower() == 'true'
 
 
@@ -806,6 +809,27 @@ def get_postgres_lock_engine(
                 lock_engine, engine_namespace='advisory-lock', mode='sync')
             _postgres_lock_engine_cache[connection_url] = lock_engine
         return _postgres_lock_engine_cache[connection_url]
+
+
+def create_postgres_nullpool_engine(
+    engine: sqlalchemy.engine.Engine,
+    *,
+    connect_args: dict[str, Any],
+    engine_namespace: str,
+    pool_reset_on_return: str | None = 'rollback',
+) -> sqlalchemy.engine.Engine:
+    """Derive one instrumented, physically non-reusing PostgreSQL engine."""
+    if engine.dialect.name != SQLAlchemyDialect.POSTGRESQL.value:
+        raise ValueError('Postgres NullPool connections require PostgreSQL. '
+                         f'Current dialect: {engine.dialect.name}')
+    derived = sqlalchemy.create_engine(
+        engine.url,
+        poolclass=sqlalchemy.NullPool,
+        connect_args=dict(connect_args),
+        pool_reset_on_return=(pool_reset_on_return))
+    _install_postgres_connection_metrics_listener(
+        derived, engine_namespace=engine_namespace, mode='sync')
+    return derived
 
 
 def get_postgres_lock_connection(

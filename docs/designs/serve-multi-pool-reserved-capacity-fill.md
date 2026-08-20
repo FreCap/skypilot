@@ -1,16 +1,71 @@
 # Multi-pool SkyServe reserved-capacity fill
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
-Status: the additive reserved-fill, exact worker-projection, generalized
+Status: active production qualification. Production release `1.1.1382` runs
+the exact split-role writer cohort. PRs #1607, #1608, and #1609 are merged in
+release candidate `1.1.1385`: Kueue admission waits are passive and
+deadline-safe, fresh provider-present ambiguous launches have one exact
+generation/UID-fenced adjudication path, and apply updates preserve the active
+lifecycle epoch.
+`boltz-l4-fleet` is elected on the one-way
+`DURABLE_INTENT`/`DURABLE_FEED`/`DURABLE_PROJECTED` protocol-v2 path, with no
+paid claims. The seven original provider-absent launch rows and the final
+generation-race cleanup row were evidence-proven and removed through the
+canonical reducers. Five fresh provider-present rows await the merged #1608
+adjudicator. Platform PR #8652 is merged; after the controller rollout its
+clean `min_replicas: 0`, zero-fill-floor, full-backfill service update will be
+reapplied without a platform runtime pin.
+
+The remaining production launch wave exposed two steady-state gates. First,
+many simultaneous terminal launch authorizations independently repeat the
+same live AWS and Kubernetes proof under separate five-second deadlines.
+Isolated full-fleet proofs complete in about three seconds, but 15 or more
+parallel launch proofs contend and intermittently reject the complete claim
+heartbeat. The first implementation in PR #1604 used a policy-instance-local
+in-flight map and is intentionally blocked: every production launch executes
+in a separate `DisposableExecutor` child process, and the policy instance is
+reset after fork, so that implementation cannot coalesce the production wave.
+PR #1604 now installs the PostgreSQL-only Serve054 provider-proof receipt
+described below. One advisory-lock owner publishes a safe, exact
+context-wide AWS/Kubernetes summary for `(policy identity, gate generation,
+context)` and independent processes may reuse it only inside the existing
+five-second authorization-freshness horizon. Exact launch scope is still
+validated per caller and the single receipt row is revalidated on the database
+clock immediately before the provider effect. The executable policy contract
+advances deliberately to revision `1.1.1386`. Its first fresh 4x16 CI pressure
+run stayed below the memory gate but exposed a scheduler-dependent test metric:
+48 active short-lived reads had backend ages above 100 ms even though exactly
+one transaction owned the lock. That age proxy has been replaced by the
+deterministic owner/parked-loser proof below; merge remains gated on three
+fresh exact-head CI passes. Second, provider effects can
+still race the moving allocation fence before the generalized
+request/association receipt is durably bound, producing new ambiguous capacity
+debits and exposing the RWX stale-file-handle dependency. The required final
+path is the already-planned atomic PostgreSQL
+replica/association/request admission followed by asynchronous provider
+actuation; neither more retries nor EFS is authority.
+
+Historical rollout record: the additive reserved-fill, exact worker-projection, generalized
 non-pool binding, demand, route, executor-termination, provider-independent
 route, durable actuation-intent, supply-aware paid-residual, successor-schema,
 and scheduler-mode prerequisites are merged through PRs #1537, #1540, #1542,
 #1547, #1548, #1549, #1552, #1553, and #1555. Production Helm revision 436 /
 release `1.1.1359` runs the exact 2 API / 2 controller / 2 executor split-role
 cohort on RWX storage. Production committed clean successor version 63 on
-2026-08-19, then platform PR #8652 committed version 64 with the same
-three worker projections and `utilization_gate: false`. Exact database readback
+2026-08-19. Before platform PR #8652 merged, one deployment attempt durably
+stored an equivalent version 64 after API acceptance but failed before
+election. The merged #8652 deployment workflow has not subsequently completed,
+and version 64 was not activated or elected at the last observation. Its
+post-merge combined run `32281262288` validated and dry-ran successfully, then
+failed closed in the separate test target because `boltz-l4-fleet-test` does
+not exist and cannot be bootstrapped without an atomic Platform endpoint
+update; it made no production service change. After the controller rollout,
+the existing prod-only `ml-model-deploy.yml` dispatch with `models=boltz-2`,
+`mode=prod`, and `provider=skypilot` targets only `boltz-l4-fleet` and remains
+the canonical application path. Fresh live readback remains required. The
+stored version 64 has the same three worker
+projections and `utilization_gate: false`. Historical exact database readback
 proves its three non-null worker
 projections include a PHX H200 projection that uses
 `default-scheduler`, `be`/`be-ls`, priority -1000/`Never`,
@@ -21,11 +76,12 @@ projections include a PHX H200 projection that uses
 supersedes version 62, which proved the projection shape but remains ineligible
 because it pins the rejected `v5.44.1-boltz-2` image. At the 2026-08-19
 inspection compatible pools published free A100, A100-80GB, and H200 GPUs but
-version 64 has not yet admitted them. The reconciliation gate is
+the stored version 64 had not admitted them. The last-observed reconciliation
+gate is
 `SEQUENCED_ACTIVE` generation 1, authorized to the unchanged policy contract
 introduced in release `1.1.1358`; the release `1.1.1359` overlay incorrectly
 derived policy authority from its unrelated artifact version. That prevented
-the broker from refreshing version 63's claim to current version 64, while the
+the broker from refreshing version 63's claim to stored version 64, while the
 canonical activation command correctly rejected the stale claim. The clean
 fix is to keep artifact versioning independent from the explicit policy
 contract revision, deploy the complete writer cohort, let the unchanged
@@ -358,13 +414,14 @@ will replace the target. Each legacy operation also replaces one immutable
 state reference, so readers never tear a target or snapshot object while that
 intentional cross-generation state is visible.
 
-Draft cleanup PR #1506 contains a superficially similar hunk that derives
+Closed cleanup PR #1506 contained a superficially similar hunk that derived
 `next_demand_generation = self._reconcile_generation + 1`. That is unsafe: the
 live durable feed was already at generation 68023 while a restarted controller
 counter begins at zero, and replay would manufacture false new evidence. This
-focused fix supersedes only that controller-local-generation hunk. The rest of
-#1506 remains draft, blocked, and governed by its existing production removal
-gates.
+focused fix superseded that controller-local-generation hunk. PRs #1506 and
+#1510 are closed and superseded; they reserve no API or Serve migration number.
+Any later cleanup must be re-derived from observed old-path use after the
+production horizon and receive then-current heads only when its code exists.
 
 An activation preflight on 2026-08-18 also found that the mechanical
 transition still required the historical *exact* Serve047/API011 revisions,
@@ -1801,6 +1858,148 @@ All network calls use the remaining deadline, one-attempt client retries, and a
 shared cancellation event. Raw provider payloads and credential material never
 enter errors or proof output.
 
+Launch authorization shares only a short-lived provider proof, never an exact
+launch scope or a permission to create a replica. Serve054 adds the
+PostgreSQL-only `serve_reserved_fill_reclaim_provider_proofs` table. A fresh
+random 256-bit `receipt_nonce` is its primary key. The exact-authority tuple of
+reconciliation-gate generation, all three immutable policy identity fields,
+and Kubernetes context is unique. Its SHA-256 is computed only as the
+advisory-lock ID and is not persisted. The table and API are launch-proof
+specific, so they carry no fixed-value purpose or provider-domain
+discriminator. Each row otherwise carries only proof schema version, one safe
+JSONB object containing the exact `aws` and `kubernetes` summaries, its
+canonical SHA-256, and database-clock `completed_at`. There is no persisted
+generation or expiry: the nonce changes on every insert or refresh, and
+freshness is derived as `completed_at + 5 seconds > clock_timestamp()`.
+Delete/reinsert of the same authority and payload therefore cannot match an
+older ticket.
+
+The application accepts contexts of at most 1,024 UTF-8 bytes and canonical
+proof JSON of at most 32 KiB with at most 32 nested container levels.
+PostgreSQL independently limits the rendered JSONB value to 64 KiB; that
+deliberate headroom accounts for JSONB text spacing and normalization rather
+than claiming its byte representation is identical to compact canonical JSON.
+The database also rejects malformed identities, nonces, schema versions, and
+digests. The table has no
+service foreign key because the provider fact is context-wide; service,
+replica, accelerator, projection, and pool authority remain outside it and are
+revalidated separately. Proof payloads contain only the existing safe
+summaries and never AWS credentials, EKS bearer tokens, kubeconfigs, or raw
+provider responses. Central state has no SQLite implementation or fallback.
+
+After all existing local identity, projection, admission, accelerator, and
+pool-key checks pass, one deadline-watched worker constructs one repository and
+derived Serve engine. Every network-capable construction, database, and
+provider operation remains inside that watched work; the handler main thread
+performs no proof-path network I/O. The worker opens one dedicated `NullPool`
+transaction, reads the exact context-authority row plus PostgreSQL
+`clock_timestamp()`, and uses a fresh canonical row immediately. On a missing,
+expired, malformed, or semantically inexact row, that same transaction makes
+exactly one nonblocking `pg_try_advisory_xact_lock` attempt using the authority
+hash. A loser rolls back and physically closes before polling. A winner rereads
+the exact authority under its transaction lock to close the read/election race.
+Before that reread or any provider work, it transaction-locally sets and
+verifies PostgreSQL `application_name = skypilot-reclaim-proof-owner`; failure
+to tag the elected phase rolls back and fails closed. It then
+captures the database-clock proof-start anchor, runs the AWS and Kubernetes
+provider reads concurrently under the same outer deadline, validates the exact
+complete pair, and performs one authority-tuple
+`INSERT ... ON CONFLICT DO UPDATE` with a fresh nonce. It decodes `RETURNING`,
+commits, and physically closes before the receipt can authorize its caller.
+Transaction commit, rollback, connection loss, or process death releases the
+lock atomically; no custom session-lock lifecycle, DBAPI facade,
+prior-generation CAS, or unlock query remains. Receipt waits never consume or
+retain an ordinary API/Serve `QueuePool` slot.
+The provider deadline reserves the final 0.5 seconds of the outer horizon for
+publication and physical session close.
+
+The receipt-owned connection path is PostgreSQL-only, `NullPool`, and
+instrumented under the bounded `reserved-fill-reclaim-proof` metric label. It
+uses the distinct transaction-local `skypilot-reclaim-proof-owner` database
+phase tag only while it owns the advisory transaction, making retained-owner
+observations deterministic without changing pool identity or metric cardinality.
+It
+retains URL connection options, performs no generic database retry, permits
+one libpq connection attempt with a one-second connect timeout, applies
+200-millisecond server statement/lock limits and client socket send/receive
+limits, and sets `idle_in_transaction_session_timeout` to 6 seconds, explicitly
+above the five-second outer horizon while bounding a wedged provider-held
+transaction. These limits reduce pressure and make normal database faults
+prompt; they are not the absolute survivor boundary because synchronous DNS
+and a lost commit response cannot be proven bounded by libpq.
+The existing per-invocation `DisposableExecutor` is that boundary. At the
+five-second outer deadline the policy sets cancellation, reports failure
+without joining an uncooperative proof thread, and the existing inner warden
+stops, kills, reaps, and proves absence of the exact handler family before its
+typed `family_drained` result becomes visible. No new warden protocol or
+long-lived execution path is introduced.
+
+A caller that loses its one election attempt never reacquires the lock and
+never joins an exclusive-lock handoff convoy. It waits locally and makes a
+bounded number of jittered, exponentially spaced `NullPool` receipt reads,
+starting at 400 milliseconds and capped at one second. A
+waiter may spend its remaining outer horizon on a final client-bounded read;
+the post-read deadline check rejects a late result and `DisposableExecutor`
+remains the hard stalled-session boundary. Loss of the elected transaction,
+provider failure, or uncertain publication denies authorization to the current
+invocation. A failure before commit leaves no newly published or usable
+receipt; a prior stale or malformed row may remain but cannot authorize. A lost
+commit acknowledgement may leave either no row or exactly one complete
+canonical row. Partial receipt rows and partial launch authority are impossible,
+and a later invocation may safely read that committed row or reprove it.
+Already-observed
+losers fail closed at their
+original deadline and never re-elect. Because failures are deliberately not
+persisted, a slow contemporaneous handler that has not yet attempted the lock
+may become leader after the failed leader releases it; this is a later
+independent attempt, not a waiter handoff. The existing durable actuation
+intent/request retry remains the sole durable retry owner. Thus the contract is
+one active leader per exact context authority, exactly one AWS call and one
+Kubernetes call in a successful synchronized cold wave, no cached failure, no
+retained waiter sessions, and no advisory-lock handoff convoy. The synchronized
+90-process gate measures the instantaneous and total physical-open bounds;
+`NullPool` alone is not a global connection cap.
+
+Each provider future captures its local monotonic completion, and the typed
+context candidate carries the older of the AWS and Kubernetes completions
+outside the persisted payload. The repository maps that oldest completion from
+the proof-start database/local clock anchor into `completed_at`. The receipt is
+therefore never newer than either fact even when domain durations are
+asymmetric, without discarding the complete five-second reuse horizon after the
+older fact actually completed. Loss of the transaction makes publication fail.
+Provider failures are not persisted or cached, and database, lock, clock,
+payload, semantic, digest, or authority uncertainty fails closed without
+falling back to an independent provider read.
+
+Receipt readers conservatively map database age back to local monotonic time by
+adding the full SQL round-trip to the database-reported age. Each caller then
+mints its own exact `ReclaimLaunchAuthorization` carrying the one immutable
+context receipt reference and its conservative completion time. The final
+existing PostgreSQL launch-authority transaction selects and share-locks that
+row by nonce with `FOR SHARE NOWAIT`, requires its exact
+policy/gate/context/schema/digest, derives database-clock age from
+`completed_at`, and revalidates the nested Kubernetes physical UID in the
+terminal SQL authorization immediately before provider I/O. A concurrent
+refresh or delete conflicts with that row lock. If the updater holds the lock
+first, the final guard rejects immediately through `NOWAIT`; if the guard holds
+it first, the proof-engine updater waits only for its 200-millisecond
+statement/lock bound and then rejects. The row lock linearizes only this
+terminal SQL authorization and is released when its transaction ends; it does
+not span the provider effect. The existing shared fleet-gate advisory guard
+does remain held across that effect. A
+policy rotation, gate advance, context mismatch, receipt ABA, expiry,
+deletion, malformed payload, or database loss therefore rejects the launch.
+Distinct context locks remain parallel.
+
+This deliberately reuses completed evidence inside, but never beyond, the
+same five-second horizon already accepted for one launch ticket. It does not
+mint a fill-plan capability. Durable intents can live for roughly 180 seconds
+and can be delayed by per-pool leasing, API queueing, retries, and Kueue; a
+five-second pre-fanout capability would routinely expire, while extending it
+to the intent horizon would weaken external IAM/Kueue/scheduler-drift safety.
+Refreshing the shared receipt at the terminal boundary preserves that safety
+without a process-local second authority path.
+
 The deployment preflight is machine-readable:
 
 ```bash
@@ -1808,7 +2007,7 @@ python -m boltz_reserved_fill_reclaim_policy
 ```
 
 It prints exactly one JSON object. Successful preflight and the structured
-activation, claim, and launch log payloads use schema 1 with `operation`,
+activation, claim, and launch log payloads use schema 2 with `operation`,
 `success`, the V2 `contract`, all three identity fields, completion time, and
 one record per attested context. Each AWS record includes
 `association_count`, `expected_role_arn`, and the explicit boolean
@@ -1816,7 +2015,7 @@ one record per attested context. Each AWS record includes
 namespace UIDs, exact queue names, IRSA-absence result,
 `assign_queue_labels_for_pods`, and per-flavor non-deleting Node counts plus
 reviewed product/capacity. Failed CLI preflight returns exit 1 and only
-`{"schema_version":1,"operation":"preflight","success":false,
+`{"schema_version":2,"operation":"preflight","success":false,
 "error_code":"ATTESTATION_FAILED"}`. Runtime activation and authorization
 fail closed with `ReclaimAttestationError`.
 
@@ -2706,12 +2905,12 @@ either case.
 | 2a.3 | Global activation scope with per-service duplicate-pool validation | Revision 431 preflight exposed that the deployment policy incorrectly treated two services sharing one broker pool/card as a duplicate claim. The fix groups activation claims by service, retains same-service duplicate rejection, and permits the documented cross-service sharing before one fleet-wide provider attestation. |
 | 2a.4 | Remove redundant admission-policy authority from reserved fill | Platform PR #8649 is superseded and must not change the shared KubeRay/HPTO policy for fleet activation. Policy-bundle schema v5 removes ValidatingAdmissionPolicy and binding reads while retaining the stronger exact Kueue controller/webhook and synchronous/fresh Pod lifecycle proof. Activation requires only the SkyPilot fix-forward deployment and a fresh full-fleet preflight; no Terraform or platform Helm change is part of this gate. |
 | 2b | New immutable service version with task-owned Kubernetes overrides removed, `min_replicas: 0`, and exact non-null worker projections | Version 63 is committed, elected, and controller-applied at lifecycle epoch 82 on known-good image `v3.682.2-boltz-2`; it is the clean demand-gated activation successor. Version 62 remains rejected historical projection evidence. |
-| 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. #1506 remains its stacked removal. |
+| 2c | P2c provider-independent route leases and safe zero-demand paid retirement (Serve051/API88) | PR #1531 is merged and deployed dark. PR #1532's exact-owner fix is deployed as revision 410 / v1.1.1314. PR #1533's immutable route-contract fix is deployed as revision 411 / v1.1.1315 and removes the shared routing-lock dependency. Production then exposed synchronous per-probe PostgreSQL receipt writes on the composition event loop. The bounded batch receipt-writer fix-forward and provider-stall qualification remain open. Historical cleanup #1506 is closed/superseded and reserves no head. |
 | 2d | P2d grant-before-row per-pool actuation intents (Serve052) | Merged in PR #1537 and deployed dark within revision 418. Production activation and busy-lane/no-row evidence remain gates. |
 | 2e | Atomic per-service durable-demand plus durable-actuation promotion | PR #1555 is merged and deployed dark in revision 431 / release 1.1.1338: one controller fence, routing linearization lock, and PostgreSQL transaction replace the two promotion requests. Draft cleanup PR #1556 removes both deprecated separate surfaces and the unsupported demand demotion after the documented production horizon. Activation remains gated by 2a.3, 2a.4, and a successful full-fleet re-attestation. |
 | 2f | Promoted capacity-authority controller takeover | The fix-forward implementation is merged in PR #1562: the existing owner-transfer transaction preserves both one-way epochs, rebinds demand and zero-cost capability together, invalidates pre-row predecessor intents, and leaves route/report admission cold until fresh replacement evidence. No schema, chart, provider, or platform change is required. Deployment and child/Pod takeover qualification remain activation prerequisites. |
-| 2g | Production full reserved backfill | Platform PR #8652 changes only the existing service policy and its validator/docs: production uses `utilization_gate: false`; test explicitly retains `true`. Apply the live change only after 2e/2f activation, changing one boolean relative to the clean demand-gated successor and preserving its known-good model image and immutable worker projections. |
-| 3 | G2/P3 cleanup API016/Serve053 plus final non-pool cleanup API017/Serve054 | Drafts #1506/#1510 must be restacked after 2c/2d and remain undeployed until the full horizon passes. |
+| 2g | Production full reserved backfill | Platform PR #8652 is merged, but its merged deployment workflow has not successfully completed and version 64 is not elected or activated at the last observation. A pre-merge attempt durably stored an equivalent version 64 after API acceptance and then failed before election; fresh live readback is required. The PR changes only the existing service policy and its validator/docs: production uses `utilization_gate: false`; test explicitly retains `true`. Complete the live workflow only after 2e/2f activation, changing one boolean relative to the clean demand-gated successor and preserving its known-good model image and immutable worker projections. |
+| 3 | Steady-state cleanup after the production horizon | Closed PRs #1506/#1510 are superseded and reserve no API/Serve heads. Re-derive the smallest deletion-only cleanup from live old-path-use evidence; allocate no migration unless that concrete diff requires one. Serve054 belongs only to the provider-proof receipt. |
 
 Durable acceptance atomically binds rows to the existing asynchronous launch
 path through the generic non-pool handler, and
@@ -2725,6 +2924,27 @@ Decision summary and phase table above. The A/B/C, split-topology, publisher,
 and platform-PR sequences retained in the subsections below are historical
 review evidence only. They must not be executed, used as merge gates, or
 treated as deployment authority after revision 418.
+
+### Serve054 one-way rollout boundary
+
+Serve054 is additive, and applying it does not invalidate already-running
+`1.1.1385` controller children or their ordinary traffic/fill transactions.
+It does deliberately advance the single Serve Alembic head. An old controller
+that restarts after that advance cannot re-adopt a service: its compiled
+placement-normalization recognized-head set ends at Serve053, so adoption
+fails closed. An image rollback to `1.1.1385` is therefore forbidden once the
+migration job commits Serve054.
+
+Deploy the successor image and migration in one direct Helm fix-forward
+operation, permit only the bounded migration-first overlap, and require the
+complete successor API/controller/executor cohort plus successful service
+controller adoption before any activation or `boltz-l4-fleet` update. Existing
+old children may serve during that bounded overlap, but no old restarted child
+is treated as healthy adoption evidence. If the rollout stalls after Serve054,
+repair and deploy another successor image; do not stamp the database backward,
+run the forward-only downgrade, restore `1.1.1385`, or create a precursor
+schema path. This is the already-established one-way Helm/fix-forward contract,
+not a new migration topology.
 
 ### Generalized binding prerequisite
 
@@ -3213,6 +3433,124 @@ to create zero-cost compute automatically; observing that effect is required.
     healthy. A missing map should stop only new fill, not fail the service.
 
 ## Verification plan and evidence
+
+The 2026-08-20 production trace showed isolated full-fleet preflights at
+2.92--3.32 seconds while a 15-plus-launch wave caused overlapping
+five-second attestation failures. The focused regression must use real
+PostgreSQL and real OS handler processes matching the database topology inside
+`DisposableExecutor`. Barrier-synchronized cohorts of 15 and 90 independently
+instantiated policy objects run against a cold receipt while the elected
+provider proofs remain parked for 3.2 seconds, inside the observed
+2.92--3.32-second production range, and every caller retains the same
+absolute five-second horizon. The production guardian and warden do not import
+the policy or open proof/database sessions; the stress test therefore spawns
+the 15/90 handler processes directly while the existing process-boundary suite
+separately owns guardian/warden/FD-quarantine correctness. CI keeps the
+15-process case in the ordinary suite but runs the marked 90-process case in
+its own non-xdist 4x16 shard, so it never contends with three unrelated test
+workers. The spawned pressure target uses a strictly test-only import topology:
+it installs only the `sky` and `sky.serve` package search paths before importing
+the real policy, repository, schemas, and database utilities. It therefore
+skips unrelated CLI/API re-export initializers without stubbing any contract
+under test. The ordinary pytest process retains the normal package
+initializers, and every result attests that the clean spawned worker took the
+narrow path. This topology proves the database and concurrency contracts; it
+does not emulate production worker bootstrap or establish production handler
+RSS. The separate `DisposableExecutor` suite owns that process boundary. The
+shard is qualified only after repeated CI runs establish safe runner memory
+headroom; otherwise it moves unchanged to a >=32 GiB profile.
+The elected transaction changes its PostgreSQL `application_name` locally to
+`skypilot-reclaim-proof-owner` immediately after the nonblocking advisory lock
+succeeds; any failure to install that phase tag rolls back and denies the
+proof. The pressure target parks every loser at the entry to receipt polling,
+which is reachable only after its election transaction and NullPool connection
+have physically closed. It separately parks both provider callbacks. The
+parent waits for the two callbacks and all `N - 1` losing PIDs, then requires
+exactly one owner session in `idle in transaction`, exactly one granted
+transaction advisory lock on that owner, zero base-name proof sessions, and
+zero advisory waiters. It then releases the losers into the real bounded
+receipt-polling wave while keeping the provider owner parked until 3.2 seconds.
+This proves both the deterministic no-retained-loser snapshot and the complete
+production polling pressure; it does not suppress the pressure to obtain the
+snapshot. This deterministic observation replaces backend-age thresholds,
+which measure process scheduling rather than connection retention.
+One additional real
+`DisposableExecutor` test elects one context receipt owner, proves its AWS and
+Kubernetes provider callbacks are both stalled while exactly one session holds
+exactly one advisory lock, then verifies the five-second failure produces
+`FAILED` plus
+`family_drained` and, after that process-family proof, zero surviving proof
+sessions/locks, no receipt/provider effect, and a successful later fresh-nonce
+reproof. This process boundary is
+the hard survivor/session guarantee; the local libpq, server-statement, and
+socket timeouts above are pressure-reduction and prompt-failure layers. Each
+pressure case
+must produce exactly one AWS and one Kubernetes provider read, one receipt row,
+one nonce, and one returned reference; exactly one tagged owner session and
+one advisory-lock holder; no advisory-lock waiters; and fewer than 100
+simultaneous proof sessions. Every worker executes its terminal final guard on
+an ordinary Serve database connection before it reports success, and zero
+proof/worker/counter sessions survive the completed wave. The complete
+empirical wave, including those guards, must use fewer than eight physical
+session opens per worker plus a fixed allowance of 20 over the full five-second
+horizon. Tests also cover distinct authorities, database-clock expiry,
+conservative SQL-round-trip age mapping, provider
+failure without caching, leader/advisory-session loss before publish, the
+intentional already-observed-waiter-wave fail-closed result plus one later
+durable retry, waiter timeout without leader cancellation, semantic cache
+mismatch, malformed exact-authority-row repair, delete/reinsert ABA, scope
+mismatch despite a valid context proof, and final-guard rejection of missing,
+expired, malformed, wrong-nonce, wrong-digest, wrong-gate, wrong-identity,
+or wrong-context rows. A reverse row-lock race holds an update lock first and
+proves the final guard uses `FOR SHARE NOWAIT`, fails closed promptly without
+running the downstream provider effect, then succeeds after the conflicting
+transaction ends:
+
+```bash
+pytest -n 0 -q \
+  tests/unit_tests/test_reserved_fill_reclaim_proofs.py \
+  tests/unit_tests/test_boltz_reserved_fill_reclaim_policy.py \
+  -k 'multiprocess_launches_share_fresh_provider_receipt or \
+      expired_receipt_refreshes_once or \
+      failed_provider_proof_is_not_persisted or \
+      lost_advisory_session_cannot_publish or \
+      final_guard_rejects_stale_or_mismatched_receipt or \
+      kubernetes_provider_uses_the_exact_assumed_audit_session'
+```
+
+Local PostgreSQL qualification on 2026-08-20 used one shared absolute
+five-second deadline for every handler and included each handler's terminal
+guard. Before deterministic phase tagging, the first fresh 4x16 CI run used
+8,688,271,360 bytes at its cgroup peak and completed all 90 authorizations in
+4.399 seconds, but correctly failed qualification because the old
+`backend_start > 100 ms` proxy classified 48 scheduler-delayed active reads as
+long lived. Pinning the same workload to four local CPUs reproduced the false
+classification with 22 such reads while still showing one lock holder and no
+waiters; the age proxy is therefore removed, not relaxed.
+
+With the exact owner/parked-loser barrier, the 15-process wave completed in
+3.949 seconds with a 0.002-second maximum start skew, five peak proof sessions,
+and 88 physical opens. The 90-process wave pinned to four local CPUs completed
+in 4.393 seconds with a 0.051-second maximum start skew, 71 peak proof sessions,
+and 538 physical opens. At the deterministic observation point every non-owner
+PID was parked after physical close and PostgreSQL showed exactly one tagged
+`idle in transaction` owner, one advisory-lock holder, zero base-name proof
+sessions, and zero advisory waiters. Both waves produced one AWS call, one
+Kubernetes call, one row, one nonce, matching returned references and terminal
+guards, and zero surviving proof/worker/counter sessions. Cross-pod production
+qualification remains a rollout gate and is not inferred from this local
+process evidence. Earlier diagnostic measurement of the narrow 90-worker
+topology found 3,553,361 KiB aggregate worker PSS and 3,818,638 KiB including
+pytest and the manager, but the shared local pod's historical cgroup peak makes
+that evidence ineligible to qualify a 16-GiB runner or claim production worker
+RSS. The dedicated fresh CI job sets a 12-GiB absolute cgroup limit; the
+pressure test reads and reports
+cgroup-v2 `memory.peak` (or samples `memory.current` when peak is unavailable)
+or cgroup-v1 `memory.max_usage_in_bytes`, including pytest setup, runner, and
+PostgreSQL overhead when they share that cgroup, and fails when the metric is
+unavailable or exceeds the limit. Qualification requires three consecutive
+exact 90-process CI passes under that absolute limit; otherwise the unchanged
+test moves to a >=32-GiB profile.
 
 ### Required automated commands
 
@@ -3775,6 +4113,22 @@ legacy activation.
 
 ## Open gates
 
+- [x] Deploy Serve053 recognition and empty durable-intent recovery as exact
+  Helm release `1.1.1377`; prove the controller advances route generations and
+  the original provider-absent rows retire without manual deletion.
+- [ ] Merge and deploy PR #1604's implemented Serve054 PostgreSQL
+  provider-proof receipt. Local cross-process qualification retains the shared
+  five-second operation/freshness horizon with no failure cache or fallback;
+  cross-pod production qualification remains open.
+- [ ] Replace pre-admission provider launches with the atomic PostgreSQL
+  replica/association/request receipt, then remove the HTTP/system-identity and
+  RWX/EFS correctness paths in the already-required stacked cleanup.
+- [ ] Adjudicate every exact PRESENT/quiesced launch through the existing
+  generation/UID-fenced cleanup graph; UNKNOWN or replaced identities remain
+  quarantined rather than inferred absent.
+- [ ] Prove a large grant assigns every compatible free GPU within the bounded
+  convergence target, with zero paid spill and no new ambiguous capacity debit.
+
 - [x] Deploy and qualify the generalized binding, demand/route projections,
   G1S precursor, provider-independent routes, P2d durable actuation intents,
   and the supply-aware paid residual as direct Helm revision 418 / release
@@ -3894,11 +4248,12 @@ legacy activation.
   `DURABLE_PROJECTED` at epoch 1 and must be verified rather than promoted.
   Resource-action authority remains gated by its separate shadow horizon.
   Promotion is one way and fix-forward only.
-- [ ] Merge Platform PR #8652 after CI and review, then create the production
-  full-backfill successor from the clean demand-gated activation version,
-  changing only `reserved_capacity_fill.utilization_gate` to `false`. Prove
-  the known-good model image, secrets, worker projections, endpoint, and every
-  other service field are unchanged. Test remains demand-gated.
+- [x] Merge Platform PR #8652 after CI and review. It is a service-spec change
+  only: no Terraform/Terragrunt or platform runtime pin is part of this path.
+- [ ] After the successor controller rollout, apply #8652's production
+  full-backfill service update from the clean demand-gated activation version.
+  Prove the known-good model image, secrets, worker projections, endpoint, and
+  every other service field are unchanged. Test remains demand-gated.
 - [ ] With zero authenticated demand, prove every fresh, authenticated,
   policy-compatible reclaimable zero-cost slot granted to this service is
   covered by a durable intent or a correctly attributed admitted,
@@ -3928,10 +4283,10 @@ legacy activation.
 - [ ] Pass typed provider present/absent/unknown/replaced,
   legacy-real-effect, lost-ACK, poisoned-row progress, broker conservation,
   no-paid-spill, and full restart/adoption tests.
-- [ ] Restack cleanup #1506 as API016/Serve053 and #1510 as API017/Serve054.
-  Merge them only after the complete capability, stale-writer, route, demand,
-  and actuation horizon proves zero old-path use and zero unsettled unbound
-  work.
+- [ ] After the complete capability, stale-writer, route, demand, and
+  actuation horizon proves zero old-path use and zero unsettled unbound work,
+  re-derive a deletion-only cleanup from current source. Closed/superseded PRs
+  #1506/#1510 reserve no schema or API heads and must not be revived.
 - [ ] Keep atomic-authority cleanup #1556 stacked on feature PR #1555 until
   the immediate, +10 minute, +30 minute, and complete stale/quiescence horizon
   proves no partial authority pair, paid spill, or ordinary-traffic regression;

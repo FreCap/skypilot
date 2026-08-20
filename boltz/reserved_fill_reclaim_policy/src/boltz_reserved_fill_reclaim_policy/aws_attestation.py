@@ -9,7 +9,9 @@ import threading
 import time
 from typing import Any
 
-from sky.adaptors import aws as aws_adaptor
+from sky.adaptors import common as adaptor_common
+
+aws_adaptor = adaptor_common.LazyImport('sky.adaptors.aws')
 
 
 class AwsAttestationError(RuntimeError):
@@ -64,12 +66,8 @@ class AuditSessionCache:
         ambient_session_factory: Callable[..., Any] | None = None,
         assumed_session_factory: Callable[..., Any] | None = None,
     ) -> None:
-        self._ambient_session_factory = (
-            aws_adaptor.session_with_client_defaults
-            if ambient_session_factory is None else ambient_session_factory)
-        self._assumed_session_factory = (aws_adaptor.boto3.session.Session
-                                         if assumed_session_factory is None else
-                                         assumed_session_factory)
+        self._ambient_session_factory = ambient_session_factory
+        self._assumed_session_factory = assumed_session_factory
         self._condition = threading.Condition()
         self._credentials: dict[tuple[str, str], _TemporaryCredentials] = {}
         self._refreshing: set[tuple[str, str]] = set()
@@ -110,9 +108,12 @@ class AuditSessionCache:
     def _assume(self, role_arn: str, region: str, deadline_monotonic: float,
                 cancellation: threading.Event) -> _TemporaryCredentials:
         timeout = _client_timeout(deadline_monotonic, cancellation)
-        ambient_session = self._ambient_session_factory(connect_timeout=timeout,
-                                                        read_timeout=timeout,
-                                                        total_max_attempts=1)
+        factory = self._ambient_session_factory
+        if factory is None:
+            factory = aws_adaptor.session_with_client_defaults
+        ambient_session = factory(connect_timeout=timeout,
+                                  read_timeout=timeout,
+                                  total_max_attempts=1)
         sts = ambient_session.client('sts', region_name=region)
         response = sts.assume_role(
             RoleArn=role_arn,
@@ -148,11 +149,13 @@ class AuditSessionCache:
                     self._refreshing.discard(key)
                     self._condition.notify_all()
         _remaining(deadline_monotonic, cancellation)
-        return self._assumed_session_factory(
-            aws_access_key_id=credentials.access_key_id,
-            aws_secret_access_key=credentials.secret_access_key,
-            aws_session_token=credentials.session_token,
-            region_name=region)
+        factory = self._assumed_session_factory
+        if factory is None:
+            factory = aws_adaptor.boto3.session.Session
+        return factory(aws_access_key_id=credentials.access_key_id,
+                       aws_secret_access_key=credentials.secret_access_key,
+                       aws_session_token=credentials.session_token,
+                       region_name=region)
 
 
 def _require_cluster(response: object, expected: Mapping[str, Any]) -> None:

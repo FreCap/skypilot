@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import types
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -29,6 +30,7 @@ from boltz_reserved_fill_reclaim_policy import POLICY_REVISION  # noqa: E402
 from boltz_reserved_fill_reclaim_policy import preflight  # noqa: E402
 
 from sky.serve import reserved_fill_reclaim_attestation as reclaim
+from sky.serve import reserved_fill_reclaim_proofs as reclaim_proofs
 
 
 def _bundle_document() -> dict:
@@ -100,7 +102,7 @@ def test_embedded_bundle_binds_observed_gpu_products_and_canonical_names():
     ]
     assert bundle.policy_revision == (
         f'boltz-reserved-fill-reclaim-policy/{POLICY_REVISION}')
-    assert POLICY_REVISION == '1.1.1358'
+    assert POLICY_REVISION == '1.1.1386'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
                   'cpu')['borrowing_limit'] == '12100'
     assert _quota(phx, 'inference', 'ml.p5e.48xlarge',
@@ -414,14 +416,69 @@ def _context_proof(context: dict, provider: dict) -> policy_lib._ContextProof:
                 for node in provider['node_inventory'])))
 
 
+def _set_summary_path(summary: dict, path: tuple[str | int, ...],
+                      value: object) -> None:
+    target: Any = summary
+    for component in path[:-1]:
+        target = target[component]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize(
+    ('domain', 'path', 'value'),
+    (
+        ('aws', ('cluster_arn',), 'arn:aws:eks:us-west-2:1:cluster/wrong'),
+        ('aws', ('expected_role_arn',), 'arn:aws:iam::123456789012:role/wrong'),
+        ('aws', ('identity_absence_proven',), 'yes'),
+        ('kubernetes', ('physical_cluster_uid',), 'wrong-cluster'),
+        ('kubernetes', ('namespace_uid',), 'wrong-namespace'),
+        ('kubernetes', ('local_queue_name',), 'wrong-queue'),
+        ('kubernetes', ('custom_scheduler_deployment_proven',), 'yes'),
+        ('kubernetes',
+         ('resource_flavor_topology_names', 0, 1), 'wrong-topology'),
+        ('kubernetes', ('node_flavors', 0, 'non_deleting_node_count'), 0),
+        ('kubernetes',
+         ('node_flavors', 0, 'product_label_value'), 'wrong-product'),
+    ),
+)
+def test_cached_provider_summary_is_bound_to_exact_reviewed_context(
+        domain, path, value):
+    policy = policy_lib.BoltzReservedFillReclaimPolicy()
+    context_name = 'phx_research_cluster_eks'
+    proof = _context_proof(policy._bundle.fleet_context(context_name),
+                           policy._bundle.provider_context(context_name))
+    typed = proof.aws if domain == 'aws' else proof.kubernetes
+    summary, _ = reclaim_proofs.canonical_proof_payload(
+        dataclasses.asdict(typed))
+
+    if domain == 'aws':
+        assert policy._decode_aws_proof_summary(
+            summary, context_name=context_name) == typed
+    else:
+        assert policy._decode_kubernetes_proof_summary(
+            summary, context_name=context_name) == typed
+
+    _set_summary_path(summary, path, value)
+    with pytest.raises(reclaim.ReclaimAttestationError,
+                       match='cached .* provider proof'):
+        if domain == 'aws':
+            policy._decode_aws_proof_summary(summary, context_name=context_name)
+        else:
+            policy._decode_kubernetes_proof_summary(summary,
+                                                    context_name=context_name)
+
+
 def _fake_attest(policy: policy_lib.BoltzReservedFillReclaimPolicy):
 
     def attest(names, _deadline):
-        return {
+        context_names = tuple(names)
+        context_proofs = {
             name: _context_proof(
                 policy._bundle.fleet_context(name),
-                policy._bundle.provider_context(name)) for name in names
+                policy._bundle.provider_context(name)) for name in context_names
         }
+        completed = time.monotonic()
+        return context_proofs, {name: completed for name in context_names}
 
     return attest
 
@@ -457,7 +514,7 @@ def test_unchanged_policy_authorizes_current_service_version_refresh(
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     identity = policy.policy_identity()
     assert identity.policy_revision == (
-        'boltz-reserved-fill-reclaim-policy/1.1.1358')
+        'boltz-reserved-fill-reclaim-policy/1.1.1386')
 
     authorizations = []
     for service_version in (63, 64):
@@ -662,7 +719,7 @@ def test_activation_rejects_accelerator_scheduling_mismatch(monkeypatch):
 def test_launch_rejects_accelerator_scheduling_mismatch(monkeypatch):
     policy = policy_lib.BoltzReservedFillReclaimPolicy()
     provider_calls = mock.Mock()
-    monkeypatch.setattr(policy, '_attest_contexts', provider_calls)
+    monkeypatch.setattr(policy, '_attest_launch_context', provider_calls)
     context = policy._bundle.fleet_context('phx_research_cluster_eks')
     admission = dataclasses.replace(
         _admission(context, 'h200'),
@@ -784,10 +841,12 @@ def test_provider_domains_and_contexts_start_concurrently(monkeypatch):
         return proof.aws if domain == 'aws' else proof.kubernetes
 
     monkeypatch.setattr(policy, '_provider_job', provider_job)
-    proofs = policy._attest_contexts(policy._bundle.contexts,
-                                     time.monotonic() + 2)
+    proofs, oldest_completions = policy._attest_contexts(
+        policy._bundle.contexts,
+        time.monotonic() + 2)
 
     assert set(proofs) == set(policy._bundle.contexts)
+    assert set(oldest_completions) == set(policy._bundle.contexts)
 
 
 def test_kubernetes_provider_uses_the_exact_assumed_audit_session(monkeypatch):
